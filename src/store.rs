@@ -8,13 +8,16 @@ use std::sync::{
 };
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
+use crate::db::{
+    Connection, DatabaseHealthHandle, DatabaseHealthSnapshot, DatabaseSyncHandle,
+    OptionalExtension, Row, TransactionBehavior, params, params_from_iter,
+};
 use base64::Engine;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
 use resend_rs::types::CreateEmailBaseOptions;
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -24,7 +27,7 @@ use uuid::Uuid;
 const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
 
 use crate::ServerGeo;
-use crate::config::{Config, tunnel_domain_host};
+use crate::config::{Config, DatabaseMode, tunnel_domain_host};
 use crate::ctl_client::authorize_control_request;
 use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
@@ -919,11 +922,41 @@ fn build_dashboard_country_aggregation(
 #[derive(Clone)]
 pub struct AppStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
+    database_health: DatabaseHealthHandle,
+    database_sync: DatabaseSyncHandle,
     share_log_recovery_attempts: Arc<Mutex<HashMap<String, i64>>>,
     auth_email_send_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
     ip_hash_salt: Arc<String>,
     geo_lookup_base_url: Arc<String>,
     market_usd_cny_rate_micros: Arc<AtomicI64>,
+}
+
+fn map_database_error(context: &str, error: crate::db::Error) -> AppError {
+    if error.is_unavailable() {
+        AppError::ServiceUnavailable(format!("{context}: {error}"))
+    } else {
+        AppError::Internal(format!("{context}: {error}"))
+    }
+}
+
+fn map_public_host_error(error: crate::public_hosts::PublicHostCatalogError) -> AppError {
+    use crate::public_hosts::PublicHostCatalogError;
+    match error {
+        PublicHostCatalogError::Invalid(message) => AppError::BadRequest(message.into()),
+        PublicHostCatalogError::Conflict(message) => AppError::Conflict(message),
+        PublicHostCatalogError::Corrupt(message) => AppError::Internal(message),
+        PublicHostCatalogError::Database(error) if error.is_unavailable() => {
+            AppError::ServiceUnavailable(format!("public host catalog: {error}"))
+        }
+        PublicHostCatalogError::Database(error) => {
+            AppError::Internal(format!("public host catalog database error: {error}"))
+        }
+    }
+}
+
+#[cfg(test)]
+fn init_schema(conn: &Connection) -> Result<(), AppError> {
+    crate::schema::apply(conn)
 }
 
 /// P18: 测试接続で必要な share の基本情報。
@@ -985,11 +1018,7 @@ pub struct ImageGenerationResultAccess {
 }
 
 pub fn image_results_root(config: &Config) -> PathBuf {
-    config
-        .db_path
-        .parent()
-        .map(|parent| parent.join("image-results"))
-        .unwrap_or_else(|| PathBuf::from("./image-results"))
+    config.data_dir.join("image-results")
 }
 
 pub fn image_result_path(config: &Config, storage_key: &str) -> Option<PathBuf> {
@@ -1239,19 +1268,34 @@ impl CleanupResult {
 
 impl AppStore {
     pub fn new(config: &Config) -> Result<Self, AppError> {
-        if let Some(parent) = config.db_path.parent() {
+        std::fs::create_dir_all(&config.data_dir)
+            .map_err(|e| AppError::Internal(format!("create data dir failed: {e}")))?;
+        if let Some(parent) = config.database.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| AppError::Internal(format!("create db dir failed: {e}")))?;
         }
-        let conn = Connection::open(&config.db_path)
-            .map_err(|e| AppError::Internal(format!("open db failed: {e}")))?;
+        let conn = match config.database.mode {
+            DatabaseMode::Local => Connection::open(&config.database.path),
+            DatabaseMode::Turso => Connection::open_remote_replica(
+                &config.database.path,
+                config.database.turso_url.clone().ok_or_else(|| {
+                    AppError::Internal("Turso database URL is not configured".into())
+                })?,
+                config.database.turso_auth_token.clone().ok_or_else(|| {
+                    AppError::Internal("Turso database auth token is not configured".into())
+                })?,
+            ),
+        }
+        .map_err(|error| map_database_error("open business database", error))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| AppError::Internal(format!("enable sqlite foreign keys failed: {e}")))?;
         conn.pragma_update(None, "busy_timeout", 5_000_i64)
             .map_err(|e| AppError::Internal(format!("set sqlite busy timeout failed: {e}")))?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| AppError::Internal(format!("enable sqlite WAL failed: {e}")))?;
-        init_schema(&conn)?;
+        if config.database.mode == DatabaseMode::Local {
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| AppError::Internal(format!("enable sqlite WAL failed: {e}")))?;
+        }
+        crate::schema::apply(&conn)?;
         let (boot_notification_policy, _) =
             ClientNotificationPolicy::for_runtime(&config.client_notifications, config);
         let boot_notification_template = NotificationTemplateContext::from_config(config);
@@ -1262,8 +1306,12 @@ impl AppStore {
             Utc::now(),
         )?;
         let salt = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
+        let database_health = conn.health_handle();
+        let database_sync = conn.sync_handle();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            database_health,
+            database_sync,
             share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
@@ -1281,10 +1329,14 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("enable test foreign keys failed: {error}"))
             })?;
-        init_schema(&conn)?;
+        crate::schema::apply(&conn)?;
         let salt = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
+        let database_health = conn.health_handle();
+        let database_sync = conn.sync_handle();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            database_health,
+            database_sync,
             share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
@@ -1303,6 +1355,17 @@ impl AppStore {
     pub(crate) fn set_market_usd_cny_rate_micros(&self, rate_micros: i64) {
         self.market_usd_cny_rate_micros
             .store(rate_micros, AtomicOrdering::Release);
+    }
+
+    pub fn sync_database(&self) -> Result<DatabaseHealthSnapshot, AppError> {
+        self.database_sync
+            .sync()
+            .map_err(|error| map_database_error("sync business database", error))?;
+        Ok(self.database_health.snapshot())
+    }
+
+    pub fn database_health_snapshot(&self) -> DatabaseHealthSnapshot {
+        self.database_health.snapshot()
     }
 
     pub async fn lookup_geo_country_code_for_ip(&self, ip: &str) -> Option<String> {
@@ -1332,7 +1395,7 @@ impl AppStore {
         &self,
         installation_id: &str,
     ) -> Result<(), AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin purge tx failed: {e}")))?;
@@ -1392,7 +1455,7 @@ impl AppStore {
         let country_code = metadata.country_code.clone();
         let new_control_secret = Alphanumeric.sample_string(&mut rand::thread_rng(), 44);
         let response = {
-            let mut conn = self.conn.lock().await;
+            let conn = self.conn.lock().await;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
@@ -1601,7 +1664,7 @@ impl AppStore {
         input: crate::models::ReportInstallationStatusRequest,
     ) -> Result<crate::models::ReportInstallationStatusResponse, AppError> {
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1673,7 +1736,7 @@ impl AppStore {
         };
 
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1739,7 +1802,7 @@ impl AppStore {
         validate_request_nonce(&input.nonce)?;
 
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2050,7 +2113,7 @@ impl AppStore {
         template: &NotificationTemplateContext,
         now: DateTime<Utc>,
     ) -> Result<NotificationReconcileStats, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2069,7 +2132,7 @@ impl AppStore {
         policy: &ClientNotificationPolicy,
         now: DateTime<Utc>,
     ) -> Result<NotificationReconcileStats, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2335,7 +2398,7 @@ impl AppStore {
             return Ok(NotificationAggregateStats::default());
         }
 
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2691,7 +2754,7 @@ impl AppStore {
                 "notification worker_id is required".into(),
             ));
         }
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2900,7 +2963,7 @@ impl AppStore {
         policy: &ClientNotificationPolicy,
         now: DateTime<Utc>,
     ) -> Result<bool, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -3235,7 +3298,7 @@ impl AppStore {
                 "invalid notification delivery terminal status".into(),
             ));
         }
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -3610,7 +3673,7 @@ impl AppStore {
             old_email: &old_email,
             new_email: &new_email,
         };
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?
             .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
         verify_signed_share_request(
@@ -3886,7 +3949,7 @@ impl AppStore {
         }
 
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| AppError::Internal(format!("begin email verification failed: {e}")))?;
@@ -6399,7 +6462,7 @@ impl AppStore {
 
         let now = Utc::now().to_rfc3339();
         let persistence_result = {
-            let mut conn = self.conn.lock().await;
+            let conn = self.conn.lock().await;
             (|| -> Result<(), AppError> {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -8213,7 +8276,7 @@ impl AppStore {
         let notification_audit_cutoff =
             (Utc::now() - Duration::seconds(CLIENT_NOTIFICATION_AUDIT_RETENTION_SECS)).to_rfc3339();
         let (mut result, stale_subdomains, stale_image_storage_keys) = {
-            let mut conn = self.conn.lock().await;
+            let conn = self.conn.lock().await;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| AppError::Internal(format!("begin cleanup tx failed: {e}")))?;
@@ -9525,7 +9588,7 @@ impl AppStore {
             return Ok(HashMap::new());
         }
         let conn = self.conn.lock().await;
-        // Use a single IN-clause query; rusqlite doesn't support array params,
+        // Use a single IN-clause query; SQLite doesn't support array parameters,
         // so build a placeholder list. The batch is capped by the caller.
         let placeholders: Vec<&str> = share_ids.iter().map(|_| "?").collect();
         let sql = format!(
@@ -9535,9 +9598,9 @@ impl AppStore {
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| AppError::Internal(format!("prepare parallel_limits failed: {e}")))?;
-        let params: Vec<&dyn rusqlite::ToSql> = share_ids
+        let params: Vec<&dyn crate::db::ToSql> = share_ids
             .iter()
-            .map(|s| s as &dyn rusqlite::ToSql)
+            .map(|s| s as &dyn crate::db::ToSql)
             .collect();
         let rows = stmt
             .query_map(params.as_slice(), |row| {
@@ -10733,7 +10796,7 @@ impl BoardMessageRow {
     }
 }
 
-fn map_board_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BoardMessageRow> {
+fn map_board_row(row: &crate::db::Row<'_>) -> crate::db::Result<BoardMessageRow> {
     let pinned_at: Option<String> = row.get(7)?;
     let featured_at: Option<String> = row.get(8)?;
     let created_at: String = row.get(9)?;
@@ -12072,1642 +12135,6 @@ fn write_map_display_settings(
     Ok(())
 }
 
-fn init_schema(conn: &Connection) -> Result<(), AppError> {
-    crate::public_hosts::init_schema(conn).map_err(map_public_host_error)?;
-    crate::market_access::init_schema(conn).map_err(|error| {
-        AppError::Internal(format!("initialize market access schema failed: {error}"))
-    })?;
-    crate::client_market::init_schema(conn).map_err(map_client_market_schema_error)?;
-    crate::share_market::init_schema(conn).map_err(|error| {
-        AppError::Internal(format!("initialize Share Market schema failed: {error}"))
-    })?;
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS installations (
-            id TEXT PRIMARY KEY,
-            public_key TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            app_version TEXT NOT NULL,
-            owner_email TEXT,
-            owner_verified_at TEXT,
-            last_seen_ip TEXT,
-            country_code TEXT,
-            country TEXT,
-            region TEXT,
-            city TEXT,
-            latitude REAL,
-            longitude REAL,
-            geo_candidate_country_code TEXT,
-            geo_candidate_country TEXT,
-            geo_candidate_region TEXT,
-            geo_candidate_city TEXT,
-            geo_candidate_latitude REAL,
-            geo_candidate_longitude REAL,
-            geo_candidate_hits INTEGER NOT NULL DEFAULT 0,
-            geo_candidate_first_seen_at TEXT,
-            geo_last_changed_at TEXT,
-            created_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            control_secret_b64 TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS registration_admission_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_scope TEXT NOT NULL,
-            occurred_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS registration_geo_cache (
-            source_scope TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            cached_at_ms INTEGER,
-            claim_owner TEXT,
-            claim_expires_at_ms INTEGER,
-            country_code TEXT,
-            country TEXT,
-            region TEXT,
-            city TEXT,
-            latitude REAL,
-            longitude REAL,
-            updated_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS leases (
-            id TEXT PRIMARY KEY,
-            installation_id TEXT NOT NULL,
-            connection_id TEXT NOT NULL UNIQUE,
-            protocol_epoch TEXT NOT NULL,
-            router_id TEXT NOT NULL,
-            route_id TEXT NOT NULL,
-            rotation_id TEXT NOT NULL,
-            generation INTEGER NOT NULL,
-            expected_generation INTEGER NOT NULL,
-            state TEXT NOT NULL DEFAULT 'issued',
-            subdomain TEXT NOT NULL,
-            tunnel_type TEXT NOT NULL,
-            ssh_username TEXT NOT NULL,
-            ssh_password TEXT NOT NULL,
-            issued_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            used_at TEXT,
-            ready_at TEXT,
-            activated_at TEXT,
-            retired_at TEXT,
-            share_json TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS tunnel_route_heads (
-            router_id TEXT NOT NULL,
-            route_id TEXT NOT NULL,
-            subdomain TEXT NOT NULL,
-            active_generation INTEGER NOT NULL,
-            active_connection_id TEXT NOT NULL,
-            active_rotation_id TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (router_id, route_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS shares (
-            share_id TEXT PRIMARY KEY,
-            capacity_pool_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            share_name TEXT NOT NULL,
-            owner_email TEXT,
-            shared_with_emails_json TEXT NOT NULL DEFAULT '[]',
-            market_access_mode TEXT NOT NULL DEFAULT 'selected',
-            access_by_app_json TEXT NOT NULL DEFAULT '{}',
-            app_settings_json TEXT NOT NULL DEFAULT '{}',
-            for_sale_official_price_percent_by_app_json TEXT NOT NULL DEFAULT '{}',
-            description TEXT,
-            for_sale TEXT NOT NULL DEFAULT 'No',
-            subdomain TEXT,
-            app_type TEXT NOT NULL,
-            provider_id TEXT,
-            enabled_claude INTEGER NOT NULL DEFAULT 0,
-            enabled_codex INTEGER NOT NULL DEFAULT 0,
-            enabled_gemini INTEGER NOT NULL DEFAULT 0,
-            token_limit INTEGER NOT NULL,
-            parallel_limit INTEGER NOT NULL DEFAULT 3,
-            tokens_used INTEGER NOT NULL,
-            requests_count INTEGER NOT NULL,
-            share_status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            upstream_provider_json TEXT,
-            app_runtimes_json TEXT,
-            app_providers_json TEXT,
-            -- Share 的全部 app/provider 绑定快照（JSON: {app_type: provider_id}）。
-            bindings_json TEXT,
-            user_grants_json TEXT NOT NULL DEFAULT '{}',
-            supported_user_token_periods_json TEXT NOT NULL DEFAULT '[]',
-            runtime_refreshed_at TEXT,
-            config_revision INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS share_bindings (
-            share_id TEXT NOT NULL REFERENCES shares(share_id) ON DELETE CASCADE,
-            app_type TEXT NOT NULL CHECK (app_type IN ('claude', 'codex', 'gemini')),
-            provider_id TEXT NOT NULL CHECK (provider_id != ''),
-            PRIMARY KEY (share_id, app_type)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_share_bindings_app_share
-            ON share_bindings(app_type, share_id);
-
-        CREATE TABLE IF NOT EXISTS installation_client_tunnels (
-            installation_id TEXT PRIMARY KEY,
-            owner_email TEXT NOT NULL,
-            subdomain TEXT NOT NULL UNIQUE,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            last_seen_at TEXT
-        );
-
-        DROP TABLE IF EXISTS installation_payout_profiles;
-
-        CREATE TABLE IF NOT EXISTS share_request_logs (
-            request_id TEXT PRIMARY KEY,
-            installation_id TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            share_name TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            provider_name TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            model TEXT NOT NULL,
-            request_model TEXT NOT NULL,
-            request_agent TEXT NOT NULL DEFAULT '',
-            requested_model TEXT NOT NULL DEFAULT '',
-            actual_model TEXT NOT NULL DEFAULT '',
-            actual_model_source TEXT NOT NULL DEFAULT '',
-            requested_reasoning_effort TEXT,
-            effective_reasoning_effort TEXT,
-            client_service_tier TEXT,
-            effective_service_tier TEXT,
-            service_tier_decision TEXT,
-            usage_state TEXT NOT NULL DEFAULT 'observed',
-            stream_status TEXT,
-            usage_revision INTEGER NOT NULL DEFAULT 0,
-            status_code INTEGER NOT NULL,
-            latency_ms INTEGER NOT NULL,
-            first_token_ms INTEGER,
-            input_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            cache_read_tokens INTEGER NOT NULL,
-            cache_creation_tokens INTEGER NOT NULL,
-            quota_tokens INTEGER,
-            is_streaming INTEGER NOT NULL,
-            session_id TEXT,
-            user_country TEXT,
-            user_country_iso3 TEXT,
-            user_email TEXT,
-            is_health_check INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS image_generation_jobs (
-            job_id TEXT PRIMARY KEY,
-            share_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            share_name TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            provider_name TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            model TEXT NOT NULL,
-            status TEXT NOT NULL,
-            status_code INTEGER,
-            latency_ms INTEGER NOT NULL DEFAULT 0,
-            queued_at INTEGER NOT NULL,
-            started_at INTEGER,
-            completed_at INTEGER,
-            expires_at INTEGER,
-            prompt_preview TEXT,
-            error_message TEXT,
-            result_mime_type TEXT,
-            result_size_bytes INTEGER,
-            result_storage_key TEXT,
-            result_token_hash TEXT,
-            created_by_email TEXT,
-            client_ip TEXT,
-            user_country TEXT,
-            idempotency_key TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS image_generation_request_logs (
-            request_id TEXT PRIMARY KEY,
-            share_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            share_name TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            provider_name TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            model TEXT NOT NULL,
-            status TEXT NOT NULL,
-            status_code INTEGER,
-            latency_ms INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            completed_at INTEGER,
-            prompt_preview TEXT,
-            error_message TEXT,
-            result_mime_type TEXT,
-            result_size_bytes INTEGER,
-            result_storage_key TEXT,
-            result_access_token TEXT,
-            created_by_email TEXT,
-            client_ip TEXT,
-            user_country TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS share_health_checks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            share_id TEXT NOT NULL,
-            checked_at INTEGER NOT NULL,
-            is_healthy INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'unknown',
-            reason TEXT,
-            router_epoch TEXT NOT NULL DEFAULT 'legacy'
-        );
-
-        CREATE TABLE IF NOT EXISTS installation_health_checks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            installation_id TEXT NOT NULL,
-            checked_at INTEGER NOT NULL,
-            is_healthy INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'unknown',
-            reason TEXT,
-            router_epoch TEXT NOT NULL DEFAULT 'legacy'
-        );
-
-        CREATE TABLE IF NOT EXISTS share_model_health_checks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id TEXT NOT NULL UNIQUE,
-            share_id TEXT NOT NULL,
-            subdomain TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            requested_model TEXT NOT NULL,
-            actual_model TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL,
-            status_code INTEGER,
-            latency_ms INTEGER NOT NULL DEFAULT 0,
-            first_token_ms INTEGER,
-            error_message TEXT,
-            checked_at INTEGER NOT NULL,
-            source TEXT NOT NULL DEFAULT 'scheduled'
-        );
-
-        CREATE TABLE IF NOT EXISTS share_model_health_state (
-            share_id TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            requested_model TEXT NOT NULL,
-            actual_model TEXT NOT NULL DEFAULT '',
-            last_status TEXT NOT NULL,
-            last_success_at INTEGER,
-            last_failed_at INTEGER,
-            last_checked_at INTEGER NOT NULL,
-            recent_results_json TEXT NOT NULL DEFAULT '[]',
-            error_message TEXT,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (share_id, app_type, requested_model)
-        );
-
-        CREATE TABLE IF NOT EXISTS share_edit_requests (
-            id TEXT PRIMARY KEY,
-            share_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            owner_email TEXT NOT NULL,
-            revision INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            patch_json TEXT NOT NULL,
-            created_by_email TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            applied_at TEXT,
-            error_message TEXT,
-            retired_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS market_disabled_shares (
-            market_email TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            disabled_by_email TEXT NOT NULL,
-            reason TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (market_email, share_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS market_share_model_failure_state (
-            market_email TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            requested_model TEXT NOT NULL,
-            actual_model TEXT NOT NULL DEFAULT '',
-            last_status TEXT NOT NULL,
-            last_success_at INTEGER,
-            last_failed_at INTEGER,
-            last_checked_at INTEGER NOT NULL,
-            recent_results_json TEXT NOT NULL DEFAULT '[]',
-            error_message TEXT,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (market_email, share_id, app_type, requested_model)
-        );
-
-        CREATE TABLE IF NOT EXISTS market_share_runtime_states (
-            market_email TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            router_id TEXT,
-            scope TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            app_type TEXT,
-            model_id TEXT,
-            model_name TEXT,
-            reason_kind TEXT,
-            reason TEXT,
-            failure_count INTEGER,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS dashboard_presence (
-            session_id TEXT PRIMARY KEY,
-            last_seen_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS dashboard_ux_events (
-            id TEXT PRIMARY KEY,
-            event_type TEXT NOT NULL,
-            source TEXT,
-            target_type TEXT,
-            step_count INTEGER,
-            elapsed_ms INTEGER,
-            keyboard INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS email_send_logs (
-            id TEXT PRIMARY KEY,
-            email_type TEXT NOT NULL,
-            to_email TEXT NOT NULL,
-            provider_message_id TEXT,
-            status TEXT NOT NULL,
-            error_message TEXT,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS request_nonces (
-            installation_id TEXT NOT NULL,
-            action TEXT NOT NULL,
-            nonce TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (installation_id, action, nonce)
-        );
-
-        CREATE TABLE IF NOT EXISTS installation_notification_state (
-            installation_id TEXT PRIMARY KEY,
-            registration_state TEXT NOT NULL DEFAULT 'provisional',
-            registration_verified_at TEXT,
-            monitoring_enabled INTEGER NOT NULL DEFAULT 0,
-            presence_state TEXT NOT NULL DEFAULT 'unknown',
-            last_authenticated_seen_at TEXT,
-            last_boot_id TEXT,
-            offline_candidate_since TEXT,
-            offline_since TEXT,
-            recovery_candidate_since TEXT,
-            last_recovered_at TEXT,
-            offline_episode INTEGER NOT NULL DEFAULT 0,
-            last_offline_event_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (installation_id) REFERENCES installations(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS client_notification_events (
-            id TEXT PRIMARY KEY,
-            dedupe_key TEXT NOT NULL UNIQUE,
-            kind TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            episode INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL,
-            occurred_at TEXT NOT NULL,
-            not_before TEXT NOT NULL,
-            snapshot_json TEXT NOT NULL,
-            suppression_reason TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS installation_setup_completions (
-            installation_id TEXT PRIMARY KEY,
-            setup_id TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'explicit'
-                CHECK (source IN ('explicit', 'legacy_fallback')),
-            password_hint TEXT,
-            notification_status TEXT NOT NULL
-                CHECK (notification_status IN ('queued', 'suppressed_disabled')),
-            event_id TEXT,
-            completed_at TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (installation_id) REFERENCES installations(id) ON DELETE CASCADE,
-            FOREIGN KEY (event_id) REFERENCES client_notification_events(id) ON DELETE SET NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS email_delivery_batches (
-            id TEXT PRIMARY KEY,
-            notification_lane TEXT NOT NULL DEFAULT 'registration'
-                CHECK (notification_lane IN ('offline', 'registration')),
-            recipient TEXT NOT NULL,
-            recipient_priority INTEGER NOT NULL DEFAULT 0,
-            from_address TEXT NOT NULL,
-            reply_to TEXT,
-            subject TEXT NOT NULL,
-            html_body TEXT NOT NULL,
-            text_body TEXT NOT NULL DEFAULT '',
-            idempotency_key TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            not_before TEXT NOT NULL,
-            next_attempt_at TEXT,
-            claim_owner TEXT,
-            claim_expires_at TEXT,
-            provider_message_id TEXT,
-            error_message TEXT,
-            template_fingerprint TEXT NOT NULL,
-            delivery_kind TEXT NOT NULL DEFAULT 'lifecycle',
-            incident_key TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            sent_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS email_delivery_batch_items (
-            batch_id TEXT NOT NULL,
-            event_id TEXT NOT NULL,
-            recipient TEXT NOT NULL,
-            PRIMARY KEY (batch_id, event_id, recipient),
-            UNIQUE (event_id, recipient),
-            FOREIGN KEY (batch_id) REFERENCES email_delivery_batches(id) ON DELETE CASCADE,
-            FOREIGN KEY (event_id) REFERENCES client_notification_events(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS client_notification_runtime (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            enabled INTEGER NOT NULL DEFAULT 0,
-            enabled_since TEXT,
-            policy_fingerprint TEXT,
-            delivery_configured INTEGER NOT NULL DEFAULT 0,
-            template_fingerprint TEXT,
-            recipient_hourly_limit INTEGER NOT NULL DEFAULT 10,
-            global_hourly_limit INTEGER NOT NULL DEFAULT 50,
-            registration_recipient_hourly_limit INTEGER NOT NULL DEFAULT 3,
-            registration_global_hourly_limit INTEGER NOT NULL DEFAULT 10,
-            registration_overflow_active INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS client_registration_notification_overflow (
-            window_start TEXT PRIMARY KEY,
-            window_end TEXT NOT NULL,
-            event_count INTEGER NOT NULL DEFAULT 0,
-            first_occurred_at TEXT NOT NULL,
-            last_occurred_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'materialized')),
-            summary_event_id TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            email_normalized TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL DEFAULT 'active',
-            created_at TEXT NOT NULL,
-            last_login_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS email_login_challenges (
-            id TEXT PRIMARY KEY,
-            email_normalized TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            purpose TEXT NOT NULL,
-            code_hash TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            consumed_at TEXT,
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            resend_available_at TEXT NOT NULL,
-            created_ip TEXT,
-            created_user_agent TEXT,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS user_sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            access_token_hash TEXT NOT NULL UNIQUE,
-            refresh_token_hash TEXT NOT NULL UNIQUE,
-            access_expires_at TEXT NOT NULL,
-            refresh_expires_at TEXT NOT NULL,
-            revoked_at TEXT,
-            rotated_at TEXT,
-            created_at TEXT NOT NULL,
-            last_used_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS user_api_tokens (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            token_hash TEXT NOT NULL UNIQUE,
-            token_prefix TEXT NOT NULL,
-            token_plaintext TEXT,
-            scopes_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            last_used_at TEXT,
-            reset_at TEXT,
-            revoked_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS router_markets (
-            id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            subdomain TEXT NOT NULL UNIQUE,
-            public_base_url TEXT NOT NULL,
-            market_kind TEXT NOT NULL DEFAULT 'usage',
-            scopes_json TEXT NOT NULL DEFAULT '[\"market:shares:read\",\"market:proxy:use\",\"market:email:notify\"]',
-            pricing_json TEXT,
-            maintenance_enabled INTEGER NOT NULL DEFAULT 0,
-            maintenance_message TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
-            listed INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            offline_since TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS router_gateways (
-            id TEXT PRIMARY KEY,
-            owner_email TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            public_key TEXT NOT NULL UNIQUE,
-            public_base_url TEXT,
-            app_version TEXT,
-            scopes_json TEXT NOT NULL DEFAULT '[\"gateway:shares:read\",\"gateway:proxy:use\",\"gateway:feedback:write\",\"gateway:request_logs:write\"]',
-            status TEXT NOT NULL DEFAULT 'active',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS market_notification_emails (
-            id TEXT PRIMARY KEY,
-            market_email TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            to_email TEXT NOT NULL,
-            locale TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            provider_message_id TEXT,
-            status TEXT NOT NULL,
-            error_message TEXT,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS market_request_logs (
-            request_id TEXT PRIMARY KEY,
-            market_id TEXT NOT NULL,
-            market_email TEXT NOT NULL,
-            market_subdomain TEXT NOT NULL,
-            user_email TEXT,
-            api_key_prefix TEXT,
-            router_id TEXT,
-            share_id TEXT,
-            share_subdomain TEXT,
-            model TEXT,
-            request_agent TEXT NOT NULL DEFAULT '',
-            requested_model TEXT NOT NULL DEFAULT '',
-            actual_model TEXT NOT NULL DEFAULT '',
-            actual_model_source TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL,
-            status_code INTEGER,
-            error_message TEXT,
-            latency_ms INTEGER,
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-            usage_amount_usd TEXT,
-            created_at TEXT NOT NULL,
-            settled_at TEXT,
-            user_country TEXT,
-            user_country_iso3 TEXT,
-            synced_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_leases_installation_id ON leases(installation_id);
-        CREATE INDEX IF NOT EXISTS idx_registration_admission_source_time
-            ON registration_admission_events(source_scope, occurred_at_ms);
-        CREATE INDEX IF NOT EXISTS idx_registration_admission_time
-            ON registration_admission_events(occurred_at_ms);
-        CREATE INDEX IF NOT EXISTS idx_registration_geo_cache_cached
-            ON registration_geo_cache(status, cached_at_ms);
-        CREATE INDEX IF NOT EXISTS idx_registration_geo_cache_claim
-            ON registration_geo_cache(status, claim_expires_at_ms);
-        CREATE INDEX IF NOT EXISTS idx_installations_unowned
-            ON installations(owner_verified_at) WHERE owner_verified_at IS NULL;
-        CREATE INDEX IF NOT EXISTS idx_leases_subdomain ON leases(subdomain);
-        CREATE INDEX IF NOT EXISTS idx_installation_client_tunnels_owner ON installation_client_tunnels(owner_email, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_id ON share_request_logs(share_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_app_user_created
-            ON share_request_logs(share_id, app_type, user_email, created_at);
-        CREATE INDEX IF NOT EXISTS idx_share_request_logs_created_at ON share_request_logs(created_at);
-        CREATE INDEX IF NOT EXISTS idx_image_jobs_share_queued ON image_generation_jobs(share_id, queued_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_image_jobs_provider_queued ON image_generation_jobs(provider_id, queued_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_image_jobs_installation_queued ON image_generation_jobs(installation_id, queued_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_image_jobs_status_queued ON image_generation_jobs(status, queued_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_image_jobs_expires ON image_generation_jobs(expires_at);
-        CREATE INDEX IF NOT EXISTS idx_image_request_logs_share_created ON image_generation_request_logs(share_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_image_request_logs_provider_created ON image_generation_request_logs(provider_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_image_request_logs_status_created ON image_generation_request_logs(status, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_image_request_logs_created_at ON image_generation_request_logs(created_at);
-        CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_installation_health_checks ON installation_health_checks(installation_id, checked_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_share_health_checks_checked_at ON share_health_checks(checked_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_installation_health_checks_checked_at ON installation_health_checks(checked_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_share_model_health_checks_share ON share_model_health_checks(share_id, app_type, requested_model, checked_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_share_model_health_state_share ON share_model_health_state(share_id, app_type, last_status);
-        CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_installation_notification_presence
-            ON installation_notification_state(monitoring_enabled, presence_state, last_authenticated_seen_at);
-        CREATE INDEX IF NOT EXISTS idx_client_notification_events_pending
-            ON client_notification_events(status, not_before, occurred_at);
-        CREATE INDEX IF NOT EXISTS idx_client_notification_events_lane_pending
-            ON client_notification_events(status, kind, not_before, occurred_at, id);
-        CREATE INDEX IF NOT EXISTS idx_client_notification_events_installation_kind_status
-            ON client_notification_events(installation_id, kind, status);
-        CREATE INDEX IF NOT EXISTS idx_client_notification_events_storm
-            ON client_notification_events(status, occurred_at, kind, installation_id);
-        CREATE INDEX IF NOT EXISTS idx_installation_setup_completions_event
-            ON installation_setup_completions(event_id);
-        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_claim
-            ON email_delivery_batches(status, next_attempt_at, not_before, claim_expires_at);
-        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_send_cap
-            ON email_delivery_batches(status, sent_at);
-        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_claim_cap
-            ON email_delivery_batches(status, claim_expires_at);
-        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_send_cap
-            ON email_delivery_batches(LOWER(recipient), status, sent_at);
-        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_claim_cap
-            ON email_delivery_batches(LOWER(recipient), status, claim_expires_at);
-        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recent
-            ON email_delivery_batches(created_at DESC, id DESC);
-        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_retention
-            ON email_delivery_batches(updated_at, status);
-        CREATE INDEX IF NOT EXISTS idx_client_notification_events_retention
-            ON client_notification_events(updated_at, status);
-        CREATE INDEX IF NOT EXISTS idx_client_registration_notification_overflow_pending
-            ON client_registration_notification_overflow(status, window_end, window_start);
-        CREATE INDEX IF NOT EXISTS idx_dashboard_ux_events_created ON dashboard_ux_events(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_email_send_logs_created_at ON email_send_logs(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_request_nonces_created_at ON request_nonces(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_auth_challenges_email ON email_login_challenges(email_normalized, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_auth_challenges_installation ON email_login_challenges(installation_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_user_sessions_installation ON user_sessions(installation_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_router_markets_status ON router_markets(status, listed, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_router_markets_subdomain ON router_markets(subdomain);
-        CREATE INDEX IF NOT EXISTS idx_router_gateways_owner ON router_gateways(owner_email, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_router_gateways_status ON router_gateways(status, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_notification_emails_market_created ON market_notification_emails(market_email, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_notification_emails_to_created ON market_notification_emails(to_email, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_request_logs_market_created ON market_request_logs(market_email, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_created ON market_request_logs(share_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_agent_user_created
-            ON market_request_logs(share_id, request_agent, user_email, created_at);
-        CREATE INDEX IF NOT EXISTS idx_market_request_logs_created ON market_request_logs(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status);
-        CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_market_share ON market_share_runtime_states(market_email, share_id);
-        CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_expires ON market_share_runtime_states(expires_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_market_share_runtime_states_unique
-            ON market_share_runtime_states (
-                market_email,
-                share_id,
-                scope,
-                kind,
-                COALESCE(app_type, ''),
-                COALESCE(model_id, ''),
-                COALESCE(model_name, '')
-            );
-
-        CREATE TABLE IF NOT EXISTS board_messages (
-            id TEXT PRIMARY KEY,
-            author_kind TEXT NOT NULL,
-            author_user_id TEXT,
-            author_email TEXT,
-            author_label TEXT NOT NULL,
-            guest_id TEXT,
-            client_ip_hash TEXT,
-            body TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'visible',
-            pinned_at TEXT,
-            featured_at TEXT,
-            deleted_by TEXT,
-            deleted_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_board_msgs_created ON board_messages(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_board_msgs_pinned ON board_messages(pinned_at DESC) WHERE pinned_at IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_board_msgs_featured ON board_messages(featured_at DESC) WHERE featured_at IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_board_msgs_author_user ON board_messages(author_user_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_board_msgs_guest ON board_messages(guest_id, created_at DESC);
-
-        CREATE TABLE IF NOT EXISTS board_rate_limit (
-            scope TEXT NOT NULL,
-            bucket_start INTEGER NOT NULL,
-            count INTEGER NOT NULL,
-            PRIMARY KEY (scope, bucket_start)
-        );
-        CREATE INDEX IF NOT EXISTS idx_board_rate_bucket ON board_rate_limit(bucket_start DESC);
-
-        CREATE TABLE IF NOT EXISTS admin_audit_log (
-            id TEXT PRIMARY KEY,
-            actor_email TEXT,
-            action TEXT NOT NULL,
-            payload_json TEXT,
-            ip TEXT,
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_log(created_at DESC);
-
-        CREATE TABLE IF NOT EXISTS router_map_display_settings (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            settings_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS router_announcement_settings (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            settings_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        ",
-    )
-    .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
-    crate::usage_account::init_schema(conn)?;
-    add_column_if_missing(
-        conn,
-        "leases",
-        "protocol_epoch",
-        "TEXT NOT NULL DEFAULT 'namespace-flat-1'",
-    )?;
-    add_column_if_missing(
-        conn,
-        "installation_setup_completions",
-        "source",
-        "TEXT NOT NULL DEFAULT 'explicit' CHECK (source IN ('explicit', 'legacy_fallback'))",
-    )?;
-    add_column_if_missing(conn, "leases", "router_id", "TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(conn, "leases", "route_id", "TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(conn, "leases", "rotation_id", "TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(conn, "leases", "generation", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(
-        conn,
-        "leases",
-        "expected_generation",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(conn, "leases", "state", "TEXT NOT NULL DEFAULT 'issued'")?;
-    add_column_if_missing(conn, "leases", "ready_at", "TEXT")?;
-    add_column_if_missing(conn, "leases", "activated_at", "TEXT")?;
-    add_column_if_missing(conn, "leases", "retired_at", "TEXT")?;
-    add_column_if_missing(conn, "share_request_logs", "quota_tokens", "INTEGER")?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_app_user_created
-         ON share_request_logs(share_id, app_type, user_email, created_at)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("index Share user quota logs failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_agent_user_created
-         ON market_request_logs(share_id, request_agent, user_email, created_at)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("index Market user quota logs failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_leases_route_generation
-         ON leases(route_id, generation)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("index lease generations failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_leases_rotation
-         ON leases(route_id, rotation_id)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("index lease rotations failed: {e}")))?;
-    conn.execute(
-        "UPDATE router_markets
-            SET scopes_json = '[\"market:shares:read\",\"market:proxy:use\",\"market:email:notify\",\"market:request_logs:write\"]'
-          WHERE scopes_json = '[]'",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("backfill empty market scopes failed: {e}")))?;
-    conn.execute(
-        "UPDATE router_markets
-            SET scopes_json = replace(scopes_json, ']', ',\"market:request_logs:write\"]')
-          WHERE instr(scopes_json, 'market:request_logs:write') = 0",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("backfill market request log scope failed: {e}")))?;
-    conn.execute(
-        "UPDATE router_markets
-            SET scopes_json = replace(scopes_json, ']', ',\"market:share_states:write\"]')
-          WHERE instr(scopes_json, 'market:share_states:write') = 0",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("backfill market share state scope failed: {e}")))?;
-    conn.execute(
-        "UPDATE router_markets
-            SET scopes_json = replace(scopes_json, ']', ',\"market:share_states:release\"]')
-          WHERE instr(scopes_json, 'market:share_states:release') = 0",
-        [],
-    )
-    .map_err(|e| {
-        AppError::Internal(format!(
-            "backfill market share state release scope failed: {e}"
-        ))
-    })?;
-    let columns = conn
-        .prepare("PRAGMA table_info(installations)")
-        .and_then(|mut stmt| {
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|e| AppError::Internal(format!("inspect installations schema failed: {e}")))?;
-    if !columns.iter().any(|name| name == "last_seen_ip") {
-        conn.execute("ALTER TABLE installations ADD COLUMN last_seen_ip TEXT", [])
-            .map_err(|e| {
-                AppError::Internal(format!("add installations last_seen_ip failed: {e}"))
-            })?;
-    }
-    if !columns.iter().any(|name| name == "owner_email") {
-        conn.execute("ALTER TABLE installations ADD COLUMN owner_email TEXT", [])
-            .map_err(|e| {
-                AppError::Internal(format!("add installations owner_email failed: {e}"))
-            })?;
-    }
-    if !columns.iter().any(|name| name == "owner_verified_at") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN owner_verified_at TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("add installations owner_verified_at failed: {e}"))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "country_code") {
-        conn.execute("ALTER TABLE installations ADD COLUMN country_code TEXT", [])
-            .map_err(|e| {
-                AppError::Internal(format!("add installations country_code failed: {e}"))
-            })?;
-    }
-    if !columns.iter().any(|name| name == "country") {
-        conn.execute("ALTER TABLE installations ADD COLUMN country TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations country failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "region") {
-        conn.execute("ALTER TABLE installations ADD COLUMN region TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations region failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "city") {
-        conn.execute("ALTER TABLE installations ADD COLUMN city TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations city failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "latitude") {
-        conn.execute("ALTER TABLE installations ADD COLUMN latitude REAL", [])
-            .map_err(|e| AppError::Internal(format!("add installations latitude failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "longitude") {
-        conn.execute("ALTER TABLE installations ADD COLUMN longitude REAL", [])
-            .map_err(|e| AppError::Internal(format!("add installations longitude failed: {e}")))?;
-    }
-    if !columns
-        .iter()
-        .any(|name| name == "geo_candidate_country_code")
-    {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_country_code TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add installations geo_candidate_country_code failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "geo_candidate_country") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_country TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add installations geo_candidate_country failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "geo_candidate_region") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_region TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add installations geo_candidate_region failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "geo_candidate_city") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_city TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("add installations geo_candidate_city failed: {e}"))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "geo_candidate_latitude") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_latitude REAL",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add installations geo_candidate_latitude failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "geo_candidate_longitude") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_longitude REAL",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add installations geo_candidate_longitude failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "geo_candidate_hits") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_hits INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("add installations geo_candidate_hits failed: {e}"))
-        })?;
-    }
-    if !columns
-        .iter()
-        .any(|name| name == "geo_candidate_first_seen_at")
-    {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_candidate_first_seen_at TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add installations geo_candidate_first_seen_at failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "geo_last_changed_at") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN geo_last_changed_at TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("add installations geo_last_changed_at failed: {e}"))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "control_secret_b64") {
-        conn.execute(
-            "ALTER TABLE installations ADD COLUMN control_secret_b64 TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("add installations control_secret_b64 failed: {e}"))
-        })?;
-    }
-    add_column_if_missing(
-        conn,
-        "installations",
-        "delegate_upgrade_to_router_owner",
-        "INTEGER",
-    )?;
-    add_column_if_missing(conn, "installations", "app_commit_id", "TEXT")?;
-    add_column_if_missing(conn, "installations", "update_available", "INTEGER")?;
-    add_column_if_missing(conn, "installations", "upgrade_capable", "INTEGER")?;
-    add_column_if_missing(conn, "installations", "status_reported_at", "TEXT")?;
-    add_column_if_missing(conn, "installations", "public_ip", "TEXT")?;
-    let columns = conn
-        .prepare("PRAGMA table_info(shares)")
-        .and_then(|mut stmt| {
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|e| AppError::Internal(format!("inspect shares schema failed: {e}")))?;
-    if !columns.iter().any(|name| name == "subdomain") {
-        conn.execute("ALTER TABLE shares ADD COLUMN subdomain TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add shares subdomain failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "description") {
-        conn.execute("ALTER TABLE shares ADD COLUMN description TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add shares description failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "owner_email") {
-        conn.execute("ALTER TABLE shares ADD COLUMN owner_email TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add shares owner_email failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "shared_with_emails_json") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN shared_with_emails_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("add shares shared_with_emails_json failed: {e}"))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "user_grants_json") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN user_grants_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares user_grants_json failed: {e}")))?;
-    }
-    if !columns
-        .iter()
-        .any(|name| name == "supported_user_token_periods_json")
-    {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN supported_user_token_periods_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add shares supported_user_token_periods_json failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "market_access_mode") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN market_access_mode TEXT NOT NULL DEFAULT 'selected'",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares market_access_mode failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "access_by_app_json") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN access_by_app_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares access_by_app_json failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "app_settings_json") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN app_settings_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares app_settings_json failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "for_sale") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN for_sale TEXT NOT NULL DEFAULT 'No'",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares for_sale failed: {e}")))?;
-    }
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS email_send_logs (
-            id TEXT PRIMARY KEY,
-            email_type TEXT NOT NULL,
-            to_email TEXT NOT NULL,
-            provider_message_id TEXT,
-            status TEXT NOT NULL,
-            error_message TEXT,
-            created_at TEXT NOT NULL
-        )",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create email_send_logs table failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_email_send_logs_created_at ON email_send_logs(created_at DESC)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create email_send_logs index failed: {e}")))?;
-    if !columns.iter().any(|name| name == "enabled_claude") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN enabled_claude INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares enabled_claude failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "enabled_codex") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN enabled_codex INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares enabled_codex failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "enabled_gemini") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN enabled_gemini INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares enabled_gemini failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "upstream_provider_json") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN upstream_provider_json TEXT",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("add shares upstream_provider_json failed: {e}"))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "app_runtimes_json") {
-        conn.execute("ALTER TABLE shares ADD COLUMN app_runtimes_json TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add shares app_runtimes_json failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "app_providers_json") {
-        conn.execute("ALTER TABLE shares ADD COLUMN app_providers_json TEXT", [])
-            .map_err(|e| {
-                AppError::Internal(format!("add shares app_providers_json failed: {e}"))
-            })?;
-    }
-    if !columns.iter().any(|name| name == "bindings_json") {
-        // Share 的 app/provider 绑定快照。新写入严格要求 1..=3 个 binding；该列保留
-        // nullable 仅用于 SQLite schema 的增量建表过程。
-        conn.execute("ALTER TABLE shares ADD COLUMN bindings_json TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add shares bindings_json failed: {e}")))?;
-    }
-    if !columns
-        .iter()
-        .any(|name| name == "for_sale_official_price_percent_by_app_json")
-    {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN for_sale_official_price_percent_by_app_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "add shares for_sale_official_price_percent_by_app_json failed: {e}"
-            ))
-        })?;
-    }
-    if !columns.iter().any(|name| name == "parallel_limit") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN parallel_limit INTEGER NOT NULL DEFAULT 3",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares parallel_limit failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "runtime_refreshed_at") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN runtime_refreshed_at TEXT",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares runtime_refreshed_at failed: {e}")))?;
-    }
-    if !columns.iter().any(|name| name == "config_revision") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares config_revision failed: {e}")))?;
-    }
-    // share_token 已废弃：caller 身份在 router 边界由 user_api_token + email ACL 校验，
-    // tunnel→client 用 X-CC-Switch-Share-Id 识别 share。该列对老库可能仍然存在 + 带
-    // NOT NULL 约束，新 INSERT 会因此报错，需要 DROP 掉。
-    if columns.iter().any(|name| name == "share_token") {
-        // 索引必须先删；不然 SQLite 拒绝 DROP COLUMN。
-        let _ = conn.execute("DROP INDEX IF EXISTS idx_shares_token", []);
-        conn.execute("ALTER TABLE shares DROP COLUMN share_token", [])
-            .map_err(|e| AppError::Internal(format!("drop shares.share_token failed: {e}")))?;
-    }
-    add_column_if_missing(conn, "share_edit_requests", "retired_at", "TEXT")?;
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create subdomain unique index failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_share_edit_requests_share_status ON share_edit_requests(share_id, status, revision DESC)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create share edit status index failed: {e}")))?;
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_edit_requests_pending_unique ON share_edit_requests(share_id) WHERE status = 'pending'",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create pending share edit unique index failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_market_disabled_shares_share ON market_disabled_shares(share_id)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create market disabled share index failed: {e}")))?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS market_share_model_failure_state (
-            market_email TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            requested_model TEXT NOT NULL,
-            actual_model TEXT NOT NULL DEFAULT '',
-            last_status TEXT NOT NULL,
-            last_success_at INTEGER,
-            last_failed_at INTEGER,
-            last_checked_at INTEGER NOT NULL,
-            recent_results_json TEXT NOT NULL DEFAULT '[]',
-            error_message TEXT,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (market_email, share_id, app_type, requested_model)
-        )",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create market failure state table failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create market failure state index failed: {e}")))?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "request_agent",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "requested_model",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "actual_model",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "actual_model_source",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "requested_reasoning_effort",
-        "TEXT",
-    )?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "effective_reasoning_effort",
-        "TEXT",
-    )?;
-    add_column_if_missing(conn, "share_request_logs", "client_service_tier", "TEXT")?;
-    add_column_if_missing(conn, "share_request_logs", "effective_service_tier", "TEXT")?;
-    add_column_if_missing(conn, "share_request_logs", "service_tier_decision", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "usage_state",
-        "TEXT NOT NULL DEFAULT 'observed'",
-    )?;
-    add_column_if_missing(conn, "share_request_logs", "stream_status", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "usage_revision",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(conn, "share_request_logs", "user_country", "TEXT")?;
-    add_column_if_missing(conn, "share_request_logs", "user_country_iso3", "TEXT")?;
-    add_column_if_missing(conn, "share_request_logs", "user_email", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "share_request_logs",
-        "is_health_check",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    for table in ["share_health_checks", "installation_health_checks"] {
-        add_column_if_missing(conn, table, "status", "TEXT NOT NULL DEFAULT 'unknown'")?;
-        add_column_if_missing(conn, table, "reason", "TEXT")?;
-        add_column_if_missing(
-            conn,
-            table,
-            "router_epoch",
-            "TEXT NOT NULL DEFAULT 'legacy'",
-        )?;
-        conn.execute(
-            &format!(
-                "UPDATE {table}
-                 SET status = CASE WHEN is_healthy = 1 THEN 'healthy' ELSE 'unhealthy' END,
-                     reason = COALESCE(reason, 'legacy_probe')
-                 WHERE router_epoch = 'legacy' AND status = 'unknown'"
-            ),
-            [],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "backfill {table} observation status failed: {error}"
-            ))
-        })?;
-    }
-    add_column_if_missing(
-        conn,
-        "market_request_logs",
-        "request_agent",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "market_request_logs",
-        "requested_model",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "market_request_logs",
-        "actual_model",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "market_request_logs",
-        "actual_model_source",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(conn, "user_api_tokens", "token_plaintext", "TEXT")?;
-    add_column_if_missing(conn, "user_sessions", "rotated_at", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "email_delivery_batches",
-        "recipient_priority",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(
-        conn,
-        "email_delivery_batches",
-        "notification_lane",
-        "TEXT NOT NULL DEFAULT 'registration' CHECK (notification_lane IN ('offline', 'registration'))",
-    )?;
-    conn.execute(
-        "UPDATE email_delivery_batches
-         SET notification_lane = CASE
-             WHEN EXISTS (
-                 SELECT 1
-                 FROM email_delivery_batch_items bi
-                 INNER JOIN client_notification_events e ON e.id = bi.event_id
-                 WHERE bi.batch_id = email_delivery_batches.id
-                   AND e.kind = 'client_offline'
-             ) THEN 'offline'
-             ELSE 'registration'
-         END",
-        [],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!(
-            "backfill notification delivery lanes failed: {error}"
-        ))
-    })?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_priority_claim
-         ON email_delivery_batches(
-             notification_lane, recipient_priority, status, next_attempt_at, not_before,
-             claim_expires_at
-         )",
-        [],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!(
-            "create prioritized notification claim index failed: {error}"
-        ))
-    })?;
-    add_column_if_missing(
-        conn,
-        "email_delivery_batches",
-        "from_address",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(conn, "email_delivery_batches", "reply_to", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "email_delivery_batches",
-        "text_body",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "email_delivery_batches",
-        "delivery_kind",
-        "TEXT NOT NULL DEFAULT 'lifecycle'",
-    )?;
-    add_column_if_missing(conn, "email_delivery_batches", "incident_key", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "client_notification_runtime",
-        "recipient_hourly_limit",
-        "INTEGER NOT NULL DEFAULT 10",
-    )?;
-    add_column_if_missing(
-        conn,
-        "client_notification_runtime",
-        "global_hourly_limit",
-        "INTEGER NOT NULL DEFAULT 50",
-    )?;
-    add_column_if_missing(
-        conn,
-        "client_notification_runtime",
-        "registration_recipient_hourly_limit",
-        "INTEGER NOT NULL DEFAULT 3",
-    )?;
-    add_column_if_missing(
-        conn,
-        "client_notification_runtime",
-        "registration_global_hourly_limit",
-        "INTEGER NOT NULL DEFAULT 10",
-    )?;
-    add_column_if_missing(
-        conn,
-        "client_notification_runtime",
-        "registration_overflow_active",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_client_notification_events_lane_pending
-             ON client_notification_events(status, kind, not_before, occurred_at, id);
-         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_lane_claim
-             ON email_delivery_batches(
-                 notification_lane, status, next_attempt_at, not_before,
-                 claim_expires_at, recipient_priority, created_at, id
-             );
-         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_lane_send_cap
-             ON email_delivery_batches(notification_lane, status, sent_at);
-         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_lane_claim_cap
-             ON email_delivery_batches(notification_lane, status, claim_expires_at);
-         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_lane_send_cap
-             ON email_delivery_batches(
-                 LOWER(recipient), notification_lane, status, sent_at
-             );
-         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_lane_claim_cap
-             ON email_delivery_batches(
-                 LOWER(recipient), notification_lane, status, claim_expires_at
-             );
-         CREATE INDEX IF NOT EXISTS idx_client_registration_notification_overflow_pending
-             ON client_registration_notification_overflow(status, window_end, window_start);",
-    )
-    .map_err(|error| {
-        AppError::Internal(format!("create notification lane indexes failed: {error}"))
-    })?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_incident
-         ON email_delivery_batches(recipient, incident_key, created_at DESC)",
-        [],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!(
-            "create notification incident index failed: {error}"
-        ))
-    })?;
-    add_column_if_missing(conn, "market_request_logs", "error_message", "TEXT")?;
-    add_column_if_missing(conn, "market_request_logs", "user_country", "TEXT")?;
-    add_column_if_missing(conn, "market_request_logs", "user_country_iso3", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "image_generation_request_logs",
-        "result_storage_key",
-        "TEXT",
-    )?;
-    add_column_if_missing(
-        conn,
-        "image_generation_request_logs",
-        "result_access_token",
-        "TEXT",
-    )?;
-    add_column_if_missing(
-        conn,
-        "router_markets",
-        "market_kind",
-        "TEXT NOT NULL DEFAULT 'usage'",
-    )?;
-    add_column_if_missing(conn, "router_markets", "pricing_json", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "router_markets",
-        "maintenance_enabled",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(conn, "router_markets", "maintenance_message", "TEXT")?;
-    add_column_if_missing(conn, "installations", "provision_source", "TEXT")?;
-    add_column_if_missing(conn, "installations", "provision_host_id", "TEXT")?;
-    conn.execute(
-        "UPDATE installations
-         SET owner_email = (
-                 SELECT s.owner_email
-                 FROM shares s
-                 WHERE s.installation_id = installations.id
-                   AND s.owner_email IS NOT NULL
-                   AND s.owner_email != ''
-                 ORDER BY s.created_at DESC
-                 LIMIT 1
-             ),
-             owner_verified_at = COALESCE(owner_verified_at, last_seen_at)
-         WHERE (owner_email IS NULL OR owner_email = '')
-           AND EXISTS (
-                 SELECT 1
-                 FROM shares s
-                 WHERE s.installation_id = installations.id
-                   AND s.owner_email IS NOT NULL
-                   AND s.owner_email != ''
-             )",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("backfill installation owner email failed: {e}")))?;
-    client_chat::init_schema(conn)?;
-    crate::market_billing::init_schema(conn).map_err(|error| {
-        AppError::Internal(format!("initialize Market billing schema failed: {error}"))
-    })?;
-    conn.execute(
-        "INSERT OR IGNORE INTO installation_notification_state (
-            installation_id, registration_state, monitoring_enabled, presence_state,
-            created_at, updated_at
-         )
-         SELECT id, 'baseline', 0, 'unknown', created_at, last_seen_at
-         FROM installations",
-        [],
-    )
-    .map_err(|e| {
-        AppError::Internal(format!(
-            "baseline existing installation notification state failed: {e}"
-        ))
-    })?;
-    ensure_installation_public_key_uniqueness(conn)?;
-    Ok(())
-}
-
-fn ensure_installation_public_key_uniqueness(conn: &Connection) -> Result<(), AppError> {
-    let duplicates = conn
-        .prepare(
-            "SELECT public_key, GROUP_CONCAT(id, ',')
-             FROM installations
-             GROUP BY public_key
-             HAVING COUNT(*) > 1
-             ORDER BY public_key",
-        )
-        .and_then(|mut statement| {
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "inspect duplicate installation keys failed: {error}"
-            ))
-        })?;
-    if !duplicates.is_empty() {
-        let conflicts = duplicates
-            .into_iter()
-            .map(|(key, ids)| format!("{} => [{}]", client_identity_hash(&key), ids))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(AppError::Internal(format!(
-            "duplicate installation public keys require explicit data consolidation before migration: {conflicts}"
-        )));
-    }
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_installations_public_key_unique
-         ON installations(public_key)",
-        [],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!(
-            "create installation public key unique index failed: {error}"
-        ))
-    })?;
-    Ok(())
-}
-
 fn initialize_client_notification_runtime(
     conn: &Connection,
     policy: &ClientNotificationPolicy,
@@ -14810,9 +13237,9 @@ fn load_pending_notification_events(
             |row| {
                 let snapshot_json = row.get::<_, String>(4)?;
                 let snapshot = serde_json::from_str(&snapshot_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
+                    crate::db::Error::FromSqlConversionFailure(
                         4,
-                        rusqlite::types::Type::Text,
+                        crate::db::types::Type::Text,
                         Box::new(error),
                     )
                 })?;
@@ -15583,30 +14010,6 @@ fn enqueue_client_offline_chat_event_tx(
     )
 }
 
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<(), AppError> {
-    let sql = format!("PRAGMA table_info({table})");
-    let columns = conn
-        .prepare(&sql)
-        .and_then(|mut stmt| {
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|e| AppError::Internal(format!("inspect {table} schema failed: {e}")))?;
-    if !columns.iter().any(|name| name == column) {
-        conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add {table}.{column} failed: {e}")))?;
-    }
-    Ok(())
-}
-
 fn normalize_reported_public_ipv4(value: &str) -> Option<String> {
     value
         .parse::<std::net::Ipv4Addr>()
@@ -15636,7 +14039,7 @@ const INSTALLATION_SELECT_COLUMNS: &str = "id, public_key, platform, app_version
                 geo_last_changed_at, created_at, last_seen_at,
                 delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip, provision_source";
 
-fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installation> {
+fn map_installation_row(row: &crate::db::Row<'_>) -> crate::db::Result<Installation> {
     Ok(Installation {
         id: row.get(0)?,
         public_key: row.get(1)?,
@@ -15648,9 +14051,9 @@ fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installatio
             .map(|value| parse_dt_sql(&value))
             .transpose()
             .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
+                crate::db::Error::FromSqlConversionFailure(
                     5,
-                    rusqlite::types::Type::Text,
+                    crate::db::types::Type::Text,
                     Box::new(error),
                 )
             })?,
@@ -15673,9 +14076,9 @@ fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installatio
             .map(|value| parse_dt_sql(&value))
             .transpose()
             .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
+                crate::db::Error::FromSqlConversionFailure(
                     20,
-                    rusqlite::types::Type::Text,
+                    crate::db::types::Type::Text,
                     Box::new(error),
                 )
             })?,
@@ -15684,23 +14087,23 @@ fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installatio
             .map(|value| parse_dt_sql(&value))
             .transpose()
             .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
+                crate::db::Error::FromSqlConversionFailure(
                     21,
-                    rusqlite::types::Type::Text,
+                    crate::db::types::Type::Text,
                     Box::new(error),
                 )
             })?,
         created_at: parse_dt_sql(&row.get::<_, String>(22)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
+            crate::db::Error::FromSqlConversionFailure(
                 22,
-                rusqlite::types::Type::Text,
+                crate::db::types::Type::Text,
                 Box::new(error),
             )
         })?,
         last_seen_at: parse_dt_sql(&row.get::<_, String>(23)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
+            crate::db::Error::FromSqlConversionFailure(
                 23,
-                rusqlite::types::Type::Text,
+                crate::db::types::Type::Text,
                 Box::new(error),
             )
         })?,
@@ -15713,9 +14116,9 @@ fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installatio
             .map(|value| parse_dt_sql(&value))
             .transpose()
             .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
+                crate::db::Error::FromSqlConversionFailure(
                     28,
-                    rusqlite::types::Type::Text,
+                    crate::db::types::Type::Text,
                     Box::new(error),
                 )
             })?,
@@ -16488,41 +14891,6 @@ mod token_period_window_tests {
     }
 
     #[test]
-    fn quota_schema_migration_is_idempotent_for_existing_databases() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn.execute(
-            "ALTER TABLE share_request_logs DROP COLUMN quota_tokens",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "ALTER TABLE shares DROP COLUMN supported_user_token_periods_json",
-            [],
-        )
-        .unwrap();
-
-        init_schema(&conn).unwrap();
-        init_schema(&conn).unwrap();
-
-        let columns = |table: &str| {
-            conn.prepare(&format!("PRAGMA table_info({table})"))
-                .unwrap()
-                .query_map([], |row| row.get::<_, String>(1))
-                .unwrap()
-                .collect::<Result<HashSet<_>, _>>()
-                .unwrap()
-        };
-        assert!(columns("share_request_logs").contains("quota_tokens"));
-        assert!(columns("share_request_logs").contains("usage_state"));
-        assert!(columns("share_request_logs").contains("stream_status"));
-        assert!(columns("share_request_logs").contains("usage_revision"));
-        assert!(columns("share_request_logs").contains("requested_reasoning_effort"));
-        assert!(columns("share_request_logs").contains("effective_service_tier"));
-        assert!(columns("shares").contains("supported_user_token_periods_json"));
-    }
-
-    #[test]
     fn missing_or_invalid_capability_uses_legacy_periods() {
         let legacy = legacy_supported_user_token_periods();
         assert_eq!(parse_supported_user_token_periods("[]"), legacy);
@@ -16649,20 +15017,20 @@ fn query_share_email_token_totals_for_windows(
     }
     let mut values_sql = Vec::with_capacity(windows.len());
     let mut values = vec![
-        rusqlite::types::Value::Text(share_id.to_string()),
-        rusqlite::types::Value::Text(app.to_string()),
+        crate::db::types::Value::Text(share_id.to_string()),
+        crate::db::types::Value::Text(app.to_string()),
     ];
     for (index, window) in windows.iter().enumerate() {
         let base = 3 + index * 3;
         values_sql.push(format!("(?{base}, ?{}, ?{})", base + 1, base + 2));
-        values.push(rusqlite::types::Value::Text(window.key.clone()));
+        values.push(crate::db::types::Value::Text(window.key.clone()));
         values.push(match window.start {
-            Some(start) => rusqlite::types::Value::Integer(start.timestamp()),
-            None => rusqlite::types::Value::Null,
+            Some(start) => crate::db::types::Value::Integer(start.timestamp()),
+            None => crate::db::types::Value::Null,
         });
         values.push(match window.end {
-            Some(end) => rusqlite::types::Value::Integer(end.timestamp()),
-            None => rusqlite::types::Value::Null,
+            Some(end) => crate::db::types::Value::Integer(end.timestamp()),
+            None => crate::db::types::Value::Null,
         });
     }
 
@@ -16933,10 +15301,10 @@ fn next_share_edit_revision(conn: &Connection, share_id: &str) -> Result<i64, Ap
     .map_err(|e| AppError::Internal(format!("query next share edit revision failed: {e}")))
 }
 
-fn share_edit_from_row(row: &rusqlite::Row<'_>) -> Result<ShareEditView, rusqlite::Error> {
+fn share_edit_from_row(row: &crate::db::Row<'_>) -> Result<ShareEditView, crate::db::Error> {
     let patch_json: String = row.get(5)?;
     let patch = serde_json::from_str::<ShareSettingsPatch>(&patch_json).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(5, crate::db::types::Type::Text, Box::new(err))
     })?;
     let created_at = parse_rfc3339_row(row.get::<_, String>(7)?, 7)?;
     let updated_at = parse_rfc3339_row(row.get::<_, String>(8)?, 8)?;
@@ -16959,13 +15327,13 @@ fn share_edit_from_row(row: &rusqlite::Row<'_>) -> Result<ShareEditView, rusqlit
     })
 }
 
-fn parse_rfc3339_row(value: String, index: usize) -> Result<DateTime<Utc>, rusqlite::Error> {
+fn parse_rfc3339_row(value: String, index: usize) -> Result<DateTime<Utc>, crate::db::Error> {
     DateTime::parse_from_rfc3339(&value)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
+            crate::db::Error::FromSqlConversionFailure(
                 index,
-                rusqlite::types::Type::Text,
+                crate::db::types::Type::Text,
                 Box::new(err),
             )
         })
@@ -17668,7 +16036,7 @@ fn normalize_usage_email(value: &str) -> Option<String> {
 
 fn parse_upstream_provider(
     value: Option<String>,
-) -> Result<Option<ShareUpstreamProvider>, rusqlite::Error> {
+) -> Result<Option<ShareUpstreamProvider>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -17676,11 +16044,11 @@ fn parse_upstream_provider(
         return Ok(None);
     }
     serde_json::from_str(&value).map(Some).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
-fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlite::Error> {
+fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, crate::db::Error> {
     let Some(value) = value else {
         return Ok(ShareAppRuntimes::default());
     };
@@ -17688,7 +16056,7 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
         return Ok(ShareAppRuntimes::default());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
@@ -17696,7 +16064,7 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
 /// 空字符串 / NULL 只作为数据库读取的防御性兜底；新写入不会产生空 binding。
 fn parse_share_bindings(
     value: Option<String>,
-) -> Result<BTreeMap<String, String>, rusqlite::Error> {
+) -> Result<BTreeMap<String, String>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -17704,13 +16072,13 @@ fn parse_share_bindings(
         return Ok(BTreeMap::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
 fn parse_share_access_by_app(
     value: Option<String>,
-) -> Result<BTreeMap<String, ShareAppAccess>, rusqlite::Error> {
+) -> Result<BTreeMap<String, ShareAppAccess>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -17718,13 +16086,13 @@ fn parse_share_access_by_app(
         return Ok(BTreeMap::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
 fn parse_share_app_settings(
     value: Option<String>,
-) -> Result<BTreeMap<String, ShareAppSettings>, rusqlite::Error> {
+) -> Result<BTreeMap<String, ShareAppSettings>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -17732,13 +16100,13 @@ fn parse_share_app_settings(
         return Ok(BTreeMap::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
 fn parse_share_official_price_percent_by_app(
     value: Option<String>,
-) -> Result<BTreeMap<String, u16>, rusqlite::Error> {
+) -> Result<BTreeMap<String, u16>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -17746,13 +16114,13 @@ fn parse_share_official_price_percent_by_app(
         return Ok(BTreeMap::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
 fn parse_share_user_grants(
     value: Option<String>,
-) -> Result<BTreeMap<String, ShareUserGrant>, rusqlite::Error> {
+) -> Result<BTreeMap<String, ShareUserGrant>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -17760,7 +16128,7 @@ fn parse_share_user_grants(
         return Ok(BTreeMap::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
@@ -17808,7 +16176,7 @@ fn effective_share_app_settings(share: &ShareDescriptor) -> BTreeMap<String, Sha
     out
 }
 
-fn parse_app_providers(value: Option<String>) -> Result<ShareAppProviders, rusqlite::Error> {
+fn parse_app_providers(value: Option<String>) -> Result<ShareAppProviders, crate::db::Error> {
     let Some(value) = value else {
         return Ok(ShareAppProviders::default());
     };
@@ -17816,11 +16184,11 @@ fn parse_app_providers(value: Option<String>) -> Result<ShareAppProviders, rusql
         return Ok(ShareAppProviders::default());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
-fn parse_json_value(value: Option<String>) -> Result<Option<serde_json::Value>, rusqlite::Error> {
+fn parse_json_value(value: Option<String>) -> Result<Option<serde_json::Value>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -17828,7 +16196,7 @@ fn parse_json_value(value: Option<String>) -> Result<Option<serde_json::Value>, 
         return Ok(None);
     }
     serde_json::from_str(&value).map(Some).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
@@ -18150,12 +16518,12 @@ fn recent_model_health_results(
     collect_rows(rows)
 }
 
-fn parse_recent_results(value: String) -> Result<Vec<String>, rusqlite::Error> {
+fn parse_recent_results(value: String) -> Result<Vec<String>, crate::db::Error> {
     if value.trim().is_empty() {
         return Ok(Vec::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
@@ -19385,7 +17753,7 @@ fn list_recent_share_request_logs(
     Ok(deduplicate_recent_share_request_logs(logs))
 }
 
-fn map_share_request_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRequestLogEntry> {
+fn map_share_request_log_row(row: &crate::db::Row<'_>) -> crate::db::Result<ShareRequestLogEntry> {
     Ok(ShareRequestLogEntry {
         request_id: row.get(0)?,
         share_id: row.get(1)?,
@@ -19463,7 +17831,7 @@ fn market_log_total_tokens_expr(alias: &str) -> String {
 
 fn map_image_generation_request_log_row(
     row: &Row<'_>,
-) -> Result<ImageGenerationRequestLogEntry, rusqlite::Error> {
+) -> Result<ImageGenerationRequestLogEntry, crate::db::Error> {
     Ok(ImageGenerationRequestLogEntry {
         request_id: row.get(0)?,
         share_id: row.get(1)?,
@@ -20478,7 +18846,7 @@ fn list_online_minutes_10m(conn: &Connection) -> Result<HashMap<String, usize>, 
     Ok(map)
 }
 
-fn map_lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelLease> {
+fn map_lease_row(row: &crate::db::Row<'_>) -> crate::db::Result<TunnelLease> {
     let share_json: Option<String> = row.get(16)?;
     Ok(TunnelLease {
         protocol_epoch: row.get(0)?,
@@ -20504,25 +18872,25 @@ fn map_lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelLease> {
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
+                crate::db::Error::FromSqlConversionFailure(
                     16,
-                    rusqlite::types::Type::Text,
+                    crate::db::types::Type::Text,
                     Box::new(e),
                 )
             })?,
     })
 }
 
-fn parse_dt_sql(value: &str) -> rusqlite::Result<DateTime<Utc>> {
+fn parse_dt_sql(value: &str) -> crate::db::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+            crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(e))
         })
 }
 
 fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+    rows: crate::db::MappedRows<'_, impl FnMut(&crate::db::Row<'_>) -> crate::db::Result<T>>,
 ) -> Result<Vec<T>, AppError> {
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| AppError::Internal(format!("collect rows failed: {e}")))
@@ -20546,24 +18914,6 @@ fn normalize_subdomain(value: &str) -> Result<String, AppError> {
         return Err(AppError::BadRequest("invalid subdomain".into()));
     }
     Ok(value)
-}
-
-fn map_client_market_schema_error(
-    error: crate::client_market::ClientMarketSchemaError,
-) -> AppError {
-    AppError::Internal(error.to_string())
-}
-
-fn map_public_host_error(error: crate::public_hosts::PublicHostCatalogError) -> AppError {
-    use crate::public_hosts::PublicHostCatalogError;
-    match error {
-        PublicHostCatalogError::Invalid(message) => AppError::BadRequest(message.into()),
-        PublicHostCatalogError::Conflict(message) => AppError::Conflict(message),
-        PublicHostCatalogError::Corrupt(message) => AppError::Internal(message),
-        PublicHostCatalogError::Database(error) => {
-            AppError::Internal(format!("public host catalog database error: {error}"))
-        }
-    }
 }
 
 fn normalize_market_kind(value: Option<&str>) -> Result<String, AppError> {
@@ -20698,7 +19048,7 @@ fn get_gateway_by_public_key(
     .map_err(|e| AppError::Internal(format!("query gateway by public key failed: {e}")))
 }
 
-fn gateway_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GatewayRegistryRecord> {
+fn gateway_record_from_row(row: &crate::db::Row<'_>) -> crate::db::Result<GatewayRegistryRecord> {
     Ok(GatewayRegistryRecord {
         id: row.get(0)?,
         owner_email: row.get(1)?,
@@ -21498,7 +19848,7 @@ fn release_reclaimable_subdomain_claim(
     Ok(())
 }
 
-fn map_share_constraint_error(err: rusqlite::Error) -> AppError {
+fn map_share_constraint_error(err: crate::db::Error) -> AppError {
     let text = err.to_string();
     if text.contains("UNIQUE constraint failed: shares.subdomain")
         || text.contains("idx_shares_subdomain_unique")
@@ -21535,7 +19885,7 @@ impl ClientTunnelRecord {
     }
 }
 
-fn map_client_tunnel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientTunnelRecord> {
+fn map_client_tunnel_row(row: &crate::db::Row<'_>) -> crate::db::Result<ClientTunnelRecord> {
     Ok(ClientTunnelRecord {
         installation_id: row.get(0)?,
         owner_email: row.get(1)?,
@@ -21597,7 +19947,7 @@ fn list_client_tunnels(conn: &Connection) -> Result<Vec<ClientTunnelRecord>, App
     Ok(output)
 }
 
-fn map_client_tunnel_constraint_error(err: rusqlite::Error) -> AppError {
+fn map_client_tunnel_constraint_error(err: crate::db::Error) -> AppError {
     let text = err.to_string();
     if text.contains("UNIQUE constraint failed: installation_client_tunnels.subdomain") {
         AppError::Conflict("client tunnel subdomain already claimed".into())
@@ -21834,11 +20184,6 @@ fn registration_nonce_subject(public_key: &str) -> String {
         "registration:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
     )
-}
-
-fn client_identity_hash(public_key: &str) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(Sha256::digest(public_key.trim().as_bytes()))
 }
 
 fn insert_installation_notification_baseline(
@@ -22774,7 +21119,7 @@ fn generate_numeric_code(len: usize) -> String {
         .collect()
 }
 
-fn parse_string_vec(value: Option<String>) -> Result<Vec<String>, rusqlite::Error> {
+fn parse_string_vec(value: Option<String>) -> Result<Vec<String>, crate::db::Error> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -22782,7 +21127,7 @@ fn parse_string_vec(value: Option<String>) -> Result<Vec<String>, rusqlite::Erro
         return Ok(Vec::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
@@ -23477,7 +21822,7 @@ fn persist_session(conn: &Connection, session: &AuthSession) -> Result<(), AppEr
     Ok(())
 }
 
-fn map_auth_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthSession> {
+fn map_auth_session_row(row: &crate::db::Row<'_>) -> crate::db::Result<AuthSession> {
     Ok(AuthSession {
         session_id: row.get(0)?,
         user_id: row.get(1)?,
@@ -23530,9 +21875,9 @@ fn get_refreshable_session_by_refresh_hash(
     .map_err(|e| AppError::Internal(format!("query refreshable session failed: {e}")))
 }
 
-fn parse_scopes_json(value: String) -> Result<Vec<String>, rusqlite::Error> {
+fn parse_scopes_json(value: String) -> Result<Vec<String>, crate::db::Error> {
     serde_json::from_str::<Vec<String>>(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
     })
 }
 
@@ -23846,7 +22191,6 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
@@ -23997,7 +22341,7 @@ mod tests {
             hash_token(&format!("{email}:222222"))
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -24028,7 +22372,7 @@ mod tests {
         drop(held);
         waiter.await.expect("same-scope lock waiter");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -24095,7 +22439,7 @@ mod tests {
         .expect("resent challenge");
         assert_eq!(latest_a.code_hash, hash_token(&format!("{email}:333333")));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -24189,7 +22533,7 @@ mod tests {
             EmailVerificationRejectionReason::NotFound
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -24229,7 +22573,7 @@ mod tests {
             .expect("read atomic verification records");
         assert_eq!(persisted, (1, 1, 1, 1));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -24278,7 +22622,7 @@ mod tests {
             .expect("read rolled back verification records");
         assert_eq!(persisted, (0, 0, 0));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -24320,7 +22664,7 @@ mod tests {
             .expect("read committed auth attempt count");
         assert_eq!(attempt_count, 1);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -24461,6 +22805,10 @@ mod tests {
     fn test_config(name: &str) -> Config {
         let db_path =
             std::env::temp_dir().join(format!("cc-switch-router-{name}-{}.db", Uuid::new_v4()));
+        let data_dir = db_path
+            .parent()
+            .expect("test database parent")
+            .to_path_buf();
         Config {
             api_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
             ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2222),
@@ -24468,7 +22816,8 @@ mod tests {
             ssh_public_addr: String::new(),
             use_localhost: true,
             lease_ttl_secs: 60,
-            db_path,
+            data_dir,
+            database: crate::config::DatabaseConfig::local(db_path),
             host_key_path: std::env::temp_dir()
                 .join(format!("cc-switch-router-{name}-{}.key", Uuid::new_v4())),
             provision_ssh_private_key_path: std::env::temp_dir()
@@ -25031,8 +23380,8 @@ mod tests {
             .expect("linked share after clear");
         assert!(linked_share.market_states.is_empty());
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-        let _ = std::fs::remove_file(PathBuf::from(config.metrics.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
+        let _ = std::fs::remove_file(&config.metrics.db_path);
     }
 
     #[tokio::test]
@@ -25120,7 +23469,7 @@ mod tests {
             "owner@example.com"
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -25161,7 +23510,7 @@ mod tests {
                 .expect("missing app is denied")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -25254,7 +23603,7 @@ mod tests {
                 .expect("app settings override accessByApp")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -25302,7 +23651,7 @@ mod tests {
                 .expect("private share acl")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     async fn insert_health_check(
@@ -25786,7 +24135,7 @@ mod tests {
         );
         assert!(share.active_edit.is_none());
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -26096,7 +24445,7 @@ mod tests {
         assert_eq!(other_shares.len(), 1);
         assert!((other_shares[0].signals.owner_penalty - 1.0).abs() < 1e-9);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26180,7 +24529,7 @@ mod tests {
         assert_eq!(latest.request_count, 3);
         assert_eq!(latest.failure_count, 3);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26246,7 +24595,7 @@ mod tests {
             "any healthy linked share in a minute should make the market dot healthy"
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26283,7 +24632,7 @@ mod tests {
 
         assert_eq!(market_state_count, 0);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26335,7 +24684,7 @@ mod tests {
         );
         assert!((shares[0].signals.owner_penalty - 0.7).abs() < 1e-9);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26409,7 +24758,7 @@ mod tests {
             Some("unavailable")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26447,7 +24796,7 @@ mod tests {
         assert!(shares[0].app_availability.claude.is_none());
         assert!((shares[0].signals.owner_penalty - 1.0).abs() < 1e-9);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26511,7 +24860,7 @@ mod tests {
         assert_eq!(codex.reason.as_deref(), Some("weekly quota exhausted"));
         assert!((shares[0].signals.owner_penalty - 0.25).abs() < 1e-9);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     fn test_share_request_log_entry(
@@ -26751,7 +25100,7 @@ mod tests {
         assert_eq!(logs[0].request_id, "imgreq-11");
         assert_eq!(logs[9].request_id, "imgreq-2");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -26856,7 +25205,7 @@ mod tests {
             "selected access must not expose removed ShareTo emails"
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -26998,7 +25347,7 @@ mod tests {
             .expect("owner row");
         assert_eq!(owner.total_tokens, 50);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -27173,7 +25522,7 @@ mod tests {
             Some("shareto")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -27235,7 +25584,7 @@ mod tests {
         assert_eq!(share_url_view.tokens_used_by_app.get("codex"), Some(&1000));
         assert_eq!(share_url_view.requests_count_by_app.get("codex"), Some(&7));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -27311,7 +25660,7 @@ mod tests {
         assert!(svg.contains("?period=24h"));
         assert!(svg.contains("gpt-5"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -27365,7 +25714,7 @@ mod tests {
             25
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -27419,7 +25768,7 @@ mod tests {
         assert_eq!(shares[0].subdomain, "all-share-sub");
         assert_eq!(shares[0].share_status, "active");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -27466,7 +25815,7 @@ mod tests {
         );
         assert_eq!(shares[0].signals.stability, 1.0);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     async fn insert_signed_installation(store: &AppStore, installation_id: &str) -> SigningKey {
@@ -27862,7 +26211,7 @@ mod tests {
         assert!(!admin_json.contains("htmlBody"));
         assert!(!admin_json.contains("textBody"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -27905,7 +26254,7 @@ mod tests {
         assert_eq!(completion_status, "suppressed_disabled");
         assert!(hint.is_none());
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28016,7 +26365,7 @@ mod tests {
         assert_eq!(Uuid::parse_str(&state.4).unwrap().get_version_num(), 4);
         assert_eq!(state.5, 1);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28092,7 +26441,7 @@ mod tests {
         assert_eq!(batch_count, 1);
         assert!(html.contains("a******z"));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28179,7 +26528,7 @@ mod tests {
         assert_eq!((state.0, state.1), (2, 1));
         assert!(state.2.contains("r******d"));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28282,7 +26631,7 @@ mod tests {
             .expect("count claimed legacy lifecycle");
         assert_eq!(counts, (1, 1));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28399,7 +26748,7 @@ mod tests {
             ("explicit".into(), "suppressed_disabled".into(), None, 0)
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28468,7 +26817,7 @@ mod tests {
             .await
             .expect("do not replay disabled legacy fallback");
         assert_eq!(stats.batches_created, 0);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28502,7 +26851,7 @@ mod tests {
             .expect("count old reclaim setup tracking");
         assert_eq!(tracked, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28607,7 +26956,7 @@ mod tests {
             .expect("read explicit receipt after legacy delivery");
         assert_eq!(state, ("explicit".into(), None, 0));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28687,7 +27036,7 @@ mod tests {
                 }
             );
         }
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28738,7 +27087,7 @@ mod tests {
             .expect("count setup envelope mutations");
         assert_eq!(mutated, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28787,7 +27136,7 @@ mod tests {
             .await
             .expect("same nonce can retry after rollback");
         assert_eq!(response.status, InstallationSetupCompletedStatus::Queued);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28884,7 +27233,7 @@ mod tests {
         assert_eq!(registration_events, 0);
         assert_eq!(registration_state, "verified");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28968,7 +27317,7 @@ mod tests {
         assert!(orphan_hint.is_none());
         tx.commit().expect("commit hint cleanup tx");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     fn sign_issue_lease_request(signing_key: &SigningKey, request: &IssueLeaseRequest) -> String {
@@ -29307,7 +27656,7 @@ mod tests {
             .expect_err("other users cannot inspect upgrade state");
         assert!(owner_error.to_string().contains("only installation owner"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29328,7 +27677,7 @@ mod tests {
 
         assert_eq!(subdomains, vec!["active-sub".to_string()]);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29360,7 +27709,7 @@ mod tests {
         assert_eq!(by_subdomain.get("market-a"), Some(&RouteIntentKind::Market));
         assert!(!by_subdomain.contains_key("paused-sub"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29410,7 +27759,7 @@ mod tests {
         assert_eq!(accepted.share_id, "share-runtime");
         assert_eq!(accepted.subdomain, "runtime-sub");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29459,7 +27808,7 @@ mod tests {
 
         assert!(err.to_string().contains("subdomain mismatch"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29535,7 +27884,7 @@ mod tests {
 
         assert_eq!(lease.subdomain, "aaa");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29709,7 +28058,7 @@ mod tests {
             .expect_err("renewal nonce replay must fail");
         assert!(replay.to_string().contains("nonce already used"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29785,7 +28134,7 @@ mod tests {
         assert_eq!(lease_count, 1);
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29877,7 +28226,7 @@ mod tests {
         assert_eq!(retired, 1);
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -29968,7 +28317,7 @@ mod tests {
         assert_eq!(lease_count, 1);
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -30129,7 +28478,7 @@ mod tests {
             .expect("count registration events");
         assert_eq!(event_count, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -30209,7 +28558,7 @@ mod tests {
             .unwrap();
         assert_eq!((admission_count, installation_count), (1, 1));
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30247,7 +28596,7 @@ mod tests {
             .unwrap();
         assert_eq!(admission_count, 1);
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30312,7 +28661,7 @@ mod tests {
             .unwrap();
         assert_eq!((admission_count, installation_count), (0, 0));
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30367,7 +28716,7 @@ mod tests {
             .unwrap();
         assert_eq!((admission_count, installation_count), (2, 1));
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30390,7 +28739,7 @@ mod tests {
             assert!(indexes.contains(expected), "missing {expected}");
         }
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30457,7 +28806,7 @@ mod tests {
             .unwrap();
         assert_eq!(counts, (1, 1));
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30503,7 +28852,7 @@ mod tests {
             error => panic!("unexpected admission error: {error}"),
         }
 
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30576,7 +28925,7 @@ mod tests {
             .unwrap();
         assert_eq!(geocoded, 2, "cached geo must be applied to the new key");
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30636,7 +28985,7 @@ mod tests {
             .expect("expired negative cache can be refreshed");
         server.abort();
         assert_eq!(hits.load(AtomicOrdering::SeqCst), 2);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -30779,7 +29128,7 @@ mod tests {
                 .all(|key| key.contains(&second.installation_id))
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -30860,7 +29209,7 @@ mod tests {
             .expect("read authenticated legacy state");
         assert_eq!(state, ("verified".into(), 0, 0));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -30922,7 +29271,7 @@ mod tests {
             .expect("read heartbeat state");
         assert_eq!(state, (1, "online".into(), Some("boot-1".into())));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -30996,7 +29345,7 @@ mod tests {
             .expect("read public ip");
         assert_eq!(public_ip.as_deref(), Some("203.0.113.10"));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31179,7 +29528,7 @@ mod tests {
         assert_eq!(message_count, 2);
         assert_eq!(chat_email_count, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31250,7 +29599,7 @@ mod tests {
             .expect("count disabled-notification chat outputs");
         assert_eq!((message_count, email_count), (1, 0));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31388,7 +29737,7 @@ mod tests {
             .expect("count sent notification audit");
         assert_eq!(audit_count, 1);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31438,7 +29787,7 @@ mod tests {
             vec![("pending".into(), 1), ("suppressed_storm".into(), 1)]
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31509,7 +29858,7 @@ mod tests {
             .expect("read ownerless registration status");
         assert_eq!(status, "awaiting_owner");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31583,7 +29932,7 @@ mod tests {
         assert_eq!(runtime_enabled, 0);
         assert_eq!(batch_status, "suppressed_disabled");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31678,7 +30027,7 @@ mod tests {
             ]
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31747,7 +30096,7 @@ mod tests {
         assert_eq!(batches, vec!["old-retry-batch"]);
         assert_eq!(events, vec!["old-pending-event"]);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31789,7 +30138,7 @@ mod tests {
         assert!(json.get("html").is_none());
         assert!(json.get("htmlBody").is_none());
         assert!(json.get("recipient").is_none());
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31854,7 +30203,7 @@ mod tests {
             ]
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31904,7 +30253,7 @@ mod tests {
             .expect("read active delivery kind");
         assert_eq!(delivery_kind, "lifecycle");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -31973,7 +30322,7 @@ mod tests {
             .expect("read offline recipients");
         assert_eq!(recipients, vec!["owner@example.com".to_string()]);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32019,7 +30368,7 @@ mod tests {
             .expect("read registration recipients");
         assert_eq!(recipients, vec!["owner@example.com".to_string()]);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32106,7 +30455,7 @@ mod tests {
             .expect("count disabled owner-wait batches");
         assert_eq!(batch_count, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32267,7 +30616,7 @@ mod tests {
                 .contains("https://ownerchangeclient.router.example.com/")
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32391,7 +30740,7 @@ mod tests {
             ]
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32532,7 +30881,7 @@ mod tests {
             ]
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32602,7 +30951,7 @@ mod tests {
             "existing owner notification batch",
         );
         assert_eq!(claimed.recipient, "a-owner@example.com");
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32650,7 +30999,7 @@ mod tests {
             "prioritized batch",
         );
         assert_eq!(claimed.id, "a-owner-batch");
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32749,78 +31098,7 @@ mod tests {
             .expect("read offline event status");
         assert_eq!(offline_status, "batched");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-    }
-
-    #[tokio::test]
-    async fn notification_lane_migration_backfills_offline_mixed_and_empty_batches() {
-        let (store, config) = setup_store("notification-lane-backfill").await;
-        let now = Utc::now();
-        let conn = store.conn.lock().await;
-        for (id, kind) in [
-            ("backfill-offline", "client_offline"),
-            ("backfill-registration", "client_registered"),
-            ("backfill-mixed-offline", "client_offline"),
-            ("backfill-mixed-registration", "client_registered"),
-        ] {
-            insert_test_notification_event(&conn, id, kind, now);
-        }
-        for id in [
-            "offline-batch",
-            "registration-batch",
-            "mixed-batch",
-            "empty-batch",
-        ] {
-            insert_test_notification_batch_in_lane(
-                &conn,
-                id,
-                NotificationLane::Registration,
-                &format!("{id}@example.com"),
-                "pending",
-                now,
-                None,
-                None,
-                None,
-            );
-        }
-        for (batch_id, event_id) in [
-            ("offline-batch", "backfill-offline"),
-            ("registration-batch", "backfill-registration"),
-            ("mixed-batch", "backfill-mixed-offline"),
-            ("mixed-batch", "backfill-mixed-registration"),
-        ] {
-            conn.execute(
-                "INSERT INTO email_delivery_batch_items (batch_id, event_id, recipient)
-                 VALUES (?1, ?2, ?3)",
-                params![batch_id, event_id, format!("{batch_id}@example.com")],
-            )
-            .expect("insert lane backfill item");
-        }
-
-        init_schema(&conn).expect("rerun notification lane migration");
-        let lanes = conn
-            .prepare(
-                "SELECT id, notification_lane FROM email_delivery_batches
-                 WHERE id LIKE '%-batch' ORDER BY id",
-            )
-            .expect("prepare backfilled lanes")
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .expect("query backfilled lanes")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read backfilled lanes");
-        assert_eq!(
-            lanes,
-            vec![
-                ("empty-batch".into(), "registration".into()),
-                ("mixed-batch".into(), "offline".into()),
-                ("offline-batch".into(), "offline".into()),
-                ("registration-batch".into(), "registration".into()),
-            ]
-        );
-        drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32878,7 +31156,7 @@ mod tests {
         assert!(incidents.iter().all(|(_, kind, _)| kind == "incident"));
         assert_ne!(incidents[0].2, incidents[1].2);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32929,7 +31207,7 @@ mod tests {
         assert_eq!(offline_batches, 1);
         assert_eq!(registration_status, "pending");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -32997,7 +31275,7 @@ mod tests {
             );
             assert_eq!(claimed.id, expected_id);
         }
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33077,7 +31355,7 @@ mod tests {
             .expect("read capped registration status");
         assert_eq!(status, "suppressed_rate_limit");
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33169,7 +31447,7 @@ mod tests {
         .expect("drop batches below low watermark");
         assert!(!registration_overflow_should_capture_tx(&conn, now).expect("below batch low"));
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33230,7 +31508,7 @@ mod tests {
             .await
             .expect("list overflow delivery summary");
         assert!(deliveries.is_empty());
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33262,7 +31540,7 @@ mod tests {
             ]
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33312,7 +31590,7 @@ mod tests {
         assert_eq!(status, "suppressed_expired");
         assert_eq!(batch_count, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33428,7 +31706,7 @@ mod tests {
             ]
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33505,7 +31783,7 @@ mod tests {
             assert!(!body.contains("old-owner@example.com"));
         }
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33653,7 +31931,7 @@ mod tests {
                 .any(|detail| detail.contains("idx_client_notification_events_lane_pending"))
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -33796,7 +32074,7 @@ mod tests {
         );
         assert!(registration_batch.subject.contains("registered"));
         assert!(registration_batch.text.contains("CC-Switch Router"));
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33838,7 +32116,7 @@ mod tests {
         assert!(stored_secret.is_some());
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33892,7 +32170,7 @@ mod tests {
         assert_eq!(monitoring_enabled, 0);
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -33924,7 +32202,7 @@ mod tests {
             .expect("market lease may reconnect during its TTL");
         assert_eq!(reconnected.connection_id, lease.connection_id);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     /// `is_market_subdomain` is what HTTP handlers use to decide whether to
@@ -33972,7 +32250,7 @@ mod tests {
             "share subdomain must never be flagged as market"
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34030,7 +32308,7 @@ mod tests {
         assert_eq!(public_markets.len(), 1);
         assert_eq!(public_markets[0].email, "market@example.com");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34074,7 +32352,7 @@ mod tests {
                 .is_some()
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34154,7 +32432,7 @@ mod tests {
             .expect_err("market subdomain should be reserved");
         assert!(err.to_string().contains("subdomain is reserved"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34291,7 +32569,7 @@ mod tests {
                 .contains("signature verification failed")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34404,7 +32682,7 @@ mod tests {
             .expect("read owner verification time");
         assert!(verified_at.is_some());
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34511,7 +32789,7 @@ mod tests {
             .await
             .expect("verified bootstrap owner can claim client tunnel");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34586,7 +32864,7 @@ mod tests {
                 .is_none()
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34638,7 +32916,7 @@ mod tests {
             Some("owner@example.com".into())
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34753,7 +33031,7 @@ mod tests {
         assert_eq!(stored.subdomain, "client-alpha");
         assert!(!stored.enabled);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34882,7 +33160,7 @@ mod tests {
                 .as_deref(),
             Some(new_email)
         );
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34939,7 +33217,7 @@ mod tests {
             Some(new_email.into())
         );
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35040,7 +33318,7 @@ mod tests {
         assert_eq!(synced.1, test_share_host("minimal"));
         assert_eq!(synced.2, "Yes");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35122,7 +33400,7 @@ mod tests {
             .expect_err("claim/share mismatch should fail");
         assert!(err.to_string().contains("claim does not match"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35231,7 +33509,7 @@ mod tests {
             vec![("share-old".into(), "inst-old".into(), owner_host)]
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35343,7 +33621,7 @@ mod tests {
             Some("router@example.com".into())
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35455,7 +33733,7 @@ mod tests {
             vec![("share-old".into(), "inst-same".into(), reused_host)]
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35607,7 +33885,7 @@ mod tests {
                 .contains("signature verification failed")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35673,7 +33951,7 @@ mod tests {
             );
         }
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -35897,7 +34175,7 @@ mod tests {
         assert!(retired_edit.2.is_some());
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36013,7 +34291,7 @@ mod tests {
         }
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36225,7 +34503,7 @@ mod tests {
         }
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -36311,7 +34589,7 @@ mod tests {
         assert_eq!(share_count, 2);
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36534,7 +34812,7 @@ mod tests {
         );
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36616,7 +34894,7 @@ mod tests {
         assert_eq!(other_count, 1);
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36710,7 +34988,7 @@ mod tests {
             .await
             .expect("batch sync with checkedAt model health should verify");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36795,7 +35073,7 @@ mod tests {
         );
 
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36838,7 +35116,7 @@ mod tests {
             assert_eq!(stored.expires_at, "2030-01-01T00:00:00Z");
         }
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -36960,7 +35238,7 @@ mod tests {
         assert_eq!(old_health, 1);
         assert_eq!(old_market_logs, 1);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37036,7 +35314,7 @@ mod tests {
             .expect("read reconciled shares");
         assert_eq!(share_ids, vec!["share-existing", "share-one", "share-two"]);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37197,7 +35475,7 @@ mod tests {
                 .contains("signature verification failed")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37235,7 +35513,7 @@ mod tests {
         );
         assert_eq!(snapshot.clients[0].operational_summary.state, "online");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37268,7 +35546,7 @@ mod tests {
         );
         assert_eq!(snapshot.clients[0].operational_summary.state, "online");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37311,7 +35589,7 @@ mod tests {
         );
         assert_eq!(snapshot.clients[0].operational_summary.state, "offline");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37350,7 +35628,7 @@ mod tests {
         );
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37413,7 +35691,7 @@ mod tests {
         client_share_ids.sort();
         assert_eq!(client_share_ids, vec!["share-new", "share-old"]);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37487,7 +35765,7 @@ mod tests {
                 >= 1
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37559,7 +35837,7 @@ mod tests {
                 .is_some_and(|client| client.owner_email.is_none())
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37600,7 +35878,7 @@ mod tests {
         assert_eq!(snapshot.map.countries.len(), 1);
         assert_eq!(snapshot.clients.len(), 2);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37629,7 +35907,7 @@ mod tests {
         assert_eq!(points.clients[0].lon, 138.25);
         assert_eq!(points.clients[0].count, 3);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37678,7 +35956,7 @@ mod tests {
         assert_eq!(share.market_links[0].email, "market@example.com");
         assert!(share.unknown_market_emails.is_empty());
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37703,7 +35981,7 @@ mod tests {
         assert!(!share.can_edit_settings);
         assert_eq!(share.shared_with_emails, vec!["shared@example.com"]);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37732,7 +36010,7 @@ mod tests {
 
         assert!(err.to_string().contains("only share owner"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37779,7 +36057,7 @@ mod tests {
             .await
             .expect("current Client capability must allow fixed periods");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37811,7 +36089,7 @@ mod tests {
                 .contains("share owner is managed by the installation owner")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37838,7 +36116,7 @@ mod tests {
                 .contains("share owner is managed by the installation owner")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37893,7 +36171,7 @@ mod tests {
             );
         }
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37962,7 +36240,7 @@ mod tests {
                 .expect("query pending state after ack")
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -37986,7 +36264,7 @@ mod tests {
 
         assert!(err.to_string().contains("only share owner"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38064,7 +36342,7 @@ mod tests {
         assert!(!active_subdomains.contains(&"stale-sub".to_string()));
         assert!(active_subdomains.contains(&"fresh-sub".to_string()));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38147,7 +36425,7 @@ mod tests {
         assert_eq!(image_request_ids, vec!["img-history-recent"]);
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38311,7 +36589,7 @@ mod tests {
         }
         drop(conn);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38420,7 +36698,7 @@ mod tests {
         assert_eq!(installations_after, 0);
         assert_eq!(shares_after, 0);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38516,7 +36794,7 @@ mod tests {
         assert_eq!(message_count, 1);
         assert_eq!(chat_email_count, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38624,7 +36902,7 @@ mod tests {
             .expect("count installation after terminal notification");
         assert_eq!(retained_after_terminal, 0);
         drop(conn);
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38682,7 +36960,7 @@ mod tests {
         assert!(!active_subdomains.contains(&"stale-sub".to_string()));
         assert!(active_subdomains.contains(&"fresh-sub".to_string()));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38773,7 +37051,7 @@ mod tests {
             "only the long-paused share should be deleted",
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38854,7 +37132,7 @@ mod tests {
         assert!(active_subdomains.contains(&"online-sub".to_string()));
         assert!(!active_subdomains.contains(&"offline-old-sub".to_string()));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38887,7 +37165,7 @@ mod tests {
         assert_eq!(share.online_minutes_24h, ONLINE_WINDOW_MINUTES);
         assert_eq!(share.online_rate_24h, 100.0);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38954,7 +37232,7 @@ mod tests {
                 < 0.01
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -38988,7 +37266,7 @@ mod tests {
         assert_eq!(previous.status, "offline");
         assert_eq!(previous.observed_minutes, 1);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -39021,7 +37299,7 @@ mod tests {
         assert_eq!(share.recent_model_health_checks[0].checked_at, now);
         assert_eq!(share.recent_model_health_checks[9].checked_at, now - 9);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -39268,7 +37546,7 @@ mod tests {
         assert_eq!(stale_count, 0);
         assert_eq!(current_count, 1);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     /// C-fix: even if a (buggy or pre-fix) cc-switch client pushes
@@ -39365,7 +37643,7 @@ mod tests {
         );
         assert_eq!(claude_checks, 1, "claude is bound — its entry must land");
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     /// C-fix: after a user unbinds an app, any historical model_health rows
@@ -39433,7 +37711,7 @@ mod tests {
             "historical codex rows must be purged once codex is no longer bound"
         );
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -39505,7 +37783,7 @@ mod tests {
         assert!(app_providers_json.contains("provider-1"));
         assert!(app_providers_json.contains("account@example.com"));
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -39582,7 +37860,7 @@ mod tests {
 
         assert_eq!(current_count, 1);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -39618,7 +37896,7 @@ mod tests {
         assert_eq!(last_status, "failed");
         assert_eq!(last_checked_at, now);
 
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     /// Regression test for the rate-limit bypass Codex flagged: a guest can
@@ -39862,7 +38140,7 @@ mod tests {
             .expect("read Share event room");
         assert_eq!(materialized_room, room_id);
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -39998,7 +38276,7 @@ mod tests {
             .expect("count idempotent event messages");
         assert_eq!(source_count, 1);
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40092,7 +38370,7 @@ mod tests {
             )
             .expect("check unpublished payment asset cleanup");
         assert_eq!(unpublished_exists, 0);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40195,7 +38473,7 @@ mod tests {
         assert!(!stored_payload.contains("AIza-do-not-store"));
         assert!(stored_payload.contains("[credential omitted]"));
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40261,7 +38539,7 @@ mod tests {
             .expect("read archived Provider visit");
         assert_eq!(provider_visits, 1);
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40341,7 +38619,7 @@ mod tests {
             .expect("count healthy event");
         assert_eq!(healthy_count, 1);
         drop(conn);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40492,7 +38770,7 @@ mod tests {
                 .expect("count expired events");
             assert_eq!(expired_events, 1);
         }
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40592,7 +38870,7 @@ mod tests {
             .expect("count chat events")
         };
         assert_eq!(event_count, 1);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40645,7 +38923,7 @@ mod tests {
         assert_eq!(rooms.rooms.len(), 1);
         assert_eq!(rooms.rooms[0].unread_count, 1);
         assert_eq!(rooms.total_unread, 1);
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40716,7 +38994,7 @@ mod tests {
         assert!(claim.html.contains("second external message"));
         assert!(!claim.html.contains("owner reply"));
         assert_eq!(claim.recipient, "owner@example.com");
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40838,7 +39116,7 @@ mod tests {
                 .await,
             Err(AppError::NotFound(_))
         ));
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
@@ -40920,6 +39198,6 @@ mod tests {
                 .contains("sibling that must still be delivered")
         );
         assert!(!rebuilt.html.contains("message that will be deleted"));
-        let _ = std::fs::remove_file(config.db_path);
+        let _ = std::fs::remove_file(config.database.path);
     }
 }

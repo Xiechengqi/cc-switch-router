@@ -10,6 +10,7 @@ mod client_market_trade;
 mod client_meta;
 mod config;
 mod ctl_client;
+mod db;
 mod dynamic_settings;
 mod embed_usage;
 mod error;
@@ -29,6 +30,7 @@ mod public_hosts;
 mod recent_traffic;
 mod registration_admission;
 mod scheduling_signals;
+mod schema;
 mod server_state;
 mod share_market;
 mod ssh;
@@ -55,7 +57,7 @@ use uuid::Uuid;
 use crate::abuse::AbuseTracker;
 use crate::board_telegram::TelegramNotifier;
 use crate::client_market::ClientMarketJobSecrets;
-use crate::config::{Config, ensure_default_env_file, load_env_file};
+use crate::config::{Config, DatabaseMode, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
 use crate::ip_blacklist_stats::{IpBlacklistStats, format_top_counts};
 use crate::metrics::MetricsRegistry;
@@ -92,6 +94,9 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env();
     config
+        .validate_database_config()
+        .map_err(anyhow::Error::msg)?;
+    config
         .validate_official_provider_config()
         .map_err(anyhow::Error::msg)?;
     let server_geo = resolve_server_geo().await;
@@ -104,7 +109,11 @@ async fn main() -> Result<()> {
         server_label = "server",
         server_lat = server_geo.lat,
         server_lon = server_geo.lon,
-        db_path = %config.db_path.display(),
+        data_dir = %config.data_dir.display(),
+        db_mode = config.database.mode.as_str(),
+        db_path = %config.database.path.display(),
+        turso_url = config.database.turso_url.as_deref().unwrap_or("-"),
+        db_sync_interval_secs = config.database.sync_interval_secs,
         env_path = %env_path.display(),
         use_localhost = config.use_localhost,
         cleanup_interval_secs = config.cleanup_interval_secs,
@@ -116,7 +125,7 @@ async fn main() -> Result<()> {
         client_email_notifications_enabled = config.client_notifications.enabled,
         client_notification_recipient_mode = "owner_email",
         client_offline_alert_secs = config.client_notifications.offline_alert_secs,
-        db_exists = config.db_path.exists(),
+        db_exists = config.database.path.exists(),
         host_key_path = %config.host_key_path.display(),
         host_key_exists = config.host_key_path.exists(),
         provision_ssh_private_key_path = %config.provision_ssh_private_key_path.display(),
@@ -264,6 +273,9 @@ async fn main() -> Result<()> {
     let client_market_trade_state = state.clone();
     let share_market_state = state.clone();
     let market_billing_state = state.clone();
+    let database_sync_store = state.store.clone();
+    let database_sync_interval_secs = config.database.sync_interval_secs;
+    let database_sync_enabled = config.database.mode == DatabaseMode::Turso;
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -284,6 +296,29 @@ async fn main() -> Result<()> {
                 );
             }
         }
+    });
+
+    let database_sync_task = database_sync_enabled.then(|| {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(database_sync_interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match database_sync_store.sync_database() {
+                    Ok(health) => {
+                        tracing::debug!(
+                            frames_synced = health.last_frames_synced,
+                            "Turso Embedded Replica synchronized"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Turso Embedded Replica sync failed");
+                    }
+                }
+            }
+        })
     });
 
     let cleanup_task = tokio::spawn(async move {
@@ -510,6 +545,9 @@ async fn main() -> Result<()> {
     };
 
     cleanup_task.abort();
+    if let Some(task) = database_sync_task {
+        task.abort();
+    }
     ip_blacklist_log_task.abort();
     probe_task.abort();
     runtime_task.abort();
@@ -1020,7 +1058,12 @@ Environment:
   CC_SWITCH_ROUTER_RESEND_FROM           Sender email, default noreply@[TUNNEL_DOMAIN]
   CC_SWITCH_ROUTER_USE_LOCALHOST         Use http for localhost-style domains, default false
   CC_SWITCH_ROUTER_LEASE_TTL_SECS        Tunnel lease ttl, default 60
-  CC_SWITCH_ROUTER_DB_PATH               SQLite path, default $HOME/.cc-switch-router/cc-switch-router.db
+  CC_SWITCH_ROUTER_DATA_DIR              Router-owned local data directory
+  CC_SWITCH_ROUTER_DB_MODE               Business database mode: local or turso, default local
+  CC_SWITCH_ROUTER_DB_PATH               Local libSQL or Embedded Replica file path
+  CC_SWITCH_ROUTER_TURSO_URL              Turso URL, required in turso mode
+  CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN       Turso token, required in turso mode
+  CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS  Embedded Replica pull interval, default 60
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 86400
   CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS Request history retention, default 30 (1-365)

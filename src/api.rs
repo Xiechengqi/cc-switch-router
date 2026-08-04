@@ -531,8 +531,35 @@ async fn install_client_script() -> impl IntoResponse {
     )
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { ok: true })
+async fn health(State(state): State<ServerState>) -> impl IntoResponse {
+    let snapshot = state.store.database_health_snapshot();
+    let (status, response) = database_health_response(snapshot);
+    (status, Json(response))
+}
+
+fn database_health_response(
+    snapshot: crate::db::DatabaseHealthSnapshot,
+) -> (StatusCode, HealthResponse) {
+    let status = if snapshot.available {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        HealthResponse {
+            ok: snapshot.available,
+            database: crate::models::DatabaseHealthResponse {
+                mode: snapshot.mode.as_str().to_string(),
+                available: snapshot.available,
+                last_attempt_at_ms: snapshot.last_attempt_at_ms,
+                last_success_at_ms: snapshot.last_success_at_ms,
+                last_failure_at_ms: snapshot.last_failure_at_ms,
+                consecutive_failures: snapshot.consecutive_failures,
+                last_frames_synced: snapshot.last_frames_synced,
+            },
+        },
+    )
 }
 
 async fn markets(State(state): State<ServerState>) -> Result<Json<MarketsResponse>, AppError> {
@@ -2734,6 +2761,28 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn database_health_response_reports_remote_outage_without_error_details() {
+        let (status, response) = database_health_response(crate::db::DatabaseHealthSnapshot {
+            mode: crate::db::ConnectionMode::TursoReplica,
+            available: false,
+            last_attempt_at_ms: Some(100),
+            last_success_at_ms: Some(50),
+            last_failure_at_ms: Some(100),
+            consecutive_failures: 2,
+            last_frames_synced: 7,
+            last_error: Some("database unavailable: secret remote detail".into()),
+        });
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.ok);
+        assert_eq!(response.database.mode, "turso");
+        let payload = serde_json::to_value(response).expect("serialize health response");
+        assert_eq!(payload["database"]["consecutiveFailures"], 2);
+        assert!(payload["database"].get("lastError").is_none());
+        assert!(!payload.to_string().contains("secret remote detail"));
+    }
 
     #[test]
     fn share_edit_event_stream_requests_initial_resync() {

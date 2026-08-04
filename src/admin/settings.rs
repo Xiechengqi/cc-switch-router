@@ -13,6 +13,7 @@ use crate::error::AppError;
 #[serde(rename_all = "snake_case")]
 pub enum FieldType {
     Text,
+    Select,
     Int,
     Decimal,
     Bool,
@@ -61,6 +62,8 @@ pub struct SettingsFieldView {
     pub default: Option<String>,
     pub description: String,
     pub placeholder: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,15 +179,75 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
     },
     // ── Persistence ──
     SettingsField {
-        key: "CC_SWITCH_ROUTER_DB_PATH",
-        label: "SQLite DB path",
+        key: "CC_SWITCH_ROUTER_DATA_DIR",
+        label: "Router data directory",
         group: "Persistence",
         field_type: FieldType::Path,
         required: false,
         restart_required: true,
         default: None,
-        description: "Filesystem path for the SQLite database. Created if missing.",
+        description: "Directory for Router-owned local files such as image results and Client Market SSH known_hosts.",
+        placeholder: Some("/var/lib/cc-switch-router"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_DB_MODE",
+        label: "Business database mode",
+        group: "Persistence",
+        field_type: FieldType::Select,
+        required: false,
+        restart_required: true,
+        default: Some("local"),
+        description: "Use local for a standalone libSQL file or turso for a Turso Cloud Embedded Replica.",
+        placeholder: None,
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_DB_PATH",
+        label: "Business database file",
+        group: "Persistence",
+        field_type: FieldType::Path,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Local libSQL file in local mode, or the on-disk Embedded Replica file in Turso mode.",
         placeholder: Some("/var/lib/cc-switch-router/router.db"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_TURSO_URL",
+        label: "Turso database URL",
+        group: "Persistence",
+        field_type: FieldType::Text,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Turso Cloud database URL. Required in turso mode; must use libsql:// or https:// and contain no credentials, query, or fragment.",
+        placeholder: Some("libsql://database-organization.turso.io"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN",
+        label: "Turso auth token",
+        group: "Persistence",
+        field_type: FieldType::Secret,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Secret token used by the Embedded Replica for synchronization and delegated writes.",
+        placeholder: Some("eyJhbGciOiJFZERTQSIs..."),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS",
+        label: "Replica sync interval (seconds)",
+        group: "Persistence",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("60"),
+        description: "How often a Turso Embedded Replica pulls committed Cloud frames (1-3600 seconds).",
+        placeholder: Some("60"),
         dynamic_group: None,
     },
     SettingsField {
@@ -1101,6 +1164,10 @@ pub fn schema_response() -> SettingsSchemaResponse {
             .map(|field| {
                 let mut view = field_to_view(field);
                 match field.key {
+                    "CC_SWITCH_ROUTER_DATA_DIR" => {
+                        let path = crate::config::default_data_dir().display().to_string();
+                        view.placeholder = Some(path);
+                    }
                     "CC_SWITCH_ROUTER_DB_PATH" => {
                         let path = crate::config::default_db_path().display().to_string();
                         view.placeholder = Some(path);
@@ -1150,6 +1217,10 @@ fn field_to_view(field: &SettingsField) -> SettingsFieldView {
         default: field.default.map(str::to_string),
         description: field.description.to_string(),
         placeholder: field.placeholder.map(str::to_string),
+        options: match field.key {
+            "CC_SWITCH_ROUTER_DB_MODE" => vec!["local".into(), "turso".into()],
+            _ => Vec::new(),
+        },
     }
 }
 
@@ -1292,6 +1363,7 @@ pub fn validate_and_diff(
     }
     validate_registration_admission_relations(&next, updates)?;
     validate_client_notification_relations(&next, updates)?;
+    validate_database_relations(&next, updates)?;
 
     Ok(ApplyOutcome {
         updated_keys: updated,
@@ -1398,8 +1470,29 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             }
             validate_client_notification_integer(field.key, value)?;
             validate_registration_admission_integer(field.key, value)?;
+            if field.key == "CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS"
+                && !(1..=3_600).contains(&value)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "{} must be between 1 and 3600, got: {value}",
+                    field.key
+                )));
+            }
             Ok(Some(trimmed.to_string()))
         }
+        FieldType::Select => match field.key {
+            "CC_SWITCH_ROUTER_DB_MODE" => match trimmed.to_ascii_lowercase().as_str() {
+                "local" | "turso" => Ok(Some(trimmed.to_ascii_lowercase())),
+                _ => Err(AppError::BadRequest(format!(
+                    "{} must be local or turso, got: {raw}",
+                    field.key
+                ))),
+            },
+            _ => Err(AppError::Internal(format!(
+                "unsupported select settings field: {}",
+                field.key
+            ))),
+        },
         FieldType::Decimal => {
             if field.key != "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" {
                 return Err(AppError::Internal(format!(
@@ -1471,8 +1564,57 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             }
             Ok(Some(url))
         }
+        FieldType::Text if field.key == "CC_SWITCH_ROUTER_TURSO_URL" => {
+            crate::config::validate_turso_url(trimmed).map_err(AppError::BadRequest)?;
+            Ok(Some(trimmed.to_string()))
+        }
         FieldType::Path | FieldType::Text | FieldType::Secret => Ok(Some(trimmed.to_string())),
     }
+}
+
+fn validate_database_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<(), AppError> {
+    const DATABASE_KEYS: &[&str] = &[
+        "CC_SWITCH_ROUTER_DB_MODE",
+        "CC_SWITCH_ROUTER_DB_PATH",
+        "CC_SWITCH_ROUTER_TURSO_URL",
+        "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN",
+        "CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS",
+    ];
+    if !updates
+        .keys()
+        .any(|key| DATABASE_KEYS.contains(&key.as_str()))
+    {
+        return Ok(());
+    }
+
+    let configured = |key: &str| {
+        let file_value = next.get(key).cloned();
+        let value = if updates.contains_key(key) {
+            file_value
+        } else {
+            file_value.or_else(|| std::env::var(key).ok())
+        };
+        value.filter(|value| !value.trim().is_empty())
+    };
+    let mode = configured("CC_SWITCH_ROUTER_DB_MODE").unwrap_or_else(|| "local".into());
+    if !mode.eq_ignore_ascii_case("turso") {
+        return Ok(());
+    }
+    let url = configured("CC_SWITCH_ROUTER_TURSO_URL").ok_or_else(|| {
+        AppError::BadRequest(
+            "CC_SWITCH_ROUTER_TURSO_URL is required when database mode is turso".into(),
+        )
+    })?;
+    crate::config::validate_turso_url(&url).map_err(AppError::BadRequest)?;
+    if configured("CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN").is_none() {
+        return Err(AppError::BadRequest(
+            "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN is required when database mode is turso".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_client_notification_integer(key: &str, value: i64) -> Result<(), AppError> {
@@ -1840,6 +1982,90 @@ mod tests {
         assert_eq!(normalize_value(field, "ON").unwrap(), Some("true".into()));
         assert_eq!(normalize_value(field, "off").unwrap(), Some("false".into()));
         assert!(normalize_value(field, "maybe").is_err());
+    }
+
+    #[test]
+    fn database_mode_schema_and_validation_are_strict() {
+        let schema = schema_response();
+        let mode = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "CC_SWITCH_ROUTER_DB_MODE")
+            .expect("database mode field");
+        assert!(matches!(mode.field_type, FieldType::Select));
+        assert_eq!(mode.options, vec!["local", "turso"]);
+
+        let mode_field = field_by_key("CC_SWITCH_ROUTER_DB_MODE").unwrap();
+        assert_eq!(
+            normalize_value(mode_field, "TURSO").unwrap(),
+            Some("turso".into())
+        );
+        assert!(normalize_value(mode_field, "remote").is_err());
+
+        let url_field = field_by_key("CC_SWITCH_ROUTER_TURSO_URL").unwrap();
+        assert!(normalize_value(url_field, "libsql://router-example.turso.io").is_ok());
+        assert!(normalize_value(url_field, "http://router-example.turso.io").is_err());
+        assert!(normalize_value(url_field, "libsql://router.turso.io?token=secret").is_err());
+    }
+
+    #[test]
+    fn turso_mode_requires_url_and_secret_token() {
+        let existing = HashMap::new();
+        let mut updates =
+            BTreeMap::from([("CC_SWITCH_ROUTER_DB_MODE".into(), Some("turso".into()))]);
+        assert!(validate_and_diff(&existing, &updates).is_err());
+
+        updates.insert(
+            "CC_SWITCH_ROUTER_TURSO_URL".into(),
+            Some("libsql://router-example.turso.io".into()),
+        );
+        assert!(validate_and_diff(&existing, &updates).is_err());
+
+        updates.insert(
+            "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN".into(),
+            Some("secret-token".into()),
+        );
+        let outcome = validate_and_diff(&existing, &updates).expect("complete Turso settings");
+        assert_eq!(outcome.restart_required_keys.len(), 3);
+
+        let existing = HashMap::from([
+            ("CC_SWITCH_ROUTER_DB_MODE".into(), "turso".into()),
+            (
+                "CC_SWITCH_ROUTER_TURSO_URL".into(),
+                "libsql://router-example.turso.io".into(),
+            ),
+            (
+                "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN".into(),
+                "existing-token".into(),
+            ),
+        ]);
+        let updates = BTreeMap::from([("CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN".into(), None)]);
+        assert!(validate_and_diff(&existing, &updates).is_err());
+    }
+
+    #[test]
+    fn turso_token_is_never_returned_by_settings_values_api() {
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-settings-secret-{}.env",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN=do-not-return-this-token\n",
+        )
+        .expect("write settings fixture");
+
+        let response = values_response(&path).expect("read settings values");
+        let token = response
+            .values
+            .iter()
+            .find(|entry| entry.key == "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN")
+            .expect("Turso token entry");
+        assert!(token.is_secret);
+        assert!(token.has_value);
+        assert!(token.value.is_none());
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2251,7 +2477,10 @@ mod tests {
             ssh_public_addr: String::new(),
             use_localhost: true,
             lease_ttl_secs: 60,
-            db_path: std::env::temp_dir().join("cc-switch-router-rebuild-test.db"),
+            data_dir: std::env::temp_dir(),
+            database: crate::config::DatabaseConfig::local(
+                std::env::temp_dir().join("cc-switch-router-rebuild-test.db"),
+            ),
             host_key_path: std::env::temp_dir().join("cc-switch-router-rebuild-test.key"),
             provision_ssh_private_key_path: std::env::temp_dir()
                 .join("cc-switch-router-rebuild-test-id_rsa"),

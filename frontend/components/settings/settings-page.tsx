@@ -5,6 +5,7 @@ import { Alert, Button, Card, Checkbox, Chip, Input, ListBox, ScrollShadow, Text
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   settingsFieldDescription,
@@ -333,6 +334,17 @@ function SettingsFieldRow({
               </Checkbox.Content>
             </Checkbox>
           </div>
+        ) : field.fieldType === "select" ? (
+          <CompactSelect
+            value={String(value || field.default || "")}
+            options={(field.options || []).map((option) => ({
+              value: option,
+              label: option === "turso" ? "Turso Cloud" : option === "local" ? "Local libSQL" : option,
+            }))}
+            onChange={onChange}
+            ariaLabel={settingsFieldLabel(t, field)}
+            triggerClassName="min-h-10 text-sm"
+          />
         ) : field.fieldType === "email_list" || field.fieldType === "ip_list" ? (
           <TextArea id={field.key} value={String(value ?? "")} onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)} placeholder={field.placeholder || ""} />
         ) : (
@@ -360,7 +372,7 @@ function dirtyValue(field: SettingsField, entry: SettingValueEntry | undefined, 
     return raw === "true" || raw === "1" || raw === "yes" || raw === "on";
   }
   if (field.fieldType === "secret") return "";
-  return entry?.value || "";
+  return entry?.value || field.default || "";
 }
 
 function buildUpdates(schema: SettingsSchema | null, dirty: Record<string, DirtyValue>) {

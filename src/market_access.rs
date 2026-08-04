@@ -1,9 +1,9 @@
+use crate::db::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -40,31 +40,6 @@ pub const ERROR_MARKET_RELATIONSHIP_CLOSED: &str = "MARKET_RELATIONSHIP_CLOSED";
 
 const MAX_CREDIT_LIMIT_MINOR: i64 = 100_000_000;
 const ACCESS_REQUEST_REAPPLY_COOLDOWN_HOURS: i64 = 24;
-
-const CREATE_SUPPLIER_ACCESS_POLICIES_TABLE: &str =
-    "CREATE TABLE IF NOT EXISTS market_supplier_access_policies (
-        supplier_user_id TEXT NOT NULL,
-        supplier_email TEXT NOT NULL,
-        product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
-        pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
-        mode TEXT NOT NULL CHECK (mode IN ('whitelist', 'blacklist')),
-        revision INTEGER NOT NULL DEFAULT 1,
-        risk_acknowledged_at TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (supplier_user_id, product_kind, pricing_kind)
-    );";
-
-const CREATE_COUNTERPARTY_ACCESS_RULES_TABLE: &str =
-    "CREATE TABLE IF NOT EXISTS market_counterparty_access_rules (
-        counterparty_id TEXT NOT NULL,
-        product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
-        pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
-        decision TEXT NOT NULL CHECK (decision IN ('inherit', 'allow', 'deny')),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (counterparty_id, product_kind, pricing_kind)
-    );";
 
 #[derive(Debug, Clone)]
 pub struct MarketAccessActor {
@@ -369,229 +344,6 @@ struct UpdatePublicCreditLineRequest {
     expected_revision: i64,
 }
 
-fn pricing_scope_rebuild_source(
-    conn: &Connection,
-    table: &str,
-    expected_primary_key: &[&str],
-) -> Result<Option<bool>, rusqlite::Error> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let schema = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    if schema.is_empty() {
-        return Ok(None);
-    }
-
-    let has_pricing_kind = schema.iter().any(|(name, _)| name == "pricing_kind");
-    let mut primary_key = schema
-        .iter()
-        .filter(|(_, position)| *position > 0)
-        .map(|(name, position)| (*position, name.as_str()))
-        .collect::<Vec<_>>();
-    primary_key.sort_unstable_by_key(|(position, _)| *position);
-    let primary_key = primary_key
-        .into_iter()
-        .map(|(_, name)| name)
-        .collect::<Vec<_>>();
-
-    Ok((!has_pricing_kind || primary_key != expected_primary_key).then_some(has_pricing_kind))
-}
-
-fn migrate_pricing_scoped_access_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let supplier_policy_source = pricing_scope_rebuild_source(
-        conn,
-        "market_supplier_access_policies",
-        &["supplier_user_id", "product_kind", "pricing_kind"],
-    )?;
-    let counterparty_rule_source = pricing_scope_rebuild_source(
-        conn,
-        "market_counterparty_access_rules",
-        &["counterparty_id", "product_kind", "pricing_kind"],
-    )?;
-    if supplier_policy_source.is_none() && counterparty_rule_source.is_none() {
-        return Ok(());
-    }
-
-    let tx = conn.unchecked_transaction()?;
-    if let Some(source_has_pricing_kind) = supplier_policy_source {
-        tx.execute_batch(
-            "ALTER TABLE market_supplier_access_policies
-                 RENAME TO market_supplier_access_policies_legacy_pricing_scope;",
-        )?;
-        tx.execute_batch(CREATE_SUPPLIER_ACCESS_POLICIES_TABLE)?;
-        if source_has_pricing_kind {
-            tx.execute_batch(
-                "INSERT INTO market_supplier_access_policies (
-                    supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
-                    revision, risk_acknowledged_at, created_at, updated_at
-                 )
-                 SELECT supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
-                        revision, risk_acknowledged_at, created_at, updated_at
-                 FROM market_supplier_access_policies_legacy_pricing_scope;",
-            )?;
-        } else {
-            tx.execute_batch(
-                "INSERT INTO market_supplier_access_policies (
-                    supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
-                    revision, risk_acknowledged_at, created_at, updated_at
-                 )
-                 SELECT legacy.supplier_user_id, legacy.supplier_email, legacy.product_kind,
-                        scope.pricing_kind, legacy.mode, legacy.revision,
-                        legacy.risk_acknowledged_at, legacy.created_at, legacy.updated_at
-                 FROM market_supplier_access_policies_legacy_pricing_scope AS legacy
-                 CROSS JOIN (
-                    SELECT 'free' AS pricing_kind
-                    UNION ALL SELECT 'paid'
-                 ) AS scope;",
-            )?;
-        }
-        tx.execute_batch("DROP TABLE market_supplier_access_policies_legacy_pricing_scope;")?;
-    }
-
-    if let Some(source_has_pricing_kind) = counterparty_rule_source {
-        tx.execute_batch(
-            "ALTER TABLE market_counterparty_access_rules
-                 RENAME TO market_counterparty_access_rules_legacy_pricing_scope;",
-        )?;
-        tx.execute_batch(CREATE_COUNTERPARTY_ACCESS_RULES_TABLE)?;
-        if source_has_pricing_kind {
-            tx.execute_batch(
-                "INSERT INTO market_counterparty_access_rules (
-                    counterparty_id, product_kind, pricing_kind, decision, created_at, updated_at
-                 )
-                 SELECT counterparty_id, product_kind, pricing_kind, decision,
-                        created_at, updated_at
-                 FROM market_counterparty_access_rules_legacy_pricing_scope;",
-            )?;
-        } else {
-            tx.execute_batch(
-                "INSERT INTO market_counterparty_access_rules (
-                    counterparty_id, product_kind, pricing_kind, decision, created_at, updated_at
-                 )
-                 SELECT legacy.counterparty_id, legacy.product_kind, scope.pricing_kind,
-                        legacy.decision, legacy.created_at, legacy.updated_at
-                 FROM market_counterparty_access_rules_legacy_pricing_scope AS legacy
-                 CROSS JOIN (
-                    SELECT 'free' AS pricing_kind
-                    UNION ALL SELECT 'paid'
-                 ) AS scope;",
-            )?;
-        }
-        tx.execute_batch("DROP TABLE market_counterparty_access_rules_legacy_pricing_scope;")?;
-    }
-    tx.commit()
-}
-
-pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    migrate_pricing_scoped_access_tables(conn)?;
-    conn.execute_batch(CREATE_SUPPLIER_ACCESS_POLICIES_TABLE)?;
-    conn.execute_batch(CREATE_COUNTERPARTY_ACCESS_RULES_TABLE)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS market_counterparties (
-            id TEXT PRIMARY KEY,
-            supplier_user_id TEXT NOT NULL,
-            supplier_email TEXT NOT NULL,
-            buyer_user_id TEXT,
-            buyer_email TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
-            revision INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            revoked_at TEXT,
-            UNIQUE (supplier_user_id, buyer_email)
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_market_counterparty_bound_user
-            ON market_counterparties(supplier_user_id, buyer_user_id)
-            WHERE buyer_user_id IS NOT NULL;
-        CREATE TABLE IF NOT EXISTS market_credit_grants (
-            counterparty_id TEXT NOT NULL,
-            currency TEXT NOT NULL,
-            kind TEXT NOT NULL CHECK (kind IN ('none', 'limited', 'unlimited')),
-            limit_minor INTEGER,
-            revision INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (counterparty_id, currency)
-        );
-        CREATE TABLE IF NOT EXISTS market_public_credit_policies (
-            supplier_user_id TEXT NOT NULL,
-            supplier_email TEXT NOT NULL,
-            currency TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            limit_minor INTEGER,
-            revision INTEGER NOT NULL DEFAULT 1,
-            risk_acknowledged_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (supplier_user_id, currency)
-        );
-        CREATE TABLE IF NOT EXISTS market_access_events (
-            id TEXT PRIMARY KEY,
-            supplier_user_id TEXT NOT NULL,
-            counterparty_id TEXT,
-            actor_user_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            detail_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_counterparties_supplier_status
-            ON market_counterparties(supplier_user_id, status, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_market_access_events_supplier
-            ON market_access_events(supplier_user_id, created_at);
-        CREATE TABLE IF NOT EXISTS market_access_requests (
-            id TEXT PRIMARY KEY,
-            supplier_user_id TEXT NOT NULL,
-            supplier_email TEXT NOT NULL,
-            buyer_user_id TEXT NOT NULL,
-            buyer_email TEXT NOT NULL,
-            product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
-            pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
-            target_kind TEXT NOT NULL CHECK (target_kind IN ('share_seat', 'client_host')),
-            target_id TEXT NOT NULL,
-            target_label TEXT NOT NULL,
-            daily_rate_minor INTEGER,
-            currency TEXT,
-            status TEXT NOT NULL CHECK (status IN ('requested', 'approved', 'rejected', 'cancelled')),
-            revision INTEGER NOT NULL DEFAULT 1,
-            requested_at TEXT NOT NULL,
-            resolved_at TEXT,
-            resolved_by_user_id TEXT,
-            resolution_reason TEXT,
-            resolution_note TEXT
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_market_access_request_requested
-            ON market_access_requests(
-                supplier_user_id, buyer_user_id, product_kind, pricing_kind
-            ) WHERE status = 'requested';
-        CREATE INDEX IF NOT EXISTS idx_market_access_requests_supplier
-            ON market_access_requests(supplier_user_id, status, requested_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_access_requests_buyer
-            ON market_access_requests(buyer_user_id, status, requested_at DESC);",
-    )?;
-    let request_columns = conn
-        .prepare("PRAGMA table_info(market_access_requests)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !request_columns.iter().any(|name| name == "resolution_note") {
-        conn.execute(
-            "ALTER TABLE market_access_requests ADD COLUMN resolution_note TEXT",
-            [],
-        )?;
-    }
-    if !request_columns
-        .iter()
-        .any(|name| name == "daily_rate_minor")
-    {
-        conn.execute(
-            "ALTER TABLE market_access_requests ADD COLUMN daily_rate_minor INTEGER",
-            [],
-        )?;
-    }
-    Ok(())
-}
-
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/market-access/dashboard", get(get_dashboard))
@@ -635,7 +387,7 @@ pub fn router() -> Router<ServerState> {
         )
 }
 
-fn map_db(context: &'static str) -> impl FnOnce(rusqlite::Error) -> AppError {
+fn map_db(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
 
@@ -1428,7 +1180,7 @@ async fn create_access_request(
     Json(input): Json<CreateAccessRequest>,
 ) -> Result<Json<AccessRequestView>, AppError> {
     let actor = require_actor(&state, &headers, "market:access:write").await?;
-    let mut conn = state.store.conn.lock().await;
+    let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_db("begin market access application"))?;
@@ -1650,7 +1402,7 @@ async fn approve_access_request(
     let actor = require_actor(&state, &headers, "market:access:write").await?;
     {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market access approval"))?;
@@ -1743,7 +1495,7 @@ async fn reject_access_request(
     let actor = require_actor(&state, &headers, "market:access:write").await?;
     {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market access rejection"))?;
@@ -1822,7 +1574,7 @@ async fn cancel_access_request(
 ) -> Result<Json<AccessRequestView>, AppError> {
     let actor = require_actor(&state, &headers, "market:access:write").await?;
     let now = Utc::now().to_rfc3339();
-    let mut conn = state.store.conn.lock().await;
+    let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_db("begin market access cancellation"))?;
@@ -1869,7 +1621,7 @@ async fn update_policy(
     let mode = normalize_mode(&input.mode)?;
     {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin access policy update"))?;
@@ -2084,7 +1836,7 @@ async fn upsert_counterparty(
     let credit_lines_changed = !input.credit_lines.is_empty();
     let id = {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let buyer_user_id = conn
             .query_row(
                 "SELECT id FROM users WHERE email_normalized = ?1",
@@ -2278,7 +2030,7 @@ async fn update_counterparty(
     let actor = require_actor(&state, &headers, "market:access:write").await?;
     let needs_reconcile = {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin counterparty update"))?;
@@ -2326,7 +2078,7 @@ async fn update_counterparties_batch(
     }
     let needs_reconcile = {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin counterparty batch update"))?;
@@ -2364,7 +2116,7 @@ async fn update_credit_line(
     let currency = normalize_currency(&currency)?;
     {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin credit line update"))?;
@@ -2435,7 +2187,7 @@ async fn update_public_credit_line(
         validate_public_credit_line(input.enabled, input.limit_minor, input.risk_acknowledged)?;
     {
         let now = Utc::now().to_rfc3339();
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin public credit update"))?;
@@ -2953,14 +2705,12 @@ mod tests {
 
     fn access_connection() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory database");
-        init_schema(&conn).expect("initialize market access schema");
+        crate::schema::apply(&conn).expect("initialize database baseline");
         conn
     }
 
     fn access_request_connection() -> Connection {
-        let conn = access_connection();
-        crate::share_market::init_schema(&conn).expect("initialize Share market schema");
-        conn
+        access_connection()
     }
 
     fn test_actor(user_id: &str, email: &str) -> MarketAccessActor {
@@ -3149,7 +2899,7 @@ mod tests {
 
     #[test]
     fn paid_approval_and_credit_are_atomic() {
-        let mut conn = access_request_connection();
+        let conn = access_request_connection();
         insert_paid_share_target(&conn, "seat-approval");
         let buyer = test_actor("buyer", "buyer@example.com");
         let supplier = test_actor("supplier", "supplier@example.com");
@@ -3312,7 +3062,7 @@ mod tests {
 
     #[test]
     fn paid_approval_accepts_unlimited_credit() {
-        let mut conn = access_request_connection();
+        let conn = access_request_connection();
         insert_paid_share_target(&conn, "seat-unlimited");
         let buyer = test_actor("buyer", "buyer@example.com");
         let supplier = test_actor("supplier", "supplier@example.com");
@@ -3484,7 +3234,7 @@ mod tests {
 
     #[test]
     fn batch_counterparty_updates_roll_back_on_stale_revision() {
-        let mut conn = access_connection();
+        let conn = access_connection();
         let actor = test_actor("supplier", "supplier@example.com");
         let now = test_request_time().to_rfc3339();
         for (id, buyer_id, buyer_email) in [
@@ -3614,152 +3364,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unscoped_access_tables_migrate_to_both_pricing_scopes() {
-        let conn = Connection::open_in_memory().expect("open legacy in-memory database");
-        conn.execute_batch(
-            "CREATE TABLE market_supplier_access_policies (
-                supplier_user_id TEXT NOT NULL,
-                supplier_email TEXT NOT NULL,
-                product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
-                mode TEXT NOT NULL CHECK (mode IN ('whitelist', 'blacklist')),
-                revision INTEGER NOT NULL DEFAULT 1,
-                risk_acknowledged_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (supplier_user_id, product_kind)
-            );
-            CREATE TABLE market_counterparty_access_rules (
-                counterparty_id TEXT NOT NULL,
-                product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
-                decision TEXT NOT NULL CHECK (decision IN ('inherit', 'allow', 'deny')),
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (counterparty_id, product_kind)
-            );
-            INSERT INTO market_supplier_access_policies (
-                supplier_user_id, supplier_email, product_kind, mode, revision,
-                risk_acknowledged_at, created_at, updated_at
-            ) VALUES
-                ('supplier', 'supplier@example.com', 'share', 'whitelist', 7,
-                 NULL, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'),
-                ('supplier', 'supplier@example.com', 'client_host', 'blacklist', 3,
-                 '2026-01-03T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z');
-            INSERT INTO market_counterparty_access_rules (
-                counterparty_id, product_kind, decision, created_at, updated_at
-            ) VALUES
-                ('counterparty', 'share', 'allow',
-                 '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'),
-                ('counterparty', 'client_host', 'deny',
-                 '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z');",
-        )
-        .expect("initialize legacy access schema");
-
-        init_schema(&conn).expect("migrate legacy access schema");
-
-        let policy_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM market_supplier_access_policies",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count migrated policies");
-        assert_eq!(policy_count, 4);
-        for pricing_kind in [PRICING_FREE, PRICING_PAID] {
-            let share_policy: (String, i64, Option<String>, String, String) = conn
-                .query_row(
-                    "SELECT mode, revision, risk_acknowledged_at, created_at, updated_at
-                     FROM market_supplier_access_policies
-                     WHERE supplier_user_id = 'supplier' AND product_kind = 'share'
-                       AND pricing_kind = ?1",
-                    params![pricing_kind],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .expect("read migrated Share policy");
-            assert_eq!(
-                share_policy,
-                (
-                    MODE_WHITELIST.into(),
-                    7,
-                    None,
-                    "2026-01-01T00:00:00Z".into(),
-                    "2026-01-02T00:00:00Z".into(),
-                )
-            );
-
-            let client_host_rule: String = conn
-                .query_row(
-                    "SELECT decision FROM market_counterparty_access_rules
-                     WHERE counterparty_id = 'counterparty' AND product_kind = 'client_host'
-                       AND pricing_kind = ?1",
-                    params![pricing_kind],
-                    |row| row.get(0),
-                )
-                .expect("read migrated Client Host rule");
-            assert_eq!(client_host_rule, DECISION_DENY);
-        }
-
-        assert_eq!(
-            pricing_scope_rebuild_source(
-                &conn,
-                "market_supplier_access_policies",
-                &["supplier_user_id", "product_kind", "pricing_kind"],
-            )
-            .expect("inspect migrated policy schema"),
-            None
-        );
-        assert_eq!(
-            pricing_scope_rebuild_source(
-                &conn,
-                "market_counterparty_access_rules",
-                &["counterparty_id", "product_kind", "pricing_kind"],
-            )
-            .expect("inspect migrated rule schema"),
-            None
-        );
-
-        init_schema(&conn).expect("rerun migrated access schema initialization");
-        let policy_count_after_rerun: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM market_supplier_access_policies",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count policies after rerun");
-        assert_eq!(policy_count_after_rerun, 4);
-        conn.execute(
-            "INSERT INTO market_supplier_access_policies (
-                supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
-                revision, created_at, updated_at
-             ) VALUES ('supplier', 'supplier@example.com', 'share', 'free',
-                       'whitelist', 8, '2026-01-01T00:00:00Z', '2026-01-04T00:00:00Z')
-             ON CONFLICT(supplier_user_id, product_kind, pricing_kind)
-             DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at",
-            [],
-        )
-        .expect("upsert migrated pricing-scoped policy");
-        let revision: i64 = conn
-            .query_row(
-                "SELECT revision FROM market_supplier_access_policies
-                 WHERE supplier_user_id = 'supplier' AND product_kind = 'share'
-                   AND pricing_kind = 'free'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read updated migrated policy");
-        assert_eq!(revision, 8);
-    }
-
-    #[test]
     fn access_defaults_are_split_and_preapproved_email_binds_per_scope() {
-        let mut conn = access_connection();
+        let conn = access_connection();
         let now = Utc::now().to_rfc3339();
         assert!(
             product_access_allowed_tx(
@@ -3999,7 +3605,6 @@ mod tests {
     #[test]
     fn revoking_counterparty_credit_only_updates_matching_accounts() {
         let conn = access_connection();
-        crate::market_billing::init_schema(&conn).expect("initialize market billing schema");
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO market_counterparties (
@@ -4053,7 +3658,6 @@ mod tests {
     #[test]
     fn applying_private_credit_refreshes_an_existing_public_account() {
         let conn = access_connection();
-        crate::market_billing::init_schema(&conn).expect("initialize market billing schema");
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO market_counterparties (

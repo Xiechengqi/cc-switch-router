@@ -23,7 +23,7 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
   (Cloudflare)    │                                    │
   SSH   ────────► │  SSH 反向隧道服务端 (:2222)           │
                   │                                    │
-                  │  SQLite ×2(主库 + 独立 metrics 库)   │
+                  │  libSQL 业务库 + 本地 metrics 库    │
                   └────────────────────────────────────┘
                                   ▲
                                   │ SSH reverse tunnel
@@ -35,9 +35,9 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 - **HTTP 服务** — API 端点 + 基于 Host subdomain 的反向代理 + 内嵌前端,共用同一端口
 - **SSH 服务** — 基于 `russh` 的 reverse forwarding,一次性密码认证
-- **数据存储** — SQLite,存储 installation、lease、share、市场与通知等状态
+- **数据存储** — 业务库可使用本地 libSQL 或 Turso Cloud Embedded Replica；metrics 始终使用独立本地数据库
 
-核心依赖:`axum`、`russh`、`rusqlite`、`tokio`、`reqwest`
+核心依赖:`axum`、`russh`、`libsql`、`tokio`、`reqwest`
 
 ## 客户端
 
@@ -107,7 +107,13 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期(秒);已连接 client 使用签名续期 API 原连接续期,不按该周期重建 SSH |
-| `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router.db` | SQLite 路径 |
+| `CC_SWITCH_ROUTER_DATA_DIR` | `$HOME/.cc-switch-router` | Router 自有本地文件目录,包含图片结果、SSH known_hosts 等 |
+| `CC_SWITCH_ROUTER_DB_MODE` | `local` | 业务数据库模式:`local` 或 `turso` |
+| `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router.db` | local 模式的 libSQL 文件,或 turso 模式的 Embedded Replica 文件 |
+| `CC_SWITCH_ROUTER_TURSO_URL` | 空 | turso 模式必填的 `libsql://` 或 `https://` 数据库 URL;不得携带凭据、query 或 fragment |
+| `CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN` | 空 | turso 模式必填的数据库 Token;Settings API 只返回是否已配置,不返回明文 |
+| `CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS` | `60` | Embedded Replica 拉取 Turso 已提交 frame 的周期,范围 1-3600 秒 |
+| `CC_SWITCH_ROUTER_METRICS_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router-metrics.db` | 独立本地 metrics 数据库;不会同步到 Turso |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔(秒) |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `86400` | 过期 lease 保留时长(秒) |
 | `CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS` | `30` | Share 请求记录和图片请求历史保留天数,范围 1-365;不影响累计 Token 用量 |
@@ -158,7 +164,38 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
-注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 installation 身份执行 SQLite 持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复已注册 installation 仍受尝试速率保护,但不消耗新身份额度,也不受未绑定 installation 水位线阻断。
+注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 installation 身份执行业务库持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复已注册 installation 仍受尝试速率保护,但不消耗新身份额度,也不受未绑定 installation 水位线阻断。
+
+### Turso Cloud 模式
+
+Turso 模式使用 Embedded Replica:读请求访问本地副本,所有写事务委派给 Turso primary,后台按配置周期拉取远端 frame。Router 不启用 offline writes,因此 Turso 不可达时写操作失败并返回 HTTP `503`/`DATABASE_UNAVAILABLE`,`/v1/healthz` 同时返回 `503`;远端恢复且下一次同步或写操作成功后健康状态恢复。
+
+先创建一个全新的空 Turso 数据库及可写 Token:
+
+```bash
+turso db create cc-switch-router
+turso db show cc-switch-router --url
+turso db tokens create cc-switch-router
+```
+
+将 URL 和 Token 写入 Router 配置:
+
+```dotenv
+CC_SWITCH_ROUTER_DB_MODE=turso
+CC_SWITCH_ROUTER_DB_PATH=/var/lib/cc-switch-router/router-replica.db
+CC_SWITCH_ROUTER_TURSO_URL=libsql://cc-switch-router-organization.turso.io
+CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN=replace-with-database-token
+CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS=60
+CC_SWITCH_ROUTER_METRICS_DB_PATH=/var/lib/cc-switch-router/router-metrics.db
+```
+
+部署约束:
+
+- 只运行一个可写 Router 实例。当前没有多 Router leader election,同时写同一 Turso 数据库不在支持范围内。
+- 只支持全新空业务库。首次启动原子安装 `schema/0001_baseline.sql` 并登记 checksum;非空且没有 `schema_migrations` 的数据库、未知版本或 checksum 不匹配都会拒绝启动。
+- 不迁移本地旧库,也不提供 SQLite/Turso 双写。切换模式等价于为新环境选择另一套业务库。
+- `CC_SWITCH_ROUTER_DB_PATH` 是当前实例独占的副本文件,不能由多个进程或节点共享。Turso 是业务数据源,metrics 数据库与 Router 本地文件仍需按普通本地状态管理。
+- Token 只放在 `CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN`;不要放进 URL、命令行参数或日志。Settings 中修改数据库配置后必须重启。
 
 最小生产示例:
 
@@ -180,7 +217,7 @@ Share Market 与 Client Market 按产品和价格类型使用四项独立供应�
 
 付费商品共用账户级后付费赊账：每项服务先享受 12 小时健康时长试用,之后只按 Router 观测到的健康服务秒数累计固定 USD 每日费用。同一买家和供应商共用一个 USD 余额；有限额度使用达到 80% 时向相关 Client 公开聊天室写入系统预警,用满后生成聚合账单并暂停相关服务。账单按 Settings 中的美元兑人民币汇率同时提供双币金额，默认 `1 USD = 7 CNY`；出账时冻结汇率和人民币金额，后续设置变更不改写历史账单，CNY 不形成独立账户。无限额度不自动出账,供应商可主动要求清账；买家也可主动清账,最后一项服务结束时剩余余额会自动出账。Router 不经手资金,付款声明仍需供应商确认到账；逾期声明或争议不会自行解除市场赊账限制。
 
-Client 公开聊天室与 `installation.id` 一一对应,只为已验证 Owner 的 Client 建立；同一 Client 下的所有 Share 共用这一房间,不存在 Share 独立聊天室。历史消息公开可读,发送真人消息必须使用 Router 登录 Session;普通用户 API Token 不能发送。匿名访客的最近聊天室和已读游标只保存在当前浏览器,登录后会一次性合并到服务端用户记录。非 Owner 真人消息在同一聊天室内从第一条消息开始使用固定 60 秒窗口聚合,窗口内每条消息都完整写入同一封 Owner 邮件;Owner 自己的消息和系统消息不会触发聊天邮件。消息与邮件事件在同一 SQLite 事务落库,后台使用固定 Resend 幂等键、claim lease、重试和 dead-letter。Client 被清理后聊天室转为公开只读归档并保留 60 天,同一 Client 在期限内恢复时沿用原房间。
+Client 公开聊天室与 `installation.id` 一一对应,只为已验证 Owner 的 Client 建立；同一 Client 下的所有 Share 共用这一房间,不存在 Share 独立聊天室。历史消息公开可读,发送真人消息必须使用 Router 登录 Session;普通用户 API Token 不能发送。匿名访客的最近聊天室和已读游标只保存在当前浏览器,登录后会一次性合并到服务端用户记录。非 Owner 真人消息在同一聊天室内从第一条消息开始使用固定 60 秒窗口聚合,窗口内每条消息都完整写入同一封 Owner 邮件;Owner 自己的消息和系统消息不会触发聊天邮件。消息与邮件事件在同一业务库事务落库,后台使用固定 Resend 幂等键、claim lease、重试和 dead-letter。Client 被清理后聊天室转为公开只读归档并保留 60 天,同一 Client 在期限内恢复时沿用原房间。
 
 Share Market、Client Market 与统一账务的关键事件通过持久化 outbox 写入对应 Client 公开聊天室。租用双方的完整邮箱、账单金额、收款方式与联系方式、付款 reference/note、凭证 URL、争议或回收原因以及安全的原始错误均公开展示；系统消息引用的同源收款图片随消息公开并在消息保留期内防止清理,未发布图片仍需 Owner 或账单买方身份。API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥和 SSH/lease 凭据禁止进入 Market 源事件和聊天室 payload；后端在持久化前拒绝敏感字段与 query/fragment/userinfo 带凭据的 URL,并替换外部错误或备注中的凭据片段,前端渲染时再执行一次同类过滤。`PaymentMethod.token` 只允许表达 `USDT`/`USDC` 资产符号。验证码、安全通知、Client 注册/离线生命周期邮件和真人聊天提醒邮件仍保留,Market/Billing 业务事件本身不再发送交易邮件。
 
@@ -212,7 +249,7 @@ RUST_LOG=debug cc-switch-router
 
 ```bash
 curl http://127.0.0.1/v1/healthz
-# {"ok":true}
+# {"ok":true,"database":{"mode":"local","available":true,...}}
 ```
 
 控制台:`http://127.0.0.1/`
@@ -293,8 +330,9 @@ listener。日志使用 append 模式;生产环境应由 `logrotate` 或 journal
 
 **已知架构限制**
 
-- 所有 SQLite 访问(含只读)串行通过单个 `Mutex<Connection>`,这是当前主要的并发瓶颈
-- 数据库迁移无版本表,依赖 `CREATE TABLE IF NOT EXISTS` 与列存在性探测,每次启动全量重跑,无回滚路径
+- 所有业务库访问(含只读)串行通过单个 `Mutex<Connection>`,这是当前主要的并发瓶颈
+- 当前 schema 只有 fresh-install baseline,不支持导入或原地升级任何旧业务数据库
+- Turso 模式只支持单活 Router 写实例,远端不可用时不接受离线写
 - 默认用户 API token 以明文列存储以支持 UI 重复展示;数据库泄露等同于活跃 token 泄露
 - 注册限流的内存 token bucket 无持久化,进程重启后短时间内尝试速率保护失效
 

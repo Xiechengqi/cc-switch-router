@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::db::{Connection, OptionalExtension, params};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -65,31 +65,6 @@ impl TokenAgg {
             total_tokens: self.total(),
         }
     }
-}
-
-pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS user_profiles (
-            user_id TEXT PRIMARY KEY,
-            username TEXT,
-            username_normalized TEXT UNIQUE,
-            public_stats_enabled INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_share_request_logs_user_email_created
-            ON share_request_logs(user_email, created_at)
-            WHERE user_email IS NOT NULL AND is_health_check = 0;
-
-        CREATE INDEX IF NOT EXISTS idx_market_request_logs_user_email_created
-            ON market_request_logs(user_email, created_at)
-            WHERE user_email IS NOT NULL;
-        ",
-    )
-    .map_err(|e| AppError::Internal(format!("init usage account schema failed: {e}")))?;
-    Ok(())
 }
 
 fn normalize_account_usage_period(value: &str) -> Result<AccountUsagePeriodWindow, AppError> {
@@ -600,7 +575,7 @@ fn query_consumer_events(
     Ok(events)
 }
 
-fn map_usage_event_row(row: &rusqlite::Row<'_>) -> Result<UsageEvent, rusqlite::Error> {
+fn map_usage_event_row(row: &crate::db::Row<'_>) -> Result<UsageEvent, crate::db::Error> {
     Ok((
         row.get::<_, String>(0)?,
         row.get::<_, String>(1)?,

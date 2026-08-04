@@ -70,10 +70,10 @@ Dashboard 浏览器同样通过 `POST /v1/installations/register` 建立 Ed25519
 - 同一浏览器 profile 的并发初始化必须收敛到同一组 `installationId`、公钥和私钥。单标签页使用 single-flight；支持 Web Locks API 时，跨标签页以 `cc-switch-router-installation-identity-v1` 锁串行初始化，并在持锁后重新读取持久化身份。
 - `POST /v1/auth/email/request-code` 使用 action `auth_request_code` 和 `{ email, purpose: "login" }` 签名。前端必须保存该次请求实际使用的完整 installation 身份快照。
 - challenge 的逻辑作用域是 `email_normalized + installation_id + purpose`。同一邮箱可在多个 installation 上同时持有有效 challenge；重发只消费同一作用域的旧 challenge，不得影响其他设备。
-- 同一邮箱和 installation 的并发发码在 Router 进程内串行执行，后到请求必须在前一请求落盘后重新经过冷却检查；等待邮件供应商时不得持有 SQLite 连接锁。
+- 同一邮箱和 installation 的并发发码在 Router 进程内串行执行，后到请求必须在前一请求落盘后重新经过冷却检查；等待邮件供应商时不得持有业务数据库连接锁。
 - challenge 的 `created_at`、过期时间和重发冷却从邮件供应商确认发送成功后开始计算，发信耗时不占用验证码有效期。
 - `POST /v1/auth/email/verify-code` 必须提交发送 challenge 时保存的 `installationId`，不得在校验时重新解析可能已变化的浏览器身份。
-- 正确验证码的消费、用户 upsert、Session 创建和默认 API Token 创建位于同一个 SQLite `IMMEDIATE` 事务；任一写入失败时全部回滚。错误验证码的 `attempt_count` 独立提交。
+- 正确验证码的消费、用户 upsert、Session 创建和默认 API Token 创建位于同一个 libSQL `IMMEDIATE` 事务；任一写入失败时全部回滚。错误验证码的 `attempt_count` 独立提交。
 - 客户端只接收通用安全错误。Router 日志仅记录 `expired`、`consumed`、`installation_mismatch`、`not_found`、`invalid_code` 或 `attempt_limit` 原因码，不记录邮箱、验证码或验证码 hash。
 
 ---
@@ -222,7 +222,7 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 - 模式切换和产品规则更新只影响新租用。撤销整个买家关系会把该买家的账户信用设为 `none` 并终止现有付费服务；以后确认历史账单也不会恢复这些服务。现有免费服务不因单独修改策略而中断,Owner 可另行强制回收。
 - 所有更新操作使用 revision 做乐观并发控制；下列 `PUT` 请求必须提交当前资源的 `expectedRevision`，新资源提交 `0`。浏览器可用用户 Session；外部系统可用用户 API Token,读取和写入分别要求 `market:access:read`、`market:access:write` scope。
 - 白名单买家可从具体 Share seat 或 Client Host 发起「申请准入」。同一买家、供应商、产品和价格作用域只保留一个待处理申请；拒绝后 24 小时内不能重复申请。申请记录目标名称、当时的日费和币种供供应商判断，供应商的「市场准备」与「市场准入」入口显示待处理数量；最终租用仍校验商品当前 `offerRevision`。
-- 免费申请批准只允许对应免费作用域。付费申请必须在同一 SQLite Immediate 事务中同时允许对应付费作用域并授予有效 USD 有限或无限额度；任一步失败时关系、规则、额度和申请状态全部回滚。供应商拒绝必须提交原因，买家可用申请 revision 取消仍在等待的申请。
+- 免费申请批准只允许对应免费作用域。付费申请必须在同一 libSQL Immediate 事务中同时允许对应付费作用域并授予有效 USD 有限或无限额度；任一步失败时关系、规则、额度和申请状态全部回滚。供应商拒绝必须提交原因，买家可用申请 revision 取消仍在等待的申请。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -288,7 +288,7 @@ USD 是唯一报价、授信、记账和结算币种。账单总额与每条账�
 
 Share Market、Client Market 和统一账务不创建商品级聊天室。Router 只按 `installation.id` 建立唯一 Client 公开房间；Share Market 表格和 Client Market Provider/租客入口均解析到对应 `GET /v1/chat/clients/:installation_id/room`。同一 Client 的多个 Share 必须返回同一个 room ID。
 
-关键业务事件与原业务写入处于同一 SQLite 事务,先进入 `client_chat_system_outbox`,再由后台幂等物化为系统消息。Share 服务启停、到期、供应商变更、离线/恢复；挂牌、拼车位、租用、授权、回收；Client 开通、清理开始/成功/失败、强制释放；额度预警、出账、付款声明/确认/拒绝、逾期、争议和裁决均属于该事件流。系统消息自动关注 Owner、Provider、租客和 actor,产生未读,但不触发真人聊天提醒邮件。
+关键业务事件与原业务写入处于同一 libSQL 事务,先进入 `client_chat_system_outbox`,再由后台幂等物化为系统消息。Share 服务启停、到期、供应商变更、离线/恢复；挂牌、拼车位、租用、授权、回收；Client 开通、清理开始/成功/失败、强制释放；额度预警、出账、付款声明/确认/拒绝、逾期、争议和裁决均属于该事件流。系统消息自动关注 Owner、Provider、租客和 actor,产生未读,但不触发真人聊天提醒邮件。
 
 事件 payload 是公开数据。Router 原样公开完整邮箱、账单金额、收款方式/联系方式、付款 reference/note、凭证 URL、争议/回收原因和安全的原始错误。系统消息中由 Owner/Provider/Supplier 发布的 `/v1/account/payment-assets/:id` 收款图片也允许匿名读取；未被系统消息引用的资产继续要求 Owner 或对应账单买方 Session。以下内容是唯一保密例外,不得出现在 DB、API、日志或 UI：API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥以及 SSH/lease 凭据。`PaymentMethod.token` 仅在 `kind=crypto` 且值为 `USDT`/`USDC` 时作为公开资产符号放行,其他 `token` 字段均按凭据拒绝。后端入 outbox 前拒绝敏感字段和带凭据 query/userinfo/fragment 的 URL,错误文本命中凭据片段时整体替换为固定占位；Web UI 还会独立执行字段、文本和 URL 二次过滤。
 

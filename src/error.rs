@@ -79,6 +79,12 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let database_unavailable = match &self {
+            AppError::ServiceUnavailable(message) | AppError::Internal(message) => {
+                message.contains("database unavailable:")
+            }
+            _ => false,
+        };
         let status = match &self {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
@@ -91,6 +97,7 @@ impl IntoResponse for AppError {
             AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AppError::Coded { status, .. } => *status,
+            AppError::Internal(_) if database_unavailable => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let retry_after_secs = match &self {
@@ -101,10 +108,15 @@ impl IntoResponse for AppError {
         };
         let (code, details) = match &self {
             AppError::Coded { code, details, .. } => (Some(*code), Some(details.clone())),
+            _ if database_unavailable => (Some("DATABASE_UNAVAILABLE"), None),
             _ => (None, None),
         };
         let body = ErrorBody {
-            message: self.to_string(),
+            message: if database_unavailable {
+                "database unavailable".into()
+            } else {
+                self.to_string()
+            },
             code,
             details,
         };
@@ -155,5 +167,21 @@ mod tests {
         assert_eq!(payload["code"], "MARKET_ACCESS_REQUIRED");
         assert_eq!(payload["details"]["productKind"], "share");
         assert_eq!(payload["details"]["pricingKind"], "paid");
+    }
+
+    #[tokio::test]
+    async fn wrapped_database_unavailable_error_returns_503() {
+        let response = AppError::Internal(
+            "write share failed: database unavailable: connection refused".into(),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read database error response");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("decode database error response");
+        assert_eq!(payload["message"], "database unavailable");
+        assert_eq!(payload["code"], "DATABASE_UNAVAILABLE");
     }
 }

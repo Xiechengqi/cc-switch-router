@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use crate::db::{Connection, OptionalExtension, params};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -16,7 +17,6 @@ use axum::routing::{delete, get, post};
 use base64::Engine;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -358,147 +358,6 @@ impl ClientMarketJobSecrets {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ClientMarketSchemaError {
-    #[error("client market database error: {0}")]
-    Database(#[from] rusqlite::Error),
-}
-
-pub fn init_schema(conn: &Connection) -> Result<(), ClientMarketSchemaError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS router_ssh_hosts (
-            id TEXT PRIMARY KEY,
-            ip TEXT NOT NULL,
-            port INTEGER NOT NULL,
-            host_owner_email TEXT NOT NULL,
-            country_code TEXT,
-            hostname TEXT,
-            ssh_host_key_fingerprint TEXT,
-            status TEXT NOT NULL,
-            installation_id TEXT,
-            last_verified_at TEXT,
-            last_error TEXT,
-            note TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(ip, port)
-        );
-        CREATE INDEX IF NOT EXISTS idx_router_ssh_hosts_supply
-            ON router_ssh_hosts(host_owner_email, status, country_code);
-
-        CREATE TABLE IF NOT EXISTS provisioning_jobs (
-            id TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            host_id TEXT,
-            host_owner_email TEXT,
-            client_owner_email TEXT,
-            selection_owners_json TEXT,
-            selection_regions_json TEXT,
-            subdomain TEXT,
-            installation_id TEXT,
-            status TEXT NOT NULL,
-            phase TEXT NOT NULL DEFAULT 'pending',
-            log_blob TEXT NOT NULL DEFAULT '',
-            secret_ref TEXT,
-            failure_code TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_provisioning_jobs_client
-            ON provisioning_jobs(client_owner_email, status, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_provisioning_jobs_host
-            ON provisioning_jobs(host_id, status);
-
-        CREATE TABLE IF NOT EXISTS subdomain_reservations (
-            subdomain TEXT PRIMARY KEY COLLATE NOCASE,
-            job_id TEXT NOT NULL,
-            host_id TEXT,
-            client_owner_email TEXT,
-            installation_id TEXT,
-            expires_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS client_market_host_import_jobs (
-            id TEXT PRIMARY KEY,
-            provider_id TEXT NOT NULL,
-            owner_email TEXT NOT NULL,
-            source_ip TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            completed_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS client_market_host_import_items (
-            id TEXT PRIMARY KEY,
-            job_id TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            ip TEXT NOT NULL,
-            port INTEGER NOT NULL,
-            payload_json TEXT NOT NULL,
-            status TEXT NOT NULL,
-            host_id TEXT,
-            error_message TEXT,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(job_id, position),
-            UNIQUE(job_id, ip, port)
-        );",
-    )?;
-    add_column_if_missing(
-        conn,
-        "provisioning_jobs",
-        "phase",
-        "TEXT NOT NULL DEFAULT 'pending'",
-    )?;
-    add_column_if_missing(conn, "provisioning_jobs", "failure_code", "TEXT")?;
-    add_column_if_missing(conn, "subdomain_reservations", "host_id", "TEXT")?;
-    add_column_if_missing(conn, "subdomain_reservations", "client_owner_email", "TEXT")?;
-    add_column_if_missing(conn, "subdomain_reservations", "installation_id", "TEXT")?;
-    add_column_if_missing(conn, "router_ssh_hosts", "ip_intel_json", "TEXT")?;
-    conn.execute(
-        "UPDATE router_ssh_hosts SET status = ?1 WHERE status = 'provisioning'",
-        params![HOST_STATUS_LOCKED],
-    )?;
-    conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_router_ssh_hosts_installation
-            ON router_ssh_hosts(installation_id)
-            WHERE installation_id IS NOT NULL;
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_provisioning_jobs_active_host
-            ON provisioning_jobs(host_id)
-            WHERE host_id IS NOT NULL AND status IN ('pending', 'running');
-         CREATE INDEX IF NOT EXISTS idx_subdomain_reservations_job
-            ON subdomain_reservations(job_id);
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_subdomain_reservations_installation
-            ON subdomain_reservations(installation_id)
-            WHERE installation_id IS NOT NULL;
-         CREATE INDEX IF NOT EXISTS idx_client_market_host_import_jobs_status
-            ON client_market_host_import_jobs(status, updated_at);
-         CREATE INDEX IF NOT EXISTS idx_client_market_host_import_items_pending
-            ON client_market_host_import_items(job_id, status, position);",
-    )?;
-    crate::client_market_trade::init_schema(conn)?;
-    Ok(())
-}
-
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<(), rusqlite::Error> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|existing| existing == column) {
-        conn.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        ))?;
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 struct ActiveSubdomainReservation {
     job_id: String,
@@ -728,11 +587,7 @@ pub(crate) fn authorize_client_market_subdomain_claim(
 }
 
 pub fn known_hosts_path(config: &Config) -> PathBuf {
-    config
-        .db_path
-        .parent()
-        .map(|dir| dir.join("client_market_ssh_known_hosts"))
-        .unwrap_or_else(|| PathBuf::from("./data/client_market_ssh_known_hosts"))
+    config.data_dir.join("client_market_ssh_known_hosts")
 }
 
 pub fn router_public_url(config: &Config) -> String {
@@ -4788,7 +4643,7 @@ impl AppStore {
     ) -> Result<String, AppError> {
         let job_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin Host import job failed: {error}"))
         })?;
@@ -4832,7 +4687,7 @@ impl AppStore {
         job_id: &str,
     ) -> Result<HostImportJobWork, AppError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin Host import claim failed: {error}"))
         })?;
@@ -4952,7 +4807,7 @@ impl AppStore {
         &self,
         job_id: &str,
     ) -> Result<HostImportResponse, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin Host import completion failed: {error}"))
         })?;
@@ -5110,9 +4965,9 @@ impl AppStore {
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| AppError::Internal(format!("prepare list hosts failed: {e}")))?;
-        let params: Vec<&dyn rusqlite::ToSql> = binds
+        let params: Vec<&dyn crate::db::ToSql> = binds
             .iter()
-            .map(|value| value as &dyn rusqlite::ToSql)
+            .map(|value| value as &dyn crate::db::ToSql)
             .collect();
         let rows = stmt
             .query_map(params.as_slice(), map_router_ssh_host_row)
@@ -5344,7 +5199,7 @@ impl AppStore {
                 "owner and region selections must each contain 1 to 100 values".into(),
             ));
         }
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|e| {
             AppError::Internal(format!("begin provisioning job transaction failed: {e}"))
         })?;
@@ -5736,7 +5591,7 @@ impl AppStore {
             ));
         }
         let expires_at_ms = Utc::now().timestamp_millis() + SUBDOMAIN_RESERVATION_TTL_MS;
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin claim host tx failed: {e}")))?;
@@ -5806,7 +5661,7 @@ impl AppStore {
         let mut query = tx
             .prepare(&sql)
             .map_err(|e| AppError::Internal(format!("prepare claim host failed: {e}")))?;
-        let mut values: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        let mut values: Vec<&dyn crate::db::ToSql> = Vec::new();
         for owner in owners {
             values.push(owner);
         }
@@ -6008,7 +5863,7 @@ impl AppStore {
         id: &str,
         rotation: HostFingerprintRotation<'_>,
     ) -> Result<RouterSshHostRecord, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!(
                 "begin SSH host fingerprint rotation failed: {error}"
@@ -6092,7 +5947,7 @@ impl AppStore {
         hostname: Option<&str>,
         fingerprint: Option<&str>,
     ) -> Result<RouterSshHostRecord, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin complete host reverify failed: {e}")))?;
@@ -6196,7 +6051,7 @@ impl AppStore {
         status: &str,
         reason: &str,
     ) -> Result<(), AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin quarantine host tx failed: {e}")))?;
@@ -6319,7 +6174,7 @@ impl AppStore {
         log: &str,
     ) -> Result<(), AppError> {
         let chunk = sanitize_job_log_chunk(log);
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|e| {
             AppError::Internal(format!("begin create failure transaction failed: {e}"))
         })?;
@@ -6411,7 +6266,7 @@ impl AppStore {
         provision_source: &str,
         dashboard_url: &str,
     ) -> Result<(), AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin complete job tx failed: {e}")))?;
@@ -6574,7 +6429,7 @@ impl AppStore {
         deny_client_access: Option<bool>,
     ) -> Result<String, AppError> {
         let viewer = normalize_market_email(viewer_email)?;
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|e| {
             AppError::Internal(format!("begin cleanup job transaction failed: {e}"))
         })?;
@@ -6787,7 +6642,7 @@ impl AppStore {
         job_id: &str,
         host_id: &str,
     ) -> Result<(), AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|e| {
             AppError::Internal(format!("begin finish cleanup transaction failed: {e}"))
         })?;
@@ -6852,7 +6707,7 @@ impl AppStore {
         let failure_code = crate::store::client_chat::sanitize_system_event_text(failure_code);
         let failure_code = failure_code.as_str();
         let chunk = sanitize_job_log_chunk(log);
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|e| {
             AppError::Internal(format!("begin fail cleanup transaction failed: {e}"))
         })?;
@@ -7082,7 +6937,7 @@ fn get_provisioning_job(
     .map_err(|e| AppError::Internal(format!("get job failed: {e}")))
 }
 
-fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSshHostRecord> {
+fn map_router_ssh_host_row(row: &crate::db::Row<'_>) -> crate::db::Result<RouterSshHostRecord> {
     let methods_json: String = row.get(21)?;
     let contacts_json: String = row.get(22)?;
     let currency: Option<String> = row.get(23)?;
@@ -7129,7 +6984,7 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
     })
 }
 
-fn map_provisioning_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProvisioningJobRecord> {
+fn map_provisioning_job_row(row: &crate::db::Row<'_>) -> crate::db::Result<ProvisioningJobRecord> {
     let owners_json: String = row.get(5)?;
     let regions_json: String = row.get(6)?;
     let selection_owners: Vec<String> = serde_json::from_str(&owners_json).unwrap_or_default();
@@ -7155,9 +7010,9 @@ fn map_provisioning_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provisi
 }
 
 fn collect_host_rows(
-    rows: rusqlite::MappedRows<
+    rows: crate::db::MappedRows<
         '_,
-        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RouterSshHostRecord>,
+        impl FnMut(&crate::db::Row<'_>) -> crate::db::Result<RouterSshHostRecord>,
     >,
 ) -> Result<Vec<RouterSshHostRecord>, AppError> {
     let mut output = Vec::new();
@@ -7200,7 +7055,8 @@ mod tests {
             ssh_public_addr: String::new(),
             use_localhost: true,
             lease_ttl_secs: 60,
-            db_path: root.join("router.db"),
+            data_dir: root.clone(),
+            database: crate::config::DatabaseConfig::local(root.join("router.db")),
             host_key_path: root.join("host-key"),
             provision_ssh_private_key_path: root.join("provision-key"),
             provision_ssh_public_key_path: root.join("provision-key.pub"),
@@ -7569,7 +7425,7 @@ mod tests {
     #[test]
     fn schema_excludes_legacy_prepaid_billing_contract() {
         let conn = Connection::open_in_memory().expect("open in-memory database");
-        init_schema(&conn).expect("initialize Client Market schema");
+        crate::schema::apply(&conn).expect("initialize database baseline");
 
         for table in [
             "client_market_invoices",
@@ -8111,7 +7967,7 @@ mod tests {
             .unwrap();
 
         {
-            let mut conn = store.conn.lock().await;
+            let conn = store.conn.lock().await;
             insert_installation(&conn, "installation-bound", "client@example.com");
             assert!(matches!(
                 authorize_client_market_subdomain_claim(
@@ -9831,7 +9687,7 @@ mod tests {
             .expect("commit fixed-duration free Host quote");
         let activated_at = Utc::now();
         {
-            let mut conn = store.conn.lock().await;
+            let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE router_ssh_hosts SET free_duration_days = 30 WHERE id = ?1",
                 params![host.id],
@@ -9930,7 +9786,7 @@ mod tests {
             vec!["expired-free-client".to_string()]
         );
         {
-            let mut conn = store.conn.lock().await;
+            let conn = store.conn.lock().await;
             let tx = conn.transaction().unwrap();
             crate::client_market_trade::cleanup_started_tx(
                 &tx,

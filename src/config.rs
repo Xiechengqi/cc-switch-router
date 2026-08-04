@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,124 @@ pub const MAX_REQUEST_LOG_RETENTION_DAYS: u32 = 365;
 /// Historical hardcoded IP-intelligence origins. Kept as the default so existing
 /// deployments keep working; override with `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS`.
 const DEFAULT_IP_INTEL_ENDPOINTS: &[&str] = &["http://3.0.3.0", "http://3.0.2.1", "http://3.0.2.9"];
+
+pub const DEFAULT_DB_SYNC_INTERVAL_SECS: u64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseMode {
+    Local,
+    Turso,
+}
+
+impl DatabaseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Turso => "turso",
+        }
+    }
+
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "turso" => Ok(Self::Turso),
+            _ => Err(format!(
+                "CC_SWITCH_ROUTER_DB_MODE must be local or turso, got: {value}"
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DatabaseConfig {
+    pub mode: DatabaseMode,
+    /// Local database file in local mode; embedded-replica file in Turso mode.
+    pub path: PathBuf,
+    pub turso_url: Option<String>,
+    pub turso_auth_token: Option<String>,
+    pub sync_interval_secs: u64,
+}
+
+impl DatabaseConfig {
+    #[cfg(test)]
+    pub fn local(path: PathBuf) -> Self {
+        Self {
+            mode: DatabaseMode::Local,
+            path,
+            turso_url: None,
+            turso_auth_token: None,
+            sync_interval_secs: DEFAULT_DB_SYNC_INTERVAL_SECS,
+        }
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.path.as_os_str().is_empty() {
+            return Err("CC_SWITCH_ROUTER_DB_PATH cannot be empty".into());
+        }
+        if !(1..=3_600).contains(&self.sync_interval_secs) {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS must be between 1 and 3600, got: {}",
+                self.sync_interval_secs
+            ));
+        }
+        if self.mode == DatabaseMode::Turso {
+            let url = self
+                .turso_url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "CC_SWITCH_ROUTER_TURSO_URL is required in turso mode".to_string()
+                })?;
+            validate_turso_url(url)?;
+            if self
+                .turso_auth_token
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err("CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN is required in turso mode".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_turso_url(value: &str) -> std::result::Result<(), String> {
+    let parsed = url::Url::parse(value.trim())
+        .map_err(|_| "CC_SWITCH_ROUTER_TURSO_URL must be a valid URL".to_string())?;
+    if !matches!(parsed.scheme(), "libsql" | "https") {
+        return Err("CC_SWITCH_ROUTER_TURSO_URL must use libsql:// or https://".into());
+    }
+    if parsed.host_str().is_none() {
+        return Err("CC_SWITCH_ROUTER_TURSO_URL must include a host".into());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "CC_SWITCH_ROUTER_TURSO_URL must not contain credentials, query, or fragment; use CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN for authentication"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+impl fmt::Debug for DatabaseConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DatabaseConfig")
+            .field("mode", &self.mode)
+            .field("path", &self.path)
+            .field("turso_url", &self.turso_url)
+            .field(
+                "turso_auth_token",
+                &self.turso_auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("sync_interval_secs", &self.sync_interval_secs)
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
@@ -68,7 +187,8 @@ pub struct Config {
     pub ssh_public_addr: String,
     pub use_localhost: bool,
     pub lease_ttl_secs: i64,
-    pub db_path: PathBuf,
+    pub data_dir: PathBuf,
+    pub database: DatabaseConfig,
     pub host_key_path: PathBuf,
     /// Outbound Client Market SSH private key (default `$HOME/.ssh/cc-switch-router-provision`).
     pub provision_ssh_private_key_path: PathBuf,
@@ -135,6 +255,29 @@ impl Config {
             env_var("CC_SWITCH_ROUTER_OWNER_EMAIL").as_deref(),
             &tunnel_domain,
         );
+        let data_dir = env_var("CC_SWITCH_ROUTER_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_data_dir);
+        let database = DatabaseConfig {
+            mode: DatabaseMode::parse(
+                env_var("CC_SWITCH_ROUTER_DB_MODE")
+                    .as_deref()
+                    .unwrap_or("local"),
+            )
+            .unwrap_or_else(|message| panic!("{message}")),
+            path: env_var("CC_SWITCH_ROUTER_DB_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_db_path_in(&data_dir)),
+            turso_url: env_var("CC_SWITCH_ROUTER_TURSO_URL"),
+            turso_auth_token: env_var("CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN"),
+            sync_interval_secs: env_var("CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS")
+                .map(|value| {
+                    value.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("invalid CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS: {value}")
+                    })
+                })
+                .unwrap_or(DEFAULT_DB_SYNC_INTERVAL_SECS),
+        };
         let provision_ssh_private_key_path =
             env_var("CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH")
                 .or_else(|| env_var("CC_SWITCH_ROUTER_PROVISION_SSH_KEY_PATH"))
@@ -163,12 +306,11 @@ impl Config {
             lease_ttl_secs: env_var("CC_SWITCH_ROUTER_LEASE_TTL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
-            db_path: env_var("CC_SWITCH_ROUTER_DB_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(default_db_path),
+            data_dir: data_dir.clone(),
+            database,
             host_key_path: env_var("CC_SWITCH_ROUTER_HOST_KEY_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(default_host_key_path),
+                .unwrap_or_else(|| data_dir.join("ssh_host_ed25519_key")),
             provision_ssh_private_key_path,
             provision_ssh_public_key_path,
             cleanup_interval_secs: env_var("CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS")
@@ -312,7 +454,7 @@ impl Config {
                 enabled: env_bool("CC_SWITCH_ROUTER_METRICS_ENABLED", true),
                 db_path: env_var("CC_SWITCH_ROUTER_METRICS_DB_PATH")
                     .map(PathBuf::from)
-                    .unwrap_or_else(default_metrics_db_path),
+                    .unwrap_or_else(|| default_metrics_db_path_in(&data_dir)),
                 retention_days: env_var("CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(7),
@@ -344,6 +486,17 @@ impl Config {
 
     pub fn validate_official_provider_config(&self) -> std::result::Result<(), String> {
         validate_official_provider_config(self.use_localhost, self.router_owner_email.as_deref())
+    }
+
+    pub fn validate_database_config(&self) -> std::result::Result<(), String> {
+        self.database.validate()?;
+        if self.data_dir.as_os_str().is_empty() {
+            return Err("CC_SWITCH_ROUTER_DATA_DIR cannot be empty".into());
+        }
+        if self.database.path == self.metrics.db_path {
+            return Err("business database and metrics database must use different paths".into());
+        }
+        Ok(())
     }
 
     pub fn tunnel_url(&self, subdomain: &str) -> String {
@@ -378,18 +531,23 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 pub fn default_db_path() -> PathBuf {
-    path_in_home(&format!("{APP_NAME}.db"))
-        .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}.db")))
+    default_db_path_in(&default_data_dir())
 }
 
 pub fn default_metrics_db_path() -> PathBuf {
-    path_in_home(&format!("{APP_NAME}-metrics.db"))
-        .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}-metrics.db")))
+    default_metrics_db_path_in(&default_data_dir())
 }
 
 pub fn default_host_key_path() -> PathBuf {
-    path_in_home("ssh_host_ed25519_key")
-        .unwrap_or_else(|| PathBuf::from("./data/ssh_host_ed25519_key"))
+    default_data_dir().join("ssh_host_ed25519_key")
+}
+
+fn default_db_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(format!("{APP_NAME}.db"))
+}
+
+fn default_metrics_db_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(format!("{APP_NAME}-metrics.db"))
 }
 
 pub fn default_provision_ssh_private_key_path() -> PathBuf {
@@ -468,7 +626,13 @@ CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR=
 CC_SWITCH_ROUTER_OWNER_EMAIL=
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
+CC_SWITCH_ROUTER_DATA_DIR={}
+CC_SWITCH_ROUTER_DB_MODE=local
 CC_SWITCH_ROUTER_DB_PATH={}
+# Required only when CC_SWITCH_ROUTER_DB_MODE=turso.
+CC_SWITCH_ROUTER_TURSO_URL=
+CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN=
+CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS=60
 CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS=300
 CC_SWITCH_ROUTER_LEASE_RETENTION_SECS=86400
 CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS=30
@@ -543,6 +707,7 @@ CC_SWITCH_ROUTER_METRICS_DB_PATH={}
 CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS=7
 CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS=5
 ",
+        default_data_dir().display(),
         default_db_path().display(),
         default_metrics_db_path().display()
     )
@@ -705,7 +870,8 @@ mod tests {
             ssh_public_addr: String::new(),
             use_localhost: true,
             lease_ttl_secs: 60,
-            db_path: PathBuf::from("/tmp/test.db"),
+            data_dir: PathBuf::from("/tmp"),
+            database: DatabaseConfig::local(PathBuf::from("/tmp/test.db")),
             host_key_path: PathBuf::from("/tmp/test.key"),
             provision_ssh_private_key_path: PathBuf::from("/tmp/test_id_rsa"),
             provision_ssh_public_key_path: PathBuf::from("/tmp/test_id_rsa.pub"),
@@ -795,6 +961,77 @@ mod tests {
     #[test]
     fn default_env_includes_request_log_retention_default() {
         assert!(default_env_contents().contains("CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS=30"));
+    }
+
+    #[test]
+    fn database_defaults_to_local_mode() {
+        let contents = default_env_contents();
+        assert!(contents.contains("CC_SWITCH_ROUTER_DB_MODE=local"));
+        assert!(contents.contains("CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS=60"));
+        assert_eq!(DatabaseMode::parse("LOCAL"), Ok(DatabaseMode::Local));
+        assert_eq!(DatabaseMode::parse("turso"), Ok(DatabaseMode::Turso));
+        assert!(DatabaseMode::parse("remote").is_err());
+    }
+
+    #[test]
+    fn turso_database_config_requires_valid_url_and_token() {
+        let mut database = DatabaseConfig {
+            mode: DatabaseMode::Turso,
+            path: PathBuf::from("/tmp/router-replica.db"),
+            turso_url: None,
+            turso_auth_token: None,
+            sync_interval_secs: DEFAULT_DB_SYNC_INTERVAL_SECS,
+        };
+        assert!(database.validate().unwrap_err().contains("TURSO_URL"));
+
+        database.turso_url = Some("libsql://router-example.turso.io".into());
+        assert!(database.validate().unwrap_err().contains("AUTH_TOKEN"));
+
+        database.turso_auth_token = Some("secret-token".into());
+        assert!(database.validate().is_ok());
+        database.turso_url = Some("https://router-example.turso.io".into());
+        assert!(database.validate().is_ok());
+
+        for invalid in [
+            "http://router-example.turso.io",
+            "libsql://",
+            "libsql://user:password@router-example.turso.io",
+            "libsql://router-example.turso.io?authToken=secret",
+            "not-a-url",
+        ] {
+            database.turso_url = Some(invalid.into());
+            assert!(
+                database.validate().is_err(),
+                "accepted invalid URL: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_sync_interval_is_bounded() {
+        let mut database = DatabaseConfig::local(PathBuf::from("/tmp/router.db"));
+        database.sync_interval_secs = 0;
+        assert!(database.validate().is_err());
+        database.sync_interval_secs = 1;
+        assert!(database.validate().is_ok());
+        database.sync_interval_secs = 3_600;
+        assert!(database.validate().is_ok());
+        database.sync_interval_secs = 3_601;
+        assert!(database.validate().is_err());
+    }
+
+    #[test]
+    fn database_debug_redacts_turso_token() {
+        let database = DatabaseConfig {
+            mode: DatabaseMode::Turso,
+            path: PathBuf::from("/tmp/router-replica.db"),
+            turso_url: Some("libsql://router-example.turso.io".into()),
+            turso_auth_token: Some("do-not-log-this-token".into()),
+            sync_interval_secs: DEFAULT_DB_SYNC_INTERVAL_SECS,
+        };
+        let debug = format!("{database:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("do-not-log-this-token"));
     }
 
     #[test]

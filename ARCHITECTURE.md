@@ -44,7 +44,7 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
   (Cloudflare)    │                                    │
   SSH   ────────► │  SSH 反向隧道服务端 (:2222)           │
                   │                                    │
-                  │  SQLite ×2(主库 + 独立 metrics 库)   │
+                  │  libSQL 业务库 + 本地 metrics 库    │
                   └────────────────────────────────────┘
                                   ▲
                                   │ SSH reverse tunnel
@@ -52,7 +52,7 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
                          cc-switch-server 实例
 ```
 
-核心依赖:`axum`、`russh`、`rusqlite`、`tokio`、`reqwest`。
+核心依赖:`axum`、`russh`、`libsql`、`tokio`、`reqwest`。
 
 **客户端**:`cc-switch-server` 是唯一客户端。`install-client.sh` 负责在远程主机上部署它。
 
@@ -99,7 +99,7 @@ Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 
 - Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
 - **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
 
-市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `free_duration_days`，Subscription 另存 `activated_at` / `expires_at`。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 SQLite Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
+市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `free_duration_days`，Subscription 另存 `activated_at` / `expires_at`。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
 
 账户 UI 以 `/account/market-readiness` 作为供应商运营摘要，聚合收款资料、待准入数量、账务待办与四项准入策略；实际写操作仍分别归属收款信息、市场准入和市场账务页面。账务页以待处理、应付、应收、历史和管理员争议分区，不引入独立的前端账务状态。
 
@@ -184,14 +184,14 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 层 | 结构 | 存储 |
 |---|---|---|
 | 注册准入 | 全局 / 来源 / 公钥三级 TokenBucket | 内存(`registration_admission.rs:465`) |
-| 新身份配额 | 10 分钟 / 小时 / 日 滑窗 | SQLite(重启不重置) |
-| 未绑定 Owner 水位 | 默认 50000,达到后暂停新身份准入 | SQLite |
+| 新身份配额 | 10 分钟 / 小时 / 日 滑窗 | 业务 libSQL(重启不重置) |
+| 未绑定 Owner 水位 | 默认 50000,达到后暂停新身份准入 | 业务 libSQL |
 | 请求并发 | 6 个 `KeyedConcurrencyLimiter` | 内存(`proxy.rs:562-573`) |
 | 认证滥用 | 10 分钟 10 次失败 → 封禁 1 小时 | 内存(`abuse.rs:6-8`) |
 
 并发限流键位:`share_id`、`share_id:app`、`share_id:app:email`、用户 IP(免费档)、图片任务、市场邮箱。
 
-> **已知限制**:内存 TokenBucket 无持久化,进程重启即清零。SQLite 侧的新身份配额能兜住真正的身份创建,但尝试洪水本身在重启瞬间不受限。
+> **已知限制**:内存 TokenBucket 无持久化,进程重启即清零。业务库侧的新身份配额能兜住真正的身份创建,但尝试洪水本身在重启瞬间不受限。
 
 ### 真实客户端 IP
 
@@ -206,11 +206,19 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 ## 5. 数据层
 
-主库与 metrics 库分离,当前共 96 张表。
+业务库与 metrics 库分离。业务库当前有 96 张业务表,另有 1 张 `schema_migrations` 元数据表。
 
-**连接模型**:单个 `Arc<Mutex<Connection>>`,WAL 模式、外键开启、`busy_timeout = 5000ms`(`store.rs:1241-1246`)。
+**数据库模式**:
 
-**迁移策略**:无版本表。`CREATE TABLE IF NOT EXISTS` 建表,再经 `PRAGMA table_info` 探测后 `ALTER TABLE ADD COLUMN` 补列(`store.rs:13068+`)。每次启动全量重跑,幂等但无回滚路径。
+- `local`:独立本地 libSQL 文件,WAL 模式。
+- `turso`:Turso Cloud Embedded Replica,本地读、远端委派写,周期拉取远端 frame。未启用 offline writes,远端不可用时写操作失败并将健康状态置为 unavailable。
+- metrics 始终通过独立本地 `libsql-rusqlite` 文件存储,不进入 Turso。
+
+**连接模型**:业务读写保留单个 `Arc<Mutex<Connection>>`,外键开启、`busy_timeout = 5000ms`;local 模式额外启用 WAL。同步 facade 在专用 Tokio runtime 执行 libSQL async I/O,从而保持现有 store 的同步 SQL 边界。Turso 周期同步通过独立的 database handle 运行,健康快照通过共享原子状态读取,两者都不获取业务连接 mutex。
+
+**Schema 策略**:仅支持全新环境。空库首次启动在 `BEGIN IMMEDIATE` 事务中安装 `schema/0001_baseline.sql`,随后写入版本与 SHA-256 checksum。非空且没有迁移元数据的旧库、未知版本和 checksum 不匹配都会拒绝启动,不执行历史探测、补列或数据迁移。
+
+**Turso 运行约束**:只支持单个可写 Router 实例,不包含 leader election 或多写协调。`/v1/healthz` 暴露模式、可用状态、最近同步/失败时间、连续失败次数与同步 frame 数；远端故障时返回 503,但不向调用方暴露底层连接错误或 Token。
 
 ### 表分组
 
@@ -238,7 +246,8 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 ### 已知限制
 
-- **单连接全局锁**:所有 store 方法(含只读)都要 `self.conn.lock().await`。WAL 对跨进程并发读有效,但不缓解进程内这把 tokio Mutex 的串行化。这是当前最确定的扩展性瓶颈。
+- **单连接全局锁**:所有业务 store 方法(含只读)都要 `self.conn.lock().await`。local 模式的 WAL 不缓解进程内这把 tokio Mutex 的串行化；Turso 委派写也经过该锁。周期 replica sync 和健康快照不经过该锁。这仍是当前最确定的扩展性瓶颈。
+- **单活 Turso 写实例**:当前不支持多个 Router 同时写同一 Turso 数据库；云端不可用时写请求直接失败,没有本地补写队列。
 - **`user_api_tokens.token_plaintext`**:默认 token 以明文存储,以支持在 UI 中重复展示 API key(`store.rs:12756, 23472`)。同表已有 `token_hash`。DB 泄露即等于活跃 token 泄露。
 - 健康检查类表使用 AUTOINCREMENT 追加,依赖 `cleanup_expired_data` 清理而非 schema 层 TTL。
 
@@ -246,7 +255,7 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 聊天室身份只使用 `installation.id`。每个已验证 Owner 的 installation 最多有一个 active 房间,该 Client 下所有 Share、Share Market 租约、Client Market 租约和统一账务事件都写入同一房间；系统不创建 Share 房间或 Share 成员期。
 
-业务事务先在同一 SQLite 事务内写入 `client_chat_system_outbox`,后台再物化为 `author_kind=system`、`message_kind=market_event` 的不可删除消息。`source_kind + source_event_id + installation_id` 提供幂等键；失败事件指数退避,达到上限进入 dead-letter,不会阻塞后续事件。Owner、Provider、租客和事件 actor 会自动写入 `chat_visits`,因此可在各自入口看到房间与未读数。
+业务事务先在同一 libSQL 事务内写入 `client_chat_system_outbox`,后台再物化为 `author_kind=system`、`message_kind=market_event` 的不可删除消息。`source_kind + source_event_id + installation_id` 提供幂等键；失败事件指数退避,达到上限进入 dead-letter,不会阻塞后续事件。Owner、Provider、租客和事件 actor 会自动写入 `chat_visits`,因此可在各自入口看到房间与未读数。
 
 市场系统消息公开完整交易上下文,包括双方邮箱、金额、收款资料、付款凭证、reference/note、争议或回收原因和不含凭据的原始错误。物化系统消息时,仅当同源收款图片属于 payload 中的 Owner/Provider/Supplier,才写入 `chat_public_payment_assets`；该映射随消息级联删除并阻止资料更新提前清理图片。后端禁止 API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥、SSH/lease 凭据和带凭据 query/fragment 的 URL 进入 outbox；仅 `kind=crypto` 的 `USDT`/`USDC` 收款资产符号可使用 `token` 字段。前端渲染前再次过滤。系统消息不创建 `chat_email_events`,只有真人访客消息可触发 Owner 聊天提醒邮件。
 

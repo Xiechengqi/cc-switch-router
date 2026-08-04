@@ -1522,6 +1522,19 @@ pub struct IssueLeaseResponse {
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub ok: bool,
+    pub database: DatabaseHealthResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseHealthResponse {
+    pub mode: String,
+    pub available: bool,
+    pub last_attempt_at_ms: Option<i64>,
+    pub last_success_at_ms: Option<i64>,
+    pub last_failure_at_ms: Option<i64>,
+    pub consecutive_failures: u64,
+    pub last_frames_synced: u64,
 }
 
 #[derive(Debug, Serialize)]

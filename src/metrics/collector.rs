@@ -307,7 +307,7 @@ fn read_process_uptime_secs() -> Option<u64> {
 fn read_disk_usage(config: &Config, metrics_db_path: &Path) -> Vec<DiskUsage> {
     let mut paths = vec![
         ("root".to_string(), PathBuf::from("/")),
-        ("business db".to_string(), config.db_path.clone()),
+        ("business db".to_string(), config.database.path.clone()),
         ("metrics db".to_string(), metrics_db_path.to_path_buf()),
         (
             "logs".to_string(),

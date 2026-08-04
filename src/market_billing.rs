@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
+use crate::db::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -352,217 +352,6 @@ fn default_settlement_grace_hours() -> i64 {
     DEFAULT_SETTLEMENT_GRACE_HOURS
 }
 
-pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS supplier_billing_profiles (
-            supplier_user_id TEXT NOT NULL,
-            supplier_email TEXT NOT NULL,
-            currency TEXT NOT NULL,
-            settlement_grace_hours INTEGER NOT NULL DEFAULT 24,
-            revision INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (supplier_user_id, currency)
-        );
-        CREATE TABLE IF NOT EXISTS market_credit_accounts (
-            id TEXT PRIMARY KEY,
-            buyer_user_id TEXT NOT NULL,
-            buyer_email TEXT NOT NULL,
-            supplier_user_id TEXT NOT NULL,
-            supplier_email TEXT NOT NULL,
-            currency TEXT NOT NULL,
-            status TEXT NOT NULL,
-            balance_units INTEGER NOT NULL DEFAULT 0,
-            open_invoice_id TEXT,
-            close_requested INTEGER NOT NULL DEFAULT 0,
-            credit_kind TEXT NOT NULL CHECK (credit_kind IN ('none', 'limited', 'unlimited')),
-            credit_limit_minor INTEGER,
-            credit_source TEXT NOT NULL CHECK (credit_source IN ('counterparty', 'public')),
-            credit_revision INTEGER NOT NULL,
-            version INTEGER NOT NULL DEFAULT 1,
-            last_warning_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE (buyer_user_id, supplier_user_id, currency)
-        );
-        CREATE TABLE IF NOT EXISTS market_service_contracts (
-            id TEXT PRIMARY KEY,
-            account_id TEXT NOT NULL,
-            product_kind TEXT NOT NULL,
-            product_ref TEXT NOT NULL,
-            service_ref TEXT NOT NULL,
-            service_label TEXT NOT NULL,
-            buyer_user_id TEXT NOT NULL,
-            buyer_email TEXT NOT NULL,
-            supplier_user_id TEXT NOT NULL,
-            supplier_email TEXT NOT NULL,
-            currency TEXT NOT NULL,
-            daily_rate_minor INTEGER NOT NULL,
-            offer_revision INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            trial_seconds_remaining INTEGER NOT NULL,
-            health_state TEXT NOT NULL DEFAULT 'unknown',
-            desired_control_state TEXT NOT NULL DEFAULT 'active',
-            applied_control_state TEXT NOT NULL DEFAULT 'active',
-            control_error TEXT,
-            last_evaluated_at TEXT NOT NULL,
-            activated_at TEXT NOT NULL,
-            suspended_at TEXT,
-            terminated_at TEXT,
-            termination_reason TEXT,
-            replacement_of TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_market_active_product_contract
-            ON market_service_contracts(product_kind, product_ref)
-            WHERE status != 'terminated';
-        CREATE INDEX IF NOT EXISTS idx_market_contract_account_status
-            ON market_service_contracts(account_id, status);
-        CREATE INDEX IF NOT EXISTS idx_market_contract_reconcile
-            ON market_service_contracts(status, last_evaluated_at);
-        CREATE TABLE IF NOT EXISTS market_service_intervals (
-            id TEXT PRIMARY KEY,
-            contract_id TEXT NOT NULL,
-            state TEXT NOT NULL,
-            observation_reason TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT NOT NULL,
-            elapsed_seconds INTEGER NOT NULL DEFAULT 0,
-            trial_seconds INTEGER NOT NULL DEFAULT 0,
-            billable_seconds INTEGER NOT NULL DEFAULT 0,
-            amount_units INTEGER NOT NULL DEFAULT 0,
-            invoice_id TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_intervals_contract
-            ON market_service_intervals(contract_id, started_at);
-        CREATE TABLE IF NOT EXISTS market_accrual_entries (
-            id TEXT PRIMARY KEY,
-            account_id TEXT NOT NULL,
-            contract_id TEXT NOT NULL,
-            interval_id TEXT NOT NULL UNIQUE,
-            currency TEXT NOT NULL,
-            daily_rate_minor INTEGER NOT NULL,
-            billable_seconds INTEGER NOT NULL,
-            amount_units INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            invoice_id TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_accrual_account_status
-            ON market_accrual_entries(account_id, status, created_at);
-        CREATE TABLE IF NOT EXISTS market_invoices (
-            id TEXT PRIMARY KEY,
-            account_id TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            amount_minor INTEGER NOT NULL,
-            amount_cny_minor INTEGER NOT NULL,
-            usd_cny_rate_micros INTEGER NOT NULL,
-            amount_units INTEGER NOT NULL,
-            currency TEXT NOT NULL,
-            payment_methods_json TEXT NOT NULL,
-            payment_contacts_json TEXT NOT NULL,
-            payment_profile_updated_at TEXT NOT NULL,
-            status TEXT NOT NULL,
-            due_at TEXT NOT NULL,
-            deadline_at TEXT NOT NULL,
-            opened_at TEXT NOT NULL,
-            declared_at TEXT,
-            paid_at TEXT,
-            overdue_at TEXT,
-            disputed_at TEXT,
-            voided_at TEXT,
-            UNIQUE (account_id, sequence)
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_market_account_open_invoice
-            ON market_invoices(account_id)
-            WHERE status IN ('open', 'payment_declared', 'overdue', 'disputed');
-        CREATE TABLE IF NOT EXISTS market_invoice_lines (
-            id TEXT PRIMARY KEY,
-            invoice_id TEXT NOT NULL,
-            contract_id TEXT NOT NULL,
-            product_kind TEXT NOT NULL,
-            product_ref TEXT NOT NULL,
-            service_ref TEXT NOT NULL,
-            service_label TEXT NOT NULL,
-            daily_rate_minor INTEGER NOT NULL,
-            billable_seconds INTEGER NOT NULL,
-            amount_minor INTEGER NOT NULL,
-            amount_cny_minor INTEGER NOT NULL,
-            amount_units INTEGER NOT NULL,
-            service_started_at TEXT NOT NULL,
-            service_ended_at TEXT NOT NULL,
-            evidence_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_invoice_lines_invoice
-            ON market_invoice_lines(invoice_id, service_started_at);
-        CREATE TABLE IF NOT EXISTS market_payment_declarations (
-            id TEXT PRIMARY KEY,
-            invoice_id TEXT NOT NULL,
-            buyer_user_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            payment_method_kind TEXT,
-            payment_reference TEXT,
-            note TEXT,
-            evidence_url TEXT,
-            declared_at TEXT NOT NULL,
-            rejected_at TEXT,
-            rejection_reason TEXT
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_market_active_payment_declaration
-            ON market_payment_declarations(invoice_id)
-            WHERE status = 'declared';
-        CREATE TABLE IF NOT EXISTS market_payment_receipts (
-            id TEXT PRIMARY KEY,
-            invoice_id TEXT NOT NULL UNIQUE,
-            declaration_id TEXT NOT NULL,
-            supplier_user_id TEXT NOT NULL,
-            confirmed_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS market_billing_disputes (
-            id TEXT PRIMARY KEY,
-            invoice_id TEXT NOT NULL,
-            opened_by_user_id TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            status TEXT NOT NULL,
-            resolution TEXT,
-            created_at TEXT NOT NULL,
-            resolved_at TEXT
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_market_dispute_invoice
-            ON market_billing_disputes(invoice_id);
-        CREATE TABLE IF NOT EXISTS market_credit_restrictions (
-            id TEXT PRIMARY KEY,
-            buyer_user_id TEXT NOT NULL,
-            invoice_id TEXT NOT NULL UNIQUE,
-            reason TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            lifted_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_restrictions_buyer
-            ON market_credit_restrictions(buyer_user_id, status);
-        CREATE TABLE IF NOT EXISTS market_billing_events (
-            id TEXT PRIMARY KEY,
-            account_id TEXT,
-            contract_id TEXT,
-            invoice_id TEXT,
-            actor_user_id TEXT,
-            event_type TEXT NOT NULL,
-            detail_json TEXT NOT NULL,
-            idempotency_key TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_billing_events_account
-            ON market_billing_events(account_id, created_at);",
-    )?;
-    Ok(())
-}
-
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/market-billing/config", get(get_billing_config))
@@ -711,7 +500,7 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
         .map_err(|_| AppError::Internal("stored billing timestamp is invalid".into()))
 }
 
-fn map_db(context: &'static str) -> impl FnOnce(rusqlite::Error) -> AppError {
+fn map_db(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
 
@@ -1846,7 +1635,7 @@ impl AppStore {
         currency: &str,
     ) -> Result<(), AppError> {
         let currency = normalize_currency(currency)?;
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin supplier billing profile check"))?;
@@ -1865,7 +1654,7 @@ impl AppStore {
         currency: &str,
     ) -> Result<(), AppError> {
         let currency = normalize_currency(currency)?;
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin market credit eligibility check"))?;
@@ -1895,7 +1684,7 @@ impl AppStore {
             ));
         }
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin supplier billing profile update"))?;
@@ -1943,7 +1732,7 @@ impl AppStore {
         now: DateTime<Utc>,
     ) -> Result<String, AppError> {
         let now = now.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market billing contract activation"))?;
@@ -1961,7 +1750,7 @@ impl AppStore {
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let now = now.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market billing contract termination"))?;
@@ -2060,7 +1849,7 @@ impl AppStore {
         suspended: bool,
     ) -> Result<Option<String>, AppError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Client billing suspension"))?;
@@ -2474,7 +2263,7 @@ impl AppStore {
         before_sequence: Option<i64>,
         limit: usize,
     ) -> Result<BillingInvoiceHistoryView, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin market invoice history read"))?;
@@ -2581,7 +2370,7 @@ impl AppStore {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let usd_cny_rate_micros = self.market_usd_cny_rate_micros();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin voluntary market settlement"))?;
@@ -2747,7 +2536,7 @@ impl AppStore {
         let note = note.map(|value| crate::store::client_chat::sanitize_system_event_text(&value));
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market payment declaration"))?;
@@ -2823,7 +2612,7 @@ impl AppStore {
     ) -> Result<Vec<BillingAction>, AppError> {
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market receipt confirmation"))?;
@@ -2963,7 +2752,7 @@ impl AppStore {
         let reason = crate::store::client_chat::sanitize_system_event_text(reason);
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market payment rejection"))?;
@@ -3049,7 +2838,7 @@ impl AppStore {
         let reason = crate::store::client_chat::sanitize_system_event_text(reason);
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market billing dispute"))?;
@@ -3180,7 +2969,7 @@ impl AppStore {
         let note = sanitized_note.as_deref();
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market dispute resolution"))?;
@@ -3314,7 +3103,7 @@ impl AppStore {
         let reason = crate::store::client_chat::sanitize_system_event_text(reason);
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market invoice void"))?;
@@ -4167,7 +3956,7 @@ impl AppStore {
         now: DateTime<Utc>,
     ) -> Result<Vec<BillingAction>, AppError> {
         let usd_cny_rate_micros = self.market_usd_cny_rate_micros();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market billing reconciliation"))?;
@@ -4586,7 +4375,7 @@ mod tests {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let now = Utc::now();
         let (subscription_id, installation_id) = {
-            let mut conn = store.conn.lock().await;
+            let conn = store.conn.lock().await;
             let fixture = insert_share_billing_chat_fixture(&conn, now);
             conn.execute(
                 "INSERT INTO market_credit_accounts (

@@ -2,6 +2,7 @@ use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration as StdDuration;
 
+use crate::db::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, header};
@@ -13,7 +14,6 @@ use futures_util::StreamExt;
 use image::{ImageFormat, ImageReader};
 use rand::seq::SliceRandom;
 use reqwest::redirect::Policy;
-use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
@@ -253,221 +253,6 @@ pub struct RentalView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_cleanup_job_id: Option<String>,
     pub updated_at: String,
-}
-
-pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS host_provider_profiles (
-            provider_id TEXT PRIMARY KEY,
-            owner_email TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS host_provider_daily_stats (
-            provider_id TEXT NOT NULL,
-            stat_date TEXT NOT NULL,
-            host_total INTEGER NOT NULL,
-            idle_total INTEGER NOT NULL,
-            allocated_total INTEGER NOT NULL,
-            external_client_total INTEGER NOT NULL,
-            online_samples INTEGER NOT NULL,
-            observed_samples INTEGER NOT NULL,
-            anomalous_host_samples INTEGER NOT NULL,
-            host_samples INTEGER NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (provider_id, stat_date)
-        );
-        CREATE TABLE IF NOT EXISTS account_payment_profiles (
-            user_id TEXT PRIMARY KEY,
-            owner_email TEXT NOT NULL,
-            methods_json TEXT NOT NULL DEFAULT '[]',
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS account_payment_methods (
-            id TEXT PRIMARY KEY,
-            profile_user_id TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            method_json TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(profile_user_id, position)
-        );
-        CREATE TABLE IF NOT EXISTS account_payment_assets (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            source_url TEXT NOT NULL,
-            media_type TEXT NOT NULL,
-            content BLOB NOT NULL,
-            sha256 TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(user_id, source_url, sha256)
-        );
-        CREATE TABLE IF NOT EXISTS client_market_allocation_quotes (
-            id TEXT PRIMARY KEY,
-            client_user_id TEXT NOT NULL,
-            client_owner_email TEXT NOT NULL,
-            status TEXT NOT NULL,
-            fixed_host_id TEXT,
-            expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS client_market_allocation_quote_items (
-            id TEXT PRIMARY KEY,
-            quote_id TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            host_id TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            host_owner_email TEXT NOT NULL,
-            country_code TEXT,
-            hostname TEXT,
-            daily_rate_minor INTEGER,
-            currency TEXT,
-            free_duration_days INTEGER,
-            offer_revision INTEGER NOT NULL,
-            UNIQUE(quote_id, position),
-            UNIQUE(quote_id, host_id)
-        );
-        CREATE TABLE IF NOT EXISTS client_market_batches (
-            id TEXT PRIMARY KEY,
-            quote_id TEXT NOT NULL UNIQUE,
-            client_user_id TEXT NOT NULL,
-            client_owner_email TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS client_market_subscriptions (
-            installation_id TEXT PRIMARY KEY,
-            host_id TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            host_owner_email TEXT NOT NULL,
-            client_user_id TEXT NOT NULL,
-            client_owner_email TEXT NOT NULL,
-            status TEXT NOT NULL,
-            daily_rate_minor INTEGER,
-            currency TEXT,
-            free_duration_days INTEGER,
-            offer_revision INTEGER NOT NULL,
-            activated_at TEXT,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            released_at TEXT
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_client_market_active_subscription_host
-            ON client_market_subscriptions(host_id) WHERE status != 'released';
-        CREATE TABLE IF NOT EXISTS client_market_audit_events (
-            id TEXT PRIMARY KEY,
-            installation_id TEXT,
-            host_id TEXT,
-            actor_user_id TEXT,
-            actor_email TEXT,
-            event_type TEXT NOT NULL,
-            detail_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS client_market_offer_events (
-            id TEXT PRIMARY KEY,
-            host_id TEXT NOT NULL,
-            offer_revision INTEGER NOT NULL,
-            actor_user_id TEXT,
-            actor_email TEXT,
-            detail_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(host_id, offer_revision)
-        );
-        CREATE TABLE IF NOT EXISTS client_market_subscription_events (
-            id TEXT PRIMARY KEY,
-            installation_id TEXT NOT NULL,
-            host_id TEXT,
-            actor_user_id TEXT,
-            actor_email TEXT,
-            event_type TEXT NOT NULL,
-            detail_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_payment_methods_profile
-            ON account_payment_methods(profile_user_id, enabled, position);
-        CREATE INDEX IF NOT EXISTS idx_market_subscription_events_installation
-            ON client_market_subscription_events(installation_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_market_quotes_owner
-            ON client_market_allocation_quotes(client_user_id, status, expires_at);
-        CREATE INDEX IF NOT EXISTS idx_market_subscriptions_client
-            ON client_market_subscriptions(client_user_id, status);
-        CREATE INDEX IF NOT EXISTS idx_market_subscriptions_provider
-            ON client_market_subscriptions(provider_id, status);
-        ",
-    )?;
-    add_column(conn, "router_ssh_hosts", "provider_id", "TEXT")?;
-    add_column(conn, "router_ssh_hosts", "daily_rate_minor", "INTEGER")?;
-    add_column(conn, "router_ssh_hosts", "currency", "TEXT")?;
-    add_column(conn, "router_ssh_hosts", "free_duration_days", "INTEGER")?;
-    add_column(
-        conn,
-        "router_ssh_hosts",
-        "offer_revision",
-        "INTEGER NOT NULL DEFAULT 1",
-    )?;
-    add_column(conn, "provisioning_jobs", "batch_id", "TEXT")?;
-    add_column(conn, "provisioning_jobs", "quote_id", "TEXT")?;
-    add_column(conn, "provisioning_jobs", "client_owner_user_id", "TEXT")?;
-    add_column(conn, "provisioning_jobs", "cleanup_reason", "TEXT")?;
-    add_column(
-        conn,
-        "client_market_allocation_quote_items",
-        "currency",
-        "TEXT",
-    )?;
-    add_column(
-        conn,
-        "client_market_allocation_quote_items",
-        "free_duration_days",
-        "INTEGER",
-    )?;
-    add_column(conn, "client_market_subscriptions", "currency", "TEXT")?;
-    add_column(
-        conn,
-        "client_market_subscriptions",
-        "free_duration_days",
-        "INTEGER",
-    )?;
-    add_column(conn, "client_market_subscriptions", "activated_at", "TEXT")?;
-    add_column(conn, "client_market_subscriptions", "expires_at", "TEXT")?;
-    add_column(
-        conn,
-        "account_payment_profiles",
-        "contacts_json",
-        "TEXT NOT NULL DEFAULT '[]'",
-    )?;
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_router_ssh_hosts_provider_supply
-            ON router_ssh_hosts(provider_id, status, country_code);
-         CREATE INDEX IF NOT EXISTS idx_client_market_free_expiry
-            ON client_market_subscriptions(status, expires_at)
-            WHERE daily_rate_minor IS NULL AND expires_at IS NOT NULL;",
-    )?;
-    Ok(())
-}
-
-fn add_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<(), rusqlite::Error> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|value| value == column) {
-        conn.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        ))?;
-    }
-    Ok(())
 }
 
 pub fn router() -> Router<ServerState> {
@@ -1485,7 +1270,7 @@ impl AppStore {
         event_type: &str,
         detail: serde_json::Value,
     ) -> Result<(), AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin audit write failed: {error}")))?;
@@ -1512,7 +1297,7 @@ impl AppStore {
         actor_user_id: &str,
         actor_email: &str,
     ) -> Result<ForceReleaseResponse, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let now = Utc::now();
         let tx = conn
             .transaction()
@@ -1599,7 +1384,7 @@ impl AppStore {
         &self,
         session: &AuthSession,
     ) -> Result<(), AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin creation gate check failed: {error}"))
         })?;
@@ -1635,7 +1420,7 @@ impl AppStore {
         let email = normalize_email(owner_email)?;
         let email_key = format!("email:{email}");
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin Provider sync failed: {error}")))?;
@@ -1816,7 +1601,7 @@ impl AppStore {
             AppError::Internal(format!("encode payment methods failed: {error}"))
         })?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin payment profile update failed: {error}"))
         })?;
@@ -2037,7 +1822,7 @@ impl AppStore {
         official_email: Option<&str>,
     ) -> Result<ProviderSupplyResponse, AppError> {
         let official_email = official_email.map(|value| value.trim().to_ascii_lowercase());
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         {
             let tx = conn.transaction().map_err(|error| {
                 AppError::Internal(format!("begin Provider supply heal failed: {error}"))
@@ -2321,7 +2106,7 @@ impl AppStore {
         let daily_rate_minor = validate_offer(daily_rate_minor)?;
         let currency = normalize_offer_currency(daily_rate_minor, currency)?;
         let free_duration_days = validate_free_duration_days(daily_rate_minor, free_duration_days)?;
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin offer update failed: {error}")))?;
@@ -2529,7 +2314,7 @@ impl AppStore {
             ));
         }
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin allocation quote failed: {error}"))
         })?;
@@ -2766,7 +2551,7 @@ impl AppStore {
         prepared: &[(String, String, String, i64)],
     ) -> Result<CommitQuoteResponse, AppError> {
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin quote commit failed: {error}")))?;
@@ -2984,7 +2769,7 @@ impl AppStore {
         session: &AuthSession,
     ) -> Result<(), AppError> {
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin quote cancellation failed: {error}"))
         })?;
@@ -3126,7 +2911,7 @@ impl AppStore {
         &self,
         now: DateTime<Utc>,
     ) -> Result<Vec<String>, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!(
                 "begin Client Market quote reconcile failed: {error}"
@@ -3237,7 +3022,7 @@ struct QuoteCandidate {
     offer_revision: i64,
 }
 
-fn map_quote_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuoteCandidate> {
+fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandidate> {
     Ok(QuoteCandidate {
         host_id: row.get(0)?,
         provider_id: row.get(1)?,
@@ -3399,7 +3184,7 @@ fn load_rental_views(
     let mut statement = conn
         .prepare(&sql)
         .map_err(|error| AppError::Internal(format!("prepare rental list failed: {error}")))?;
-    let mapper = |row: &rusqlite::Row<'_>| {
+    let mapper = |row: &crate::db::Row<'_>| {
         Ok(RentalRow {
             installation_id: row.get(0)?,
             host_id: row.get(1)?,
@@ -4226,7 +4011,7 @@ mod tests {
     #[tokio::test]
     async fn client_market_audit_redacts_credential_fragments_before_persistence() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
-        let mut conn = store.conn.lock().await;
+        let conn = store.conn.lock().await;
         let tx = conn
             .transaction()
             .expect("begin audit redaction transaction");

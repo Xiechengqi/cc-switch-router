@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
+use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -33,273 +33,6 @@ enum ChatDeliveryOutcome<'a> {
 
 const SHARE_OFFLINE_CONFIRM_SECS: i64 = 180;
 const SHARE_RECOVERY_CONFIRM_SECS: i64 = 120;
-
-pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS chat_rooms (
-            id TEXT PRIMARY KEY,
-            installation_id TEXT NOT NULL,
-            client_label_snapshot TEXT NOT NULL,
-            owner_user_id_snapshot TEXT,
-            owner_email_snapshot TEXT NOT NULL,
-            owner_generation INTEGER NOT NULL DEFAULT 1,
-            status TEXT NOT NULL DEFAULT 'active'
-                CHECK (status IN ('active', 'archived')),
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            last_message_at TEXT,
-            archived_at TEXT,
-            delete_after TEXT,
-            UNIQUE (installation_id, owner_generation)
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT,
-            id TEXT NOT NULL UNIQUE,
-            room_id TEXT NOT NULL,
-            author_user_id TEXT NOT NULL,
-            author_email TEXT NOT NULL,
-            author_label TEXT NOT NULL,
-            client_message_id TEXT NOT NULL,
-            author_kind TEXT NOT NULL DEFAULT 'user'
-                CHECK (author_kind IN ('user', 'system')),
-            message_kind TEXT NOT NULL DEFAULT 'text'
-                CHECK (message_kind IN ('text', 'market_event')),
-            event_type TEXT,
-            event_payload_json TEXT,
-            payload_version INTEGER NOT NULL DEFAULT 1,
-            source_event_id TEXT UNIQUE,
-            body TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'visible'
-                CHECK (status IN ('visible', 'deleted')),
-            deleted_by TEXT,
-            deleted_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE (room_id, author_user_id, client_message_id),
-            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_visits (
-            user_id TEXT NOT NULL,
-            room_id TEXT NOT NULL,
-            first_opened_at TEXT NOT NULL,
-            last_opened_at TEXT NOT NULL,
-            last_read_seq INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (user_id, room_id),
-            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS share_presence_state (
-            share_id TEXT PRIMARY KEY,
-            state TEXT NOT NULL DEFAULT 'unknown'
-                CHECK (state IN ('unknown', 'online', 'offline')),
-            router_epoch TEXT NOT NULL,
-            has_online_baseline INTEGER NOT NULL DEFAULT 0,
-            unhealthy_since TEXT,
-            healthy_since TEXT,
-            offline_episode INTEGER NOT NULL DEFAULT 0,
-            last_offline_event_id TEXT,
-            last_recovered_event_id TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS client_chat_system_outbox (
-            id TEXT PRIMARY KEY,
-            installation_id TEXT NOT NULL,
-            source_kind TEXT NOT NULL,
-            source_event_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            follower_user_ids_json TEXT NOT NULL DEFAULT '[]',
-            status TEXT NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'processing', 'completed', 'dead_letter')),
-            attempts INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at TEXT,
-            last_error TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            completed_at TEXT,
-            UNIQUE (source_kind, source_event_id, installation_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_public_payment_assets (
-            asset_id TEXT NOT NULL,
-            message_id TEXT NOT NULL,
-            room_id TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (asset_id, message_id),
-            FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE,
-            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_rate_limit (
-            scope TEXT NOT NULL,
-            bucket_start INTEGER NOT NULL,
-            count INTEGER NOT NULL,
-            PRIMARY KEY (scope, bucket_start)
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_email_events (
-            id TEXT PRIMARY KEY,
-            message_id TEXT NOT NULL UNIQUE,
-            room_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            owner_generation INTEGER NOT NULL,
-            recipient TEXT NOT NULL,
-            status TEXT NOT NULL,
-            window_started_at TEXT NOT NULL,
-            window_ends_at TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE,
-            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_email_deliveries (
-            id TEXT PRIMARY KEY,
-            room_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            client_label TEXT NOT NULL,
-            owner_generation INTEGER NOT NULL,
-            recipient TEXT NOT NULL,
-            from_address TEXT NOT NULL,
-            reply_to TEXT,
-            subject TEXT NOT NULL,
-            html_body TEXT NOT NULL,
-            text_body TEXT NOT NULL,
-            idempotency_key TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            not_before TEXT NOT NULL,
-            next_attempt_at TEXT,
-            claim_owner TEXT,
-            claim_expires_at TEXT,
-            provider_message_id TEXT,
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            sent_at TEXT,
-            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_email_delivery_items (
-            delivery_id TEXT NOT NULL,
-            event_id TEXT NOT NULL,
-            PRIMARY KEY (delivery_id, event_id),
-            FOREIGN KEY (delivery_id) REFERENCES chat_email_deliveries(id) ON DELETE CASCADE,
-            FOREIGN KEY (event_id) REFERENCES chat_email_events(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chat_rooms_status
-            ON chat_rooms(status, delete_after);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_rooms_active_installation
-            ON chat_rooms(installation_id) WHERE status = 'active';
-        CREATE INDEX IF NOT EXISTS idx_chat_messages_room_seq
-            ON chat_messages(room_id, seq DESC);
-        CREATE INDEX IF NOT EXISTS idx_chat_messages_author
-            ON chat_messages(author_user_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_chat_visits_user_recent
-            ON chat_visits(user_id, last_opened_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_client_chat_system_outbox_pending
-            ON client_chat_system_outbox(status, next_attempt_at, created_at);
-        CREATE INDEX IF NOT EXISTS idx_chat_public_payment_assets_asset
-            ON chat_public_payment_assets(asset_id);
-        CREATE INDEX IF NOT EXISTS idx_chat_events_pending
-            ON chat_email_events(status, window_ends_at, room_id, owner_generation);
-        CREATE INDEX IF NOT EXISTS idx_chat_delivery_claim
-            ON chat_email_deliveries(status, next_attempt_at, not_before, claim_expires_at);
-        CREATE INDEX IF NOT EXISTS idx_chat_delivery_recent
-            ON chat_email_deliveries(created_at DESC, id DESC);
-        ",
-    )
-    .map_err(|error| {
-        AppError::Internal(format!("initialize client chat schema failed: {error}"))
-    })?;
-
-    let now = Utc::now();
-    conn.execute(
-        "INSERT OR IGNORE INTO chat_rooms (
-            id, installation_id, client_label_snapshot, owner_user_id_snapshot,
-            owner_email_snapshot,
-            owner_generation, status, created_at, updated_at
-         )
-         SELECT lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
-                substr(lower(hex(randomblob(2))), 2) || '-' ||
-                substr('89ab', abs(random()) % 4 + 1, 1) ||
-                substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6))),
-                i.id,
-                COALESCE(NULLIF(t.subdomain, ''), i.platform || ' · ' || substr(i.id, 1, 8)),
-                (SELECT u.id FROM users u WHERE u.email_normalized = lower(trim(i.owner_email))),
-                lower(trim(i.owner_email)), 1, 'active', ?1, ?1
-         FROM installations i
-         LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
-         WHERE i.owner_verified_at IS NOT NULL
-           AND i.owner_email IS NOT NULL
-           AND trim(i.owner_email) != ''",
-        params![now.to_rfc3339()],
-    )
-    .map_err(|error| AppError::Internal(format!("backfill client chat rooms failed: {error}")))?;
-
-    let verified_clients = {
-        let mut statement = conn
-            .prepare(
-                "SELECT id, lower(trim(owner_email))
-                 FROM installations
-                 WHERE owner_verified_at IS NOT NULL
-                   AND owner_email IS NOT NULL
-                   AND trim(owner_email) != ''",
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("prepare verified chat clients failed: {error}"))
-            })?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| {
-                AppError::Internal(format!("query verified chat clients failed: {error}"))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                AppError::Internal(format!("read verified chat clients failed: {error}"))
-            })?
-    };
-    for (installation_id, owner_email) in verified_clients {
-        ensure_room_for_verified_owner_tx(conn, &installation_id, &owner_email, now)?;
-    }
-
-    let ownerless_active_installations = {
-        let mut statement = conn
-            .prepare(
-                "SELECT r.installation_id
-                 FROM chat_rooms r
-                 LEFT JOIN installations i ON i.id = r.installation_id
-                 WHERE r.status = 'active'
-                   AND (i.id IS NULL OR i.owner_verified_at IS NULL
-                        OR i.owner_email IS NULL OR trim(i.owner_email) = '')",
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("prepare ownerless chat rooms failed: {error}"))
-            })?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| {
-                AppError::Internal(format!("query ownerless chat rooms failed: {error}"))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                AppError::Internal(format!("read ownerless chat rooms failed: {error}"))
-            })?
-    };
-    for installation_id in ownerless_active_installations {
-        archive_room_for_installation_tx(conn, &installation_id, now)?;
-    }
-    Ok(())
-}
 
 pub(super) fn ensure_room_for_verified_owner_tx(
     conn: &Connection,
@@ -983,7 +716,7 @@ impl AppStore {
         hasher.update(scope_value.as_bytes());
         let scope = format!("public-read:{}", hex::encode(hasher.finalize()));
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1160,7 +893,7 @@ impl AppStore {
             )));
         }
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1326,7 +1059,7 @@ impl AppStore {
             .map_err(|_| AppError::BadRequest("clientMessageId must be a UUID".into()))?;
         let body = normalize_chat_body(&body)?;
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1454,7 +1187,7 @@ impl AppStore {
     }
 
     pub async fn process_client_chat_system_outbox(&self, limit: usize) -> Result<usize, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let mut completed = 0;
         for _ in 0..limit.clamp(1, 200) {
             let now = Utc::now();
@@ -1545,7 +1278,7 @@ impl AppStore {
     ) -> Result<ClientChatMessageView, AppError> {
         validate_public_id(message_id, "message id")?;
         let now = Utc::now();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| AppError::Internal(format!("begin chat delete failed: {error}")))?;
@@ -1616,7 +1349,7 @@ impl AppStore {
         let Some(sender) = template.sender.as_deref() else {
             return Ok(ChatAggregateStats::default());
         };
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1883,7 +1616,7 @@ impl AppStore {
         now: DateTime<Utc>,
         lease_secs: i64,
     ) -> Result<Option<ChatDeliveryClaim>, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1972,7 +1705,7 @@ impl AppStore {
         worker_id: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, AppError> {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2116,7 +1849,7 @@ impl AppStore {
             } => ("retry", None, Some(error), Some(next_attempt_at)),
             ChatDeliveryOutcome::DeadLetter(error) => ("dead_letter", None, Some(error), None),
         };
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2268,7 +2001,7 @@ impl AppStore {
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         validate_public_id(delivery_id, "delivery id")?;
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2825,7 +2558,7 @@ fn latest_visible_message_preview(
     let sql = "SELECT seq, body, author_label, author_kind, message_kind, event_type,
                       event_payload_json, status, created_at
                FROM chat_messages WHERE room_id = ?1 ORDER BY seq DESC LIMIT 1";
-    let read = |row: &rusqlite::Row<'_>| {
+    let read = |row: &crate::db::Row<'_>| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -2918,7 +2651,7 @@ fn count_visible_messages_after(
     })
 }
 
-fn query_messages<P: rusqlite::Params>(
+fn query_messages<P: crate::db::Params>(
     conn: &Connection,
     sql: &str,
     params: P,

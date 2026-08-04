@@ -951,12 +951,13 @@ export type SettingsField = {
   key: string;
   label: string;
   group: string;
-  fieldType: "text" | "int" | "decimal" | "bool" | "path" | "url" | "email" | "email_list" | "ip_list" | "secret";
+  fieldType: "text" | "select" | "int" | "decimal" | "bool" | "path" | "url" | "email" | "email_list" | "ip_list" | "secret";
   required: boolean;
   restartRequired: boolean;
   default?: string | null;
   description: string;
   placeholder?: string | null;
+  options?: string[];
 };
 
 export type SettingsSchema = {

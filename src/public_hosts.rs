@@ -1,5 +1,5 @@
+use crate::db::{Connection, OptionalExtension, params};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::namespace::{
@@ -67,33 +67,7 @@ pub enum PublicHostCatalogError {
     #[error("public host catalog is corrupt: {0}")]
     Corrupt(String),
     #[error("public host catalog database error: {0}")]
-    Database(#[from] rusqlite::Error),
-}
-
-pub fn init_schema(conn: &Connection) -> Result<(), PublicHostCatalogError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS public_hosts (
-            label TEXT PRIMARY KEY COLLATE NOCASE,
-            route_id TEXT NOT NULL,
-            kind TEXT NOT NULL CHECK(kind IN ('client', 'share', 'market')),
-            subject_id TEXT NOT NULL,
-            installation_id TEXT,
-            target_lane_id TEXT NOT NULL,
-            lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active', 'disabled', 'tombstoned')),
-            revision INTEGER NOT NULL CHECK(revision > 0),
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_public_hosts_live_subject
-            ON public_hosts(kind, subject_id)
-            WHERE lifecycle != 'tombstoned';
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_public_hosts_live_route
-            ON public_hosts(route_id)
-            WHERE lifecycle != 'tombstoned';
-        CREATE INDEX IF NOT EXISTS idx_public_hosts_target_lane
-            ON public_hosts(target_lane_id, lifecycle);",
-    )?;
-    Ok(())
+    Database(#[from] crate::db::Error),
 }
 
 pub fn claim(
@@ -308,15 +282,15 @@ fn same_claim(existing: &PublicHostRecord, input: &NewPublicHost<'_>) -> bool {
         && existing.target_lane_id == input.target_lane_id
 }
 
-fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicHostRecord> {
+fn map_record(row: &crate::db::Row<'_>) -> crate::db::Result<PublicHostRecord> {
     let kind = match row.get::<_, String>(2)?.as_str() {
         "client" => PublicHostKind::Client,
         "share" => PublicHostKind::Share,
         "market" => PublicHostKind::Market,
         value => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
+            return Err(crate::db::Error::FromSqlConversionFailure(
                 2,
-                rusqlite::types::Type::Text,
+                crate::db::types::Type::Text,
                 Box::new(PublicHostCatalogError::Corrupt(format!(
                     "unknown public host kind {value}"
                 ))),
@@ -325,7 +299,7 @@ fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicHostRecord> {
     };
     let lifecycle_raw = row.get::<_, String>(6)?;
     let lifecycle = PublicHostLifecycle::parse(&lifecycle_raw).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+        crate::db::Error::FromSqlConversionFailure(6, crate::db::types::Type::Text, Box::new(error))
     })?;
     Ok(PublicHostRecord {
         label: row.get(0)?,
@@ -341,13 +315,13 @@ fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicHostRecord> {
     })
 }
 
-fn parse_time(value: String, column: usize) -> rusqlite::Result<DateTime<Utc>> {
+fn parse_time(value: String, column: usize) -> crate::db::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
+            crate::db::Error::FromSqlConversionFailure(
                 column,
-                rusqlite::types::Type::Text,
+                crate::db::types::Type::Text,
                 Box::new(error),
             )
         })
@@ -368,7 +342,7 @@ mod tests {
 
     fn database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
+        crate::schema::apply(&conn).unwrap();
         conn
     }
 

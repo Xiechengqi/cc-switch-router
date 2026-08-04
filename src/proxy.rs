@@ -4419,7 +4419,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(backend_hits.load(AtomicOrdering::SeqCst), 0);
-        let _ = std::fs::remove_file(&config.db_path);
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -4472,7 +4472,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(backend_hits.load(AtomicOrdering::SeqCst), 0);
-        let _ = std::fs::remove_file(&config.db_path);
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -4561,7 +4561,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(backend_hits.load(AtomicOrdering::SeqCst), 1);
-        let _ = std::fs::remove_file(&config.db_path);
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     fn proxy_test_state(config: &Config, proxy: Arc<ProxyRegistry>) -> ServerState {
@@ -4611,6 +4611,11 @@ mod tests {
     }
 
     fn proxy_test_config(name: &str) -> Config {
+        let data_dir = std::env::temp_dir();
+        let db_path = data_dir.join(format!(
+            "cc-switch-router-proxy-{name}-{}.db",
+            Uuid::new_v4()
+        ));
         Config {
             api_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -4618,10 +4623,8 @@ mod tests {
             ssh_public_addr: String::new(),
             use_localhost: true,
             lease_ttl_secs: 60,
-            db_path: std::env::temp_dir().join(format!(
-                "cc-switch-router-proxy-{name}-{}.db",
-                Uuid::new_v4()
-            )),
+            data_dir,
+            database: crate::config::DatabaseConfig::local(db_path),
             host_key_path: std::env::temp_dir().join(format!(
                 "cc-switch-router-proxy-{name}-{}.key",
                 Uuid::new_v4()
@@ -4723,7 +4726,7 @@ mod tests {
                 "INSERT INTO users
                     (id, email_normalized, status, created_at, last_login_at)
                  VALUES ('router-user', 'owner@example.com', 'active', ?1, ?1)",
-                rusqlite::params![now.to_rfc3339()],
+                crate::db::params![now.to_rfc3339()],
             )
             .unwrap();
             conn.execute(
@@ -4732,7 +4735,7 @@ mod tests {
                      access_expires_at, refresh_expires_at, created_at, last_used_at)
                  VALUES ('router-session', 'router-user', ?1, ?2, 'refresh-hash',
                          ?3, ?4, ?5, ?5)",
-                rusqlite::params![
+                crate::db::params![
                     registered.installation_id,
                     access_hash,
                     (now + chrono::Duration::hours(1)).to_rfc3339(),
@@ -4763,7 +4766,7 @@ mod tests {
             let conn = state.store.conn.lock().await;
             conn.execute(
                 "UPDATE installations SET provision_source = ?2 WHERE id = ?1",
-                rusqlite::params![
+                crate::db::params![
                     registered.installation_id,
                     crate::client_market::PROVISION_SOURCE_ROUTER_MARKET,
                 ],
@@ -4783,7 +4786,7 @@ mod tests {
             .is_none()
         );
 
-        let _ = std::fs::remove_file(&config.db_path);
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration as StdDuration;
 
+use crate::db::{Connection, OptionalExtension, Transaction, params};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -213,122 +213,6 @@ impl NormalizedSeat {
     }
 }
 
-pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "        CREATE TABLE IF NOT EXISTS share_market_listings (
-            id TEXT PRIMARY KEY,
-            share_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            owner_user_id TEXT NOT NULL,
-            owner_email TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('active', 'closed')),
-            deleted_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_share_market_active_listing
-            ON share_market_listings(share_id) WHERE status = 'active';
-        CREATE TABLE IF NOT EXISTS share_market_seats (
-            id TEXT PRIMARY KEY,
-            listing_id TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('available', 'reserved', 'occupied', 'revoking', 'disabled', 'deleted')),
-            parallel_limit INTEGER,
-            token_limit INTEGER,
-            token_period_json TEXT NOT NULL,
-            daily_rate_minor INTEGER,
-            currency TEXT,
-            free_duration_days INTEGER,
-            offer_revision INTEGER NOT NULL DEFAULT 1,
-            current_subscription_id TEXT,
-            retired_subscription_id TEXT,
-            retired_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(listing_id, position),
-            FOREIGN KEY(listing_id) REFERENCES share_market_listings(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS share_market_subscriptions (
-            id TEXT PRIMARY KEY,
-            seat_id TEXT NOT NULL,
-            listing_id TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            entitlement_id TEXT NOT NULL UNIQUE,
-            owner_user_id TEXT NOT NULL,
-            owner_email TEXT NOT NULL,
-            renter_user_id TEXT NOT NULL,
-            renter_email TEXT NOT NULL,
-            status TEXT NOT NULL,
-            parallel_limit INTEGER,
-            token_limit INTEGER,
-            token_period_json TEXT NOT NULL,
-            daily_rate_minor INTEGER,
-            currency TEXT,
-            free_duration_days INTEGER,
-            offer_revision INTEGER NOT NULL,
-            release_reason TEXT,
-            activated_at TEXT,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            released_at TEXT,
-            FOREIGN KEY(seat_id) REFERENCES share_market_seats(id),
-            FOREIGN KEY(listing_id) REFERENCES share_market_listings(id)
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_share_market_active_seat
-            ON share_market_subscriptions(seat_id) WHERE status NOT IN ('released', 'grant_failed');
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_share_market_active_renter_share
-            ON share_market_subscriptions(renter_user_id, share_id)
-            WHERE status NOT IN ('released', 'grant_failed');
-        CREATE TABLE IF NOT EXISTS share_control_operations (
-            id TEXT PRIMARY KEY,
-            share_id TEXT NOT NULL,
-            share_sequence INTEGER NOT NULL,
-            entitlement_id TEXT NOT NULL,
-            subscription_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('upsert', 'revoke')),
-            email TEXT NOT NULL,
-            policy_json TEXT,
-            status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched', 'applied', 'rejected')),
-            edit_id TEXT UNIQUE,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            applied_at TEXT,
-            UNIQUE(share_id, share_sequence),
-            FOREIGN KEY(subscription_id) REFERENCES share_market_subscriptions(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_share_control_dispatch
-            ON share_control_operations(status, share_id, share_sequence);
-        CREATE TABLE IF NOT EXISTS share_market_events (
-            id TEXT PRIMARY KEY,
-            share_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
-            listing_id TEXT,
-            seat_id TEXT,
-            subscription_id TEXT,
-            actor_user_id TEXT,
-            actor_email TEXT,
-            event_type TEXT NOT NULL,
-            dedupe_key TEXT NOT NULL UNIQUE,
-            detail_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_share_market_subscriptions_owner
-            ON share_market_subscriptions(owner_user_id, status);
-        CREATE INDEX IF NOT EXISTS idx_share_market_subscriptions_renter
-            ON share_market_subscriptions(renter_user_id, status);",
-    )?;
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_share_market_seats_listing_lifecycle
-             ON share_market_seats(listing_id, retired_at, position);",
-    )?;
-    crate::market_billing::init_schema(conn)?;
-    Ok(())
-}
-
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route(
@@ -426,7 +310,7 @@ async fn require_session(
         .ok_or_else(|| AppError::Unauthorized("authenticated user session required".into()))
 }
 
-fn map_db(context: &'static str) -> impl FnOnce(rusqlite::Error) -> AppError {
+fn map_db(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
 
@@ -1726,7 +1610,7 @@ impl AppStore {
             return Err(AppError::BadRequest("shareId is required".into()));
         }
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share Market listing"))?;
@@ -1858,7 +1742,7 @@ impl AppStore {
     ) -> Result<String, AppError> {
         let seat = normalize_seat(input)?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(map_db("begin add Share seat"))?;
         let owner: Option<(String, String, String, String, String, String, String)> = tx
             .query_row(
@@ -1985,7 +1869,7 @@ impl AppStore {
     ) -> Result<(), AppError> {
         let seat = normalize_seat(input.seat)?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin update Share seat"))?;
@@ -2103,7 +1987,7 @@ impl AppStore {
         seat_id: &str,
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin delete Share seat"))?;
@@ -2164,7 +2048,7 @@ impl AppStore {
         listing_id: &str,
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin close Share listing"))?;
@@ -2216,7 +2100,7 @@ impl AppStore {
         listing_id: &str,
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin delete Share listing"))?;
@@ -2442,7 +2326,7 @@ impl AppStore {
     ) -> Result<String, AppError> {
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin rent Share seat"))?;
@@ -2709,7 +2593,7 @@ impl AppStore {
             ));
         }
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share seat release"))?;
@@ -3247,7 +3131,7 @@ impl AppStore {
         now_dt: DateTime<Utc>,
     ) -> Result<Vec<ShareEditAvailableEvent>, AppError> {
         let now = now_dt.to_rfc3339();
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share Market reconciliation"))?;
@@ -4139,7 +4023,7 @@ pub async fn suspend_for_billing(
 ) -> Result<(), AppError> {
     let now = Utc::now().to_rfc3339();
     {
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share billing suspension"))?;
@@ -4215,7 +4099,7 @@ pub async fn resume_after_billing(
 ) -> Result<(), AppError> {
     let now = Utc::now().to_rfc3339();
     {
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share billing resume"))?;
@@ -4302,7 +4186,7 @@ pub async fn terminate_for_billing(
 ) -> Result<(), AppError> {
     let now = Utc::now().to_rfc3339();
     {
-        let mut conn = state.store.conn.lock().await;
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share billing termination"))?;
@@ -5002,7 +4886,7 @@ mod tests {
     fn schema_enforces_one_active_renter_per_share() {
         let conn = Connection::open_in_memory().expect("memory database");
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        init_schema(&conn).expect("schema");
+        crate::schema::apply(&conn).expect("schema");
         let active_renter_index: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -5018,7 +4902,7 @@ mod tests {
     fn schema_excludes_legacy_pricing_period_columns() {
         let conn = Connection::open_in_memory().expect("memory database");
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        init_schema(&conn).expect("schema");
+        crate::schema::apply(&conn).expect("schema");
 
         for table in ["share_market_seats", "share_market_subscriptions"] {
             let columns = conn
