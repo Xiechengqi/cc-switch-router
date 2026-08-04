@@ -177,7 +177,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 
 Server 仅在本地日志已开启、级别为 `info` 且“日志采集”开关开启时上传 `INFO/WARN/ERROR`;`DEBUG/TRACE` 不进入上传 channel。断网期间待传日志保存在 Server 本机最多 16 MiB、最长 6 小时的 JSONL spool 中,恢复后按最多 200 条、256 KiB 的签名批次续传。
 
-Router 的 `Log（日志）` 顶级页面按身份实时计算权限:匿名用户只有在 public 开启时可查看全部 Client 的脱敏最近 5 分钟;登录用户可查看当前已验证归属自己的全部 Client 保留日志;admin 可查看全部 Client。邮箱、IP、URL、凭据字段、源文件和 installation 标识不会进入匿名投影,匿名搜索也只匹配脱敏后的文本。私有视图支持筛选、游标分页和 JSONL 导出。
+Router 的 `日志`（英文 `Log`）顶级页面按身份实时计算权限:匿名用户只有在 public 开启时可查看全部 Client 的脱敏最近 5 分钟;登录用户可查看当前已验证归属自己的全部 Client 保留日志;admin 可查看全部 Client。日志列表以当前 Client tunnel Subdomain 作为公开标识,点击后打开权限裁剪的 Client 详情侧栏。邮箱、IP、完整 URL、凭据字段、源文件和 installation 标识不会进入匿名投影,匿名搜索也只匹配脱敏后的文本。私有视图支持筛选、游标分页和 JSONL 导出。
 
 Router 按 Client/stream 写入 4 MiB JSONL 活跃文件并轮转为 gzip 分段,每 15 分钟独立执行保留期和总容量清理。查询按授权 Client 目录和文件时间收敛扫描范围;日志正文、stream cursor 和检索签名密钥均不写业务数据库。生产部署应把日志目录放在 Router 本地持久盘,并根据 Client 数量和实际 `INFO` 速率调整容量上限。
 

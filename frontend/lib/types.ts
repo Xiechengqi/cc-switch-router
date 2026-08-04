@@ -1975,6 +1975,17 @@ export type ServerLogScope = "public" | "mine" | "all";
 export type ServerLogClient = {
   installationId: string;
   clientAlias: string;
+  owned: boolean;
+  subdomain?: string;
+  tunnelUrl?: string;
+  ownerEmail?: string;
+  platform: string;
+  appVersion: string;
+  countryCode?: string;
+  region?: string;
+  createdAt: string;
+  lastSeenAt: string;
+  tunnelEnabled?: boolean;
 };
 
 export type ServerLogMeta = {
@@ -1991,6 +2002,7 @@ export type ServerLogMeta = {
 export type ServerLogEvent = {
   eventId: string;
   clientAlias: string;
+  clientSubdomain?: string;
   installationId?: string;
   streamId?: string;
   sequence?: number;

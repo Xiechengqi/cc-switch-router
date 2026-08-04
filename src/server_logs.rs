@@ -532,6 +532,10 @@ struct ServerLogEventView {
     event_id: String,
     client_alias: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    client_subdomain: Option<String>,
+    #[serde(skip)]
+    lookup_installation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     installation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_id: Option<String>,
@@ -556,9 +560,12 @@ struct ServerLogEventView {
 
 impl ServerLogEventView {
     fn from_stored(event: StoredServerLogEvent, public: bool) -> Self {
+        let lookup_installation_id = event.installation_id.clone();
         Self {
             event_id: event.event_id,
             client_alias: event.client_alias,
+            client_subdomain: None,
+            lookup_installation_id,
             installation_id: (!public).then_some(event.installation_id),
             stream_id: (!public).then_some(event.stream_id),
             sequence: (!public).then_some(event.sequence),
@@ -599,6 +606,51 @@ struct ServerLogEventsResponse {
 struct ServerLogClientView {
     installation_id: String,
     client_alias: String,
+    owned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subdomain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tunnel_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_email: Option<String>,
+    platform: String,
+    app_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    created_at: chrono::DateTime<Utc>,
+    last_seen_at: chrono::DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tunnel_enabled: Option<bool>,
+}
+
+impl ServerLogClientView {
+    fn from_record(
+        record: crate::store::ServerLogClientRecord,
+        state: &ServerState,
+        owned: bool,
+    ) -> Self {
+        let tunnel_url = record
+            .subdomain
+            .as_deref()
+            .map(|subdomain| state.config.tunnel_url(subdomain));
+        Self {
+            client_alias: client_alias(&state.server_logs.cursor_key, &record.installation_id),
+            installation_id: record.installation_id,
+            owned,
+            subdomain: record.subdomain,
+            tunnel_url,
+            owner_email: record.owner_email,
+            platform: record.platform,
+            app_version: record.app_version,
+            country_code: record.country_code,
+            region: record.region,
+            created_at: record.created_at,
+            last_seen_at: record.last_seen_at,
+            tunnel_enabled: record.tunnel_enabled,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -661,25 +713,32 @@ async fn server_log_meta(
         .as_ref()
         .is_some_and(|session| dynamic.is_admin(&session.email));
     drop(dynamic);
-    let installation_ids = if let Some(session) = session.as_ref() {
-        if is_admin {
-            state.store.list_all_installation_ids().await?
-        } else {
-            state
-                .store
-                .list_verified_installation_ids_for_owner(&session.email)
-                .await?
-        }
+    let owned_installation_ids = if let Some(session) = session.as_ref() {
+        state
+            .store
+            .list_verified_installation_ids_for_owner(&session.email)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let clients = if authenticated {
+        let visible_installation_ids = (!is_admin).then_some(&owned_installation_ids);
+        state
+            .store
+            .list_server_log_client_records(visible_installation_ids)
+            .await?
+            .into_iter()
+            .filter(|record| is_admin || owned_installation_ids.contains(&record.installation_id))
+            .map(|record| {
+                let owned = owned_installation_ids.contains(&record.installation_id);
+                ServerLogClientView::from_record(record, &state, owned)
+            })
+            .collect()
     } else {
         Vec::new()
     };
-    let clients = installation_ids
-        .into_iter()
-        .map(|installation_id| ServerLogClientView {
-            client_alias: client_alias(&state.server_logs.cursor_key, &installation_id),
-            installation_id,
-        })
-        .collect();
     let mut scopes = Vec::new();
     if public_enabled {
         scopes.push("public".to_string());
@@ -709,7 +768,9 @@ async fn server_log_events(
 ) -> Result<Json<ServerLogEventsResponse>, AppError> {
     let access = resolve_query_access(&state, &headers, query.scope.as_deref()).await?;
     validate_requested_installation(&access, query.installation_id.as_deref())?;
-    Ok(Json(state.server_logs.query(access, query).await?))
+    let mut response = state.server_logs.query(access, query).await?;
+    enrich_client_subdomains(&state, &mut response).await?;
+    Ok(Json(response))
 }
 
 async fn server_log_export(
@@ -726,7 +787,8 @@ async fn server_log_export(
     validate_requested_installation(&access, query.installation_id.as_deref())?;
     query.limit = Some(MAX_QUERY_LIMIT);
     query.cursor = None;
-    let response = state.server_logs.query(access, query).await?;
+    let mut response = state.server_logs.query(access, query).await?;
+    enrich_client_subdomains(&state, &mut response).await?;
     let mut body = String::new();
     for event in response.events {
         body.push_str(
@@ -745,6 +807,32 @@ async fn server_log_export(
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(body))
         .map_err(|error| AppError::Internal(format!("build log export response: {error}")))
+}
+
+async fn enrich_client_subdomains(
+    state: &ServerState,
+    response: &mut ServerLogEventsResponse,
+) -> Result<(), AppError> {
+    let installation_ids = response
+        .events
+        .iter()
+        .map(|event| event.lookup_installation_id.clone())
+        .collect::<HashSet<_>>();
+    let subdomains = state
+        .store
+        .list_client_tunnel_subdomains_for_installations(&installation_ids)
+        .await?;
+    apply_client_subdomains(response, &subdomains);
+    Ok(())
+}
+
+fn apply_client_subdomains(
+    response: &mut ServerLogEventsResponse,
+    subdomains: &HashMap<String, String>,
+) {
+    for event in &mut response.events {
+        event.client_subdomain = subdomains.get(&event.lookup_installation_id).cloned();
+    }
 }
 
 async fn resolve_query_access(
@@ -1836,7 +1924,7 @@ mod tests {
             .expect("duplicate ingest");
         assert_eq!(duplicate.accepted, 0);
 
-        let response = store
+        let mut response = store
             .query(
                 QueryAccess {
                     public_only: true,
@@ -1847,13 +1935,25 @@ mod tests {
             )
             .await
             .expect("query public logs");
+        apply_client_subdomains(
+            &mut response,
+            &HashMap::from([("installation-a".to_string(), "client-sub".to_string())]),
+        );
         assert_eq!(response.events.len(), 1);
         assert!(response.events[0].installation_id.is_none());
+        assert_eq!(
+            response.events[0].client_subdomain.as_deref(),
+            Some("client-sub")
+        );
         assert!(response.events[0].fields.is_none());
         assert!(!response.events[0].message.contains("user@example.com"));
         assert!(!response.events[0].message.contains("203.0.113.2"));
         assert!(!response.events[0].message.contains("secret"));
         assert!(!response.events[0].target.contains("203.0.113.2"));
+        let public_json = serde_json::to_value(&response.events[0]).expect("serialize public log");
+        assert_eq!(public_json["clientSubdomain"], "client-sub");
+        assert!(public_json.get("installationId").is_none());
+        assert!(public_json.get("lookupInstallationId").is_none());
 
         let side_channel = store
             .query(
