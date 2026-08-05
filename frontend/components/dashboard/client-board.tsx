@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Drawer, toast } from "@heroui/react";
-import { ChevronDown, ListFilter, MessageCircle, Plus, Search, X } from "lucide-react";
+import { ArrowRightLeft, ChevronDown, ListFilter, MessageCircle, Plus, Search, X } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
@@ -46,6 +46,7 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
 import { clientMarketMineHref } from "@/lib/dashboard-nav";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
+import { ClientSubdomainTakeoverDialog } from "@/components/dashboard/client-subdomain-takeover-dialog";
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -175,6 +176,20 @@ function ClientDetailsButton({ onOpen }: { onOpen: () => void }) {
   );
 }
 
+function ClientTakeoverButton({ onOpen }: { onOpen: () => void }) {
+  const { t } = useLocaleText();
+  return (
+    <ClientHeaderInlineButton
+      label={t("dashboard.subdomainTakeover.action")}
+      onClick={onOpen}
+      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 text-[11px] font-medium text-amber-800 transition-colors hover:border-amber-300 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+    >
+      <ArrowRightLeft className="h-3 w-3" aria-hidden />
+      <span>{t("dashboard.subdomainTakeover.action")}</span>
+    </ClientHeaderInlineButton>
+  );
+}
+
 function ClientChatButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const { openChat, unreadByInstallation } = useClientChat();
@@ -277,6 +292,7 @@ function ClientCard({
   onRentalChanged,
   collapsed,
   onToggleCollapsed,
+  onOpenTakeover,
 }: {
   client: DashboardClient;
   shares: ShareView[];
@@ -289,6 +305,7 @@ function ClientCard({
   onRentalChanged: () => Promise<void> | void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  onOpenTakeover?: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
@@ -388,6 +405,7 @@ function ClientCard({
               />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
+              {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
               <ClientDetailsButton onOpen={openClientDrawer} />
               <ClientChatButton client={client} />
             </div>
@@ -471,6 +489,7 @@ export function ClientBoard({
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
   const [createClientOpen, setCreateClientOpen] = React.useState(false);
+  const [takeoverTargetId, setTakeoverTargetId] = React.useState("");
   const [filtersOpen, setFiltersOpen] = React.useState(false);
   const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
@@ -525,6 +544,20 @@ export function ClientBoard({
   );
   const shareById = React.useMemo(() => new Map(shares.map((share) => [share.shareId, share])), [shares]);
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
+  const sessionEmail = session?.user?.email?.trim().toLocaleLowerCase() || "";
+  const takeoverSourcesFor = React.useCallback(
+    (target: DashboardClient) => {
+      if (!sessionEmail || target.clientTunnel?.routeState !== "active" || !target.clientTunnel.enabled) return [];
+      const targetOwner = (target.clientTunnel.ownerEmail || target.installation.ownerEmail || "").trim().toLocaleLowerCase();
+      if (targetOwner !== sessionEmail) return [];
+      return clients.filter((candidate) => {
+        if (candidate.installation.id === target.installation.id || !candidate.clientTunnel?.subdomain) return false;
+        const owner = (candidate.clientTunnel.ownerEmail || candidate.installation.ownerEmail || "").trim().toLocaleLowerCase();
+        return owner === sessionEmail;
+      });
+    },
+    [clients, sessionEmail],
+  );
   const clientByShareId = React.useMemo(() => {
     const map = new Map<string, DashboardClient>();
     clients.forEach((client) => (client.shareIds || []).forEach((shareId) => map.set(shareId, client)));
@@ -694,6 +727,11 @@ export function ClientBoard({
   }, [clientById, focus.drawerTarget, shareById]);
 
   const selectedClient = selectedClientId ? clientById.get(selectedClientId) || null : null;
+  const takeoverTarget = takeoverTargetId ? clientById.get(takeoverTargetId) || null : null;
+  const takeoverSources = React.useMemo(
+    () => (takeoverTarget ? takeoverSourcesFor(takeoverTarget) : []),
+    [takeoverSourcesFor, takeoverTarget],
+  );
   const selectedShare = selectedShareId ? shareById.get(selectedShareId) || null : null;
   const connectShareId = connectShare?.shareId || "";
   const currentConnectShare = connectShareId ? shareById.get(connectShareId) || null : null;
@@ -830,7 +868,7 @@ export function ClientBoard({
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
@@ -935,6 +973,16 @@ export function ClientBoard({
       <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
       <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} onCreated={() => void refreshRentalsAndDashboard()} />
+      <ClientSubdomainTakeoverDialog
+        target={takeoverTarget}
+        sources={takeoverSources}
+        open={!!takeoverTarget}
+        onOpenChange={(open) => !open && setTakeoverTargetId("")}
+        onCompleted={async () => {
+          setTakeoverTargetId("");
+          await refreshRentalsAndDashboard();
+        }}
+      />
     </section>
   );
 }

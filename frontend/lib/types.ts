@@ -219,6 +219,22 @@ export type DashboardClient = {
   removalAt?: string;
 };
 
+export type ClientSubdomainTakeoverRequest = {
+  targetInstallationId: string;
+  sourceInstallationId: string;
+};
+
+export type ClientSubdomainTakeoverResponse = {
+  ok: boolean;
+  takeoverId: string;
+  status: "completed" | "activation_pending" | "recovery_pending";
+  targetInstallationId: string;
+  sourceInstallationId: string;
+  retiredSubdomain: string;
+  adoptedSubdomain: string;
+  warning?: string;
+};
+
 export type ShareTokenPeriod =
   | "lifetime"
   | "day"
@@ -1057,6 +1073,74 @@ export type MetricEvent = {
   details?: Record<string, unknown>;
 };
 
+export type AlertIncident = {
+  id: string;
+  fingerprint: string;
+  scope: string;
+  kind: string;
+  entityKind: string;
+  entityId?: string | null;
+  severity: "info" | "warning" | "critical" | string;
+  status: "firing" | "acknowledged" | "silenced" | "resolved" | string;
+  title: string;
+  message: string;
+  details: Record<string, unknown>;
+  occurrenceCount: number;
+  startedAt: number;
+  lastSeenAt: number;
+  lastTransitionAt: number;
+  resolvedAt?: number | null;
+  acknowledgedAt?: number | null;
+  acknowledgedBy?: string | null;
+  acknowledgementNote?: string | null;
+  silencedAt?: number | null;
+  silencedUntil?: number | null;
+  silencedBy?: string | null;
+  silenceNote?: string | null;
+};
+
+export type AlertDelivery = {
+  id: string;
+  incidentId: string;
+  transitionId: string;
+  channel: string;
+  status: string;
+  attempts: number;
+  providerMessageId?: string | null;
+  nextAttemptAt?: number | null;
+  lastError?: string | null;
+  createdAt: number;
+  updatedAt: number;
+  sentAt?: number | null;
+};
+
+export type AlertChannelState = {
+  channel: string;
+  enabled: boolean;
+  configured: boolean;
+  status: "disabled" | "misconfigured" | "ready" | "healthy" | "degraded" | string;
+  lastAttemptAt?: number | null;
+  lastSuccessAt?: number | null;
+  lastError?: string | null;
+};
+
+export type AlertChannelTestResponse = {
+  ok: boolean;
+  channel: string;
+  providerMessageId?: string | null;
+  testedAt: number;
+};
+
+export type AlertingOverview = {
+  activeCount: number;
+  criticalCount: number;
+  resolvedCount: number;
+  failedDeliveryCount: number;
+  incidents: AlertIncident[];
+  deliveries: AlertDelivery[];
+  channels: AlertChannelState[];
+};
+
 export type DiskUsage = {
   label: string;
   mountPoint: string;
@@ -1126,6 +1210,31 @@ export type RouterMetricsStatus = {
   dbErrorsTotal: number;
 };
 
+export type ClientMetricsItem = {
+  installationId: string;
+  clientLabel: string;
+  status: "online" | "recovering" | "offline" | "unknown" | string;
+  monitoringEnabled: boolean;
+  platform: string;
+  appVersion: string;
+  countryCode?: string | null;
+  lastAuthenticatedSeenAt?: number | null;
+  offlineSince?: number | null;
+  lastRecoveredAt?: number | null;
+  offlineEpisode: number;
+};
+
+export type ClientMetricsSnapshot = {
+  timestamp: number;
+  total: number;
+  monitored: number;
+  online: number;
+  recovering: number;
+  offline: number;
+  unknown: number;
+  items: ClientMetricsItem[];
+};
+
 export type LlmMetricsSnapshot = {
   rpm: number;
   tpm: number;
@@ -1150,8 +1259,10 @@ export type MetricsSnapshot = {
   lastPersistedAt?: number | null;
   host: HostMetricsStatus;
   router: RouterMetricsStatus;
+  clients: ClientMetricsSnapshot;
   llm: LlmMetricsSnapshot;
   alerts: MetricEvent[];
+  incidents: AlertIncident[];
 };
 
 export type HostMetricsPoint = {
@@ -1175,6 +1286,15 @@ export type RouterMetricsPoint = {
   dbErrorsTotal: number;
 };
 
+export type ClientMetricsPoint = {
+  timestamp: number;
+  total: number;
+  online: number;
+  recovering: number;
+  offline: number;
+  unknown: number;
+};
+
 export type LlmMetricsPoint = {
   timestamp: number;
   rpm: number;
@@ -1192,6 +1312,7 @@ export type MetricsSeriesResponse = {
   step: string;
   host: HostMetricsPoint[];
   router: RouterMetricsPoint[];
+  clients: ClientMetricsPoint[];
   llm: LlmMetricsPoint[];
 };
 
@@ -1405,6 +1526,7 @@ export type ClientMarketHost = {
   isHostOwner?: boolean;
   isClientOwner?: boolean;
   canControlRecovery?: boolean;
+  canRetireUnreachable?: boolean;
   recovery?: ClientMarketRecovery;
   lastVerifiedAt?: string;
   lastError?: string;
@@ -1829,6 +1951,7 @@ export type ClientMarketRental = {
   contacts?: PaymentContact[];
   isClientOwner: boolean;
   canRelease: boolean;
+  canFinalizeRelease: boolean;
   /** Pending/running cleanup job — used to resume progress UI after refresh. */
   activeCleanupJobId?: string;
   updatedAt: string;

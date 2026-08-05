@@ -140,6 +140,53 @@ pub struct MetricsConfig {
     pub db_path: PathBuf,
     pub retention_days: u32,
     pub sample_interval_secs: u64,
+    pub alerting: AlertingSettings,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AlertingSettings {
+    pub enabled: bool,
+    pub repeat_interval_secs: i64,
+    pub history_retention_days: u32,
+    pub telegram_enabled: bool,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
+    pub telegram_topic_id: Option<i64>,
+    pub telegram_min_severity: String,
+}
+
+impl Default for AlertingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repeat_interval_secs: 30 * 60,
+            history_retention_days: 90,
+            telegram_enabled: false,
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            telegram_topic_id: None,
+            telegram_min_severity: "warning".into(),
+        }
+    }
+}
+
+impl fmt::Debug for AlertingSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AlertingSettings")
+            .field("enabled", &self.enabled)
+            .field("repeat_interval_secs", &self.repeat_interval_secs)
+            .field("history_retention_days", &self.history_retention_days)
+            .field("telegram_enabled", &self.telegram_enabled)
+            .field(
+                "telegram_bot_token",
+                &self.telegram_bot_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("telegram_chat_id", &self.telegram_chat_id)
+            .field("telegram_topic_id", &self.telegram_topic_id)
+            .field("telegram_min_severity", &self.telegram_min_severity)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,16 +276,6 @@ pub struct Config {
     /// from the broader administrator set.
     pub router_owner_email: Option<String>,
     pub admin_emails: HashSet<String>,
-    pub telegram_bot_token: Option<String>,
-    pub telegram_chat_id: Option<String>,
-    pub telegram_topic_id: Option<i64>,
-    pub telegram_notify_all: bool,
-    pub telegram_notify_admin: bool,
-    pub board_max_len: usize,
-    pub board_guest_per_hour: i64,
-    pub board_user_per_hour: i64,
-    pub board_pin_limit: i64,
-    pub board_guest_self_delete_secs: i64,
     pub ux_telemetry_enabled: bool,
     pub ux_telemetry_retention_days: u32,
     pub footer_telegram_url: String,
@@ -425,29 +462,6 @@ impl Config {
             verification_service_api_key: env_var("CC_SWITCH_ROUTER_VERIFICATION_SERVICE_API_KEY"),
             router_owner_email,
             admin_emails,
-            telegram_bot_token: env_var("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN")
-                .filter(|v| !v.trim().is_empty()),
-            telegram_chat_id: env_var("CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID")
-                .filter(|v| !v.trim().is_empty()),
-            telegram_topic_id: env_var("CC_SWITCH_ROUTER_TELEGRAM_TOPIC_ID")
-                .and_then(|v| v.trim().parse().ok()),
-            telegram_notify_all: env_bool("CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL", true),
-            telegram_notify_admin: env_bool("CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ADMIN", true),
-            board_max_len: env_var("CC_SWITCH_ROUTER_BOARD_MAX_LEN")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000),
-            board_guest_per_hour: env_var("CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
-            board_user_per_hour: env_var("CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
-            board_pin_limit: env_var("CC_SWITCH_ROUTER_BOARD_PIN_LIMIT")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3),
-            board_guest_self_delete_secs: env_var("CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
             ux_telemetry_enabled: env_bool("CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED", false),
             ux_telemetry_retention_days: env_var("CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS")
                 .and_then(|v| v.parse().ok())
@@ -467,6 +481,25 @@ impl Config {
                 sample_interval_secs: env_var("CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(5),
+                alerting: AlertingSettings {
+                    enabled: env_bool("CC_SWITCH_ROUTER_ALERTING_ENABLED", true),
+                    repeat_interval_secs: env_i64(
+                        "CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS",
+                        30 * 60,
+                    ),
+                    history_retention_days: env_var(
+                        "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS",
+                    )
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(90),
+                    telegram_enabled: env_bool("CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED", false),
+                    telegram_bot_token: env_var("CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN"),
+                    telegram_chat_id: env_var("CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID"),
+                    telegram_topic_id: env_var("CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID")
+                        .and_then(|value| value.parse().ok()),
+                    telegram_min_severity: env_var("CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY")
+                        .unwrap_or_else(|| "warning".into()),
+                },
             },
         }
     }
@@ -693,20 +726,7 @@ CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT=3
 CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT=10
 # router@<tunnel_domain-host> is always treated as admin. Use this variable
 # to add additional admin emails (comma-separated, case-insensitive).
-# Legacy board settings below are retained for one read-only compatibility release.
-# All legacy board mutations now return HTTP 410; Client chat has independent limits.
 CC_SWITCH_ROUTER_ADMIN_EMAILS=
-# Telegram settings no longer receive Client chat content.
-CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN=
-CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID=
-# CC_SWITCH_ROUTER_TELEGRAM_TOPIC_ID=
-CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL=true
-CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ADMIN=true
-CC_SWITCH_ROUTER_BOARD_MAX_LEN=1000
-CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR=5
-CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR=30
-CC_SWITCH_ROUTER_BOARD_PIN_LIMIT=3
-CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS=300
 CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED=false
 CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS=7
 CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL=https://t.me/tokenswitchorg
@@ -714,6 +734,14 @@ CC_SWITCH_ROUTER_METRICS_ENABLED=true
 CC_SWITCH_ROUTER_METRICS_DB_PATH={}
 CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS=7
 CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS=5
+CC_SWITCH_ROUTER_ALERTING_ENABLED=true
+CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS=1800
+CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS=90
+CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED=false
+CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN=
+CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID=
+CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID=
+CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY=warning
 ",
         default_data_dir().display(),
         default_db_path().display(),
@@ -911,16 +939,6 @@ mod tests {
             verification_service_api_key: None,
             router_owner_email: None,
             admin_emails: HashSet::new(),
-            telegram_bot_token: None,
-            telegram_chat_id: None,
-            telegram_topic_id: None,
-            telegram_notify_all: true,
-            telegram_notify_admin: true,
-            board_max_len: 1000,
-            board_guest_per_hour: 5,
-            board_user_per_hour: 30,
-            board_pin_limit: 3,
-            board_guest_self_delete_secs: 300,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
             footer_telegram_url: DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
@@ -929,6 +947,7 @@ mod tests {
                 db_path: PathBuf::from("/tmp/test-metrics.db"),
                 retention_days: 7,
                 sample_interval_secs: 5,
+                alerting: AlertingSettings::default(),
             },
         };
 

@@ -3073,66 +3073,6 @@ pub struct HealthTimelineBucket {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BoardMessageView {
-    pub id: String,
-    pub body: String,
-    pub author_kind: String,
-    pub author_label: String,
-    pub is_mine: bool,
-    pub pinned: bool,
-    pub featured: bool,
-    pub created_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pinned_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub featured_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BoardMessageListResponse {
-    pub messages: Vec<BoardMessageView>,
-    pub tab: String,
-    pub total_visible: usize,
-    /// Server-snapshot time clients echo back as `?since=` to receive only changes.
-    pub as_of: DateTime<Utc>,
-    /// IDs that became invisible to this tab since `since` (deleted, unpinned, unfeatured).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub removed_ids: Vec<String>,
-    /// True when the response is a delta against `since` rather than a full snapshot.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub incremental: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct PostBoardMessageRequest {
-    pub body: String,
-    #[serde(default)]
-    pub guest_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct BoardMessageToggleRequest {
-    pub value: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BoardMetaResponse {
-    pub total: usize,
-    pub pinned_count: usize,
-    pub featured_count: usize,
-    pub can_post_as_admin: bool,
-    pub max_body_length: usize,
-    pub guest_self_delete_secs: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ClientChatMessageView {
     pub id: String,
     pub seq: i64,

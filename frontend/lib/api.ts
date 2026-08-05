@@ -32,6 +32,10 @@ import type {
   LlmTopResponse,
   LlmReliabilityResponse,
   MetricEvent,
+  AlertChannelState,
+  AlertChannelTestResponse,
+  AlertIncident,
+  AlertingOverview,
   MapDisplaySettings,
   MapDisplaySettingsUpdate,
   AnnouncementSettings,
@@ -79,6 +83,8 @@ import type {
   MarketCreditKind,
   ServerLogEventsResponse,
   ServerLogMeta,
+  ClientSubdomainTakeoverRequest,
+  ClientSubdomainTakeoverResponse,
 } from "@/lib/types";
 
 
@@ -116,6 +122,16 @@ export async function parseJson<T>(response: Response): Promise<T> {
 
 export async function getDashboard() {
   return parseJson<DashboardResponse>(await authFetch("/v1/dashboard", { cache: "no-store" }));
+}
+
+export async function takeOverClientSubdomain(input: ClientSubdomainTakeoverRequest) {
+  return parseJson<ClientSubdomainTakeoverResponse>(
+    await authFetch("/v1/installations/client-subdomain-takeover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
 }
 
 export async function getMapDisplay() {
@@ -442,10 +458,6 @@ export async function downloadRouterLog() {
   URL.revokeObjectURL(url);
 }
 
-export async function testTelegram() {
-  return parseJson<{ ok: boolean }>(await authFetch("/v1/admin/telegram/test", { method: "POST" }));
-}
-
 export async function getMetricsSnapshot() {
   return parseJson<MetricsSnapshot>(await authFetch("/v1/admin/metrics/snapshot", { cache: "no-store" }));
 }
@@ -477,6 +489,65 @@ export async function getMetricEvents(limit = 100) {
 
 export async function clearMetrics() {
   return parseJson<ClearMetricsResponse>(await authFetch("/v1/admin/metrics", { method: "DELETE" }));
+}
+
+export async function getAlertingOverview(limit = 100) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return parseJson<AlertingOverview>(
+    await authFetch(`/v1/admin/alerting/overview?${params}`, { cache: "no-store" }),
+  );
+}
+
+export async function getAlertingChannels() {
+  return parseJson<AlertChannelState[]>(
+    await authFetch("/v1/admin/alerting/channels", { cache: "no-store" }),
+  );
+}
+
+export async function testAlertingChannel(channel: string) {
+  return parseJson<AlertChannelTestResponse>(
+    await authFetch(`/v1/admin/alerting/channels/${encodeURIComponent(channel)}/test`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function acknowledgeAlertIncident(incidentId: string, note?: string) {
+  return parseJson<AlertIncident>(
+    await authFetch(`/v1/admin/alerting/incidents/${encodeURIComponent(incidentId)}/acknowledge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: note || null }),
+    }),
+  );
+}
+
+export async function silenceAlertIncident(incidentId: string, durationSecs: number, note?: string) {
+  return parseJson<AlertIncident>(
+    await authFetch(`/v1/admin/alerting/incidents/${encodeURIComponent(incidentId)}/silence`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ durationSecs, note: note || null }),
+    }),
+  );
+}
+
+export async function resumeAlertIncident(incidentId: string, note?: string) {
+  return parseJson<AlertIncident>(
+    await authFetch(`/v1/admin/alerting/incidents/${encodeURIComponent(incidentId)}/resume`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: note || null }),
+    }),
+  );
+}
+
+export async function retryAlertDelivery(deliveryId: string) {
+  return parseJson<{ ok: boolean }>(
+    await authFetch(`/v1/admin/alerting/deliveries/${encodeURIComponent(deliveryId)}/retry`, {
+      method: "POST",
+    }),
+  );
 }
 
 export async function getClientChatRoom(installationId: string, signal?: AbortSignal) {
@@ -706,6 +777,20 @@ export async function deleteClientMarketHost(id: string) {
   );
 }
 
+export async function retireUnreachableClientMarketHost(id: string) {
+  return parseJson<{
+    hostId: string;
+    installationId: string;
+    previousSubscriptionStatus: string;
+    status: string;
+  }>(
+    await authFetch(
+      `/v1/client-market/hosts/${encodeURIComponent(id)}/retire-unreachable`,
+      { method: "POST" },
+    ),
+  );
+}
+
 export async function reverifyClientMarketHost(id: string) {
   return parseJson<ClientMarketHost>(
     await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/reverify`, {
@@ -804,6 +889,21 @@ export async function releaseClientMarketRental(installationId: string) {
     await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/release`, {
       method: "POST",
     }),
+  );
+}
+
+export async function finalizeClientMarketFailedRental(installationId: string) {
+  return parseJson<{
+    installationId: string;
+    previousStatus: string;
+    status: string;
+    hostId?: string;
+    hostStatus?: string;
+  }>(
+    await authFetch(
+      `/v1/client-market/clients/${encodeURIComponent(installationId)}/finalize-release`,
+      { method: "POST" },
+    ),
   );
 }
 

@@ -124,6 +124,7 @@ function synthesizeRentalFromHost(
     paymentMethodKinds: host.paymentMethodKinds || [],
     isClientOwner,
     canRelease: !!host.installationId,
+    canFinalizeRelease: false,
     updatedAt: host.updatedAt || host.createdAt || new Date(0).toISOString(),
   };
 }

@@ -62,7 +62,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
 | `/v1/client-market/*` | 33 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
-| `/v1/admin/*` | 约 36 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
+| `/v1/admin/*` | 约 43 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`logs/batch`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/server-logs/*` | 3 | 公开读 / 已验证 Client owner / Router owner | `meta`、`events`、`export`；匿名与非 owner 每 Client 仅可读脱敏后的最近 10 行，完整日志权限方可导出 |
@@ -78,7 +78,6 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:username` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 10 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/profile`、`me/usage/consumer`、`me/usage/provider` |
-| `/v1/board/*` | 5 | — | 遗留接口,写操作返回 `410 Gone` |
 | 其余单例 | 约 15 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`_market/proxy/*`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
 
 ## 二进制部署
@@ -117,6 +116,17 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN` | 空 | turso 模式必填的数据库 Token;Settings API 只返回是否已配置,不返回明文 |
 | `CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS` | `60` | Embedded Replica 拉取 Turso 已提交 frame 的周期,范围 1-3600 秒 |
 | `CC_SWITCH_ROUTER_METRICS_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router-metrics.db` | 独立本地 metrics 数据库;不会同步到 Turso |
+| `CC_SWITCH_ROUTER_METRICS_ENABLED` | `true` | 是否采集 Host、Router、Client 和 LLM metrics；修改后需重启 |
+| `CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS` | `7` | metrics 采样历史保留天数；事故历史使用独立配置 |
+| `CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS` | `5` | metrics 采样与条件判断间隔；修改后需重启 |
+| `CC_SWITCH_ROUTER_ALERTING_ENABLED` | `true` | 是否为新事故流转创建 IM 投递；事故本身始终持久化，可在 Settings 热更新 |
+| `CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS` | `1800` | 未确认活跃事故的提醒间隔，范围 60 秒至 7 天 |
+| `CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS` | `90` | 已恢复事故、流转、投递尝试、渠道测试和已完成 Client 信号的保留天数 |
+| `CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED` | `false` | 启用 Telegram Bot 告警；同时要求 Bot Token 和 Chat ID |
+| `CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN` | 空 | `@BotFather` 签发的 Token；Settings API 不回传明文 |
+| `CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID` | 空 | Telegram 私聊、群组、超级群组或频道 ID |
+| `CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID` | 空 | 论坛模式超级群组的可选 `message_thread_id` |
+| `CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY` | `warning` | Telegram 最低投递级别：`info`、`warning` 或 `critical` |
 | `CC_SWITCH_ROUTER_SERVER_LOG_INGEST_ENABLED` | `true` | 是否接收已注册 Server 的 Ed25519 签名日志批次;修改后需重启 |
 | `CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR` | `$CC_SWITCH_ROUTER_DATA_DIR/server-logs` | 每个 Client 最近 100 行 Server 日志与独立 stream cursor 的文件目录;不按时间清理且不会写入业务库;修改后需重启 |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔(秒) |
@@ -227,6 +237,14 @@ EOF
 
 Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离线 episode 去重,注册与离线邮件都只发送至对应 Client 当前已验证的 Owner 邮箱。关闭总开关时,Router 会推进在线状态 baseline 并抑制待发记录;以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度,registration lane 使用独立的 `3/10` 小时额度,两者互不占用。未完成的 outbox 会持续保留,已发送、dead-letter、取消和抑制记录保留 30 天供审计。
 
+### 运维事故与即时通知
+
+Metrics 采集器持续判断 FD、CPU、内存、磁盘、SSH route 生命周期、数据库/EMFILE 新增错误和 LLM 错误率/限流。Client 离线不另做心跳算法，而是复用 Client 生命周期通知的可信 presence 状态机：确认离线、稳定恢复和离线后最终删除会在同一业务事务写入 `operator_alert_signal_outbox`，再由告警 worker 幂等写入 metrics 数据库。
+
+每个 fingerprint 同时最多一个未恢复事故，状态为 `firing`、`acknowledged`、`silenced` 或 `resolved`。新建、升级、提醒、恢复通知、静默到期和手动恢复都会记录 transition；通知 payload 在 transition 创建时冻结。确认、静默或更新的可通知 transition 会把尚未发送的旧投递置为不可重试的 `superseded`，避免恢复后再送达过期 firing 消息；曾收到高等级告警的渠道仍会收到对应恢复通知。投递使用 claim lease、指数退避和最多 12 次自动尝试，失败后进入 dead-letter，可在 Metrics 页面手动重新排队。`DELETE /v1/admin/metrics` 只清采样与旧 metrics event，不删除事故、投递或待处理 Client 信号。
+
+告警投递、状态查询和测试 API 均以通用渠道 ID 工作，事故与 outbox 模型不依赖具体供应商；当前唯一注册的适配器是 Telegram，通过 Bot `sendMessage` 投递。Settings 页面可独立测试已注册渠道并显示最近真实投递/测试状态；Metrics 页面可确认、定时静默、恢复事故通知和重试失败投递。未来新增渠道只需增加配置、适配器和渠道注册，不需要重写事故状态机、投递存储或管理 API。
+
 Share Market 与 Client Market 按产品和价格类型使用四项独立供应商准入策略：免费商品默认黑名单模式（默认开放），付费商品默认白名单模式（仅可信买家）。供应商可预先按买家邮箱建立信任，也可处理买家从具体商品发起的准入申请；批准付费申请时必须原子授予 USD 有限或无限信用额度。切换付费作用域到黑名单模式必须显式确认风险，且未知买家只有在供应商另行开启有限公共额度后才能租用付费商品；公共额度不能设为无限。
 
 付费商品共用账户级后付费赊账：每项服务先享受 12 小时健康时长试用,之后只按 Router 观测到的健康服务秒数累计固定 USD 每日费用。同一买家和供应商共用一个 USD 余额；有限额度使用达到 80% 时向相关 Client 公开聊天室写入系统预警,用满后生成聚合账单并暂停相关服务。账单按 Settings 中的美元兑人民币汇率同时提供双币金额，默认 `1 USD = 7 CNY`；出账时冻结汇率和人民币金额，后续设置变更不改写历史账单，CNY 不形成独立账户。无限额度不自动出账,供应商可主动要求清账；买家也可主动清账,最后一项服务结束时剩余余额会自动出账。Router 不经手资金,付款声明仍需供应商确认到账；逾期声明或争议不会自行解除市场赊账限制。
@@ -235,7 +253,7 @@ Client 公开聊天室与 `installation.id` 一一对应,只为已验证 Owner �
 
 Share Market、Client Market 与统一账务的关键事件通过持久化 outbox 写入对应 Client 公开聊天室。租用双方的完整邮箱、账单金额、收款方式与联系方式、付款 reference/note、凭证 URL、争议或回收原因以及安全的原始错误均公开展示；系统消息引用的同源收款图片随消息公开并在消息保留期内防止清理,未发布图片仍需 Owner 或账单买方身份。API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥和 SSH/lease 凭据禁止进入 Market 源事件和聊天室 payload；后端在持久化前拒绝敏感字段与 query/fragment/userinfo 带凭据的 URL,并替换外部错误或备注中的凭据片段,前端渲染时再执行一次同类过滤。`PaymentMethod.token` 只允许表达 `USDT`/`USDC` 资产符号。验证码、安全通知、Client 注册/离线生命周期邮件和真人聊天提醒邮件仍保留,Market/Billing 业务事件本身不再发送交易邮件。
 
-旧 `/v1/board/*` 数据不迁移也不删除;GET 在一个兼容版本内保持只读,POST/置顶/精选/删除均返回 HTTP `410 Gone`。旧 `CC_SWITCH_ROUTER_BOARD_*` 和 Board Telegram 开关仅作为兼容配置保留,不影响 Client 聊天室。
+旧留言板、`/v1/board/*` API 及其 Telegram 推送配置已彻底移除；Client 公开聊天室是唯一的站内讨论渠道。
 
 Setup 完成通知采用 Router-first 发布顺序:先部署支持 `POST /v1/installations/setup-completed` 的 Router,再升级 Server。新 Server 在 setup 成功后显式提交签名完成事件;尚未升级的旧 Server 首次 claim Client tunnel 时,Router 会创建临时 fallback 并等待固定 30 分钟,宽限期内若收到显式事件就由显式事件接管,否则才发送 legacy 注册通知。fallback 仅覆盖刚注册并很快 claim tunnel 的 Client,旧 installation 重连不会触发。所有受支持 Server 版本都已实现显式上报且最旧版本退出后,应删除该兼容桥。
 

@@ -47,6 +47,7 @@ pub(super) fn ensure_room_for_verified_owner_tx(
              FROM installations i
              LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
              WHERE i.id = ?1
+               AND i.lifecycle = 'active'
                AND i.owner_verified_at IS NOT NULL
                AND lower(trim(i.owner_email)) = ?2",
             params![installation_id, owner_email],
@@ -139,6 +140,43 @@ pub(super) fn archive_room_for_installation_tx(
     )
     .map_err(|error| AppError::Internal(format!("archive client chat room failed: {error}")))?;
     cancel_room_deliveries_tx(conn, &room_id, "cancelled_room_archived", now)?;
+    Ok(())
+}
+
+pub(super) fn update_active_room_label_for_installation_tx(
+    conn: &Connection,
+    installation_id: &str,
+    client_label: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE chat_rooms
+         SET client_label_snapshot = ?2, updated_at = ?3
+         WHERE installation_id = ?1 AND status = 'active'",
+        params![installation_id, client_label, now.to_rfc3339()],
+    )
+    .map_err(|error| AppError::Internal(format!("update client chat label failed: {error}")))?;
+    Ok(())
+}
+
+pub(super) fn suppress_pending_system_events_for_installation_tx(
+    conn: &Connection,
+    installation_id: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE client_chat_system_outbox
+         SET status = 'completed', next_attempt_at = NULL, last_error = ?2,
+             updated_at = ?3, completed_at = ?3
+         WHERE installation_id = ?1 AND status IN ('pending', 'processing')",
+        params![installation_id, reason, now.to_rfc3339()],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "suppress fenced Client chat system events failed: {error}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -399,6 +437,25 @@ pub(crate) fn enqueue_client_system_event_tx(
     validate_system_event_identity(source_kind, "source kind", 64)?;
     validate_system_event_identity(source_event_id, "source event id", 256)?;
     validate_system_event_identity(event_type, "event type", 128)?;
+    let fenced_without_archive =
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM installations i
+                WHERE i.id = ?1 AND i.lifecycle = 'fenced'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chat_rooms r
+                      WHERE r.installation_id = i.id AND r.status = 'archived'
+                  )
+             )",
+            params![installation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("check fenced Client chat target failed: {error}"))
+        })? != 0;
+    if fenced_without_archive {
+        return Ok(());
+    }
     let payload = sanitize_system_event_payload(payload)?;
     let payload_json = serde_json::to_string(&payload)
         .map_err(|error| AppError::Internal(format!("encode client chat event failed: {error}")))?;
@@ -1081,7 +1138,7 @@ impl AppStore {
                         lower(trim(i.owner_email)), i.owner_verified_at
                  FROM chat_rooms r
                  LEFT JOIN installations i ON i.id = r.installation_id
-                 WHERE r.id = ?1 AND r.status = 'active'",
+                 WHERE r.id = ?1 AND r.status = 'active' AND i.lifecycle = 'active'",
                 params![room_id],
                 |row| {
                     Ok((
@@ -2149,6 +2206,7 @@ fn resolve_client_system_event_room_tx(
                     (SELECT id FROM users WHERE email_normalized = lower(trim(i.owner_email)))
              FROM installations i
              WHERE i.id = ?1 AND i.owner_verified_at IS NOT NULL
+               AND i.lifecycle = 'active'
                AND i.owner_email IS NOT NULL AND trim(i.owner_email) != ''",
             params![installation_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
@@ -2160,17 +2218,24 @@ fn resolve_client_system_event_room_tx(
         return Ok((room_id, owner_user_id));
     }
 
-    let installation_exists = conn
+    let installation_lifecycle = conn
         .query_row(
-            "SELECT 1 FROM installations WHERE id = ?1",
+            "SELECT lifecycle FROM installations WHERE id = ?1",
             params![installation_id],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|error| AppError::Internal(format!("check chat event Client failed: {error}")))?
-        .is_some();
-    if installation_exists {
+        .map_err(|error| AppError::Internal(format!("check chat event Client failed: {error}")))?;
+    if installation_lifecycle.as_deref() == Some("active") {
         return Err(AppError::Conflict("client owner is not verified".into()));
+    }
+    if installation_lifecycle
+        .as_deref()
+        .is_some_and(|lifecycle| lifecycle != "fenced")
+    {
+        return Err(AppError::Internal(
+            "Client lifecycle is invalid while resolving an archived chat event".into(),
+        ));
     }
 
     conn.query_row(
@@ -2179,7 +2244,7 @@ fn resolve_client_system_event_room_tx(
                          (SELECT u.id FROM users u
                           WHERE u.email_normalized = lower(trim(r.owner_email_snapshot))))
          FROM chat_rooms r
-         WHERE installation_id = ?1
+         WHERE installation_id = ?1 AND status = 'archived'
          ORDER BY owner_generation DESC LIMIT 1",
         params![installation_id],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),

@@ -2,7 +2,9 @@ use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration as StdDuration;
 
-use crate::db::{Connection, OptionalExtension, Transaction, params, params_from_iter};
+use crate::db::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, header};
@@ -249,6 +251,8 @@ pub struct RentalView {
     pub contacts: Vec<PaymentContact>,
     pub is_client_owner: bool,
     pub can_release: bool,
+    /// The renter may end a wedged release without changing the Host disposition.
+    pub can_finalize_release: bool,
     /// Latest pending/running cleanup job for this installation (page-refresh resume).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_cleanup_job_id: Option<String>,
@@ -291,9 +295,26 @@ pub fn router() -> Router<ServerState> {
             get(get_client_rental),
         )
         .route(
+            "/v1/client-market/clients/:installation_id/finalize-release",
+            post(finalize_failed_release),
+        )
+        .route(
             "/v1/admin/client-market/subscriptions/:installation_id/force-release",
             post(admin_force_release_subscription),
         )
+}
+
+async fn finalize_failed_release(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(installation_id): AxumPath<String>,
+) -> Result<Json<ForceReleaseResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let outcome = state
+        .store
+        .client_market_finalize_release_for_owner(&installation_id, &session)
+        .await?;
+    Ok(Json(outcome))
 }
 
 /// Operator escape hatch for a subscription wedged in teardown.
@@ -1297,21 +1318,61 @@ impl AppStore {
         actor_user_id: &str,
         actor_email: &str,
     ) -> Result<ForceReleaseResponse, AppError> {
+        self.client_market_finalize_stuck_subscription(
+            installation_id,
+            actor_user_id,
+            actor_email,
+            None,
+            "subscription_force_released",
+        )
+        .await
+    }
+
+    pub async fn client_market_finalize_release_for_owner(
+        &self,
+        installation_id: &str,
+        session: &AuthSession,
+    ) -> Result<ForceReleaseResponse, AppError> {
+        self.client_market_finalize_stuck_subscription(
+            installation_id,
+            &session.user_id,
+            &session.email,
+            Some(&session.user_id),
+            "subscription_release_finalized",
+        )
+        .await
+    }
+
+    async fn client_market_finalize_stuck_subscription(
+        &self,
+        installation_id: &str,
+        actor_user_id: &str,
+        actor_email: &str,
+        required_client_user_id: Option<&str>,
+        event_type: &str,
+    ) -> Result<ForceReleaseResponse, AppError> {
         let conn = self.conn.lock().await;
         let now = Utc::now();
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| AppError::Internal(format!("begin force release failed: {error}")))?;
 
-        let (previous_status, host_id): (String, Option<String>) = tx
+        let (previous_status, host_id, client_user_id): (String, Option<String>, String) = tx
             .query_row(
-                "SELECT status, host_id FROM client_market_subscriptions WHERE installation_id = ?1",
+                "SELECT status, host_id, client_user_id
+                 FROM client_market_subscriptions WHERE installation_id = ?1",
                 params![installation_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("load subscription failed: {error}")))?
             .ok_or_else(|| AppError::NotFound("subscription not found".into()))?;
+
+        if required_client_user_id.is_some_and(|expected| expected != client_user_id) {
+            return Err(AppError::Forbidden(
+                "only the Client owner may finalize this failed release".into(),
+            ));
+        }
 
         if previous_status != SUBSCRIPTION_RELEASE_FAILED
             && previous_status != SUBSCRIPTION_RELEASING
@@ -1319,6 +1380,26 @@ impl AppStore {
             return Err(AppError::Conflict(format!(
                 "subscription is {previous_status}; only releasing or release_failed can be force released"
             )));
+        }
+
+        let active_cleanup_jobs: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_jobs
+                 WHERE installation_id = ?1 AND type = 'cleanup'
+                   AND status IN ('pending', 'running')",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "check active cleanup before release failed: {error}"
+                ))
+            })?;
+        if active_cleanup_jobs > 0 {
+            return Err(AppError::Conflict(
+                "cleanup is still running; wait for it to finish before finalizing the release"
+                    .into(),
+            ));
         }
 
         // Compare-and-set on the status we actually read, so a concurrent cleanup
@@ -1360,10 +1441,11 @@ impl AppStore {
             host_id.as_deref(),
             Some(actor_user_id),
             Some(actor_email),
-            "subscription_force_released",
+            event_type,
             serde_json::json!({
                 "previousStatus": previous_status,
                 "hostStatus": host_status,
+                "remoteCleanupBypassed": true,
             }),
             now,
         )?;
@@ -3253,6 +3335,12 @@ fn load_rental_views(
             can_release: (client_role || provider_role)
                 && row.status != SUBSCRIPTION_RELEASED
                 && row.status != SUBSCRIPTION_RELEASING,
+            can_finalize_release: client_role
+                && matches!(
+                    row.status.as_str(),
+                    SUBSCRIPTION_RELEASING | SUBSCRIPTION_RELEASE_FAILED
+                )
+                && row.active_cleanup_job_id.is_none(),
             active_cleanup_job_id: row.active_cleanup_job_id,
             updated_at: row.updated_at,
         });
@@ -3273,6 +3361,7 @@ fn client_market_event_is_chat_visible(event_type: &str) -> bool {
             | "client_recovery_failed"
             | "client_recovery_blocked"
             | "subscription_force_released"
+            | "subscription_release_finalized"
     )
 }
 
@@ -3295,7 +3384,9 @@ fn client_market_event_fallback_status(event_type: &str) -> &'static str {
         "free_period_expiring" => SUBSCRIPTION_ACTIVE,
         "free_period_expired" => SUBSCRIPTION_RELEASING,
         "cleanup_started" => SUBSCRIPTION_RELEASING,
-        "cleanup_finished" | "subscription_force_released" => SUBSCRIPTION_RELEASED,
+        "cleanup_finished" | "subscription_force_released" | "subscription_release_finalized" => {
+            SUBSCRIPTION_RELEASED
+        }
         "cleanup_failed" => SUBSCRIPTION_RELEASE_FAILED,
         "client_recovery_succeeded" | "client_recovery_failed" | "client_recovery_blocked" => {
             SUBSCRIPTION_ACTIVE

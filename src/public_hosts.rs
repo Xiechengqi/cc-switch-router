@@ -163,6 +163,61 @@ pub fn replace_claim_in_transaction(
     claim(conn, input)
 }
 
+pub(crate) fn takeover_rebind(
+    conn: &Connection,
+    input: NewPublicHost<'_>,
+    previous_installation_id: &str,
+) -> Result<PublicHostRecord, PublicHostCatalogError> {
+    validate_claim(&input)?;
+    let label = input.label.trim().to_ascii_lowercase();
+    if let Some(subject_host) = get_live_by_subject(conn, input.kind, input.subject_id)?
+        && subject_host.label != label
+    {
+        return Err(PublicHostCatalogError::Conflict(format!(
+            "{} {} still owns label {}",
+            kind_str(input.kind),
+            input.subject_id,
+            subject_host.label
+        )));
+    }
+
+    let Some(existing) = get_by_label(conn, &label)? else {
+        return claim(conn, input);
+    };
+    if same_claim(&existing, &input) {
+        set_lifecycle(conn, &label, PublicHostLifecycle::Active)?;
+        return get_by_label(conn, &label)?.ok_or_else(|| {
+            PublicHostCatalogError::Corrupt("rebound public host cannot be read back".into())
+        });
+    }
+    if existing.installation_id.as_deref() != Some(previous_installation_id) {
+        return Err(PublicHostCatalogError::Conflict(format!(
+            "label {label} is not owned by the takeover source installation"
+        )));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE public_hosts
+         SET route_id = ?2, kind = ?3, subject_id = ?4, installation_id = ?5,
+             target_lane_id = ?6, lifecycle = 'active', revision = revision + 1,
+             updated_at = ?7
+         WHERE label = ?1",
+        params![
+            label,
+            input.route_id,
+            kind_str(input.kind),
+            input.subject_id,
+            input.installation_id,
+            input.target_lane_id,
+            now,
+        ],
+    )?;
+    get_by_label(conn, &label)?.ok_or_else(|| {
+        PublicHostCatalogError::Corrupt("rebound public host cannot be read back".into())
+    })
+}
+
 pub fn set_lifecycle(
     conn: &Connection,
     label: &str,

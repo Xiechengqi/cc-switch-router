@@ -13,11 +13,13 @@ use crate::config::{Config, MetricsConfig};
 use crate::error::AppError;
 use crate::models::{MarketRequestLogEntry, ShareRequestLogEntry};
 use crate::proxy::ProxyRegistry;
+use crate::store::AppStore;
+use crate::{alerting::AlertingService, alerting::models::AlertCondition};
 
 use self::collector::{HostSampler, host_info};
 use self::models::{
-    HostMetricsInfo, HostMetricsStatus, LlmMetricsSnapshot, LlmRequestMetric, MetricEvent,
-    MetricsHealth, MetricsSnapshot, RouterMetricsStatus,
+    ClientMetricsSnapshot, HostMetricsInfo, HostMetricsStatus, LlmMetricsSnapshot,
+    LlmRequestMetric, MetricEvent, MetricsHealth, MetricsSnapshot, RouterMetricsStatus,
 };
 use self::store::MetricsStore;
 
@@ -28,6 +30,7 @@ pub struct MetricsRegistry {
     store: MetricsStore,
     sampler: Mutex<HostSampler>,
     last_host: Mutex<Option<HostMetricsStatus>>,
+    last_router: Mutex<Option<RouterMetricsStatus>>,
     proxy_inflight: AtomicU64,
     proxy_requests_total: AtomicU64,
     proxy_upstream_errors_total: AtomicU64,
@@ -53,6 +56,7 @@ impl MetricsRegistry {
             store: MetricsStore::new(config.db_path, config.retention_days),
             sampler: Mutex::new(HostSampler::default()),
             last_host: Mutex::new(None),
+            last_router: Mutex::new(None),
             proxy_inflight: AtomicU64::new(0),
             proxy_requests_total: AtomicU64::new(0),
             proxy_upstream_errors_total: AtomicU64::new(0),
@@ -95,9 +99,23 @@ impl MetricsRegistry {
         &self,
         config: &Config,
         proxy: &ProxyRegistry,
+        app_store: &AppStore,
+        alerting: &AlertingService,
     ) -> Result<(), AppError> {
         let host = self.current_host_status(config).await;
         let router = self.router_status(proxy).await;
+        let previous_router = self.last_router.lock().await.replace(router.clone());
+        let (clients, client_metrics_error) =
+            match app_store.client_metrics_snapshot(chrono::Utc::now()).await {
+                Ok(clients) => (clients, None),
+                Err(error) => (
+                    ClientMetricsSnapshot {
+                        timestamp: host.timestamp,
+                        ..Default::default()
+                    },
+                    Some(error.to_string()),
+                ),
+            };
         let llm = if self.enabled {
             self.store.llm_snapshot(5 * 60).await.unwrap_or_default()
         } else {
@@ -105,13 +123,17 @@ impl MetricsRegistry {
         };
         if self.enabled {
             self.store
-                .insert_sample(host.clone(), router.clone())
+                .insert_sample(host.clone(), router.clone(), clients.clone())
                 .await?;
-            let alerts = build_alerts(&host, &router, &llm);
-            for event in alerts {
-                if let Err(err) = self.store.insert_event_deduped(event).await {
-                    debug!("persist metric alert failed: {err}");
-                }
+            let conditions = build_alert_conditions(
+                &host,
+                &router,
+                previous_router.as_ref(),
+                &llm,
+                client_metrics_error.as_deref(),
+            );
+            if let Err(error) = alerting.reconcile_metrics(conditions, host.timestamp).await {
+                debug!("reconcile persistent metric incidents failed: {error}");
             }
         }
         Ok(())
@@ -121,6 +143,8 @@ impl MetricsRegistry {
         &self,
         config: &Config,
         proxy: &ProxyRegistry,
+        app_store: &AppStore,
+        alerting: &AlertingService,
     ) -> Result<MetricsSnapshot, AppError> {
         let host = self.current_host_status(config).await;
         let router = self.router_status(proxy).await;
@@ -130,11 +154,34 @@ impl MetricsRegistry {
             LlmMetricsSnapshot::default()
         };
         llm.inflight = self.proxy_inflight.load(Ordering::Relaxed);
-        let alerts = build_alerts(&host, &router, &llm);
-        let status = alerts
+        let clients = app_store
+            .client_metrics_snapshot(chrono::Utc::now())
+            .await
+            .unwrap_or_else(|_| ClientMetricsSnapshot {
+                timestamp: host.timestamp,
+                ..Default::default()
+            });
+        let incidents = alerting.active_incidents().await.unwrap_or_default();
+        let alerts = incidents
             .iter()
-            .fold(MetricsHealth::Healthy, |current, event| {
-                match (current, event.severity.as_str()) {
+            .map(|incident| MetricEvent {
+                id: None,
+                timestamp: incident.last_transition_at,
+                severity: incident.severity.clone(),
+                kind: incident.kind.clone(),
+                message: incident.message.clone(),
+                details: serde_json::json!({
+                    "incidentId": incident.id,
+                    "status": incident.status,
+                    "entityKind": incident.entity_kind,
+                    "entityId": incident.entity_id,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let status = incidents
+            .iter()
+            .fold(MetricsHealth::Healthy, |current, incident| {
+                match (current, incident.severity.as_str()) {
                     (_, "critical") => MetricsHealth::Critical,
                     (MetricsHealth::Healthy, "warning") => MetricsHealth::Warning,
                     (other, _) => other,
@@ -153,8 +200,10 @@ impl MetricsRegistry {
             last_persisted_at,
             host,
             router,
+            clients,
             llm,
             alerts,
+            incidents,
         })
     }
 
@@ -404,6 +453,8 @@ pub async fn run_collector(
     metrics: Arc<MetricsRegistry>,
     config: Config,
     proxy: Arc<ProxyRegistry>,
+    app_store: AppStore,
+    alerting: Arc<AlertingService>,
 ) {
     if let Err(err) = metrics.init().await {
         warn!("metrics init failed: {err}");
@@ -418,7 +469,10 @@ pub async fn run_collector(
         if !config.metrics.enabled {
             continue;
         }
-        if let Err(err) = metrics.sample_and_store(&config, &proxy).await {
+        if let Err(err) = metrics
+            .sample_and_store(&config, &proxy, &app_store, &alerting)
+            .await
+        {
             metrics.record_db_error();
             debug!("metrics sample failed: {err}");
         }
@@ -447,89 +501,188 @@ fn decrement(value: &AtomicU64) {
     }
 }
 
-fn build_alerts(
+fn build_alert_conditions(
     host: &HostMetricsStatus,
     router: &RouterMetricsStatus,
+    previous_router: Option<&RouterMetricsStatus>,
     llm: &LlmMetricsSnapshot,
-) -> Vec<MetricEvent> {
-    let now = host.timestamp;
-    let mut events = Vec::new();
+    client_metrics_error: Option<&str>,
+) -> Vec<AlertCondition> {
+    let mut conditions = Vec::new();
+    let mut push =
+        |kind: &str, severity: &str, title: &str, message: &str, details: serde_json::Value| {
+            conditions.push(AlertCondition {
+                fingerprint: format!("{kind}:router:router"),
+                scope: "metrics".into(),
+                kind: kind.into(),
+                entity_kind: "router".into(),
+                entity_id: Some("router".into()),
+                severity: severity.into(),
+                title: title.into(),
+                message: message.into(),
+                details,
+            });
+        };
     if let Some(fd) = host.process.fd_usage_percent {
         if fd >= 85.0 {
-            events.push(event(
-                now,
-                "critical",
+            push(
                 "fd_pressure",
+                "critical",
+                "Router file descriptor pressure",
                 "FD usage is critical",
                 serde_json::json!({ "fdUsagePercent": fd }),
-            ));
+            );
         } else if fd >= 70.0 {
-            events.push(event(
-                now,
-                "warning",
+            push(
                 "fd_pressure",
+                "warning",
+                "Router file descriptor pressure",
                 "FD usage is elevated",
                 serde_json::json!({ "fdUsagePercent": fd }),
-            ));
+            );
+        }
+    }
+    if let Some(cpu) = host.cpu_percent {
+        if cpu >= 90.0 {
+            push(
+                "host_cpu_pressure",
+                "critical",
+                "Host CPU pressure",
+                "Host CPU usage is critical",
+                serde_json::json!({ "cpuPercent": cpu }),
+            );
+        } else if cpu >= 75.0 {
+            push(
+                "host_cpu_pressure",
+                "warning",
+                "Host CPU pressure",
+                "Host CPU usage is elevated",
+                serde_json::json!({ "cpuPercent": cpu }),
+            );
+        }
+    }
+    if let (Some(used), Some(total)) = (host.memory_used_bytes, host.memory_total_bytes) {
+        if total > 0 {
+            let percent = used as f64 * 100.0 / total as f64;
+            if percent >= 92.0 {
+                push(
+                    "host_memory_pressure",
+                    "critical",
+                    "Host memory pressure",
+                    "Host memory usage is critical",
+                    serde_json::json!({ "memoryUsagePercent": percent }),
+                );
+            } else if percent >= 80.0 {
+                push(
+                    "host_memory_pressure",
+                    "warning",
+                    "Host memory pressure",
+                    "Host memory usage is elevated",
+                    serde_json::json!({ "memoryUsagePercent": percent }),
+                );
+            }
+        }
+    }
+    if let Some(disk) = host.disks.first().filter(|disk| disk.total_bytes > 0) {
+        let percent = disk.used_bytes as f64 * 100.0 / disk.total_bytes as f64;
+        if percent >= 90.0 {
+            push(
+                "host_disk_pressure",
+                "critical",
+                "Host disk pressure",
+                "Primary disk usage is critical",
+                serde_json::json!({
+                    "diskUsagePercent": percent,
+                    "mountPoint": disk.mount_point,
+                }),
+            );
+        } else if percent >= 80.0 {
+            push(
+                "host_disk_pressure",
+                "warning",
+                "Host disk pressure",
+                "Primary disk usage is elevated",
+                serde_json::json!({
+                    "diskUsagePercent": percent,
+                    "mountPoint": disk.mount_point,
+                }),
+            );
         }
     }
     if router.ssh_forward_listeners > router.active_routes + 2 {
-        events.push(event(
-            now,
-            "critical",
+        push(
             "route_lifecycle",
+            "critical",
+            "SSH route lifecycle mismatch",
             "Forward listeners exceed active routes",
             serde_json::json!({
                 "forwardListeners": router.ssh_forward_listeners,
                 "activeRoutes": router.active_routes,
             }),
-        ));
+        );
     }
-    if router.db_errors_total > 0 {
-        events.push(event(
-            now,
-            "warning",
-            "db_error",
-            "Metrics observed DB errors",
-            serde_json::json!({ "dbErrorsTotal": router.db_errors_total }),
-        ));
+    if let Some(previous) = previous_router {
+        let db_errors = router
+            .db_errors_total
+            .saturating_sub(previous.db_errors_total);
+        if db_errors > 0 {
+            push(
+                "db_error",
+                "warning",
+                "Router database errors",
+                "Router observed new database errors",
+                serde_json::json!({ "newErrors": db_errors, "total": router.db_errors_total }),
+            );
+        }
+        let emfile_errors = router
+            .ssh_forward_emfile_errors_total
+            .saturating_sub(previous.ssh_forward_emfile_errors_total);
+        if emfile_errors > 0 {
+            push(
+                "ssh_emfile",
+                "critical",
+                "SSH listener file descriptor exhaustion",
+                "SSH forwarding observed too many open files",
+                serde_json::json!({ "newErrors": emfile_errors }),
+            );
+        }
     }
-    if llm.error_rate >= 0.10 {
-        events.push(event(
-            now,
-            "warning",
+    if llm.rpm >= 1.0 && llm.error_rate >= 0.25 {
+        push(
             "llm_error_rate",
+            "critical",
+            "LLM request error rate",
+            "LLM error rate is critical",
+            serde_json::json!({ "errorRate": llm.error_rate, "rpm": llm.rpm }),
+        );
+    } else if llm.rpm >= 1.0 && llm.error_rate >= 0.10 {
+        push(
+            "llm_error_rate",
+            "warning",
+            "LLM request error rate",
             "LLM error rate is elevated",
-            serde_json::json!({ "errorRate": llm.error_rate }),
-        ));
+            serde_json::json!({ "errorRate": llm.error_rate, "rpm": llm.rpm }),
+        );
     }
     if llm.rate_limit_per_minute >= 5.0 {
-        events.push(event(
-            now,
-            "warning",
+        push(
             "llm_rate_limit",
+            "warning",
+            "LLM rate limiting",
             "LLM rate limits increased",
             serde_json::json!({ "rateLimitPerMinute": llm.rate_limit_per_minute }),
-        ));
+        );
     }
-    events
-}
-
-fn event(
-    timestamp: i64,
-    severity: &str,
-    kind: &str,
-    message: &str,
-    details: serde_json::Value,
-) -> MetricEvent {
-    MetricEvent {
-        id: None,
-        timestamp,
-        severity: severity.into(),
-        kind: kind.into(),
-        message: message.into(),
-        details,
+    if let Some(error) = client_metrics_error {
+        push(
+            "client_metrics_unavailable",
+            "warning",
+            "Client status metrics unavailable",
+            "Router could not read the Client presence state",
+            serde_json::json!({ "error": error.chars().take(500).collect::<String>() }),
+        );
     }
+    conditions
 }
 
 fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {

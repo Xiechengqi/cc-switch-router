@@ -9,9 +9,9 @@ use tokio::task::spawn_blocking;
 use crate::error::AppError;
 
 use super::models::{
-    ClearMetricsResponse, HostMetricsPoint, HostMetricsStatus, LlmMetricsPoint, LlmRequestMetric,
-    LlmTopItem, LlmTopResponse, MetricEvent, MetricsSeriesResponse, RouterMetricsPoint,
-    RouterMetricsStatus,
+    ClearMetricsResponse, ClientMetricsPoint, ClientMetricsSnapshot, HostMetricsPoint,
+    HostMetricsStatus, LlmMetricsPoint, LlmRequestMetric, LlmTopItem, LlmTopResponse, MetricEvent,
+    MetricsSeriesResponse, RouterMetricsPoint, RouterMetricsStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -43,6 +43,8 @@ impl MetricsStore {
         }
         let conn = Connection::open(&self.path)
             .map_err(|err| AppError::Internal(format!("open metrics db failed: {err}")))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| AppError::Internal(format!("configure metrics db failed: {err}")))?;
         if !self.initialized.load(Ordering::Acquire) {
             init_metrics_db(&conn)?;
             self.initialized.store(true, Ordering::Release);
@@ -61,12 +63,14 @@ impl MetricsStore {
         &self,
         host: HostMetricsStatus,
         router: RouterMetricsStatus,
+        clients: ClientMetricsSnapshot,
     ) -> Result<(), AppError> {
         let store = self.clone();
         spawn_blocking(move || {
             let conn = store.open()?;
             insert_host_metrics(&conn, &host)?;
             insert_router_metrics(&conn, host.timestamp, &router)?;
+            insert_client_metrics(&conn, &clients)?;
             Ok(())
         })
         .await
@@ -208,6 +212,7 @@ impl MetricsStore {
                 step: step_label,
                 host: load_host_series(&conn, start_ts, end_ts, step_secs)?,
                 router: load_router_series(&conn, start_ts, end_ts, step_secs)?,
+                clients: load_client_series(&conn, start_ts, end_ts, step_secs)?,
                 llm: load_llm_series(&conn, start_ts, end_ts, step_secs)?,
             })
         })
@@ -301,6 +306,7 @@ impl MetricsStore {
             for table in [
                 "host_metrics",
                 "router_metrics",
+                "client_metrics",
                 "llm_request_metrics",
                 "metric_events",
             ] {
@@ -403,6 +409,17 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
             db_errors_total INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_router_metrics_ts ON router_metrics(timestamp);
+
+        CREATE TABLE IF NOT EXISTS client_metrics (
+            timestamp INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            monitored INTEGER NOT NULL,
+            online INTEGER NOT NULL,
+            recovering INTEGER NOT NULL,
+            offline INTEGER NOT NULL,
+            unknown_count INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_client_metrics_ts ON client_metrics(timestamp);
 
         CREATE TABLE IF NOT EXISTS llm_request_metrics (
             timestamp INTEGER NOT NULL,
@@ -568,6 +585,28 @@ fn insert_router_metrics(
     Ok(())
 }
 
+fn insert_client_metrics(
+    conn: &Connection,
+    clients: &ClientMetricsSnapshot,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO client_metrics (
+            timestamp, total, monitored, online, recovering, offline, unknown_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            clients.timestamp,
+            clients.total as i64,
+            clients.monitored as i64,
+            clients.online as i64,
+            clients.recovering as i64,
+            clients.offline as i64,
+            clients.unknown as i64,
+        ],
+    )
+    .map_err(|error| AppError::Internal(format!("insert Client metrics failed: {error}")))?;
+    Ok(())
+}
+
 fn insert_llm_request_metric(conn: &Connection, metric: &LlmRequestMetric) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO llm_request_metrics (
@@ -640,6 +679,7 @@ fn prune_old_metrics(conn: &Connection, now_ts: i64, retention_days: u32) -> Res
     for (table, column) in [
         ("host_metrics", "timestamp"),
         ("router_metrics", "timestamp"),
+        ("client_metrics", "timestamp"),
         ("llm_request_metrics", "timestamp"),
         ("metric_events", "timestamp"),
     ] {
@@ -825,6 +865,63 @@ fn load_router_series(
             proxy_upstream_errors_total: 0,
             health_probe_failures_total: 0,
             db_errors_total: 0,
+        },
+    ))
+}
+
+fn load_client_series(
+    conn: &Connection,
+    start_ts: i64,
+    end_ts: i64,
+    step_secs: i64,
+) -> Result<Vec<ClientMetricsPoint>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "WITH bucketed AS (
+                SELECT *, (timestamp / ?1) * ?1 AS bucket_ts
+                FROM client_metrics
+                WHERE timestamp >= ?2 AND timestamp <= ?3
+             ), latest AS (
+                SELECT bucket_ts, MAX(timestamp) AS latest_ts
+                FROM bucketed GROUP BY bucket_ts
+             )
+             SELECT b.bucket_ts, b.total, b.online, b.recovering,
+                    b.offline, b.unknown_count
+             FROM bucketed b
+             JOIN latest l ON l.bucket_ts = b.bucket_ts AND l.latest_ts = b.timestamp
+             ORDER BY b.bucket_ts ASC",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare Client metrics series failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map(params![step_secs, start_ts, end_ts], |row| {
+            Ok(ClientMetricsPoint {
+                timestamp: row.get(0)?,
+                total: row.get::<_, i64>(1)?.max(0) as u64,
+                online: row.get::<_, i64>(2)?.max(0) as u64,
+                recovering: row.get::<_, i64>(3)?.max(0) as u64,
+                offline: row.get::<_, i64>(4)?.max(0) as u64,
+                unknown: row.get::<_, i64>(5)?.max(0) as u64,
+            })
+        })
+        .map_err(|error| {
+            AppError::Internal(format!("query Client metrics series failed: {error}"))
+        })?;
+    let buckets = collect_rows(rows, "Client metrics series")?;
+    Ok(fill_time_axis(
+        start_ts,
+        end_ts,
+        step_secs,
+        buckets,
+        |point| point.timestamp,
+        |timestamp| ClientMetricsPoint {
+            timestamp,
+            total: 0,
+            online: 0,
+            recovering: 0,
+            offline: 0,
+            unknown: 0,
         },
     ))
 }
@@ -1308,7 +1405,9 @@ fn load_events(conn: &Connection, limit: usize) -> Result<Vec<MetricEvent>, AppE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::models::{DiskUsage, NetworkMetricsStatus, ProcessMetricsStatus};
+    use crate::metrics::models::{
+        ClientMetricsSnapshot, DiskUsage, NetworkMetricsStatus, ProcessMetricsStatus,
+    };
 
     #[test]
     fn host_series_reads_avg_rss_as_real() {
@@ -1323,6 +1422,47 @@ mod tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].timestamp, 900);
         assert_eq!(series[0].process_rss_bytes, Some(101));
+    }
+
+    #[test]
+    fn client_series_uses_latest_sample_in_each_bucket() {
+        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        init_metrics_db(&conn).expect("init metrics db");
+        insert_client_metrics(
+            &conn,
+            &ClientMetricsSnapshot {
+                timestamp: 900,
+                total: 4,
+                monitored: 4,
+                online: 3,
+                recovering: 0,
+                offline: 1,
+                unknown: 0,
+                items: Vec::new(),
+            },
+        )
+        .expect("insert first Client sample");
+        insert_client_metrics(
+            &conn,
+            &ClientMetricsSnapshot {
+                timestamp: 910,
+                total: 4,
+                monitored: 4,
+                online: 2,
+                recovering: 1,
+                offline: 1,
+                unknown: 0,
+                items: Vec::new(),
+            },
+        )
+        .expect("insert latest Client sample");
+
+        let series = load_client_series(&conn, 900, 929, 30).expect("load Client series");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].timestamp, 900);
+        assert_eq!(series[0].online, 2);
+        assert_eq!(series[0].recovering, 1);
+        assert_eq!(series[0].offline, 1);
     }
 
     fn host_sample(timestamp: i64, rss_bytes: u64) -> HostMetricsStatus {

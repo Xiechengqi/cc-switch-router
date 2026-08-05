@@ -105,7 +105,7 @@ location.reload();
 | 新建 Client | `..._create_client_providers_v2`, `..._create_client_regions_v2` |
 | 窗口 | `..._console_windows_v1/v2`, `..._web_terminal_windows_v1`(sessionStorage) |
 | Share 页 | `cc_switch_share_api_email_v1`, `cc_switch_share_api_token_v1` |
-| 其他 | `..._chat_anon_visits_v1`, `..._map_request_ticker_expanded_v1`, `..._board_guest_v1`, `cc-switch-router-client-upgrade-state` |
+| 其他 | `..._chat_anon_visits_v1`, `..._map_request_ticker_expanded_v1`, `cc-switch-router-client-upgrade-state` |
 
 > **注意版本号后缀**。`owner_scope_v2` / `sort_v2` / `status_filter_v2` 是近期升版的键;老用户升级后会被重置一次,用例 H-01 覆盖这个首次进入行为。
 
@@ -664,12 +664,13 @@ location.reload();
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
 | X-01 | 非管理员 | 打开 `/settings` | 提示无权限;**仍显示只读的版本面板与地图面板** |
-| X-02 | 管理员 | 打开 | 左侧分组导航 + 表单;79 个字段 / 14 个分组 |
+| X-02 | 管理员 | 打开 | 左侧分组导航 + 表单;85 个字段 / 18 个分组 |
 | X-03 | 管理员 | 修改任意字段 | 该分组出现未保存计数角标;顶部保存按钮显示总数 |
 | X-04 | 管理员 | 点保存 | 返回更新/未变/需重启的键数量 |
 | X-05 | 管理员 | 改需重启字段 | 字段显示「需重启」chip |
 | X-06 | 管理员 | 点「保存并重启」 | 保存后重启;轮询 `/v1/healthz` 至恢复后自动刷新 |
-| X-07 | 管理员 | 点「测试 Telegram」 | 成功/失败横幅 |
+| X-07 | 管理员 | 点击当前已注册渠道 Telegram 的「发送测试」 | 成功或失败横幅；状态、最近成功时间和安全错误同步刷新 |
+| X-39 | Telegram 未配置或供应商请求失败 | 观察渠道状态并发送测试 | 未配置时按钮禁用；请求失败时显示 degraded 和可理解错误，不泄露 Bot Token |
 | X-08 | 管理员 | 打开持久化分组 | 显示 provision 公钥与 authorized_keys 行,可复制 |
 | X-25 | 管理员 | 逐类字段验证控件类型 | bool→复选框;email_list/ip_list→多行文本域;secret→密码框且已设置时有提示;int/url/email→对应 input type |
 | X-26 | 管理员 | 观察字段来源标注 | 每个字段显示取值来源(env / 文件 / 默认) |
@@ -714,7 +715,7 @@ location.reload();
 | N-02 | 管理员 | 打开 | 初始骨架屏 → 数据渲染 |
 | N-03 | 管理员 | 切 5 个时间范围 | 15m/1h/6h/24h/7d;步长相应为 15s/30s/1m/5m/15m |
 | N-04 | 管理员 | 开自动刷新 | 每 5 秒静默刷新;关闭后停止 |
-| N-05 | 管理员 | 切 5 个 tab | 概览 / 主机 / 路由 / LLM / 事件 各自加载 |
+| N-05 | 管理员 | 切 7 个 tab | 概览 / 主机 / 路由 / Clients / LLM / 告警 / 事件各自加载 |
 | N-06 | 数据陈旧或关闭 | 观察图表标题 | 显示琥珀色 stale/disabled 角标 |
 | N-07 | 管理员 | 点「清空指标」 | 二次确认(danger)→ 成功 Alert 5 秒后自动消失 |
 | N-08 | 概览 tab | 观察 | 4 个实时 KPI + 8 个指标卡(含迷你图)+ 系统风险趋势图 + 最近 6 条事件 |
@@ -723,6 +724,10 @@ location.reload();
 | N-11 | LLM tab | 观察 | 5 个 KPI + 请求/错误趋势 + Token 趋势 + 模型替换面板 + Top 消费者表 |
 | N-12 | 事件 tab | 观察 | 完整事件列表 |
 | N-13 | 指标库为空 | 打开 | 空态而非报错;图表显示无数据 |
+| N-15 | Clients tab | 观察在线、恢复中、离线 Client | KPI、趋势和清单使用同一 presence 状态；显示最近可信心跳、离线开始时间和 episode |
+| N-16 | 告警 tab 有 firing 事故 | 确认、选择时长静默、恢复通知 | 状态即时刷新；确认/静默不变成 resolved；静默截止时间可见；恢复通知创建新投递 |
+| N-17 | 存在 retry/dead-letter/渠道禁用投递 | 修复配置后点重试；随后制造更新事故流转 | 原冻结 payload 重新进入 pending；旧投递被标记 `superseded` 后按钮禁用，不会在恢复通知后补发过期 firing |
+| N-18 | 管理员清空 metrics | 刷新告警 tab | 采样历史被清理，事故、transition 和投递历史仍保留 |
 | N-14 | 承 N-07 | 清空后观察 | 各 tab 数据归零,不残留旧值 |
 
 ---

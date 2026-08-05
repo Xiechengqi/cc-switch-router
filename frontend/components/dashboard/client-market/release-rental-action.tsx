@@ -2,11 +2,15 @@
 
 import * as React from "react";
 import { Button, Chip, Modal, toast } from "@heroui/react";
-import { Loader2 } from "lucide-react";
+import { Loader2, Unlink } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getClientMarketJob, releaseClientMarketRental } from "@/lib/api";
+import {
+  finalizeClientMarketFailedRental,
+  getClientMarketJob,
+  releaseClientMarketRental,
+} from "@/lib/api";
 import {
   cleanupFailureGuidanceKey,
   cleanupPhaseLabelKey,
@@ -19,6 +23,62 @@ const RESUME_STORAGE_PREFIX = "client-market:release-job:";
 
 function resumeStorageKey(installationId: string) {
   return `${RESUME_STORAGE_PREFIX}${installationId}`;
+}
+
+export function FinalizeFailedRentalAction({
+  rental,
+  onChanged,
+  className,
+}: {
+  rental: ClientMarketRental;
+  onChanged: () => Promise<void> | void;
+  className?: string;
+}) {
+  const { t } = useLocaleText();
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  if (!rental.canFinalizeRelease) return null;
+
+  const finalize = async () => {
+    setBusy(true);
+    try {
+      await finalizeClientMarketFailedRental(rental.installationId);
+      setConfirmOpen(false);
+      toast.success(t("clientMarket.release.finalizeSucceeded"));
+      await onChanged();
+    } catch (reason) {
+      toast.danger(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <Button
+        size="sm"
+        variant="ghost"
+        className={className ?? "h-6 px-2 text-[11px] text-amber-800"}
+        isDisabled={busy}
+        onClick={() => setConfirmOpen(true)}
+      >
+        <Unlink className="h-3.5 w-3.5" />
+        {t("clientMarket.release.finalizeAction")}
+      </Button>
+      <ConfirmAlertDialog
+        open={confirmOpen}
+        title={t("clientMarket.release.finalizeConfirmTitle")}
+        description={t("clientMarket.release.finalizeConfirmDescription")}
+        confirmLabel={t("clientMarket.release.finalizeAction")}
+        cancelLabel={t("common.cancel")}
+        busy={busy}
+        tone="danger"
+        onConfirm={() => void finalize()}
+        onOpenChange={(next) => !busy && setConfirmOpen(next)}
+      />
+    </>
+  );
 }
 
 export function ReleaseRentalAction({

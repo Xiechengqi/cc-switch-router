@@ -206,13 +206,13 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 ## 5. 数据层
 
-业务库与 metrics 库分离。业务库当前有 96 张业务表,另有 1 张 `schema_migrations` 元数据表。
+业务库与 metrics 库分离。业务库当前有 97 张业务表,另有 1 张 `schema_migrations` 元数据表。
 
 **数据库模式**:
 
 - `local`:独立本地 libSQL 文件,WAL 模式。
 - `turso`:Turso Cloud Embedded Replica,本地读、远端委派写,周期拉取远端 frame。未启用 offline writes,远端不可用时写操作失败并将健康状态置为 unavailable。
-- metrics 始终通过独立本地 `libsql-rusqlite` 文件存储,不进入 Turso。
+- metrics 始终通过独立本地 `libsql-rusqlite` 文件存储,不进入 Turso。除采样表外,持久化事故、transition、投递 outbox/attempt、渠道测试和 source-event 去重也位于该文件；清空 metrics 采样不会清理这些事故表。
 
 **连接模型**:业务读写保留单个 `Arc<Mutex<Connection>>`,外键开启、`busy_timeout = 5000ms`;local 模式额外启用 WAL。同步 facade 在专用 Tokio runtime 执行 libSQL async I/O,从而保持现有 store 的同步 SQL 边界。Turso 周期同步通过独立的 database handle 运行,健康快照通过共享原子状态读取,两者都不获取业务连接 mutex。
 
@@ -231,9 +231,9 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`account_payment_*` |
 | 联邦与市场 | `router_markets`、`router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions` |
 | 通知 | `client_notification_events`、`email_delivery_batches` 等 9 张 |
+| 运维告警信号 | `operator_alert_signal_outbox` |
 | 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
 | 认证 | `users`、`user_sessions`、`user_api_tokens`、`email_login_challenges`、`user_profiles` |
-| 遗留 | `board_*`(接口已返回 410 Gone,数据保留) |
 
 ### 账户用量（Provider / Consumer）
 
@@ -286,6 +286,7 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 | `runtime_task` | 10min | share 运行时快照刷新 |
 | `resend_usage_task` | 10min | Resend 配额轮询 |
 | `metrics_task` | — | 指标采集 |
+| `alerting_task` | 2s | Client 信号入库、静默到期、已注册 IM 渠道投递与重试 |
 | `notification_task` | 5s | 离线/恢复邮件 outbox |
 | `chat_notification_task` | — | 聊天邮件投递 |
 | `client_market_trade_task` | 20s | Client Market 报价、免费期限、释放与清理状态对账 |
@@ -313,6 +314,14 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 - 12 次尝试后进入死信
 - 可重试状态码:408、425、429、5xx,以及带 `concurrent_idempotent_requests` 的 409
 - 单收件人与全局双层小时配额,offline 与 registration 两条 lane 额度互不占用
+
+### 8.1 运维事故与 IM 渠道
+
+`src/alerting/` 使用 metrics SQLite 保存 `alert_incidents`、`alert_transitions`、`alert_deliveries`、`alert_delivery_attempts`、`alert_channel_checks` 和 `alert_source_events`。Fingerprint 保证同一条件同时只有一个活跃事故；Metrics 条件按完整观测集 reconcile，Client presence 则通过业务库 `operator_alert_signal_outbox` 跨库传递，source event ID 同时在两侧去重。
+
+事故状态为 `firing`、`acknowledged`、`silenced`、`resolved`。确认与静默不伪造恢复；严重级别升级会重新唤醒已确认事故，静默到期仍异常时自动回到 firing，真实恢复始终产生 recovery transition。每次可通知 transition 在同一 metrics SQLite 事务内冻结渠道 payload 并创建 delivery；同一事故尚未发送的旧 delivery 会先进入不可重试的 `superseded`，且曾接收高等级 firing 的当前启用渠道不会因事故降级而漏掉 recovery。worker 使用 60 秒 claim lease、带稳定 jitter 的指数退避和 12 次自动尝试；attempt number 防止过期 worker 覆盖已被重新认领的投递。
+
+渠道适配器通过稳定的字符串 ID 注册，投递 policy、outbox、渠道状态和管理 API 均不依赖具体供应商。当前唯一注册的 Telegram adapter 调用 Bot `sendMessage`；未来渠道可在不改动事故状态机和存储模型的前提下加入。所有渠道错误在持久化和 API 返回前截断并清除换行或 Token，Secret Settings 只返回 `hasValue`。
 
 ---
 

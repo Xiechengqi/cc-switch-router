@@ -3,7 +3,7 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, toast } from "@heroui/react";
-import { Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pause, Pencil, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pause, Pencil, Play, Plus, RefreshCw, ServerOff, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -26,6 +26,7 @@ import {
   getClientMarketJob,
   pauseClientMarketHostRecovery,
   reverifyClientMarketHost,
+  retireUnreachableClientMarketHost,
   resumeClientMarketHostRecovery,
   retryClientMarketHostRecovery,
 } from "@/lib/api";
@@ -44,6 +45,7 @@ import {
   hostCanDelete,
   hostCanManage,
   hostCanReverify,
+  hostCanRetireUnreachable,
   hostDisplayLabel,
   hostStatusGuidanceKey,
   recoveryBlockedReasonKey,
@@ -82,7 +84,7 @@ function HostRowImpl({
   const viewerEmail = session?.user?.email;
   const { openTerminal } = useWebTerminal();
   const [busy, setBusy] = React.useState(false);
-  const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | null>(null);
+  const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | "retire" | null>(null);
   const [denyRenterAccess, setDenyRenterAccess] = React.useState(false);
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
@@ -103,6 +105,7 @@ function HostRowImpl({
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
   const canReverify = hostCanReverify(host, viewerEmail);
+  const canRetireUnreachable = hostCanRetireUnreachable(host, viewerEmail);
   const canOpenTerminal = host.canWebTerminal === true || canManageHost;
   const recovery = host.recovery;
   const canControlRecovery =
@@ -192,6 +195,20 @@ function HostRowImpl({
     }
   };
 
+  const onRetireUnreachable = async () => {
+    setConfirmAction(null);
+    setBusy(true);
+    try {
+      await retireUnreachableClientMarketHost(host.id);
+      toast.success(t("clientMarket.retireUnreachableSucceeded"));
+      onChanged();
+    } catch (err) {
+      toast.danger(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onRecoveryAction = async (action: "pause" | "resume" | "retry") => {
     setBusy(true);
     try {
@@ -216,14 +233,20 @@ function HostRowImpl({
         ),
         confirmLabel: t(isRetryCleanup ? "clientMarket.retryCleanup" : "clientMarket.cleanup"),
       }
-    : confirmAction === "delete"
+      : confirmAction === "delete"
       ? {
           title: t("clientMarket.deleteHostConfirmTitle"),
           description: t("clientMarket.deleteHostConfirmDesc", { host: hostLabel }),
           confirmLabel: t("clientMarket.deleteHost"),
         }
+      : confirmAction === "retire"
+        ? {
+            title: t("clientMarket.retireUnreachableConfirmTitle"),
+            description: t("clientMarket.retireUnreachableConfirmDesc", { host: hostLabel }),
+            confirmLabel: t("clientMarket.retireUnreachable"),
+          }
       : null;
-  const hasActions = canManageHost || canDelete || canCleanup || canReverify || canControlRecovery;
+  const hasActions = canManageHost || canDelete || canCleanup || canReverify || canRetireUnreachable || canControlRecovery;
   const ipPort = host.ip ? `${host.ip}${host.port ? `:${host.port}` : ""}` : "";
   const intel = host.ipIntel;
   const locationLabel = formatHostIpLocation(intel, countryName, locale);
@@ -496,6 +519,16 @@ function HostRowImpl({
                         {t("clientMarket.deleteHost")}
                       </Dropdown.Item>
                     ) : null}
+                    {canRetireUnreachable ? (
+                      <Dropdown.Item
+                        id="retire-unreachable"
+                        className="text-destructive"
+                        onAction={() => setConfirmAction("retire")}
+                      >
+                        <ServerOff className="h-4 w-4" />
+                        {t("clientMarket.retireUnreachable")}
+                      </Dropdown.Item>
+                    ) : null}
                   </Dropdown.Menu>
                 </Dropdown.Popover>
               </Dropdown>
@@ -559,6 +592,8 @@ function HostRowImpl({
                   onConfirm={() => {
                     if (confirmAction === "cleanup") {
                       void onCleanup(denyRenterAccess);
+                    } else if (confirmAction === "retire") {
+                      void onRetireUnreachable();
                     } else void onDelete();
                   }}
                   onOpenChange={(nextOpen) => {

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::alerting::models::AlertIncident;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsSnapshot {
@@ -12,8 +14,10 @@ pub struct MetricsSnapshot {
     pub last_persisted_at: Option<i64>,
     pub host: HostMetricsStatus,
     pub router: RouterMetricsStatus,
+    pub clients: ClientMetricsSnapshot,
     pub llm: LlmMetricsSnapshot,
     pub alerts: Vec<MetricEvent>,
+    pub incidents: Vec<AlertIncident>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -119,6 +123,35 @@ pub struct RouterMetricsStatus {
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClientMetricsSnapshot {
+    pub timestamp: i64,
+    pub total: u64,
+    pub monitored: u64,
+    pub online: u64,
+    pub recovering: u64,
+    pub offline: u64,
+    pub unknown: u64,
+    pub items: Vec<ClientMetricsItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientMetricsItem {
+    pub installation_id: String,
+    pub client_label: String,
+    pub status: String,
+    pub monitoring_enabled: bool,
+    pub platform: String,
+    pub app_version: String,
+    pub country_code: Option<String>,
+    pub last_authenticated_seen_at: Option<i64>,
+    pub offline_since: Option<i64>,
+    pub last_recovered_at: Option<i64>,
+    pub offline_episode: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LlmMetricsSnapshot {
     pub rpm: f64,
     pub tpm: f64,
@@ -153,6 +186,7 @@ pub struct MetricsSeriesResponse {
     pub step: String,
     pub host: Vec<HostMetricsPoint>,
     pub router: Vec<RouterMetricsPoint>,
+    pub clients: Vec<ClientMetricsPoint>,
     pub llm: Vec<LlmMetricsPoint>,
 }
 
@@ -179,6 +213,17 @@ pub struct RouterMetricsPoint {
     pub proxy_upstream_errors_total: u64,
     pub health_probe_failures_total: u64,
     pub db_errors_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientMetricsPoint {
+    pub timestamp: i64,
+    pub total: u64,
+    pub online: u64,
+    pub recovering: u64,
+    pub offline: u64,
+    pub unknown: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -40,6 +40,7 @@ const TERMINAL_JOB_RETENTION: ChronoDuration = ChronoDuration::days(30);
 const RECOVERY_ELIGIBILITY_PREDICATE: &str = "
     h.status = 'allocated'
     AND h.installation_id = i.id
+    AND i.lifecycle = 'active'
     AND i.provision_source = 'router_market'
     AND i.provision_host_id = h.id
     AND s.installation_id = i.id

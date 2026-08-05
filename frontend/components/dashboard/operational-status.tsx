@@ -72,6 +72,22 @@ export function shareOperationalSummary(share: ShareView): OperationalSummary {
 
 export function clientOperationalSummary(client: DashboardClient, _shares: ShareView[] = []): OperationalSummary {
   if (client.operationalSummary) return client.operationalSummary;
+  if (client.clientTunnel) {
+    if (client.clientTunnel.enabled && client.clientTunnel.routeState === "reconnecting") {
+      return {
+        state: "reconnecting",
+        primaryReason: { code: "route_reconnecting", severity: "info", entityType: "client", entityId: client.installation.id, startedAt: client.clientTunnel.routeStateSince },
+        additionalReasonCount: 0,
+      };
+    }
+    if (!client.clientTunnel.enabled || !client.clientTunnel.online) {
+      return {
+        state: "offline",
+        primaryReason: { code: "route_offline", severity: "critical", entityType: "client", entityId: client.installation.id },
+        additionalReasonCount: 0,
+      };
+    }
+  }
   const latestHealth = client.healthChecks?.at(-1);
   if (latestHealth && !latestHealth.isHealthy) {
     return {
@@ -84,23 +100,6 @@ export function clientOperationalSummary(client: DashboardClient, _shares: Share
       },
       additionalReasonCount: 0,
     };
-  }
-  if (client.clientTunnel) {
-    if (client.clientTunnel.enabled && client.clientTunnel.routeState === "reconnecting") {
-      return {
-        state: "reconnecting",
-        primaryReason: { code: "route_reconnecting", severity: "info", entityType: "client", entityId: client.installation.id, startedAt: client.clientTunnel.routeStateSince },
-        additionalReasonCount: 0,
-      };
-    }
-    if (client.clientTunnel.enabled && !client.clientTunnel.online) {
-      return {
-        state: "offline",
-        primaryReason: { code: "route_offline", severity: "critical", entityType: "client", entityId: client.installation.id },
-        additionalReasonCount: 0,
-      };
-    }
-    return { state: "online", additionalReasonCount: 0 };
   }
   return { state: "online", additionalReasonCount: 0 };
 }

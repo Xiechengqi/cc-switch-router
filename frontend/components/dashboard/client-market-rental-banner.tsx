@@ -1,7 +1,10 @@
 "use client";
 
 import { Clock3, HandCoins, Loader2 } from "lucide-react";
-import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
+import {
+  FinalizeFailedRentalAction,
+  ReleaseRentalAction,
+} from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import type { ClientMarketRental } from "@/lib/types";
@@ -44,6 +47,7 @@ export function ClientMarketRentalBanner({
         <Loader2 className="h-3 w-3 animate-spin" />
         {t("clientMarket.release.releasing")}
         {!readOnly && resumeRelease ? <ReleaseRentalAction rental={rental} onChanged={onChanged} /> : null}
+        {!readOnly ? <FinalizeFailedRentalAction rental={rental} onChanged={onChanged} /> : null}
       </span>
     );
   }
@@ -57,6 +61,7 @@ export function ClientMarketRentalBanner({
         ) : manageHref ? (
           <a href={manageHref} className="text-[11px] font-medium text-accent hover:underline">{t("clientMarket.release.manageInMarket")}</a>
         ) : null}
+        {!readOnly ? <FinalizeFailedRentalAction rental={rental} onChanged={onChanged} /> : null}
       </span>
     );
   }

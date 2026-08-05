@@ -27,14 +27,13 @@ use uuid::Uuid;
 const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
 
 use crate::ServerGeo;
+use crate::alerting::models::OperatorAlertSignal;
 use crate::config::{Config, DatabaseMode, tunnel_domain_host};
 use crate::ctl_client::authorize_control_request;
-use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
 use crate::models::{
     AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate, AuthSession, AuthUser,
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
-    BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
     ClientTunnelClaimRequest, ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse,
     ClientTunnelUpdateRequest, ClientTunnelView, CountryBoard, CountryClientBoard, CountryMapPoint,
@@ -76,8 +75,8 @@ use crate::models::{
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
 use crate::namespace::{
-    PROTOCOL_EPOCH, PublicHostKind, normalize_client_subdomain, normalize_market_slug,
-    parse_share_label,
+    PROTOCOL_EPOCH, PublicHostKind, build_share_label, normalize_client_subdomain,
+    normalize_market_slug, parse_share_label,
 };
 use crate::notifications::{
     ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
@@ -510,7 +509,7 @@ fn client_operational_summary(
     let tunnel_offline = client
         .client_tunnel
         .as_ref()
-        .is_some_and(|tunnel| tunnel.enabled && !tunnel.online);
+        .is_some_and(|tunnel| !tunnel.enabled || !tunnel.online);
     let heartbeat_stale = now - client.installation.last_seen_at > Duration::seconds(stale_seconds);
 
     if tunnel_offline {
@@ -1114,6 +1113,44 @@ pub struct ClientTunnelRouteTarget {
     pub subdomain: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClientSubdomainTakeoverPlan {
+    pub id: String,
+    pub target_installation_id: String,
+    pub source_installation_id: String,
+    pub owner_email: String,
+    pub target_original_subdomain: String,
+    pub adopted_subdomain: String,
+    pub source_retired_subdomain: String,
+    pub activate_at_ms: i64,
+    pub control_secret: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientSubdomainTakeoverCommit {
+    pub id: String,
+    pub target_installation_id: String,
+    pub source_installation_id: String,
+    pub target_original_subdomain: String,
+    pub adopted_subdomain: String,
+    pub old_routes: Vec<String>,
+    pub new_routes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientSubdomainTakeoverRecovery {
+    pub plan: ClientSubdomainTakeoverPlan,
+    pub status: String,
+    pub old_routes: Vec<String>,
+    pub new_routes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientSubdomainTakeoverAuthorization {
+    pub authorized: bool,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteIntentKind {
     Share,
@@ -1370,7 +1407,8 @@ impl AppStore {
         let mut statement = conn
             .prepare(
                 "SELECT id FROM installations
-                 WHERE owner_verified_at IS NOT NULL
+                 WHERE lifecycle = 'active'
+                   AND owner_verified_at IS NOT NULL
                    AND owner_email IS NOT NULL
                    AND LOWER(TRIM(owner_email)) = ?1
                  ORDER BY created_at DESC, id ASC",
@@ -1391,7 +1429,11 @@ impl AppStore {
     pub async fn list_all_installation_ids(&self) -> Result<Vec<String>, AppError> {
         let conn = self.conn.lock().await;
         let mut statement = conn
-            .prepare("SELECT id FROM installations ORDER BY created_at DESC, id ASC")
+            .prepare(
+                "SELECT id FROM installations
+                 WHERE lifecycle = 'active'
+                 ORDER BY created_at DESC, id ASC",
+            )
             .map_err(|error| {
                 AppError::Internal(format!("prepare installation id query failed: {error}"))
             })?;
@@ -1417,7 +1459,7 @@ impl AppStore {
             .unwrap_or_default();
         installation_ids.sort_unstable();
         let installation_filter = (!installation_ids.is_empty())
-            .then(|| format!("WHERE i.id IN ({})", repeat_vars(installation_ids.len())));
+            .then(|| format!("AND i.id IN ({})", repeat_vars(installation_ids.len())));
         let conn = self.conn.lock().await;
         let mut statement = conn
             .prepare(&format!(
@@ -1428,6 +1470,7 @@ impl AppStore {
                         NULLIF(TRIM(t.subdomain), ''), t.enabled
                    FROM installations i
               LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
+                  WHERE i.lifecycle = 'active'
                      {}
                ORDER BY i.created_at DESC, i.id ASC",
                 installation_filter.as_deref().unwrap_or_default()
@@ -1638,6 +1681,21 @@ impl AppStore {
                 .map_err(|error| {
                     AppError::Internal(format!("begin installation registration failed: {error}"))
                 })?;
+            let fenced = tx
+                .query_row(
+                    "SELECT reason FROM installation_fences WHERE public_key = ?1",
+                    params![public_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("check installation fence failed: {error}"))
+                })?;
+            if let Some(reason) = fenced {
+                return Err(AppError::Forbidden(format!(
+                    "installation identity is permanently fenced: {reason}"
+                )));
+            }
             let existing_installation_id = find_installation_id_by_public_key(&tx, public_key)?;
             let proof_verified = verify_registration_signature(
                 public_key,
@@ -1826,7 +1884,8 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let secret: Option<String> = conn
             .query_row(
-                "SELECT control_secret_b64 FROM installations WHERE id = ?1",
+                "SELECT control_secret_b64 FROM installations
+                 WHERE id = ?1 AND lifecycle = 'active'",
                 params![installation_id],
                 |row| row.get(0),
             )
@@ -1834,6 +1893,691 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
             .flatten();
         Ok(secret)
+    }
+
+    pub async fn begin_client_subdomain_takeover(
+        &self,
+        actor_email: &str,
+        target_installation_id: &str,
+        source_installation_id: &str,
+        activate_at_ms: i64,
+    ) -> Result<ClientSubdomainTakeoverPlan, AppError> {
+        let actor_email = normalize_email(actor_email)?;
+        let target_installation_id = target_installation_id.trim();
+        let source_installation_id = source_installation_id.trim();
+        if target_installation_id.is_empty() || source_installation_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "targetInstallationId and sourceInstallationId are required".into(),
+            ));
+        }
+        if target_installation_id == source_installation_id {
+            return Err(AppError::BadRequest(
+                "target and source Client must differ".into(),
+            ));
+        }
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin Client subdomain takeover failed: {error}"))
+            })?;
+        let target = get_installation(&tx, target_installation_id)?
+            .ok_or_else(|| AppError::NotFound("target Client not found".into()))?;
+        let source = get_installation(&tx, source_installation_id)?
+            .ok_or_else(|| AppError::NotFound("source Client not found".into()))?;
+        let target_owner = verified_installation_owner_email(&target)?;
+        let source_owner = verified_installation_owner_email(&source)?;
+        if target_owner != actor_email || source_owner != actor_email {
+            return Err(AppError::Forbidden(
+                "both Clients must belong to the authenticated owner".into(),
+            ));
+        }
+        let target_tunnel = get_client_tunnel_by_installation(&tx, target_installation_id)?
+            .ok_or_else(|| AppError::Conflict("target Client has no claimed subdomain".into()))?;
+        let source_tunnel = get_client_tunnel_by_installation(&tx, source_installation_id)?
+            .ok_or_else(|| AppError::Conflict("source Client has no claimed subdomain".into()))?;
+        validate_takeover_tunnel_owners(&target_tunnel, &source_tunnel, &actor_email)?;
+        if !target_tunnel.enabled {
+            return Err(AppError::Conflict(
+                "target Client tunnel must be enabled".into(),
+            ));
+        }
+        if target_tunnel.subdomain == source_tunnel.subdomain {
+            return Err(AppError::Conflict(
+                "target and source Client already use the same subdomain".into(),
+            ));
+        }
+        let active_takeover = tx
+            .query_row(
+                "SELECT id FROM client_subdomain_takeovers
+                 WHERE status NOT IN ('completed', 'failed')
+                   AND (
+                       target_installation_id IN (?1, ?2)
+                       OR source_installation_id IN (?1, ?2)
+                   )
+                 LIMIT 1",
+                params![target_installation_id, source_installation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("check active Client takeover failed: {error}"))
+            })?;
+        if active_takeover.is_some() {
+            return Err(AppError::Conflict(
+                "one of the Clients already has an active subdomain takeover".into(),
+            ));
+        }
+        ensure_takeover_client_market_ready_tx(
+            &tx,
+            target_installation_id,
+            source_installation_id,
+        )?;
+        validate_takeover_share_labels_tx(
+            &tx,
+            target_installation_id,
+            source_installation_id,
+            &target_tunnel.subdomain,
+            &source_tunnel.subdomain,
+        )?;
+        let control_secret = tx
+            .query_row(
+                "SELECT control_secret_b64 FROM installations
+                 WHERE id = ?1 AND lifecycle = 'active'",
+                params![target_installation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read takeover control secret failed: {error}"))
+            })?
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::UnprocessableEntity("target Client control secret is unavailable".into())
+            })?;
+
+        let id = Uuid::new_v4().to_string();
+        let source_retired_subdomain = retired_takeover_subdomain(source_installation_id, &id);
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO client_subdomain_takeovers (
+                id, target_installation_id, source_installation_id, owner_email,
+                target_original_subdomain, adopted_subdomain, source_retired_subdomain,
+                status, activate_at_ms, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'preparing', ?8, ?9, ?9)",
+            params![
+                id,
+                target_installation_id,
+                source_installation_id,
+                actor_email,
+                target_tunnel.subdomain,
+                source_tunnel.subdomain,
+                source_retired_subdomain,
+                activate_at_ms,
+                now,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("create Client subdomain takeover failed: {error}"))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit Client takeover prepare failed: {error}"))
+        })?;
+        Ok(ClientSubdomainTakeoverPlan {
+            id,
+            target_installation_id: target_installation_id.to_string(),
+            source_installation_id: source_installation_id.to_string(),
+            owner_email: actor_email,
+            target_original_subdomain: target_tunnel.subdomain,
+            adopted_subdomain: source_tunnel.subdomain,
+            source_retired_subdomain,
+            activate_at_ms,
+            control_secret,
+        })
+    }
+
+    pub async fn mark_client_subdomain_takeover_server_prepared(
+        &self,
+        takeover_id: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE client_subdomain_takeovers
+                 SET status = 'server_prepared', server_prepared_at = COALESCE(server_prepared_at, ?2),
+                     updated_at = ?2, last_error = NULL
+                 WHERE id = ?1 AND status = 'preparing'",
+                params![takeover_id, now],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("mark Client takeover prepared failed: {error}"))
+            })?;
+        if changed == 0 {
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM client_subdomain_takeovers WHERE id = ?1",
+                    params![takeover_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("read Client takeover status failed: {error}"))
+                })?;
+            if !status.as_deref().is_some_and(|status| {
+                matches!(
+                    status,
+                    "server_prepared" | "router_committed" | "server_committed" | "completed"
+                )
+            }) {
+                return Err(AppError::Conflict(
+                    "Client subdomain takeover is no longer preparable".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn fail_client_subdomain_takeover(
+        &self,
+        takeover_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let now = Utc::now().to_rfc3339();
+        let error = error.chars().take(1_000).collect::<String>();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE client_subdomain_takeovers
+             SET status = 'failed', last_error = ?2, updated_at = ?3, completed_at = ?3
+             WHERE id = ?1 AND status IN ('preparing', 'server_prepared')",
+                params![takeover_id, error, now],
+            )
+            .map_err(|db_error| {
+                AppError::Internal(format!("fail Client subdomain takeover failed: {db_error}"))
+            })?;
+        Ok(changed == 1)
+    }
+
+    pub async fn fail_client_subdomain_takeover_if_preparing(
+        &self,
+        takeover_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let now = Utc::now().to_rfc3339();
+        let error = error.chars().take(1_000).collect::<String>();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE client_subdomain_takeovers
+                 SET status = 'failed', last_error = ?2, updated_at = ?3, completed_at = ?3
+                 WHERE id = ?1 AND status = 'preparing'",
+                params![takeover_id, error, now],
+            )
+            .map_err(|db_error| {
+                AppError::Internal(format!(
+                    "fail preparing Client subdomain takeover failed: {db_error}"
+                ))
+            })?;
+        Ok(changed == 1)
+    }
+
+    pub async fn commit_client_subdomain_takeover(
+        &self,
+        takeover_id: &str,
+    ) -> Result<ClientSubdomainTakeoverCommit, AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin Client takeover commit failed: {error}"))
+            })?;
+        let row = takeover_job_row_tx(&tx, takeover_id)?
+            .ok_or_else(|| AppError::NotFound("Client subdomain takeover not found".into()))?;
+        if matches!(
+            row.status.as_str(),
+            "router_committed" | "server_committed" | "completed"
+        ) {
+            return Ok(row.into_commit()?);
+        }
+        if !matches!(row.status.as_str(), "preparing" | "server_prepared") {
+            return Err(AppError::Conflict(
+                "Client subdomain takeover cannot be committed".into(),
+            ));
+        }
+
+        let target = get_installation(&tx, &row.target_installation_id)?
+            .ok_or_else(|| AppError::Conflict("target Client is no longer active".into()))?;
+        let source = get_installation(&tx, &row.source_installation_id)?
+            .ok_or_else(|| AppError::Conflict("source Client is no longer active".into()))?;
+        let target_owner = verified_installation_owner_email(&target)?;
+        let source_owner = verified_installation_owner_email(&source)?;
+        if target_owner != row.owner_email || source_owner != row.owner_email {
+            return Err(AppError::Conflict(
+                "Client ownership changed during subdomain takeover".into(),
+            ));
+        }
+        let target_tunnel = get_client_tunnel_by_installation(&tx, &row.target_installation_id)?
+            .ok_or_else(|| AppError::Conflict("target Client tunnel disappeared".into()))?;
+        let source_tunnel = get_client_tunnel_by_installation(&tx, &row.source_installation_id)?
+            .ok_or_else(|| AppError::Conflict("source Client tunnel disappeared".into()))?;
+        validate_takeover_tunnel_owners(&target_tunnel, &source_tunnel, &row.owner_email)?;
+        if target_tunnel.subdomain != row.target_original_subdomain
+            || source_tunnel.subdomain != row.adopted_subdomain
+        {
+            return Err(AppError::Conflict(
+                "Client subdomain changed during takeover".into(),
+            ));
+        }
+        ensure_takeover_client_market_ready_tx(
+            &tx,
+            &row.target_installation_id,
+            &row.source_installation_id,
+        )?;
+
+        let target_shares = takeover_share_routes_tx(&tx, &row.target_installation_id)?;
+        let source_shares = takeover_share_routes_tx(&tx, &row.source_installation_id)?;
+        let source_share_ids = takeover_share_ids_tx(&tx, &row.source_installation_id)?;
+        let target_new_routes = validate_takeover_share_labels_tx(
+            &tx,
+            &row.target_installation_id,
+            &row.source_installation_id,
+            &row.target_original_subdomain,
+            &row.adopted_subdomain,
+        )?;
+        let now = Utc::now().to_rfc3339();
+        crate::share_market::terminate_installation_for_takeover_tx(
+            &tx,
+            &row.source_installation_id,
+            "client_subdomain_takeover",
+            &now,
+        )?;
+        quiesce_fenced_installation_notifications_tx(&tx, &row.source_installation_id, Utc::now())?;
+        client_chat::archive_room_for_installation_tx(
+            &tx,
+            &row.source_installation_id,
+            Utc::now(),
+        )?;
+        client_chat::suppress_pending_system_events_for_installation_tx(
+            &tx,
+            &row.source_installation_id,
+            "suppressed because the Client was permanently fenced by subdomain takeover",
+            Utc::now(),
+        )?;
+        quiesce_takeover_client_market_recovery_tx(
+            &tx,
+            &row.target_installation_id,
+            &row.source_installation_id,
+            &now,
+        )?;
+        for share_id in &source_share_ids {
+            retire_share_tx(&tx, share_id, &row.source_installation_id)?;
+        }
+
+        crate::public_hosts::tombstone_subject(
+            &tx,
+            PublicHostKind::Client,
+            &row.target_installation_id,
+        )
+        .map_err(map_public_host_error)?;
+        for (share_id, _) in &target_shares {
+            crate::public_hosts::tombstone_subject(&tx, PublicHostKind::Share, share_id)
+                .map_err(map_public_host_error)?;
+        }
+
+        tx.execute(
+            "UPDATE installation_client_tunnels
+             SET subdomain = ?2, enabled = 0, updated_at = ?3
+             WHERE installation_id = ?1",
+            params![
+                row.source_installation_id,
+                row.source_retired_subdomain,
+                now
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("retire source Client tunnel failed: {error}"))
+        })?;
+        tx.execute(
+            "UPDATE installation_client_tunnels
+             SET subdomain = ?2, enabled = 1, updated_at = ?3
+             WHERE installation_id = ?1",
+            params![row.target_installation_id, row.adopted_subdomain, now],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("adopt Client tunnel subdomain failed: {error}"))
+        })?;
+        client_chat::update_active_room_label_for_installation_tx(
+            &tx,
+            &row.target_installation_id,
+            &row.adopted_subdomain,
+            Utc::now(),
+        )?;
+
+        let client_route_id = format!("client:{}", row.target_installation_id);
+        crate::public_hosts::takeover_rebind(
+            &tx,
+            crate::public_hosts::NewPublicHost {
+                label: &row.adopted_subdomain,
+                route_id: &client_route_id,
+                kind: PublicHostKind::Client,
+                subject_id: &row.target_installation_id,
+                installation_id: Some(&row.target_installation_id),
+                target_lane_id: &row.target_installation_id,
+            },
+            &row.source_installation_id,
+        )
+        .map_err(map_public_host_error)?;
+        for ((share_id, _), new_subdomain) in target_shares.iter().zip(&target_new_routes) {
+            let route_id = format!("share:{share_id}");
+            crate::public_hosts::takeover_rebind(
+                &tx,
+                crate::public_hosts::NewPublicHost {
+                    label: new_subdomain,
+                    route_id: &route_id,
+                    kind: PublicHostKind::Share,
+                    subject_id: share_id,
+                    installation_id: Some(&row.target_installation_id),
+                    target_lane_id: &row.target_installation_id,
+                },
+                &row.source_installation_id,
+            )
+            .map_err(map_public_host_error)?;
+            tx.execute(
+                "UPDATE shares SET subdomain = ?2, updated_at = ?3
+                 WHERE share_id = ?1 AND installation_id = ?4",
+                params![share_id, new_subdomain, now, row.target_installation_id],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("update takeover Share subdomain failed: {error}"))
+            })?;
+        }
+
+        tx.execute(
+            "INSERT INTO installation_fences (
+                public_key, installation_id, takeover_id, reason, created_at
+             ) VALUES (?1, ?2, ?3, 'client_subdomain_takeover', ?4)
+             ON CONFLICT(public_key) DO NOTHING",
+            params![source.public_key, row.source_installation_id, row.id, now],
+        )
+        .map_err(|error| AppError::Internal(format!("fence source Client failed: {error}")))?;
+        tx.execute(
+            "UPDATE installations
+             SET lifecycle = 'fenced', fenced_at = ?2, fence_reason = 'client_subdomain_takeover'
+             WHERE id = ?1 AND lifecycle = 'active'",
+            params![row.source_installation_id, now],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("disable source installation failed: {error}"))
+        })?;
+        tx.execute(
+            "DELETE FROM tunnel_route_heads
+             WHERE route_id IN (
+                 SELECT route_id FROM leases WHERE installation_id IN (?1, ?2)
+             )",
+            params![row.target_installation_id, row.source_installation_id],
+        )
+        .map_err(|error| AppError::Internal(format!("retire route heads failed: {error}")))?;
+        tx.execute(
+            "UPDATE leases
+             SET state = 'retired', retired_at = COALESCE(retired_at, ?3)
+             WHERE installation_id IN (?1, ?2) AND retired_at IS NULL",
+            params![row.target_installation_id, row.source_installation_id, now],
+        )
+        .map_err(|error| AppError::Internal(format!("retire takeover leases failed: {error}")))?;
+
+        let mut old_routes = vec![
+            row.target_original_subdomain.clone(),
+            row.adopted_subdomain.clone(),
+        ];
+        old_routes.extend(target_shares.iter().map(|(_, route)| route.clone()));
+        old_routes.extend(source_shares.iter().map(|(_, route)| route.clone()));
+        old_routes.sort();
+        old_routes.dedup();
+        let mut new_routes = vec![row.adopted_subdomain.clone()];
+        new_routes.extend(
+            takeover_active_share_routes_tx(&tx, &row.target_installation_id)?
+                .into_iter()
+                .map(|(_, route)| route),
+        );
+        new_routes.sort();
+        new_routes.dedup();
+        let old_routes_json = serde_json::to_string(&old_routes).map_err(|error| {
+            AppError::Internal(format!("encode takeover old routes failed: {error}"))
+        })?;
+        let new_routes_json = serde_json::to_string(&new_routes).map_err(|error| {
+            AppError::Internal(format!("encode takeover new routes failed: {error}"))
+        })?;
+        tx.execute(
+            "UPDATE client_subdomain_takeovers
+             SET status = 'router_committed', old_routes_json = ?2, new_routes_json = ?3,
+                 router_committed_at = COALESCE(router_committed_at, ?4), updated_at = ?4,
+                 last_error = NULL
+             WHERE id = ?1",
+            params![row.id, old_routes_json, new_routes_json, now],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("persist Client takeover commit failed: {error}"))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit Client subdomain takeover failed: {error}"))
+        })?;
+        Ok(ClientSubdomainTakeoverCommit {
+            id: row.id,
+            target_installation_id: row.target_installation_id,
+            source_installation_id: row.source_installation_id,
+            target_original_subdomain: row.target_original_subdomain,
+            adopted_subdomain: row.adopted_subdomain,
+            old_routes,
+            new_routes,
+        })
+    }
+
+    pub async fn complete_client_subdomain_takeover(
+        &self,
+        takeover_id: &str,
+        server_committed: bool,
+        warning: Option<&str>,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let warning = warning.map(|value| value.chars().take(1_000).collect::<String>());
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE client_subdomain_takeovers
+             SET status = 'completed',
+                 server_committed_at = CASE WHEN ?2 = 1 THEN COALESCE(server_committed_at, ?4) ELSE server_committed_at END,
+                 completed_at = COALESCE(completed_at, ?4), updated_at = ?4, last_error = ?3
+             WHERE id = ?1 AND status IN ('router_committed', 'server_committed', 'completed')",
+            params![takeover_id, if server_committed { 1 } else { 0 }, warning, now],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("complete Client subdomain takeover failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn defer_client_subdomain_takeover_completion(
+        &self,
+        takeover_id: &str,
+        server_committed: bool,
+        warning: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let warning = warning.chars().take(1_000).collect::<String>();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE client_subdomain_takeovers
+             SET status = CASE
+                     WHEN status = 'server_committed' OR ?2 = 1 THEN 'server_committed'
+                     ELSE 'router_committed'
+                 END,
+                 server_committed_at = CASE WHEN ?2 = 1 THEN COALESCE(server_committed_at, ?4) ELSE server_committed_at END,
+                 updated_at = ?4, last_error = ?3
+             WHERE id = ?1 AND status IN ('router_committed', 'server_committed')",
+            params![
+                takeover_id,
+                if server_committed { 1 } else { 0 },
+                warning,
+                now
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("defer Client takeover completion failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn list_client_subdomain_takeover_recovery(
+        &self,
+    ) -> Result<Vec<ClientSubdomainTakeoverRecovery>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, target_installation_id, source_installation_id, owner_email,
+                        target_original_subdomain, adopted_subdomain, source_retired_subdomain,
+                        status, activate_at_ms, old_routes_json, new_routes_json
+                 FROM client_subdomain_takeovers
+                 WHERE status IN ('preparing', 'server_prepared', 'router_committed', 'server_committed')
+                 ORDER BY created_at",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare Client takeover recovery failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query Client takeover recovery failed: {error}"))
+            })?;
+        let mut output = Vec::new();
+        for row in rows {
+            let (
+                id,
+                target_installation_id,
+                source_installation_id,
+                owner_email,
+                target_original_subdomain,
+                adopted_subdomain,
+                source_retired_subdomain,
+                status,
+                activate_at_ms,
+                old_routes_json,
+                new_routes_json,
+            ) = row.map_err(|error| {
+                AppError::Internal(format!("read Client takeover recovery failed: {error}"))
+            })?;
+            let control_secret = conn
+                .query_row(
+                    "SELECT control_secret_b64 FROM installations
+                     WHERE id = ?1 AND lifecycle = 'active'",
+                    params![target_installation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("read recovery control secret failed: {error}"))
+                })?
+                .flatten()
+                .unwrap_or_default();
+            output.push(ClientSubdomainTakeoverRecovery {
+                plan: ClientSubdomainTakeoverPlan {
+                    id,
+                    target_installation_id,
+                    source_installation_id,
+                    owner_email,
+                    target_original_subdomain,
+                    adopted_subdomain,
+                    source_retired_subdomain,
+                    activate_at_ms,
+                    control_secret,
+                },
+                status,
+                old_routes: serde_json::from_str(&old_routes_json).unwrap_or_default(),
+                new_routes: serde_json::from_str(&new_routes_json).unwrap_or_default(),
+            });
+        }
+        Ok(output)
+    }
+
+    pub async fn authorize_client_subdomain_takeover_activation(
+        &self,
+        installation_id: &str,
+        takeover_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+    ) -> Result<ClientSubdomainTakeoverAuthorization, AppError> {
+        let takeover_id = takeover_id.trim();
+        if takeover_id.is_empty() || takeover_id.len() > 128 {
+            return Err(AppError::BadRequest(
+                "takeoverId must be a non-empty identifier of at most 128 bytes".into(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin Client takeover authorization failed: {error}"
+                ))
+            })?;
+        let installation = get_installation(&tx, installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        let payload = ClientSubdomainTakeoverAuthorizationPayload { takeover_id };
+        verify_signed_share_request(
+            &tx,
+            &installation.public_key,
+            installation_id,
+            crate::client_subdomain_takeover::CLIENT_SUBDOMAIN_TAKEOVER_AUTHORIZATION_ACTION,
+            &payload,
+            timestamp_ms,
+            nonce,
+            signature,
+        )?;
+        let (target_installation_id, status) = tx
+            .query_row(
+                "SELECT target_installation_id, status
+                 FROM client_subdomain_takeovers WHERE id = ?1",
+                params![takeover_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read Client takeover authorization failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| AppError::NotFound("Client subdomain takeover not found".into()))?;
+        if target_installation_id != installation_id {
+            return Err(AppError::Forbidden(
+                "takeover authorization belongs to another Client".into(),
+            ));
+        }
+        let authorized = matches!(
+            status.as_str(),
+            "router_committed" | "server_committed" | "completed"
+        );
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit Client takeover authorization failed: {error}"
+            ))
+        })?;
+        Ok(ClientSubdomainTakeoverAuthorization { authorized, status })
     }
 
     pub async fn report_installation_status(
@@ -2304,6 +3048,251 @@ impl AppStore {
         Ok(stats)
     }
 
+    pub async fn claim_operator_alert_signals(
+        &self,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<OperatorAlertSignal>, AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin operator alert signal claim failed: {error}"))
+            })?;
+        let timestamp = now.to_rfc3339();
+        let claim_expires_at = (now + Duration::seconds(lease_secs.max(1))).to_rfc3339();
+        let source_event_ids = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT source_event_id
+                     FROM operator_alert_signal_outbox
+                     WHERE (
+                         status IN ('pending', 'retry')
+                         AND COALESCE(next_attempt_at, occurred_at) <= ?1
+                     ) OR (
+                         status = 'claimed' AND claim_expires_at <= ?1
+                     )
+                     ORDER BY occurred_at, source_event_id
+                     LIMIT ?2",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "prepare operator alert signal claim failed: {error}"
+                    ))
+                })?;
+            let rows = statement
+                .query_map(params![timestamp, limit.clamp(1, 500) as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("query operator alert signal claim failed: {error}"))
+                })?;
+            collect_rows(rows)?
+        };
+        let mut claimed_ids = Vec::new();
+        for source_event_id in source_event_ids {
+            let claimed = tx
+                .execute(
+                    "UPDATE operator_alert_signal_outbox
+                     SET status = 'claimed', attempts = attempts + 1,
+                         claimed_by = ?2, claim_expires_at = ?3, updated_at = ?4
+                     WHERE source_event_id = ?1 AND (
+                         (status IN ('pending', 'retry')
+                          AND COALESCE(next_attempt_at, occurred_at) <= ?4)
+                         OR (status = 'claimed' AND claim_expires_at <= ?4)
+                     )",
+                    params![source_event_id, worker_id, claim_expires_at, timestamp],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("claim operator alert signal failed: {error}"))
+                })?;
+            if claimed == 1 {
+                claimed_ids.push(source_event_id);
+            }
+        }
+        let mut signals = Vec::new();
+        for source_event_id in claimed_ids {
+            let signal = tx
+                .query_row(
+                    "SELECT source_event_id, fingerprint, transition, kind,
+                            entity_kind, entity_id, severity, title, message,
+                            details_json, occurred_at, attempts
+                     FROM operator_alert_signal_outbox
+                     WHERE source_event_id = ?1 AND status = 'claimed' AND claimed_by = ?2",
+                    params![source_event_id, worker_id],
+                    |row| {
+                        let details_raw = row.get::<_, String>(9)?;
+                        let occurred_at = parse_dt_sql(&row.get::<_, String>(10)?)?;
+                        Ok(OperatorAlertSignal {
+                            source_event_id: row.get(0)?,
+                            fingerprint: row.get(1)?,
+                            transition: row.get(2)?,
+                            kind: row.get(3)?,
+                            entity_kind: row.get(4)?,
+                            entity_id: row.get(5)?,
+                            severity: row.get(6)?,
+                            title: row.get(7)?,
+                            message: row.get(8)?,
+                            details: serde_json::from_str(&details_raw)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                            occurred_at: occurred_at.timestamp(),
+                            attempts: row.get::<_, i64>(11)?.max(0) as u32,
+                        })
+                    },
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "read claimed operator alert signal failed: {error}"
+                    ))
+                })?;
+            signals.push(signal);
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit operator alert signal claim failed: {error}"
+            ))
+        })?;
+        Ok(signals)
+    }
+
+    pub async fn client_metrics_snapshot(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<crate::metrics::models::ClientMetricsSnapshot, AppError> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT i.id, COALESCE(NULLIF(ict.subdomain, ''), i.id),
+                        COALESCE(ns.presence_state, 'unknown'),
+                        COALESCE(ns.monitoring_enabled, 0), i.platform, i.app_version,
+                        i.country_code, ns.last_authenticated_seen_at, ns.offline_since,
+                        ns.last_recovered_at, COALESCE(ns.offline_episode, 0)
+                 FROM installations i
+                 LEFT JOIN installation_notification_state ns
+                   ON ns.installation_id = i.id
+                 LEFT JOIN installation_client_tunnels ict
+                   ON ict.installation_id = i.id
+                 WHERE i.lifecycle = 'active'
+                 ORDER BY CASE COALESCE(ns.presence_state, 'unknown')
+                            WHEN 'offline' THEN 0 WHEN 'recovering' THEN 1
+                            WHEN 'online' THEN 2 ELSE 3 END,
+                          COALESCE(ns.last_authenticated_seen_at, i.last_seen_at) DESC",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare Client metrics snapshot failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                let parse_optional_timestamp = |index| -> crate::db::Result<Option<i64>> {
+                    row.get::<_, Option<String>>(index)?
+                        .map(|value| parse_dt_sql(&value).map(|value| value.timestamp()))
+                        .transpose()
+                };
+                Ok(crate::metrics::models::ClientMetricsItem {
+                    installation_id: row.get(0)?,
+                    client_label: row.get(1)?,
+                    status: row.get(2)?,
+                    monitoring_enabled: row.get::<_, i64>(3)? != 0,
+                    platform: row.get(4)?,
+                    app_version: row.get(5)?,
+                    country_code: row.get(6)?,
+                    last_authenticated_seen_at: parse_optional_timestamp(7)?,
+                    offline_since: parse_optional_timestamp(8)?,
+                    last_recovered_at: parse_optional_timestamp(9)?,
+                    offline_episode: row.get::<_, i64>(10)?.max(0) as u64,
+                })
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query Client metrics snapshot failed: {error}"))
+            })?;
+        let items = collect_rows(rows)?;
+        let mut snapshot = crate::metrics::models::ClientMetricsSnapshot {
+            timestamp: now.timestamp(),
+            total: items.len() as u64,
+            items,
+            ..Default::default()
+        };
+        for item in &snapshot.items {
+            snapshot.monitored += u64::from(item.monitoring_enabled);
+            match item.status.as_str() {
+                "online" => snapshot.online += 1,
+                "recovering" => snapshot.recovering += 1,
+                "offline" => snapshot.offline += 1,
+                _ => snapshot.unknown += 1,
+            }
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn complete_operator_alert_signal(
+        &self,
+        source_event_id: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let timestamp = now.to_rfc3339();
+        conn.execute(
+            "UPDATE operator_alert_signal_outbox
+             SET status = 'completed', completed_at = ?3, updated_at = ?3,
+                 claimed_by = NULL, claim_expires_at = NULL, next_attempt_at = NULL,
+                 last_error = NULL
+             WHERE source_event_id = ?1 AND status = 'claimed' AND claimed_by = ?2",
+            params![source_event_id, worker_id, timestamp],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("complete operator alert signal failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn retry_operator_alert_signal(
+        &self,
+        source_event_id: &str,
+        worker_id: &str,
+        error_message: &str,
+        next_attempt_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE operator_alert_signal_outbox
+             SET status = 'retry', next_attempt_at = ?3, last_error = ?4,
+                 claimed_by = NULL, claim_expires_at = NULL, updated_at = ?5
+             WHERE source_event_id = ?1 AND status = 'claimed' AND claimed_by = ?2",
+            params![
+                source_event_id,
+                worker_id,
+                next_attempt_at.to_rfc3339(),
+                sanitize_operator_alert_error(error_message),
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("retry operator alert signal failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn prune_operator_alert_signals(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, AppError> {
+        let conn = self.conn.lock().await;
+        let deleted = conn
+            .execute(
+                "DELETE FROM operator_alert_signal_outbox
+                 WHERE status = 'completed' AND completed_at < ?1",
+                params![cutoff.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prune operator alert signals failed: {error}"))
+            })?;
+        Ok(deleted as u64)
+    }
+
     pub async fn reconcile_client_notification_events(
         &self,
         policy: &ClientNotificationPolicy,
@@ -2458,6 +3447,18 @@ impl AppStore {
                         &last_seen_timestamp,
                         &now,
                     )?;
+                    enqueue_client_presence_operator_signal_tx(
+                        &tx,
+                        &state.installation_id,
+                        episode,
+                        "firing",
+                        "heartbeat_timeout",
+                        &state.platform,
+                        &state.app_version,
+                        state.tunnel_subdomain.as_deref(),
+                        Some(&last_seen_timestamp),
+                        now,
+                    )?;
                     let snapshot = serde_json::json!({
                         "installationId": state.installation_id,
                         "platform": state.platform,
@@ -2520,6 +3521,19 @@ impl AppStore {
                         .map_err(|error| {
                             AppError::Internal(format!("confirm client recovery failed: {error}"))
                         })?;
+                        let recovered_last_seen = last_seen.to_rfc3339();
+                        enqueue_client_presence_operator_signal_tx(
+                            &tx,
+                            &state.installation_id,
+                            state.offline_episode,
+                            "resolved",
+                            "stable_heartbeats",
+                            &state.platform,
+                            &state.app_version,
+                            state.tunnel_subdomain.as_deref(),
+                            Some(&recovered_last_seen),
+                            now,
+                        )?;
                         stats.recovered += 1;
                     }
                 }
@@ -8568,6 +9582,7 @@ impl AppStore {
             for installation_id in &expired_installation_ids {
                 stale_subdomains
                     .extend(route_subdomains_for_installation_tx(&tx, installation_id)?);
+                enqueue_removed_client_operator_signal_tx(&tx, installation_id, Utc::now())?;
                 purge_installation_data_tx(&tx, installation_id)?;
                 deleted_installations += 1;
             }
@@ -10447,357 +11462,6 @@ impl AppStore {
         }
     }
 
-    pub async fn create_board_message(
-        &self,
-        settings: &BoardSettings,
-        author: BoardAuthor,
-        body: String,
-        client_ip: Option<&str>,
-    ) -> Result<BoardMessageView, AppError> {
-        let normalized = normalize_board_body(&body, settings.max_len)?;
-        let now = Utc::now();
-        let id = Uuid::new_v4().to_string();
-        let (author_kind, author_user_id, author_email, author_label, guest_id) =
-            author.into_storage_fields();
-        let ip_hash = client_ip.map(|ip| hash_ip_for_board(ip, &self.ip_hash_salt));
-        let viewer_user_id = author_user_id.clone();
-        let viewer_guest_id = guest_id.clone();
-
-        let conn = self.conn.lock().await;
-
-        if author_kind != "admin" {
-            // Anonymous posts: prefer the salted IP bucket. The
-            // `X-Board-Guest-Id` header is attacker-controlled (a client can
-            // rotate it on every request to mint a fresh bucket), so it is
-            // only used as a fallback when no IP is available — that scope
-            // is intentionally narrow.
-            let scope = if let Some(email) = author_email.as_deref() {
-                format!("user:{email}")
-            } else if let Some(hash) = ip_hash.as_deref() {
-                format!("ip:{hash}")
-            } else if let Some(guest) = guest_id.as_deref() {
-                format!("guest:{guest}")
-            } else {
-                "guest:anon".to_string()
-            };
-            let limit = if author_kind == "user" {
-                settings.user_per_hour
-            } else {
-                settings.guest_per_hour
-            };
-            consume_board_rate_limit_tx(&conn, &scope, limit, now)?;
-        }
-
-        conn.execute(
-            "INSERT INTO board_messages (
-                id, author_kind, author_user_id, author_email, author_label,
-                guest_id, client_ip_hash, body, status, pinned_at, featured_at,
-                deleted_by, deleted_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'visible', NULL, NULL, NULL, NULL, ?9, ?9)",
-            params![
-                id,
-                author_kind,
-                author_user_id,
-                author_email,
-                author_label,
-                guest_id,
-                ip_hash,
-                normalized,
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("insert board message failed: {e}")))?;
-
-        let row = load_board_message_row(&conn, &id)?
-            .ok_or_else(|| AppError::Internal("inserted board message not found".into()))?;
-        Ok(row.into_view(viewer_user_id.as_deref(), viewer_guest_id.as_deref()))
-    }
-
-    pub async fn list_board_messages(
-        &self,
-        tab: &str,
-        limit: usize,
-        viewer_user_id: Option<&str>,
-        viewer_guest_id: Option<&str>,
-        since: Option<DateTime<Utc>>,
-    ) -> Result<BoardMessageListResponse, AppError> {
-        let limit = limit.clamp(1, 200);
-        let tab = normalize_board_tab(tab);
-        let tab_visible_clause = match tab.as_str() {
-            "pinned" => "status = 'visible' AND pinned_at IS NOT NULL",
-            "featured" => {
-                "status = 'visible' AND (featured_at IS NOT NULL OR pinned_at IS NOT NULL)"
-            }
-            _ => "status = 'visible'",
-        };
-
-        let conn = self.conn.lock().await;
-
-        let (messages, removed_ids, incremental) = if let Some(since) = since.as_ref() {
-            let since_str = since.to_rfc3339();
-            let messages_sql = format!(
-                "SELECT id, author_kind, author_user_id, author_email, author_label,
-                        guest_id, body, pinned_at, featured_at, created_at
-                   FROM board_messages
-                  WHERE {tab_visible_clause}
-                    AND datetime(updated_at) > datetime(?1)
-                  ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC,
-                           (featured_at IS NOT NULL) DESC, featured_at DESC,
-                           datetime(created_at) DESC
-                  LIMIT ?2"
-            );
-            let mut stmt = conn.prepare(&messages_sql).map_err(|e| {
-                AppError::Internal(format!("prepare board incremental list failed: {e}"))
-            })?;
-            let rows = stmt
-                .query_map(params![since_str, limit as i64], map_board_row)
-                .map_err(|e| AppError::Internal(format!("query board incremental failed: {e}")))?;
-            let mut messages = Vec::new();
-            for row in rows {
-                let row =
-                    row.map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
-                messages.push(row.into_view(viewer_user_id, viewer_guest_id));
-            }
-
-            let removed_sql = format!(
-                "SELECT id FROM board_messages
-                  WHERE datetime(updated_at) > datetime(?1)
-                    AND NOT ({tab_visible_clause})
-                  LIMIT ?2"
-            );
-            let mut stmt = conn.prepare(&removed_sql).map_err(|e| {
-                AppError::Internal(format!("prepare board removed list failed: {e}"))
-            })?;
-            let removed: Vec<String> = stmt
-                .query_map(params![since_str, limit as i64], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(|e| AppError::Internal(format!("query board removed failed: {e}")))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| AppError::Internal(format!("read board removed failed: {e}")))?;
-
-            (messages, removed, true)
-        } else {
-            let sql = format!(
-                "SELECT id, author_kind, author_user_id, author_email, author_label,
-                        guest_id, body, pinned_at, featured_at, created_at
-                   FROM board_messages
-                  WHERE {tab_visible_clause}
-                  ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC,
-                           (featured_at IS NOT NULL) DESC, featured_at DESC,
-                           datetime(created_at) DESC
-                  LIMIT ?1"
-            );
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| AppError::Internal(format!("prepare board list failed: {e}")))?;
-            let rows = stmt
-                .query_map(params![limit as i64], map_board_row)
-                .map_err(|e| AppError::Internal(format!("query board messages failed: {e}")))?;
-            let mut messages = Vec::new();
-            for row in rows {
-                let row =
-                    row.map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
-                messages.push(row.into_view(viewer_user_id, viewer_guest_id));
-            }
-            (messages, Vec::new(), false)
-        };
-
-        let total_visible: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM board_messages WHERE status = 'visible'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        // Capture as_of after the queries — under the connection lock, no concurrent writes
-        // could have applied in between, so any future write will have updated_at > as_of.
-        let as_of = Utc::now();
-
-        Ok(BoardMessageListResponse {
-            messages,
-            tab,
-            total_visible: total_visible.max(0) as usize,
-            as_of,
-            removed_ids,
-            incremental,
-        })
-    }
-
-    pub async fn set_board_pinned(
-        &self,
-        settings: &BoardSettings,
-        id: &str,
-        value: bool,
-    ) -> Result<BoardMessageView, AppError> {
-        let now = Utc::now();
-        let conn = self.conn.lock().await;
-        let existing = load_board_message_row(&conn, id)?
-            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
-        if existing.status != "visible" {
-            return Err(AppError::Conflict("message is not visible".into()));
-        }
-        if value {
-            // Enforce pin cap: keep the latest N pinned, oldest auto-unpin.
-            if settings.pin_limit > 0 {
-                let cap = settings.pin_limit as i64;
-                let pinned_ids: Vec<String> = {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id FROM board_messages
-                              WHERE status = 'visible' AND pinned_at IS NOT NULL
-                                AND id <> ?1
-                              ORDER BY pinned_at DESC",
-                        )
-                        .map_err(|e| AppError::Internal(format!("prepare pin scan failed: {e}")))?;
-                    let rows = stmt
-                        .query_map(params![id], |row| row.get::<_, String>(0))
-                        .map_err(|e| AppError::Internal(format!("scan pinned failed: {e}")))?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| AppError::Internal(format!("read pinned ids failed: {e}")))?
-                };
-                if pinned_ids.len() as i64 >= cap {
-                    let take = pinned_ids.len() as i64 - (cap - 1);
-                    for victim in pinned_ids.iter().rev().take(take.max(0) as usize) {
-                        conn.execute(
-                            "UPDATE board_messages
-                                SET pinned_at = NULL, updated_at = ?2
-                              WHERE id = ?1",
-                            params![victim, now.to_rfc3339()],
-                        )
-                        .map_err(|e| AppError::Internal(format!("auto-unpin failed: {e}")))?;
-                    }
-                }
-            }
-            conn.execute(
-                "UPDATE board_messages
-                    SET pinned_at = ?2, updated_at = ?2
-                  WHERE id = ?1",
-                params![id, now.to_rfc3339()],
-            )
-            .map_err(|e| AppError::Internal(format!("pin message failed: {e}")))?;
-        } else {
-            conn.execute(
-                "UPDATE board_messages
-                    SET pinned_at = NULL, updated_at = ?2
-                  WHERE id = ?1",
-                params![id, now.to_rfc3339()],
-            )
-            .map_err(|e| AppError::Internal(format!("unpin message failed: {e}")))?;
-        }
-        let row = load_board_message_row(&conn, id)?
-            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
-        Ok(row.into_view(None, None))
-    }
-
-    pub async fn set_board_featured(
-        &self,
-        id: &str,
-        value: bool,
-    ) -> Result<BoardMessageView, AppError> {
-        let now = Utc::now();
-        let conn = self.conn.lock().await;
-        let existing = load_board_message_row(&conn, id)?
-            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
-        if existing.status != "visible" {
-            return Err(AppError::Conflict("message is not visible".into()));
-        }
-        let featured_at = if value { Some(now.to_rfc3339()) } else { None };
-        conn.execute(
-            "UPDATE board_messages
-                SET featured_at = ?2, updated_at = ?3
-              WHERE id = ?1",
-            params![id, featured_at, now.to_rfc3339()],
-        )
-        .map_err(|e| AppError::Internal(format!("feature message failed: {e}")))?;
-        let row = load_board_message_row(&conn, id)?
-            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
-        Ok(row.into_view(None, None))
-    }
-
-    pub async fn delete_board_message(
-        &self,
-        settings: &BoardSettings,
-        id: &str,
-        is_admin: bool,
-        admin_email: Option<&str>,
-        viewer_guest_id: Option<&str>,
-    ) -> Result<(), AppError> {
-        let now = Utc::now();
-        let conn = self.conn.lock().await;
-        let existing = load_board_message_row(&conn, id)?
-            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
-        if existing.status != "visible" {
-            return Ok(());
-        }
-        let allowed = if is_admin {
-            true
-        } else if existing.author_kind == "guest" {
-            let matches_guest = match (viewer_guest_id, existing.guest_id.as_deref()) {
-                (Some(viewer), Some(owner)) => !viewer.is_empty() && viewer == owner,
-                _ => false,
-            };
-            let age = (now - existing.created_at).num_seconds();
-            matches_guest && age <= settings.guest_self_delete_secs
-        } else {
-            false
-        };
-        if !allowed {
-            return Err(AppError::Forbidden("you cannot delete this message".into()));
-        }
-        conn.execute(
-            "UPDATE board_messages
-                SET status = 'deleted', deleted_by = ?2, deleted_at = ?3,
-                    updated_at = ?3, pinned_at = NULL, featured_at = NULL
-              WHERE id = ?1",
-            params![id, admin_email, now.to_rfc3339()],
-        )
-        .map_err(|e| AppError::Internal(format!("delete board message failed: {e}")))?;
-        Ok(())
-    }
-
-    pub async fn board_meta(
-        &self,
-        can_post_as_admin: bool,
-        max_body_length: usize,
-        guest_self_delete_secs: i64,
-    ) -> Result<BoardMetaResponse, AppError> {
-        let conn = self.conn.lock().await;
-        let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM board_messages WHERE status = 'visible'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let pinned: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM board_messages
-                  WHERE status = 'visible' AND pinned_at IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let featured: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM board_messages
-                  WHERE status = 'visible'
-                    AND (featured_at IS NOT NULL OR pinned_at IS NOT NULL)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        Ok(BoardMetaResponse {
-            total: total.max(0) as usize,
-            pinned_count: pinned.max(0) as usize,
-            featured_count: featured.max(0) as usize,
-            can_post_as_admin,
-            max_body_length,
-            guest_self_delete_secs,
-        })
-    }
-
     pub async fn record_admin_audit(
         &self,
         actor_email: Option<&str>,
@@ -10873,289 +11537,6 @@ pub struct AdminAuditEntry {
     pub payload_json: Option<String>,
     pub ip: Option<String>,
     pub created_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum BoardAuthor {
-    Admin {
-        user_id: String,
-        email: String,
-    },
-    User {
-        user_id: String,
-        email: String,
-    },
-    Guest {
-        guest_id: String,
-        name: Option<String>,
-    },
-}
-
-impl BoardAuthor {
-    fn into_storage_fields(
-        self,
-    ) -> (
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        Option<String>,
-    ) {
-        match self {
-            BoardAuthor::Admin { user_id, email } => (
-                "admin".to_string(),
-                Some(user_id),
-                Some(email),
-                "Official".to_string(),
-                None,
-            ),
-            BoardAuthor::User { user_id, email } => {
-                let label = mask_email(&email);
-                ("user".to_string(), Some(user_id), Some(email), label, None)
-            }
-            BoardAuthor::Guest { guest_id, name } => {
-                let label = name
-                    .as_deref()
-                    .map(normalize_guest_name)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "Guest".to_string());
-                ("guest".to_string(), None, None, label, Some(guest_id))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BoardMessageRow {
-    id: String,
-    author_kind: String,
-    author_user_id: Option<String>,
-    #[allow(dead_code)]
-    author_email: Option<String>,
-    author_label: String,
-    guest_id: Option<String>,
-    body: String,
-    pinned_at: Option<DateTime<Utc>>,
-    featured_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-    status: String,
-}
-
-impl BoardMessageRow {
-    fn into_view(
-        self,
-        viewer_user_id: Option<&str>,
-        viewer_guest_id: Option<&str>,
-    ) -> BoardMessageView {
-        let is_mine = match self.author_kind.as_str() {
-            "guest" => match (viewer_guest_id, self.guest_id.as_deref()) {
-                (Some(viewer), Some(owner)) => !viewer.is_empty() && viewer == owner,
-                _ => false,
-            },
-            "user" | "admin" => match (viewer_user_id, self.author_user_id.as_deref()) {
-                (Some(viewer), Some(owner)) => !viewer.is_empty() && viewer == owner,
-                _ => false,
-            },
-            _ => false,
-        };
-        BoardMessageView {
-            id: self.id,
-            body: self.body,
-            author_kind: self.author_kind,
-            author_label: self.author_label,
-            is_mine,
-            pinned: self.pinned_at.is_some(),
-            featured: self.featured_at.is_some(),
-            created_at: self.created_at,
-            pinned_at: self.pinned_at,
-            featured_at: self.featured_at,
-        }
-    }
-}
-
-fn map_board_row(row: &crate::db::Row<'_>) -> crate::db::Result<BoardMessageRow> {
-    let pinned_at: Option<String> = row.get(7)?;
-    let featured_at: Option<String> = row.get(8)?;
-    let created_at: String = row.get(9)?;
-    Ok(BoardMessageRow {
-        id: row.get(0)?,
-        author_kind: row.get(1)?,
-        author_user_id: row.get(2)?,
-        author_email: row.get(3)?,
-        author_label: row.get(4)?,
-        guest_id: row.get(5)?,
-        body: row.get(6)?,
-        pinned_at: pinned_at.as_deref().map(parse_dt_sql).transpose()?,
-        featured_at: featured_at.as_deref().map(parse_dt_sql).transpose()?,
-        created_at: parse_dt_sql(&created_at)?,
-        status: "visible".to_string(),
-    })
-}
-
-fn load_board_message_row(
-    conn: &Connection,
-    id: &str,
-) -> Result<Option<BoardMessageRow>, AppError> {
-    conn.query_row(
-        "SELECT id, author_kind, author_user_id, author_email, author_label,
-                guest_id, body, pinned_at, featured_at, created_at, status
-           FROM board_messages
-          WHERE id = ?1",
-        params![id],
-        |row| {
-            let pinned_at: Option<String> = row.get(7)?;
-            let featured_at: Option<String> = row.get(8)?;
-            let created_at: String = row.get(9)?;
-            Ok(BoardMessageRow {
-                id: row.get(0)?,
-                author_kind: row.get(1)?,
-                author_user_id: row.get(2)?,
-                author_email: row.get(3)?,
-                author_label: row.get(4)?,
-                guest_id: row.get(5)?,
-                body: row.get(6)?,
-                pinned_at: pinned_at.as_deref().map(parse_dt_sql).transpose()?,
-                featured_at: featured_at.as_deref().map(parse_dt_sql).transpose()?,
-                created_at: parse_dt_sql(&created_at)?,
-                status: row.get(10)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| AppError::Internal(format!("load board message failed: {e}")))
-}
-
-fn normalize_board_tab(value: &str) -> String {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "pinned" => "pinned".into(),
-        "featured" => "featured".into(),
-        _ => "all".into(),
-    }
-}
-
-fn normalize_board_body(body: &str, max_len: usize) -> Result<String, AppError> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::BadRequest("message body is empty".into()));
-    }
-    let max_len = max_len.max(1);
-    let char_count = trimmed.chars().count();
-    if char_count > max_len {
-        return Err(AppError::BadRequest(format!(
-            "message body exceeds {max_len} characters"
-        )));
-    }
-    let stripped: String = trimmed
-        .chars()
-        .filter(|ch| {
-            if ch.is_control() {
-                matches!(*ch, '\n' | '\r' | '\t')
-            } else {
-                // Strip common zero-width / bidi formatting characters.
-                !matches!(
-                    *ch,
-                    '\u{200B}'
-                        | '\u{200C}'
-                        | '\u{200D}'
-                        | '\u{2060}'
-                        | '\u{FEFF}'
-                        | '\u{202A}'
-                        | '\u{202B}'
-                        | '\u{202C}'
-                        | '\u{202D}'
-                        | '\u{202E}'
-                )
-            }
-        })
-        .collect();
-    let cleaned = stripped.trim().to_string();
-    if cleaned.is_empty() {
-        return Err(AppError::BadRequest("message body is empty".into()));
-    }
-    let link_count = cleaned.matches("http://").count() + cleaned.matches("https://").count();
-    if link_count >= 3 {
-        return Err(AppError::BadRequest(
-            "too many links in a single message".into(),
-        ));
-    }
-    Ok(cleaned)
-}
-
-fn normalize_guest_name(value: &str) -> String {
-    let cleaned: String = value
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .filter(|ch| {
-            !matches!(
-                *ch,
-                '\u{200B}'
-                    | '\u{200C}'
-                    | '\u{200D}'
-                    | '\u{2060}'
-                    | '\u{FEFF}'
-                    | '\u{202A}'
-                    | '\u{202B}'
-                    | '\u{202C}'
-                    | '\u{202D}'
-                    | '\u{202E}'
-            )
-        })
-        .collect();
-    let trimmed = cleaned.trim();
-    let truncated: String = trimmed.chars().take(16).collect();
-    truncated
-}
-
-fn hash_ip_for_board(ip: &str, salt: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(salt.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(ip.as_bytes());
-    let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn consume_board_rate_limit_tx(
-    conn: &Connection,
-    scope: &str,
-    limit: i64,
-    now: DateTime<Utc>,
-) -> Result<(), AppError> {
-    if limit <= 0 {
-        return Err(AppError::TooManyRequests(
-            "message board posting is disabled for this audience".into(),
-        ));
-    }
-    let bucket = now.timestamp() / 3600;
-    let cleanup_cutoff = bucket - 24;
-    conn.execute(
-        "DELETE FROM board_rate_limit WHERE bucket_start < ?1",
-        params![cleanup_cutoff],
-    )
-    .map_err(|e| AppError::Internal(format!("prune board rate limit failed: {e}")))?;
-
-    let current: i64 = conn
-        .query_row(
-            "SELECT count FROM board_rate_limit WHERE scope = ?1 AND bucket_start = ?2",
-            params![scope, bucket],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("read board rate limit failed: {e}")))?
-        .unwrap_or(0);
-    if current >= limit {
-        return Err(AppError::TooManyRequests(
-            "message board posting rate limit exceeded".into(),
-        ));
-    }
-    conn.execute(
-        "INSERT INTO board_rate_limit (scope, bucket_start, count)
-         VALUES (?1, ?2, 1)
-         ON CONFLICT(scope, bucket_start) DO UPDATE SET count = count + 1",
-        params![scope, bucket],
-    )
-    .map_err(|e| AppError::Internal(format!("bump board rate limit failed: {e}")))?;
-    Ok(())
 }
 
 async fn fetch_share_request_logs_from_route(
@@ -11785,7 +12166,10 @@ fn delete_share_auxiliary_rows_tx(conn: &Connection, share_id: &str) -> Result<(
     Ok(())
 }
 
-fn purge_installation_data_tx(conn: &Connection, installation_id: &str) -> Result<(), AppError> {
+pub(crate) fn purge_installation_data_tx(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<(), AppError> {
     client_chat::archive_room_for_installation_tx(conn, installation_id, Utc::now())?;
     let share_ids = {
         let mut stmt = conn
@@ -11909,7 +12293,7 @@ fn validate_share_prune_ids(share_ids: &[String]) -> Result<HashSet<String>, App
     Ok(unique)
 }
 
-fn retire_share_tx(
+pub(crate) fn retire_share_tx(
     conn: &Connection,
     share_id: &str,
     installation_id: &str,
@@ -13109,6 +13493,7 @@ fn notification_batch_is_authorized_for_current_owner(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE
                         WHEN i.owner_verified_at IS NOT NULL
+                         AND i.lifecycle = 'active'
                          AND i.owner_email IS NOT NULL
                          AND TRIM(i.owner_email) != ''
                          AND LOWER(i.owner_email) = LOWER(?2)
@@ -14089,6 +14474,18 @@ fn materialize_offline_events_before_cleanup_tx(
                 &now,
             )?;
         }
+        enqueue_client_presence_operator_signal_tx(
+            conn,
+            &installation_id,
+            episode,
+            "firing",
+            "cleanup_timeout",
+            &platform,
+            &app_version,
+            tunnel_subdomain.as_deref(),
+            last_authenticated_seen_at.as_deref(),
+            now,
+        )?;
         let status = if should_notify {
             "pending"
         } else if notifications_enabled {
@@ -14187,6 +14584,224 @@ fn enqueue_client_offline_chat_event_tx(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn enqueue_operator_alert_signal_tx(
+    conn: &Connection,
+    source_event_id: &str,
+    fingerprint: &str,
+    transition: &str,
+    kind: &str,
+    entity_kind: &str,
+    entity_id: Option<&str>,
+    severity: &str,
+    title: &str,
+    message: &str,
+    details: serde_json::Value,
+    occurred_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let timestamp = occurred_at.to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO operator_alert_signal_outbox (
+            source_event_id, fingerprint, transition, kind, entity_kind, entity_id,
+            severity, title, message, details_json, status, attempts,
+            next_attempt_at, occurred_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                   'pending', 0, ?11, ?11, ?11, ?11)",
+        params![
+            source_event_id,
+            fingerprint,
+            transition,
+            kind,
+            entity_kind,
+            entity_id,
+            severity,
+            title,
+            message,
+            details.to_string(),
+            timestamp,
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("enqueue operator alert signal failed: {error}"))
+    })?;
+    Ok(())
+}
+
+fn enqueue_client_presence_operator_signal_tx(
+    conn: &Connection,
+    installation_id: &str,
+    episode: i64,
+    transition: &str,
+    reason: &str,
+    platform: &str,
+    app_version: &str,
+    tunnel_subdomain: Option<&str>,
+    last_authenticated_seen_at: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let state = if transition == "firing" {
+        "offline"
+    } else {
+        reason
+    };
+    let source_transition = if transition == "firing" {
+        "offline"
+    } else if reason == "installation_removed" {
+        "removed"
+    } else {
+        "recovered"
+    };
+    let client_label = tunnel_subdomain
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(installation_id);
+    let (title, message) = if transition == "firing" {
+        (
+            "Client offline",
+            format!("Client {client_label} is confirmed offline."),
+        )
+    } else if reason == "installation_removed" {
+        (
+            "Client monitoring ended",
+            format!("Client {client_label} was removed after remaining offline."),
+        )
+    } else {
+        (
+            "Client recovered",
+            format!("Client {client_label} recovered after stable authenticated heartbeats."),
+        )
+    };
+    enqueue_operator_alert_signal_tx(
+        conn,
+        &format!("client_presence:{source_transition}:{installation_id}:{episode}"),
+        &format!("client_offline:client:{installation_id}"),
+        transition,
+        "client_offline",
+        "client",
+        Some(installation_id),
+        "critical",
+        title,
+        &message,
+        serde_json::json!({
+            "installationId": installation_id,
+            "clientLabel": client_label,
+            "episode": episode,
+            "state": state,
+            "reason": reason,
+            "platform": platform,
+            "appVersion": app_version,
+            "lastAuthenticatedSeenAt": last_authenticated_seen_at,
+            "occurredAt": occurred_at,
+        }),
+        occurred_at,
+    )
+}
+
+fn enqueue_removed_client_operator_signal_tx(
+    conn: &Connection,
+    installation_id: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let state = conn
+        .query_row(
+            "SELECT ns.offline_episode, ns.presence_state, i.platform, i.app_version,
+                    ict.subdomain, ns.last_authenticated_seen_at
+             FROM installation_notification_state ns
+             INNER JOIN installations i ON i.id = ns.installation_id
+             LEFT JOIN installation_client_tunnels ict
+               ON ict.installation_id = ns.installation_id
+             WHERE ns.installation_id = ?1",
+            params![installation_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read removed Client alert state failed: {error}"))
+        })?;
+    let Some((episode, presence_state, platform, app_version, subdomain, last_seen)) = state else {
+        return Ok(());
+    };
+    if episode <= 0 || !matches!(presence_state.as_str(), "offline" | "recovering") {
+        return Ok(());
+    }
+    enqueue_client_presence_operator_signal_tx(
+        conn,
+        installation_id,
+        episode,
+        "resolved",
+        "installation_removed",
+        &platform,
+        &app_version,
+        subdomain.as_deref(),
+        last_seen.as_deref(),
+        occurred_at,
+    )
+}
+
+fn quiesce_fenced_installation_notifications_tx(
+    conn: &Connection,
+    installation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    enqueue_removed_client_operator_signal_tx(conn, installation_id, now)?;
+    let timestamp = now.to_rfc3339();
+    conn.execute(
+        "UPDATE installation_notification_state
+         SET monitoring_enabled = 0, offline_candidate_since = NULL,
+             recovery_candidate_since = NULL, updated_at = ?2
+         WHERE installation_id = ?1",
+        params![installation_id, timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "disable fenced Client notification monitoring failed: {error}"
+        ))
+    })?;
+    conn.execute(
+        "UPDATE client_notification_events
+         SET status = 'suppressed_installation_fenced',
+             suppression_reason = 'installation permanently fenced by Client subdomain takeover',
+             updated_at = ?2
+         WHERE installation_id = ?1
+           AND status IN ('pending', 'batched', 'awaiting_owner', 'awaiting_setup')",
+        params![installation_id, timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "suppress fenced Client notification events failed: {error}"
+        ))
+    })?;
+    conn.execute(
+        "UPDATE installation_setup_completions
+         SET password_hint = NULL, updated_at = ?2
+         WHERE installation_id = ?1 AND password_hint IS NOT NULL",
+        params![installation_id, timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "clear fenced Client setup password hint failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn sanitize_operator_alert_error(value: &str) -> String {
+    value
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(1_000)
+        .collect()
+}
+
 fn normalize_reported_public_ipv4(value: &str) -> Option<String> {
     value
         .parse::<std::net::Ipv4Addr>()
@@ -14201,7 +14816,7 @@ fn get_installation(
     conn.query_row(
         &format!(
             "SELECT {INSTALLATION_SELECT_COLUMNS}
-         FROM installations WHERE id = ?1"
+         FROM installations WHERE id = ?1 AND lifecycle = 'active'"
         ),
         params![installation_id],
         map_installation_row,
@@ -14328,7 +14943,7 @@ fn find_installation_id_by_public_key(
     conn.query_row(
         "SELECT id
          FROM installations
-         WHERE public_key = ?1
+         WHERE public_key = ?1 AND lifecycle = 'active'
          ORDER BY last_seen_at DESC, created_at DESC
          LIMIT 1",
         params![public_key],
@@ -14378,7 +14993,9 @@ fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> 
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {INSTALLATION_SELECT_COLUMNS}
-             FROM installations ORDER BY last_seen_at DESC"
+             FROM installations
+             WHERE lifecycle = 'active'
+             ORDER BY last_seen_at DESC"
         ))
         .map_err(|e| AppError::Internal(format!("prepare installations failed: {e}")))?;
     let rows = stmt
@@ -20047,6 +20664,333 @@ struct ClientTunnelRecord {
     last_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+struct ClientSubdomainTakeoverJobRow {
+    id: String,
+    target_installation_id: String,
+    source_installation_id: String,
+    owner_email: String,
+    target_original_subdomain: String,
+    adopted_subdomain: String,
+    source_retired_subdomain: String,
+    status: String,
+    old_routes_json: String,
+    new_routes_json: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientSubdomainTakeoverAuthorizationPayload<'a> {
+    takeover_id: &'a str,
+}
+
+impl ClientSubdomainTakeoverJobRow {
+    fn into_commit(self) -> Result<ClientSubdomainTakeoverCommit, AppError> {
+        let old_routes = serde_json::from_str(&self.old_routes_json).map_err(|error| {
+            AppError::Internal(format!("decode takeover old routes failed: {error}"))
+        })?;
+        let new_routes = serde_json::from_str(&self.new_routes_json).map_err(|error| {
+            AppError::Internal(format!("decode takeover new routes failed: {error}"))
+        })?;
+        Ok(ClientSubdomainTakeoverCommit {
+            id: self.id,
+            target_installation_id: self.target_installation_id,
+            source_installation_id: self.source_installation_id,
+            target_original_subdomain: self.target_original_subdomain,
+            adopted_subdomain: self.adopted_subdomain,
+            old_routes,
+            new_routes,
+        })
+    }
+}
+
+fn takeover_job_row_tx(
+    conn: &Connection,
+    takeover_id: &str,
+) -> Result<Option<ClientSubdomainTakeoverJobRow>, AppError> {
+    conn.query_row(
+        "SELECT id, target_installation_id, source_installation_id, owner_email,
+                target_original_subdomain, adopted_subdomain, source_retired_subdomain,
+                status, old_routes_json, new_routes_json
+         FROM client_subdomain_takeovers WHERE id = ?1",
+        params![takeover_id],
+        |row| {
+            Ok(ClientSubdomainTakeoverJobRow {
+                id: row.get(0)?,
+                target_installation_id: row.get(1)?,
+                source_installation_id: row.get(2)?,
+                owner_email: row.get(3)?,
+                target_original_subdomain: row.get(4)?,
+                adopted_subdomain: row.get(5)?,
+                source_retired_subdomain: row.get(6)?,
+                status: row.get(7)?,
+                old_routes_json: row.get(8)?,
+                new_routes_json: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| AppError::Internal(format!("query Client takeover failed: {error}")))
+}
+
+fn takeover_share_routes_tx(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<Vec<(String, String)>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT share_id, subdomain FROM shares
+             WHERE installation_id = ?1
+               AND subdomain IS NOT NULL AND subdomain != '' AND subdomain != '-'
+             ORDER BY share_id",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare takeover Share routes failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map(params![installation_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| {
+            AppError::Internal(format!("query takeover Share routes failed: {error}"))
+        })?;
+    collect_rows(rows)
+}
+
+fn takeover_active_share_routes_tx(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<Vec<(String, String)>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT share_id, subdomain FROM shares
+             WHERE installation_id = ?1 AND share_status = 'active'
+               AND subdomain IS NOT NULL AND subdomain != '' AND subdomain != '-'
+             ORDER BY share_id",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "prepare active takeover Share routes failed: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(params![installation_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "query active takeover Share routes failed: {error}"
+            ))
+        })?;
+    collect_rows(rows)
+}
+
+fn takeover_share_ids_tx(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut statement = conn
+        .prepare("SELECT share_id FROM shares WHERE installation_id = ?1 ORDER BY share_id")
+        .map_err(|error| {
+            AppError::Internal(format!("prepare takeover Share ids failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map(params![installation_id], |row| row.get::<_, String>(0))
+        .map_err(|error| AppError::Internal(format!("query takeover Share ids failed: {error}")))?;
+    collect_rows(rows)
+}
+
+fn validate_takeover_share_labels_tx(
+    conn: &Connection,
+    target_installation_id: &str,
+    source_installation_id: &str,
+    target_subdomain: &str,
+    adopted_subdomain: &str,
+) -> Result<Vec<String>, AppError> {
+    let target_shares = takeover_share_routes_tx(conn, target_installation_id)?;
+    let mut labels = Vec::with_capacity(target_shares.len());
+    let mut unique = HashSet::with_capacity(target_shares.len());
+    for (share_id, current_label) in target_shares {
+        let parsed = parse_share_label(&current_label).map_err(|message| {
+            AppError::Conflict(format!(
+                "target Share {share_id} has an invalid host label: {message}"
+            ))
+        })?;
+        if parsed.client_subdomain != target_subdomain {
+            return Err(AppError::Conflict(format!(
+                "target Share {share_id} does not use the target Client subdomain"
+            )));
+        }
+        let next_label = build_share_label(&parsed.share_slug, adopted_subdomain)
+            .map_err(|message| AppError::Conflict(message.into()))?;
+        if !unique.insert(next_label.clone()) {
+            return Err(AppError::Conflict(
+                "target Shares would produce duplicate host labels".into(),
+            ));
+        }
+        if let Some(existing) =
+            crate::public_hosts::get_by_label(conn, &next_label).map_err(map_public_host_error)?
+            && existing.installation_id.as_deref() != Some(source_installation_id)
+            && !(existing.kind == PublicHostKind::Share && existing.subject_id == share_id)
+        {
+            return Err(AppError::Conflict(format!(
+                "target Share host {next_label} is not owned by the source Client"
+            )));
+        }
+        let conflicting_installation = conn
+            .query_row(
+                "SELECT installation_id FROM shares
+                 WHERE subdomain = ?1 AND installation_id NOT IN (?2, ?3)
+                 LIMIT 1",
+                params![next_label, target_installation_id, source_installation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("check takeover Share conflict failed: {error}"))
+            })?;
+        if conflicting_installation.is_some() {
+            return Err(AppError::Conflict(format!(
+                "target Share host {next_label} is already in use"
+            )));
+        }
+        labels.push(next_label);
+    }
+    Ok(labels)
+}
+
+fn ensure_takeover_client_market_ready_tx(
+    conn: &Connection,
+    target_installation_id: &str,
+    source_installation_id: &str,
+) -> Result<(), AppError> {
+    let target_subscription_status = conn
+        .query_row(
+            "SELECT status FROM client_market_subscriptions WHERE installation_id = ?1",
+            params![target_installation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "check target Client Market subscription failed: {error}"
+            ))
+        })?;
+    if target_subscription_status
+        .as_deref()
+        .is_some_and(|status| status != "active")
+    {
+        return Err(AppError::Conflict(
+            "target Client Market subscription must be active before subdomain takeover".into(),
+        ));
+    }
+
+    let target_host_status = conn
+        .query_row(
+            "SELECT status FROM router_ssh_hosts WHERE installation_id = ?1",
+            params![target_installation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "check target Client Market Host state failed: {error}"
+            ))
+        })?;
+    if target_host_status
+        .as_deref()
+        .is_some_and(|status| status != "allocated")
+    {
+        return Err(AppError::Conflict(
+            "target Client Market Host must be allocated before subdomain takeover".into(),
+        ));
+    }
+
+    let target_cleanup_recovery = conn
+        .query_row(
+            "SELECT 1 FROM client_market_cleanup_recovery_state
+             WHERE installation_id = ?1 AND stopped_at IS NULL",
+            params![target_installation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "check target Client Market cleanup recovery failed: {error}"
+            ))
+        })?;
+    if target_cleanup_recovery.is_some() {
+        return Err(AppError::Conflict(
+            "target Client Market cleanup recovery must finish before subdomain takeover".into(),
+        ));
+    }
+
+    let blocking_job = conn
+        .query_row(
+            "SELECT type FROM provisioning_jobs
+             WHERE installation_id IN (?1, ?2)
+               AND status IN ('pending', 'running')
+               AND type != 'recover'
+             ORDER BY created_at LIMIT 1",
+            params![target_installation_id, source_installation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("check Client takeover market jobs failed: {error}"))
+        })?;
+    if let Some(job_type) = blocking_job {
+        return Err(AppError::Conflict(format!(
+            "Client Market {job_type} job must finish before subdomain takeover"
+        )));
+    }
+    Ok(())
+}
+
+fn quiesce_takeover_client_market_recovery_tx(
+    conn: &Connection,
+    target_installation_id: &str,
+    source_installation_id: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE provisioning_jobs
+         SET status = 'failed', phase = 'complete', failure_code = 'client_subdomain_takeover',
+             log_blob = substr(
+                 COALESCE(log_blob, '') || 'recovery cancelled by Client subdomain takeover\n',
+                 -131072
+             ),
+             updated_at = ?3
+         WHERE installation_id IN (?1, ?2) AND type = 'recover'
+           AND status IN ('pending', 'running')",
+        params![target_installation_id, source_installation_id, now],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("cancel Client takeover recoveries failed: {error}"))
+    })?;
+    conn.execute(
+        "DELETE FROM client_market_recovery_state
+         WHERE installation_id IN (?1, ?2)",
+        params![target_installation_id, source_installation_id],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "clear Client takeover recovery state failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn retired_takeover_subdomain(_installation_id: &str, takeover_id: &str) -> String {
+    let takeover = takeover_id
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .take(20)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("retired-{takeover}")
+}
+
 impl ClientTunnelRecord {
     fn into_view(self, config: &Config) -> ClientTunnelView {
         ClientTunnelView {
@@ -20103,6 +21047,27 @@ fn get_client_tunnel_by_subdomain(
     )
     .optional()
     .map_err(|e| AppError::Internal(format!("query client tunnel by subdomain failed: {e}")))
+}
+
+fn validate_takeover_tunnel_owners(
+    target: &ClientTunnelRecord,
+    source: &ClientTunnelRecord,
+    expected_owner: &str,
+) -> Result<(), AppError> {
+    if !target
+        .owner_email
+        .trim()
+        .eq_ignore_ascii_case(expected_owner)
+        || !source
+            .owner_email
+            .trim()
+            .eq_ignore_ascii_case(expected_owner)
+    {
+        return Err(AppError::Conflict(
+            "Client tunnel owner metadata does not match the verified installation owner".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn list_client_tunnels(conn: &Connection) -> Result<Vec<ClientTunnelRecord>, AppError> {
@@ -23031,16 +23996,6 @@ mod tests {
             verification_service_api_key: None,
             router_owner_email: None,
             admin_emails: HashSet::new(),
-            telegram_bot_token: None,
-            telegram_chat_id: None,
-            telegram_topic_id: None,
-            telegram_notify_all: false,
-            telegram_notify_admin: false,
-            board_max_len: 1000,
-            board_guest_per_hour: 5,
-            board_user_per_hour: 30,
-            board_pin_limit: 3,
-            board_guest_self_delete_secs: 300,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
             footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
@@ -23052,6 +24007,7 @@ mod tests {
                 )),
                 retention_days: 7,
                 sample_interval_secs: 5,
+                alerting: crate::config::AlertingSettings::default(),
             },
         }
     }
@@ -29587,6 +30543,28 @@ mod tests {
                 )
                 .expect("read first offline episode");
             assert_eq!(state, ("offline".into(), 1, 1, 1));
+            let operator_signals: Vec<(String, String)> = {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT source_event_id, transition
+                         FROM operator_alert_signal_outbox
+                         WHERE entity_id = 'inst-presence'
+                         ORDER BY occurred_at, source_event_id",
+                    )
+                    .expect("prepare operator presence signals");
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .expect("query operator presence signals")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("read operator presence signals")
+            };
+            assert_eq!(
+                operator_signals,
+                vec![(
+                    "client_presence:offline:inst-presence:1".into(),
+                    "firing".into()
+                )]
+            );
             let (source_kind, source_event_id, event_type, payload_json): (
                 String,
                 String,
@@ -29649,6 +30627,16 @@ mod tests {
             )
             .expect("read recovered presence");
         assert_eq!(presence, "online");
+        let recovered_signal_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE source_event_id = 'client_presence:recovered:inst-presence:1'
+                   AND transition = 'resolved'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count recovered operator signal");
+        assert_eq!(recovered_signal_count, 1);
         drop(conn);
 
         let recovered_last_seen = offline_now + Duration::seconds(100);
@@ -29680,6 +30668,15 @@ mod tests {
                 )
                 .expect("read cooldown-suppressed notification");
             assert_eq!(second_notification_status, "suppressed_cooldown");
+            let operator_signal_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                     WHERE entity_id = 'inst-presence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count operator presence signals");
+            assert_eq!(operator_signal_count, 3);
         }
         assert_eq!(
             store
@@ -35771,6 +36768,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_operational_summary_marks_disabled_client_tunnel_offline() {
+        let (store, config) = setup_store("dashboard-client-tunnel-disabled").await;
+        insert_installation(&store, "inst-1").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", "client-sub").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_client_tunnels SET enabled = 0 WHERE installation_id = ?1",
+                params!["inst-1"],
+            )
+            .expect("disable client tunnel");
+        }
+
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &ProxyRegistry::default(),
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+
+        assert_eq!(snapshot.clients[0].operational_summary.state, "offline");
+        assert_eq!(
+            snapshot.clients[0]
+                .operational_summary
+                .primary_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("route_offline")
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn local_ux_telemetry_records_only_minimized_fields() {
         let (store, config) = setup_store("dashboard-ux-telemetry").await;
         store
@@ -38077,70 +39114,6 @@ mod tests {
         let _ = std::fs::remove_file(&config.database.path);
     }
 
-    /// Regression test for the rate-limit bypass Codex flagged: a guest can
-    /// rotate `X-Board-Guest-Id` to mint fresh buckets. The fix keys
-    /// anonymous posts by salted IP instead, so guest_id rotation must NOT
-    /// bypass `board_guest_per_hour`.
-    #[tokio::test]
-    async fn guest_rate_limit_keys_on_ip_not_guest_id() {
-        use crate::dynamic_settings::BoardSettings;
-        let (store, _config) = setup_store("guest-rate-limit-by-ip").await;
-        let settings = BoardSettings {
-            max_len: 1000,
-            guest_per_hour: 3,
-            user_per_hour: 100,
-            pin_limit: 3,
-            guest_self_delete_secs: 300,
-        };
-        let same_ip = Some("203.0.113.5");
-
-        // Rotate guest_id on every call from the same IP. After
-        // `guest_per_hour` successful posts, the next one must be rejected.
-        for i in 0..settings.guest_per_hour {
-            let guest_id = format!("rotated-guest-{i}");
-            let author = BoardAuthor::Guest {
-                guest_id,
-                name: None,
-            };
-            store
-                .create_board_message(&settings, author, format!("msg {i}"), same_ip)
-                .await
-                .expect("post under limit succeeds");
-        }
-        let overflow = store
-            .create_board_message(
-                &settings,
-                BoardAuthor::Guest {
-                    guest_id: "rotated-guest-final".into(),
-                    name: None,
-                },
-                "overflow".into(),
-                same_ip,
-            )
-            .await;
-        assert!(
-            matches!(overflow, Err(AppError::TooManyRequests(_))),
-            "guest_id rotation must not bypass the per-IP guest rate limit, \
-             got: {overflow:?}"
-        );
-
-        // A request from a different IP, even with a reused guest_id, gets
-        // its own bucket and succeeds.
-        let other_ip = Some("198.51.100.7");
-        store
-            .create_board_message(
-                &settings,
-                BoardAuthor::Guest {
-                    guest_id: "rotated-guest-0".into(),
-                    name: None,
-                },
-                "from-other-ip".into(),
-                other_ip,
-            )
-            .await
-            .expect("different IP gets a fresh bucket");
-    }
-
     #[tokio::test]
     async fn announcement_settings_round_trip_updates_revision() {
         let (store, _config) = setup_store("announcement-settings-round-trip").await;
@@ -39422,6 +40395,698 @@ mod tests {
             Some("logs-alpha")
         );
         assert!(!subdomains.contains_key("log-client-b"));
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_subdomain_takeover_rebinds_namespace_and_permanently_fences_source() {
+        let (store, config) = setup_store("client-subdomain-takeover").await;
+        let target_id = "takeover-target";
+        let source_id = "takeover-source";
+        let target_signing_key = SigningKey::generate(&mut OsRng);
+        insert_installation(&store, target_id).await;
+        insert_installation(&store, source_id).await;
+        insert_setup_client_tunnel(&store, target_id, "targeta").await;
+        insert_setup_client_tunnel(&store, source_id, "sourceb").await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations
+                 SET control_secret_b64 = 'target-control', public_key = ?2
+                 WHERE id = ?1",
+                params![target_id, public_key_b64(&target_signing_key)],
+            )
+            .expect("set takeover control secret");
+            for (label, installation_id) in [("targeta", target_id), ("sourceb", source_id)] {
+                let route_id = format!("client:{installation_id}");
+                crate::public_hosts::claim(
+                    &conn,
+                    crate::public_hosts::NewPublicHost {
+                        label,
+                        route_id: &route_id,
+                        kind: PublicHostKind::Client,
+                        subject_id: installation_id,
+                        installation_id: Some(installation_id),
+                        target_lane_id: installation_id,
+                    },
+                )
+                .expect("claim takeover Client host");
+            }
+            for (share_id, installation_id, label, status) in [
+                ("target-share", target_id, "sharedslug--targeta", "active"),
+                ("target-paused", target_id, "pausedslug--targeta", "paused"),
+                ("source-share", source_id, "sharedslug--sourceb", "active"),
+                ("source-extra", source_id, "extraslug--sourceb", "active"),
+            ] {
+                conn.execute(
+                    "INSERT INTO shares (
+                        share_id, capacity_pool_id, installation_id, share_name,
+                        shared_with_emails_json, market_access_mode, access_by_app_json,
+                        app_settings_json, for_sale_official_price_percent_by_app_json,
+                        for_sale, subdomain, app_type, enabled_claude, enabled_codex,
+                        enabled_gemini, token_limit, parallel_limit, tokens_used,
+                        requests_count, share_status, created_at, expires_at, updated_at
+                     ) VALUES (?1, ?1, ?2, ?1, '[]', 'selected', '{}', '{}', '{}',
+                               'No', ?3, 'codex', 0, 1, 0, -1, 3, 0, 0,
+                               ?4, ?5, '2099-12-31T23:59:59Z', ?5)",
+                    params![share_id, installation_id, label, status, now],
+                )
+                .expect("insert takeover Share");
+                let route_id = format!("share:{share_id}");
+                crate::public_hosts::claim(
+                    &conn,
+                    crate::public_hosts::NewPublicHost {
+                        label,
+                        route_id: &route_id,
+                        kind: PublicHostKind::Share,
+                        subject_id: share_id,
+                        installation_id: Some(installation_id),
+                        target_lane_id: installation_id,
+                    },
+                )
+                .expect("claim takeover Share host");
+            }
+            for (listing_id, share_id, installation_id) in [
+                ("target-listing", "target-share", target_id),
+                ("source-listing", "source-share", source_id),
+            ] {
+                conn.execute(
+                    "INSERT INTO share_market_listings (
+                        id, share_id, installation_id, owner_user_id, owner_email,
+                        status, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 'owner-user', 'owner@example.com', 'active', ?4, ?4)",
+                    params![listing_id, share_id, installation_id, now],
+                )
+                .expect("insert takeover listing");
+            }
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, monitoring_enabled, presence_state,
+                    last_authenticated_seen_at, offline_since, offline_episode,
+                    last_offline_event_at, created_at, updated_at
+                 ) VALUES (?1, 'verified', 1, 'offline', ?2, ?2, 1, ?2, ?2, ?2)",
+                params![source_id, now],
+            )
+            .expect("insert source notification state");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES (
+                    'source-offline-event', 'takeover-source-offline', 'client_offline',
+                    ?1, 1, 'pending', ?2, ?2, '{}', ?2, ?2
+                 )",
+                params![source_id, now],
+            )
+            .expect("insert source pending notification");
+            for (room_id, installation_id, label) in [
+                ("target-chat-room", target_id, "targeta"),
+                ("source-chat-room", source_id, "sourceb"),
+            ] {
+                conn.execute(
+                    "INSERT INTO chat_rooms (
+                        id, installation_id, client_label_snapshot,
+                        owner_email_snapshot, owner_generation, status,
+                        created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 'owner@example.com', 1, 'active', ?4, ?4)",
+                    params![room_id, installation_id, label, now],
+                )
+                .expect("insert takeover Client chat room");
+            }
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                source_id,
+                "client_market",
+                "takeover-pending-before-fence",
+                "client_offline",
+                serde_json::json!({ "summary": "pending before fence" }),
+                &[],
+                &now,
+            )
+            .expect("enqueue source chat event before takeover");
+            conn.execute(
+                "INSERT INTO provisioning_jobs (
+                    id, type, installation_id, status, phase, log_blob, created_at, updated_at
+                 ) VALUES (
+                    'target-active-recovery', 'recover', ?1, 'running',
+                    'recovery_waiting', '', ?2, ?2
+                 )",
+                params![target_id, now],
+            )
+            .expect("insert target recovery job before takeover");
+        }
+
+        let plan = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect("prepare takeover");
+        let pending_auth_timestamp = Utc::now().timestamp_millis();
+        let pending_auth_nonce = "takeover-auth-pending";
+        let pending_auth_payload = ClientSubdomainTakeoverAuthorizationPayload {
+            takeover_id: &plan.id,
+        };
+        let pending_auth_signature = sign_test_payload(
+            &target_signing_key,
+            target_id,
+            crate::client_subdomain_takeover::CLIENT_SUBDOMAIN_TAKEOVER_AUTHORIZATION_ACTION,
+            &pending_auth_payload,
+            pending_auth_timestamp,
+            pending_auth_nonce,
+        );
+        let pending_auth = store
+            .authorize_client_subdomain_takeover_activation(
+                target_id,
+                &plan.id,
+                pending_auth_timestamp,
+                pending_auth_nonce,
+                &pending_auth_signature,
+            )
+            .await
+            .expect("authorize pending takeover");
+        assert!(!pending_auth.authorized);
+        assert_eq!(pending_auth.status, "preparing");
+        store
+            .mark_client_subdomain_takeover_server_prepared(&plan.id)
+            .await
+            .expect("mark Server prepared");
+        let committed = store
+            .commit_client_subdomain_takeover(&plan.id)
+            .await
+            .expect("commit takeover");
+        let repeated = store
+            .commit_client_subdomain_takeover(&plan.id)
+            .await
+            .expect("repeat takeover commit");
+        assert_eq!(repeated.new_routes, committed.new_routes);
+        assert!(committed.new_routes.contains(&"sourceb".to_string()));
+        assert!(
+            committed
+                .new_routes
+                .contains(&"sharedslug--sourceb".to_string())
+        );
+        assert!(
+            !committed
+                .new_routes
+                .contains(&"pausedslug--sourceb".to_string())
+        );
+        let committed_auth_timestamp = Utc::now().timestamp_millis();
+        let committed_auth_nonce = "takeover-auth-committed";
+        let committed_auth_payload = ClientSubdomainTakeoverAuthorizationPayload {
+            takeover_id: &plan.id,
+        };
+        let committed_auth_signature = sign_test_payload(
+            &target_signing_key,
+            target_id,
+            crate::client_subdomain_takeover::CLIENT_SUBDOMAIN_TAKEOVER_AUTHORIZATION_ACTION,
+            &committed_auth_payload,
+            committed_auth_timestamp,
+            committed_auth_nonce,
+        );
+        let committed_auth = store
+            .authorize_client_subdomain_takeover_activation(
+                target_id,
+                &plan.id,
+                committed_auth_timestamp,
+                committed_auth_nonce,
+                &committed_auth_signature,
+            )
+            .await
+            .expect("authorize committed takeover");
+        assert!(committed_auth.authorized);
+        assert_eq!(committed_auth.status, "router_committed");
+
+        let conn = store.conn.lock().await;
+        let target_tunnel: (String, i64) = conn
+            .query_row(
+                "SELECT subdomain, enabled FROM installation_client_tunnels WHERE installation_id = ?1",
+                params![target_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read target tunnel");
+        assert_eq!(target_tunnel, ("sourceb".into(), 1));
+        let source_tunnel: (String, i64) = conn
+            .query_row(
+                "SELECT subdomain, enabled FROM installation_client_tunnels WHERE installation_id = ?1",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read source tunnel");
+        assert_eq!(source_tunnel.1, 0);
+        assert!(source_tunnel.0.starts_with("retired-"));
+        let target_share: String = conn
+            .query_row(
+                "SELECT subdomain FROM shares WHERE share_id = 'target-share'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read target Share");
+        assert_eq!(target_share, "sharedslug--sourceb");
+        let paused_target_share: (String, String) = conn
+            .query_row(
+                "SELECT subdomain, share_status FROM shares WHERE share_id = 'target-paused'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read paused target Share");
+        assert_eq!(
+            paused_target_share,
+            ("pausedslug--sourceb".into(), "paused".into())
+        );
+        let source_share_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE installation_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .expect("count source Shares");
+        assert_eq!(source_share_count, 0);
+        let listings: (String, String) = conn
+            .query_row(
+                "SELECT
+                    (SELECT status FROM share_market_listings WHERE id = 'target-listing'),
+                    (SELECT status FROM share_market_listings WHERE id = 'source-listing')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read takeover listings");
+        assert_eq!(listings, ("active".into(), "closed".into()));
+        let source_lifecycle: String = conn
+            .query_row(
+                "SELECT lifecycle FROM installations WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .expect("read source lifecycle");
+        assert_eq!(source_lifecycle, "fenced");
+        let chat_rooms: (String, String, String, String) = conn
+            .query_row(
+                "SELECT
+                    (SELECT client_label_snapshot FROM chat_rooms WHERE id = 'target-chat-room'),
+                    (SELECT status FROM chat_rooms WHERE id = 'source-chat-room'),
+                    (SELECT client_label_snapshot FROM chat_rooms WHERE id = 'source-chat-room'),
+                    (SELECT status FROM client_chat_system_outbox
+                     WHERE source_event_id = 'takeover-pending-before-fence')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read takeover Client chat rooms");
+        assert_eq!(
+            chat_rooms,
+            (
+                "sourceb".into(),
+                "archived".into(),
+                "sourceb".into(),
+                "completed".into()
+            )
+        );
+        let recovery_job_status: String = conn
+            .query_row(
+                "SELECT status FROM provisioning_jobs WHERE id = 'target-active-recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read cancelled target recovery job");
+        assert_eq!(recovery_job_status, "failed");
+        client_chat::enqueue_client_system_event_tx(
+            &conn,
+            source_id,
+            "client_market",
+            "takeover-post-fence-cleanup",
+            "cleanup_failed",
+            serde_json::json!({ "summary": "post-fence cleanup audit" }),
+            &[],
+            &now,
+        )
+        .expect("enqueue post-fence source chat event");
+        let source_notification: (i64, String) = conn
+            .query_row(
+                "SELECT ns.monitoring_enabled, e.status
+                 FROM installation_notification_state ns
+                 JOIN client_notification_events e ON e.installation_id = ns.installation_id
+                 WHERE ns.installation_id = ?1 AND e.id = 'source-offline-event'",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read fenced source notification state");
+        assert_eq!(
+            source_notification,
+            (0, "suppressed_installation_fenced".into())
+        );
+        let fence_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installation_fences WHERE installation_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .expect("count source fence");
+        assert_eq!(fence_count, 1);
+        let adopted_host = crate::public_hosts::get_by_label(&conn, "sourceb")
+            .expect("read adopted Client host")
+            .expect("adopted Client host");
+        assert_eq!(adopted_host.subject_id, target_id);
+        assert_eq!(adopted_host.installation_id.as_deref(), Some(target_id));
+        drop(conn);
+        let metrics = store
+            .client_metrics_snapshot(Utc::now())
+            .await
+            .expect("read takeover Client metrics");
+        assert_eq!(metrics.total, 1);
+        assert_eq!(metrics.items[0].installation_id, target_id);
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(1)
+                .await
+                .expect("materialize post-fence source chat event"),
+            1
+        );
+        {
+            let conn = store.conn.lock().await;
+            let source_room: (String, i64) = conn
+                .query_row(
+                    "SELECT status,
+                            (SELECT COUNT(*) FROM chat_messages WHERE room_id = chat_rooms.id)
+                     FROM chat_rooms WHERE id = 'source-chat-room'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read archived source chat after system event");
+            assert_eq!(source_room, ("archived".into(), 1));
+            assert!(
+                client_chat::ensure_room_for_verified_owner_tx(
+                    &conn,
+                    source_id,
+                    "owner@example.com",
+                    Utc::now(),
+                )
+                .is_err(),
+                "a fenced Client chat room must never reactivate"
+            );
+        }
+        assert!(
+            store
+                .installation_control_secret(source_id)
+                .await
+                .expect("read fenced secret")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_subdomain_takeover_rejects_divergent_tunnel_owner_metadata() {
+        let (store, config) = setup_store("client-subdomain-takeover-owner-invariant").await;
+        insert_installation(&store, "takeover-owner-target").await;
+        insert_installation(&store, "takeover-owner-source").await;
+        insert_client_tunnel(
+            &store,
+            "takeover-owner-target",
+            "owner@example.com",
+            "ownertarget",
+        )
+        .await;
+        insert_client_tunnel(
+            &store,
+            "takeover-owner-source",
+            "different@example.com",
+            "ownersource",
+        )
+        .await;
+
+        let error = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                "takeover-owner-target",
+                "takeover-owner-source",
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect_err("divergent tunnel owner must be rejected");
+        assert!(matches!(error, AppError::Conflict(_)));
+        assert!(error.to_string().contains("tunnel owner metadata"));
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_subdomain_takeover_rejects_active_market_create_or_cleanup_jobs() {
+        let (store, config) = setup_store("client-subdomain-takeover-active-market-job").await;
+        let target_id = "takeover-market-job-target";
+        let source_id = "takeover-market-job-source";
+        insert_installation(&store, target_id).await;
+        insert_installation(&store, source_id).await;
+        insert_client_tunnel(&store, target_id, "owner@example.com", "marketjobtarget").await;
+        insert_client_tunnel(&store, source_id, "owner@example.com", "marketjobsource").await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET control_secret_b64 = 'market-job-control' WHERE id = ?1",
+                params![target_id],
+            )
+            .expect("set market-job takeover control secret");
+            conn.execute(
+                "INSERT INTO provisioning_jobs (
+                    id, type, installation_id, status, phase, log_blob, created_at, updated_at
+                 ) VALUES (
+                    'blocking-create-job', 'create', ?1, 'running', 'waiting_for_client', '', ?2, ?2
+                 )",
+                params![source_id, now],
+            )
+            .expect("insert blocking Client Market job");
+        }
+
+        let error = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect_err("active create job must block takeover");
+        assert!(matches!(error, AppError::Conflict(_)));
+        assert!(error.to_string().contains("Client Market create job"));
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE provisioning_jobs SET status = 'failed' WHERE id = 'blocking-create-job'",
+                [],
+            )
+            .expect("finish blocking Client Market job");
+        store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect("terminal Client Market job must release takeover");
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_subdomain_takeover_requires_stable_target_market_state() {
+        let (store, config) = setup_store("client-subdomain-takeover-target-market-state").await;
+        let target_id = "takeover-market-state-target";
+        let source_id = "takeover-market-state-source";
+        let host_id = "takeover-market-state-host";
+        insert_installation(&store, target_id).await;
+        insert_installation(&store, source_id).await;
+        insert_client_tunnel(&store, target_id, "owner@example.com", "marketstatetarget").await;
+        insert_client_tunnel(&store, source_id, "owner@example.com", "marketstatesource").await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET control_secret_b64 = 'market-state-control' WHERE id = ?1",
+                params![target_id],
+            )
+            .expect("set target takeover control secret");
+            conn.execute(
+                "INSERT INTO router_ssh_hosts (
+                    id, ip, port, host_owner_email, status, installation_id, created_at, updated_at
+                 ) VALUES (?1, '198.18.40.1', 22, 'provider@example.com', 'allocated', ?2, ?3, ?3)",
+                params![host_id, target_id, now],
+            )
+            .expect("insert target Client Market Host");
+            conn.execute(
+                "INSERT INTO client_market_subscriptions (
+                    installation_id, host_id, provider_id, host_owner_email,
+                    client_user_id, client_owner_email, status, offer_revision,
+                    created_at, updated_at
+                 ) VALUES (
+                    ?1, ?2, 'provider-user', 'provider@example.com',
+                    'owner-user', 'owner@example.com', 'release_failed', 1, ?3, ?3
+                 )",
+                params![target_id, host_id, now],
+            )
+            .expect("insert failed target Client Market subscription");
+        }
+
+        let error = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect_err("non-active target subscription must block takeover");
+        assert!(error.to_string().contains("subscription must be active"));
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_market_subscriptions SET status = 'active' WHERE installation_id = ?1",
+                params![target_id],
+            )
+            .expect("reactivate target subscription");
+            conn.execute(
+                "INSERT INTO client_market_cleanup_recovery_state (
+                    host_id, installation_id, attempt_count, next_attempt_at, updated_at
+                 ) VALUES (?1, ?2, 0, ?3, ?3)",
+                params![host_id, target_id, now],
+            )
+            .expect("insert target cleanup recovery");
+        }
+        let error = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect_err("target cleanup recovery must block takeover");
+        assert!(error.to_string().contains("cleanup recovery must finish"));
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "DELETE FROM client_market_cleanup_recovery_state WHERE installation_id = ?1",
+                params![target_id],
+            )
+            .expect("clear target cleanup recovery");
+            conn.execute(
+                "UPDATE router_ssh_hosts SET status = 'unreachable' WHERE id = ?1",
+                params![host_id],
+            )
+            .expect("mark target Host unstable");
+        }
+        let error = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect_err("unstable target Host must block takeover");
+        assert!(error.to_string().contains("Host must be allocated"));
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE router_ssh_hosts SET status = 'allocated' WHERE id = ?1",
+                params![host_id],
+            )
+            .expect("stabilize target Host");
+        store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect("stable target Client Market state must allow takeover");
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn failed_client_subdomain_takeover_releases_both_clients_for_retry() {
+        let (store, config) = setup_store("client-subdomain-takeover-terminal-retry").await;
+        let target_id = "takeover-retry-target";
+        let source_id = "takeover-retry-source";
+        insert_installation(&store, target_id).await;
+        insert_installation(&store, source_id).await;
+        insert_client_tunnel(&store, target_id, "owner@example.com", "retrytarget").await;
+        insert_client_tunnel(&store, source_id, "owner@example.com", "retrysource").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET control_secret_b64 = 'retry-control' WHERE id = ?1",
+                params![target_id],
+            )
+            .expect("set retry takeover control secret");
+        }
+
+        let first = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect("prepare first takeover");
+        store
+            .mark_client_subdomain_takeover_server_prepared(&first.id)
+            .await
+            .expect("mark first takeover prepared");
+        assert!(
+            !store
+                .fail_client_subdomain_takeover_if_preparing(
+                    &first.id,
+                    "stale preparing recovery must not overwrite Server acknowledgement",
+                )
+                .await
+                .expect("reject stale preparing failure")
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_client_tunnels SET subdomain = 'retrychanged' WHERE installation_id = ?1",
+                params![target_id],
+            )
+            .expect("change target subdomain during takeover");
+        }
+        let commit_error = store
+            .commit_client_subdomain_takeover(&first.id)
+            .await
+            .expect_err("changed target subdomain must reject commit");
+        assert!(matches!(commit_error, AppError::Conflict(_)));
+        store
+            .fail_client_subdomain_takeover(&first.id, &commit_error.to_string())
+            .await
+            .expect("fail terminal takeover");
+
+        let retry = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect("failed takeover must release both active-job constraints");
+        assert_ne!(retry.id, first.id);
 
         let _ = std::fs::remove_file(config.database.path);
     }

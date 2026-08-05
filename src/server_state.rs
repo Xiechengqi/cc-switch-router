@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::abuse::AbuseTracker;
 use crate::admin::upgrade::SharedUpgradeRegistry;
-use crate::board_telegram::TelegramNotifier;
+use crate::alerting::AlertingService;
 use crate::client_market::ClientMarketJobSecrets;
 use crate::client_market_terminal::TerminalSessionManager;
 use crate::config::Config;
@@ -50,6 +50,8 @@ pub struct ServerState {
     pub client_market_terminal: Arc<Mutex<TerminalSessionManager>>,
     /// Per-installation exclusion and wake-up channel for automatic Client recovery.
     pub client_market_recovery: Arc<crate::client_market_recovery::ClientMarketRecoveryCoordinator>,
+    /// Ensures Client subdomain takeover reconciliation has only one active worker.
+    pub client_subdomain_takeover_recovery_running: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes external billing suspend/resume/terminate effects across API and worker tasks.
     pub market_billing_controls: Arc<Mutex<()>>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
@@ -59,8 +61,6 @@ pub struct ServerState {
     pub abuse: Arc<AbuseTracker>,
     /// In-memory aggregation for blocked IP blacklist requests. Flushed to logs periodically.
     pub ip_blacklist_stats: Arc<IpBlacklistStats>,
-    /// Optional Telegram bot client; populated when telegram env vars are set.
-    pub telegram: Arc<RwLock<Option<Arc<TelegramNotifier>>>>,
     /// Single-flight upgrade orchestrator with SSE log fan-out.
     pub upgrade_registry: SharedUpgradeRegistry,
     /// Fan-out control channel for online cc-switch-server clients. Events are wake-ups only;
@@ -75,6 +75,8 @@ pub struct ServerState {
     pub scheduling_overrides: Arc<OverrideStore>,
     /// Separate metrics collector/store for host, router, and LLM observability.
     pub metrics: Arc<MetricsRegistry>,
+    /// Persistent operator incidents and channel-neutral delivery outbox.
+    pub alerting: Arc<AlertingService>,
     /// Bounded in-memory admission limiter for the public installation registration endpoint.
     pub registration_admission: Arc<RegistrationAdmissionLimiter>,
 }

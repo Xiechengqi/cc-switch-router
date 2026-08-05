@@ -1,7 +1,7 @@
 mod abuse;
 mod admin;
+mod alerting;
 mod api;
-mod board_telegram;
 mod cf;
 mod client_chat;
 mod client_market;
@@ -9,6 +9,7 @@ mod client_market_recovery;
 mod client_market_terminal;
 mod client_market_trade;
 mod client_meta;
+mod client_subdomain_takeover;
 mod config;
 mod ctl_client;
 mod db;
@@ -57,7 +58,6 @@ use tracing_subscriber::filter::LevelFilter;
 use uuid::Uuid;
 
 use crate::abuse::AbuseTracker;
-use crate::board_telegram::TelegramNotifier;
 use crate::client_market::ClientMarketJobSecrets;
 use crate::config::{Config, DatabaseMode, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
@@ -156,13 +156,11 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(Resend::new)
         .map(Arc::new);
-    let telegram = TelegramNotifier::from_config(&config);
     let default_admin_email = config.default_admin_email();
     info!(
         admin_emails = config.admin_emails.len(),
         default_admin = default_admin_email.as_deref().unwrap_or("-"),
-        telegram_enabled = telegram.is_some(),
-        "legacy board compatibility configured"
+        "router administration configured"
     );
     if let Some(ref fp) = ssh_host_fingerprint {
         info!("ssh host key fingerprint: {}", fp);
@@ -177,6 +175,12 @@ async fn main() -> Result<()> {
         .build()
         .context("build proxy http client failed")?;
     let metrics = MetricsRegistry::new(config.metrics.clone());
+    let dynamic = Arc::new(RwLock::new(DynamicSettings::from_config(&config)));
+    let alerting = crate::alerting::AlertingService::new(
+        config.metrics.db_path.clone(),
+        dynamic.clone(),
+        &config,
+    )?;
     let server_logs = Arc::new(server_logs::ServerLogStore::from_env(&config.data_dir)?);
 
     let state = ServerState {
@@ -188,7 +192,7 @@ async fn main() -> Result<()> {
         proxy_http,
         resend,
         resend_usage_cache: Arc::new(Mutex::new(None)),
-        dynamic: Arc::new(RwLock::new(DynamicSettings::from_config(&config))),
+        dynamic,
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
         provision_ssh_key_path: config.provision_ssh_private_key_path.clone(),
         provision_ssh_authorized_keys_line,
@@ -200,17 +204,20 @@ async fn main() -> Result<()> {
         client_market_recovery: Arc::new(
             crate::client_market_recovery::ClientMarketRecoveryCoordinator::default(),
         ),
+        client_subdomain_takeover_recovery_running: Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )),
         market_billing_controls: Arc::new(Mutex::new(())),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),
-        telegram: Arc::new(RwLock::new(telegram)),
         upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
         share_edit_events: broadcast::channel(512).0,
         env_path: env_path.clone(),
         start_instant: Instant::now(),
         scheduling_overrides: OverrideStore::new(),
         metrics: metrics.clone(),
+        alerting: alerting.clone(),
         registration_admission: Arc::new(RegistrationAdmissionLimiter::from_env()),
     };
     let startup_reconnect_grace =
@@ -245,6 +252,7 @@ async fn main() -> Result<()> {
         "restored known route intentions"
     );
     crate::client_market::reconcile_interrupted_jobs(state.clone()).await?;
+    crate::client_subdomain_takeover::spawn_recovery(state.clone());
 
     let ssh_server = ssh::SshServer {
         store: state.store.clone(),
@@ -274,6 +282,10 @@ async fn main() -> Result<()> {
     let metrics_config = config.clone();
     let metrics_proxy = state.proxy.clone();
     let metrics_registry = state.metrics.clone();
+    let metrics_store = state.store.clone();
+    let metrics_alerting = state.alerting.clone();
+    let alerting_service = state.alerting.clone();
+    let alerting_store = state.store.clone();
     let notification_store = state.store.clone();
     let notification_dynamic = state.dynamic.clone();
     let notification_config = config.clone();
@@ -487,8 +499,22 @@ async fn main() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     });
     let metrics_task = tokio::spawn(async move {
-        crate::metrics::run_collector(metrics_registry, metrics_config, metrics_proxy).await;
+        crate::metrics::run_collector(
+            metrics_registry,
+            metrics_config,
+            metrics_proxy,
+            metrics_store,
+            metrics_alerting,
+        )
+        .await;
         Ok::<_, anyhow::Error>(())
+    });
+    let alerting_task = tokio::spawn(async move {
+        let result = crate::alerting::run_alerting_service(alerting_service, alerting_store).await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "operator alert service stopped");
+        }
+        result
     });
     let notification_task = tokio::spawn(async move {
         let result = crate::notifications::run_client_notification_service(
@@ -606,6 +632,7 @@ async fn main() -> Result<()> {
     runtime_task.abort();
     resend_usage_task.abort();
     metrics_task.abort();
+    alerting_task.abort();
     notification_task.abort();
     chat_notification_task.abort();
     client_market_trade_task.abort();

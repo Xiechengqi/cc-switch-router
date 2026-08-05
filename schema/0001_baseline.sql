@@ -367,6 +367,22 @@ CREATE TABLE client_market_recovery_state (
         );
 CREATE INDEX idx_client_market_recovery_due
             ON client_market_recovery_state(observed_state, next_attempt_at);
+CREATE TABLE client_market_cleanup_recovery_state (
+            host_id TEXT PRIMARY KEY,
+            installation_id TEXT NOT NULL UNIQUE,
+            attempt_count INTEGER NOT NULL DEFAULT 0
+                CHECK (attempt_count >= 0 AND attempt_count <= 5),
+            next_attempt_at TEXT,
+            last_attempt_at TEXT,
+            last_outcome TEXT,
+            stopped_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES router_ssh_hosts(id) ON DELETE CASCADE,
+            FOREIGN KEY (installation_id) REFERENCES installations(id) ON DELETE CASCADE
+        );
+CREATE INDEX idx_client_market_cleanup_recovery_due
+            ON client_market_cleanup_recovery_state(next_attempt_at)
+            WHERE stopped_at IS NULL;
 CREATE INDEX idx_market_quotes_owner
             ON client_market_allocation_quotes(client_user_id, status, expires_at);
 CREATE INDEX idx_market_subscriptions_client
@@ -715,8 +731,49 @@ CREATE TABLE installations (
             geo_last_changed_at TEXT,
             created_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
-            control_secret_b64 TEXT
+            control_secret_b64 TEXT,
+            lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active', 'fenced')),
+            fenced_at TEXT,
+            fence_reason TEXT
         , delegate_upgrade_to_router_owner INTEGER, app_commit_id TEXT, update_available INTEGER, upgrade_capable INTEGER, status_reported_at TEXT, public_ip TEXT, provision_source TEXT, provision_host_id TEXT);
+CREATE TABLE installation_fences (
+            public_key TEXT PRIMARY KEY,
+            installation_id TEXT NOT NULL,
+            takeover_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+CREATE TABLE client_subdomain_takeovers (
+            id TEXT PRIMARY KEY,
+            target_installation_id TEXT NOT NULL,
+            source_installation_id TEXT NOT NULL,
+            owner_email TEXT NOT NULL,
+            target_original_subdomain TEXT NOT NULL,
+            adopted_subdomain TEXT NOT NULL,
+            source_retired_subdomain TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'preparing', 'server_prepared', 'router_committed',
+                'server_committed', 'completed', 'failed'
+            )),
+            activate_at_ms INTEGER NOT NULL,
+            old_routes_json TEXT NOT NULL DEFAULT '[]',
+            new_routes_json TEXT NOT NULL DEFAULT '[]',
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            server_prepared_at TEXT,
+            router_committed_at TEXT,
+            server_committed_at TEXT,
+            completed_at TEXT
+        );
+CREATE UNIQUE INDEX idx_client_subdomain_takeovers_active_target
+            ON client_subdomain_takeovers(target_installation_id)
+            WHERE status NOT IN ('completed', 'failed');
+CREATE UNIQUE INDEX idx_client_subdomain_takeovers_active_source
+            ON client_subdomain_takeovers(source_installation_id)
+            WHERE status NOT IN ('completed', 'failed');
+CREATE INDEX idx_client_subdomain_takeovers_recovery
+            ON client_subdomain_takeovers(status, updated_at);
 CREATE TABLE registration_admission_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_scope TEXT NOT NULL,
@@ -1077,6 +1134,29 @@ CREATE TABLE client_notification_events (
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+CREATE TABLE operator_alert_signal_outbox (
+            source_event_id TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            transition TEXT NOT NULL CHECK (transition IN ('firing', 'resolved')),
+            kind TEXT NOT NULL,
+            entity_kind TEXT NOT NULL,
+            entity_id TEXT,
+            severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'claimed', 'retry', 'completed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            claimed_by TEXT,
+            claim_expires_at TEXT,
+            last_error TEXT,
+            occurred_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        );
 CREATE TABLE installation_setup_completions (
             installation_id TEXT PRIMARY KEY,
             setup_id TEXT NOT NULL,
@@ -1337,6 +1417,10 @@ CREATE INDEX idx_email_delivery_batches_retention
             ON email_delivery_batches(updated_at, status);
 CREATE INDEX idx_client_notification_events_retention
             ON client_notification_events(updated_at, status);
+CREATE INDEX idx_operator_alert_signal_outbox_pending
+            ON operator_alert_signal_outbox(status, next_attempt_at, occurred_at);
+CREATE INDEX idx_operator_alert_signal_outbox_retention
+            ON operator_alert_signal_outbox(status, completed_at);
 CREATE INDEX idx_client_registration_notification_overflow_pending
             ON client_registration_notification_overflow(status, window_end, window_start);
 CREATE INDEX idx_dashboard_ux_events_created ON dashboard_ux_events(created_at DESC);
@@ -1370,35 +1454,6 @@ CREATE UNIQUE INDEX idx_market_share_runtime_states_unique
                 COALESCE(model_id, ''),
                 COALESCE(model_name, '')
             );
-CREATE TABLE board_messages (
-            id TEXT PRIMARY KEY,
-            author_kind TEXT NOT NULL,
-            author_user_id TEXT,
-            author_email TEXT,
-            author_label TEXT NOT NULL,
-            guest_id TEXT,
-            client_ip_hash TEXT,
-            body TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'visible',
-            pinned_at TEXT,
-            featured_at TEXT,
-            deleted_by TEXT,
-            deleted_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-CREATE INDEX idx_board_msgs_created ON board_messages(created_at DESC);
-CREATE INDEX idx_board_msgs_pinned ON board_messages(pinned_at DESC) WHERE pinned_at IS NOT NULL;
-CREATE INDEX idx_board_msgs_featured ON board_messages(featured_at DESC) WHERE featured_at IS NOT NULL;
-CREATE INDEX idx_board_msgs_author_user ON board_messages(author_user_id, created_at DESC);
-CREATE INDEX idx_board_msgs_guest ON board_messages(guest_id, created_at DESC);
-CREATE TABLE board_rate_limit (
-            scope TEXT NOT NULL,
-            bucket_start INTEGER NOT NULL,
-            count INTEGER NOT NULL,
-            PRIMARY KEY (scope, bucket_start)
-        );
-CREATE INDEX idx_board_rate_bucket ON board_rate_limit(bucket_start DESC);
 CREATE TABLE admin_audit_log (
             id TEXT PRIMARY KEY,
             actor_email TEXT,

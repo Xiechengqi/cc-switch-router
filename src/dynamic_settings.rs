@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use crate::config::{ClientNotificationSettings, Config};
+use crate::config::{AlertingSettings, ClientNotificationSettings, Config};
 
 /// Settings that can change at runtime without restarting the process.
 ///
@@ -13,9 +13,8 @@ use crate::config::{ClientNotificationSettings, Config};
 pub struct DynamicSettings {
     pub admin_emails: HashSet<String>,
     pub security: SecuritySettings,
-    pub telegram: TelegramSettings,
-    pub board: BoardSettings,
     pub client_notifications: ClientNotificationSettings,
+    pub alerting: AlertingSettings,
     pub market_usd_cny_rate_micros: i64,
     pub footer_telegram_url: String,
 }
@@ -31,24 +30,6 @@ pub struct IpBlock {
     prefix: u8,
 }
 
-#[derive(Debug, Clone)]
-pub struct TelegramSettings {
-    pub bot_token: Option<String>,
-    pub chat_id: Option<String>,
-    pub topic_id: Option<i64>,
-    pub notify_all: bool,
-    pub notify_admin: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct BoardSettings {
-    pub max_len: usize,
-    pub guest_per_hour: i64,
-    pub user_per_hour: i64,
-    pub pin_limit: i64,
-    pub guest_self_delete_secs: i64,
-}
-
 impl DynamicSettings {
     pub fn from_config(config: &Config) -> Self {
         Self {
@@ -56,21 +37,8 @@ impl DynamicSettings {
             security: SecuritySettings {
                 ip_blacklist: parse_ip_blacklist(&config.ip_blacklist),
             },
-            telegram: TelegramSettings {
-                bot_token: config.telegram_bot_token.clone(),
-                chat_id: config.telegram_chat_id.clone(),
-                topic_id: config.telegram_topic_id,
-                notify_all: config.telegram_notify_all,
-                notify_admin: config.telegram_notify_admin,
-            },
-            board: BoardSettings {
-                max_len: config.board_max_len,
-                guest_per_hour: config.board_guest_per_hour,
-                user_per_hour: config.board_user_per_hour,
-                pin_limit: config.board_pin_limit,
-                guest_self_delete_secs: config.board_guest_self_delete_secs,
-            },
             client_notifications: config.client_notifications.clone(),
+            alerting: config.metrics.alerting.clone(),
             market_usd_cny_rate_micros: config.market_usd_cny_rate_micros,
             footer_telegram_url: config.footer_telegram_url.clone(),
         }

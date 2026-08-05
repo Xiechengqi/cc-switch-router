@@ -114,6 +114,7 @@ const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
     "providerDeniedClientAccess",
     "reason",
   ],
+  subscription_release_finalized: ["hostname", "providerEmail", "reason"],
   cleanup_failed: ["failureCode", "reason", "hostname", "providerEmail"],
   client_recovery_succeeded: ["recoveryMethod", "attemptLevel", "hostname", "providerEmail"],
   client_recovery_failed: [
@@ -613,6 +614,10 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
     case "cleanup_finished":
     case "subscription_force_released":
       return t("chat.event.cleanupFinished", {
+        client: payloadString(payload, "clientLabel"),
+      });
+    case "subscription_release_finalized":
+      return t("chat.event.releaseFinalized", {
         client: payloadString(payload, "clientLabel"),
       });
     case "cleanup_failed":

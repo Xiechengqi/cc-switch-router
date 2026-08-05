@@ -31,7 +31,6 @@ pub fn normalize_market_slug(value: &str) -> Result<String, &'static str> {
     normalize_public_slug(value, "market slug")
 }
 
-#[cfg(test)]
 pub fn build_share_label(share_slug: &str, client_subdomain: &str) -> Result<String, &'static str> {
     let share_slug = normalize_share_slug(share_slug)?;
     let client_subdomain = normalize_client_subdomain(client_subdomain)?;

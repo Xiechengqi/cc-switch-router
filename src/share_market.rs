@@ -3057,6 +3057,90 @@ fn finish_release_tx(
     Ok(())
 }
 
+pub(crate) fn terminate_installation_for_takeover_tx(
+    tx: &crate::db::Connection,
+    installation_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    tx.execute(
+        "UPDATE market_access_requests
+         SET status = 'cancelled', revision = revision + 1, resolved_at = ?2,
+             resolution_reason = ?3
+         WHERE status = 'requested' AND target_kind = 'share_seat'
+           AND target_id IN (
+               SELECT seat.id
+               FROM share_market_seats seat
+               INNER JOIN share_market_listings listing ON listing.id = seat.listing_id
+               WHERE listing.installation_id = ?1
+           )",
+        params![installation_id, now, reason],
+    )
+    .map_err(map_db("cancel takeover Share access requests"))?;
+    let subscriptions = {
+        let mut statement = tx
+            .prepare(
+                "SELECT id, seat_id
+                 FROM share_market_subscriptions
+                 WHERE installation_id = ?1
+                   AND status NOT IN ('released', 'grant_failed')",
+            )
+            .map_err(map_db("prepare takeover Share subscriptions"))?;
+        let rows = statement
+            .query_map(params![installation_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(map_db("query takeover Share subscriptions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read takeover Share subscriptions"))?
+    };
+    for (subscription_id, seat_id) in subscriptions {
+        crate::market_billing::terminate_contract_tx(tx, "share", &subscription_id, reason, now)?;
+        tx.execute(
+            "UPDATE share_control_operations
+             SET status = 'rejected', last_error = ?2, updated_at = ?3
+             WHERE subscription_id = ?1 AND status IN ('pending', 'dispatched')",
+            params![subscription_id, reason, now],
+        )
+        .map_err(map_db("retire takeover Share control operations"))?;
+        tx.execute(
+            "UPDATE share_market_subscriptions
+             SET status = 'released', release_reason = ?2, updated_at = ?3, released_at = ?3
+             WHERE id = ?1 AND status NOT IN ('released', 'grant_failed')",
+            params![subscription_id, reason, now],
+        )
+        .map_err(map_db("release takeover Share subscription"))?;
+        tx.execute(
+            "UPDATE share_market_seats
+             SET status = 'deleted', current_subscription_id = NULL,
+                 retired_subscription_id = COALESCE(retired_subscription_id, ?2),
+                 retired_at = COALESCE(retired_at, ?3), updated_at = ?3
+             WHERE id = ?1",
+            params![seat_id, subscription_id, now],
+        )
+        .map_err(map_db("retire takeover Share seat"))?;
+    }
+
+    tx.execute(
+        "UPDATE share_market_seats
+         SET status = 'deleted', current_subscription_id = NULL,
+             retired_at = COALESCE(retired_at, ?2), updated_at = ?2
+         WHERE listing_id IN (
+             SELECT id FROM share_market_listings WHERE installation_id = ?1
+         ) AND status != 'deleted'",
+        params![installation_id, now],
+    )
+    .map_err(map_db("delete remaining takeover Share seats"))?;
+    tx.execute(
+        "UPDATE share_market_listings
+         SET status = 'closed', deleted_at = COALESCE(deleted_at, ?2), updated_at = ?2
+         WHERE installation_id = ?1 AND status != 'closed'",
+        params![installation_id, now],
+    )
+    .map_err(map_db("close takeover Share listings"))?;
+    Ok(())
+}
+
 fn retire_seat(
     conn: &Connection,
     seat_id: &str,

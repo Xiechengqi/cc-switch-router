@@ -30,8 +30,7 @@ pub enum FieldType {
 pub enum DynamicGroup {
     AdminEmails,
     Security,
-    Telegram,
-    Board,
+    Alerting,
     ClientNotifications,
     MarketBilling,
 }
@@ -943,11 +942,11 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("…"),
         dynamic_group: None,
     },
-    // ── Admin & retired message board compatibility ──
+    // ── Client Market ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_OWNER_EMAIL",
         label: "Official Client Market Provider",
-        group: "Admin & message board",
+        group: "Client Market",
         field_type: FieldType::Email,
         required: false,
         restart_required: true,
@@ -959,7 +958,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField {
         key: "CC_SWITCH_ROUTER_ADMIN_EMAILS",
         label: "Extra admin emails",
-        group: "Admin & message board",
+        group: "Administrators",
         field_type: FieldType::EmailList,
         required: false,
         restart_required: false,
@@ -967,127 +966,6 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         description: "Comma-separated extra admin emails. router@<tunnel-host> is always admin.",
         placeholder: Some("ops@example.com, sre@example.com"),
         dynamic_group: Some(DynamicGroup::AdminEmails),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_BOARD_MAX_LEN",
-        label: "Legacy board (read-only): max message length",
-        group: "Admin & message board",
-        field_type: FieldType::Int,
-        required: false,
-        restart_required: false,
-        default: Some("1000"),
-        description: "Deprecated compatibility setting. The legacy board is read-only and Client chat uses a fixed 1000-character limit.",
-        placeholder: Some("1000"),
-        dynamic_group: Some(DynamicGroup::Board),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR",
-        label: "Legacy board (read-only): guest messages / hour",
-        group: "Admin & message board",
-        field_type: FieldType::Int,
-        required: false,
-        restart_required: false,
-        default: Some("5"),
-        description: "Deprecated compatibility setting; anonymous legacy board posts are disabled.",
-        placeholder: Some("5"),
-        dynamic_group: Some(DynamicGroup::Board),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR",
-        label: "Legacy board (read-only): user messages / hour",
-        group: "Admin & message board",
-        field_type: FieldType::Int,
-        required: false,
-        restart_required: false,
-        default: Some("30"),
-        description: "Deprecated compatibility setting; legacy board posts are disabled.",
-        placeholder: Some("30"),
-        dynamic_group: Some(DynamicGroup::Board),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_BOARD_PIN_LIMIT",
-        label: "Legacy board (read-only): simultaneous pin limit",
-        group: "Admin & message board",
-        field_type: FieldType::Int,
-        required: false,
-        restart_required: false,
-        default: Some("3"),
-        description: "Deprecated compatibility setting; legacy board moderation is disabled.",
-        placeholder: Some("3"),
-        dynamic_group: Some(DynamicGroup::Board),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS",
-        label: "Legacy board (read-only): guest self-delete window (s)",
-        group: "Admin & message board",
-        field_type: FieldType::Int,
-        required: false,
-        restart_required: false,
-        default: Some("300"),
-        description: "Deprecated compatibility setting; anonymous legacy board posts are disabled.",
-        placeholder: Some("300"),
-        dynamic_group: Some(DynamicGroup::Board),
-    },
-    // ── Telegram ──
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN",
-        label: "Telegram bot token",
-        group: "Telegram",
-        field_type: FieldType::Secret,
-        required: false,
-        restart_required: false,
-        default: None,
-        description: "@BotFather token. Leave empty to disable Telegram notifications.",
-        placeholder: Some("123456:ABC-…"),
-        dynamic_group: Some(DynamicGroup::Telegram),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID",
-        label: "Telegram chat id",
-        group: "Telegram",
-        field_type: FieldType::Text,
-        required: false,
-        restart_required: false,
-        default: None,
-        description: "Numeric chat id (group, channel, or user) for notifications.",
-        placeholder: Some("-100123…"),
-        dynamic_group: Some(DynamicGroup::Telegram),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_TELEGRAM_TOPIC_ID",
-        label: "Telegram topic id (forum)",
-        group: "Telegram",
-        field_type: FieldType::Int,
-        required: false,
-        restart_required: false,
-        default: None,
-        description: "Optional supergroup forum topic id (message_thread_id).",
-        placeholder: Some("42"),
-        dynamic_group: Some(DynamicGroup::Telegram),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL",
-        label: "Notify on every new board message",
-        group: "Telegram",
-        field_type: FieldType::Bool,
-        required: false,
-        restart_required: false,
-        default: Some("true"),
-        description: "Master switch for pushing new board messages to Telegram.",
-        placeholder: None,
-        dynamic_group: Some(DynamicGroup::Telegram),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ADMIN",
-        label: "Also notify when admin posts",
-        group: "Telegram",
-        field_type: FieldType::Bool,
-        required: false,
-        restart_required: false,
-        default: Some("true"),
-        description: "When false, posts from admin accounts are skipped.",
-        placeholder: None,
-        dynamic_group: Some(DynamicGroup::Telegram),
     },
     SettingsField {
         key: "CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED",
@@ -1173,6 +1051,102 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("5"),
         dynamic_group: None,
     },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERTING_ENABLED",
+        label: "Enable operator alerts",
+        group: "Alerting",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("true"),
+        description: "Persist incidents at all times, and enqueue enabled IM channel deliveries while this switch is on.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS",
+        label: "Firing reminder interval",
+        group: "Alerting",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("1800"),
+        description: "Minimum seconds between reminders for an unacknowledged incident that remains active.",
+        placeholder: Some("1800"),
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS",
+        label: "Resolved incident retention",
+        group: "Alerting",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("90"),
+        description: "Days to retain resolved incidents and their delivery audit history. Active incidents are never pruned.",
+        placeholder: Some("90"),
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED",
+        label: "Enable Telegram alerts",
+        group: "Telegram alerts",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("false"),
+        description: "Deliver new, escalated, reminder, resumed, and recovery transitions through Telegram.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN",
+        label: "Telegram bot token",
+        group: "Telegram alerts",
+        field_type: FieldType::Secret,
+        required: false,
+        restart_required: false,
+        default: None,
+        description: "Bot token issued by @BotFather. It is never returned by the Settings API or written to logs.",
+        placeholder: Some("123456:ABC..."),
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID",
+        label: "Telegram chat id",
+        group: "Telegram alerts",
+        field_type: FieldType::Text,
+        required: false,
+        restart_required: false,
+        default: None,
+        description: "Target user, group, or channel chat id.",
+        placeholder: Some("-1001234567890"),
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID",
+        label: "Telegram forum topic id",
+        group: "Telegram alerts",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: None,
+        description: "Optional message_thread_id for a forum topic in a supergroup.",
+        placeholder: Some("42"),
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY",
+        label: "Telegram minimum severity",
+        group: "Telegram alerts",
+        field_type: FieldType::Select,
+        required: false,
+        restart_required: false,
+        default: Some("warning"),
+        description: "Lowest incident severity delivered to Telegram.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
 ];
 
 pub fn schema_response() -> SettingsSchemaResponse {
@@ -1244,6 +1218,9 @@ fn field_to_view(field: &SettingsField) -> SettingsFieldView {
         placeholder: field.placeholder.map(str::to_string),
         options: match field.key {
             "CC_SWITCH_ROUTER_DB_MODE" => vec!["local".into(), "turso".into()],
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
+                vec!["info".into(), "warning".into(), "critical".into()]
+            }
             _ => Vec::new(),
         },
     }
@@ -1388,6 +1365,7 @@ pub fn validate_and_diff(
     }
     validate_registration_admission_relations(&next, updates)?;
     validate_client_notification_relations(&next, updates)?;
+    validate_alerting_relations(&next, updates)?;
     validate_database_relations(&next, updates)?;
 
     Ok(ApplyOutcome {
@@ -1495,6 +1473,7 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             }
             validate_client_notification_integer(field.key, value)?;
             validate_registration_admission_integer(field.key, value)?;
+            validate_alerting_integer(field.key, value)?;
             if field.key == "CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS"
                 && !(1..=3_600).contains(&value)
             {
@@ -1513,6 +1492,15 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                     field.key
                 ))),
             },
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "info" | "warning" | "critical" => Ok(Some(trimmed.to_ascii_lowercase())),
+                    _ => Err(AppError::BadRequest(format!(
+                        "{} must be info, warning, or critical, got: {raw}",
+                        field.key
+                    ))),
+                }
+            }
             _ => Err(AppError::Internal(format!(
                 "unsupported select settings field: {}",
                 field.key
@@ -1670,6 +1658,68 @@ fn validate_client_notification_integer(key: &str, value: i64) -> Result<(), App
     Ok(())
 }
 
+fn validate_alerting_integer(key: &str, value: i64) -> Result<(), AppError> {
+    let range = match key {
+        "CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS" => Some((60, 7 * 86_400)),
+        "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS" => Some((1, 3_650)),
+        "CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID" => Some((1, i64::from(i32::MAX))),
+        _ => None,
+    };
+    if let Some((min, max)) = range {
+        if !(min..=max).contains(&value) {
+            return Err(AppError::BadRequest(format!(
+                "{key} must be between {min} and {max}, got: {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_alerting_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<(), AppError> {
+    const ALERT_KEYS: &[&str] = &[
+        "CC_SWITCH_ROUTER_ALERTING_ENABLED",
+        "CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED",
+        "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN",
+        "CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID",
+        "CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID",
+        "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY",
+    ];
+    if !updates.keys().any(|key| ALERT_KEYS.contains(&key.as_str())) {
+        return Ok(());
+    }
+    let configured = |key: &str| {
+        next.get(key)
+            .cloned()
+            .or_else(|| {
+                (!updates.contains_key(key))
+                    .then(|| std::env::var(key).ok())
+                    .flatten()
+            })
+            .filter(|value| !value.trim().is_empty())
+    };
+    let enabled = |key: &str| {
+        configured(key)
+            .map(|value| parse_bool_truthy(&value))
+            .unwrap_or(false)
+    };
+    if enabled("CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED") {
+        for key in [
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN",
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID",
+        ] {
+            if configured(key).is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "{key} is required when Telegram alerts are enabled"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_client_notification_relations(
     next: &BTreeMap<String, String>,
     updates: &BTreeMap<String, Option<String>>,
@@ -1814,46 +1864,36 @@ pub fn apply_updates_to_dynamic(
                 }
                 current.admin_emails = set;
             }
-            "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN" => {
-                current.telegram.bot_token = value.map(str::to_string);
-            }
-            "CC_SWITCH_ROUTER_IP_BLACKLIST" => {
-                current.security.ip_blacklist = value
-                    .map(crate::dynamic_settings::parse_ip_blacklist)
-                    .unwrap_or_default();
-            }
-            "CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID" => {
-                current.telegram.chat_id = value.map(str::to_string);
-            }
-            "CC_SWITCH_ROUTER_TELEGRAM_TOPIC_ID" => {
-                current.telegram.topic_id = value.and_then(|v| v.parse().ok());
-            }
-            "CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL" => {
-                current.telegram.notify_all = value.map(parse_bool_truthy).unwrap_or(true);
-            }
-            "CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ADMIN" => {
-                current.telegram.notify_admin = value.map(parse_bool_truthy).unwrap_or(true);
-            }
-            "CC_SWITCH_ROUTER_BOARD_MAX_LEN" => {
-                current.board.max_len = value.and_then(|v| v.parse::<usize>().ok()).unwrap_or(1000);
-            }
-            "CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR" => {
-                current.board.guest_per_hour =
-                    value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(5);
-            }
-            "CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR" => {
-                current.board.user_per_hour =
-                    value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(30);
-            }
-            "CC_SWITCH_ROUTER_BOARD_PIN_LIMIT" => {
-                current.board.pin_limit = value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(3);
-            }
-            "CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS" => {
-                current.board.guest_self_delete_secs =
-                    value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(300);
-            }
             "CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL" => {
                 current.footer_telegram_url = value.map(str::to_string).unwrap_or_default();
+            }
+            "CC_SWITCH_ROUTER_ALERTING_ENABLED" => {
+                current.alerting.enabled = value.map(parse_bool_truthy).unwrap_or(true);
+            }
+            "CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS" => {
+                current.alerting.repeat_interval_secs = value
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(30 * 60);
+            }
+            "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS" => {
+                current.alerting.history_retention_days =
+                    value.and_then(|value| value.parse().ok()).unwrap_or(90);
+            }
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED" => {
+                current.alerting.telegram_enabled = value.map(parse_bool_truthy).unwrap_or(false);
+            }
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN" => {
+                current.alerting.telegram_bot_token = value.map(str::to_string);
+            }
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID" => {
+                current.alerting.telegram_chat_id = value.map(str::to_string);
+            }
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID" => {
+                current.alerting.telegram_topic_id = value.and_then(|value| value.parse().ok());
+            }
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
+                current.alerting.telegram_min_severity =
+                    value.unwrap_or("warning").to_ascii_lowercase();
             }
             "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED" => {
                 current.client_notifications.enabled = value.map(parse_bool_truthy).unwrap_or(true);
@@ -1959,12 +1999,9 @@ mod tests {
 
     #[test]
     fn normalize_int_rejects_garbage() {
-        let field = field_by_key("CC_SWITCH_ROUTER_BOARD_MAX_LEN").unwrap();
+        let field = field_by_key("CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS").unwrap();
         assert!(normalize_value(field, "abc").is_err());
-        assert_eq!(
-            normalize_value(field, " 1500 ").unwrap(),
-            Some("1500".into())
-        );
+        assert_eq!(normalize_value(field, " 30 ").unwrap(), Some("30".into()));
     }
 
     #[test]
@@ -1982,7 +2019,7 @@ mod tests {
             Some(DynamicGroup::MarketBilling)
         ));
 
-        let config = test_static_config_with_board_overrides();
+        let config = test_static_config();
         let mut dynamic = DynamicSettings::from_config(&config);
         let updates = BTreeMap::from([(
             "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(),
@@ -2003,10 +2040,57 @@ mod tests {
 
     #[test]
     fn normalize_bool_canonicalizes() {
-        let field = field_by_key("CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL").unwrap();
+        let field = field_by_key("CC_SWITCH_ROUTER_METRICS_ENABLED").unwrap();
         assert_eq!(normalize_value(field, "ON").unwrap(), Some("true".into()));
         assert_eq!(normalize_value(field, "off").unwrap(), Some("false".into()));
         assert!(normalize_value(field, "maybe").is_err());
+    }
+
+    #[test]
+    fn alert_channels_require_complete_credentials() {
+        let existing = HashMap::new();
+        let mut telegram = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED".into(),
+                Some("true".into()),
+            ),
+            ("CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN".into(), None),
+            ("CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID".into(), None),
+        ]);
+        assert!(validate_and_diff(&existing, &telegram).is_err());
+        telegram.insert(
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN".into(),
+            Some("bot-token".into()),
+        );
+        telegram.insert(
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID".into(),
+            Some("-100123".into()),
+        );
+        assert!(validate_and_diff(&existing, &telegram).is_ok());
+    }
+
+    #[test]
+    fn alert_channel_secrets_are_never_returned_by_settings_values_api() {
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-alert-settings-secret-{}.env",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN=telegram-secret\n",
+        )
+        .expect("write alert settings fixture");
+
+        let response = values_response(&path).expect("read alert settings values");
+        let entry = response
+            .values
+            .iter()
+            .find(|entry| entry.key == "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN")
+            .expect("alert secret entry");
+        assert!(entry.is_secret);
+        assert!(entry.has_value);
+        assert!(entry.value.is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2290,14 +2374,20 @@ mod tests {
     #[test]
     fn validate_returns_diff_and_dynamic_groups() {
         let mut existing = HashMap::new();
-        existing.insert("CC_SWITCH_ROUTER_BOARD_MAX_LEN".into(), "1000".into());
+        existing.insert("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(), "7".into());
         let mut updates = BTreeMap::new();
-        updates.insert("CC_SWITCH_ROUTER_BOARD_MAX_LEN".into(), Some("2000".into()));
-        updates.insert("CC_SWITCH_ROUTER_BOARD_PIN_LIMIT".into(), Some("5".into()));
+        updates.insert(
+            "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(),
+            Some("7.2".into()),
+        );
+        updates.insert(
+            "CC_SWITCH_ROUTER_ADMIN_EMAILS".into(),
+            Some("ops@example.com".into()),
+        );
         let outcome = validate_and_diff(&existing, &updates).unwrap();
         assert_eq!(outcome.updated_keys.len(), 2);
         assert_eq!(outcome.restart_required_keys.len(), 0);
-        assert_eq!(outcome.dynamic_groups.len(), 1);
+        assert_eq!(outcome.dynamic_groups.len(), 2);
     }
 
     #[test]
@@ -2328,12 +2418,9 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("bak"));
     }
 
-    /// Codex's first round: process-env board limits must survive a PATCH
-    /// that doesn't mention them. An admin saving an unrelated field
-    /// must not silently reset every other dynamic value.
     #[test]
     fn unrelated_patch_preserves_boot_values() {
-        let static_config = test_static_config_with_board_overrides();
+        let static_config = test_static_config();
         let mut current = DynamicSettings::from_config(&static_config);
         let mut updates: BTreeMap<String, Option<String>> = BTreeMap::new();
         updates.insert(
@@ -2343,20 +2430,6 @@ mod tests {
 
         apply_updates_to_dynamic(&mut current, &updates, &static_config);
 
-        // Board limits from the boot Config (process env) must survive.
-        assert_eq!(current.board.max_len, 4242);
-        assert_eq!(current.board.guest_per_hour, 17);
-        assert_eq!(current.board.user_per_hour, 99);
-        assert_eq!(current.board.pin_limit, 7);
-        assert_eq!(current.board.guest_self_delete_secs, 600);
-
-        // Telegram bool was set to a non-default at boot; must not snap to true.
-        assert!(!current.telegram.notify_all);
-        assert!(!current.telegram.notify_admin);
-        assert_eq!(current.telegram.bot_token.as_deref(), Some("boot-token"));
-
-        // ADMIN_EMAILS supersedes the boot set, but default admin
-        // (derived from tunnel_domain) is still merged in.
         assert!(current.admin_emails.contains("alice@example.com"));
         assert!(
             current.admin_emails.contains("router@router.example.com"),
@@ -2370,7 +2443,7 @@ mod tests {
     /// built-in `router@<tunnel-host>` admin is always kept.
     #[test]
     fn clearing_admin_emails_revokes_extras_immediately() {
-        let static_config = test_static_config_with_board_overrides();
+        let static_config = test_static_config();
         // Start with a runtime that already has an extra admin loaded
         // (the "boot-extra@example.com" from process env).
         let mut current = DynamicSettings::from_config(&static_config);
@@ -2391,42 +2464,9 @@ mod tests {
         );
     }
 
-    /// Clearing the Telegram bot token must disable notifications
-    /// immediately (the API handler will then rebuild the notifier as
-    /// None on the same flow).
-    #[test]
-    fn clearing_telegram_bot_token_disables_in_place() {
-        let static_config = test_static_config_with_board_overrides();
-        let mut current = DynamicSettings::from_config(&static_config);
-        assert_eq!(current.telegram.bot_token.as_deref(), Some("boot-token"));
-
-        let mut updates: BTreeMap<String, Option<String>> = BTreeMap::new();
-        updates.insert("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN".into(), None);
-        // Also explicit-empty form should behave the same as None.
-        updates.insert("CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID".into(), Some("".into()));
-        apply_updates_to_dynamic(&mut current, &updates, &static_config);
-
-        assert!(current.telegram.bot_token.is_none());
-        assert!(current.telegram.chat_id.is_none());
-    }
-
-    /// Clearing a numeric board field falls back to the canonical
-    /// default (matches `Config::from_env`'s `.unwrap_or(...)`).
-    #[test]
-    fn clearing_board_int_resets_to_canonical_default() {
-        let static_config = test_static_config_with_board_overrides();
-        let mut current = DynamicSettings::from_config(&static_config);
-        assert_eq!(current.board.max_len, 4242);
-
-        let mut updates: BTreeMap<String, Option<String>> = BTreeMap::new();
-        updates.insert("CC_SWITCH_ROUTER_BOARD_MAX_LEN".into(), None);
-        apply_updates_to_dynamic(&mut current, &updates, &static_config);
-        assert_eq!(current.board.max_len, 1000, "schema default kicks in");
-    }
-
     #[test]
     fn client_notification_kill_switch_applies_immediately() {
-        let static_config = test_static_config_with_board_overrides();
+        let static_config = test_static_config();
         let mut current = DynamicSettings::from_config(&static_config);
         let mut updates = BTreeMap::new();
         updates.insert(
@@ -2466,7 +2506,7 @@ mod tests {
 
     #[test]
     fn client_notification_offline_window_must_precede_cleanup() {
-        let mut config = test_static_config_with_board_overrides();
+        let mut config = test_static_config();
         config.cleanup_interval_secs = 300;
         config.client_stale_secs = 3_600;
         let mut settings = crate::config::ClientNotificationSettings::default();
@@ -2492,7 +2532,7 @@ mod tests {
         );
     }
 
-    fn test_static_config_with_board_overrides() -> Config {
+    fn test_static_config() -> Config {
         use std::collections::HashSet;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         Config {
@@ -2542,16 +2582,6 @@ mod tests {
                 "router@router.example.com".to_string(),
                 "boot-extra@example.com".to_string(),
             ]),
-            telegram_bot_token: Some("boot-token".into()),
-            telegram_chat_id: Some("-100".into()),
-            telegram_topic_id: Some(42),
-            telegram_notify_all: false,
-            telegram_notify_admin: false,
-            board_max_len: 4242,
-            board_guest_per_hour: 17,
-            board_user_per_hour: 99,
-            board_pin_limit: 7,
-            board_guest_self_delete_secs: 600,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
             footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
@@ -2560,6 +2590,7 @@ mod tests {
                 db_path: std::env::temp_dir().join("cc-switch-router-rebuild-test-metrics.db"),
                 retention_days: 7,
                 sample_interval_secs: 5,
+                alerting: crate::config::AlertingSettings::default(),
             },
         }
     }

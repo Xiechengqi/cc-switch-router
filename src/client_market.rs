@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use crate::db::{Connection, OptionalExtension, params};
+use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -15,7 +15,7 @@ use axum::extract::{ConnectInfo, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::routing::{delete, get, post};
 use base64::Engine;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -64,6 +64,7 @@ const JOB_PHASE_COMPLETE: &str = "complete";
 const JOB_PHASE_ROLLBACK: &str = "rollback";
 
 const CLEANUP_FAILURE_SSH_TIMEOUT: &str = "cleanup_ssh_timeout";
+const CLEANUP_FAILURE_SSH_UNREACHABLE: &str = "cleanup_ssh_unreachable";
 const CLEANUP_FAILURE_STOP: &str = "cleanup_stop_failed";
 const CLEANUP_FAILURE_WIPE: &str = "cleanup_wipe_failed";
 const CLEANUP_FAILURE_PURGE: &str = "cleanup_purge_failed";
@@ -75,8 +76,17 @@ const CLEANUP_PURGE_ATTEMPTS: u32 = 3;
 const CLEANUP_PURGE_RETRY_BASE: Duration = Duration::from_secs(1);
 /// Draining hosts without an active cleanup job longer than this are repaired.
 const STALE_DRAINING_AFTER: Duration = Duration::from_secs(10 * 60);
-/// Unreachable hosts that look remotely clean are auto-healed after this age.
-const UNREACHABLE_AUTO_HEAL_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Delay before each unattended clean-host probe. Five failed probes are terminal;
+/// Providers retain the explicit retry, reverify, and permanent-retirement actions.
+const CLEANUP_RECOVERY_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(60 * 60),
+    Duration::from_secs(6 * 60 * 60),
+    Duration::from_secs(24 * 60 * 60),
+];
+const CLEANUP_RECOVERY_CLAIM_LIMIT: usize = 4;
+const CLEANUP_RECOVERY_CLAIM_LEASE: Duration = Duration::from_secs(10 * 60);
 /// Hosts claimed for provisioning but with no active job for longer than this are
 /// stranded — the worker panicked, or the process died between claim and spawn.
 /// `locked` has no other exit, so without this sweep the Host leaves the pool for
@@ -643,6 +653,10 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/client-market/hosts/ip-info", post(lookup_host_ip_info))
         .route("/v1/client-market/supply-summary", get(supply_summary))
         .route("/v1/client-market/hosts/:id", delete(delete_host))
+        .route(
+            "/v1/client-market/hosts/:id/retire-unreachable",
+            post(retire_unreachable_host),
+        )
         .route("/v1/client-market/hosts/:id/reverify", post(reverify_host))
         .route(
             "/v1/client-market/hosts/:id/ssh-host-key/scan",
@@ -748,6 +762,8 @@ struct RouterSshHostView {
     is_client_owner: bool,
     #[serde(default)]
     can_control_recovery: bool,
+    #[serde(default)]
+    can_retire_unreachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery: Option<crate::client_market_recovery::ClientMarketRecoveryView>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -830,6 +846,11 @@ async fn list_hosts(
         .store
         .client_market_recovery_views_for_hosts(&recovery_host_ids)
         .await?;
+    let retirable_host_ids = if viewer.is_some() {
+        state.store.client_market_retirable_host_ids().await?
+    } else {
+        HashSet::new()
+    };
     let mut access_by_scope = HashMap::new();
     let mut eligibility_by_scope = HashMap::new();
     if let Some(session) = viewer.as_ref() {
@@ -883,6 +904,7 @@ async fn list_hosts(
             let reveal_recovery_detail = is_host_owner || viewer_is_admin;
             let can_control_recovery =
                 state.config.client_market_recovery_enabled && reveal_recovery_detail;
+            let can_retire_unreachable = is_host_owner && retirable_host_ids.contains(&host.id);
             let recovery = if reveal_installation || viewer_is_admin {
                 recovery_by_host.get(&host.id).cloned().map(|mut recovery| {
                     if !reveal_recovery_detail {
@@ -962,6 +984,7 @@ async fn list_hosts(
                 is_host_owner,
                 is_client_owner,
                 can_control_recovery,
+                can_retire_unreachable,
                 recovery,
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
@@ -1800,6 +1823,33 @@ async fn delete_host(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RetireUnreachableHostResponse {
+    pub host_id: String,
+    pub installation_id: String,
+    pub previous_subscription_status: String,
+    pub status: String,
+    #[serde(skip)]
+    subdomain: Option<String>,
+}
+
+async fn retire_unreachable_host(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RetireUnreachableHostResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let outcome = state
+        .store
+        .client_market_retire_unreachable_host(&id, &session)
+        .await?;
+    if let Some(subdomain) = outcome.subdomain.as_deref() {
+        state.proxy.remove_route(subdomain).await;
+    }
+    Ok(Json(outcome))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CreateClientResponse {
     job_id: String,
 }
@@ -2247,84 +2297,98 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
         }
     }
 
-    let unreachable = state
+    let cleanup_recovery_claims = state
         .store
-        .client_market_list_hosts_by_status(HOST_STATUS_UNREACHABLE)
+        .client_market_claim_due_cleanup_recoveries(now, CLEANUP_RECOVERY_CLAIM_LIMIT)
         .await?;
-    for host in unreachable {
-        let Some(installation_id) = host.installation_id.clone() else {
-            continue;
-        };
-        let updated = chrono::DateTime::parse_from_rfc3339(&host.updated_at)
-            .ok()
-            .map(|ts| ts.with_timezone(&Utc));
-        let Some(updated) = updated else {
-            continue;
-        };
-        if now.signed_duration_since(updated)
-            < chrono::Duration::from_std(UNREACHABLE_AUTO_HEAL_AFTER)
-                .unwrap_or(chrono::Duration::minutes(5))
-        {
-            continue;
-        }
-        match ssh_remote_is_market_clean(&state, &host).await {
-            Ok(true) => {
-                info!(
-                    host_id = %host.id,
-                    installation_id = %installation_id,
-                    "auto-healing unreachable host that is remotely clean"
-                );
-                if let Some(subdomain) = host.client_subdomain.as_deref() {
-                    state.proxy.remove_route(subdomain).await;
-                } else if let Ok(Some(subdomain)) = state
-                    .store
-                    .client_market_subdomain_for_installation(&installation_id)
-                    .await
-                {
-                    state.proxy.remove_route(&subdomain).await;
-                }
-                if let Err(err) = state
-                    .store
-                    .purge_installation_for_client_market(&installation_id)
-                    .await
-                {
-                    warn!(
-                        host_id = %host.id,
-                        error = %err,
-                        "auto-heal purge failed"
-                    );
-                    continue;
-                }
-                if let Err(err) = state
-                    .store
-                    .client_market_complete_host_reverify(
-                        &host.id,
-                        host.hostname.as_deref(),
-                        host.ssh_host_key_fingerprint.as_deref(),
-                    )
-                    .await
-                {
-                    warn!(
-                        host_id = %host.id,
-                        error = %err,
-                        "auto-heal reverify finalize failed"
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(err) => {
-                warn!(
-                    host_id = %host.id,
-                    error = %err,
-                    "auto-heal remote probe failed"
-                );
-            }
+    let cleanup_recovery_results = stream::iter(cleanup_recovery_claims.into_iter().map(|claim| {
+        let runner_state = state.clone();
+        async move { reconcile_cleanup_recovery_claim(runner_state, claim).await }
+    }))
+    .buffer_unordered(CLEANUP_RECOVERY_CLAIM_LIMIT)
+    .collect::<Vec<_>>()
+    .await;
+    for result in cleanup_recovery_results {
+        if let Err(error) = result {
+            warn!(error = %error, "cleanup recovery probe failed");
         }
     }
 
     reconcile_stranded_locked_hosts(&state, now).await?;
     reconcile_stranded_reserved_hosts(&state, now).await?;
     Ok(())
+}
+
+async fn reconcile_cleanup_recovery_claim(
+    state: ServerState,
+    claim: CleanupRecoveryClaim,
+) -> Result<(), AppError> {
+    let _recovery_guard = state
+        .client_market_recovery
+        .lock(&claim.installation_id)
+        .await;
+    let Some(host) = state.store.client_market_get_host(&claim.host_id).await? else {
+        return Ok(());
+    };
+    if host.status != HOST_STATUS_UNREACHABLE
+        || host.installation_id.as_deref() != Some(claim.installation_id.as_str())
+    {
+        return Ok(());
+    }
+    match ssh_remote_is_market_clean(&state, &host).await {
+        Ok(true) => {
+            if let Some(subdomain) = host.client_subdomain.as_deref() {
+                state.proxy.remove_route(subdomain).await;
+            }
+            match state
+                .store
+                .client_market_finalize_clean_unreachable_host(
+                    &claim.host_id,
+                    &claim.installation_id,
+                )
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        host_id = %claim.host_id,
+                        installation_id = %claim.installation_id,
+                        attempt = claim.attempt_count,
+                        "returned remotely clean unreachable Host to the idle pool"
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    state
+                        .store
+                        .client_market_finish_cleanup_recovery_attempt(
+                            &claim,
+                            &format!("router_finalize_failed: {error}"),
+                            Utc::now(),
+                        )
+                        .await?;
+                    Err(error)
+                }
+            }
+        }
+        Ok(false) => {
+            state
+                .store
+                .client_market_finish_cleanup_recovery_attempt(
+                    &claim,
+                    "remote_not_clean",
+                    Utc::now(),
+                )
+                .await
+        }
+        Err(error) => {
+            let outcome = format!("probe_failed:{}", classify_cleanup_failure(&error));
+            state
+                .store
+                .client_market_finish_cleanup_recovery_attempt(&claim, &outcome, Utc::now())
+                .await?;
+            Err(error)
+        }
+    }
 }
 
 /// `locked` is entered when a Host is claimed for provisioning and is normally left
@@ -2794,10 +2858,16 @@ fn is_cleanup_phase(phase: &str) -> bool {
 fn classify_cleanup_failure(error: &AppError) -> &'static str {
     let detail = error.to_string();
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("fingerprint") {
+    if lower.contains("fingerprint")
+        || lower.contains("no pinned ssh")
+        || lower.contains("remote host identification has changed")
+        || lower.contains("host key verification failed")
+    {
         CLEANUP_FAILURE_FINGERPRINT
     } else if lower.contains("binding") || lower.contains("installation mismatch") {
         CLEANUP_FAILURE_BINDING
+    } else if cleanup_error_is_ssh_unreachable(&lower) {
+        CLEANUP_FAILURE_SSH_UNREACHABLE
     } else if lower.contains("exceeded its execution timeout") || lower.contains("timeout") {
         CLEANUP_FAILURE_SSH_TIMEOUT
     } else if lower.contains("failed to stop")
@@ -2814,6 +2884,36 @@ fn classify_cleanup_failure(error: &AppError) -> &'static str {
     } else {
         CLEANUP_FAILURE_GENERIC
     }
+}
+
+fn cleanup_error_is_ssh_unreachable(lower: &str) -> bool {
+    [
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "network is unreachable",
+        "no route to host",
+        "could not resolve hostname",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "connection reset by peer",
+        "connection closed by remote host",
+        "connection closed by ",
+        "kex_exchange_identification: connection closed",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn cleanup_recovery_next_at(now: DateTime<Utc>, completed_attempts: u32) -> Option<DateTime<Utc>> {
+    CLEANUP_RECOVERY_BACKOFF
+        .get(completed_attempts as usize)
+        .and_then(|delay| chrono::Duration::from_std(*delay).ok())
+        .map(|delay| now + delay)
+}
+
+fn cleanup_recovery_requires_manual_intervention(outcome: &str) -> bool {
+    outcome.contains(CLEANUP_FAILURE_FINGERPRINT) || outcome.contains(CLEANUP_FAILURE_BINDING)
 }
 
 async fn run_cleanup_job_inner(
@@ -3069,7 +3169,10 @@ async fn handle_cleanup_job_failure(state: &ServerState, job_id: &str, error: &A
         CLEANUP_FAILURE_PURGE => {
             "cleanup failed after remote wipe; use Retry cleanup or Re-verify to finish\n"
         }
-        CLEANUP_FAILURE_SSH_TIMEOUT | CLEANUP_FAILURE_STOP | CLEANUP_FAILURE_WIPE => {
+        CLEANUP_FAILURE_SSH_UNREACHABLE
+        | CLEANUP_FAILURE_SSH_TIMEOUT
+        | CLEANUP_FAILURE_STOP
+        | CLEANUP_FAILURE_WIPE => {
             "cleanup failed on the host; retry cleanup, or re-verify after manual cleanup\n"
         }
         CLEANUP_FAILURE_FINGERPRINT | CLEANUP_FAILURE_BINDING => {
@@ -4793,6 +4896,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         is_host_owner: false,
         is_client_owner: false,
         can_control_recovery: false,
+        can_retire_unreachable: false,
         recovery: None,
         last_verified_at: reveal.then_some(host.last_verified_at).flatten(),
         last_error: reveal.then_some(host.last_error).flatten(),
@@ -4876,6 +4980,13 @@ pub struct ProvisioningJobRecord {
     pub failure_code: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupRecoveryClaim {
+    host_id: String,
+    installation_id: String,
+    attempt_count: u32,
 }
 
 fn normalize_market_email(value: &str) -> Result<String, AppError> {
@@ -5436,6 +5547,204 @@ impl AppStore {
         conn.execute("DELETE FROM router_ssh_hosts WHERE id = ?1", params![id])
             .map_err(|e| AppError::Internal(format!("delete host failed: {e}")))?;
         Ok(())
+    }
+
+    pub async fn client_market_retire_unreachable_host(
+        &self,
+        id: &str,
+        session: &crate::models::AuthSession,
+    ) -> Result<RetireUnreachableHostResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin unreachable Host retirement failed: {error}"))
+            })?;
+        type RetirementRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: RetirementRow = tx
+            .query_row(
+                "SELECT h.status, h.installation_id, h.provider_id, h.host_owner_email,
+                        i.provision_source, i.provision_host_id, t.enabled, t.subdomain,
+                        s.status, s.host_id
+                 FROM router_ssh_hosts h
+                 LEFT JOIN installations i ON i.id = h.installation_id
+                 LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
+                 LEFT JOIN client_market_subscriptions s ON s.installation_id = h.installation_id
+                 WHERE h.id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("load unreachable Host retirement failed: {error}"))
+            })?
+            .ok_or_else(|| AppError::NotFound("host not found".into()))?;
+        let (
+            host_status,
+            installation_id,
+            provider_id,
+            host_owner_email,
+            provision_source,
+            provision_host_id,
+            tunnel_enabled,
+            subdomain,
+            subscription_status,
+            subscription_host_id,
+        ) = row;
+        if !session_is_host_owner(session, provider_id.as_deref(), &host_owner_email) {
+            return Err(AppError::Forbidden(
+                "only the Host Provider may permanently remove this lost Host".into(),
+            ));
+        }
+        if host_status != HOST_STATUS_UNREACHABLE {
+            return Err(AppError::Conflict(
+                "only an unreachable Host can be permanently removed without SSH cleanup".into(),
+            ));
+        }
+        let installation_id = installation_id.ok_or_else(|| {
+            AppError::Conflict("unreachable Host no longer has an installation binding".into())
+        })?;
+        if provision_source.as_deref() != Some(PROVISION_SOURCE_ROUTER_MARKET)
+            || provision_host_id.as_deref() != Some(id)
+        {
+            return Err(AppError::Conflict(
+                "Host installation binding is not managed by Client Market".into(),
+            ));
+        }
+        if tunnel_enabled != Some(0) {
+            return Err(AppError::Conflict(
+                "Client tunnel must be disabled before permanently removing the Host".into(),
+            ));
+        }
+        let subscription_status = subscription_status.ok_or_else(|| {
+            AppError::Conflict("Host has no Client Market subscription to finalize".into())
+        })?;
+        if subscription_host_id.as_deref() != Some(id)
+            || !matches!(
+                subscription_status.as_str(),
+                "releasing" | "release_failed" | "released"
+            )
+        {
+            return Err(AppError::Conflict(
+                "Host subscription has not entered the release state".into(),
+            ));
+        }
+        let active_jobs: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_jobs
+                 WHERE host_id = ?1 AND status IN ('pending', 'running')",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("check active Host jobs failed: {error}"))
+            })?;
+        if active_jobs > 0 {
+            return Err(AppError::Conflict(
+                "Host still has an active job; wait for it to finish before permanent removal"
+                    .into(),
+            ));
+        }
+
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        crate::market_billing::terminate_contract_tx(
+            &tx,
+            "client_host",
+            &installation_id,
+            "unreachable_host_retired",
+            &now_text,
+        )?;
+        let subscription_changed = tx
+            .execute(
+                "UPDATE client_market_subscriptions
+                 SET status = 'released', released_at = COALESCE(released_at, ?3), updated_at = ?3
+                 WHERE installation_id = ?1 AND host_id = ?2
+                   AND status IN ('releasing', 'release_failed', 'released')",
+                params![installation_id, id, now_text],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "finalize retired Host subscription failed: {error}"
+                ))
+            })?;
+        if subscription_changed != 1 {
+            return Err(AppError::Conflict(
+                "Host subscription changed concurrently; retry".into(),
+            ));
+        }
+        crate::client_market_trade::insert_audit_tx(
+            &tx,
+            Some(&installation_id),
+            Some(id),
+            Some(&session.user_id),
+            Some(&session.email),
+            "unreachable_host_retired",
+            serde_json::json!({
+                "previousStatus": subscription_status,
+                "remoteCleanupBypassed": true,
+            }),
+            now,
+        )?;
+        crate::public_hosts::tombstone_subject(
+            &tx,
+            crate::namespace::PublicHostKind::Client,
+            &installation_id,
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("tombstone retired Client route failed: {error}"))
+        })?;
+        crate::store::purge_installation_data_tx(&tx, &installation_id)?;
+        let host_deleted = tx
+            .execute(
+                "DELETE FROM router_ssh_hosts
+                 WHERE id = ?1 AND status = 'unreachable' AND installation_id = ?2",
+                params![id, installation_id],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("delete retired unreachable Host failed: {error}"))
+            })?;
+        if host_deleted != 1 {
+            return Err(AppError::Conflict(
+                "unreachable Host changed concurrently; retry".into(),
+            ));
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit unreachable Host retirement failed: {error}"
+            ))
+        })?;
+        Ok(RetireUnreachableHostResponse {
+            host_id: id.to_string(),
+            installation_id,
+            previous_subscription_status: subscription_status,
+            status: "retired".into(),
+            subdomain,
+        })
     }
 
     pub async fn client_market_create_job(
@@ -6066,6 +6375,304 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("query hosts by status failed: {e}")))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| AppError::Internal(format!("read hosts by status failed: {e}")))
+    }
+
+    async fn client_market_retirable_host_ids(&self) -> Result<HashSet<String>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT h.id
+                 FROM router_ssh_hosts h
+                 JOIN installations i ON i.id = h.installation_id
+                 JOIN installation_client_tunnels t ON t.installation_id = i.id
+                 JOIN client_market_subscriptions s ON s.installation_id = i.id
+                 WHERE h.status = 'unreachable'
+                   AND i.provision_source = ?1 AND i.provision_host_id = h.id
+                   AND t.enabled = 0 AND s.host_id = h.id
+                   AND s.status IN ('releasing', 'release_failed', 'released')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM provisioning_jobs j
+                       WHERE j.host_id = h.id AND j.status IN ('pending', 'running')
+                   )",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare retirable Host list failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![PROVISION_SOURCE_ROUTER_MARKET], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query retirable Host list failed: {error}"))
+            })?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read retirable Host list failed: {error}"))
+        })
+    }
+
+    async fn client_market_claim_due_cleanup_recoveries(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<CleanupRecoveryClaim>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin cleanup recovery claim failed: {error}"))
+            })?;
+        tx.execute(
+            "DELETE FROM client_market_cleanup_recovery_state
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM router_ssh_hosts h
+                 JOIN installations i ON i.id = h.installation_id
+                 JOIN installation_client_tunnels t ON t.installation_id = i.id
+                 JOIN client_market_subscriptions s ON s.installation_id = i.id
+                 WHERE h.id = client_market_cleanup_recovery_state.host_id
+                   AND i.id = client_market_cleanup_recovery_state.installation_id
+                   AND h.status = 'unreachable' AND t.enabled = 0
+                   AND s.host_id = h.id
+                   AND s.status IN ('releasing', 'release_failed', 'released')
+             )",
+            [],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prune cleanup recovery state failed: {error}"))
+        })?;
+        let now_text = now.to_rfc3339();
+        tx.execute(
+            "UPDATE client_market_cleanup_recovery_state
+             SET next_attempt_at = NULL, stopped_at = ?1,
+                 last_outcome = 'probe_interrupted', updated_at = ?1
+             WHERE stopped_at IS NULL AND attempt_count >= 5
+               AND last_outcome = 'probing'
+               AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1",
+            params![now_text],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("stop interrupted cleanup recovery failed: {error}"))
+        })?;
+        let claim_lease_until = chrono::Duration::from_std(CLEANUP_RECOVERY_CLAIM_LEASE)
+            .ok()
+            .map(|lease| (now + lease).to_rfc3339())
+            .expect("cleanup recovery claim lease is valid");
+        let due = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT r.host_id, r.installation_id, r.attempt_count
+                     FROM client_market_cleanup_recovery_state r
+                     JOIN router_ssh_hosts h ON h.id = r.host_id
+                     JOIN installation_client_tunnels t
+                       ON t.installation_id = r.installation_id
+                     JOIN client_market_subscriptions s
+                       ON s.installation_id = r.installation_id
+                     WHERE r.stopped_at IS NULL
+                       AND r.next_attempt_at IS NOT NULL AND r.next_attempt_at <= ?1
+                       AND r.attempt_count < 5
+                       AND h.status = 'unreachable'
+                       AND h.installation_id = r.installation_id
+                       AND t.enabled = 0
+                       AND s.host_id = h.id
+                       AND s.status IN ('releasing', 'release_failed', 'released')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM provisioning_jobs j
+                           WHERE j.host_id = h.id AND j.status IN ('pending', 'running')
+                       )
+                     ORDER BY r.next_attempt_at, r.host_id
+                     LIMIT ?2",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("prepare cleanup recovery claims failed: {error}"))
+                })?;
+            let rows = statement
+                .query_map(params![now_text, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("query cleanup recovery claims failed: {error}"))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                AppError::Internal(format!("read cleanup recovery claims failed: {error}"))
+            })?
+        };
+        let mut claimed = Vec::with_capacity(due.len());
+        for (host_id, installation_id, previous_attempt_count) in due {
+            let next_attempt_count = previous_attempt_count.saturating_add(1).min(5);
+            let changed = tx
+                .execute(
+                    "UPDATE client_market_cleanup_recovery_state
+                     SET attempt_count = ?4, next_attempt_at = ?6,
+                         last_attempt_at = ?3, last_outcome = 'probing', updated_at = ?3
+                     WHERE host_id = ?1 AND installation_id = ?2
+                       AND attempt_count = ?5 AND stopped_at IS NULL
+                       AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?3",
+                    params![
+                        host_id,
+                        installation_id,
+                        now_text,
+                        next_attempt_count,
+                        previous_attempt_count,
+                        claim_lease_until,
+                    ],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("claim cleanup recovery failed: {error}"))
+                })?;
+            if changed == 1 {
+                claimed.push(CleanupRecoveryClaim {
+                    host_id,
+                    installation_id,
+                    attempt_count: u32::try_from(next_attempt_count).unwrap_or(5),
+                });
+            }
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit cleanup recovery claims failed: {error}"))
+        })?;
+        Ok(claimed)
+    }
+
+    async fn client_market_finish_cleanup_recovery_attempt(
+        &self,
+        claim: &CleanupRecoveryClaim,
+        outcome: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let outcome = crate::store::client_chat::sanitize_system_event_text(outcome)
+            .chars()
+            .take(500)
+            .collect::<String>();
+        let next_attempt_at = (!cleanup_recovery_requires_manual_intervention(&outcome))
+            .then(|| cleanup_recovery_next_at(now, claim.attempt_count))
+            .flatten();
+        let stopped_at = next_attempt_at.is_none().then(|| now.to_rfc3339());
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE client_market_cleanup_recovery_state
+             SET next_attempt_at = ?4, last_outcome = ?5, stopped_at = ?6, updated_at = ?7
+             WHERE host_id = ?1 AND installation_id = ?2 AND attempt_count = ?3
+               AND last_outcome = 'probing' AND stopped_at IS NULL",
+                params![
+                    claim.host_id,
+                    claim.installation_id,
+                    i64::from(claim.attempt_count),
+                    next_attempt_at.map(|value| value.to_rfc3339()),
+                    outcome,
+                    stopped_at,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("finish cleanup recovery attempt failed: {error}"))
+            })?;
+        if changed == 0 {
+            tracing::debug!(
+                host_id = %claim.host_id,
+                installation_id = %claim.installation_id,
+                attempt = claim.attempt_count,
+                "discarded stale cleanup recovery result"
+            );
+        }
+        Ok(())
+    }
+
+    async fn client_market_finalize_clean_unreachable_host(
+        &self,
+        host_id: &str,
+        installation_id: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin clean Host recovery failed: {error}"))
+            })?;
+        let eligible: Option<i64> = tx
+            .query_row(
+                "SELECT 1
+                 FROM router_ssh_hosts h
+                 JOIN installations i ON i.id = h.installation_id
+                 JOIN installation_client_tunnels t ON t.installation_id = i.id
+                 WHERE h.id = ?1 AND i.id = ?2
+                   AND h.status = 'unreachable' AND t.enabled = 0
+                   AND i.provision_source = ?3 AND i.provision_host_id = h.id
+                   AND NOT EXISTS (
+                       SELECT 1 FROM provisioning_jobs j
+                       WHERE j.host_id = h.id AND j.status IN ('pending', 'running')
+                   )",
+                params![host_id, installation_id, PROVISION_SOURCE_ROUTER_MARKET],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("validate clean Host recovery failed: {error}"))
+            })?;
+        if eligible.is_none() {
+            return Err(AppError::Conflict(
+                "unreachable Host changed before cleanup recovery completed".into(),
+            ));
+        }
+        let has_subscription: i64 = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM client_market_subscriptions
+                    WHERE installation_id = ?1 AND host_id = ?2
+                      AND status IN ('releasing', 'release_failed', 'released')
+                 )",
+                params![installation_id, host_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("check clean Host subscription failed: {error}"))
+            })?;
+        if has_subscription != 0 {
+            crate::client_market_trade::cleanup_finished_tx(
+                &tx,
+                installation_id,
+                host_id,
+                Utc::now(),
+            )?;
+        }
+        crate::public_hosts::tombstone_subject(
+            &tx,
+            crate::namespace::PublicHostKind::Client,
+            installation_id,
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("tombstone recovered Client route failed: {error}"))
+        })?;
+        crate::store::purge_installation_data_tx(&tx, installation_id)?;
+        let now = Utc::now().to_rfc3339();
+        let changed = tx
+            .execute(
+                "UPDATE router_ssh_hosts
+                 SET status = 'idle', installation_id = NULL, last_error = NULL, updated_at = ?3
+                 WHERE id = ?1 AND status = 'unreachable' AND installation_id = ?2",
+                params![host_id, installation_id, now],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "return clean recovered Host to idle failed: {error}"
+                ))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "unreachable Host changed while cleanup recovery completed".into(),
+            ));
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit clean Host recovery failed: {error}"))
+        })?;
+        Ok(())
     }
 
     pub async fn client_market_host_has_active_job(&self, host_id: &str) -> Result<bool, AppError> {
@@ -6866,6 +7473,16 @@ impl AppStore {
                 "clear recovery state before cleanup failed: {error}"
             ))
         })?;
+        tx.execute(
+            "DELETE FROM client_market_cleanup_recovery_state
+             WHERE installation_id = ?1 AND host_id = ?2",
+            params![installation_id, host.0],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "clear cleanup recovery state before retry failed: {error}"
+            ))
+        })?;
         if host.3 == HOST_STATUS_DRAINING {
             let active: i64 = tx
                 .query_row(
@@ -7018,7 +7635,8 @@ impl AppStore {
         let tx = conn.transaction().map_err(|e| {
             AppError::Internal(format!("begin fail cleanup transaction failed: {e}"))
         })?;
-        let now = Utc::now().to_rfc3339();
+        let now_at = Utc::now();
+        let now = now_at.to_rfc3339();
         let job: Option<(Option<String>, String)> = tx
             .query_row(
                 "SELECT installation_id, status
@@ -7187,12 +7805,43 @@ impl AppStore {
                 "cleanup job changed concurrently".into(),
             ));
         }
+        let requires_manual = cleanup_recovery_requires_manual_intervention(failure_code);
+        let next_attempt_at = (!requires_manual)
+            .then(|| cleanup_recovery_next_at(now_at, 0))
+            .flatten()
+            .map(|value| value.to_rfc3339());
+        let stopped_at = requires_manual.then(|| now.clone());
+        tx.execute(
+            "INSERT INTO client_market_cleanup_recovery_state (
+                host_id, installation_id, attempt_count, next_attempt_at,
+                last_attempt_at, last_outcome, stopped_at, updated_at
+             ) VALUES (?1, ?2, 0, ?3, NULL, ?4, ?5, ?6)
+             ON CONFLICT(host_id) DO UPDATE SET
+                installation_id = excluded.installation_id,
+                attempt_count = 0,
+                next_attempt_at = excluded.next_attempt_at,
+                last_attempt_at = NULL,
+                last_outcome = excluded.last_outcome,
+                stopped_at = excluded.stopped_at,
+                updated_at = excluded.updated_at",
+            params![
+                host_id,
+                installation_id,
+                next_attempt_at,
+                failure_code,
+                stopped_at,
+                now,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("schedule failed cleanup recovery failed: {error}"))
+        })?;
         crate::client_market_trade::cleanup_failed_tx(
             &tx,
             &installation_id,
             host_id,
             failure_code,
-            Utc::now(),
+            now_at,
         )?;
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit failed cleanup job failed: {e}")))?;
@@ -7395,16 +8044,6 @@ mod tests {
             verification_service_api_key: None,
             router_owner_email: None,
             admin_emails: HashSet::new(),
-            telegram_bot_token: None,
-            telegram_chat_id: None,
-            telegram_topic_id: None,
-            telegram_notify_all: false,
-            telegram_notify_admin: false,
-            board_max_len: 1000,
-            board_guest_per_hour: 5,
-            board_user_per_hour: 30,
-            board_pin_limit: 3,
-            board_guest_self_delete_secs: 300,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
             footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
@@ -7413,6 +8052,7 @@ mod tests {
                 db_path: root.join("metrics.db"),
                 retention_days: 7,
                 sample_interval_secs: 5,
+                alerting: crate::config::AlertingSettings::default(),
             },
         };
         (config, root)
@@ -10546,6 +11186,32 @@ mod tests {
             )),
             CLEANUP_FAILURE_FINGERPRINT
         );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::BadRequest(
+                "ssh failed (exit status: 255): connect to host 192.0.2.10 port 22: Connection refused"
+                    .into()
+            )),
+            CLEANUP_FAILURE_SSH_UNREACHABLE
+        );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::BadRequest(
+                "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! Host key verification failed"
+                    .into()
+            )),
+            CLEANUP_FAILURE_FINGERPRINT
+        );
+    }
+
+    #[test]
+    fn cleanup_recovery_backoff_is_bounded_and_terminal() {
+        let now = Utc::now();
+        let expected_seconds = [5 * 60, 15 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60];
+        for (completed_attempts, expected) in expected_seconds.into_iter().enumerate() {
+            let next = cleanup_recovery_next_at(now, completed_attempts as u32)
+                .expect("retry remains scheduled");
+            assert_eq!((next - now).num_seconds(), expected);
+        }
+        assert!(cleanup_recovery_next_at(now, 5).is_none());
     }
 
     /// `release_failed` had no exit: nothing transitioned a subscription out of it
@@ -10616,6 +11282,418 @@ mod tests {
                 .await,
             Err(AppError::Conflict(_))
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn client_owner_can_finalize_only_a_wedged_release_without_an_active_cleanup() {
+        let (store, _config, root) = test_store("trade-owner-finalize-release");
+        let host = add_provider_host(
+            &store,
+            "provider-owner-finalize",
+            "provider@example.com",
+            "198.18.30.2",
+            "US",
+            None,
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, offer_revision,
+                     created_at, updated_at)
+                 VALUES ('owner-stuck-client', ?1, 'provider-owner-finalize',
+                         'provider@example.com', 'owner-stuck', 'owner@example.com',
+                         'releasing', 1, ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provisioning_jobs
+                    (id, type, host_id, installation_id, status, phase, log_blob,
+                     created_at, updated_at)
+                 VALUES ('owner-stuck-cleanup', 'cleanup', ?1, 'owner-stuck-client',
+                         'running', 'cleanup_stop', '', ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+        }
+
+        let owner = market_session("owner-stuck", "owner@example.com");
+        assert!(matches!(
+            store
+                .client_market_finalize_release_for_owner(
+                    "owner-stuck-client",
+                    &market_session("stranger", "stranger@example.com")
+                )
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            store
+                .client_market_finalize_release_for_owner("owner-stuck-client", &owner)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE provisioning_jobs SET status = 'failed', phase = 'complete'
+                 WHERE id = 'owner-stuck-cleanup'",
+                [],
+            )
+            .unwrap();
+        }
+        let outcome = store
+            .client_market_finalize_release_for_owner("owner-stuck-client", &owner)
+            .await
+            .expect("owner finalizes a cleanup with no active job");
+        assert_eq!(outcome.previous_status, "releasing");
+        assert_eq!(outcome.status, "released");
+        assert_eq!(
+            store
+                .client_market_get_host(&host.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            HOST_STATUS_IDLE,
+            "finalizing the rental must not change Host disposition"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cleanup_recovery_state_backs_off_stops_and_manual_retry_resets_it() {
+        let (store, _config, root) = test_store("cleanup-recovery-backoff");
+        let host = add_provider_host(
+            &store,
+            "provider-cleanup-backoff",
+            "provider@example.com",
+            "198.18.30.3",
+            "US",
+            None,
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            insert_installation(&conn, "cleanup-backoff-client", "client@example.com");
+            conn.execute(
+                "UPDATE installations SET provision_source = ?2, provision_host_id = ?3
+                 WHERE id = ?1",
+                params![
+                    "cleanup-backoff-client",
+                    PROVISION_SOURCE_ROUTER_MARKET,
+                    host.id
+                ],
+            )
+            .unwrap();
+            insert_tunnel_and_public_host(
+                &conn,
+                "cleanup-backoff-client",
+                "client@example.com",
+                "cleanup-backoff-client",
+            );
+            conn.execute(
+                "UPDATE installation_client_tunnels SET enabled = 0
+                 WHERE installation_id = 'cleanup-backoff-client'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE router_ssh_hosts
+                 SET status = 'draining', installation_id = 'cleanup-backoff-client'
+                 WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, offer_revision,
+                     created_at, updated_at)
+                 VALUES ('cleanup-backoff-client', ?1, 'provider-cleanup-backoff',
+                         'provider@example.com', 'client-backoff', 'client@example.com',
+                         'releasing', 1, ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provisioning_jobs
+                    (id, type, host_id, host_owner_email, client_owner_email, subdomain,
+                     installation_id, status, phase, log_blob, created_at, updated_at)
+                 VALUES ('cleanup-backoff-job', 'cleanup', ?1, 'provider@example.com',
+                         'client@example.com', 'cleanup-backoff-client',
+                         'cleanup-backoff-client', 'running', 'cleanup_stop', '', ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+        }
+        store
+            .client_market_fail_cleanup_job(
+                "cleanup-backoff-job",
+                &host.id,
+                CLEANUP_FAILURE_SSH_UNREACHABLE,
+                "connection refused",
+            )
+            .await
+            .expect("persist failed cleanup and initial retry");
+
+        let mut due_at = {
+            let conn = store.conn.lock().await;
+            let (attempt_count, next_attempt_at): (i64, String) = conn
+                .query_row(
+                    "SELECT attempt_count, next_attempt_at
+                     FROM client_market_cleanup_recovery_state WHERE host_id = ?1",
+                    params![host.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(attempt_count, 0);
+            DateTime::parse_from_rfc3339(&next_attempt_at)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert!(
+            store
+                .client_market_claim_due_cleanup_recoveries(
+                    due_at - chrono::Duration::seconds(1),
+                    1
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for expected_attempt in 1..=5 {
+            let claims = store
+                .client_market_claim_due_cleanup_recoveries(due_at, 1)
+                .await
+                .expect("claim due cleanup recovery");
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].attempt_count, expected_attempt);
+            store
+                .client_market_finish_cleanup_recovery_attempt(
+                    &claims[0],
+                    "probe_failed:cleanup_ssh_unreachable",
+                    due_at,
+                )
+                .await
+                .expect("finish cleanup recovery attempt");
+            store
+                .client_market_finish_cleanup_recovery_attempt(
+                    &claims[0],
+                    "late_duplicate_result",
+                    due_at + chrono::Duration::seconds(1),
+                )
+                .await
+                .expect("discard duplicate cleanup recovery result");
+            let conn = store.conn.lock().await;
+            let (next, stopped, outcome): (Option<String>, Option<String>, String) = conn
+                .query_row(
+                    "SELECT next_attempt_at, stopped_at, last_outcome
+                     FROM client_market_cleanup_recovery_state WHERE host_id = ?1",
+                    params![host.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(outcome, "probe_failed:cleanup_ssh_unreachable");
+            if expected_attempt < 5 {
+                assert!(stopped.is_none());
+                due_at = DateTime::parse_from_rfc3339(next.as_deref().unwrap())
+                    .unwrap()
+                    .with_timezone(&Utc);
+            } else {
+                assert!(next.is_none());
+                assert!(stopped.is_some());
+            }
+        }
+
+        store
+            .client_market_begin_cleanup_job(
+                "cleanup-backoff-client",
+                "provider@example.com",
+                false,
+            )
+            .await
+            .expect("manual cleanup retry remains available");
+        let conn = store.conn.lock().await;
+        let recovery_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_market_cleanup_recovery_state WHERE host_id = ?1",
+                params![host.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery_rows, 0);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_can_permanently_retire_only_a_fenced_unreachable_host() {
+        let (store, _config, root) = test_store("retire-unreachable-host");
+        let host = add_provider_host(
+            &store,
+            "provider-retire-lost",
+            "provider@example.com",
+            "198.18.30.4",
+            "US",
+            None,
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            insert_installation(&conn, "retire-lost-client", "client@example.com");
+            conn.execute(
+                "UPDATE installations SET provision_source = ?2, provision_host_id = ?3
+                 WHERE id = ?1",
+                params![
+                    "retire-lost-client",
+                    PROVISION_SOURCE_ROUTER_MARKET,
+                    host.id
+                ],
+            )
+            .unwrap();
+            insert_tunnel_and_public_host(
+                &conn,
+                "retire-lost-client",
+                "client@example.com",
+                "retire-lost-client",
+            );
+            conn.execute(
+                "UPDATE router_ssh_hosts
+                 SET status = 'unreachable', installation_id = 'retire-lost-client'
+                 WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, offer_revision,
+                     created_at, updated_at)
+                 VALUES ('retire-lost-client', ?1, 'provider-retire-lost',
+                         'provider@example.com', 'client-retire-lost', 'client@example.com',
+                         'release_failed', 1, ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO client_market_cleanup_recovery_state
+                    (host_id, installation_id, attempt_count, next_attempt_at,
+                     last_outcome, updated_at)
+                 VALUES (?1, 'retire-lost-client', 1, ?2,
+                         'probe_failed:cleanup_ssh_unreachable', ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+        }
+        let provider = market_session("provider-retire-lost", "provider@example.com");
+        assert!(matches!(
+            store
+                .client_market_retire_unreachable_host(
+                    &host.id,
+                    &market_session("stranger", "stranger@example.com")
+                )
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            store
+                .client_market_retire_unreachable_host(&host.id, &provider)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_client_tunnels SET enabled = 0
+                 WHERE installation_id = 'retire-lost-client'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provisioning_jobs
+                    (id, type, host_id, installation_id, status, phase, log_blob,
+                     created_at, updated_at)
+                 VALUES ('retire-lost-active-job', 'cleanup', ?1, 'retire-lost-client',
+                         'running', 'cleanup_stop', '', ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store
+                .client_market_retire_unreachable_host(&host.id, &provider)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE provisioning_jobs SET status = 'failed', phase = 'complete'
+                 WHERE id = 'retire-lost-active-job'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome = store
+            .client_market_retire_unreachable_host(&host.id, &provider)
+            .await
+            .expect("permanently retire fenced lost Host");
+        assert_eq!(outcome.installation_id, "retire-lost-client");
+        assert_eq!(outcome.previous_subscription_status, "release_failed");
+        assert_eq!(outcome.status, "retired");
+        assert_eq!(outcome.subdomain.as_deref(), Some("retire-lost-client"));
+        assert!(
+            store
+                .client_market_get_host(&host.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .installation_provision_source("retire-lost-client")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        {
+            let conn = store.conn.lock().await;
+            let subscription_status: String = conn
+                .query_row(
+                    "SELECT status FROM client_market_subscriptions
+                     WHERE installation_id = 'retire-lost-client'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(subscription_status, "released");
+            let recovery_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM client_market_cleanup_recovery_state
+                     WHERE host_id = ?1",
+                    params![host.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(recovery_rows, 0);
+            assert_eq!(
+                get_public_host(&conn, "retire-lost-client")
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle,
+                PublicHostLifecycle::Tombstoned
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

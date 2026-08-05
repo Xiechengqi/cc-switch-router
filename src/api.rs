@@ -11,6 +11,7 @@ use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{MethodRouter, any, delete, get, patch, post, put};
 use axum::{Json, Router};
+use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,12 +33,10 @@ use crate::admin::{
     },
 };
 use crate::client_meta::extract_client_metadata;
-use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 use crate::models::{
     AccountUsageResponse, AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate,
     AuthSession, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
-    BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     ClientChatDeliveriesResponse, ClientChatMessageListResponse, ClientChatReadRequest,
     ClientChatReadResponse, ClientChatRoomListResponse, ClientChatRoomLookupRequest,
@@ -337,6 +336,14 @@ pub fn router(state: ServerState) -> Router {
             "/v1/installations/client-tunnel/claim",
             post(claim_client_tunnel),
         )
+        .route(
+            "/v1/installations/client-subdomain-takeover",
+            post(client_subdomain_takeover),
+        )
+        .route(
+            "/v1/installations/client-subdomain-takeover/authorization",
+            post(client_subdomain_takeover_authorization),
+        )
         .route("/v1/auth/email/request-code", post(request_email_code))
         .route("/v1/auth/email/verify-code", post(verify_email_code))
         .route(
@@ -412,15 +419,6 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/shares/heartbeat", post(share_heartbeat))
         .route("/v1/shares/delete", post(delete_share))
         .route("/v1/shares/prune", post(prune_shares))
-        .route("/v1/board/messages", get(list_board_messages))
-        .route("/v1/board/messages", post(post_board_message))
-        .route("/v1/board/messages/:id/pin", post(pin_board_message))
-        .route(
-            "/v1/board/messages/:id/feature",
-            post(feature_board_message),
-        )
-        .route("/v1/board/messages/:id", delete(delete_board_message))
-        .route("/v1/board/meta", get(board_meta))
         .route("/v1/chat/rooms/lookup", post(lookup_chat_rooms))
         .route("/v1/chat/rooms", get(list_visited_chat_rooms))
         .route("/v1/chat/meta", get(client_chat_meta))
@@ -463,7 +461,6 @@ pub fn router(state: ServerState) -> Router {
             "/v1/admin/logs/router/download",
             get(admin_router_log_download),
         )
-        .route("/v1/admin/telegram/test", post(admin_telegram_test))
         .route("/v1/admin/audit", get(admin_audit_list))
         .route("/v1/admin/metrics/snapshot", get(admin_metrics_snapshot))
         .route("/v1/admin/metrics/host/info", get(admin_metrics_host_info))
@@ -485,6 +482,28 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/admin/metrics/events", get(admin_metrics_events))
         .route("/v1/admin/metrics", delete(admin_metrics_clear))
+        .route("/v1/admin/alerting/overview", get(admin_alerting_overview))
+        .route("/v1/admin/alerting/channels", get(admin_alerting_channels))
+        .route(
+            "/v1/admin/alerting/channels/:channel/test",
+            post(admin_alerting_channel_test),
+        )
+        .route(
+            "/v1/admin/alerting/incidents/:incident_id/acknowledge",
+            post(admin_alerting_incident_acknowledge),
+        )
+        .route(
+            "/v1/admin/alerting/incidents/:incident_id/silence",
+            post(admin_alerting_incident_silence),
+        )
+        .route(
+            "/v1/admin/alerting/incidents/:incident_id/resume",
+            post(admin_alerting_incident_resume),
+        )
+        .route(
+            "/v1/admin/alerting/deliveries/:delivery_id/retry",
+            post(admin_alerting_delivery_retry),
+        )
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
         .route(
             "/_gateway/proxy/:share_id/*path",
@@ -1471,6 +1490,31 @@ async fn update_client_tunnel(
                 extract_client_metadata(&headers, addr),
             )
             .await?,
+    ))
+}
+
+async fn client_subdomain_takeover(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::client_subdomain_takeover::ClientSubdomainTakeoverRequest>,
+) -> Result<Json<crate::client_subdomain_takeover::ClientSubdomainTakeoverResponse>, AppError> {
+    let owner_email = require_session_email(&state, &headers).await?;
+    Ok(Json(
+        crate::client_subdomain_takeover::execute(state, &owner_email, input).await?,
+    ))
+}
+
+async fn client_subdomain_takeover_authorization(
+    State(state): State<ServerState>,
+    Json(input): Json<
+        crate::client_subdomain_takeover::ClientSubdomainTakeoverAuthorizationRequest,
+    >,
+) -> Result<
+    Json<crate::client_subdomain_takeover::ClientSubdomainTakeoverAuthorizationResponse>,
+    AppError,
+> {
+    Ok(Json(
+        crate::client_subdomain_takeover::authorization(state, input).await?,
     ))
 }
 
@@ -4636,18 +4680,6 @@ pub(crate) fn extract_router_api_token(headers: &HeaderMap) -> Option<&str> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BoardListQuery {
-    #[serde(default)]
-    tab: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-    /// RFC3339 timestamp; if present, the server returns only changes since that time.
-    #[serde(default)]
-    since: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ClientChatMessageQuery {
     #[serde(default)]
     before_seq: Option<i64>,
@@ -4767,15 +4799,6 @@ fn dev_session_status() -> SessionStatusResponse {
         installation_owner_email: None,
         is_admin: true,
     }
-}
-
-fn extract_guest_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-board-guest-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && value.len() <= 80)
-        .map(str::to_string)
 }
 
 pub(crate) async fn require_admin_session(
@@ -5079,96 +5102,6 @@ async fn admin_requeue_client_chat_delivery(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn list_board_messages(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Query(query): Query<BoardListQuery>,
-) -> Result<Json<BoardMessageListResponse>, AppError> {
-    let session = resolve_router_session(&state, &headers).await?;
-    let guest_id = extract_guest_id(&headers);
-    let viewer_user_id = session.as_ref().map(|s| s.user_id.clone());
-    let since = query
-        .since
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
-    let response = state
-        .store
-        .list_board_messages(
-            query.tab.as_deref().unwrap_or("all"),
-            query.limit.unwrap_or(50),
-            viewer_user_id.as_deref(),
-            guest_id.as_deref(),
-            since,
-        )
-        .await?;
-    Ok(Json(response))
-}
-
-async fn post_board_message(
-    State(_state): State<ServerState>,
-    _headers: HeaderMap,
-    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
-) -> Result<Json<BoardMessageView>, AppError> {
-    Err(AppError::Gone(
-        "the message board is read-only; use a Client chat room".into(),
-    ))
-}
-
-async fn pin_board_message(
-    State(_state): State<ServerState>,
-    _headers: HeaderMap,
-    Path(_id): Path<String>,
-) -> Result<Json<BoardMessageView>, AppError> {
-    Err(AppError::Gone(
-        "the message board is read-only; use a Client chat room".into(),
-    ))
-}
-
-async fn feature_board_message(
-    State(_state): State<ServerState>,
-    _headers: HeaderMap,
-    Path(_id): Path<String>,
-) -> Result<Json<BoardMessageView>, AppError> {
-    Err(AppError::Gone(
-        "the message board is read-only; use a Client chat room".into(),
-    ))
-}
-
-async fn delete_board_message(
-    State(_state): State<ServerState>,
-    _headers: HeaderMap,
-    Path(_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    Err(AppError::Gone(
-        "the message board is read-only; use a Client chat room".into(),
-    ))
-}
-
-async fn board_meta(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<BoardMetaResponse>, AppError> {
-    let session = resolve_router_session(&state, &headers).await?;
-    let (board_settings, can_post_as_admin) = {
-        let dynamic = state.dynamic.read().await;
-        let admin = session
-            .as_ref()
-            .map(|s| dynamic.is_admin(&s.email))
-            .unwrap_or(false);
-        (dynamic.board.clone(), admin)
-    };
-    let meta = state
-        .store
-        .board_meta(
-            can_post_as_admin,
-            board_settings.max_len,
-            board_settings.guest_self_delete_secs,
-        )
-        .await?;
-    Ok(Json(meta))
-}
-
 async fn admin_settings_schema(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -5293,17 +5226,7 @@ async fn admin_settings_apply(
     *dynamic_guard = next_dynamic.clone();
     drop(dynamic_guard);
 
-    // 5) rebuild telegram notifier if its inputs changed.
-    let needs_telegram = outcome
-        .updated_keys
-        .iter()
-        .any(|k| k.starts_with("CC_SWITCH_ROUTER_TELEGRAM_"));
-    if needs_telegram {
-        let rebuilt = build_notifier_from_dynamic(&state, &next_dynamic).await;
-        *state.telegram.write().await = rebuilt;
-    }
-
-    // 6) audit.
+    // 5) audit.
     let metadata = extract_client_metadata(&headers, addr);
     let payload = serde_json::json!({
         "updatedKeys": outcome.updated_keys,
@@ -5332,22 +5255,6 @@ async fn admin_settings_apply(
         dynamic_groups_refreshed: dynamic_groups,
         env_path: state.env_path.display().to_string(),
     }))
-}
-
-async fn build_notifier_from_dynamic(
-    state: &ServerState,
-    dynamic: &DynamicSettings,
-) -> Option<std::sync::Arc<crate::board_telegram::TelegramNotifier>> {
-    // Reuse the existing constructor by spoofing a Config-shaped view; simpler
-    // than rewriting it for two callers. The notifier only inspects telegram_*,
-    // tunnel_domain, and use_localhost — the rest can stay as the boot snapshot.
-    let mut config = state.config.clone();
-    config.telegram_bot_token = dynamic.telegram.bot_token.clone();
-    config.telegram_chat_id = dynamic.telegram.chat_id.clone();
-    config.telegram_topic_id = dynamic.telegram.topic_id;
-    config.telegram_notify_all = dynamic.telegram.notify_all;
-    config.telegram_notify_admin = dynamic.telegram.notify_admin;
-    crate::board_telegram::TelegramNotifier::from_config(&config)
 }
 
 async fn admin_version(
@@ -5843,30 +5750,6 @@ fn clamp_log_line(line: &str) -> String {
     value
 }
 
-async fn admin_telegram_test(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let session = require_admin_session(&state, &headers).await?;
-    let notifier = state.telegram.read().await.clone().ok_or_else(|| {
-        AppError::BadRequest("telegram is not configured (bot token / chat id missing)".into())
-    })?;
-    let preview = crate::models::BoardMessageView {
-        id: "preview".into(),
-        body: format!("🧪 settings test from {}", session.email),
-        author_kind: "admin".into(),
-        author_label: "Official".into(),
-        is_mine: true,
-        pinned: false,
-        featured: false,
-        created_at: chrono::Utc::now(),
-        pinned_at: None,
-        featured_at: None,
-    };
-    notifier.notify_new_message(&preview).await;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
 #[derive(Debug, Deserialize)]
 struct AdminAuditQuery {
     #[serde(default)]
@@ -5892,7 +5775,10 @@ async fn admin_metrics_snapshot(
 ) -> Result<Json<crate::metrics::models::MetricsSnapshot>, AppError> {
     require_admin_session(&state, &headers).await?;
     Ok(Json(
-        state.metrics.snapshot(&state.config, &state.proxy).await?,
+        state
+            .metrics
+            .snapshot(&state.config, &state.proxy, &state.store, &state.alerting)
+            .await?,
     ))
 }
 
@@ -6010,6 +5896,188 @@ async fn admin_metrics_clear(
         )
         .await;
     Ok(Json(result))
+}
+
+async fn admin_alerting_overview(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::metrics::models::MetricsRangeQuery>,
+) -> Result<Json<crate::alerting::models::AlertingOverview>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .alerting
+            .overview(query.limit.unwrap_or(100).clamp(1, 500))
+            .await?,
+    ))
+}
+
+async fn admin_alerting_channels(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::alerting::models::AlertChannelState>>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(state.alerting.channel_states().await?))
+}
+
+async fn admin_alerting_channel_test(
+    State(state): State<ServerState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<crate::alerting::models::AlertChannelTestResponse>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let result = state.alerting.test_channel(&channel).await;
+    record_alerting_admin_audit(
+        &state,
+        &headers,
+        addr,
+        &session.email,
+        "alerting.channel.test",
+        serde_json::json!({ "channel": channel, "ok": result.is_ok() }),
+    )
+    .await;
+    Ok(Json(result?))
+}
+
+async fn admin_alerting_incident_acknowledge(
+    State(state): State<ServerState>,
+    Path(incident_id): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<crate::alerting::models::AlertAcknowledgeRequest>,
+) -> Result<Json<crate::alerting::models::AlertIncident>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let incident = state
+        .alerting
+        .store()
+        .acknowledge(
+            incident_id.clone(),
+            session.email.clone(),
+            input.note,
+            Utc::now().timestamp(),
+        )
+        .await?;
+    record_alerting_admin_audit(
+        &state,
+        &headers,
+        addr,
+        &session.email,
+        "alerting.incident.acknowledge",
+        serde_json::json!({ "incidentId": incident_id }),
+    )
+    .await;
+    Ok(Json(incident))
+}
+
+async fn admin_alerting_incident_silence(
+    State(state): State<ServerState>,
+    Path(incident_id): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<crate::alerting::models::AlertSilenceRequest>,
+) -> Result<Json<crate::alerting::models::AlertIncident>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let incident = state
+        .alerting
+        .store()
+        .silence(
+            incident_id.clone(),
+            session.email.clone(),
+            input.note,
+            Utc::now().timestamp(),
+            input.duration_secs,
+        )
+        .await?;
+    record_alerting_admin_audit(
+        &state,
+        &headers,
+        addr,
+        &session.email,
+        "alerting.incident.silence",
+        serde_json::json!({
+            "incidentId": incident_id,
+            "durationSecs": input.duration_secs,
+        }),
+    )
+    .await;
+    Ok(Json(incident))
+}
+
+async fn admin_alerting_incident_resume(
+    State(state): State<ServerState>,
+    Path(incident_id): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<crate::alerting::models::AlertAcknowledgeRequest>,
+) -> Result<Json<crate::alerting::models::AlertIncident>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let policy = state.alerting.current_delivery_policy().await;
+    let incident = state
+        .alerting
+        .store()
+        .resume(
+            incident_id.clone(),
+            session.email.clone(),
+            input.note,
+            Utc::now().timestamp(),
+            policy,
+        )
+        .await?;
+    record_alerting_admin_audit(
+        &state,
+        &headers,
+        addr,
+        &session.email,
+        "alerting.incident.resume",
+        serde_json::json!({ "incidentId": incident_id }),
+    )
+    .await;
+    Ok(Json(incident))
+}
+
+async fn admin_alerting_delivery_retry(
+    State(state): State<ServerState>,
+    Path(delivery_id): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    state
+        .alerting
+        .store()
+        .retry_delivery(delivery_id.clone(), Utc::now().timestamp())
+        .await?;
+    record_alerting_admin_audit(
+        &state,
+        &headers,
+        addr,
+        &session.email,
+        "alerting.delivery.retry",
+        serde_json::json!({ "deliveryId": delivery_id }),
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn record_alerting_admin_audit(
+    state: &ServerState,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    actor_email: &str,
+    action: &str,
+    payload: serde_json::Value,
+) {
+    let metadata = extract_client_metadata(headers, addr);
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(actor_email),
+            action,
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

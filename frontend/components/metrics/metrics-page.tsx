@@ -23,6 +23,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   clearMetrics,
+  getAlertingOverview,
   getLlmMetricsFailover,
   getLlmMetricsTop,
   getMetricEvents,
@@ -33,6 +34,7 @@ import {
 import type { MessageKey } from "@/lib/i18n";
 import type {
   HostMetricsInfo,
+  AlertingOverview,
   LlmReliabilityResponse,
   LlmTopResponse,
   MetricEvent,
@@ -52,8 +54,9 @@ import {
 } from "./metrics-cards";
 import { type ChartState, ResourceTrendChart } from "./metrics-charts";
 import { CountersTable, MetricEventsList, ModelSubstitutionPanel, TopConsumersTable } from "./metrics-tables";
+import { AlertsTab, ClientsTab } from "./metrics-client-alerts";
 
-type MetricsTab = "overview" | "host" | "router" | "llm" | "events";
+type MetricsTab = "overview" | "host" | "router" | "clients" | "llm" | "alerts" | "events";
 
 const RANGES = ["15m", "1h", "6h", "24h", "7d"];
 
@@ -74,7 +77,9 @@ const TAB_LABELS: Record<MetricsTab, MessageKey> = {
   overview: "metrics.tab.overview",
   host: "metrics.tab.host",
   router: "metrics.tab.router",
+  clients: "metrics.tab.clients",
   llm: "metrics.tab.llm",
+  alerts: "metrics.tab.alerts",
   events: "metrics.tab.events",
 };
 
@@ -90,6 +95,7 @@ export function MetricsPage() {
   const [events, setEvents] = React.useState<MetricEvent[]>([]);
   const [top, setTop] = React.useState<LlmTopResponse | null>(null);
   const [failover, setFailover] = React.useState<LlmReliabilityResponse | null>(null);
+  const [alerting, setAlerting] = React.useState<AlertingOverview | null>(null);
   const [busy, setBusy] = React.useState("");
   const [error, setError] = React.useState("");
   const [clearOpen, setClearOpen] = React.useState(false);
@@ -104,17 +110,19 @@ export function MetricsPage() {
       setError("");
     }
     try {
-      const wantSeries = activeTab !== "events";
+      const wantSeries = activeTab !== "events" && activeTab !== "alerts";
       const wantInfo = activeTab === "overview" || activeTab === "host";
       const wantEvents = activeTab === "overview" || activeTab === "events";
       const wantTop = activeTab === "llm";
-      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop, nextFailover] = await Promise.all([
+      const wantAlerting = activeTab === "alerts";
+      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop, nextFailover, nextAlerting] = await Promise.all([
         getMetricsSnapshot(),
         wantSeries ? getMetricsSeries(range) : Promise.resolve(null),
         wantInfo ? getMetricsHostInfo() : Promise.resolve(null),
         wantEvents ? getMetricEvents(100) : Promise.resolve(null),
         wantTop ? getLlmMetricsTop(range, "tokens") : Promise.resolve(null),
         wantTop ? getLlmMetricsFailover(range, 10) : Promise.resolve(null),
+        wantAlerting ? getAlertingOverview(200) : Promise.resolve(null),
       ]);
       setSnapshot(nextSnapshot);
       if (nextSeries) setSeries(nextSeries);
@@ -122,6 +130,7 @@ export function MetricsPage() {
       if (nextEvents) setEvents(nextEvents);
       if (nextTop) setTop(nextTop);
       if (nextFailover) setFailover(nextFailover);
+      if (nextAlerting) setAlerting(nextAlerting);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (/login required/i.test(message)) {
@@ -241,7 +250,7 @@ export function MetricsPage() {
       {banner ? <Alert status="success" className="!text-slate-900">{banner}</Alert> : null}
 
       <nav className="flex gap-1 overflow-x-auto rounded-xl border bg-card p-1">
-        {(["overview", "host", "router", "llm", "events"] as MetricsTab[]).map((tab) => (
+        {(["overview", "host", "router", "clients", "llm", "alerts", "events"] as MetricsTab[]).map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -259,7 +268,9 @@ export function MetricsPage() {
           {activeTab === "overview" ? <OverviewTab snapshot={snapshot} series={series} events={alertEvents} state={chartState} /> : null}
           {activeTab === "host" ? <HostTab snapshot={snapshot} series={series} hostInfo={hostInfo} state={chartState} /> : null}
           {activeTab === "router" ? <RouterTab snapshot={snapshot} series={series} state={chartState} /> : null}
+          {activeTab === "clients" ? <ClientsTab clients={snapshot?.clients} series={series} state={chartState} /> : null}
           {activeTab === "llm" ? <LlmTab snapshot={snapshot} series={series} top={top} failover={failover} state={chartState} /> : null}
+          {activeTab === "alerts" ? <AlertsTab overview={alerting} onReload={() => load(true)} /> : null}
           {activeTab === "events" ? <EventsTab events={alertEvents} /> : null}
         </>
       )}

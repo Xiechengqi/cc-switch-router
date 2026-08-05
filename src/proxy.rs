@@ -1176,6 +1176,16 @@ impl ProxyRegistry {
             .cloned()
     }
 
+    pub(crate) async fn active_client_route(&self, subdomain: &str) -> Option<RouteEntry> {
+        self.routes
+            .read()
+            .await
+            .get(subdomain)
+            .and_then(|slot| slot.active.as_ref())
+            .filter(|route| route.is_client_web())
+            .cloned()
+    }
+
     async fn route_for_share_request(
         &self,
         share_id: &str,
@@ -4566,6 +4576,15 @@ mod tests {
 
     fn proxy_test_state(config: &Config, proxy: Arc<ProxyRegistry>) -> ServerState {
         let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
+        let dynamic = Arc::new(RwLock::new(
+            crate::dynamic_settings::DynamicSettings::from_config(config),
+        ));
+        let alerting = crate::alerting::AlertingService::new(
+            config.metrics.db_path.clone(),
+            dynamic.clone(),
+            config,
+        )
+        .unwrap();
         let (share_edit_events, _) = tokio::sync::broadcast::channel(16);
         ServerState {
             config: config.clone(),
@@ -4583,9 +4602,7 @@ mod tests {
             proxy_http: reqwest::Client::new(),
             resend: None,
             resend_usage_cache: Arc::new(Mutex::new(None)),
-            dynamic: Arc::new(RwLock::new(
-                crate::dynamic_settings::DynamicSettings::from_config(config),
-            )),
+            dynamic,
             ssh_host_fingerprint: None,
             provision_ssh_key_path: config.provision_ssh_private_key_path.clone(),
             provision_ssh_authorized_keys_line: String::new(),
@@ -4599,17 +4616,20 @@ mod tests {
             client_market_recovery: Arc::new(
                 crate::client_market_recovery::ClientMarketRecoveryCoordinator::default(),
             ),
+            client_subdomain_takeover_recovery_running: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             market_billing_controls: Arc::new(Mutex::new(())),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
             ip_blacklist_stats: Arc::new(crate::ip_blacklist_stats::IpBlacklistStats::new()),
-            telegram: Arc::new(RwLock::new(None)),
             upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
             share_edit_events,
             env_path: std::env::temp_dir().join("cc-switch-router-proxy-test.env"),
             start_instant: Instant::now(),
             scheduling_overrides: crate::scheduling_signals::OverrideStore::new(),
             metrics,
+            alerting,
             registration_admission: Arc::new(
                 crate::registration_admission::RegistrationAdmissionLimiter::new(
                     crate::registration_admission::RegistrationAdmissionPolicy::default(),
@@ -4673,16 +4693,6 @@ mod tests {
             verification_service_api_key: None,
             router_owner_email: None,
             admin_emails: HashSet::new(),
-            telegram_bot_token: None,
-            telegram_chat_id: None,
-            telegram_topic_id: None,
-            telegram_notify_all: false,
-            telegram_notify_admin: false,
-            board_max_len: 1000,
-            board_guest_per_hour: 5,
-            board_user_per_hour: 30,
-            board_pin_limit: 3,
-            board_guest_self_delete_secs: 300,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
             footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
@@ -4694,6 +4704,7 @@ mod tests {
                 )),
                 retention_days: 7,
                 sample_interval_secs: 5,
+                alerting: crate::config::AlertingSettings::default(),
             },
         }
     }

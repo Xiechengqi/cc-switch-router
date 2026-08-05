@@ -25,6 +25,9 @@ type HmacSha256 = Hmac<Sha256>;
 
 const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
 const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
+const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/prepare";
+const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
+const ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/abort";
 const CTL_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Serialize)]
@@ -47,6 +50,39 @@ struct ApplyShareSettingsReply {
 struct RefreshShareUsageBody<'a> {
     share_id: &'a str,
     app: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareClientSubdomainAdoptionBody<'a> {
+    takeover_id: &'a str,
+    from_subdomain: &'a str,
+    to_subdomain: &'a str,
+    activate_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientSubdomainAdoptionIdBody<'a> {
+    takeover_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSubdomainAdoptionReply {
+    #[serde(default)]
+    pub ok: bool,
+    pub takeover_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AbortClientSubdomainAdoptionReply {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    aborted: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -297,6 +333,89 @@ pub async fn refresh_share_usage(
         return Err(CtlError::Malformed("client replied ok=false".into()));
     }
     Ok(reply)
+}
+
+pub async fn prepare_client_subdomain_adoption(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    takeover_id: &str,
+    from_subdomain: &str,
+    to_subdomain: &str,
+    activate_at_ms: i64,
+) -> Result<ClientSubdomainAdoptionReply, CtlError> {
+    let body = serde_json::to_string(&PrepareClientSubdomainAdoptionBody {
+        takeover_id,
+        from_subdomain,
+        to_subdomain,
+        activate_at_ms,
+    })
+    .map_err(|error| CtlError::Malformed(format!("serialize control body failed: {error}")))?;
+    let reply: ClientSubdomainAdoptionReply = post_control(
+        backend,
+        installation_id,
+        control_secret,
+        PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+        body,
+    )
+    .await?;
+    if !reply.ok
+        || reply.takeover_id != takeover_id
+        || !matches!(reply.status.as_str(), "prepared" | "committed")
+    {
+        return Err(CtlError::Malformed(
+            "Client subdomain adoption prepare was not acknowledged".into(),
+        ));
+    }
+    Ok(reply)
+}
+
+pub async fn commit_client_subdomain_adoption(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    takeover_id: &str,
+) -> Result<ClientSubdomainAdoptionReply, CtlError> {
+    let body = serde_json::to_string(&ClientSubdomainAdoptionIdBody { takeover_id })
+        .map_err(|error| CtlError::Malformed(format!("serialize control body failed: {error}")))?;
+    let reply: ClientSubdomainAdoptionReply = post_control(
+        backend,
+        installation_id,
+        control_secret,
+        COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+        body,
+    )
+    .await?;
+    if !reply.ok || reply.takeover_id != takeover_id || reply.status != "committed" {
+        return Err(CtlError::Malformed(
+            "Client subdomain adoption commit was not acknowledged".into(),
+        ));
+    }
+    Ok(reply)
+}
+
+pub async fn abort_client_subdomain_adoption(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    takeover_id: &str,
+) -> Result<bool, CtlError> {
+    let body = serde_json::to_string(&ClientSubdomainAdoptionIdBody { takeover_id })
+        .map_err(|error| CtlError::Malformed(format!("serialize control body failed: {error}")))?;
+    let reply: AbortClientSubdomainAdoptionReply = post_control(
+        backend,
+        installation_id,
+        control_secret,
+        ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+        body,
+    )
+    .await?;
+    if !reply.ok {
+        return Err(CtlError::Malformed(
+            "Client subdomain adoption abort was not acknowledged".into(),
+        ));
+    }
+    Ok(reply.aborted)
 }
 
 #[cfg(test)]

@@ -137,6 +137,15 @@ export function hostCanDelete(host: ClientMarketHost, viewerEmail?: string | nul
   );
 }
 
+export function hostCanRetireUnreachable(host: ClientMarketHost, viewerEmail?: string | null) {
+  return (
+    host.canRetireUnreachable === true &&
+    hostCanManage(host, viewerEmail) &&
+    host.status === "unreachable" &&
+    !!host.installationId
+  );
+}
+
 export function hostCanExport(host: ClientMarketHost, viewerEmail?: string | null) {
   return hostCanManage(host, viewerEmail) && !!host.ip && host.port != null;
 }
@@ -504,6 +513,9 @@ export function cleanupPhaseLabelKey(phase: string): MessageKey {
 export function cleanupFailureGuidanceKey(failureCode?: string): MessageKey {
   if (!failureCode) return "clientMarket.cleanupFailedGuidance";
   if (failureCode.startsWith("cleanup_purge_failed")) return "clientMarket.cleanupFailedGuidance.purge";
+  if (failureCode.startsWith("cleanup_ssh_unreachable")) {
+    return "clientMarket.cleanupFailedGuidance.unreachable";
+  }
   if (
     failureCode.startsWith("cleanup_ssh_timeout") ||
     failureCode.startsWith("cleanup_stop_failed") ||

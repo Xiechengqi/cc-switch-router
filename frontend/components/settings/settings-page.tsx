@@ -1,6 +1,6 @@
 "use client";
 
-import { Loader2, Save, Send, RotateCcw } from "lucide-react";
+import { Loader2, Save, RotateCcw } from "lucide-react";
 import { Alert, Button, Card, Checkbox, Chip, Input, ListBox, ScrollShadow, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -19,7 +19,8 @@ import { ClientNotificationDeliveriesPanel } from "@/components/settings/client-
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { AnnouncementPanel } from "@/components/settings/announcement-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
-import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService, getMapDisplay, updateMapDisplay, getProvisionSshKey } from "@/lib/api";
+import { AlertChannelsPanel } from "@/components/settings/alert-channels-panel";
+import { getSettingsSchema, getSettingsValues, saveSettings, restartService, getMapDisplay, updateMapDisplay, getProvisionSshKey } from "@/lib/api";
 import type { MapDisplaySettings, ProvisionSshKey, SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
 import { DEFAULT_MAP_DISPLAY, sameMapDisplaySettings, toMapDisplayUpdate } from "@/lib/map-display-settings";
 
@@ -43,6 +44,7 @@ export function SettingsPage() {
   const [mapSaved, setMapSaved] = React.useState<MapDisplaySettings>(DEFAULT_MAP_DISPLAY);
   const [mapDraft, setMapDraft] = React.useState<MapDisplaySettings>(DEFAULT_MAP_DISPLAY);
   const [provisionSshKey, setProvisionSshKey] = React.useState<ProvisionSshKey | null>(null);
+  const [settingsRevision, setSettingsRevision] = React.useState(0);
 
   const isAdmin = !!session?.isAdmin;
   const mapDirty = !sameMapDisplaySettings(mapDraft, mapSaved);
@@ -61,6 +63,7 @@ export function SettingsPage() {
       setMapSaved(nextMap);
       setMapDraft(nextMap);
       setProvisionSshKey(nextProvisionSshKey);
+      setSettingsRevision((revision) => revision + 1);
       setActiveGroup((current) => current || VERSION_GROUP);
       setDirty({});
       setBanner(null);
@@ -106,10 +109,6 @@ export function SettingsPage() {
           <Button variant="outline" onClick={() => load()} isDisabled={!!busy}>
             {busy === "load" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
             {t("common.reload")}
-          </Button>
-          <Button variant="outline" onClick={telegramTest} isDisabled={!!busy}>
-            {busy === "telegram" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-            {t("settings.testTelegram")}
           </Button>
           <Button variant="outline" onClick={() => submit(true)} isDisabled={!!busy || dirtyCount === 0}>
             {busy === "restart" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -197,6 +196,8 @@ export function SettingsPage() {
               </Card.Header>
               <Card.Content className="grid gap-4">
                 {busy === "load" && !schema ? <div className="text-sm text-muted-foreground">{t("settings.loading")}</div> : null}
+                {activeGroup === "Alerting" ? <AlertChannelsPanel refreshToken={settingsRevision} /> : null}
+                {activeGroup === "Telegram alerts" ? <AlertChannelsPanel channel="telegram" refreshToken={settingsRevision} /> : null}
                 {activeGroup === PERSISTENCE_GROUP && provisionSshKey ? (
                   <div className="grid gap-3 border-b pb-5">
                     <div>
@@ -272,17 +273,6 @@ export function SettingsPage() {
     }
   }
 
-  async function telegramTest() {
-    setBusy("telegram");
-    try {
-      await testTelegram();
-      setBanner({ kind: "success", text: t("settings.telegramSent") });
-    } catch (err) {
-      setBanner({ kind: "destructive", text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setBusy("");
-    }
-  }
 }
 
 function SettingsFieldRow({
