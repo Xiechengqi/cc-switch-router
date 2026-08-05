@@ -178,7 +178,6 @@ async fn main() -> Result<()> {
         .context("build proxy http client failed")?;
     let metrics = MetricsRegistry::new(config.metrics.clone());
     let server_logs = Arc::new(server_logs::ServerLogStore::from_env(&config.data_dir)?);
-    server_logs.spawn_maintenance();
 
     let state = ServerState {
         config: config.clone(),
@@ -258,6 +257,7 @@ async fn main() -> Result<()> {
     let cleanup_dynamic = state.dynamic.clone();
     let cleanup_proxy = state.proxy.clone();
     let cleanup_overrides = state.scheduling_overrides.clone();
+    let cleanup_server_logs = state.server_logs.clone();
     let market_reconcile_state = state.clone();
     let ip_blacklist_stats = state.ip_blacklist_stats.clone();
     let probe_store = state.store.clone();
@@ -342,7 +342,7 @@ async fn main() -> Result<()> {
             let mut cycle_config = cleanup_config.clone();
             cycle_config.client_notifications =
                 cleanup_dynamic.read().await.client_notifications.clone();
-            match cleanup_store
+            let cleanup_succeeded = match cleanup_store
                 .cleanup_expired_data(&cycle_config, &cleanup_proxy)
                 .await
             {
@@ -358,10 +358,46 @@ async fn main() -> Result<()> {
                         routes = result.removed_routes,
                         "cleanup removed stale data"
                     );
+                    true
                 }
-                Ok(_) => {}
+                Ok(_) => true,
                 Err(err) => {
                     tracing::warn!("cleanup failed: {err}");
+                    false
+                }
+            };
+            if cleanup_succeeded {
+                let logged_installation_ids =
+                    match cleanup_server_logs.installation_ids_with_log_state() {
+                        Ok(installation_ids) => installation_ids,
+                        Err(err) => {
+                            tracing::warn!("snapshot Server logs for cleanup failed: {err}");
+                            continue;
+                        }
+                    };
+                match cleanup_store.list_all_installation_ids().await {
+                    Ok(installation_ids) => {
+                        let existing_installation_ids =
+                            installation_ids.into_iter().collect::<HashSet<_>>();
+                        let orphaned_installation_ids = logged_installation_ids
+                            .difference(&existing_installation_ids)
+                            .cloned()
+                            .collect();
+                        match cleanup_server_logs
+                            .remove_installations(orphaned_installation_ids)
+                            .await
+                        {
+                            Ok(removed) if removed > 0 => {
+                                info!(
+                                    installations = removed,
+                                    "cleanup removed orphaned Server logs"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!("Server log orphan cleanup failed: {err}"),
+                        }
+                    }
+                    Err(err) => tracing::warn!("list installations for log cleanup failed: {err}"),
                 }
             }
             if let Err(err) =

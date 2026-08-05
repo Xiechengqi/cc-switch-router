@@ -1970,12 +1970,11 @@ export type ShareMarketOwnedShare = {
   supportedUserTokenPeriods: ShareTokenPeriod[];
 };
 
-export type ServerLogScope = "public" | "mine" | "all";
-
 export type ServerLogClient = {
-  installationId: string;
+  installationId?: string;
   clientAlias: string;
   owned: boolean;
+  fullLogAccess: boolean;
   subdomain?: string;
   tunnelUrl?: string;
   ownerEmail?: string;
@@ -1990,13 +1989,12 @@ export type ServerLogClient = {
 
 export type ServerLogMeta = {
   ingestEnabled: boolean;
-  publicEnabled: boolean;
   authenticated: boolean;
-  isAdmin: boolean;
-  scopes: ServerLogScope[];
+  isRouterOwner: boolean;
   clients: ServerLogClient[];
-  retentionDays: number;
-  publicWindowSeconds: number;
+  retainedLineLimit: number;
+  publicLineLimit: number;
+  pollIntervalSeconds: number;
 };
 
 export type ServerLogEvent = {
@@ -2020,6 +2018,6 @@ export type ServerLogEvent = {
 
 export type ServerLogEventsResponse = {
   events: ServerLogEvent[];
-  nextCursor?: string;
-  publicWindowSeconds?: number;
+  visibleLineLimit: number;
+  retainedLineLimit: number;
 };

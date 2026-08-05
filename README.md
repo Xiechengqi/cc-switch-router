@@ -65,7 +65,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/admin/*` | 约 36 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`logs/batch`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
-| `/v1/server-logs/*` | 3 | public 开关 / 用户 Session / admin | `meta`、`events`、`export`；匿名仅可读脱敏后的最近 5 分钟且不能导出 |
+| `/v1/server-logs/*` | 3 | 公开读 / 已验证 Client owner / Router owner | `meta`、`events`、`export`；匿名与非 owner 每 Client 仅可读脱敏后的最近 10 行，完整日志权限方可导出 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
@@ -118,10 +118,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS` | `60` | Embedded Replica 拉取 Turso 已提交 frame 的周期,范围 1-3600 秒 |
 | `CC_SWITCH_ROUTER_METRICS_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router-metrics.db` | 独立本地 metrics 数据库;不会同步到 Turso |
 | `CC_SWITCH_ROUTER_SERVER_LOG_INGEST_ENABLED` | `true` | 是否接收已注册 Server 的 Ed25519 签名日志批次;修改后需重启 |
-| `CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR` | `$CC_SWITCH_ROUTER_DATA_DIR/server-logs` | Server 日志 JSONL、gzip 分段、stream cursor 的文件目录;不会写入业务库;修改后需重启 |
-| `CC_SWITCH_ROUTER_SERVER_LOG_RETENTION_DAYS` | `7` | Server 日志文件保留天数,范围 1-90;修改后需重启 |
-| `CC_SWITCH_ROUTER_SERVER_LOG_MAX_TOTAL_MIB` | `1024` | Server 日志事件文件总容量上限,范围 16-1048576 MiB;超限删除最旧文件;修改后需重启 |
-| `CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED` | `false` | 是否允许匿名用户查看全部 Client 最近 5 分钟日志的脱敏投影;可在 Settings 热更新 |
+| `CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR` | `$CC_SWITCH_ROUTER_DATA_DIR/server-logs` | 每个 Client 最近 100 行 Server 日志与独立 stream cursor 的文件目录;不按时间清理且不会写入业务库;修改后需重启 |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔(秒) |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `86400` | 过期 lease 保留时长(秒) |
 | `CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS` | `30` | Share 请求记录和图片请求历史保留天数,范围 1-365;不影响累计 Token 用量 |
@@ -177,9 +174,9 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 
 Server 仅在本地日志已开启、级别为 `info` 且“日志采集”开关开启时上传 `INFO/WARN/ERROR`;`DEBUG/TRACE` 不进入上传 channel。断网期间待传日志保存在 Server 本机最多 16 MiB、最长 6 小时的 JSONL spool 中,恢复后按最多 200 条、256 KiB 的签名批次续传。
 
-Router 的 `日志`（英文 `Log`）顶级页面按身份实时计算权限:匿名用户只有在 public 开启时可查看全部 Client 的脱敏最近 5 分钟;登录用户可查看当前已验证归属自己的全部 Client 保留日志;admin 可查看全部 Client。日志列表以当前 Client tunnel Subdomain 作为公开标识,点击后打开权限裁剪的 Client 详情侧栏。邮箱、IP、完整 URL、凭据字段、源文件和 installation 标识不会进入匿名投影,匿名搜索也只匹配脱敏后的文本。私有视图支持筛选、游标分页和 JSONL 导出。
+Router 的 `日志`（英文 `Log`）顶级页面仅列出已经建立日志 stream/cursor 的 Client,按 Client 形成表格。点击一行会展开白色只读日志文本区,展开期间每 3 秒刷新。匿名用户和非该 Client owner 的登录用户只能查看该 Client 最近 10 行的脱敏投影;已验证 Client owner 与 `CC_SWITCH_ROUTER_OWNER_EMAIL` 对应的 Router owner 可查看该 Client 全部 100 行保留日志及完整结构字段。额外 admin 不会自动获得完整日志权限,除非同时是该 Client owner。完整日志权限方仍可使用 JSONL 导出接口。
 
-Router 按 Client/stream 写入 4 MiB JSONL 活跃文件并轮转为 gzip 分段,每 15 分钟独立执行保留期和总容量清理。查询按授权 Client 目录和文件时间收敛扫描范围;日志正文、stream cursor 和检索签名密钥均不写业务数据库。生产部署应把日志目录放在 Router 本地持久盘,并根据 Client 数量和实际 `INFO` 速率调整容量上限。
+匿名投影不包含邮箱、IP、完整 URL、日志 fields、源文件、stream、sequence 或 installation 标识;Router 在持久化前还会清除常见凭据。每个 Client 的全部 stream 共用一个原子替换的 `events.jsonl`,只保留最新 100 行;每个 stream 的 sequence cursor 单独持久化,启动时会从已落盘事件补齐缺失或落后的 cursor。日志不按时间或全局容量清理,因此长时间没有新日志的现存 Client 不会被清空;业务库已删除的 installation 日志目录会随常规 cleanup 一并删除。日志正文、stream cursor 和 alias HMAC 密钥均位于 Router 本地日志目录,不写业务数据库;生产部署应使用持久盘并按 Client 数量预留空间。
 
 注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 installation 身份执行业务库持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复已注册 installation 仍受尝试速率保护,但不消耗新身份额度,也不受未绑定 installation 水位线阻断。
 

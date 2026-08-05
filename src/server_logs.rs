@@ -1,10 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Query, State};
@@ -12,12 +10,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{TimeZone, Utc};
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -34,13 +27,11 @@ const MAX_BATCH_EVENTS: usize = 200;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_TARGET_BYTES: usize = 512;
 const MAX_FIELDS_BYTES: usize = 32 * 1024;
-const MAX_QUERY_LIMIT: usize = 500;
-const DEFAULT_QUERY_LIMIT: usize = 200;
-const PUBLIC_WINDOW_MS: i64 = 5 * 60 * 1_000;
-const PUBLIC_CLOCK_SKEW_MS: i64 = 60 * 1_000;
-const SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RETAINED_LINES_PER_CLIENT: usize = 100;
+const PUBLIC_VISIBLE_LINES_PER_CLIENT: usize = 10;
+const DEFAULT_POLL_INTERVAL_SECONDS: u32 = 3;
 const CURSOR_KEY_FILE: &str = ".cursor-key";
-const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const EVENTS_FILE: &str = "events.jsonl";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -48,8 +39,6 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct ServerLogRuntimeConfig {
     pub enabled: bool,
     pub root: PathBuf,
-    pub retention_days: u32,
-    pub max_total_bytes: u64,
 }
 
 impl ServerLogRuntimeConfig {
@@ -62,19 +51,7 @@ impl ServerLogRuntimeConfig {
                 (!value.is_empty()).then(|| PathBuf::from(value))
             })
             .unwrap_or_else(|| data_dir.join("server-logs"));
-        let retention_days = env_u32("CC_SWITCH_ROUTER_SERVER_LOG_RETENTION_DAYS", 7, 1, 90)?;
-        let max_total_mib = env_u64(
-            "CC_SWITCH_ROUTER_SERVER_LOG_MAX_TOTAL_MIB",
-            1_024,
-            16,
-            1_048_576,
-        )?;
-        Ok(Self {
-            enabled,
-            root,
-            retention_days,
-            max_total_bytes: max_total_mib.saturating_mul(1024 * 1024),
-        })
+        Ok(Self { enabled, root })
     }
 }
 
@@ -151,27 +128,24 @@ struct StreamCursorFile {
     installation_id: String,
     stream_id: String,
     last_sequence: u64,
-    active_day: String,
     updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct StreamState {
     last_sequence: u64,
-    active_day: String,
 }
 
 #[derive(Debug, Default)]
 struct Catalog {
     streams: HashMap<(String, String), StreamState>,
-    public_recent: VecDeque<StoredServerLogEvent>,
+    last_received_at_ms: i64,
 }
 
 pub struct ServerLogStore {
     config: ServerLogRuntimeConfig,
     catalog: Mutex<Catalog>,
     cursor_key: [u8; 32],
-    stored_event_bytes: AtomicU64,
     ingest_slots: Arc<Semaphore>,
     query_slots: Arc<Semaphore>,
 }
@@ -186,8 +160,6 @@ impl ServerLogStore {
         Self::open(ServerLogRuntimeConfig {
             enabled: false,
             root,
-            retention_days: 7,
-            max_total_bytes: 16 * 1024 * 1024,
         })
         .expect("create disabled server log store")
     }
@@ -199,55 +171,76 @@ impl ServerLogStore {
                 config.root.display()
             ))
         })?;
-        let stored_event_bytes = cleanup_files(&config)?;
         let cursor_key = load_or_create_cursor_key(&config.root)?;
         let mut catalog = Catalog::default();
         load_stream_cursors(&config.root, &mut catalog)?;
-        recover_catalog_from_event_files(&config.root, &mut catalog, cursor_key)?;
-        prune_public_window(&mut catalog.public_recent, Utc::now().timestamp_millis());
+        let recovered_cursors = recover_catalog_from_event_files(&config.root, &mut catalog)?;
+        persist_recovered_stream_cursors(&config.root, &catalog, recovered_cursors)?;
         Ok(Self {
             config,
             catalog: Mutex::new(catalog),
             cursor_key,
-            stored_event_bytes: AtomicU64::new(stored_event_bytes),
             ingest_slots: Arc::new(Semaphore::new(4)),
             query_slots: Arc::new(Semaphore::new(4)),
         })
     }
 
-    pub fn config(&self) -> &ServerLogRuntimeConfig {
-        &self.config
+    pub(crate) fn installation_ids_with_log_state(&self) -> Result<HashSet<String>, AppError> {
+        let catalog = self
+            .catalog
+            .lock()
+            .map_err(|_| AppError::Internal("server log catalog lock poisoned".into()))?;
+        Ok(catalog
+            .streams
+            .keys()
+            .map(|(installation_id, _)| installation_id.clone())
+            .collect())
     }
 
-    pub fn spawn_maintenance(self: &Arc<Self>) {
+    pub(crate) async fn remove_installations(
+        self: &Arc<Self>,
+        installation_ids: HashSet<String>,
+    ) -> Result<usize, AppError> {
         let store = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(MAINTENANCE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let store = Arc::clone(&store);
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut catalog = store.catalog.lock().map_err(|_| {
-                        AppError::Internal("server log catalog lock poisoned".into())
-                    })?;
-                    let stored_event_bytes = cleanup_files(&store.config)?;
-                    store
-                        .stored_event_bytes
-                        .store(stored_event_bytes, Ordering::Release);
-                    catalog.streams.retain(|(installation_id, stream_id), _| {
-                        stream_has_persistent_state(&store.config.root, installation_id, stream_id)
-                    });
-                    Ok::<(), AppError>(())
-                })
-                .await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "server log maintenance failed"),
-                    Err(error) => tracing::warn!(%error, "join server log maintenance failed"),
+        tokio::task::spawn_blocking(move || store.remove_installations_sync(&installation_ids))
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("join server log orphan cleanup failed: {error}"))
+            })?
+    }
+
+    fn remove_installations_sync(
+        &self,
+        installation_ids: &HashSet<String>,
+    ) -> Result<usize, AppError> {
+        let mut catalog = self
+            .catalog
+            .lock()
+            .map_err(|_| AppError::Internal("server log catalog lock poisoned".into()))?;
+        let mut removed = 0;
+        for installation_id in installation_ids {
+            if !catalog
+                .streams
+                .keys()
+                .any(|(candidate, _)| candidate == installation_id)
+            {
+                continue;
+            }
+            match fs::remove_dir_all(installation_directory(&self.config.root, installation_id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::Internal(format!(
+                        "remove orphaned server log installation failed: {error}"
+                    )));
                 }
             }
-        });
+            catalog
+                .streams
+                .retain(|(candidate, _), _| candidate != installation_id);
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     async fn ingest(
@@ -281,18 +274,20 @@ impl ServerLogStore {
         installation_id: String,
         payload: InstallationLogBatchPayload,
     ) -> Result<InstallationLogBatchResponse, AppError> {
-        let received_at_ms = Utc::now().timestamp_millis();
-        let day = utc_day(received_at_ms);
-        let key = (installation_id.clone(), payload.stream_id.clone());
+        let stream_key = (installation_id.clone(), payload.stream_id.clone());
         let mut catalog = self
             .catalog
             .lock()
             .map_err(|_| AppError::Internal("server log catalog lock poisoned".into()))?;
-        let stream = catalog.streams.entry(key).or_insert_with(|| StreamState {
-            last_sequence: 0,
-            active_day: day.clone(),
-        });
-        let next_sequence = stream.last_sequence.saturating_add(1);
+        let received_at_ms = Utc::now()
+            .timestamp_millis()
+            .max(catalog.last_received_at_ms.saturating_add(1));
+        let last_sequence = catalog
+            .streams
+            .get(&stream_key)
+            .map(|stream| stream.last_sequence)
+            .unwrap_or_default();
+        let next_sequence = last_sequence.saturating_add(1);
         let new_events = payload
             .events
             .iter()
@@ -325,26 +320,24 @@ impl ServerLogStore {
             }
         }
 
-        let directory = stream_directory(&self.config.root, &installation_id, &payload.stream_id);
-        create_private_directory(&directory).map_err(|error| {
+        let installation_directory = installation_directory(&self.config.root, &installation_id);
+        let stream_directory =
+            stream_directory(&self.config.root, &installation_id, &payload.stream_id);
+        create_private_directory(&installation_directory).map_err(|error| {
+            AppError::Internal(format!(
+                "create server log installation directory failed: {error}"
+            ))
+        })?;
+        create_private_directory(&stream_directory).map_err(|error| {
             AppError::Internal(format!(
                 "create server log stream directory failed: {error}"
             ))
         })?;
-        if stream.active_day != day {
-            rotate_active_file(&directory, &stream.active_day)?;
-            stream.active_day = day.clone();
-        }
-        let active_path = directory.join(format!("active-{day}.jsonl"));
-        repair_trailing_partial_line(&active_path)?;
-        if active_path.metadata().map(|meta| meta.len()).unwrap_or(0) >= SEGMENT_MAX_BYTES {
-            rotate_active_file(&directory, &day)?;
-        }
 
         let alias = client_alias(&self.cursor_key, &installation_id);
-        let mut records = Vec::with_capacity(new_events.len());
-        for event in new_events {
-            records.push(StoredServerLogEvent {
+        let records = new_events
+            .into_iter()
+            .map(|event| StoredServerLogEvent {
                 event_id: event_id(&installation_id, &payload.stream_id, event.sequence),
                 installation_id: installation_id.clone(),
                 client_alias: alias.clone(),
@@ -360,44 +353,35 @@ impl ServerLogStore {
                 line: event.line,
                 server_version: bounded_text(&payload.server_version, 128),
                 commit_id: bounded_text(&payload.commit_id, 128),
-            });
-        }
-        let appended_bytes = append_records(&active_path, &records)?;
-        let approximate_stored_bytes = self
-            .stored_event_bytes
-            .fetch_add(appended_bytes, Ordering::AcqRel)
-            .saturating_add(appended_bytes);
+            })
+            .collect::<Vec<_>>();
+
+        append_bounded_records(
+            &installation_directory.join(EVENTS_FILE),
+            &records,
+            MAX_RETAINED_LINES_PER_CLIENT,
+        )?;
+        let accepted = records.len();
         let last_sequence = records
             .last()
             .map(|event| event.sequence)
-            .unwrap_or(stream.last_sequence);
-        stream.last_sequence = last_sequence;
+            .unwrap_or(last_sequence);
         write_json_atomic(
-            &directory.join("cursor.json"),
+            &stream_directory.join("cursor.json"),
             &StreamCursorFile {
                 installation_id,
                 stream_id: payload.stream_id,
                 last_sequence,
-                active_day: stream.active_day.clone(),
                 updated_at_ms: received_at_ms,
             },
         )?;
-        for record in &records {
-            catalog.public_recent.push_back(record.clone());
-        }
-        prune_public_window(&mut catalog.public_recent, received_at_ms);
-        if approximate_stored_bytes > self.config.max_total_bytes {
-            match cleanup_files(&self.config) {
-                Ok(stored_event_bytes) => self
-                    .stored_event_bytes
-                    .store(stored_event_bytes, Ordering::Release),
-                Err(error) => tracing::warn!(%error, "server log capacity cleanup failed"),
-            }
-        }
+        catalog.streams.entry(stream_key).or_default().last_sequence = last_sequence;
+        catalog.last_received_at_ms = received_at_ms;
         drop(catalog);
+
         Ok(InstallationLogBatchResponse {
             ok: true,
-            accepted: records.len(),
+            accepted,
             next_sequence: last_sequence.saturating_add(1),
         })
     }
@@ -427,81 +411,48 @@ impl ServerLogStore {
     ) -> Result<ServerLogEventsResponse, AppError> {
         let limit = query
             .limit
-            .unwrap_or(DEFAULT_QUERY_LIMIT)
-            .clamp(1, MAX_QUERY_LIMIT);
-        let cursor = query
-            .cursor
-            .as_deref()
-            .map(|value| decode_cursor(value, &self.cursor_key))
-            .transpose()?;
-        let search = query
-            .search
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase);
+            .unwrap_or(access.visible_line_limit)
+            .clamp(1, access.visible_line_limit);
         let level = query
             .level
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_ascii_lowercase);
-
-        let mut records = if access.public_only {
-            let now_ms = Utc::now().timestamp_millis();
-            let mut catalog = self
-                .catalog
-                .lock()
-                .map_err(|_| AppError::Internal("server log catalog lock poisoned".into()))?;
-            prune_public_window(&mut catalog.public_recent, now_ms);
-            catalog
-                .public_recent
-                .iter()
-                .filter(|event| is_public_window_event(event, now_ms))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            read_query_records(&self.config.root, &access, &query, cursor.as_ref(), limit)?
-        };
+        let search = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let mut records = Vec::new();
+        read_records_file(
+            &installation_directory(&self.config.root, &access.installation_id).join(EVENTS_FILE),
+            &mut records,
+        )?;
+        records.retain(|event| event.installation_id == access.installation_id);
+        records.sort_by(compare_events_descending);
+        if access.public_only {
+            records.truncate(PUBLIC_VISIBLE_LINES_PER_CLIENT);
+        }
         records.retain(|event| {
             event_matches_query(
                 event,
-                &access,
+                access.public_only,
                 &query,
-                cursor.as_ref(),
                 level.as_deref(),
                 search.as_deref(),
             )
         });
-        records.sort_by(|left, right| {
-            right
-                .received_at_ms
-                .cmp(&left.received_at_ms)
-                .then_with(|| right.event_id.cmp(&left.event_id))
-        });
-        let has_more = records.len() > limit;
         records.truncate(limit);
-        let next_cursor = has_more
-            .then(|| records.last())
-            .flatten()
-            .map(|event| {
-                encode_cursor(
-                    &CursorPayload {
-                        received_at_ms: event.received_at_ms,
-                        event_id: event.event_id.clone(),
-                    },
-                    &self.cursor_key,
-                )
-            })
-            .transpose()?;
         let events = records
             .into_iter()
             .map(|event| ServerLogEventView::from_stored(event, access.public_only))
             .collect();
         Ok(ServerLogEventsResponse {
             events,
-            next_cursor,
-            public_window_seconds: access.public_only.then_some(300),
+            visible_line_limit: access.visible_line_limit,
+            retained_line_limit: MAX_RETAINED_LINES_PER_CLIENT,
         })
     }
 }
@@ -509,21 +460,19 @@ impl ServerLogStore {
 #[derive(Debug, Clone)]
 struct QueryAccess {
     public_only: bool,
-    all_installations: bool,
-    installation_ids: HashSet<String>,
+    installation_id: String,
+    visible_line_limit: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ServerLogQuery {
-    scope: Option<String>,
-    installation_id: Option<String>,
+    client_alias: Option<String>,
     level: Option<String>,
     search: Option<String>,
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     limit: Option<usize>,
-    cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -595,18 +544,18 @@ impl ServerLogEventView {
 #[serde(rename_all = "camelCase")]
 struct ServerLogEventsResponse {
     events: Vec<ServerLogEventView>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    public_window_seconds: Option<u32>,
+    visible_line_limit: usize,
+    retained_line_limit: usize,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerLogClientView {
-    installation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installation_id: Option<String>,
     client_alias: String,
     owned: bool,
+    full_log_access: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     subdomain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -619,8 +568,8 @@ struct ServerLogClientView {
     country_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<String>,
-    created_at: chrono::DateTime<Utc>,
-    last_seen_at: chrono::DateTime<Utc>,
+    created_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tunnel_enabled: Option<bool>,
 }
@@ -630,18 +579,25 @@ impl ServerLogClientView {
         record: crate::store::ServerLogClientRecord,
         state: &ServerState,
         owned: bool,
+        full_log_access: bool,
     ) -> Self {
-        let tunnel_url = record
-            .subdomain
-            .as_deref()
-            .map(|subdomain| state.config.tunnel_url(subdomain));
+        let client_alias = client_alias(&state.server_logs.cursor_key, &record.installation_id);
+        let tunnel_url = full_log_access
+            .then(|| {
+                record
+                    .subdomain
+                    .as_deref()
+                    .map(|subdomain| state.config.tunnel_url(subdomain))
+            })
+            .flatten();
         Self {
-            client_alias: client_alias(&state.server_logs.cursor_key, &record.installation_id),
-            installation_id: record.installation_id,
+            installation_id: full_log_access.then_some(record.installation_id),
+            client_alias,
             owned,
+            full_log_access,
             subdomain: record.subdomain,
             tunnel_url,
-            owner_email: record.owner_email,
+            owner_email: full_log_access.then_some(record.owner_email).flatten(),
             platform: record.platform,
             app_version: record.app_version,
             country_code: record.country_code,
@@ -657,20 +613,12 @@ impl ServerLogClientView {
 #[serde(rename_all = "camelCase")]
 struct ServerLogMetaResponse {
     ingest_enabled: bool,
-    public_enabled: bool,
     authenticated: bool,
-    is_admin: bool,
-    scopes: Vec<String>,
+    is_router_owner: bool,
     clients: Vec<ServerLogClientView>,
-    retention_days: u32,
-    public_window_seconds: u32,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CursorPayload {
-    received_at_ms: i64,
-    event_id: String,
+    retained_line_limit: usize,
+    public_line_limit: usize,
+    poll_interval_seconds: u32,
 }
 
 pub fn router() -> Router<ServerState> {
@@ -706,13 +654,10 @@ async fn server_log_meta(
     headers: HeaderMap,
 ) -> Result<Json<ServerLogMetaResponse>, AppError> {
     let session = crate::api::resolve_router_session(&state, &headers).await?;
-    let dynamic = state.dynamic.read().await;
-    let public_enabled = dynamic.server_log_public_enabled;
     let authenticated = session.is_some();
-    let is_admin = session
+    let is_router_owner = session
         .as_ref()
-        .is_some_and(|session| dynamic.is_admin(&session.email));
-    drop(dynamic);
+        .is_some_and(|session| session_is_router_owner(&state, &session.email));
     let owned_installation_ids = if let Some(session) = session.as_ref() {
         state
             .store
@@ -723,41 +668,30 @@ async fn server_log_meta(
     } else {
         HashSet::new()
     };
-    let clients = if authenticated {
-        let visible_installation_ids = (!is_admin).then_some(&owned_installation_ids);
-        state
-            .store
-            .list_server_log_client_records(visible_installation_ids)
-            .await?
-            .into_iter()
-            .filter(|record| is_admin || owned_installation_ids.contains(&record.installation_id))
-            .map(|record| {
-                let owned = owned_installation_ids.contains(&record.installation_id);
-                ServerLogClientView::from_record(record, &state, owned)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut scopes = Vec::new();
-    if public_enabled {
-        scopes.push("public".to_string());
-    }
-    if authenticated {
-        scopes.push("mine".to_string());
-    }
-    if is_admin {
-        scopes.push("all".to_string());
-    }
+    let log_installation_ids = state.server_logs.installation_ids_with_log_state()?;
+    let clients = state
+        .store
+        .list_server_log_client_records(Some(&log_installation_ids))
+        .await?
+        .into_iter()
+        .map(|record| {
+            let owned = owned_installation_ids.contains(&record.installation_id);
+            let full_log_access = has_full_log_access(
+                is_router_owner,
+                &owned_installation_ids,
+                &record.installation_id,
+            );
+            ServerLogClientView::from_record(record, &state, owned, full_log_access)
+        })
+        .collect();
     Ok(Json(ServerLogMetaResponse {
         ingest_enabled: state.server_logs.config.enabled,
-        public_enabled,
         authenticated,
-        is_admin,
-        scopes,
+        is_router_owner,
         clients,
-        retention_days: state.server_logs.config.retention_days,
-        public_window_seconds: 300,
+        retained_line_limit: MAX_RETAINED_LINES_PER_CLIENT,
+        public_line_limit: PUBLIC_VISIBLE_LINES_PER_CLIENT,
+        poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
     }))
 }
 
@@ -766,8 +700,7 @@ async fn server_log_events(
     headers: HeaderMap,
     Query(query): Query<ServerLogQuery>,
 ) -> Result<Json<ServerLogEventsResponse>, AppError> {
-    let access = resolve_query_access(&state, &headers, query.scope.as_deref()).await?;
-    validate_requested_installation(&access, query.installation_id.as_deref())?;
+    let access = resolve_query_access(&state, &headers, query.client_alias.as_deref()).await?;
     let mut response = state.server_logs.query(access, query).await?;
     enrich_client_subdomains(&state, &mut response).await?;
     Ok(Json(response))
@@ -778,15 +711,9 @@ async fn server_log_export(
     headers: HeaderMap,
     Query(mut query): Query<ServerLogQuery>,
 ) -> Result<Response, AppError> {
-    let access = resolve_query_access(&state, &headers, query.scope.as_deref()).await?;
-    if access.public_only {
-        return Err(AppError::Unauthorized(
-            "login required to export server logs".into(),
-        ));
-    }
-    validate_requested_installation(&access, query.installation_id.as_deref())?;
-    query.limit = Some(MAX_QUERY_LIMIT);
-    query.cursor = None;
+    let access = resolve_query_access(&state, &headers, query.client_alias.as_deref()).await?;
+    ensure_export_allowed(&access)?;
+    query.limit = Some(MAX_RETAINED_LINES_PER_CLIENT);
     let mut response = state.server_logs.query(access, query).await?;
     enrich_client_subdomains(&state, &mut response).await?;
     let mut body = String::new();
@@ -838,99 +765,78 @@ fn apply_client_subdomains(
 async fn resolve_query_access(
     state: &ServerState,
     headers: &HeaderMap,
-    requested_scope: Option<&str>,
+    requested_alias: Option<&str>,
 ) -> Result<QueryAccess, AppError> {
-    let session = crate::api::resolve_router_session(state, headers).await?;
-    let public_enabled = state.dynamic.read().await.server_log_public_enabled;
-    let scope = requested_scope
+    let requested_alias = requested_alias
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(if session.is_some() { "mine" } else { "public" });
-    let is_admin = if let Some(session) = session.as_ref() {
-        state.dynamic.read().await.is_admin(&session.email)
-    } else {
-        false
-    };
-    let installation_ids = match (scope, session.as_ref()) {
-        ("mine", Some(session)) => state
+        .ok_or_else(|| AppError::BadRequest("server log clientAlias is required".into()))?;
+    let log_installation_ids = state.server_logs.installation_ids_with_log_state()?;
+    let installation_id = state
+        .store
+        .list_server_log_client_records(Some(&log_installation_ids))
+        .await?
+        .into_iter()
+        .map(|record| record.installation_id)
+        .find(|installation_id| {
+            client_alias(&state.server_logs.cursor_key, installation_id) == requested_alias
+        })
+        .ok_or_else(|| AppError::NotFound("server log client not found".into()))?;
+    let session = crate::api::resolve_router_session(state, headers).await?;
+    let is_router_owner = session
+        .as_ref()
+        .is_some_and(|session| session_is_router_owner(state, &session.email));
+    let owned_installation_ids = if let Some(session) = session.as_ref() {
+        state
             .store
             .list_verified_installation_ids_for_owner(&session.email)
             .await?
             .into_iter()
-            .collect(),
-        _ => HashSet::new(),
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
     };
-    authorize_query_access(
-        public_enabled,
-        session.is_some(),
-        is_admin,
-        installation_ids,
-        scope,
-    )
+    Ok(query_access_for_installation(
+        installation_id.clone(),
+        has_full_log_access(is_router_owner, &owned_installation_ids, &installation_id),
+    ))
 }
 
-fn authorize_query_access(
-    public_enabled: bool,
-    authenticated: bool,
-    is_admin: bool,
-    installation_ids: HashSet<String>,
-    scope: &str,
-) -> Result<QueryAccess, AppError> {
-    match scope {
-        "public" if public_enabled => Ok(QueryAccess {
-            public_only: true,
-            all_installations: false,
-            installation_ids: HashSet::new(),
-        }),
-        "public" => Err(AppError::Forbidden(
-            "public server logs are disabled".into(),
-        )),
-        "mine" => {
-            if !authenticated {
-                return Err(AppError::Unauthorized(
-                    "login required for server logs".into(),
-                ));
-            }
-            Ok(QueryAccess {
-                public_only: false,
-                all_installations: false,
-                installation_ids,
-            })
-        }
-        "all" => {
-            if !authenticated {
-                return Err(AppError::Unauthorized(
-                    "login required for server logs".into(),
-                ));
-            }
-            if !is_admin {
-                return Err(AppError::Forbidden(
-                    "admin privilege required for all server logs".into(),
-                ));
-            }
-            Ok(QueryAccess {
-                public_only: false,
-                all_installations: true,
-                installation_ids: HashSet::new(),
-            })
-        }
-        _ => Err(AppError::BadRequest(
-            "server log scope must be public, mine, or all".into(),
-        )),
+fn session_is_router_owner(state: &ServerState, email: &str) -> bool {
+    state
+        .config
+        .official_provider_email()
+        .is_some_and(|owner_email| owner_email.eq_ignore_ascii_case(email.trim()))
+}
+
+fn has_full_log_access(
+    is_router_owner: bool,
+    owned_installation_ids: &HashSet<String>,
+    installation_id: &str,
+) -> bool {
+    is_router_owner || owned_installation_ids.contains(installation_id)
+}
+
+fn query_access_for_installation(installation_id: String, full_log_access: bool) -> QueryAccess {
+    QueryAccess {
+        public_only: !full_log_access,
+        installation_id,
+        visible_line_limit: if full_log_access {
+            MAX_RETAINED_LINES_PER_CLIENT
+        } else {
+            PUBLIC_VISIBLE_LINES_PER_CLIENT
+        },
     }
 }
 
-fn validate_requested_installation(
-    access: &QueryAccess,
-    requested: Option<&str>,
-) -> Result<(), AppError> {
-    if requested.is_some_and(|installation_id| {
-        access.public_only
-            || (!access.all_installations && !access.installation_ids.contains(installation_id))
-    }) {
-        return Err(AppError::NotFound("server log client not found".into()));
+fn ensure_export_allowed(access: &QueryAccess) -> Result<(), AppError> {
+    if access.public_only {
+        Err(AppError::Forbidden(
+            "full Client log access is required to export logs".into(),
+        ))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn validate_batch(payload: &InstallationLogBatchPayload) -> Result<(), AppError> {
@@ -979,284 +885,55 @@ fn validate_batch(payload: &InstallationLogBatchPayload) -> Result<(), AppError>
     Ok(())
 }
 
-fn append_records(path: &Path, records: &[StoredServerLogEvent]) -> Result<u64, AppError> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| AppError::Internal(format!("open server log file failed: {error}")))?;
-    let previous_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    for record in records {
-        serde_json::to_writer(&mut file, record).map_err(|error| {
-            AppError::Internal(format!("encode server log event failed: {error}"))
-        })?;
-        file.write_all(b"\n").map_err(|error| {
-            AppError::Internal(format!("append server log event failed: {error}"))
-        })?;
-    }
-    file.sync_data()
-        .map_err(|error| AppError::Internal(format!("sync server log file failed: {error}")))?;
-    Ok(file
-        .metadata()
-        .map(|metadata| metadata.len().saturating_sub(previous_len))
-        .unwrap_or(0))
-}
-
-fn rotate_active_file(directory: &Path, day: &str) -> Result<(), AppError> {
-    let source = directory.join(format!("active-{day}.jsonl"));
-    if !source.is_file() || source.metadata().map(|meta| meta.len()).unwrap_or(0) == 0 {
-        return Ok(());
-    }
-    repair_trailing_partial_line(&source)?;
-    let suffix = format!(
-        "{}-{:016x}",
-        Utc::now().timestamp_millis(),
-        rand::thread_rng().next_u64()
-    );
-    let destination = directory.join(format!("segment-{day}-{suffix}.jsonl.gz"));
-    let temporary = directory.join(format!(".segment-{day}-{suffix}.jsonl.gz.new"));
-    let mut input = File::open(&source)
-        .map_err(|error| AppError::Internal(format!("open log segment failed: {error}")))?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let output = options.open(&temporary).map_err(|error| {
-        AppError::Internal(format!("create compressed log segment failed: {error}"))
-    })?;
-    let mut encoder = GzEncoder::new(output, Compression::default());
-    let compression_result = (|| {
-        std::io::copy(&mut input, &mut encoder).map_err(|error| {
-            AppError::Internal(format!("compress server log segment failed: {error}"))
-        })?;
-        let output = encoder.finish().map_err(|error| {
-            AppError::Internal(format!("finish server log segment failed: {error}"))
-        })?;
-        output
-            .sync_all()
-            .map_err(|error| AppError::Internal(format!("sync server log segment failed: {error}")))
-    })();
-    if let Err(error) = compression_result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&temporary, &destination) {
-        let _ = fs::remove_file(&temporary);
-        return Err(AppError::Internal(format!(
-            "publish compressed server log segment failed: {error}"
-        )));
-    }
-    fs::remove_file(&source).map_err(|error| {
-        AppError::Internal(format!("remove rotated server log file failed: {error}"))
-    })?;
-    Ok(())
-}
-
-fn repair_trailing_partial_line(path: &Path) -> Result<(), AppError> {
-    let Ok(mut file) = OpenOptions::new().read(true).write(true).open(path) else {
-        return Ok(());
-    };
-    let length = file
-        .metadata()
-        .map_err(|error| AppError::Internal(format!("inspect server log file failed: {error}")))?
-        .len();
-    if length == 0 {
-        return Ok(());
-    }
-    file.seek(SeekFrom::End(-1))
-        .map_err(|error| AppError::Internal(format!("seek server log file failed: {error}")))?;
-    let mut last = [0u8; 1];
-    file.read_exact(&mut last)
-        .map_err(|error| AppError::Internal(format!("read server log tail failed: {error}")))?;
-    if last[0] == b'\n' {
-        return Ok(());
-    }
-    let mut position = length;
-    let mut buffer = [0u8; 4096];
-    while position > 0 {
-        let chunk = position.min(buffer.len() as u64) as usize;
-        position -= chunk as u64;
-        file.seek(SeekFrom::Start(position)).map_err(|error| {
-            AppError::Internal(format!("seek server log recovery failed: {error}"))
-        })?;
-        file.read_exact(&mut buffer[..chunk]).map_err(|error| {
-            AppError::Internal(format!("read server log recovery failed: {error}"))
-        })?;
-        if let Some(index) = buffer[..chunk].iter().rposition(|byte| *byte == b'\n') {
-            file.set_len(position + index as u64 + 1).map_err(|error| {
-                AppError::Internal(format!("truncate partial server log event failed: {error}"))
-            })?;
-            return Ok(());
-        }
-    }
-    file.set_len(0).map_err(|error| {
-        AppError::Internal(format!("truncate invalid server log file failed: {error}"))
-    })
-}
-
-fn read_query_records(
-    root: &Path,
-    access: &QueryAccess,
-    query: &ServerLogQuery,
-    cursor: Option<&CursorPayload>,
-    limit: usize,
-) -> Result<Vec<StoredServerLogEvent>, AppError> {
-    let level = query
-        .level
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase);
-    let search = query
-        .search
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase);
-    let mut files = event_files_for_access(root, access, query.installation_id.as_deref())?
-        .into_iter()
-        .map(|path| {
-            let modified_at_ms = path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-                .unwrap_or(i64::MAX);
-            (path, modified_at_ms)
-        })
-        .collect::<Vec<_>>();
-    files.sort_by(|left, right| right.1.cmp(&left.1));
-
+fn append_bounded_records(
+    path: &Path,
+    incoming: &[StoredServerLogEvent],
+    max_records: usize,
+) -> Result<(), AppError> {
     let mut records = Vec::new();
-    for (index, (path, _)) in files.iter().enumerate() {
-        let mut from_file = Vec::new();
-        read_records_file(path, &mut from_file)?;
-        from_file.retain(|event| {
-            event_matches_query(
-                event,
-                access,
-                query,
-                cursor,
-                level.as_deref(),
-                search.as_deref(),
-            )
-        });
-        records.extend(from_file);
-        records.sort_by(compare_events_descending);
-        records.dedup_by(|left, right| left.event_id == right.event_id);
-        records.truncate(limit.saturating_add(1));
-
-        if records.len() > limit {
-            let oldest_selected = records
-                .last()
-                .map(|event| event.received_at_ms)
-                .unwrap_or(i64::MIN);
-            let next_file_upper_bound = files
-                .get(index + 1)
-                .map(|(_, modified_at_ms)| *modified_at_ms)
-                .unwrap_or(i64::MIN);
-            if next_file_upper_bound.saturating_add(2_000) < oldest_selected {
-                break;
-            }
-        }
+    read_records_file(path, &mut records)?;
+    let mut event_ids = HashSet::new();
+    records.retain(|record| event_ids.insert(record.event_id.clone()));
+    records.extend(
+        incoming
+            .iter()
+            .filter(|record| event_ids.insert(record.event_id.clone()))
+            .cloned(),
+    );
+    if records.len() > max_records {
+        records.drain(..records.len() - max_records);
     }
-    Ok(records)
+    write_records_atomic(path, &records)
 }
 
-fn event_files_for_access(
-    root: &Path,
-    access: &QueryAccess,
-    requested_installation: Option<&str>,
-) -> Result<Vec<PathBuf>, AppError> {
-    let mut files = Vec::new();
-    if let Some(installation_id) = requested_installation {
-        collect_event_files(&root.join(hash_component(installation_id)), &mut files).map_err(
-            |error| AppError::Internal(format!("scan server log directory failed: {error}")),
-        )?;
-    } else if access.all_installations {
-        collect_event_files(root, &mut files).map_err(|error| {
-            AppError::Internal(format!("scan server log directory failed: {error}"))
+fn write_records_atomic(path: &Path, records: &[StoredServerLogEvent]) -> Result<(), AppError> {
+    let temporary = path.with_extension("jsonl.new");
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|error| {
+            AppError::Internal(format!("create bounded server log file failed: {error}"))
         })?;
-    } else {
-        for installation_id in &access.installation_ids {
-            collect_event_files(&root.join(hash_component(installation_id)), &mut files).map_err(
-                |error| AppError::Internal(format!("scan server log directory failed: {error}")),
-            )?;
+        for record in records {
+            serde_json::to_writer(&mut file, record).map_err(|error| {
+                AppError::Internal(format!("encode server log event failed: {error}"))
+            })?;
+            file.write_all(b"\n").map_err(|error| {
+                AppError::Internal(format!("write server log event failed: {error}"))
+            })?;
         }
+        file.sync_all().map_err(|error| {
+            AppError::Internal(format!("sync bounded server log file failed: {error}"))
+        })?;
     }
-    Ok(files)
-}
-
-fn event_matches_query(
-    event: &StoredServerLogEvent,
-    access: &QueryAccess,
-    query: &ServerLogQuery,
-    cursor: Option<&CursorPayload>,
-    level: Option<&str>,
-    search: Option<&str>,
-) -> bool {
-    if !access.public_only
-        && !access.all_installations
-        && !access.installation_ids.contains(&event.installation_id)
-    {
-        return false;
-    }
-    if let Some(requested) = query.installation_id.as_deref() {
-        if access.public_only || event.installation_id != requested {
-            return false;
-        }
-    }
-    if query
-        .from_ms
-        .is_some_and(|from| event.received_at_ms < from)
-        || query.to_ms.is_some_and(|to| event.received_at_ms > to)
-        || level.is_some_and(|level| event.level != level)
-    {
-        return false;
-    }
-    if let Some(search) = search {
-        let (target, message) = if access.public_only {
-            (
-                public_message(&event.target),
-                public_message(&event.message),
-            )
-        } else {
-            (event.target.clone(), event.message.clone())
-        };
-        if !format!("{target} {message}")
-            .to_ascii_lowercase()
-            .contains(search)
-        {
-            return false;
-        }
-    }
-    if let Some(cursor) = cursor {
-        if (event.received_at_ms, event.event_id.as_str())
-            >= (cursor.received_at_ms, cursor.event_id.as_str())
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn compare_events_descending(
-    left: &StoredServerLogEvent,
-    right: &StoredServerLogEvent,
-) -> std::cmp::Ordering {
-    right
-        .received_at_ms
-        .cmp(&left.received_at_ms)
-        .then_with(|| right.event_id.cmp(&left.event_id))
+    fs::rename(&temporary, path).map_err(|error| {
+        AppError::Internal(format!("replace bounded server log file failed: {error}"))
+    })
 }
 
 fn read_records_file(path: &Path, records: &mut Vec<StoredServerLogEvent>) -> Result<(), AppError> {
@@ -1265,15 +942,11 @@ fn read_records_file(path: &Path, records: &mut Vec<StoredServerLogEvent>) -> Re
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(AppError::Internal(format!(
-                "open server log segment failed: {error}"
+                "open server log file failed: {error}"
             )));
         }
     };
-    if path.extension().and_then(|value| value.to_str()) == Some("gz") {
-        read_record_lines(BufReader::new(GzDecoder::new(file)), records)
-    } else {
-        read_record_lines(BufReader::new(file), records)
-    }
+    read_record_lines(BufReader::new(file), records)
 }
 
 fn read_record_lines<R: BufRead>(
@@ -1294,6 +967,56 @@ fn read_record_lines<R: BufRead>(
     Ok(())
 }
 
+fn event_matches_query(
+    event: &StoredServerLogEvent,
+    public: bool,
+    query: &ServerLogQuery,
+    level: Option<&str>,
+    search: Option<&str>,
+) -> bool {
+    if query
+        .from_ms
+        .is_some_and(|from| event.received_at_ms < from)
+        || query.to_ms.is_some_and(|to| event.received_at_ms > to)
+        || level.is_some_and(|level| event.level != level)
+    {
+        return false;
+    }
+    if let Some(search) = search {
+        let (target, message) = if public {
+            (
+                public_message(&event.target),
+                public_message(&event.message),
+            )
+        } else {
+            (event.target.clone(), event.message.clone())
+        };
+        if !format!("{target} {message}")
+            .to_ascii_lowercase()
+            .contains(search)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn compare_events_descending(
+    left: &StoredServerLogEvent,
+    right: &StoredServerLogEvent,
+) -> std::cmp::Ordering {
+    right
+        .received_at_ms
+        .cmp(&left.received_at_ms)
+        .then_with(|| {
+            if left.stream_id == right.stream_id {
+                right.sequence.cmp(&left.sequence)
+            } else {
+                right.event_id.cmp(&left.event_id)
+            }
+        })
+}
+
 fn event_files(root: &Path) -> Result<Vec<PathBuf>, AppError> {
     let mut files = Vec::new();
     collect_event_files(root, &mut files).map_err(|error| {
@@ -1307,18 +1030,10 @@ fn collect_event_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::R
         return Ok(());
     }
     for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
+        let path = entry?.path();
         if path.is_dir() {
             collect_event_files(&path, files)?;
-        } else if path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| {
-                (name.starts_with("active-") && name.ends_with(".jsonl"))
-                    || (name.starts_with("segment-") && name.ends_with(".jsonl.gz"))
-            })
-        {
+        } else if path.file_name().and_then(|value| value.to_str()) == Some(EVENTS_FILE) {
             files.push(path);
         }
     }
@@ -1340,18 +1055,16 @@ fn load_stream_cursors(root: &Path, catalog: &mut Catalog) -> Result<(), AppErro
                 .path();
             if path.is_dir() {
                 visit(&path, catalog)?;
-            } else if path.file_name().and_then(|value| value.to_str()) == Some("cursor.json") {
-                if let Ok(bytes) = fs::read(&path) {
-                    if let Ok(cursor) = serde_json::from_slice::<StreamCursorFile>(&bytes) {
-                        catalog.streams.insert(
-                            (cursor.installation_id, cursor.stream_id),
-                            StreamState {
-                                last_sequence: cursor.last_sequence,
-                                active_day: cursor.active_day,
-                            },
-                        );
-                    }
-                }
+            } else if path.file_name().and_then(|value| value.to_str()) == Some("cursor.json")
+                && let Ok(bytes) = fs::read(&path)
+                && let Ok(cursor) = serde_json::from_slice::<StreamCursorFile>(&bytes)
+            {
+                catalog.streams.insert(
+                    (cursor.installation_id, cursor.stream_id),
+                    StreamState {
+                        last_sequence: cursor.last_sequence,
+                    },
+                );
             }
         }
         Ok(())
@@ -1362,151 +1075,56 @@ fn load_stream_cursors(root: &Path, catalog: &mut Catalog) -> Result<(), AppErro
 fn recover_catalog_from_event_files(
     root: &Path,
     catalog: &mut Catalog,
-    cursor_key: [u8; 32],
-) -> Result<(), AppError> {
-    let cutoff = Utc::now().timestamp_millis() - PUBLIC_WINDOW_MS;
+) -> Result<HashMap<(String, String), i64>, AppError> {
+    let mut recovered_cursors = HashMap::new();
     for path in event_files(root)? {
-        let is_active = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| name.starts_with("active-"));
-        let recently_modified = path
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .is_some_and(|duration| duration.as_millis().min(i64::MAX as u128) as i64 >= cutoff);
-        if !is_active && !recently_modified {
-            continue;
-        }
         let mut records = Vec::new();
         read_records_file(&path, &mut records)?;
-        for mut record in records {
-            record.client_alias = client_alias(&cursor_key, &record.installation_id);
-            let key = (record.installation_id.clone(), record.stream_id.clone());
-            let state = catalog.streams.entry(key).or_insert_with(|| StreamState {
-                last_sequence: 0,
-                active_day: utc_day(record.received_at_ms),
-            });
-            state.last_sequence = state.last_sequence.max(record.sequence);
-            if record.received_at_ms >= cutoff {
-                catalog.public_recent.push_back(record);
+        if records.len() > MAX_RETAINED_LINES_PER_CLIENT {
+            records.drain(..records.len() - MAX_RETAINED_LINES_PER_CLIENT);
+            write_records_atomic(&path, &records)?;
+        }
+        for record in records {
+            catalog.last_received_at_ms = catalog.last_received_at_ms.max(record.received_at_ms);
+            let stream_key = (record.installation_id, record.stream_id);
+            let state = catalog.streams.entry(stream_key.clone()).or_default();
+            if record.sequence > state.last_sequence {
+                state.last_sequence = record.sequence;
+                recovered_cursors.insert(stream_key, record.received_at_ms);
             }
         }
     }
-    catalog
-        .public_recent
-        .make_contiguous()
-        .sort_by_key(|event| event.received_at_ms);
-    Ok(())
+    Ok(recovered_cursors)
 }
 
-fn cleanup_files(config: &ServerLogRuntimeConfig) -> Result<u64, AppError> {
-    let mut files = event_files(&config.root)?
-        .into_iter()
-        .filter_map(|path| {
-            let metadata = path.metadata().ok()?;
-            let modified = metadata.modified().ok()?;
-            Some((path, metadata.len(), modified))
-        })
-        .collect::<Vec<_>>();
-    let now = SystemTime::now();
-    let retention = Duration::from_secs(u64::from(config.retention_days) * 24 * 60 * 60);
-    for (path, _, modified) in &files {
-        if now
-            .duration_since(*modified)
-            .is_ok_and(|age| age > retention)
-        {
-            let _ = fs::remove_file(path);
-        }
-    }
-    files.retain(|(path, _, _)| path.exists());
-    files.sort_by_key(|(_, _, modified)| *modified);
-    let mut total = files.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
-    for (path, bytes, _) in files {
-        if total <= config.max_total_bytes {
-            break;
-        }
-        if fs::remove_file(path).is_ok() {
-            total = total.saturating_sub(bytes);
-        }
-    }
-    cleanup_stale_metadata(&config.root, &config.root, now, retention).map_err(|error| {
-        AppError::Internal(format!("clean server log cursor metadata failed: {error}"))
-    })?;
-    Ok(total)
-}
-
-fn cleanup_stale_metadata(
+fn persist_recovered_stream_cursors(
     root: &Path,
-    directory: &Path,
-    now: SystemTime,
-    retention: Duration,
-) -> std::io::Result<()> {
-    if !directory.exists() {
-        return Ok(());
-    }
-    let entries = fs::read_dir(directory)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    for path in &entries {
-        if path.is_dir() {
-            cleanup_stale_metadata(root, path, now, retention)?;
-        }
-    }
-
-    let remaining = fs::read_dir(directory)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    let has_event_files = remaining.iter().any(|path| is_event_file(path));
-    for path in remaining.iter().filter(|path| path.is_file()) {
-        let name = path.file_name().and_then(|value| value.to_str());
-        let is_cursor = name == Some("cursor.json");
-        let is_temporary =
-            name.is_some_and(|name| name.ends_with(".json.new") || name.ends_with(".gz.new"));
-        if (!is_cursor && !is_temporary) || (is_cursor && has_event_files) {
-            continue;
-        }
-        let stale = path
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > retention);
-        if stale {
-            let _ = fs::remove_file(path);
-        }
-    }
-
-    if directory != root && fs::read_dir(directory)?.next().is_none() {
-        let _ = fs::remove_dir(directory);
+    catalog: &Catalog,
+    recovered_cursors: HashMap<(String, String), i64>,
+) -> Result<(), AppError> {
+    for ((installation_id, stream_id), updated_at_ms) in recovered_cursors {
+        let directory = stream_directory(root, &installation_id, &stream_id);
+        create_private_directory(&directory).map_err(|error| {
+            AppError::Internal(format!(
+                "create recovered server log stream directory failed: {error}"
+            ))
+        })?;
+        let last_sequence = catalog
+            .streams
+            .get(&(installation_id.clone(), stream_id.clone()))
+            .map(|state| state.last_sequence)
+            .ok_or_else(|| AppError::Internal("recovered server log cursor is missing".into()))?;
+        write_json_atomic(
+            &directory.join("cursor.json"),
+            &StreamCursorFile {
+                installation_id,
+                stream_id,
+                last_sequence,
+                updated_at_ms,
+            },
+        )?;
     }
     Ok(())
-}
-
-fn stream_has_persistent_state(root: &Path, installation_id: &str, stream_id: &str) -> bool {
-    let directory = stream_directory(root, installation_id, stream_id);
-    if directory.join("cursor.json").is_file() {
-        return true;
-    }
-    fs::read_dir(directory).is_ok_and(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .any(|entry| is_event_file(&entry.path()))
-    })
-}
-
-fn is_event_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|name| {
-            (name.starts_with("active-") && name.ends_with(".jsonl"))
-                || (name.starts_with("segment-") && name.ends_with(".jsonl.gz"))
-        })
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
@@ -1536,10 +1154,10 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), AppErro
 
 fn load_or_create_cursor_key(root: &Path) -> Result<[u8; 32], AppError> {
     let path = root.join(CURSOR_KEY_FILE);
-    if let Ok(bytes) = fs::read(&path) {
-        if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
-            return Ok(key);
-        }
+    if let Ok(bytes) = fs::read(&path)
+        && let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice())
+    {
+        return Ok(key);
     }
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
@@ -1572,41 +1190,13 @@ fn load_or_create_cursor_key(root: &Path) -> Result<[u8; 32], AppError> {
     }
 }
 
-fn encode_cursor(payload: &CursorPayload, key: &[u8; 32]) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(payload)
-        .map_err(|error| AppError::Internal(format!("encode server log cursor: {error}")))?;
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|_| AppError::Internal("initialize server log cursor signer".into()))?;
-    mac.update(&bytes);
-    let signature = mac.finalize().into_bytes();
-    Ok(format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(bytes),
-        URL_SAFE_NO_PAD.encode(signature)
-    ))
-}
-
-fn decode_cursor(value: &str, key: &[u8; 32]) -> Result<CursorPayload, AppError> {
-    let (payload, signature) = value
-        .split_once('.')
-        .ok_or_else(|| AppError::BadRequest("invalid server log cursor".into()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| AppError::BadRequest("invalid server log cursor".into()))?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(signature)
-        .map_err(|_| AppError::BadRequest("invalid server log cursor".into()))?;
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|_| AppError::Internal("initialize server log cursor verifier".into()))?;
-    mac.update(&bytes);
-    mac.verify_slice(&signature)
-        .map_err(|_| AppError::BadRequest("invalid server log cursor signature".into()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::BadRequest("invalid server log cursor payload".into()))
+fn installation_directory(root: &Path, installation_id: &str) -> PathBuf {
+    root.join(hash_component(installation_id))
 }
 
 fn stream_directory(root: &Path, installation_id: &str, stream_id: &str) -> PathBuf {
-    root.join(hash_component(installation_id))
+    installation_directory(root, installation_id)
+        .join("streams")
         .join(hash_component(stream_id))
 }
 
@@ -1623,33 +1213,7 @@ fn client_alias(key: &[u8; 32], installation_id: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(installation_id.as_bytes());
     let digest = mac.finalize().into_bytes();
-    format!("client-{}", hex::encode(&digest[..5]))
-}
-
-fn utc_day(timestamp_ms: i64) -> String {
-    Utc.timestamp_millis_opt(timestamp_ms)
-        .single()
-        .unwrap_or_else(Utc::now)
-        .format("%Y-%m-%d")
-        .to_string()
-}
-
-fn prune_public_window(events: &mut VecDeque<StoredServerLogEvent>, now_ms: i64) {
-    let cutoff = now_ms - PUBLIC_WINDOW_MS;
-    while events
-        .front()
-        .is_some_and(|event| event.received_at_ms < cutoff)
-    {
-        events.pop_front();
-    }
-    while events.len() > 10_000 {
-        events.pop_front();
-    }
-}
-
-fn is_public_window_event(event: &StoredServerLogEvent, now_ms: i64) -> bool {
-    event.occurred_at_ms >= now_ms.saturating_sub(PUBLIC_WINDOW_MS)
-        && event.occurred_at_ms <= now_ms.saturating_add(PUBLIC_CLOCK_SKEW_MS)
+    format!("client-{}", hex::encode(&digest[..16]))
 }
 
 fn sanitize_fields(fields: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
@@ -1718,29 +1282,42 @@ fn redact_sensitive_text(input: &str) -> String {
         .lines()
         .map(|line| {
             let lower = line.to_ascii_lowercase();
-            if let Some(start) = lower.find("bearer ") {
+            let bearer_start = lower.find("bearer ");
+            let sensitive_assignment = KEYS
+                .iter()
+                .filter_map(|key| find_sensitive_assignment(&lower, key))
+                .min_by_key(|(start, _)| *start);
+            if let Some(start) = bearer_start
+                && sensitive_assignment
+                    .is_none_or(|(assignment_start, _)| start <= assignment_start)
+            {
                 return format!("{}Bearer [REDACTED]", &line[..start]);
             }
-            for key in KEYS {
-                let Some(start) = lower.find(key) else {
-                    continue;
-                };
-                let after_key = start + key.len();
-                let suffix = &line[after_key..];
-                let Some(separator) = suffix
-                    .char_indices()
-                    .find(|(index, character)| *index <= 3 && matches!(character, ':' | '='))
-                    .map(|(index, _)| index)
-                else {
-                    continue;
-                };
-                let end = after_key + separator + 1;
+            if let Some((_, end)) = sensitive_assignment {
                 return format!("{} [REDACTED]", line[..end].trim_end());
             }
             line.to_string()
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn find_sensitive_assignment(line: &str, key: &str) -> Option<(usize, usize)> {
+    let mut search_start = 0;
+    while let Some(relative_start) = line[search_start..].find(key) {
+        let start = search_start + relative_start;
+        let after_key = start + key.len();
+        let separator = line[after_key..]
+            .char_indices()
+            .take_while(|(index, _)| *index <= 3)
+            .find(|(_, character)| matches!(character, ':' | '='))
+            .map(|(index, character)| (index, character.len_utf8()));
+        if let Some((separator, separator_len)) = separator {
+            return Some((start, after_key + separator + separator_len));
+        }
+        search_start = after_key;
+    }
+    None
 }
 
 fn mask_prefixed_secret(input: &str, prefix: &str) -> String {
@@ -1835,104 +1412,79 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-pub fn public_enabled_from_env() -> bool {
-    env_bool("CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED", false)
-}
-
-fn env_u32(key: &str, default: u32, min: u32, max: u32) -> Result<u32, AppError> {
-    let value = std::env::var(key)
-        .ok()
-        .map(|value| value.trim().parse::<u32>())
-        .transpose()
-        .map_err(|_| AppError::Internal(format!("{key} must be an integer")))?
-        .unwrap_or(default);
-    if !(min..=max).contains(&value) {
-        return Err(AppError::Internal(format!(
-            "{key} must be between {min} and {max}"
-        )));
-    }
-    Ok(value)
-}
-
-fn env_u64(key: &str, default: u64, min: u64, max: u64) -> Result<u64, AppError> {
-    let value = std::env::var(key)
-        .ok()
-        .map(|value| value.trim().parse::<u64>())
-        .transpose()
-        .map_err(|_| AppError::Internal(format!("{key} must be an integer")))?
-        .unwrap_or(default);
-    if !(min..=max).contains(&value) {
-        return Err(AppError::Internal(format!(
-            "{key} must be between {min} and {max}"
-        )));
-    }
-    Ok(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cc-switch-router-server-logs-{label}-{}-{:016x}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            rand::thread_rng().next_u64()
+        ))
+    }
+
     fn test_store() -> (Arc<ServerLogStore>, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "cc-switch-router-server-logs-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
+        let root = test_root("store");
         let store = ServerLogStore::open(ServerLogRuntimeConfig {
             enabled: true,
             root: root.clone(),
-            retention_days: 7,
-            max_total_bytes: 16 * 1024 * 1024,
         })
         .expect("open log store");
         (Arc::new(store), root)
     }
 
-    fn payload(sequence: u64) -> InstallationLogBatchPayload {
+    fn payload_range(
+        stream_id: &str,
+        first_sequence: u64,
+        count: usize,
+    ) -> InstallationLogBatchPayload {
         InstallationLogBatchPayload {
             protocol_version: 1,
-            stream_id: "stream-a".into(),
+            stream_id: stream_id.into(),
             server_version: "0.1.0".into(),
             commit_id: "abc".into(),
-            events: vec![InstallationLogEvent {
-                sequence,
-                occurred_at_ms: Utc::now().timestamp_millis(),
-                level: "info".into(),
-                target: "cc_switch_server::state remote=203.0.113.2".into(),
-                message: "started token=secret user@example.com 203.0.113.2".into(),
-                fields: BTreeMap::from([
-                    ("operation".into(), Value::String("start".into())),
-                    ("access_token".into(), Value::String("secret".into())),
-                ]),
-                file: Some("src/state.rs".into()),
-                line: Some(42),
-            }],
+            events: (0..count)
+                .map(|offset| InstallationLogEvent {
+                    sequence: first_sequence + offset as u64,
+                    occurred_at_ms: Utc::now().timestamp_millis(),
+                    level: "info".into(),
+                    target: "cc_switch_server::state remote=203.0.113.2".into(),
+                    message: format!(
+                        "event={} token=secret user@example.com 203.0.113.2",
+                        first_sequence + offset as u64
+                    ),
+                    fields: BTreeMap::from([
+                        ("operation".into(), Value::String("start".into())),
+                        ("access_token".into(), Value::String("secret".into())),
+                    ]),
+                    file: Some("src/state.rs".into()),
+                    line: Some(42),
+                })
+                .collect(),
         }
+    }
+
+    fn access(installation_id: &str, full: bool) -> QueryAccess {
+        query_access_for_installation(installation_id.to_string(), full)
     }
 
     #[tokio::test]
     async fn ingest_is_idempotent_and_public_projection_is_redacted() {
         let (store, root) = test_store();
         let first = store
-            .ingest("installation-a".into(), payload(1))
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 1))
             .await
             .expect("first ingest");
         assert_eq!(first.accepted, 1);
         let duplicate = store
-            .ingest("installation-a".into(), payload(1))
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 1))
             .await
             .expect("duplicate ingest");
         assert_eq!(duplicate.accepted, 0);
 
         let mut response = store
-            .query(
-                QueryAccess {
-                    public_only: true,
-                    all_installations: false,
-                    installation_ids: HashSet::new(),
-                },
-                ServerLogQuery::default(),
-            )
+            .query(access("installation-a", false), ServerLogQuery::default())
             .await
             .expect("query public logs");
         apply_client_subdomains(
@@ -1940,6 +1492,7 @@ mod tests {
             &HashMap::from([("installation-a".to_string(), "client-sub".to_string())]),
         );
         assert_eq!(response.events.len(), 1);
+        assert_eq!(response.visible_line_limit, PUBLIC_VISIBLE_LINES_PER_CLIENT);
         assert!(response.events[0].installation_id.is_none());
         assert_eq!(
             response.events[0].client_subdomain.as_deref(),
@@ -1957,11 +1510,7 @@ mod tests {
 
         let side_channel = store
             .query(
-                QueryAccess {
-                    public_only: true,
-                    all_installations: false,
-                    installation_ids: HashSet::new(),
-                },
+                access("installation-a", false),
                 ServerLogQuery {
                     search: Some("user@example.com".into()),
                     ..Default::default()
@@ -1974,48 +1523,310 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_window_excludes_old_events_uploaded_from_a_backlog() {
+    async fn retention_is_latest_one_hundred_lines_per_client() {
         let (store, root) = test_store();
-        let mut stale = payload(1);
-        stale.events[0].occurred_at_ms = Utc::now().timestamp_millis() - PUBLIC_WINDOW_MS - 1;
         store
-            .ingest("installation-a".into(), stale)
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 125))
             .await
-            .expect("ingest stale event");
-
-        let public = store
-            .query(
-                QueryAccess {
-                    public_only: true,
-                    all_installations: false,
-                    installation_ids: HashSet::new(),
-                },
-                ServerLogQuery::default(),
-            )
-            .await
-            .expect("query public logs");
-        assert!(public.events.is_empty());
+            .expect("ingest logs");
 
         let private = store
-            .query(
-                QueryAccess {
-                    public_only: false,
-                    all_installations: false,
-                    installation_ids: HashSet::from(["installation-a".to_string()]),
-                },
-                ServerLogQuery::default(),
-            )
+            .query(access("installation-a", true), ServerLogQuery::default())
             .await
             .expect("query retained logs");
-        assert_eq!(private.events.len(), 1);
+        assert_eq!(private.events.len(), 100);
+        assert_eq!(
+            private.events.first().and_then(|event| event.sequence),
+            Some(125)
+        );
+        assert_eq!(
+            private.events.last().and_then(|event| event.sequence),
+            Some(26)
+        );
+
+        let mut on_disk = Vec::new();
+        read_records_file(
+            &installation_directory(&root, "installation-a").join(EVENTS_FILE),
+            &mut on_disk,
+        )
+        .unwrap();
+        assert_eq!(on_disk.len(), 100);
+        assert_eq!(on_disk.first().map(|event| event.sequence), Some(26));
+        assert_eq!(on_disk.last().map(|event| event.sequence), Some(125));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn log_state_only_lists_installations_that_have_uploaded_logs() {
+        let (store, root) = test_store();
+        assert!(store.installation_ids_with_log_state().unwrap().is_empty());
+        store
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.installation_ids_with_log_state().unwrap(),
+            HashSet::from(["installation-a".to_string()])
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_preserves_existing_inactive_client_logs() {
+        let (store, root) = test_store();
+        for installation_id in ["installation-a", "installation-b"] {
+            store
+                .ingest(installation_id.into(), payload_range("stream-a", 1, 1))
+                .await
+                .unwrap();
+        }
+
+        let removed = store
+            .remove_installations(HashSet::from(["installation-b".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store.installation_ids_with_log_state().unwrap(),
+            HashSet::from(["installation-a".to_string()])
+        );
+        assert!(
+            installation_directory(&root, "installation-a")
+                .join(EVENTS_FILE)
+                .is_file()
+        );
+        assert!(!installation_directory(&root, "installation-b").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn public_and_full_access_limits_are_enforced_server_side() {
+        let (store, root) = test_store();
+        store
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 100))
+            .await
+            .unwrap();
+        let request_all = ServerLogQuery {
+            limit: Some(usize::MAX),
+            ..Default::default()
+        };
+        let public = store
+            .query(access("installation-a", false), request_all.clone())
+            .await
+            .unwrap();
+        let full = store
+            .query(access("installation-a", true), request_all)
+            .await
+            .unwrap();
+        assert_eq!(public.events.len(), 10);
+        assert!(public.events.iter().all(|event| event.sequence.is_none()));
+        assert_eq!(full.events.len(), 100);
+        assert!(full.events.iter().all(|event| event.sequence.is_some()));
+        assert!(ensure_export_allowed(&access("installation-a", false)).is_err());
+        assert!(ensure_export_allowed(&access("installation-a", true)).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn public_filters_cannot_reach_beyond_the_latest_ten_lines() {
+        let (store, root) = test_store();
+        store
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 20))
+            .await
+            .unwrap();
+
+        let hidden = store
+            .query(
+                access("installation-a", false),
+                ServerLogQuery {
+                    search: Some("event=1 token=".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(hidden.events.is_empty());
+
+        let visible = store
+            .query(
+                access("installation-a", false),
+                ServerLogQuery {
+                    search: Some("event=20 token=".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.events.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn old_inactive_logs_survive_reopen() {
+        let (store, root) = test_store();
+        let mut old = payload_range("stream-a", 1, 1);
+        old.events[0].occurred_at_ms = 946_684_800_000;
+        store
+            .ingest("installation-a".into(), old)
+            .await
+            .expect("ingest old event");
+        drop(store);
+
+        let reopened = Arc::new(
+            ServerLogStore::open(ServerLogRuntimeConfig {
+                enabled: true,
+                root: root.clone(),
+            })
+            .expect("reopen log store"),
+        );
+        let response = reopened
+            .query(access("installation-a", false), ServerLogQuery::default())
+            .await
+            .expect("query old event");
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].occurred_at_ms, 946_684_800_000);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn multiple_streams_share_cap_and_keep_independent_cursors() {
+        let (store, root) = test_store();
+        store
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 70))
+            .await
+            .unwrap();
+        store
+            .ingest("installation-a".into(), payload_range("stream-b", 1, 70))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .query(access("installation-a", true), ServerLogQuery::default())
+                .await
+                .unwrap()
+                .events
+                .len(),
+            100
+        );
+        drop(store);
+
+        let reopened = Arc::new(
+            ServerLogStore::open(ServerLogRuntimeConfig {
+                enabled: true,
+                root: root.clone(),
+            })
+            .expect("reopen log store"),
+        );
+        for stream in ["stream-a", "stream-b"] {
+            let duplicate = reopened
+                .ingest("installation-a".into(), payload_range(stream, 70, 1))
+                .await
+                .unwrap();
+            assert_eq!(duplicate.accepted, 0);
+            assert_eq!(duplicate.next_sequence, 71);
+            assert!(
+                stream_directory(&root, "installation-a", stream)
+                    .join("cursor.json")
+                    .is_file()
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_trimmed_stream_cursor_still_prevents_replay_after_reopen() {
+        let (store, root) = test_store();
+        store
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 100))
+            .await
+            .unwrap();
+        store
+            .ingest("installation-a".into(), payload_range("stream-b", 1, 100))
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened = Arc::new(
+            ServerLogStore::open(ServerLogRuntimeConfig {
+                enabled: true,
+                root: root.clone(),
+            })
+            .unwrap(),
+        );
+        let duplicate = reopened
+            .ingest("installation-a".into(), payload_range("stream-a", 100, 1))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.accepted, 0);
+        assert_eq!(duplicate.next_sequence, 101);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recovered_cursor_is_persisted_before_its_events_are_trimmed() {
+        let (store, root) = test_store();
+        store
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 100))
+            .await
+            .unwrap();
+        let cursor_path = stream_directory(&root, "installation-a", "stream-a").join("cursor.json");
+        fs::remove_file(&cursor_path).unwrap();
+        drop(store);
+
+        let recovered = Arc::new(
+            ServerLogStore::open(ServerLogRuntimeConfig {
+                enabled: true,
+                root: root.clone(),
+            })
+            .unwrap(),
+        );
+        assert!(cursor_path.is_file());
+        recovered
+            .ingest("installation-a".into(), payload_range("stream-b", 1, 100))
+            .await
+            .unwrap();
+        drop(recovered);
+
+        let reopened = Arc::new(
+            ServerLogStore::open(ServerLogRuntimeConfig {
+                enabled: true,
+                root: root.clone(),
+            })
+            .unwrap(),
+        );
+        let duplicate = reopened
+            .ingest("installation-a".into(), payload_range("stream-a", 100, 1))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.accepted, 0);
+        assert_eq!(duplicate.next_sequence, 101);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn access_is_full_only_for_router_or_matching_client_owner() {
+        let owned = HashSet::from(["installation-a".to_string()]);
+        assert!(has_full_log_access(false, &owned, "installation-a"));
+        assert!(!has_full_log_access(false, &owned, "installation-b"));
+        assert!(has_full_log_access(true, &HashSet::new(), "installation-b"));
+    }
+
+    #[test]
+    fn client_alias_is_stable_opaque_and_128_bit() {
+        let key = [7u8; 32];
+        let alias = client_alias(&key, "installation-a");
+        assert_eq!(alias, client_alias(&key, "installation-a"));
+        assert_ne!(alias, client_alias(&key, "installation-b"));
+        assert!(alias.starts_with("client-"));
+        assert_eq!(alias.len(), "client-".len() + 32);
+        assert!(!alias.contains("installation-a"));
     }
 
     #[tokio::test]
     async fn ingest_rejects_sequence_gaps() {
         let (store, root) = test_store();
         let error = store
-            .ingest("installation-a".into(), payload(2))
+            .ingest("installation-a".into(), payload_range("stream-a", 2, 1))
             .await
             .expect_err("sequence gap");
         assert_eq!(error.code(), Some("SERVER_LOG_SEQUENCE_GAP"));
@@ -2023,91 +1834,8 @@ mod tests {
     }
 
     #[test]
-    fn cursor_is_signed() {
-        let key = [7u8; 32];
-        let encoded = encode_cursor(
-            &CursorPayload {
-                received_at_ms: 10,
-                event_id: "event".into(),
-            },
-            &key,
-        )
-        .expect("encode cursor");
-        assert_eq!(decode_cursor(&encoded, &key).unwrap().event_id, "event");
-        assert!(decode_cursor(&(encoded + "x"), &key).is_err());
-    }
-
-    #[test]
-    fn query_authorization_covers_public_user_and_admin_scopes() {
-        let owned = HashSet::from(["installation-a".to_string()]);
-        let public = authorize_query_access(false, false, false, HashSet::new(), "public");
-        assert!(matches!(public, Err(AppError::Forbidden(_))));
-
-        let mine = authorize_query_access(true, false, false, HashSet::new(), "mine");
-        assert!(matches!(mine, Err(AppError::Unauthorized(_))));
-
-        let mine = authorize_query_access(true, true, false, owned.clone(), "mine").unwrap();
-        assert_eq!(mine.installation_ids, owned);
-        assert!(!mine.public_only);
-        assert!(!mine.all_installations);
-
-        let all = authorize_query_access(true, true, false, HashSet::new(), "all");
-        assert!(matches!(all, Err(AppError::Forbidden(_))));
-        let all = authorize_query_access(true, true, true, HashSet::new(), "all").unwrap();
-        assert!(all.all_installations);
-    }
-
-    #[tokio::test]
-    async fn owned_client_visibility_follows_current_access_set() {
-        let (store, root) = test_store();
-        store
-            .ingest("installation-a".into(), payload(1))
-            .await
-            .unwrap();
-        store
-            .ingest("installation-b".into(), payload(1))
-            .await
-            .unwrap();
-
-        let first_access = QueryAccess {
-            public_only: false,
-            all_installations: false,
-            installation_ids: HashSet::from(["installation-a".to_string()]),
-        };
-        let first = store
-            .query(first_access, ServerLogQuery::default())
-            .await
-            .unwrap();
-        assert_eq!(first.events.len(), 1);
-        assert_eq!(
-            first.events[0].installation_id.as_deref(),
-            Some("installation-a")
-        );
-
-        let changed_access = QueryAccess {
-            public_only: false,
-            all_installations: false,
-            installation_ids: HashSet::from(["installation-b".to_string()]),
-        };
-        assert!(matches!(
-            validate_requested_installation(&changed_access, Some("installation-a")),
-            Err(AppError::NotFound(_))
-        ));
-        let changed = store
-            .query(changed_access, ServerLogQuery::default())
-            .await
-            .unwrap();
-        assert_eq!(changed.events.len(), 1);
-        assert_eq!(
-            changed.events[0].installation_id.as_deref(),
-            Some("installation-b")
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn batch_validation_rejects_non_info_family_levels() {
-        let mut invalid = payload(1);
+        let mut invalid = payload_range("stream-a", 1, 1);
         invalid.events[0].level = "debug".into();
         assert!(matches!(
             validate_batch(&invalid),
@@ -2127,55 +1855,11 @@ mod tests {
             redact_sensitive_text("token router connected"),
             "token router connected"
         );
-    }
 
-    #[tokio::test]
-    async fn cleanup_removes_expired_stream_metadata_and_empty_directories() {
-        let (store, root) = test_store();
-        store
-            .ingest("installation-a".into(), payload(1))
-            .await
-            .expect("ingest event");
-        let directory = stream_directory(&root, "installation-a", "stream-a");
-        assert!(directory.join("cursor.json").is_file());
-        std::thread::sleep(Duration::from_millis(10));
-
-        let mut cleanup_config = store.config.clone();
-        cleanup_config.retention_days = 0;
-        cleanup_files(&cleanup_config).expect("clean expired logs");
-
-        assert!(!directory.exists());
-        assert!(!stream_has_persistent_state(
-            &root,
-            "installation-a",
-            "stream-a"
-        ));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn ingest_enforces_capacity_when_the_approximate_counter_crosses_the_limit() {
-        let root = std::env::temp_dir().join(format!(
-            "cc-switch-router-server-log-capacity-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let store = Arc::new(
-            ServerLogStore::open(ServerLogRuntimeConfig {
-                enabled: true,
-                root: root.clone(),
-                retention_days: 7,
-                max_total_bytes: 1,
-            })
-            .expect("open capacity-limited log store"),
-        );
-
-        let response = store
-            .ingest("installation-a".into(), payload(1))
-            .await
-            .expect("ingest over capacity");
-        assert_eq!(response.accepted, 1);
-        assert!(event_files(&root).unwrap().is_empty());
-        assert_eq!(store.stored_event_bytes.load(Ordering::Acquire), 0);
-        let _ = fs::remove_dir_all(root);
+        let repeated = redact_sensitive_text("token router connected token=secret-value");
+        assert!(!repeated.contains("secret-value"));
+        let reordered = redact_sensitive_text("token=first authorization: second");
+        assert!(!reordered.contains("first"));
+        assert!(!reordered.contains("second"));
     }
 }

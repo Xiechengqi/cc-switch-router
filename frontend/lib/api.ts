@@ -79,7 +79,6 @@ import type {
   MarketCreditKind,
   ServerLogEventsResponse,
   ServerLogMeta,
-  ServerLogScope,
 } from "@/lib/types";
 
 
@@ -1337,18 +1336,14 @@ export async function getServerLogMeta() {
 }
 
 export async function getServerLogs(input: {
-  scope: ServerLogScope;
-  installationId?: string;
+  clientAlias: string;
   level?: string;
   search?: string;
-  cursor?: string;
   limit?: number;
 }) {
-  const params = new URLSearchParams({ scope: input.scope });
-  if (input.installationId) params.set("installationId", input.installationId);
+  const params = new URLSearchParams({ clientAlias: input.clientAlias });
   if (input.level) params.set("level", input.level);
   if (input.search) params.set("search", input.search);
-  if (input.cursor) params.set("cursor", input.cursor);
   if (input.limit) params.set("limit", String(input.limit));
   return parseJson<ServerLogEventsResponse>(
     await authFetch(`/v1/server-logs/events?${params}`, { cache: "no-store" }),
@@ -1356,13 +1351,11 @@ export async function getServerLogs(input: {
 }
 
 export async function exportServerLogs(input: {
-  scope: Exclude<ServerLogScope, "public">;
-  installationId?: string;
+  clientAlias: string;
   level?: string;
   search?: string;
 }) {
-  const params = new URLSearchParams({ scope: input.scope });
-  if (input.installationId) params.set("installationId", input.installationId);
+  const params = new URLSearchParams({ clientAlias: input.clientAlias });
   if (input.level) params.set("level", input.level);
   if (input.search) params.set("search", input.search);
   const response = await authFetch(`/v1/server-logs/export?${params}`, {
