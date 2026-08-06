@@ -592,7 +592,12 @@ fn count_active_network(conn: &Connection) -> Result<(usize, usize), AppError> {
     let active_cutoff = (Utc::now() - Duration::minutes(ACTIVE_CLIENT_WINDOW_MINUTES)).to_rfc3339();
     let active_shares: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM shares WHERE share_status = 'active'",
+            "SELECT COUNT(*)
+             FROM shares s
+             INNER JOIN installations i ON i.id = s.installation_id
+             WHERE s.share_status = 'active'
+               AND i.lifecycle = 'active'
+               AND i.client_activated_at IS NOT NULL",
             [],
             |row| row.get(0),
         )
@@ -602,7 +607,10 @@ fn count_active_network(conn: &Connection) -> Result<(usize, usize), AppError> {
             "SELECT COUNT(DISTINCT i.id)
              FROM installations i
              INNER JOIN shares s ON s.installation_id = i.id
-             WHERE i.last_seen_at >= ?1
+             INNER JOIN installation_notification_state ns ON ns.installation_id = i.id
+             WHERE ns.last_heartbeat_at >= ?1
+               AND i.lifecycle = 'active'
+               AND i.client_activated_at IS NOT NULL
                AND s.share_status = 'active'",
             params![active_cutoff],
             |row| row.get(0),
@@ -1199,5 +1207,69 @@ mod tests {
         let daily = empty_daily(&keys);
         assert_eq!(daily.len(), 2);
         assert_eq!(daily[0].total_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn active_network_requires_activation_and_fresh_heartbeat() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let stale_heartbeat = (now - Duration::minutes(16)).to_rfc3339();
+        let expires_at = (now + Duration::hours(1)).to_rfc3339();
+        let conn = store.conn.lock().await;
+
+        for (installation_id, activated_at, heartbeat_at) in [
+            ("inst-online", Some(now_text.as_str()), now_text.as_str()),
+            (
+                "inst-stale",
+                Some(now_text.as_str()),
+                stale_heartbeat.as_str(),
+            ),
+            ("inst-unactivated", None, now_text.as_str()),
+        ] {
+            conn.execute(
+                "INSERT INTO installations (
+                    id, public_key, platform, app_version, owner_email, owner_verified_at,
+                    created_at, last_seen_at, client_activated_at, control_secret_b64
+                 ) VALUES (?1, ?2, 'linux', '1.0.0', 'owner@example.com', ?3, ?3, ?3, ?4, ?5)",
+                params![
+                    installation_id,
+                    format!("key-{installation_id}"),
+                    now_text,
+                    activated_at,
+                    format!("secret-{installation_id}"),
+                ],
+            )
+            .expect("insert usage installation");
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
+                    created_at, updated_at
+                 ) VALUES (?1, 1, 'online', ?2, ?3, ?3)",
+                params![installation_id, heartbeat_at, now_text],
+            )
+            .expect("insert usage heartbeat");
+            conn.execute(
+                "INSERT INTO shares (
+                    share_id, capacity_pool_id, installation_id, share_name,
+                    shared_with_emails_json, for_sale, app_type, token_limit,
+                    tokens_used, requests_count, share_status, created_at, expires_at, updated_at
+                 ) VALUES (?1, ?1, ?2, ?1, '[]', 'No', 'proxy', 1000, 0, 0,
+                           'active', ?3, ?4, ?3)",
+                params![
+                    format!("share-{installation_id}"),
+                    installation_id,
+                    now_text,
+                    expires_at,
+                ],
+            )
+            .expect("insert usage share");
+        }
+
+        let (active_shares, active_clients) =
+            count_active_network(&conn).expect("count active network");
+
+        assert_eq!(active_shares, 2);
+        assert_eq!(active_clients, 1);
     }
 }

@@ -731,11 +731,37 @@ CREATE TABLE installations (
             geo_last_changed_at TEXT,
             created_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
-            control_secret_b64 TEXT,
+            client_activated_at TEXT,
+            control_secret_b64 TEXT NOT NULL,
             lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active', 'fenced')),
             fenced_at TEXT,
             fence_reason TEXT
         , delegate_upgrade_to_router_owner INTEGER, app_commit_id TEXT, update_available INTEGER, upgrade_capable INTEGER, status_reported_at TEXT, public_ip TEXT, provision_source TEXT, provision_host_id TEXT);
+CREATE TABLE auth_devices (
+            id TEXT PRIMARY KEY,
+            public_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK(kind IN ('browser', 'service')),
+            platform TEXT NOT NULL,
+            app_version TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'revoked')),
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+CREATE TABLE auth_device_nonces (
+            auth_device_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (auth_device_id, action, nonce),
+            FOREIGN KEY (auth_device_id) REFERENCES auth_devices(id) ON DELETE CASCADE
+        );
+CREATE TABLE identity_registration_nonces (
+            identity_kind TEXT NOT NULL CHECK(identity_kind IN ('client_installation', 'auth_device')),
+            public_key_hash TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (identity_kind, public_key_hash, nonce)
+        );
 CREATE TABLE installation_fences (
             public_key TEXT PRIMARY KEY,
             installation_id TEXT NOT NULL,
@@ -775,6 +801,11 @@ CREATE UNIQUE INDEX idx_client_subdomain_takeovers_active_source
 CREATE INDEX idx_client_subdomain_takeovers_recovery
             ON client_subdomain_takeovers(status, updated_at);
 CREATE TABLE registration_admission_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_scope TEXT NOT NULL,
+            occurred_at_ms INTEGER NOT NULL
+        );
+CREATE TABLE auth_device_registration_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_scope TEXT NOT NULL,
             occurred_at_ms INTEGER NOT NULL
@@ -1104,11 +1135,9 @@ CREATE TABLE request_nonces (
         );
 CREATE TABLE installation_notification_state (
             installation_id TEXT PRIMARY KEY,
-            registration_state TEXT NOT NULL DEFAULT 'provisional',
-            registration_verified_at TEXT,
             monitoring_enabled INTEGER NOT NULL DEFAULT 0,
             presence_state TEXT NOT NULL DEFAULT 'unknown',
-            last_authenticated_seen_at TEXT,
+            last_heartbeat_at TEXT,
             last_boot_id TEXT,
             offline_candidate_since TEXT,
             offline_since TEXT,
@@ -1244,7 +1273,9 @@ CREATE TABLE users (
 CREATE TABLE email_login_challenges (
             id TEXT PRIMARY KEY,
             email_normalized TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
+            auth_source_kind TEXT NOT NULL
+                CHECK(auth_source_kind IN ('auth_device', 'client_installation')),
+            auth_source_id TEXT NOT NULL,
             purpose TEXT NOT NULL,
             code_hash TEXT NOT NULL,
             expires_at TEXT NOT NULL,
@@ -1258,7 +1289,9 @@ CREATE TABLE email_login_challenges (
 CREATE TABLE user_sessions (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
-            installation_id TEXT NOT NULL,
+            auth_source_kind TEXT NOT NULL
+                CHECK(auth_source_kind IN ('auth_device', 'client_installation')),
+            auth_source_id TEXT NOT NULL,
             access_token_hash TEXT NOT NULL UNIQUE,
             refresh_token_hash TEXT NOT NULL UNIQUE,
             access_expires_at TEXT NOT NULL,
@@ -1363,8 +1396,18 @@ CREATE INDEX idx_registration_geo_cache_cached
             ON registration_geo_cache(status, cached_at_ms);
 CREATE INDEX idx_registration_geo_cache_claim
             ON registration_geo_cache(status, claim_expires_at_ms);
+CREATE INDEX idx_auth_device_registration_events_source_time
+            ON auth_device_registration_events(source_scope, occurred_at_ms);
 CREATE INDEX idx_installations_unowned
             ON installations(owner_verified_at) WHERE owner_verified_at IS NULL;
+CREATE INDEX idx_installations_activated
+            ON installations(lifecycle, client_activated_at, last_seen_at);
+CREATE INDEX idx_auth_devices_status_seen
+            ON auth_devices(status, last_seen_at);
+CREATE INDEX idx_auth_device_nonces_created
+            ON auth_device_nonces(created_at);
+CREATE INDEX idx_identity_registration_nonces_created
+            ON identity_registration_nonces(created_at);
 CREATE INDEX idx_leases_subdomain ON leases(subdomain);
 CREATE INDEX idx_installation_client_tunnels_owner ON installation_client_tunnels(owner_email, updated_at DESC);
 CREATE INDEX idx_shares_installation_id ON shares(installation_id);
@@ -1390,7 +1433,7 @@ CREATE INDEX idx_share_model_health_checks_share ON share_model_health_checks(sh
 CREATE INDEX idx_share_model_health_state_share ON share_model_health_state(share_id, app_type, last_status);
 CREATE INDEX idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
 CREATE INDEX idx_installation_notification_presence
-            ON installation_notification_state(monitoring_enabled, presence_state, last_authenticated_seen_at);
+            ON installation_notification_state(monitoring_enabled, presence_state, last_heartbeat_at);
 CREATE INDEX idx_client_notification_events_pending
             ON client_notification_events(status, not_before, occurred_at);
 CREATE INDEX idx_client_notification_events_lane_pending
@@ -1427,9 +1470,11 @@ CREATE INDEX idx_dashboard_ux_events_created ON dashboard_ux_events(created_at D
 CREATE INDEX idx_email_send_logs_created_at ON email_send_logs(created_at DESC);
 CREATE INDEX idx_request_nonces_created_at ON request_nonces(created_at DESC);
 CREATE INDEX idx_auth_challenges_email ON email_login_challenges(email_normalized, created_at DESC);
-CREATE INDEX idx_auth_challenges_installation ON email_login_challenges(installation_id, created_at DESC);
+CREATE INDEX idx_auth_challenges_source
+            ON email_login_challenges(auth_source_kind, auth_source_id, created_at DESC);
 CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id, created_at DESC);
-CREATE INDEX idx_user_sessions_installation ON user_sessions(installation_id, created_at DESC);
+CREATE INDEX idx_user_sessions_source
+            ON user_sessions(auth_source_kind, auth_source_id, created_at DESC);
 CREATE INDEX idx_router_markets_status ON router_markets(status, listed, updated_at DESC);
 CREATE INDEX idx_router_markets_subdomain ON router_markets(subdomain);
 CREATE INDEX idx_router_gateways_owner ON router_gateways(owner_email, updated_at DESC);

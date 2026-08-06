@@ -91,11 +91,11 @@ sessionStorage.removeItem('cc_switch_router_web_terminal_windows_v1');
 location.reload();
 ```
 
-当前共 30 个持久化键。按域分组:
+当前持久化键按域分组:
 
 | 域 | 键 |
 |---|---|
-| 认证 | `cc_switch_router_auth_v1`, `cc-switch-router-auth-refresh-v1` |
+| 认证 | `cc_switch_router_auth_v2` |
 | 语言 | `cc_switch_router_locale_v1` |
 | 公告 | `..._announcement_dismiss_today_v1`, `..._dismiss_permanent_v1` |
 | Clients 页 | `..._client_status_v1`, `..._client_sort_v1`, `..._client_expanded_v2`, `..._client_regions_v2`, `..._client_region_v1` |
@@ -137,9 +137,9 @@ location.reload();
 | A-18 | 承 A-16 | 点「不再提示」 | 关闭;刷新不再弹 |
 | A-19 | 承 A-16 | 点弹窗 X | 关闭但**不写忽略状态**,刷新后仍弹 |
 | A-20 | 任意 | 逐个点 5 个导航 tab | 分别到 clients / markets / client-market / rentals / account,选中态正确 |
-| A-21 | 清空 `cc_switch_router_auth_v1`;拦截 Network | 同一标签页同时触发 AuthProvider 初始化和发送验证码 | `/v1/installations/register` 只发送 1 次;后续 request-code 与 localStorage 使用同一 `installationId` |
-| A-22 | 清空认证 localStorage;浏览器支持 Web Locks | 同时打开两个 Dashboard 标签页 | 两页最终持有相同完整 installation 身份;总计只注册 1 个 installation;任一页发码后均不覆盖身份 |
-| A-23 | 承 A-02;拦截 verify-code | 快速输入或粘贴完整 6 位验证码 | 只发送 1 次 verify-code;body 使用最新 6 位值和 request-code 时的 `installationId` |
+| A-21 | 清空 `cc_switch_router_auth_v2`;拦截 Network | 同一标签页同时触发 AuthProvider 初始化和发送验证码 | `/v1/auth/devices/register` 只发送 1 次;后续 request-code 与 localStorage 使用同一 `authDeviceId` |
+| A-22 | 清空认证 localStorage;浏览器支持 Web Locks | 同时打开两个 Dashboard 标签页 | 两页最终持有相同完整 auth device 身份;总计只注册 1 个 auth device;任一页发码后均不覆盖身份 |
+| A-23 | 承 A-02;拦截 verify-code | 快速输入或粘贴完整 6 位验证码 | 只发送 1 次 verify-code;body 使用最新 6 位值和 request-code 时的 `authDeviceId` |
 | A-24 | 两个独立浏览器 profile/设备,同一邮箱 | 设备 A 请求验证码;设备 B 随后请求验证码;分别输入各自邮件中的验证码 | 两个 challenge 均有效;设备 B 的请求不使设备 A 报 `expired or not found` |
 | A-25 | 同一设备和邮箱 | 请求验证码后点「重新发送」;先输入旧码再输入新码 | 旧码失败且新码成功;其他设备的有效验证码不受影响 |
 | A-26 | 清空认证状态;拦截 request-code | 快速双击发送或在同一浏览器两个标签页同时为同一邮箱发码 | 前端单标签页只发 1 次;跨标签页后到请求命中冷却且不再发送第二封邮件 |
@@ -878,7 +878,7 @@ location.reload();
 | Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-16, SM-E2E-01~SM-E2E-07 |
 | 其他(regions / 公告读取) | `getRegions`、`getAnnouncement` | A-14, A-16 |
 
-认证相关在 `lib/auth.ts`(非 `api.ts`):`requestEmailCode` / `verifyEmailCode` / `refreshAccessToken` / `sessionStatus` / `logoutSession` / `ensureInstallationIdentity` → 用例 A-02~A-06, A-12。
+认证相关在 `lib/auth.ts`(非 `api.ts`):`requestEmailCode` / `verifyEmailCode` / `refreshAccessToken` / `sessionStatus` / `logoutSession` / `ensureAuthDeviceIdentity` → 用例 A-02~A-06, A-12。
 
 ### 覆盖缺口
 

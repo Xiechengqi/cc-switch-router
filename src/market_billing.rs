@@ -4177,7 +4177,8 @@ mod tests {
             session_id: format!("session-{user_id}"),
             user_id: user_id.to_string(),
             email: email.to_string(),
-            installation_id: format!("browser-{user_id}"),
+            auth_source_kind: "auth_device".into(),
+            auth_source_id: format!("browser-{user_id}"),
             access_token_hash: format!("access-{user_id}"),
             refresh_token_hash: format!("refresh-{user_id}"),
             access_expires_at: now + Duration::hours(1),
@@ -4326,8 +4327,9 @@ mod tests {
         conn.execute(
             "INSERT INTO installations (
                 id, public_key, platform, app_version, owner_email, owner_verified_at,
-                created_at, last_seen_at
-             ) VALUES (?1, 'test-public-key', 'linux', 'test', 'owner@example.com', ?2, ?2, ?2)",
+                created_at, last_seen_at, client_activated_at, control_secret_b64
+             ) VALUES (?1, 'test-public-key', 'linux', 'test', 'owner@example.com',
+                       ?2, ?2, ?2, ?2, 'billing-chat-control-secret')",
             params![installation_id, now],
         )
         .expect("insert billing chat installation");

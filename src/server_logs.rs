@@ -27,6 +27,7 @@ const MAX_BATCH_EVENTS: usize = 200;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_TARGET_BYTES: usize = 512;
 const MAX_FIELDS_BYTES: usize = 32 * 1024;
+const MAX_RAW_LINE_BYTES: usize = 32 * 1024;
 const MAX_RETAINED_LINES_PER_CLIENT: usize = 100;
 const PUBLIC_VISIBLE_LINES_PER_CLIENT: usize = 10;
 const DEFAULT_POLL_INTERVAL_SECONDS: u32 = 3;
@@ -63,6 +64,8 @@ pub struct InstallationLogEvent {
     pub level: String,
     pub target: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_line: Option<String>,
     #[serde(default)]
     pub fields: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +116,8 @@ struct StoredServerLogEvent {
     level: String,
     target: String,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_line: Option<String>,
     fields: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file: Option<String>,
@@ -348,6 +353,9 @@ impl ServerLogStore {
                 level: event.level.to_ascii_lowercase(),
                 target: redact_sensitive_text(&bounded_text(&event.target, MAX_TARGET_BYTES)),
                 message: redact_sensitive_text(&bounded_text(&event.message, MAX_MESSAGE_BYTES)),
+                raw_line: event
+                    .raw_line
+                    .map(|value| bounded_text(&redact_sensitive_text(&value), MAX_RAW_LINE_BYTES)),
                 fields: sanitize_fields(event.fields),
                 file: event.file.map(|value| bounded_text(&value, 1_024)),
                 line: event.line,
@@ -496,6 +504,8 @@ struct ServerLogEventView {
     target: String,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    raw_line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     fields: Option<BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
@@ -531,6 +541,7 @@ impl ServerLogEventView {
             } else {
                 event.message
             },
+            raw_line: if public { None } else { event.raw_line },
             fields: (!public).then_some(event.fields),
             file: (!public).then_some(event.file).flatten(),
             line: (!public).then_some(event.line).flatten(),
@@ -874,6 +885,15 @@ fn validate_batch(payload: &InstallationLogBatchPayload) -> Result<(), AppError>
                 "server log message is too large".into(),
             ));
         }
+        if let Some(raw_line) = event.raw_line.as_deref()
+            && (raw_line.len() > MAX_RAW_LINE_BYTES
+                || raw_line.contains('\r')
+                || raw_line.contains('\n'))
+        {
+            return Err(AppError::BadRequest(
+                "server log rawLine must be a single line within the size limit".into(),
+            ));
+        }
         let fields_bytes = serde_json::to_vec(&event.fields)
             .map_err(|error| AppError::BadRequest(format!("invalid server log fields: {error}")))?;
         if fields_bytes.len() > MAX_FIELDS_BYTES {
@@ -991,7 +1011,12 @@ fn event_matches_query(
         } else {
             (event.target.clone(), event.message.clone())
         };
-        if !format!("{target} {message}")
+        let raw_line = if public {
+            ""
+        } else {
+            event.raw_line.as_deref().unwrap_or_default()
+        };
+        if !format!("{target} {message} {raw_line}")
             .to_ascii_lowercase()
             .contains(search)
         {
@@ -1454,6 +1479,10 @@ mod tests {
                         "event={} token=secret user@example.com 203.0.113.2",
                         first_sequence + offset as u64
                     ),
+                    raw_line: Some(format!(
+                        "2026-08-05T23:21:25.141Z  INFO raw-only-event-{}",
+                        first_sequence + offset as u64
+                    )),
                     fields: BTreeMap::from([
                         ("operation".into(), Value::String("start".into())),
                         ("access_token".into(), Value::String("secret".into())),
@@ -1499,6 +1528,7 @@ mod tests {
             Some("client-sub")
         );
         assert!(response.events[0].fields.is_none());
+        assert!(response.events[0].raw_line.is_none());
         assert!(!response.events[0].message.contains("user@example.com"));
         assert!(!response.events[0].message.contains("203.0.113.2"));
         assert!(!response.events[0].message.contains("secret"));
@@ -1519,6 +1549,44 @@ mod tests {
             .await
             .expect("query redacted public logs");
         assert!(side_channel.events.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn full_projection_returns_and_searches_raw_lines_without_public_side_channel() {
+        let (store, root) = test_store();
+        store
+            .ingest("installation-a".into(), payload_range("stream-a", 1, 1))
+            .await
+            .unwrap();
+
+        let full = store
+            .query(
+                access("installation-a", true),
+                ServerLogQuery {
+                    search: Some("raw-only-event-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.events.len(), 1);
+        assert_eq!(
+            full.events[0].raw_line.as_deref(),
+            Some("2026-08-05T23:21:25.141Z  INFO raw-only-event-1")
+        );
+
+        let public = store
+            .query(
+                access("installation-a", false),
+                ServerLogQuery {
+                    search: Some("raw-only-event-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(public.events.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1839,6 +1907,23 @@ mod tests {
         invalid.events[0].level = "debug".into();
         assert!(matches!(
             validate_batch(&invalid),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn batch_validation_rejects_multiline_and_oversized_raw_lines() {
+        let mut multiline = payload_range("stream-a", 1, 1);
+        multiline.events[0].raw_line = Some("first\nsecond".into());
+        assert!(matches!(
+            validate_batch(&multiline),
+            Err(AppError::BadRequest(_))
+        ));
+
+        let mut oversized = payload_range("stream-a", 1, 1);
+        oversized.events[0].raw_line = Some("x".repeat(MAX_RAW_LINE_BYTES + 1));
+        assert!(matches!(
+            validate_batch(&oversized),
             Err(AppError::BadRequest(_))
         ));
     }

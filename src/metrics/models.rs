@@ -144,7 +144,7 @@ pub struct ClientMetricsItem {
     pub platform: String,
     pub app_version: String,
     pub country_code: Option<String>,
-    pub last_authenticated_seen_at: Option<i64>,
+    pub last_heartbeat_at: Option<i64>,
     pub offline_since: Option<i64>,
     pub last_recovered_at: Option<i64>,
     pub offline_episode: u64,

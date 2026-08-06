@@ -122,7 +122,7 @@ export function ClientsTab({
                 <div>{item.platform || "-"}</div>
                 <div className="text-xs text-muted-foreground">{item.appVersion || "-"}</div>
               </div>,
-              item.lastAuthenticatedSeenAt ? formatDateTime(item.lastAuthenticatedSeenAt * 1000) : "-",
+              item.lastHeartbeatAt ? formatDateTime(item.lastHeartbeatAt * 1000) : "-",
               item.offlineSince ? formatDateTime(item.offlineSince * 1000) : "-",
               formatNumber(item.offlineEpisode),
             ])}

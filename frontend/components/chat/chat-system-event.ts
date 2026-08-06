@@ -52,7 +52,7 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   instructions: "chat.detail.instructions",
   invoiceStatus: "chat.detail.invoiceStatus",
   kind: "chat.detail.kind",
-  lastAuthenticatedSeenAt: "chat.detail.lastAuthenticatedSeenAt",
+  lastHeartbeatAt: "chat.detail.lastHeartbeatAt",
   method: "chat.detail.method",
   nextAttemptAt: "chat.detail.nextAttemptAt",
   note: "chat.detail.note",
@@ -93,7 +93,7 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
  * Technical IDs / internal bookkeeping fields are intentionally omitted.
  */
 const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
-  client_offline: ["lastAuthenticatedSeenAt", "confirmedOfflineAt"],
+  client_offline: ["lastHeartbeatAt", "confirmedOfflineAt"],
   client_provisioned: [
     "providerEmail",
     "hostname",
@@ -595,7 +595,7 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
     case "client_offline":
       return t("chat.event.clientOffline", {
         client: payloadString(payload, "clientLabel"),
-        time: payloadTime(payload, "lastAuthenticatedSeenAt", locale),
+        time: payloadTime(payload, "lastHeartbeatAt", locale),
       });
     case "free_period_expiring":
       return t("chat.event.freePeriodExpiring", {

@@ -48,6 +48,7 @@ pub(super) fn ensure_room_for_verified_owner_tx(
              LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
              WHERE i.id = ?1
                AND i.lifecycle = 'active'
+               AND i.client_activated_at IS NOT NULL
                AND i.owner_verified_at IS NOT NULL
                AND lower(trim(i.owner_email)) = ?2",
             params![installation_id, owner_email],
@@ -2207,6 +2208,7 @@ fn resolve_client_system_event_room_tx(
              FROM installations i
              WHERE i.id = ?1 AND i.owner_verified_at IS NOT NULL
                AND i.lifecycle = 'active'
+               AND i.client_activated_at IS NOT NULL
                AND i.owner_email IS NOT NULL AND trim(i.owner_email) != ''",
             params![installation_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),

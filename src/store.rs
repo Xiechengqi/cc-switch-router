@@ -36,7 +36,8 @@ use crate::models::{
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
     ClientTunnelClaimRequest, ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse,
-    ClientTunnelUpdateRequest, ClientTunnelView, CountryBoard, CountryClientBoard, CountryMapPoint,
+    ClientTunnelUpdateRequest, ClientTunnelView, ClientWebRequestEmailCodeRequest,
+    ClientWebVerifyEmailCodeRequest, CountryBoard, CountryClientBoard, CountryMapPoint,
     CountryShareBoard, DashboardClientTunnelView, DashboardClientView, DashboardMap,
     DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
     DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
@@ -54,23 +55,23 @@ use crate::models::{
     MarketShareAppView, MarketShareRuntimeStateInput, MarketShareRuntimeStateView, MarketShareView,
     ModelHealthSummary, OperationalReason, OperationalSummary, PublicMapClientPoint,
     PublicMapPointsResponse, PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest,
-    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
-    RegisterInstallationResponse, RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess,
-    ShareAppAvailability, ShareAppProviders, ShareAppRuntimes, ShareAppSettings,
-    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
-    SharePendingEditsResponse, SharePruneRequest, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
-    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest, ShareTokenPeriod,
-    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
-    ShareUsageEmailRow, ShareUserGrant, ShareUserLimitStatusResponse, ShareUserLimitStatusRow,
-    ShareUserPolicy, ShareView, SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease,
-    TunnelStateRequest, TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    RegisterAuthDeviceRequest, RegisterAuthDeviceResponse, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess, ShareAppAvailability,
+    ShareAppProviders, ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest,
+    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareModelHealthCheckEntry,
+    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
+    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
+    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
+    ShareSupport, ShareSyncRequest, ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota,
+    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant,
+    ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareUserPolicy, ShareView,
+    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
+    TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
+    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -130,6 +131,8 @@ const MARKET_OFFLINE_GRACE_SECS: i64 = 24 * 60 * 60;
 const MARKET_ACTIVE_MISSING_GRACE_SECS: i64 = 5 * 60;
 const AUTH_CODE_DIGITS: usize = 6;
 const AUTH_PURPOSE_LOGIN: &str = "login";
+const AUTH_SOURCE_AUTH_DEVICE: &str = "auth_device";
+const AUTH_SOURCE_CLIENT_INSTALLATION: &str = "client_installation";
 const SESSION_REFRESH_ROTATION_GRACE_SECS: i64 = 30;
 const MARKET_DEFAULT_SCOPES: &[&str] = &[
     "market:shares:read",
@@ -482,11 +485,7 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
     }
 }
 
-fn client_operational_summary(
-    client: &DashboardClientView,
-    stale_seconds: i64,
-    now: DateTime<Utc>,
-) -> OperationalSummary {
+fn client_operational_summary(client: &DashboardClientView) -> OperationalSummary {
     if let Some(tunnel) = client
         .client_tunnel
         .as_ref()
@@ -509,24 +508,13 @@ fn client_operational_summary(
     let tunnel_offline = client
         .client_tunnel
         .as_ref()
-        .is_some_and(|tunnel| !tunnel.enabled || !tunnel.online);
-    let heartbeat_stale = now - client.installation.last_seen_at > Duration::seconds(stale_seconds);
+        .is_none_or(|tunnel| !tunnel.enabled || !tunnel.online);
 
     if tunnel_offline {
         reasons.push(operational_reason(
             "route_offline",
             "critical",
             None,
-            Some("client"),
-            Some(&client.installation.id),
-            None,
-            None,
-        ));
-    } else if client.client_tunnel.is_none() && heartbeat_stale {
-        reasons.push(operational_reason(
-            "route_offline",
-            "critical",
-            Some(client.installation.last_seen_at.to_rfc3339()),
             Some("client"),
             Some(&client.installation.id),
             None,
@@ -1190,7 +1178,7 @@ impl RouteHealthStatus {
 struct ClientPresenceScanRow {
     installation_id: String,
     presence_state: String,
-    last_authenticated_seen_at: Option<DateTime<Utc>>,
+    last_heartbeat_at: Option<DateTime<Utc>>,
     recovery_candidate_since: Option<DateTime<Utc>>,
     offline_episode: i64,
     last_offline_event_at: Option<DateTime<Utc>>,
@@ -1408,6 +1396,7 @@ impl AppStore {
             .prepare(
                 "SELECT id FROM installations
                  WHERE lifecycle = 'active'
+                   AND client_activated_at IS NOT NULL
                    AND owner_verified_at IS NOT NULL
                    AND owner_email IS NOT NULL
                    AND LOWER(TRIM(owner_email)) = ?1
@@ -1432,6 +1421,7 @@ impl AppStore {
             .prepare(
                 "SELECT id FROM installations
                  WHERE lifecycle = 'active'
+                   AND client_activated_at IS NOT NULL
                  ORDER BY created_at DESC, id ASC",
             )
             .map_err(|error| {
@@ -1468,9 +1458,10 @@ impl AppStore {
                         i.platform, i.app_version, i.country_code, i.region,
                         i.created_at, i.last_seen_at,
                         NULLIF(TRIM(t.subdomain), ''), t.enabled
-                   FROM installations i
+                  FROM installations i
               LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
                   WHERE i.lifecycle = 'active'
+                    AND i.client_activated_at IS NOT NULL
                      {}
                ORDER BY i.created_at DESC, i.id ASC",
                 installation_filter.as_deref().unwrap_or_default()
@@ -1697,20 +1688,14 @@ impl AppStore {
                 )));
             }
             let existing_installation_id = find_installation_id_by_public_key(&tx, public_key)?;
-            let proof_verified = verify_registration_signature(
-                public_key,
-                &input,
-                existing_installation_id.as_deref(),
-                now,
-            )?;
+            verify_registration_signature(public_key, &input, now)?;
             if existing_installation_id.is_none() {
                 consume_new_identity_admission(&tx, &source_scope, admission_policy, now)?;
             }
-            let enable_monitoring = proof_verified && input.proof_version == Some(2);
-            consume_request_nonce(
+            consume_identity_registration_nonce(
                 &tx,
-                &registration_nonce_subject(public_key),
-                "register_installation",
+                "client_installation",
+                public_key,
                 &input.instance_nonce,
                 now,
             )?;
@@ -1722,8 +1707,7 @@ impl AppStore {
                      app_version = ?4,
                      last_seen_ip = COALESCE(?5, last_seen_ip),
                      country_code = COALESCE(?6, country_code),
-                     last_seen_at = ?7,
-                     control_secret_b64 = COALESCE(control_secret_b64, ?8)
+                     last_seen_at = ?7
                  WHERE id = ?1",
                     params![
                         existing_installation_id,
@@ -1733,36 +1717,17 @@ impl AppStore {
                         ip,
                         country_code,
                         now.to_rfc3339(),
-                        new_control_secret,
                     ],
                 )
                 .map_err(|e| AppError::Internal(format!("update installation failed: {e}")))?;
-                let updated =
-                    get_installation(&tx, &existing_installation_id)?.ok_or_else(|| {
-                        AppError::Internal("installation disappeared during registration".into())
-                    })?;
                 insert_installation_notification_baseline(&tx, &existing_installation_id, now)?;
-                if proof_verified {
-                    record_authenticated_installation_presence(
-                        &tx,
-                        &updated,
-                        now,
-                        enable_monitoring,
-                        None,
-                    )?;
-                }
-                let control_secret = if proof_verified {
-                    tx.query_row(
+                let control_secret = tx
+                    .query_row(
                         "SELECT control_secret_b64 FROM installations WHERE id = ?1",
                         params![existing_installation_id],
-                        |row| row.get::<_, Option<String>>(0),
+                        |row| row.get::<_, String>(0),
                     )
-                    .optional()
-                    .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
-                    .flatten()
-                } else {
-                    None
-                };
+                    .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?;
                 tx.commit().map_err(|error| {
                     AppError::Internal(format!("commit installation registration failed: {error}"))
                 })?;
@@ -1796,6 +1761,7 @@ impl AppStore {
                     geo_last_changed_at: None,
                     created_at: now,
                     last_seen_at: now,
+                    client_activated_at: None,
                     delegate_upgrade_to_router_owner: None,
                     app_commit_id: None,
                     update_available: None,
@@ -1846,21 +1812,12 @@ impl AppStore {
                 )
                 .map_err(|e| AppError::Internal(format!("insert installation failed: {e}")))?;
                 insert_installation_notification_baseline(&tx, &installation.id, now)?;
-                if proof_verified {
-                    record_authenticated_installation_presence(
-                        &tx,
-                        &installation,
-                        now,
-                        enable_monitoring,
-                        None,
-                    )?;
-                }
                 tx.commit().map_err(|error| {
                     AppError::Internal(format!("commit installation registration failed: {error}"))
                 })?;
                 RegisterInstallationResponse {
                     installation_id: installation.id,
-                    control_secret: Some(new_control_secret),
+                    control_secret: new_control_secret,
                 }
             }
         };
@@ -1875,6 +1832,106 @@ impl AppStore {
             );
         }
         Ok(response)
+    }
+
+    pub async fn register_auth_device_with_admission(
+        &self,
+        input: RegisterAuthDeviceRequest,
+        metadata: ClientMetadata,
+        admission_policy: RegistrationAdmissionPolicy,
+    ) -> Result<RegisterAuthDeviceResponse, AppError> {
+        let public_key = input.public_key.trim();
+        if public_key.is_empty() {
+            return Err(AppError::BadRequest("public_key is required".into()));
+        }
+        validate_ed25519_public_key(public_key)?;
+        validate_registration_client_fields(&input.platform, &input.app_version)?;
+        validate_request_nonce(&input.instance_nonce)?;
+        let kind = input.kind.trim();
+        if !matches!(kind, "browser" | "service") {
+            return Err(AppError::BadRequest(
+                "auth device kind must be browser or service".into(),
+            ));
+        }
+        let now = Utc::now();
+        verify_auth_device_registration_signature(public_key, &input, now)?;
+        let source_scope = registration_source_scope(metadata.ip.as_deref());
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin auth device registration failed: {error}"))
+            })?;
+        let existing_id = tx
+            .query_row(
+                "SELECT id FROM auth_devices WHERE public_key = ?1 AND status = 'active'",
+                params![public_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("query auth device by public key failed: {error}"))
+            })?;
+        if existing_id.is_none() {
+            consume_new_auth_device_admission(&tx, &source_scope, admission_policy, now)?;
+        }
+        consume_identity_registration_nonce(
+            &tx,
+            "auth_device",
+            public_key,
+            &input.instance_nonce,
+            now,
+        )?;
+        let auth_device_id = if let Some(id) = existing_id {
+            let stored_kind = tx
+                .query_row(
+                    "SELECT kind FROM auth_devices WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("read auth device kind failed: {error}"))
+                })?;
+            if stored_kind != kind {
+                return Err(AppError::Conflict(
+                    "auth device kind cannot be changed".into(),
+                ));
+            }
+            tx.execute(
+                "UPDATE auth_devices
+                 SET platform = ?2, app_version = ?3, last_seen_at = ?4
+                 WHERE id = ?1",
+                params![
+                    id,
+                    input.platform.trim(),
+                    input.app_version,
+                    now.to_rfc3339()
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("update auth device failed: {error}")))?;
+            id
+        } else {
+            let id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO auth_devices (
+                    id, public_key, kind, platform, app_version, status, created_at, last_seen_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+                params![
+                    id,
+                    public_key,
+                    kind,
+                    input.platform.trim(),
+                    input.app_version,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("insert auth device failed: {error}")))?;
+            id
+        };
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit auth device registration failed: {error}"))
+        })?;
+        Ok(RegisterAuthDeviceResponse { auth_device_id })
     }
 
     pub async fn installation_control_secret(
@@ -2603,7 +2660,6 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        record_authenticated_installation_presence(&tx, &installation, now, false, None)?;
         let now = now.to_rfc3339();
         tx.execute(
             "UPDATE installations
@@ -2675,11 +2731,10 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        record_authenticated_installation_presence(
+        record_installation_heartbeat_presence(
             &tx,
             &installation,
             now,
-            true,
             Some(&input.payload.boot_id),
         )?;
         tx.execute(
@@ -2804,6 +2859,29 @@ impl AppStore {
                 "client tunnel owner does not match installation owner".into(),
             ));
         }
+
+        tx.execute(
+            "UPDATE installations
+             SET client_activated_at = COALESCE(client_activated_at, ?2)
+             WHERE id = ?1",
+            params![installation.id, now.to_rfc3339()],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("activate completed Client failed: {error}"))
+        })?;
+        tx.execute(
+            "UPDATE installation_notification_state
+             SET monitoring_enabled = CASE WHEN last_heartbeat_at IS NOT NULL THEN 1 ELSE 0 END,
+                 updated_at = ?2
+             WHERE installation_id = ?1",
+            params![installation.id, now.to_rfc3339()],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "enable activated Client monitoring failed: {error}"
+            ))
+        })?;
+        client_chat::ensure_room_for_verified_owner_tx(&tx, &installation.id, &owner_email, now)?;
 
         let snapshot = serde_json::json!({
             "installationId": installation.id,
@@ -3167,7 +3245,7 @@ impl AppStore {
                 "SELECT i.id, COALESCE(NULLIF(ict.subdomain, ''), i.id),
                         COALESCE(ns.presence_state, 'unknown'),
                         COALESCE(ns.monitoring_enabled, 0), i.platform, i.app_version,
-                        i.country_code, ns.last_authenticated_seen_at, ns.offline_since,
+                        i.country_code, ns.last_heartbeat_at, ns.offline_since,
                         ns.last_recovered_at, COALESCE(ns.offline_episode, 0)
                  FROM installations i
                  LEFT JOIN installation_notification_state ns
@@ -3175,10 +3253,11 @@ impl AppStore {
                  LEFT JOIN installation_client_tunnels ict
                    ON ict.installation_id = i.id
                  WHERE i.lifecycle = 'active'
+                   AND i.client_activated_at IS NOT NULL
                  ORDER BY CASE COALESCE(ns.presence_state, 'unknown')
                             WHEN 'offline' THEN 0 WHEN 'recovering' THEN 1
                             WHEN 'online' THEN 2 ELSE 3 END,
-                          COALESCE(ns.last_authenticated_seen_at, i.last_seen_at) DESC",
+                          COALESCE(ns.last_heartbeat_at, i.last_seen_at) DESC",
             )
             .map_err(|error| {
                 AppError::Internal(format!("prepare Client metrics snapshot failed: {error}"))
@@ -3198,7 +3277,7 @@ impl AppStore {
                     platform: row.get(4)?,
                     app_version: row.get(5)?,
                     country_code: row.get(6)?,
-                    last_authenticated_seen_at: parse_optional_timestamp(7)?,
+                    last_heartbeat_at: parse_optional_timestamp(7)?,
                     offline_since: parse_optional_timestamp(8)?,
                     last_recovered_at: parse_optional_timestamp(9)?,
                     offline_episode: row.get::<_, i64>(10)?.max(0) as u64,
@@ -3322,10 +3401,10 @@ impl AppStore {
         let baselined = tx
             .execute(
                 "INSERT OR IGNORE INTO installation_notification_state (
-                    installation_id, registration_state, monitoring_enabled, presence_state,
+                    installation_id, monitoring_enabled, presence_state,
                     created_at, updated_at
                  )
-                 SELECT id, 'baseline', 0, 'unknown', created_at, ?1 FROM installations",
+                 SELECT id, 0, 'unknown', created_at, ?1 FROM installations",
                 params![now.to_rfc3339()],
             )
             .map_err(|error| {
@@ -3337,7 +3416,7 @@ impl AppStore {
             let mut statement = tx
                 .prepare(
                     "SELECT ns.installation_id, ns.presence_state,
-                            ns.last_authenticated_seen_at, ns.recovery_candidate_since,
+                            ns.last_heartbeat_at, ns.recovery_candidate_since,
                             ns.offline_episode, ns.last_offline_event_at,
                             i.platform, i.app_version, i.owner_email,
                             i.owner_verified_at, i.country_code, i.created_at,
@@ -3346,7 +3425,8 @@ impl AppStore {
                      INNER JOIN installations i ON i.id = ns.installation_id
                      LEFT JOIN installation_client_tunnels ict
                        ON ict.installation_id = ns.installation_id
-                     WHERE ns.monitoring_enabled = 1",
+                     WHERE ns.monitoring_enabled = 1
+                       AND i.client_activated_at IS NOT NULL",
                 )
                 .map_err(|error| {
                     AppError::Internal(format!(
@@ -3358,7 +3438,7 @@ impl AppStore {
                     Ok(ClientPresenceScanRow {
                         installation_id: row.get(0)?,
                         presence_state: row.get(1)?,
-                        last_authenticated_seen_at: row
+                        last_heartbeat_at: row
                             .get::<_, Option<String>>(2)?
                             .map(|value| parse_dt_sql(&value))
                             .transpose()?,
@@ -3393,7 +3473,7 @@ impl AppStore {
         let recovery_fresh_cutoff =
             now - Duration::seconds((policy.offline_alert_secs / 2).max(30));
         for state in states {
-            let Some(last_seen) = state.last_authenticated_seen_at else {
+            let Some(last_seen) = state.last_heartbeat_at else {
                 continue;
             };
             match state.presence_state.as_str() {
@@ -3468,7 +3548,7 @@ impl AppStore {
                         "countryCode": state.country_code,
                         "tunnelSubdomain": state.tunnel_subdomain,
                         "registeredAt": state.created_at,
-                        "lastAuthenticatedSeenAt": last_seen,
+                        "lastHeartbeatAt": last_seen,
                         "offlineSince": now,
                     });
                     tx.execute(
@@ -4727,12 +4807,14 @@ impl AppStore {
             false
         };
         if already_bound && installation.owner_verified_at.is_some() {
-            client_chat::ensure_room_for_verified_owner_tx(
-                &conn,
-                &input.installation_id,
-                &email,
-                now,
-            )?;
+            if installation.client_activated_at.is_some() {
+                client_chat::ensure_room_for_verified_owner_tx(
+                    &conn,
+                    &input.installation_id,
+                    &email,
+                    now,
+                )?;
+            }
             return Ok(BindInstallationOwnerEmailResponse {
                 ok: true,
                 owner_email: email,
@@ -4804,12 +4886,6 @@ impl AppStore {
                 AppError::Internal(format!("read installation owner verification failed: {e}"))
             })?;
         if owner_verified {
-            client_chat::ensure_room_for_verified_owner_tx(
-                &conn,
-                &input.installation_id,
-                &email,
-                now,
-            )?;
             refresh_registration_notification_snapshots_tx(
                 &conn,
                 &input.installation_id,
@@ -4847,9 +4923,11 @@ impl AppStore {
                 .resolve_session_by_access_token(access_token)
                 .await?
                 .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
-            if session.installation_id != input.installation_id {
+            if session.auth_source_kind != AUTH_SOURCE_CLIENT_INSTALLATION
+                || session.auth_source_id != input.installation_id
+            {
                 return Err(AppError::Unauthorized(
-                    "authenticated session installation mismatch".into(),
+                    "authenticated session Client installation mismatch".into(),
                 ));
             }
             if session.email != new_email {
@@ -4908,12 +4986,14 @@ impl AppStore {
             params![input.installation_id, new_email, now.to_rfc3339()],
         )
         .map_err(|e| AppError::Internal(format!("change client tunnel owner failed: {e}")))?;
-        client_chat::ensure_room_for_verified_owner_tx(
-            &tx,
-            &input.installation_id,
-            &new_email,
-            now,
-        )?;
+        if installation.client_activated_at.is_some() {
+            client_chat::ensure_room_for_verified_owner_tx(
+                &tx,
+                &input.installation_id,
+                &new_email,
+                now,
+            )?;
+        }
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit owner email change failed: {e}")))?;
 
@@ -5053,37 +5133,78 @@ impl AppStore {
         input: RequestEmailCodeRequest,
         metadata: ClientMetadata,
     ) -> Result<RequestEmailCodeResponse, AppError> {
-        let email = normalize_email(&input.email)?;
+        self.request_email_code_for_source(
+            config,
+            resend,
+            &input.email,
+            AUTH_SOURCE_AUTH_DEVICE,
+            &input.auth_device_id,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+            metadata,
+        )
+        .await
+    }
+
+    pub async fn request_client_web_email_code(
+        &self,
+        config: &Config,
+        resend: Option<&Resend>,
+        input: ClientWebRequestEmailCodeRequest,
+        metadata: ClientMetadata,
+    ) -> Result<RequestEmailCodeResponse, AppError> {
+        self.request_email_code_for_source(
+            config,
+            resend,
+            &input.email,
+            AUTH_SOURCE_CLIENT_INSTALLATION,
+            &input.installation_id,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+            metadata,
+        )
+        .await
+    }
+
+    async fn request_email_code_for_source(
+        &self,
+        config: &Config,
+        resend: Option<&Resend>,
+        raw_email: &str,
+        source_kind: &str,
+        source_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        metadata: ClientMetadata,
+    ) -> Result<RequestEmailCodeResponse, AppError> {
+        let email = normalize_email(raw_email)?;
         let send_lock = self
-            .auth_email_send_lock(&email, &input.installation_id)
+            .auth_email_send_lock(&email, &format!("{source_kind}:{source_id}"))
             .await;
         let _send_guard = send_lock.lock().await;
         let request_at = Utc::now();
         {
             let conn = self.conn.lock().await;
-            let installation = get_installation(&conn, &input.installation_id)?
-                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            let public_key = auth_source_public_key(&conn, source_kind, source_id)?;
             verify_signed_payload(
-                &installation.public_key,
-                &input.installation_id,
+                &public_key,
+                source_id,
                 "auth_request_code",
                 &serde_json::json!({ "email": email, "purpose": AUTH_PURPOSE_LOGIN }),
-                input.timestamp_ms,
-                &input.nonce,
-                &input.signature,
+                timestamp_ms,
+                nonce,
+                signature,
             )?;
-            consume_request_nonce(
-                &conn,
-                &input.installation_id,
-                "auth_request_code",
-                &input.nonce,
-                request_at,
-            )?;
+            consume_auth_source_nonce(&conn, source_kind, source_id, nonce, request_at)?;
             enforce_auth_send_limits(
                 &conn,
                 config,
                 &email,
-                &input.installation_id,
+                source_kind,
+                source_id,
                 &metadata,
                 request_at,
             )?;
@@ -5101,7 +5222,8 @@ impl AppStore {
             &mut conn,
             config,
             &email,
-            &input.installation_id,
+            source_kind,
+            source_id,
             &code_hash,
             provider_message_id.as_deref(),
             &metadata,
@@ -5115,8 +5237,8 @@ impl AppStore {
         })
     }
 
-    async fn auth_email_send_lock(&self, email: &str, installation_id: &str) -> Arc<Mutex<()>> {
-        let key = (email.to_string(), installation_id.to_string());
+    async fn auth_email_send_lock(&self, email: &str, source: &str) -> Arc<Mutex<()>> {
+        let key = (email.to_string(), source.to_string());
         let mut locks = self.auth_email_send_locks.lock().await;
         locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
@@ -5132,8 +5254,41 @@ impl AppStore {
         config: &Config,
         input: VerifyEmailCodeRequest,
     ) -> Result<VerifyEmailCodeResponse, AppError> {
-        let email = normalize_email(&input.email)?;
-        let code = input.code.trim();
+        self.verify_email_code_for_source(
+            config,
+            &input.email,
+            &input.code,
+            AUTH_SOURCE_AUTH_DEVICE,
+            &input.auth_device_id,
+        )
+        .await
+    }
+
+    pub async fn verify_client_web_email_code(
+        &self,
+        config: &Config,
+        input: ClientWebVerifyEmailCodeRequest,
+    ) -> Result<VerifyEmailCodeResponse, AppError> {
+        self.verify_email_code_for_source(
+            config,
+            &input.email,
+            &input.code,
+            AUTH_SOURCE_CLIENT_INSTALLATION,
+            &input.installation_id,
+        )
+        .await
+    }
+
+    async fn verify_email_code_for_source(
+        &self,
+        config: &Config,
+        raw_email: &str,
+        raw_code: &str,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<VerifyEmailCodeResponse, AppError> {
+        let email = normalize_email(raw_email)?;
+        let code = raw_code.trim();
         if code.len() != AUTH_CODE_DIGITS || !code.chars().all(|ch| ch.is_ascii_digit()) {
             log_email_verification_rejection(EmailVerificationRejectionReason::InvalidCode);
             return Err(AppError::Unauthorized("invalid verification code".into()));
@@ -5144,18 +5299,18 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| AppError::Internal(format!("begin email verification failed: {e}")))?;
-        let installation = match get_installation(&tx, &input.installation_id)? {
-            Some(installation) => installation,
-            None => {
-                log_email_verification_rejection(EmailVerificationRejectionReason::NotFound);
-                return Err(AppError::Unauthorized("installation not found".into()));
-            }
-        };
+        if auth_source_public_key(&tx, source_kind, source_id).is_err() {
+            log_email_verification_rejection(EmailVerificationRejectionReason::NotFound);
+            return Err(AppError::Unauthorized(
+                "authentication source not found".into(),
+            ));
+        }
 
         let challenge = get_latest_active_email_challenge(
             &tx,
             &email,
-            &input.installation_id,
+            source_kind,
+            source_id,
             AUTH_PURPOSE_LOGIN,
             now,
         )?;
@@ -5163,7 +5318,8 @@ impl AppStore {
             let reason = classify_missing_email_challenge(
                 &tx,
                 &email,
-                &input.installation_id,
+                source_kind,
+                source_id,
                 AUTH_PURPOSE_LOGIN,
                 now,
             )?;
@@ -5208,7 +5364,8 @@ impl AppStore {
             let reason = classify_missing_email_challenge(
                 &tx,
                 &email,
-                &input.installation_id,
+                source_kind,
+                source_id,
                 AUTH_PURPOSE_LOGIN,
                 now,
             )?;
@@ -5227,7 +5384,8 @@ impl AppStore {
             session_id: Uuid::new_v4().to_string(),
             user_id: user.id.clone(),
             email: user.email.clone(),
-            installation_id: installation.id.clone(),
+            auth_source_kind: source_kind.to_string(),
+            auth_source_id: source_id.to_string(),
             access_token_hash: hash_token(&access_token),
             refresh_token_hash: hash_token(&refresh_token),
             access_expires_at,
@@ -5267,12 +5425,6 @@ impl AppStore {
         if current.refresh_expires_at < now {
             return Err(AppError::Unauthorized("refresh session expired".into()));
         }
-        if current.installation_id != input.installation_id {
-            return Err(AppError::Unauthorized(
-                "refresh session installation mismatch".into(),
-            ));
-        }
-
         let user = get_user_by_id(&tx, &current.user_id)?
             .ok_or_else(|| AppError::Unauthorized("user not found".into()))?;
         let access_token = generate_secret(48);
@@ -5304,7 +5456,8 @@ impl AppStore {
             session_id: Uuid::new_v4().to_string(),
             user_id: current.user_id.clone(),
             email: user.email.clone(),
-            installation_id: current.installation_id,
+            auth_source_kind: current.auth_source_kind,
+            auth_source_id: current.auth_source_id,
             access_token_hash: hash_token(&access_token),
             refresh_token_hash: hash_token(&refresh_token),
             access_expires_at,
@@ -5331,21 +5484,12 @@ impl AppStore {
     pub async fn session_status(
         &self,
         access_token: Option<&str>,
-        installation_id: Option<&str>,
     ) -> Result<SessionStatusResponse, AppError> {
-        let owner_email = if let Some(installation_id) = installation_id {
-            let conn = self.conn.lock().await;
-            get_installation_owner_email(&conn, installation_id)?
-        } else {
-            None
-        };
-
         let Some(access_token) = access_token.map(str::trim).filter(|v| !v.is_empty()) else {
             return Ok(SessionStatusResponse {
                 authenticated: false,
                 user: None,
                 expires_at: None,
-                installation_owner_email: owner_email,
                 is_admin: false,
             });
         };
@@ -5361,7 +5505,6 @@ impl AppStore {
                 email: session.email,
             }),
             expires_at: Some(session.access_expires_at),
-            installation_owner_email: owner_email,
             is_admin: false,
         })
     }
@@ -5584,7 +5727,7 @@ impl AppStore {
                 .map_err(|message| AppError::BadRequest(message.into()))?;
             let should_refresh_geo =
                 should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-            touch_installation_presence(&conn, &installation_id, &metadata, now)?;
+            touch_installation_activity(&conn, &installation_id, &metadata, now)?;
             let tx = conn.unchecked_transaction().map_err(|e| {
                 AppError::Internal(format!("begin client tunnel claim tx failed: {e}"))
             })?;
@@ -6816,7 +6959,7 @@ impl AppStore {
             verify_issue_lease_request(&conn, &installation.public_key, &input, now)?;
             let should_refresh_geo =
                 should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-            touch_installation_presence(&conn, &input.installation_id, &metadata, now)?;
+            touch_installation_activity(&conn, &input.installation_id, &metadata, now)?;
             (installation, should_refresh_geo)
         };
         if installation.1 {
@@ -7422,7 +7565,7 @@ impl AppStore {
                     "tunnel route head belongs to another generation".into(),
                 ));
             }
-            touch_installation_presence(&conn, &input.installation_id, &metadata, now)?;
+            touch_installation_activity(&conn, &input.installation_id, &metadata, now)?;
             (lease.0, lease.1)
         };
 
@@ -7877,7 +8020,7 @@ impl AppStore {
             )?;
             let should_refresh_geo =
                 should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-            touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+            touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
             drop(conn);
             if should_refresh_geo {
                 self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
@@ -7952,7 +8095,7 @@ impl AppStore {
         }
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         drop(conn);
         if should_refresh_geo {
             self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
@@ -8052,7 +8195,7 @@ impl AppStore {
         )?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         drop(conn);
         if should_refresh_geo {
             self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
@@ -8101,7 +8244,7 @@ impl AppStore {
         )?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         drop(conn);
         if should_refresh_geo {
             self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
@@ -8423,7 +8566,7 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         let edits = list_pending_share_edits_for_installation(
             &conn,
             &input.installation_id,
@@ -8452,7 +8595,7 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         let status = match input.ack.status.as_str() {
             "applied" => "applied",
             "rejected" => "rejected",
@@ -8593,7 +8736,7 @@ impl AppStore {
         )?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         drop(conn);
         if should_refresh_geo {
             self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
@@ -8653,7 +8796,7 @@ impl AppStore {
         )?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
 
         let subdomain = conn
             .query_row(
@@ -9162,8 +9305,7 @@ impl AppStore {
                     operational_summary: OperationalSummary::healthy("online"),
                     removal_at: None,
                 };
-                view.operational_summary =
-                    client_operational_summary(&view, config.client_stale_secs, Utc::now());
+                view.operational_summary = client_operational_summary(&view);
                 if view.operational_summary.state == "offline" {
                     view.removal_at = installation_removal_at.get(&view.installation.id).copied();
                 }
@@ -9742,12 +9884,27 @@ impl AppStore {
                 AppError::Internal(format!("delete stale image request logs failed: {e}"))
             })?;
 
+            let nonce_cutoff = (Utc::now() - Duration::seconds(NONCE_RETENTION_SECS)).to_rfc3339();
             tx.execute(
                 "DELETE FROM request_nonces
                  WHERE created_at < ?1",
-                params![(Utc::now() - Duration::seconds(NONCE_RETENTION_SECS)).to_rfc3339()],
+                params![nonce_cutoff],
             )
             .map_err(|e| AppError::Internal(format!("delete stale request nonces failed: {e}")))?;
+            tx.execute(
+                "DELETE FROM auth_device_nonces WHERE created_at < ?1",
+                params![nonce_cutoff],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("delete stale auth device nonces failed: {e}"))
+            })?;
+            tx.execute(
+                "DELETE FROM identity_registration_nonces WHERE created_at < ?1",
+                params![nonce_cutoff],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("delete stale registration nonces failed: {e}"))
+            })?;
             let registration_cache_now_ms = Utc::now().timestamp_millis();
             let registration_cache_cutoff_ms =
                 registration_cache_now_ms.saturating_sub(REGISTRATION_GEO_CACHE_TTL_SECS * 1_000);
@@ -9946,7 +10103,7 @@ impl AppStore {
         };
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         drop(conn);
         if should_refresh_geo {
             self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
@@ -10607,10 +10764,12 @@ impl AppStore {
                         s.bindings_json, s.capacity_pool_id,
                         COALESCE(s.for_sale_official_price_percent_by_app_json, '{}')
                  FROM shares s
-                 LEFT JOIN installations i ON i.id = s.installation_id
+                 INNER JOIN installations i ON i.id = s.installation_id
                  LEFT JOIN market_disabled_shares mds
                    ON lower(mds.market_email) = ?1 AND mds.share_id = s.share_id
                  WHERE s.share_status = 'active'
+                   AND i.lifecycle = 'active'
+                   AND i.client_activated_at IS NOT NULL
                    AND s.subdomain IS NOT NULL
                    AND s.subdomain != ''
                    AND s.subdomain != '-'
@@ -11167,9 +11326,12 @@ impl AppStore {
                 "SELECT DISTINCT i.id, i.latitude, i.longitude, i.country_code
                  FROM installations i
                  INNER JOIN shares s ON s.installation_id = i.id
-                 WHERE i.last_seen_at >= ?1
+                 INNER JOIN installation_notification_state ns ON ns.installation_id = i.id
+                 WHERE ns.last_heartbeat_at >= ?1
+                   AND i.lifecycle = 'active'
+                   AND i.client_activated_at IS NOT NULL
                    AND s.share_status = 'active'
-                 ORDER BY i.last_seen_at DESC",
+                 ORDER BY ns.last_heartbeat_at DESC",
             )
             .map_err(|e| AppError::Internal(format!("prepare public map clients failed: {e}")))?;
         let rows = stmt
@@ -11218,7 +11380,12 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let active_shares: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM shares WHERE share_status = 'active'",
+                "SELECT COUNT(*)
+                 FROM shares s
+                 INNER JOIN installations i ON i.id = s.installation_id
+                 WHERE s.share_status = 'active'
+                   AND i.lifecycle = 'active'
+                   AND i.client_activated_at IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
@@ -11228,7 +11395,10 @@ impl AppStore {
                 "SELECT COUNT(DISTINCT i.id)
                  FROM installations i
                  INNER JOIN shares s ON s.installation_id = i.id
-                 WHERE i.last_seen_at >= ?1
+                 INNER JOIN installation_notification_state ns ON ns.installation_id = i.id
+                 WHERE ns.last_heartbeat_at >= ?1
+                   AND i.lifecycle = 'active'
+                   AND i.client_activated_at IS NOT NULL
                    AND s.share_status = 'active'",
                 params![active_cutoff],
                 |row| row.get(0),
@@ -14003,11 +14173,8 @@ fn render_client_notification_batch(
                 owner_email: first.verified_owner_email.clone(),
                 version: notification_snapshot_string(&first.snapshot, "appVersion"),
                 client_url,
-                last_authenticated_seen_at: notification_snapshot_string(
-                    &first.snapshot,
-                    "lastAuthenticatedSeenAt",
-                )
-                .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
+                last_heartbeat_at: notification_snapshot_string(&first.snapshot, "lastHeartbeatAt")
+                    .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
                 offline_since: notification_snapshot_string(&first.snapshot, "offlineSince")
                     .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
                 dashboard_url: dashboard_url.to_string(),
@@ -14360,14 +14527,16 @@ fn materialize_offline_events_before_cleanup_tx(
         let mut statement = conn
             .prepare(
                 "SELECT ns.installation_id, ns.presence_state, ns.offline_episode,
-                        ns.last_authenticated_seen_at, i.platform, i.app_version,
+                        ns.last_heartbeat_at, i.platform, i.app_version,
                         i.owner_email, i.owner_verified_at, i.country_code,
                         i.created_at, ict.subdomain, ns.last_offline_event_at
                  FROM installation_notification_state ns
                  INNER JOIN installations i ON i.id = ns.installation_id
                  LEFT JOIN installation_client_tunnels ict
                    ON ict.installation_id = ns.installation_id
-                 WHERE ns.monitoring_enabled = 1 AND i.last_seen_at < ?1
+                 WHERE ns.monitoring_enabled = 1
+                   AND ns.last_heartbeat_at < ?1
+                   AND i.client_activated_at IS NOT NULL
                    AND ns.presence_state IN ('online', 'recovering')",
             )
             .map_err(|error| {
@@ -14414,7 +14583,7 @@ fn materialize_offline_events_before_cleanup_tx(
         installation_id,
         presence_state,
         previous_episode,
-        last_authenticated_seen_at,
+        last_heartbeat_at,
         platform,
         app_version,
         owner_email,
@@ -14461,7 +14630,7 @@ fn materialize_offline_events_before_cleanup_tx(
         .map_err(|error| {
             AppError::Internal(format!("materialize cleanup offline state failed: {error}"))
         })?;
-        if let Some(last_authenticated_seen_at) = last_authenticated_seen_at.as_deref() {
+        if let Some(last_heartbeat_at) = last_heartbeat_at.as_deref() {
             let verified_owner_email = owner_verified_at
                 .as_ref()
                 .and_then(|_| owner_email.as_deref());
@@ -14470,7 +14639,7 @@ fn materialize_offline_events_before_cleanup_tx(
                 &installation_id,
                 verified_owner_email,
                 episode,
-                last_authenticated_seen_at,
+                last_heartbeat_at,
                 &now,
             )?;
         }
@@ -14483,7 +14652,7 @@ fn materialize_offline_events_before_cleanup_tx(
             &platform,
             &app_version,
             tunnel_subdomain.as_deref(),
-            last_authenticated_seen_at.as_deref(),
+            last_heartbeat_at.as_deref(),
             now,
         )?;
         let status = if should_notify {
@@ -14502,7 +14671,7 @@ fn materialize_offline_events_before_cleanup_tx(
             "countryCode": country_code,
             "tunnelSubdomain": tunnel_subdomain,
             "registeredAt": created_at,
-            "lastAuthenticatedSeenAt": last_authenticated_seen_at,
+            "lastHeartbeatAt": last_heartbeat_at,
             "offlineSince": now,
         });
         conn.execute(
@@ -14540,7 +14709,7 @@ fn enqueue_client_offline_chat_event_tx(
     installation_id: &str,
     verified_owner_email: Option<&str>,
     episode: i64,
-    last_authenticated_seen_at: &str,
+    last_heartbeat_at: &str,
     confirmed_offline_at: &DateTime<Utc>,
 ) -> Result<(), AppError> {
     let Some(owner_email) = verified_owner_email
@@ -14576,7 +14745,7 @@ fn enqueue_client_offline_chat_event_tx(
         serde_json::json!({
             "summary": summary,
             "clientLabel": client_label,
-            "lastAuthenticatedSeenAt": last_authenticated_seen_at,
+            "lastHeartbeatAt": last_heartbeat_at,
             "confirmedOfflineAt": confirmed_offline_at,
         }),
         &[],
@@ -14636,7 +14805,7 @@ fn enqueue_client_presence_operator_signal_tx(
     platform: &str,
     app_version: &str,
     tunnel_subdomain: Option<&str>,
-    last_authenticated_seen_at: Option<&str>,
+    last_heartbeat_at: Option<&str>,
     occurred_at: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let state = if transition == "firing" {
@@ -14690,7 +14859,7 @@ fn enqueue_client_presence_operator_signal_tx(
             "reason": reason,
             "platform": platform,
             "appVersion": app_version,
-            "lastAuthenticatedSeenAt": last_authenticated_seen_at,
+            "lastHeartbeatAt": last_heartbeat_at,
             "occurredAt": occurred_at,
         }),
         occurred_at,
@@ -14705,7 +14874,7 @@ fn enqueue_removed_client_operator_signal_tx(
     let state = conn
         .query_row(
             "SELECT ns.offline_episode, ns.presence_state, i.platform, i.app_version,
-                    ict.subdomain, ns.last_authenticated_seen_at
+                    ict.subdomain, ns.last_heartbeat_at
              FROM installation_notification_state ns
              INNER JOIN installations i ON i.id = ns.installation_id
              LEFT JOIN installation_client_tunnels ict
@@ -14828,7 +14997,7 @@ fn get_installation(
 const INSTALLATION_SELECT_COLUMNS: &str = "id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region, city, latitude, longitude,
                 geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
                 geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
-                geo_last_changed_at, created_at, last_seen_at,
+                geo_last_changed_at, created_at, last_seen_at, client_activated_at,
                 delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip, provision_source";
 
 fn map_installation_row(row: &crate::db::Row<'_>) -> crate::db::Result<Installation> {
@@ -14899,23 +15068,34 @@ fn map_installation_row(row: &crate::db::Row<'_>) -> crate::db::Result<Installat
                 Box::new(error),
             )
         })?,
-        delegate_upgrade_to_router_owner: row.get::<_, Option<i64>>(24)?.map(|value| value != 0),
-        app_commit_id: row.get(25)?,
-        update_available: row.get::<_, Option<i64>>(26)?.map(|value| value != 0),
-        upgrade_capable: row.get::<_, Option<i64>>(27)?.map(|value| value != 0),
-        status_reported_at: row
-            .get::<_, Option<String>>(28)?
+        client_activated_at: row
+            .get::<_, Option<String>>(24)?
             .map(|value| parse_dt_sql(&value))
             .transpose()
             .map_err(|error| {
                 crate::db::Error::FromSqlConversionFailure(
-                    28,
+                    24,
                     crate::db::types::Type::Text,
                     Box::new(error),
                 )
             })?,
-        public_ip: row.get(29)?,
-        provision_source: row.get(30)?,
+        delegate_upgrade_to_router_owner: row.get::<_, Option<i64>>(25)?.map(|value| value != 0),
+        app_commit_id: row.get(26)?,
+        update_available: row.get::<_, Option<i64>>(27)?.map(|value| value != 0),
+        upgrade_capable: row.get::<_, Option<i64>>(28)?.map(|value| value != 0),
+        status_reported_at: row
+            .get::<_, Option<String>>(29)?
+            .map(|value| parse_dt_sql(&value))
+            .transpose()
+            .map_err(|error| {
+                crate::db::Error::FromSqlConversionFailure(
+                    29,
+                    crate::db::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        public_ip: row.get(30)?,
+        provision_source: row.get(31)?,
     })
 }
 
@@ -14995,6 +15175,7 @@ fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> 
             "SELECT {INSTALLATION_SELECT_COLUMNS}
              FROM installations
              WHERE lifecycle = 'active'
+               AND client_activated_at IS NOT NULL
              ORDER BY last_seen_at DESC"
         ))
         .map_err(|e| AppError::Internal(format!("prepare installations failed: {e}")))?;
@@ -15040,7 +15221,7 @@ fn get_installation_geo_state(
     .map_err(|e| AppError::Internal(format!("query installation geo state failed: {e}")))
 }
 
-fn touch_installation_presence(
+fn touch_installation_activity(
     conn: &Connection,
     installation_id: &str,
     metadata: &ClientMetadata,
@@ -15937,6 +16118,9 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     COALESCE(s.supported_user_token_periods_json, '[]'), s.capacity_pool_id,
                     COALESCE(s.for_sale_official_price_percent_by_app_json, '{}')
              FROM shares s
+             INNER JOIN installations i ON i.id = s.installation_id
+             WHERE i.lifecycle = 'active'
+               AND i.client_activated_at IS NOT NULL
              ORDER BY s.share_name ASC",
         )
         .map_err(|e| AppError::Internal(format!("prepare shares failed: {e}")))?;
@@ -21197,14 +21381,20 @@ fn consume_new_identity_admission(
     for quota in policy.source_new_identity_quotas() {
         retry_after_secs = retry_after_secs.max(registration_quota_retry_after(
             conn,
+            "registration_admission_events",
             Some(source_scope),
             quota,
             now_ms,
         )?);
     }
     for quota in policy.global_new_identity_quotas() {
-        retry_after_secs =
-            retry_after_secs.max(registration_quota_retry_after(conn, None, quota, now_ms)?);
+        retry_after_secs = retry_after_secs.max(registration_quota_retry_after(
+            conn,
+            "registration_admission_events",
+            None,
+            quota,
+            now_ms,
+        )?);
     }
     if retry_after_secs > 0 {
         return Err(AppError::RateLimited {
@@ -21255,24 +21445,88 @@ fn consume_new_identity_admission(
     Ok(())
 }
 
+fn consume_new_auth_device_admission(
+    conn: &Connection,
+    source_scope: &str,
+    policy: RegistrationAdmissionPolicy,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let now_ms = now.timestamp_millis();
+    let day_ms =
+        i64::try_from(StdDuration::from_secs(24 * 60 * 60).as_millis()).unwrap_or(86_400_000);
+    conn.execute(
+        "DELETE FROM auth_device_registration_events WHERE occurred_at_ms <= ?1",
+        params![now_ms.saturating_sub(day_ms)],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "prune expired auth device admission events failed: {error}"
+        ))
+    })?;
+
+    let mut retry_after_secs = 0_u64;
+    for quota in policy.source_new_identity_quotas() {
+        retry_after_secs = retry_after_secs.max(registration_quota_retry_after(
+            conn,
+            "auth_device_registration_events",
+            Some(source_scope),
+            quota,
+            now_ms,
+        )?);
+    }
+    for quota in policy.global_new_identity_quotas() {
+        retry_after_secs = retry_after_secs.max(registration_quota_retry_after(
+            conn,
+            "auth_device_registration_events",
+            None,
+            quota,
+            now_ms,
+        )?);
+    }
+    if retry_after_secs > 0 {
+        return Err(AppError::RateLimited {
+            message: "new auth device registration quota exceeded".into(),
+            retry_after_secs,
+        });
+    }
+    conn.execute(
+        "INSERT INTO auth_device_registration_events (source_scope, occurred_at_ms)
+         VALUES (?1, ?2)",
+        params![source_scope, now_ms],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "record accepted auth device registration failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 fn registration_quota_retry_after(
     conn: &Connection,
+    table_name: &str,
     source_scope: Option<&str>,
     quota: RegistrationQuotaWindow,
     now_ms: i64,
 ) -> Result<u64, AppError> {
+    debug_assert!(matches!(
+        table_name,
+        "registration_admission_events" | "auth_device_registration_events"
+    ));
     let window_ms = i64::try_from(quota.duration.as_millis()).unwrap_or(i64::MAX);
     let cutoff_ms = now_ms.saturating_sub(window_ms);
     let count = if let Some(source_scope) = source_scope {
         conn.query_row(
-            "SELECT COUNT(*) FROM registration_admission_events
-             WHERE source_scope = ?1 AND occurred_at_ms > ?2",
+            &format!(
+                "SELECT COUNT(*) FROM {table_name}
+                 WHERE source_scope = ?1 AND occurred_at_ms > ?2"
+            ),
             params![source_scope, cutoff_ms],
             |row| row.get::<_, i64>(0),
         )
     } else {
         conn.query_row(
-            "SELECT COUNT(*) FROM registration_admission_events WHERE occurred_at_ms > ?1",
+            &format!("SELECT COUNT(*) FROM {table_name} WHERE occurred_at_ms > ?1"),
             params![cutoff_ms],
             |row| row.get::<_, i64>(0),
         )
@@ -21290,19 +21544,23 @@ fn registration_quota_retry_after(
     let offset = count.saturating_sub(limit);
     let releases_at_ms = if let Some(source_scope) = source_scope {
         conn.query_row(
-            "SELECT occurred_at_ms FROM registration_admission_events
-             WHERE source_scope = ?1 AND occurred_at_ms > ?2
-             ORDER BY occurred_at_ms, id
-             LIMIT 1 OFFSET ?3",
+            &format!(
+                "SELECT occurred_at_ms FROM {table_name}
+                 WHERE source_scope = ?1 AND occurred_at_ms > ?2
+                 ORDER BY occurred_at_ms, id
+                 LIMIT 1 OFFSET ?3"
+            ),
             params![source_scope, cutoff_ms, offset],
             |row| row.get::<_, i64>(0),
         )
     } else {
         conn.query_row(
-            "SELECT occurred_at_ms FROM registration_admission_events
-             WHERE occurred_at_ms > ?1
-             ORDER BY occurred_at_ms, id
-             LIMIT 1 OFFSET ?2",
+            &format!(
+                "SELECT occurred_at_ms FROM {table_name}
+                 WHERE occurred_at_ms > ?1
+                 ORDER BY occurred_at_ms, id
+                 LIMIT 1 OFFSET ?2"
+            ),
             params![cutoff_ms, offset],
             |row| row.get::<_, i64>(0),
         )
@@ -21320,14 +21578,6 @@ fn registration_quota_retry_after(
         .max(1))
 }
 
-fn registration_nonce_subject(public_key: &str) -> String {
-    let digest = Sha256::digest(public_key.trim().as_bytes());
-    format!(
-        "registration:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-    )
-}
-
 fn insert_installation_notification_baseline(
     conn: &Connection,
     installation_id: &str,
@@ -21336,9 +21586,9 @@ fn insert_installation_notification_baseline(
     let now = now.to_rfc3339();
     conn.execute(
         "INSERT OR IGNORE INTO installation_notification_state (
-            installation_id, registration_state, monitoring_enabled, presence_state,
+            installation_id, monitoring_enabled, presence_state,
             created_at, updated_at
-         ) VALUES (?1, 'provisional', 0, 'unknown', ?2, ?2)",
+         ) VALUES (?1, 0, 'unknown', ?2, ?2)",
         params![installation_id, now],
     )
     .map_err(|error| {
@@ -21349,11 +21599,10 @@ fn insert_installation_notification_baseline(
     Ok(())
 }
 
-fn record_authenticated_installation_presence(
+fn record_installation_heartbeat_presence(
     conn: &Connection,
     installation: &Installation,
     now: DateTime<Utc>,
-    enable_monitoring: bool,
     boot_id: Option<&str>,
 ) -> Result<(), AppError> {
     insert_installation_notification_baseline(conn, &installation.id, now)?;
@@ -21361,15 +21610,13 @@ fn record_authenticated_installation_presence(
     let timestamp = now.to_rfc3339();
     conn.execute(
         "UPDATE installation_notification_state
-         SET registration_state = 'verified',
-             registration_verified_at = COALESCE(registration_verified_at, ?2),
-             monitoring_enabled = CASE WHEN ?3 = 1 THEN 1 ELSE monitoring_enabled END,
+         SET monitoring_enabled = CASE WHEN ?3 = 1 THEN 1 ELSE monitoring_enabled END,
              presence_state = CASE
                  WHEN presence_state = 'offline' THEN 'recovering'
                  WHEN presence_state = 'unknown' THEN 'online'
                  ELSE presence_state
              END,
-             last_authenticated_seen_at = ?2,
+             last_heartbeat_at = ?2,
              last_boot_id = COALESCE(?4, last_boot_id),
              offline_candidate_since = NULL,
              recovery_candidate_since = CASE
@@ -21382,7 +21629,7 @@ fn record_authenticated_installation_presence(
         params![
             installation.id,
             timestamp,
-            i64::from(enable_monitoring),
+            i64::from(installation.client_activated_at.is_some()),
             boot_id
         ],
     )
@@ -21526,73 +21773,76 @@ fn record_registration_notification_overflow_tx(
 fn verify_registration_signature(
     public_key: &str,
     input: &RegisterInstallationRequest,
-    existing_installation_id: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<bool, AppError> {
+) -> Result<(), AppError> {
     ensure_tunnel_protocol_epoch(&input.protocol_epoch)?;
-    if let Some(proof_version) = input.proof_version {
-        if proof_version != 2 {
-            return Err(AppError::BadRequest(
-                "unsupported registration proof_version".into(),
-            ));
-        }
-        let timestamp_ms = input.timestamp_ms.ok_or_else(|| {
-            AppError::BadRequest("timestamp_ms is required for registration proof v2".into())
-        })?;
-        let signature = input.signature.as_deref().ok_or_else(|| {
-            AppError::BadRequest("signature is required for registration proof v2".into())
-        })?;
-        let skew = (now.timestamp_millis() - timestamp_ms).abs();
-        if skew > SIGNED_REQUEST_MAX_SKEW_MS {
-            return Err(AppError::Unauthorized("stale registration proof".into()));
-        }
-        let payload = format!(
-            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{}\n{}\n{}\n{}\n{}",
-            input.public_key.trim(),
-            input.platform.trim(),
-            input.app_version,
-            input.instance_nonce,
-            timestamp_ms
-        );
-        verify_detached_signature(public_key, payload.as_bytes(), signature)?;
-        return Ok(true);
-    }
-
-    let Some(timestamp_ms) = input.timestamp_ms else {
-        if input.signature.is_some() {
-            return Err(AppError::BadRequest(
-                "timestamp_ms is required when registration signature is provided".into(),
-            ));
-        }
-        return Ok(false);
-    };
-    let Some(signature) = input.signature.as_deref() else {
-        return Err(AppError::BadRequest(
-            "signature is required when registration timestamp_ms is provided".into(),
-        ));
-    };
-    let Some(installation_id) = existing_installation_id else {
-        // Legacy signatures included the Router-generated installation id and
-        // therefore cannot prove possession during a first registration.
-        return Ok(false);
-    };
-    let skew = (now.timestamp_millis() - timestamp_ms).abs();
-    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
-        return Err(AppError::Unauthorized(
-            "stale registration recovery request".into(),
-        ));
+    if signed_request_timestamp_is_stale(now, input.timestamp_ms) {
+        return Err(AppError::Unauthorized("stale registration request".into()));
     }
     let payload = format!(
-        "{PROTOCOL_EPOCH}\n{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
-        installation_id,
+        "{PROTOCOL_EPOCH}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
         input.public_key.trim(),
         input.platform.trim(),
         input.app_version,
         input.instance_nonce,
-        timestamp_ms
+        input.timestamp_ms
     );
-    verify_detached_signature(public_key, payload.as_bytes(), signature)?;
-    Ok(true)
+    verify_detached_signature(public_key, payload.as_bytes(), &input.signature)
+}
+
+fn verify_auth_device_registration_signature(
+    public_key: &str,
+    input: &RegisterAuthDeviceRequest,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    ensure_tunnel_protocol_epoch(&input.protocol_epoch)?;
+    if signed_request_timestamp_is_stale(now, input.timestamp_ms) {
+        return Err(AppError::Unauthorized(
+            "stale auth device registration request".into(),
+        ));
+    }
+    let payload = format!(
+        "{PROTOCOL_EPOCH}\nregister_auth_device\n{}\n{}\n{}\n{}\n{}\n{}",
+        input.public_key.trim(),
+        input.kind.trim(),
+        input.platform.trim(),
+        input.app_version,
+        input.instance_nonce,
+        input.timestamp_ms
+    );
+    verify_detached_signature(public_key, payload.as_bytes(), &input.signature)
+}
+
+fn consume_identity_registration_nonce(
+    conn: &Connection,
+    identity_kind: &str,
+    public_key: &str,
+    nonce: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let public_key_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(public_key.trim().as_bytes()));
+    conn.execute(
+        "INSERT INTO identity_registration_nonces (
+            identity_kind, public_key_hash, nonce, created_at
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![identity_kind, public_key_hash, nonce, now.to_rfc3339()],
+    )
+    .map_err(|error| {
+        let text = error.to_string();
+        if text.contains("UNIQUE constraint failed")
+            || text.contains("identity_registration_nonces")
+        {
+            AppError::Unauthorized("registration nonce already used".into())
+        } else {
+            AppError::Internal(format!("store registration nonce failed: {text}"))
+        }
+    })?;
+    Ok(())
+}
+
+fn signed_request_timestamp_is_stale(now: DateTime<Utc>, timestamp_ms: i64) -> bool {
+    now.timestamp_millis().abs_diff(timestamp_ms) > SIGNED_REQUEST_MAX_SKEW_MS as u64
 }
 
 fn retire_reclaimable_route_candidates_tx(
@@ -21637,8 +21887,7 @@ fn verify_issue_lease_request(
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     ensure_tunnel_protocol_epoch(&input.protocol_epoch)?;
-    let skew = (now.timestamp_millis() - input.timestamp_ms).abs();
-    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+    if signed_request_timestamp_is_stale(now, input.timestamp_ms) {
         return Err(AppError::Unauthorized("stale lease request".into()));
     }
     verify_issue_lease_signature(public_key, input)?;
@@ -21788,8 +22037,7 @@ fn verify_signed_share_request<T: Serialize>(
     signature: &str,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let skew = (now.timestamp_millis() - timestamp_ms).abs();
-    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+    if signed_request_timestamp_is_stale(now, timestamp_ms) {
         return Err(AppError::Unauthorized("stale signed request".into()));
     }
 
@@ -21816,8 +22064,7 @@ fn verify_signed_tunnel_request<T: Serialize>(
     signature: &str,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let skew = (now.timestamp_millis() - timestamp_ms).abs();
-    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+    if signed_request_timestamp_is_stale(now, timestamp_ms) {
         return Err(AppError::Unauthorized("stale signed tunnel request".into()));
     }
     verify_tunnel_signed_payload(
@@ -21843,8 +22090,7 @@ fn verify_signed_gateway_request(
     signature: &str,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let skew = (now.timestamp_millis() - timestamp_ms).abs();
-    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+    if signed_request_timestamp_is_stale(now, timestamp_ms) {
         return Err(AppError::Unauthorized(
             "stale signed gateway request".into(),
         ));
@@ -21872,8 +22118,7 @@ fn verify_share_claim_request(
     signature: &str,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let skew = (now.timestamp_millis() - timestamp_ms).abs();
-    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+    if signed_request_timestamp_is_stale(now, timestamp_ms) {
         return Err(AppError::Unauthorized("stale signed request".into()));
     }
 
@@ -21936,9 +22181,21 @@ fn consume_authenticated_installation_nonce(
         })?;
     let result = (|| {
         consume_request_nonce(conn, installation_id, action, nonce, now)?;
-        let installation = get_installation(conn, installation_id)?
-            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-        record_authenticated_installation_presence(conn, &installation, now, false, None)
+        let updated = conn
+            .execute(
+                "UPDATE installations SET last_seen_at = ?2
+                 WHERE id = ?1 AND lifecycle = 'active'",
+                params![installation_id, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "update authenticated installation activity failed: {error}"
+                ))
+            })?;
+        if updated != 1 {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        }
+        Ok(())
     })();
     match result {
         Ok(()) => conn
@@ -22151,7 +22408,7 @@ struct EmailLoginChallenge {
 enum EmailVerificationRejectionReason {
     Expired,
     Consumed,
-    InstallationMismatch,
+    SourceMismatch,
     NotFound,
     InvalidCode,
     AttemptLimit,
@@ -22162,7 +22419,7 @@ impl EmailVerificationRejectionReason {
         match self {
             Self::Expired => "expired",
             Self::Consumed => "consumed",
-            Self::InstallationMismatch => "installation_mismatch",
+            Self::SourceMismatch => "source_mismatch",
             Self::NotFound => "not_found",
             Self::InvalidCode => "invalid_code",
             Self::AttemptLimit => "attempt_limit",
@@ -22651,16 +22908,90 @@ async fn send_market_template_email(
     Ok(Some(response.id.to_string()))
 }
 
+fn auth_source_public_key(
+    conn: &Connection,
+    source_kind: &str,
+    source_id: &str,
+) -> Result<String, AppError> {
+    match source_kind {
+        AUTH_SOURCE_AUTH_DEVICE => conn
+            .query_row(
+                "SELECT public_key FROM auth_devices
+                 WHERE id = ?1 AND status = 'active'",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("query auth device public key failed: {error}"))
+            })?
+            .ok_or_else(|| AppError::Unauthorized("auth device not found".into())),
+        AUTH_SOURCE_CLIENT_INSTALLATION => get_installation(conn, source_id)?
+            .map(|installation| installation.public_key)
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into())),
+        _ => Err(AppError::BadRequest(
+            "unsupported authentication source".into(),
+        )),
+    }
+}
+
+fn consume_auth_source_nonce(
+    conn: &Connection,
+    source_kind: &str,
+    source_id: &str,
+    nonce: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    match source_kind {
+        AUTH_SOURCE_AUTH_DEVICE => {
+            conn.execute(
+                "INSERT INTO auth_device_nonces (auth_device_id, action, nonce, created_at)
+                 VALUES (?1, 'auth_request_code', ?2, ?3)",
+                params![source_id, nonce, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                let text = error.to_string();
+                if text.contains("UNIQUE constraint failed") || text.contains("auth_device_nonces")
+                {
+                    AppError::Unauthorized("nonce already used".into())
+                } else {
+                    AppError::Internal(format!("store auth device nonce failed: {text}"))
+                }
+            })?;
+            conn.execute(
+                "UPDATE auth_devices SET last_seen_at = ?2
+                 WHERE id = ?1 AND status = 'active'",
+                params![source_id, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("update auth device activity failed: {error}"))
+            })?;
+            Ok(())
+        }
+        AUTH_SOURCE_CLIENT_INSTALLATION => consume_authenticated_installation_nonce(
+            conn,
+            source_id,
+            "auth_request_code",
+            nonce,
+            now,
+        ),
+        _ => Err(AppError::BadRequest(
+            "unsupported authentication source".into(),
+        )),
+    }
+}
+
 fn enforce_auth_send_limits(
     conn: &Connection,
     config: &Config,
     email: &str,
-    installation_id: &str,
+    source_kind: &str,
+    source_id: &str,
     metadata: &ClientMetadata,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let hour_cutoff = (now - Duration::hours(1)).to_rfc3339();
-    if let Some(next_allowed_at) = latest_challenge_cooldown(conn, email, installation_id)? {
+    if let Some(next_allowed_at) = latest_challenge_cooldown(conn, email, source_kind, source_id)? {
         if next_allowed_at > now {
             return Err(AppError::TooManyRequests(format!(
                 "verification email cooldown active, retry in {}s",
@@ -22683,17 +23014,17 @@ fn enforce_auth_send_limits(
         ));
     }
 
-    let installation_count: i64 = conn
+    let source_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM email_login_challenges
-             WHERE installation_id = ?1 AND created_at >= ?2",
-            params![installation_id, hour_cutoff],
+             WHERE auth_source_kind = ?1 AND auth_source_id = ?2 AND created_at >= ?3",
+            params![source_kind, source_id, hour_cutoff],
             |row| row.get(0),
         )
-        .map_err(|e| AppError::Internal(format!("count installation auth requests failed: {e}")))?;
-    if installation_count >= config.auth_installation_hourly_limit {
+        .map_err(|e| AppError::Internal(format!("count auth source requests failed: {e}")))?;
+    if source_count >= config.auth_source_hourly_limit {
         return Err(AppError::TooManyRequests(
-            "installation verification rate limit exceeded".into(),
+            "authentication source verification rate limit exceeded".into(),
         ));
     }
 
@@ -22719,16 +23050,18 @@ fn enforce_auth_send_limits(
 fn latest_challenge_cooldown(
     conn: &Connection,
     email: &str,
-    installation_id: &str,
+    source_kind: &str,
+    source_id: &str,
 ) -> Result<Option<DateTime<Utc>>, AppError> {
     conn.query_row(
         "SELECT resend_available_at
          FROM email_login_challenges
          WHERE email_normalized = ?1
-           AND installation_id = ?2
+           AND auth_source_kind = ?2
+           AND auth_source_id = ?3
          ORDER BY created_at DESC
          LIMIT 1",
-        params![email, installation_id],
+        params![email, source_kind, source_id],
         |row| row.get::<_, String>(0),
     )
     .optional()
@@ -22743,7 +23076,8 @@ fn persist_sent_login_challenge(
     conn: &mut Connection,
     config: &Config,
     email: &str,
-    installation_id: &str,
+    source_kind: &str,
+    source_id: &str,
     code_hash: &str,
     provider_message_id: Option<&str>,
     metadata: &ClientMetadata,
@@ -22757,23 +23091,31 @@ fn persist_sent_login_challenge(
         .map_err(|e| AppError::Internal(format!("begin auth challenge persistence failed: {e}")))?;
     tx.execute(
         "UPDATE email_login_challenges
-         SET consumed_at = ?4
+         SET consumed_at = ?5
          WHERE email_normalized = ?1
-           AND installation_id = ?2
-           AND purpose = ?3
+           AND auth_source_kind = ?2
+           AND auth_source_id = ?3
+           AND purpose = ?4
            AND consumed_at IS NULL",
-        params![email, installation_id, AUTH_PURPOSE_LOGIN, issued_at_text,],
+        params![
+            email,
+            source_kind,
+            source_id,
+            AUTH_PURPOSE_LOGIN,
+            issued_at_text,
+        ],
     )
     .map_err(|e| AppError::Internal(format!("expire old auth challenges failed: {e}")))?;
     tx.execute(
         "INSERT INTO email_login_challenges (
-            id, email_normalized, installation_id, purpose, code_hash, expires_at,
+            id, email_normalized, auth_source_kind, auth_source_id, purpose, code_hash, expires_at,
             consumed_at, attempt_count, resend_available_at, created_ip, created_user_agent, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7, ?8, NULL, ?9)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, ?8, ?9, NULL, ?10)",
         params![
             Uuid::new_v4().to_string(),
             email,
-            installation_id,
+            source_kind,
+            source_id,
             AUTH_PURPOSE_LOGIN,
             code_hash,
             expires_at.to_rfc3339(),
@@ -22806,20 +23148,22 @@ fn persist_sent_login_challenge(
 fn classify_missing_email_challenge(
     conn: &Connection,
     email: &str,
-    installation_id: &str,
+    source_kind: &str,
+    source_id: &str,
     purpose: &str,
     now: DateTime<Utc>,
 ) -> Result<EmailVerificationRejectionReason, AppError> {
     let exact_status = conn
         .query_row(
-            "SELECT consumed_at IS NOT NULL, expires_at < ?4
+            "SELECT consumed_at IS NOT NULL, expires_at < ?5
              FROM email_login_challenges
              WHERE email_normalized = ?1
-               AND installation_id = ?2
-               AND purpose = ?3
+               AND auth_source_kind = ?2
+               AND auth_source_id = ?3
+               AND purpose = ?4
              ORDER BY created_at DESC
              LIMIT 1",
-            params![email, installation_id, purpose, now.to_rfc3339()],
+            params![email, source_kind, source_id, purpose, now.to_rfc3339()],
             |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
         )
         .optional()
@@ -22833,25 +23177,23 @@ fn classify_missing_email_challenge(
         }
     }
 
-    let installation_mismatch: bool = conn
+    let source_mismatch: bool = conn
         .query_row(
             "SELECT EXISTS(
                 SELECT 1
                 FROM email_login_challenges
                 WHERE email_normalized = ?1
-                  AND installation_id <> ?2
-                  AND purpose = ?3
+                  AND (auth_source_kind <> ?2 OR auth_source_id <> ?3)
+                  AND purpose = ?4
                   AND consumed_at IS NULL
-                  AND expires_at >= ?4
+                  AND expires_at >= ?5
              )",
-            params![email, installation_id, purpose, now.to_rfc3339()],
+            params![email, source_kind, source_id, purpose, now.to_rfc3339()],
             |row| row.get(0),
         )
-        .map_err(|e| {
-            AppError::Internal(format!("classify auth installation mismatch failed: {e}"))
-        })?;
-    if installation_mismatch {
-        return Ok(EmailVerificationRejectionReason::InstallationMismatch);
+        .map_err(|e| AppError::Internal(format!("classify auth source mismatch failed: {e}")))?;
+    if source_mismatch {
+        return Ok(EmailVerificationRejectionReason::SourceMismatch);
     }
     Ok(EmailVerificationRejectionReason::NotFound)
 }
@@ -22859,7 +23201,8 @@ fn classify_missing_email_challenge(
 fn get_latest_active_email_challenge(
     conn: &Connection,
     email: &str,
-    installation_id: &str,
+    source_kind: &str,
+    source_id: &str,
     purpose: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<EmailLoginChallenge>, AppError> {
@@ -22867,13 +23210,14 @@ fn get_latest_active_email_challenge(
         "SELECT id, code_hash, attempt_count
          FROM email_login_challenges
          WHERE email_normalized = ?1
-           AND installation_id = ?2
-           AND purpose = ?3
+           AND auth_source_kind = ?2
+           AND auth_source_id = ?3
+           AND purpose = ?4
            AND consumed_at IS NULL
-           AND expires_at >= ?4
+           AND expires_at >= ?5
          ORDER BY created_at DESC
          LIMIT 1",
-        params![email, installation_id, purpose, now.to_rfc3339()],
+        params![email, source_kind, source_id, purpose, now.to_rfc3339()],
         |row| {
             Ok(EmailLoginChallenge {
                 id: row.get(0)?,
@@ -22945,13 +23289,14 @@ fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<Option<AuthUser>, 
 fn persist_session(conn: &Connection, session: &AuthSession) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO user_sessions (
-            id, user_id, installation_id, access_token_hash, refresh_token_hash,
+            id, user_id, auth_source_kind, auth_source_id, access_token_hash, refresh_token_hash,
             access_expires_at, refresh_expires_at, revoked_at, created_at, last_used_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
         params![
             session.session_id,
             session.user_id,
-            session.installation_id,
+            session.auth_source_kind,
+            session.auth_source_id,
             session.access_token_hash,
             session.refresh_token_hash,
             session.access_expires_at.to_rfc3339(),
@@ -22968,14 +23313,15 @@ fn map_auth_session_row(row: &crate::db::Row<'_>) -> crate::db::Result<AuthSessi
     Ok(AuthSession {
         session_id: row.get(0)?,
         user_id: row.get(1)?,
-        installation_id: row.get(2)?,
-        access_token_hash: row.get(3)?,
-        refresh_token_hash: row.get(4)?,
-        access_expires_at: parse_dt_sql(&row.get::<_, String>(5)?)?,
-        refresh_expires_at: parse_dt_sql(&row.get::<_, String>(6)?)?,
-        created_at: parse_dt_sql(&row.get::<_, String>(7)?)?,
-        last_used_at: parse_dt_sql(&row.get::<_, String>(8)?)?,
-        email: row.get(9)?,
+        auth_source_kind: row.get(2)?,
+        auth_source_id: row.get(3)?,
+        access_token_hash: row.get(4)?,
+        refresh_token_hash: row.get(5)?,
+        access_expires_at: parse_dt_sql(&row.get::<_, String>(6)?)?,
+        refresh_expires_at: parse_dt_sql(&row.get::<_, String>(7)?)?,
+        created_at: parse_dt_sql(&row.get::<_, String>(8)?)?,
+        last_used_at: parse_dt_sql(&row.get::<_, String>(9)?)?,
+        email: row.get(10)?,
     })
 }
 
@@ -22984,7 +23330,8 @@ fn get_session_by_access_hash(
     access_hash: &str,
 ) -> Result<Option<AuthSession>, AppError> {
     conn.query_row(
-        "SELECT s.id, s.user_id, s.installation_id, s.access_token_hash, s.refresh_token_hash,
+        "SELECT s.id, s.user_id, s.auth_source_kind, s.auth_source_id,
+                s.access_token_hash, s.refresh_token_hash,
                 s.access_expires_at, s.refresh_expires_at, s.created_at, s.last_used_at, u.email_normalized
          FROM user_sessions s
          INNER JOIN users u ON u.id = s.user_id
@@ -23004,7 +23351,8 @@ fn get_refreshable_session_by_refresh_hash(
     let rotation_cutoff =
         (now - Duration::seconds(SESSION_REFRESH_ROTATION_GRACE_SECS)).to_rfc3339();
     conn.query_row(
-        "SELECT s.id, s.user_id, s.installation_id, s.access_token_hash, s.refresh_token_hash,
+        "SELECT s.id, s.user_id, s.auth_source_kind, s.auth_source_id,
+                s.access_token_hash, s.refresh_token_hash,
                 s.access_expires_at, s.refresh_expires_at, s.created_at, s.last_used_at, u.email_normalized
          FROM user_sessions s
          INNER JOIN users u ON u.id = s.user_id
@@ -23156,6 +23504,7 @@ fn get_user_api_token_by_hash(
     .map_err(|e| AppError::Internal(format!("query user api token failed: {e}")))
 }
 
+#[cfg(test)]
 fn get_installation_owner_email(
     conn: &Connection,
     installation_id: &str,
@@ -23460,6 +23809,7 @@ mod tests {
             get_latest_active_email_challenge(
                 &conn,
                 email,
+                AUTH_SOURCE_CLIENT_INSTALLATION,
                 "auth-installation-a",
                 AUTH_PURPOSE_LOGIN,
                 issued_at,
@@ -23473,6 +23823,7 @@ mod tests {
             get_latest_active_email_challenge(
                 &conn,
                 email,
+                AUTH_SOURCE_CLIENT_INSTALLATION,
                 "auth-installation-b",
                 AUTH_PURPOSE_LOGIN,
                 issued_at,
@@ -23553,7 +23904,9 @@ mod tests {
                     SUM(CASE WHEN consumed_at IS NULL THEN 1 ELSE 0 END),
                     SUM(CASE WHEN consumed_at IS NOT NULL THEN 1 ELSE 0 END)
                  FROM email_login_challenges
-                 WHERE email_normalized = ?1 AND installation_id = 'auth-resend-a'",
+                 WHERE email_normalized = ?1
+                   AND auth_source_kind = 'client_installation'
+                   AND auth_source_id = 'auth-resend-a'",
                 params![email],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -23563,7 +23916,8 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM email_login_challenges
                  WHERE email_normalized = ?1
-                   AND installation_id = 'auth-resend-b'
+                   AND auth_source_kind = 'client_installation'
+                   AND auth_source_id = 'auth-resend-b'
                    AND consumed_at IS NULL",
                 params![email],
                 |row| row.get(0),
@@ -23573,6 +23927,7 @@ mod tests {
         let latest_a = get_latest_active_email_challenge(
             &conn,
             email,
+            AUTH_SOURCE_CLIENT_INSTALLATION,
             "auth-resend-a",
             AUTH_PURPOSE_LOGIN,
             issued_at,
@@ -23634,17 +23989,19 @@ mod tests {
             classify_missing_email_challenge(
                 &conn,
                 "mismatch@example.com",
+                AUTH_SOURCE_CLIENT_INSTALLATION,
                 "auth-reason-a",
                 AUTH_PURPOSE_LOGIN,
                 now,
             )
-            .expect("classify installation mismatch"),
-            EmailVerificationRejectionReason::InstallationMismatch
+            .expect("classify auth source mismatch"),
+            EmailVerificationRejectionReason::SourceMismatch
         );
         assert_eq!(
             classify_missing_email_challenge(
                 &conn,
                 "expired@example.com",
+                AUTH_SOURCE_CLIENT_INSTALLATION,
                 "auth-reason-a",
                 AUTH_PURPOSE_LOGIN,
                 now,
@@ -23656,6 +24013,7 @@ mod tests {
             classify_missing_email_challenge(
                 &conn,
                 "consumed@example.com",
+                AUTH_SOURCE_CLIENT_INSTALLATION,
                 "auth-reason-a",
                 AUTH_PURPOSE_LOGIN,
                 now,
@@ -23667,6 +24025,7 @@ mod tests {
             classify_missing_email_challenge(
                 &conn,
                 "missing@example.com",
+                AUTH_SOURCE_CLIENT_INSTALLATION,
                 "auth-reason-a",
                 AUTH_PURPOSE_LOGIN,
                 now,
@@ -23689,9 +24048,9 @@ mod tests {
             .await;
 
         let response = store
-            .verify_email_code(
+            .verify_client_web_email_code(
                 &config,
-                VerifyEmailCodeRequest {
+                ClientWebVerifyEmailCodeRequest {
                     email: email.into(),
                     code: code.into(),
                     installation_id: installation_id.into(),
@@ -23707,7 +24066,8 @@ mod tests {
                 "SELECT
                     (SELECT COUNT(*) FROM email_login_challenges WHERE consumed_at IS NOT NULL),
                     (SELECT COUNT(*) FROM users WHERE email_normalized = ?1),
-                    (SELECT COUNT(*) FROM user_sessions WHERE installation_id = ?2),
+                    (SELECT COUNT(*) FROM user_sessions
+                      WHERE auth_source_kind = 'client_installation' AND auth_source_id = ?2),
                     (SELECT COUNT(*) FROM user_api_tokens WHERE user_id = ?3)",
                 params![email, installation_id, response.user.id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -23740,9 +24100,9 @@ mod tests {
         }
 
         let result = store
-            .verify_email_code(
+            .verify_client_web_email_code(
                 &config,
-                VerifyEmailCodeRequest {
+                ClientWebVerifyEmailCodeRequest {
                     email: email.into(),
                     code: code.into(),
                     installation_id: installation_id.into(),
@@ -23757,7 +24117,8 @@ mod tests {
                 "SELECT
                     (SELECT COUNT(*) FROM email_login_challenges WHERE consumed_at IS NOT NULL),
                     (SELECT COUNT(*) FROM users WHERE email_normalized = ?1),
-                    (SELECT COUNT(*) FROM user_sessions WHERE installation_id = ?2)",
+                    (SELECT COUNT(*) FROM user_sessions
+                      WHERE auth_source_kind = 'client_installation' AND auth_source_id = ?2)",
                 params![email, installation_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -23784,9 +24145,9 @@ mod tests {
         .await;
 
         let result = store
-            .verify_email_code(
+            .verify_client_web_email_code(
                 &config,
-                VerifyEmailCodeRequest {
+                ClientWebVerifyEmailCodeRequest {
                     email: email.into(),
                     code: "000000".into(),
                     installation_id: installation_id.into(),
@@ -23799,7 +24160,8 @@ mod tests {
         let attempt_count: i64 = conn
             .query_row(
                 "SELECT attempt_count FROM email_login_challenges
-                 WHERE email_normalized = ?1 AND installation_id = ?2",
+                 WHERE email_normalized = ?1
+                   AND auth_source_kind = 'client_installation' AND auth_source_id = ?2",
                 params![email, installation_id],
                 |row| row.get(0),
             )
@@ -23987,7 +24349,7 @@ mod tests {
             auth_max_verify_attempts: 8,
             auth_email_hourly_limit: 10,
             auth_ip_hourly_limit: 30,
-            auth_installation_hourly_limit: 15,
+            auth_source_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
@@ -24031,6 +24393,7 @@ mod tests {
             &mut conn,
             config,
             email,
+            AUTH_SOURCE_CLIENT_INSTALLATION,
             installation_id,
             &hash_token(&format!("{email}:{code}")),
             Some("test-provider-message"),
@@ -24148,12 +24511,14 @@ mod tests {
         conn.execute(
             "INSERT OR IGNORE INTO installations (
                 id, public_key, platform, app_version, owner_email, owner_verified_at,
-                created_at, last_seen_at
-             ) VALUES (?1, ?2, 'linux', '1.0.0', 'owner@example.com', ?3, ?3, ?3)",
+                created_at, last_seen_at, client_activated_at, control_secret_b64
+             ) VALUES (?1, ?2, 'linux', '1.0.0', 'owner@example.com',
+                       ?3, ?3, ?3, ?3, ?4)",
             params![
                 id,
                 format!("notification-key-{id}"),
-                occurred_at.to_rfc3339()
+                occurred_at.to_rfc3339(),
+                format!("notification-control-{id}"),
             ],
         )
         .expect("insert notification event installation");
@@ -24162,7 +24527,7 @@ mod tests {
             "platform": "linux",
             "appVersion": "1.0.0",
             "registeredAt": occurred_at,
-            "lastAuthenticatedSeenAt": occurred_at,
+            "lastHeartbeatAt": occurred_at,
             "offlineSince": occurred_at,
         });
         conn.execute(
@@ -24231,8 +24596,9 @@ mod tests {
         let conn = store.conn.lock().await;
         conn.execute(
             "INSERT INTO installations (
-                id, public_key, platform, app_version, owner_email, owner_verified_at, created_at, last_seen_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                id, public_key, platform, app_version, owner_email, owner_verified_at,
+                created_at, last_seen_at, client_activated_at, control_secret_b64
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
             params![
                 installation_id,
                 format!("pk-{installation_id}"),
@@ -24242,6 +24608,7 @@ mod tests {
                 now,
                 now,
                 now,
+                format!("control-{installation_id}"),
             ],
         )
         .expect("insert installation");
@@ -24271,6 +24638,27 @@ mod tests {
             params![installation_id, value.to_rfc3339()],
         )
         .expect("update installation last_seen_at");
+    }
+
+    async fn set_installation_heartbeat(
+        store: &AppStore,
+        installation_id: &str,
+        value: DateTime<Utc>,
+    ) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installation_notification_state (
+                installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
+                created_at, updated_at
+             ) VALUES (?1, 1, 'online', ?2, ?2, ?2)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                monitoring_enabled = 1,
+                presence_state = 'online',
+                last_heartbeat_at = excluded.last_heartbeat_at,
+                updated_at = excluded.updated_at",
+            params![installation_id, value.to_rfc3339()],
+        )
+        .expect("set installation heartbeat");
     }
 
     async fn insert_client_tunnel(
@@ -26906,6 +27294,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_market_shares_excludes_unactivated_clients() {
+        let (store, config) = setup_store("market-share-unactivated-client").await;
+        insert_installation(&store, "inst-unactivated").await;
+        insert_share(
+            &store,
+            "inst-unactivated",
+            "share-unactivated",
+            "unactivated-share-sub",
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET client_activated_at = NULL
+                 WHERE id = 'inst-unactivated'",
+                [],
+            )
+            .expect("mark market Share Client unactivated");
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all'
+                 WHERE share_id = 'share-unactivated'",
+                [],
+            )
+            .expect("enable unactivated Client Share for Market");
+        }
+
+        let shares = store
+            .list_market_shares(
+                "future-market@example.com",
+                "router-test",
+                &HashSet::new(),
+                &HashMap::new(),
+            )
+            .await
+            .expect("list market shares");
+
+        assert!(shares.is_empty());
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn list_market_shares_marks_online_by_subdomain() {
         let (store, config) = setup_store("market-share-online-subdomain").await;
         insert_installation(&store, "inst-online").await;
@@ -26960,8 +27391,9 @@ mod tests {
         let conn = store.conn.lock().await;
         conn.execute(
             "INSERT INTO installations (
-                id, public_key, platform, app_version, owner_email, owner_verified_at, created_at, last_seen_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                id, public_key, platform, app_version, owner_email, owner_verified_at,
+                created_at, last_seen_at, client_activated_at, control_secret_b64
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
             params![
                 installation_id,
                 public_key,
@@ -26970,7 +27402,8 @@ mod tests {
                 "owner@example.com",
                 now,
                 now,
-                now
+                now,
+                format!("control-{installation_id}"),
             ],
         )
         .expect("insert signed installation");
@@ -27195,6 +27628,118 @@ mod tests {
             assert_eq!(value["status"], expected);
             assert_eq!(value["setupId"], "123e4567-e89b-42d3-a456-426614174000");
         }
+    }
+
+    #[tokio::test]
+    async fn client_becomes_visible_only_after_setup_completion() {
+        let (store, config) = setup_store("client-activation-boundary").await;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let registered = register_with_key(&store, &signing_key, "1.0.0").await;
+        let installation_id = registered.installation_id;
+        let email = "owner@example.com";
+        let payload = BindOwnerEmailSignaturePayload {
+            email,
+            verification_token: None,
+        };
+
+        assert!(store.list_all_installation_ids().await.unwrap().is_empty());
+        assert_eq!(
+            store
+                .client_metrics_snapshot(Utc::now())
+                .await
+                .expect("metrics before Client activation")
+                .total,
+            0
+        );
+
+        for attempt in 0..2_i64 {
+            let timestamp_ms = Utc::now().timestamp_millis() + attempt;
+            let nonce = format!("activation-owner-bind-{attempt}");
+            let signature = sign_test_payload(
+                &signing_key,
+                &installation_id,
+                "bind_installation_owner_email",
+                &payload,
+                timestamp_ms,
+                &nonce,
+            );
+            let bound = store
+                .bind_installation_owner_email(
+                    &config,
+                    BindInstallationOwnerEmailRequest {
+                        installation_id: installation_id.clone(),
+                        email: email.into(),
+                        verification_token: None,
+                        timestamp_ms,
+                        nonce,
+                        signature,
+                    },
+                    None,
+                )
+                .await
+                .expect("bind pre-activation owner idempotently");
+            assert_eq!(bound.already_bound, attempt != 0);
+            assert!(bound.owner_verified);
+        }
+
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            &installation_id,
+            "activationclient",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            let state: (Option<String>, i64) = conn
+                .query_row(
+                    "SELECT client_activated_at,
+                            (SELECT COUNT(*) FROM chat_rooms WHERE installation_id = ?1)
+                     FROM installations WHERE id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read pre-activation state");
+            assert_eq!(state, (None, 0));
+        }
+
+        store
+            .complete_installation_setup(signed_setup_completed_request(
+                &signing_key,
+                &installation_id,
+                setup_completed_payload(&Uuid::new_v4().to_string(), "p******w"),
+                Utc::now().timestamp_millis(),
+                "activation-setup-complete",
+            ))
+            .await
+            .expect("complete Client setup");
+
+        assert_eq!(
+            store.list_all_installation_ids().await.unwrap(),
+            vec![installation_id.clone()]
+        );
+        assert_eq!(
+            store
+                .client_metrics_snapshot(Utc::now())
+                .await
+                .expect("metrics after Client activation")
+                .total,
+            1
+        );
+        let conn = store.conn.lock().await;
+        let state: (bool, i64) = conn
+            .query_row(
+                "SELECT client_activated_at IS NOT NULL,
+                        (SELECT COUNT(*) FROM chat_rooms WHERE installation_id = ?1)
+                 FROM installations WHERE id = ?1",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read activated Client state");
+        assert_eq!(state, (true, 1));
+
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -28356,16 +28901,16 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count early registration events");
-        let registration_state: String = conn
+        let presence_state: String = conn
             .query_row(
-                "SELECT registration_state FROM installation_notification_state
+                "SELECT presence_state FROM installation_notification_state
                  WHERE installation_id = ?1",
                 params![installation_id],
                 |row| row.get(0),
             )
             .expect("read authenticated registration state");
         assert_eq!(registration_events, 0);
-        assert_eq!(registration_state, "verified");
+        assert_eq!(presence_state, "online");
         drop(conn);
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -28603,23 +29148,7 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes())
     }
 
-    fn sign_registration_recovery_request(
-        signing_key: &SigningKey,
-        installation_id: &str,
-        public_key: &str,
-        platform: &str,
-        app_version: &str,
-        instance_nonce: &str,
-        timestamp_ms: i64,
-    ) -> String {
-        let body = format!(
-            "{PROTOCOL_EPOCH}\n{installation_id}\nregister_installation\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
-        );
-        let signature = signing_key.sign(body.as_bytes());
-        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
-    }
-
-    fn sign_registration_v2_request(
+    fn sign_registration_request(
         signing_key: &SigningKey,
         public_key: &str,
         platform: &str,
@@ -28628,13 +29157,38 @@ mod tests {
         timestamp_ms: i64,
     ) -> String {
         let body = format!(
-            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
+            "{PROTOCOL_EPOCH}\nregister_installation\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
         );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
     }
 
-    async fn register_v2_with_key(
+    fn auth_device_registration_request(
+        signing_key: &SigningKey,
+        kind: &str,
+        app_version: &str,
+    ) -> RegisterAuthDeviceRequest {
+        let public_key = public_key_b64(signing_key);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let instance_nonce = Uuid::new_v4().to_string();
+        let body = format!(
+            "{PROTOCOL_EPOCH}\nregister_auth_device\n{public_key}\n{kind}\nweb\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
+        );
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.sign(body.as_bytes()).to_bytes());
+        RegisterAuthDeviceRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            public_key,
+            kind: kind.into(),
+            platform: "web".into(),
+            app_version: app_version.into(),
+            instance_nonce,
+            timestamp_ms,
+            signature,
+        }
+    }
+
+    async fn register_with_key(
         store: &AppStore,
         signing_key: &SigningKey,
         app_version: &str,
@@ -28642,7 +29196,7 @@ mod tests {
         let public_key = public_key_b64(signing_key);
         let timestamp_ms = Utc::now().timestamp_millis();
         let instance_nonce = Uuid::new_v4().to_string();
-        let signature = sign_registration_v2_request(
+        let signature = sign_registration_request(
             signing_key,
             &public_key,
             "linux",
@@ -28658,9 +29212,8 @@ mod tests {
                     platform: "linux".into(),
                     app_version: app_version.into(),
                     instance_nonce,
-                    timestamp_ms: Some(timestamp_ms),
-                    signature: Some(signature),
-                    proof_version: Some(2),
+                    timestamp_ms,
+                    signature,
                 },
                 ClientMetadata {
                     ip: None,
@@ -28668,17 +29221,17 @@ mod tests {
                 },
             )
             .await
-            .expect("register installation with proof v2")
+            .expect("register installation with signed request")
     }
 
-    fn registration_v2_request(
+    fn registration_request(
         signing_key: &SigningKey,
         app_version: &str,
     ) -> RegisterInstallationRequest {
         let public_key = public_key_b64(signing_key);
         let timestamp_ms = Utc::now().timestamp_millis();
         let instance_nonce = Uuid::new_v4().to_string();
-        let signature = sign_registration_v2_request(
+        let signature = sign_registration_request(
             signing_key,
             &public_key,
             "linux",
@@ -28692,9 +29245,8 @@ mod tests {
             platform: "linux".into(),
             app_version: app_version.into(),
             instance_nonce,
-            timestamp_ms: Some(timestamp_ms),
-            signature: Some(signature),
-            proof_version: Some(2),
+            timestamp_ms,
+            signature,
         }
     }
 
@@ -29456,56 +30008,33 @@ mod tests {
 
     #[test]
     fn cross_repo_registration_and_heartbeat_contract_vectors_verify() {
-        let public_key = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
+        let signing_key = SigningKey::from_bytes(&[42_u8; 32]);
+        let public_key = public_key_b64(&signing_key);
+        let timestamp_ms = 1_700_000_000_123;
+        let instance_nonce = "fixture-nonce-123";
         let registration = RegisterInstallationRequest {
             protocol_epoch: PROTOCOL_EPOCH.into(),
-            public_key: public_key.into(),
+            public_key: public_key.clone(),
             platform: "linux".into(),
             app_version: "1.2.3".into(),
-            instance_nonce: "fixture-nonce-123".into(),
-            timestamp_ms: Some(1_700_000_000_123),
-            signature: Some(
-                "nlRT3f2KJ0oZaI84N/naU1WYGv/bS7Pz0X7I0hDKxQg2U0RZ/eZhmpZ4yaCcTARWq7TRvaGbUe7vejXPnmkcBA=="
-                    .into(),
+            instance_nonce: instance_nonce.into(),
+            timestamp_ms,
+            signature: sign_registration_request(
+                &signing_key,
+                &public_key,
+                "linux",
+                "1.2.3",
+                instance_nonce,
+                timestamp_ms,
             ),
-            proof_version: Some(2),
         };
         let registration_time = Utc
             .timestamp_millis_opt(1_700_000_000_123)
             .single()
             .unwrap();
-        assert!(
-            verify_registration_signature(public_key, &registration, None, registration_time)
-                .unwrap()
-        );
+        verify_registration_signature(&public_key, &registration, registration_time).unwrap();
 
-        let legacy = RegisterInstallationRequest {
-            protocol_epoch: PROTOCOL_EPOCH.into(),
-            public_key: public_key.into(),
-            platform: "linux".into(),
-            app_version: "1.2.3".into(),
-            instance_nonce: "fixture-legacy-123".into(),
-            timestamp_ms: Some(1_700_000_000_234),
-            signature: Some(
-                "+SCyz8ys5tyXjoTXYkzIyb9n/LBovygmFHz4wHoDF7uJF7jNKh7egVmaUGK9E34nyWytM1fPTyoMrl+TRh4tCg=="
-                    .into(),
-            ),
-            proof_version: None,
-        };
-        let legacy_time = Utc
-            .timestamp_millis_opt(1_700_000_000_234)
-            .single()
-            .unwrap();
-        assert!(
-            verify_registration_signature(
-                public_key,
-                &legacy,
-                Some("fixture-installation"),
-                legacy_time,
-            )
-            .unwrap()
-        );
-
+        let public_key = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
         let heartbeat = crate::models::InstallationHeartbeatPayload {
             protocol_version: 1,
             boot_id: "fixture-boot".into(),
@@ -29526,13 +30055,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_v2_proves_possession_and_is_idempotent() {
-        let (store, config) = setup_store("register-v2-idempotent").await;
+    async fn registration_proves_possession_and_is_idempotent() {
+        let (store, config) = setup_store("register-idempotent").await;
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = public_key_b64(&signing_key);
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
-        let signature = sign_registration_v2_request(
+        let signature = sign_registration_request(
             &signing_key,
             &public_key,
             "linux",
@@ -29548,9 +30077,8 @@ mod tests {
                     platform: "linux".into(),
                     app_version: "2.0.0".into(),
                     instance_nonce: nonce,
-                    timestamp_ms: Some(timestamp_ms),
-                    signature: Some(signature),
-                    proof_version: Some(2),
+                    timestamp_ms,
+                    signature,
                 },
                 ClientMetadata {
                     ip: None,
@@ -29558,12 +30086,12 @@ mod tests {
                 },
             )
             .await
-            .expect("register with proof v2");
-        assert!(registered.control_secret.is_some());
+            .expect("register with signed request");
+        assert!(!registered.control_secret.is_empty());
 
         let second_timestamp = Utc::now().timestamp_millis();
         let second_nonce = Uuid::new_v4().to_string();
-        let second_signature = sign_registration_v2_request(
+        let second_signature = sign_registration_request(
             &signing_key,
             &public_key,
             "linux",
@@ -29579,9 +30107,8 @@ mod tests {
                     platform: "linux".into(),
                     app_version: "2.0.1".into(),
                     instance_nonce: second_nonce,
-                    timestamp_ms: Some(second_timestamp),
-                    signature: Some(second_signature),
-                    proof_version: Some(2),
+                    timestamp_ms: second_timestamp,
+                    signature: second_signature,
                 },
                 ClientMetadata {
                     ip: None,
@@ -29593,15 +30120,15 @@ mod tests {
         assert_eq!(registered.installation_id, recovered.installation_id);
 
         let conn = store.conn.lock().await;
-        let state: (String, i64) = conn
+        let state: (i64, String) = conn
             .query_row(
-                "SELECT registration_state, monitoring_enabled
+                "SELECT monitoring_enabled, presence_state
                  FROM installation_notification_state WHERE installation_id = ?1",
                 params![registered.installation_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("read registration state");
-        assert_eq!(state, ("verified".into(), 1));
+        assert_eq!(state, (0, "unknown".into()));
         let event_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM client_notification_events
@@ -29612,6 +30139,117 @@ mod tests {
             .expect("count registration events");
         assert_eq!(event_count, 0);
         drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn auth_device_registration_is_idempotent_and_never_creates_a_client() {
+        let (store, config) = setup_store("auth-device-registration-idempotent").await;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let first = store
+            .register_auth_device_with_admission(
+                auth_device_registration_request(&signing_key, "browser", "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("register browser auth device");
+        let repeated = store
+            .register_auth_device_with_admission(
+                auth_device_registration_request(&signing_key, "browser", "1.0.1"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("repeat browser auth device registration");
+        assert_eq!(first.auth_device_id, repeated.auth_device_id);
+
+        let conn = store.conn.lock().await;
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM auth_devices),
+                    (SELECT COUNT(*) FROM installations),
+                    (SELECT COUNT(*) FROM auth_device_registration_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("count registered identities");
+        assert_eq!(counts, (1, 0, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn auth_device_session_refresh_is_independent_from_device_lifetime() {
+        let (store, config) = setup_store("auth-device-session-independent").await;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let registered = store
+            .register_auth_device_with_admission(
+                auth_device_registration_request(&signing_key, "service", "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("register service auth device");
+        let email = "service@example.com";
+        let code = "246810";
+        {
+            let mut conn = store.conn.lock().await;
+            persist_sent_login_challenge(
+                &mut conn,
+                &config,
+                email,
+                AUTH_SOURCE_AUTH_DEVICE,
+                &registered.auth_device_id,
+                &hash_token(&format!("{email}:{code}")),
+                Some("test-provider-message"),
+                &ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                Utc::now(),
+            )
+            .expect("insert auth device login challenge");
+        }
+        let session = store
+            .verify_email_code(
+                &config,
+                VerifyEmailCodeRequest {
+                    email: email.into(),
+                    code: code.into(),
+                    auth_device_id: registered.auth_device_id.clone(),
+                },
+            )
+            .await
+            .expect("verify auth device login");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "DELETE FROM auth_devices WHERE id = ?1",
+                params![registered.auth_device_id],
+            )
+            .expect("remove auth device");
+        }
+        let refreshed = store
+            .refresh_session(
+                &config,
+                RefreshSessionRequest {
+                    refresh_token: session.refresh_token,
+                },
+            )
+            .await
+            .expect("refresh survives device removal");
+        assert_eq!(refreshed.user.email, email);
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -29629,6 +30267,21 @@ mod tests {
         assert!(validate_registration_client_fields(&"界".repeat(11), "1.0.0").is_err());
     }
 
+    #[test]
+    fn signed_request_timestamp_skew_handles_i64_extremes() {
+        let now = Utc.timestamp_millis_opt(0).single().unwrap();
+        assert!(signed_request_timestamp_is_stale(now, i64::MIN));
+        assert!(signed_request_timestamp_is_stale(now, i64::MAX));
+        assert!(!signed_request_timestamp_is_stale(
+            now,
+            SIGNED_REQUEST_MAX_SKEW_MS
+        ));
+        assert!(signed_request_timestamp_is_stale(
+            now,
+            SIGNED_REQUEST_MAX_SKEW_MS + 1
+        ));
+    }
+
     #[tokio::test]
     async fn new_identity_quota_limits_new_keys_but_existing_key_recovers() {
         let (store, config) = setup_store("registration-admission-existing").await;
@@ -29636,7 +30289,7 @@ mod tests {
         let first_key = SigningKey::generate(&mut OsRng);
         let registered = store
             .register_installation_with_admission(
-                registration_v2_request(&first_key, "1.0.0"),
+                registration_request(&first_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29649,7 +30302,7 @@ mod tests {
         let second_key = SigningKey::generate(&mut OsRng);
         let limited = store
             .register_installation_with_admission(
-                registration_v2_request(&second_key, "1.0.0"),
+                registration_request(&second_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29668,7 +30321,7 @@ mod tests {
 
         let recovered = store
             .register_installation_with_admission(
-                registration_v2_request(&first_key, "1.0.1"),
+                registration_request(&first_key, "1.0.1"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29696,21 +30349,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_registration_consumes_new_identity_quota() {
-        let (store, config) = setup_store("registration-admission-legacy").await;
+    async fn signed_registration_consumes_new_identity_quota() {
+        let (store, config) = setup_store("registration-admission-signed").await;
         let signing_key = SigningKey::generate(&mut OsRng);
         store
             .register_installation_with_admission(
-                RegisterInstallationRequest {
-                    protocol_epoch: PROTOCOL_EPOCH.into(),
-                    public_key: public_key_b64(&signing_key),
-                    platform: "linux".into(),
-                    app_version: "1.0.0".into(),
-                    instance_nonce: Uuid::new_v4().to_string(),
-                    timestamp_ms: None,
-                    signature: None,
-                    proof_version: None,
-                },
+                registration_request(&signing_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29718,7 +30362,7 @@ mod tests {
                 RegistrationAdmissionPolicy::default(),
             )
             .await
-            .expect("legacy identity accepted");
+            .expect("signed identity accepted");
 
         let conn = store.conn.lock().await;
         let admission_count: i64 = conn
@@ -29737,8 +30381,8 @@ mod tests {
     async fn invalid_signature_and_nonce_failure_do_not_consume_admission() {
         let (store, config) = setup_store("registration-admission-rollback").await;
         let signing_key = SigningKey::generate(&mut OsRng);
-        let mut invalid = registration_v2_request(&signing_key, "1.0.0");
-        invalid.signature = Some(base64::engine::general_purpose::STANDARD.encode([0_u8; 64]));
+        let mut invalid = registration_request(&signing_key, "1.0.0");
+        invalid.signature = base64::engine::general_purpose::STANDARD.encode([0_u8; 64]);
         assert!(
             store
                 .register_installation_with_admission(
@@ -29754,14 +30398,16 @@ mod tests {
         );
 
         let replay_key = SigningKey::generate(&mut OsRng);
-        let replay = registration_v2_request(&replay_key, "1.0.0");
+        let replay = registration_request(&replay_key, "1.0.0");
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "INSERT INTO request_nonces (installation_id, action, nonce, created_at)
-                 VALUES (?1, 'register_installation', ?2, ?3)",
+                "INSERT INTO identity_registration_nonces (
+                    identity_kind, public_key_hash, nonce, created_at
+                 ) VALUES ('client_installation', ?1, ?2, ?3)",
                 params![
-                    registration_nonce_subject(&replay.public_key),
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(Sha256::digest(replay.public_key.as_bytes())),
                     replay.instance_nonce,
                     Utc::now().to_rfc3339()
                 ],
@@ -29814,7 +30460,7 @@ mod tests {
         let first_key = SigningKey::generate(&mut OsRng);
         let second_key = SigningKey::generate(&mut OsRng);
         let first = store.register_installation_with_admission(
-            registration_v2_request(&first_key, "1.0.0"),
+            registration_request(&first_key, "1.0.0"),
             ClientMetadata {
                 ip: None,
                 country_code: None,
@@ -29822,7 +30468,7 @@ mod tests {
             policy,
         );
         let second = store.register_installation_with_admission(
-            registration_v2_request(&second_key, "1.0.0"),
+            registration_request(&second_key, "1.0.0"),
             ClientMetadata {
                 ip: None,
                 country_code: None,
@@ -29886,7 +30532,7 @@ mod tests {
         let first_key = SigningKey::generate(&mut OsRng);
         let registered = store
             .register_installation_with_admission(
-                registration_v2_request(&first_key, "1.0.0"),
+                registration_request(&first_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29899,7 +30545,7 @@ mod tests {
         let second_key = SigningKey::generate(&mut OsRng);
         let limited = store
             .register_installation_with_admission(
-                registration_v2_request(&second_key, "1.0.0"),
+                registration_request(&second_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29918,7 +30564,7 @@ mod tests {
 
         let recovered = store
             .register_installation_with_admission(
-                registration_v2_request(&first_key, "1.0.1"),
+                registration_request(&first_key, "1.0.1"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29953,7 +30599,7 @@ mod tests {
         let first_key = SigningKey::generate(&mut OsRng);
         store
             .register_installation_with_admission(
-                registration_v2_request(&first_key, "1.0.0"),
+                registration_request(&first_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -29966,7 +30612,7 @@ mod tests {
         let second_key = SigningKey::generate(&mut OsRng);
         let limited = store
             .register_installation_with_admission(
-                registration_v2_request(&second_key, "1.0.0"),
+                registration_request(&second_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -30020,7 +30666,7 @@ mod tests {
         let first_key = SigningKey::generate(&mut OsRng);
         let first = store
             .register_installation_with_admission(
-                registration_v2_request(&first_key, "1.0.0"),
+                registration_request(&first_key, "1.0.0"),
                 metadata.clone(),
                 RegistrationAdmissionPolicy::default(),
             )
@@ -30029,7 +30675,7 @@ mod tests {
         let second_key = SigningKey::generate(&mut OsRng);
         let second = store
             .register_installation_with_admission(
-                registration_v2_request(&second_key, "1.0.0"),
+                registration_request(&second_key, "1.0.0"),
                 metadata.clone(),
                 RegistrationAdmissionPolicy::default(),
             )
@@ -30037,7 +30683,7 @@ mod tests {
             .expect("second registration uses geo cache");
         let repeated = store
             .register_installation_with_admission(
-                registration_v2_request(&first_key, "1.0.1"),
+                registration_request(&first_key, "1.0.1"),
                 metadata,
                 RegistrationAdmissionPolicy::default(),
             )
@@ -30075,7 +30721,7 @@ mod tests {
             let signing_key = SigningKey::generate(&mut OsRng);
             store
                 .register_installation_with_admission(
-                    registration_v2_request(&signing_key, "1.0.0"),
+                    registration_request(&signing_key, "1.0.0"),
                     metadata.clone(),
                     RegistrationAdmissionPolicy::default(),
                 )
@@ -30111,7 +30757,7 @@ mod tests {
         let third_key = SigningKey::generate(&mut OsRng);
         store
             .register_installation_with_admission(
-                registration_v2_request(&third_key, "1.0.0"),
+                registration_request(&third_key, "1.0.0"),
                 metadata,
                 RegistrationAdmissionPolicy::default(),
             )
@@ -30128,7 +30774,7 @@ mod tests {
         let store = AppStore::new(&config).expect("create store");
         let signing_key = SigningKey::generate(&mut OsRng);
         let policy = notification_policy(&config);
-        let first = register_v2_with_key(&store, &signing_key, "1.0.0").await;
+        let first = register_with_key(&store, &signing_key, "1.0.0").await;
         {
             let conn = store.conn.lock().await;
             conn.execute(
@@ -30156,7 +30802,7 @@ mod tests {
             conn.execute(
                 "UPDATE installation_notification_state
                  SET monitoring_enabled = 1, presence_state = 'online',
-                     last_authenticated_seen_at = ?2
+                     last_heartbeat_at = ?2
                  WHERE installation_id = ?1",
                 params![first.installation_id, first_seen.to_rfc3339()],
             )
@@ -30182,7 +30828,7 @@ mod tests {
                 .expect("purge first installation while retaining audit");
         }
 
-        let second = register_v2_with_key(&store, &signing_key, "2.0.0").await;
+        let second = register_with_key(&store, &signing_key, "2.0.0").await;
         assert_ne!(first.installation_id, second.installation_id);
         {
             let conn = store.conn.lock().await;
@@ -30211,7 +30857,7 @@ mod tests {
             conn.execute(
                 "UPDATE installation_notification_state
                  SET monitoring_enabled = 1, presence_state = 'online',
-                     last_authenticated_seen_at = ?2
+                     last_heartbeat_at = ?2
                  WHERE installation_id = ?1",
                 params![second.installation_id, second_seen.to_rfc3339()],
             )
@@ -30266,40 +30912,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_registration_is_provisional_until_a_signed_status() {
-        let (store, config) = setup_store("register-legacy-provisional").await;
+    async fn registration_and_signed_activity_do_not_enable_monitoring() {
+        let (store, config) = setup_store("register-no-presence-without-heartbeat").await;
         let signing_key = SigningKey::generate(&mut OsRng);
-        let public_key = public_key_b64(&signing_key);
         let registered = store
             .register_installation(
-                RegisterInstallationRequest {
-                    protocol_epoch: PROTOCOL_EPOCH.into(),
-                    public_key,
-                    platform: "linux".into(),
-                    app_version: "1.0.0".into(),
-                    instance_nonce: Uuid::new_v4().to_string(),
-                    timestamp_ms: None,
-                    signature: None,
-                    proof_version: None,
-                },
+                registration_request(&signing_key, "1.0.0"),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
                 },
             )
             .await
-            .expect("legacy registration");
+            .expect("signed registration");
         {
             let conn = store.conn.lock().await;
-            let state: String = conn
+            let state: (i64, String) = conn
                 .query_row(
-                    "SELECT registration_state FROM installation_notification_state
+                    "SELECT monitoring_enabled, presence_state
+                     FROM installation_notification_state
                      WHERE installation_id = ?1",
                     params![registered.installation_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .expect("read provisional state");
-            assert_eq!(state, "provisional");
+                .expect("read initial presence state");
+            assert_eq!(state, (0, "unknown".into()));
         }
 
         let payload = crate::models::ReportInstallationStatusPayload {
@@ -30330,9 +30967,9 @@ mod tests {
             .await
             .expect("signed status proves possession");
         let conn = store.conn.lock().await;
-        let state: (String, i64, i64) = conn
+        let state: (i64, String, i64) = conn
             .query_row(
-                "SELECT ns.registration_state, ns.monitoring_enabled,
+                "SELECT ns.monitoring_enabled, ns.presence_state,
                         (SELECT COUNT(*) FROM client_notification_events e
                          WHERE e.installation_id = ns.installation_id
                            AND e.kind = 'client_registered')
@@ -30340,8 +30977,8 @@ mod tests {
                 params![registered.installation_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("read authenticated legacy state");
-        assert_eq!(state, ("verified".into(), 0, 0));
+            .expect("read signed activity presence state");
+        assert_eq!(state, (0, "unknown".into(), 0));
         drop(conn);
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -30591,19 +31228,19 @@ mod tests {
             );
             let stored_last_seen: String = conn
                 .query_row(
-                    "SELECT last_authenticated_seen_at
+                    "SELECT last_heartbeat_at
                      FROM installation_notification_state
                      WHERE installation_id = 'inst-presence'",
                     [],
                     |row| row.get(0),
                 )
                 .expect("read trusted heartbeat timestamp");
-            assert_eq!(event_payload["lastAuthenticatedSeenAt"], stored_last_seen);
+            assert_eq!(event_payload["lastHeartbeatAt"], stored_last_seen);
             assert_eq!(event_payload.as_object().map(|value| value.len()), Some(4));
             conn.execute(
                 "UPDATE installation_notification_state
                  SET presence_state = 'recovering', recovery_candidate_since = ?2,
-                     last_authenticated_seen_at = ?3
+                     last_heartbeat_at = ?3
                  WHERE installation_id = ?1",
                 params![
                     "inst-presence",
@@ -30725,10 +31362,9 @@ mod tests {
             let conn = store.conn.lock().await;
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, registration_verified_at,
-                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
                     offline_episode, created_at, updated_at
-                 ) VALUES (?1, 'verified', ?2, 1, 'online', ?2, 0, ?2, ?2)",
+                 ) VALUES (?1, 1, 'online', ?2, 0, ?2, ?2)",
                 params!["inst-disabled-offline-chat", last_seen.to_rfc3339()],
             )
             .expect("insert disabled notification presence state");
@@ -30785,7 +31421,7 @@ mod tests {
         let public_key = public_key_b64(&signing_key);
         let registered_at = Utc::now();
         let nonce = Uuid::new_v4().to_string();
-        let signature = sign_registration_v2_request(
+        let signature = sign_registration_request(
             &signing_key,
             &public_key,
             "linux",
@@ -30801,9 +31437,8 @@ mod tests {
                     platform: "linux".into(),
                     app_version: "1.0.0".into(),
                     instance_nonce: nonce,
-                    timestamp_ms: Some(registered_at.timestamp_millis()),
-                    signature: Some(signature),
-                    proof_version: Some(2),
+                    timestamp_ms: registered_at.timestamp_millis(),
+                    signature,
                 },
                 ClientMetadata {
                     ip: None,
@@ -30982,10 +31617,9 @@ mod tests {
             .expect("set tentative owner marker");
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, registration_verified_at,
-                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
                     created_at, updated_at
-                 ) VALUES (?1, 'verified', ?2, 0, 'online', ?2, ?2, ?2)",
+                 ) VALUES (?1, 0, 'online', ?2, ?2, ?2)",
                 params!["inst-owner-recipient", now.to_rfc3339()],
             )
             .expect("insert owner notification state");
@@ -31447,10 +32081,9 @@ mod tests {
             .expect("insert verified owner user");
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, registration_verified_at,
-                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
                     offline_since, offline_episode, created_at, updated_at
-                 ) VALUES ('inst-owner-offline', 'verified', ?1, 1, 'offline', ?1, ?1, 1, ?1, ?1)",
+                 ) VALUES ('inst-owner-offline', 1, 'offline', ?1, ?1, 1, ?1, ?1)",
                 params![now.to_rfc3339()],
             )
             .expect("insert owner offline state");
@@ -31466,7 +32099,7 @@ mod tests {
                     serde_json::json!({
                         "installationId": "inst-owner-offline",
                         "ownerEmail": "owner@example.com",
-                        "lastAuthenticatedSeenAt": now,
+                        "lastHeartbeatAt": now,
                         "offlineSince": now,
                     })
                     .to_string(),
@@ -31935,10 +32568,9 @@ mod tests {
             .expect("insert priority owner user");
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, registration_verified_at,
-                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
                     offline_since, offline_episode, created_at, updated_at
-                 ) VALUES ('inst-role-priority', 'verified', ?1, 1, 'offline',
+                 ) VALUES ('inst-role-priority', 1, 'offline',
                            ?1, ?1, 1, ?1, ?1)",
                 params![now.to_rfc3339()],
             )
@@ -31953,7 +32585,7 @@ mod tests {
                     now.to_rfc3339(),
                     serde_json::json!({
                         "installationId": "inst-role-priority",
-                        "lastAuthenticatedSeenAt": now,
+                        "lastHeartbeatAt": now,
                         "offlineSince": now,
                     })
                     .to_string(),
@@ -32204,11 +32836,12 @@ mod tests {
                  )
                  INSERT INTO installations (
                      id, public_key, platform, app_version, owner_email, owner_verified_at,
-                     created_at, last_seen_at
+                     created_at, last_seen_at, client_activated_at, control_secret_b64
                  )
                  SELECT printf('registration-%04d', value),
                         printf('registration-key-%04d', value),
-                        'linux', '1.0.0', 'owner@example.com', ?1, ?1, ?1
+                        'linux', '1.0.0', 'owner@example.com', ?1, ?1, ?1, ?1,
+                        printf('registration-control-%04d', value)
                  FROM registrations",
                 params![now.to_rfc3339()],
             )
@@ -32922,7 +33555,7 @@ mod tests {
                     serde_json::json!({
                         "installationId": "inst-owner-changed",
                         "ownerEmail": "old-owner@example.com",
-                        "lastAuthenticatedSeenAt": occurred_at,
+                        "lastHeartbeatAt": occurred_at,
                         "offlineSince": occurred_at,
                     })
                     .to_string(),
@@ -33145,10 +33778,9 @@ mod tests {
             .expect("insert mixed notification owner");
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, registration_verified_at,
-                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
                     offline_since, offline_episode, created_at, updated_at
-                 ) VALUES ('inst-mixed-offline', 'verified', ?1, 1, 'offline', ?1, ?1, 1, ?1, ?1)",
+                 ) VALUES ('inst-mixed-offline', 1, 'offline', ?1, ?1, 1, ?1, ?1)",
                 params![occurred_at.to_rfc3339()],
             )
             .expect("insert mixed offline state");
@@ -33172,7 +33804,7 @@ mod tests {
                             "installationId": installation_id,
                             "platform": "linux",
                             "registeredAt": occurred_at,
-                            "lastAuthenticatedSeenAt": occurred_at,
+                            "lastHeartbeatAt": occurred_at,
                             "offlineSince": occurred_at,
                         })
                         .to_string(),
@@ -33253,57 +33885,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_installation_does_not_return_existing_control_secret_without_signature() {
+    async fn register_installation_rejects_invalid_signature_without_leaking_control_secret() {
         let (store, config) = setup_store("register-existing-no-secret-leak").await;
         let signing_key = insert_signed_installation(&store, "inst-existing-register").await;
-        let public_key = public_key_b64(&signing_key);
-
-        let response = store
+        let mut request = registration_request(&signing_key, "2.0.0");
+        request.signature = base64::engine::general_purpose::STANDARD.encode([0_u8; 64]);
+        let error = store
             .register_installation(
-                RegisterInstallationRequest {
-                    protocol_epoch: PROTOCOL_EPOCH.into(),
-                    public_key,
-                    platform: "macOS".into(),
-                    app_version: "2.0.0".into(),
-                    instance_nonce: Uuid::new_v4().to_string(),
-                    timestamp_ms: None,
-                    signature: None,
-                    proof_version: None,
-                },
+                request,
                 ClientMetadata {
                     ip: None,
                     country_code: None,
                 },
             )
             .await
-            .expect("existing register should refresh metadata");
+            .expect_err("invalid registration signature must be rejected");
 
-        assert_eq!(response.installation_id, "inst-existing-register");
-        assert!(response.control_secret.is_none());
+        assert!(matches!(error, AppError::Unauthorized(_)));
         let conn = store.conn.lock().await;
-        let stored_secret: Option<String> = conn
+        let stored_secret: String = conn
             .query_row(
                 "SELECT control_secret_b64 FROM installations WHERE id = 'inst-existing-register'",
                 [],
                 |row| row.get(0),
             )
             .expect("read stored control secret");
-        assert!(stored_secret.is_some());
+        assert_eq!(stored_secret, "control-inst-existing-register");
         drop(conn);
 
         let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
-    async fn register_installation_signed_recovery_returns_existing_control_secret() {
-        let (store, config) = setup_store("register-existing-signed-recovery").await;
+    async fn repeated_signed_registration_returns_existing_control_secret() {
+        let (store, config) = setup_store("register-existing-signed-repeat").await;
         let signing_key = insert_signed_installation(&store, "inst-signed-register").await;
         let public_key = public_key_b64(&signing_key);
         let instance_nonce = Uuid::new_v4().to_string();
         let timestamp_ms = Utc::now().timestamp_millis();
-        let signature = sign_registration_recovery_request(
+        let signature = sign_registration_request(
             &signing_key,
-            "inst-signed-register",
             &public_key,
             "macOS",
             "2.0.0",
@@ -33319,9 +33940,8 @@ mod tests {
                     platform: "macOS".into(),
                     app_version: "2.0.0".into(),
                     instance_nonce,
-                    timestamp_ms: Some(timestamp_ms),
-                    signature: Some(signature),
-                    proof_version: None,
+                    timestamp_ms,
+                    signature,
                 },
                 ClientMetadata {
                     ip: None,
@@ -33329,10 +33949,10 @@ mod tests {
                 },
             )
             .await
-            .expect("signed registration recovery should return control secret");
+            .expect("repeated signed registration should return control secret");
 
         assert_eq!(response.installation_id, "inst-signed-register");
-        assert!(response.control_secret.is_some());
+        assert!(!response.control_secret.is_empty());
         let conn = store.conn.lock().await;
         let monitoring_enabled: i64 = conn
             .query_row(
@@ -33341,7 +33961,7 @@ mod tests {
                 [],
                 |row| row.get(0),
             )
-            .expect("read legacy recovery monitoring state");
+            .expect("read repeated registration monitoring state");
         assert_eq!(monitoring_enabled, 0);
         drop(conn);
 
@@ -33769,7 +34389,8 @@ mod tests {
                     session_id: Uuid::new_v4().to_string(),
                     user_id: user.id,
                     email: email.into(),
-                    installation_id: installation_id.into(),
+                    auth_source_kind: AUTH_SOURCE_CLIENT_INSTALLATION.into(),
+                    auth_source_id: installation_id.into(),
                     access_token_hash: hash_token(access_token),
                     refresh_token_hash: hash_token("refresh-token-for-owner-binding"),
                     access_expires_at: now + Duration::hours(1),
@@ -34250,7 +34871,8 @@ mod tests {
                     session_id: Uuid::new_v4().to_string(),
                     user_id: user.id,
                     email: new_email.into(),
-                    installation_id: installation_id.into(),
+                    auth_source_kind: AUTH_SOURCE_CLIENT_INSTALLATION.into(),
+                    auth_source_id: installation_id.into(),
                     access_token_hash: hash_token(access_token),
                     refresh_token_hash: hash_token("refresh-token-for-change-owner"),
                     access_expires_at: now + Duration::hours(1),
@@ -36657,6 +37279,7 @@ mod tests {
     async fn dashboard_snapshot_does_not_count_paused_share_as_active() {
         let (store, config) = setup_store("dashboard-paused").await;
         insert_installation(&store, "inst-1").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", "client-sub").await;
         insert_share(&store, "inst-1", "share-paused", "paused-sub", "paused").await;
 
         let server_geo = ServerGeo {
@@ -36664,6 +37287,18 @@ mod tests {
             lon: None,
         };
         let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "client-sub".into(),
+                "http://127.0.0.1:1".into(),
+                None,
+                None,
+                Some("Client".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
         let snapshot = store
             .dashboard_snapshot(&config, &server_geo, &proxy, None)
             .await
@@ -36695,7 +37330,21 @@ mod tests {
     async fn dashboard_operational_summary_keeps_client_online_when_only_share_route_missing() {
         let (store, config) = setup_store("dashboard-operational-offline").await;
         insert_installation(&store, "inst-1").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", "client-sub").await;
         insert_share(&store, "inst-1", "share-offline", "offline-sub", "active").await;
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "client-sub".into(),
+                "http://127.0.0.1:1".into(),
+                None,
+                None,
+                Some("Client".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
 
         let snapshot = store
             .dashboard_snapshot(
@@ -36704,7 +37353,7 @@ mod tests {
                     lat: None,
                     lon: None,
                 },
-                &ProxyRegistry::default(),
+                &proxy,
                 None,
             )
             .await
@@ -36720,6 +37369,44 @@ mod tests {
             Some("route_offline")
         );
         assert_eq!(snapshot.clients[0].operational_summary.state, "online");
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn dashboard_operational_summary_marks_missing_client_tunnel_offline() {
+        let (store, config) = setup_store("dashboard-client-tunnel-missing").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-online", "share-sub", "active").await;
+
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "share-sub".into(),
+                "http://127.0.0.1:1".into(),
+                None,
+                Some("share-online".into()),
+                Some("Share".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &proxy,
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+
+        assert!(snapshot.shares.first().expect("share").is_online);
+        assert_eq!(snapshot.clients[0].operational_summary.state, "offline");
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -36851,6 +37538,7 @@ mod tests {
         let (store, config) = setup_store("dashboard-aggregate-inflight").await;
         insert_installation(&store, "inst-1").await;
         set_installation_country_code(&store, "inst-1", "JP").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", "client-sub").await;
         insert_share(&store, "inst-1", "share-old", "old-sub", "active").await;
         insert_share(&store, "inst-1", "share-new", "new-sub", "active").await;
 
@@ -36859,6 +37547,18 @@ mod tests {
             lon: None,
         };
         let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "client-sub".into(),
+                "http://127.0.0.1:3".into(),
+                None,
+                None,
+                Some("Client".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
         proxy
             .set_route(
                 "old-sub".into(),
@@ -37102,6 +37802,7 @@ mod tests {
         for installation_id in ["inst-1", "inst-2", "inst-3"] {
             insert_installation(&store, installation_id).await;
             set_installation_country_code(&store, installation_id, "JP").await;
+            set_installation_heartbeat(&store, installation_id, Utc::now()).await;
         }
         insert_share(&store, "inst-1", "share-1", "sub-1", "active").await;
         insert_share(&store, "inst-2", "share-2", "sub-2", "active").await;
@@ -37121,6 +37822,56 @@ mod tests {
         assert_eq!(points.clients[0].lat, 36.2);
         assert_eq!(points.clients[0].lon, 138.25);
         assert_eq!(points.clients[0].count, 3);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn public_network_presence_uses_fresh_heartbeat_and_activated_clients() {
+        let (store, config) = setup_store("public-network-trusted-presence").await;
+        let now = Utc::now();
+        for installation_id in ["inst-online", "inst-stale", "inst-unactivated"] {
+            insert_installation(&store, installation_id).await;
+            set_installation_country_code(&store, installation_id, "JP").await;
+            insert_share(
+                &store,
+                installation_id,
+                &format!("share-{installation_id}"),
+                &format!("sub-{installation_id}"),
+                "active",
+            )
+            .await;
+        }
+        set_installation_heartbeat(&store, "inst-online", now).await;
+        mark_installation_last_seen(&store, "inst-stale", now).await;
+        set_installation_heartbeat(&store, "inst-stale", now - Duration::minutes(16)).await;
+        set_installation_heartbeat(&store, "inst-unactivated", now).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET client_activated_at = NULL WHERE id = 'inst-unactivated'",
+                [],
+            )
+            .expect("mark installation unactivated");
+        }
+
+        let points = store
+            .public_map_points(&ServerGeo {
+                lat: None,
+                lon: None,
+            })
+            .await
+            .expect("public map points");
+        let stats = store
+            .public_network_stats()
+            .await
+            .expect("public network stats");
+
+        assert_eq!(points.client_count, 1);
+        assert_eq!(points.clients.len(), 1);
+        assert_eq!(points.clients[0].count, 1);
+        assert_eq!(stats.active_clients, 1);
+        assert_eq!(stats.active_shares, 2);
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -37948,10 +38699,9 @@ mod tests {
             .expect("backdate cleanup chat installation");
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, registration_verified_at,
-                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
                     offline_episode, created_at, updated_at
-                 ) VALUES (?1, 'verified', ?2, 1, 'online', ?2, 0, ?2, ?2)",
+                 ) VALUES (?1, 1, 'online', ?2, 0, ?2, ?2)",
                 params![installation_id, stale.to_rfc3339()],
             )
             .expect("insert cleanup chat presence state");
@@ -38013,6 +38763,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_offline_fallback_uses_heartbeat_not_general_activity() {
+        let (store, config) = setup_store("cleanup-offline-trusted-heartbeat").await;
+        let installation_id = "inst-cleanup-trusted-heartbeat";
+        insert_installation(&store, installation_id).await;
+        let stale_heartbeat = Utc::now() - Duration::seconds(config.client_stale_secs + 60);
+        set_installation_heartbeat(&store, installation_id, stale_heartbeat).await;
+
+        let result = store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("materialize offline state from stale trusted heartbeat");
+        assert_eq!(result.deleted_installations, 0);
+
+        let conn = store.conn.lock().await;
+        let (presence_state, offline_episode, event_count, installation_count): (
+            String,
+            i64,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT ns.presence_state, ns.offline_episode,
+                        (SELECT COUNT(*) FROM client_notification_events e
+                         WHERE e.installation_id = ns.installation_id
+                           AND e.kind = 'client_offline'),
+                        (SELECT COUNT(*) FROM installations i
+                         WHERE i.id = ns.installation_id)
+                 FROM installation_notification_state ns
+                 WHERE ns.installation_id = ?1",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read heartbeat-based cleanup state");
+        assert_eq!(presence_state, "offline");
+        assert_eq!(offline_episode, 1);
+        assert_eq!(event_count, 1);
+        assert_eq!(installation_count, 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn cleanup_retains_installation_until_offline_notification_is_terminal() {
         let mut config = enabled_notification_config("cleanup-pending-offline-event");
         config.cleanup_interval_secs = 60;
@@ -38039,10 +38832,9 @@ mod tests {
             .expect("backdate pending offline installation");
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, registration_verified_at,
-                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
                     offline_episode, created_at, updated_at
-                 ) VALUES (?1, 'verified', ?2, 1, 'online', ?2, 0, ?2, ?2)",
+                 ) VALUES (?1, 1, 'online', ?2, 0, ?2, ?2)",
                 params!["inst-pending-offline", stale.to_rfc3339()],
             )
             .expect("insert pending offline state");
@@ -39172,7 +39964,8 @@ mod tests {
             session_id: format!("session-{user_id}"),
             user_id: user_id.to_string(),
             email: email.to_string(),
-            installation_id: format!("browser-{user_id}"),
+            auth_source_kind: AUTH_SOURCE_AUTH_DEVICE.into(),
+            auth_source_id: format!("browser-{user_id}"),
             access_token_hash: format!("access-{user_id}"),
             refresh_token_hash: format!("refresh-{user_id}"),
             access_expires_at: now + Duration::hours(1),
@@ -40483,10 +41276,10 @@ mod tests {
             }
             conn.execute(
                 "INSERT INTO installation_notification_state (
-                    installation_id, registration_state, monitoring_enabled, presence_state,
-                    last_authenticated_seen_at, offline_since, offline_episode,
+                    installation_id, monitoring_enabled, presence_state,
+                    last_heartbeat_at, offline_since, offline_episode,
                     last_offline_event_at, created_at, updated_at
-                 ) VALUES (?1, 'verified', 1, 'offline', ?2, ?2, 1, ?2, ?2, ?2)",
+                 ) VALUES (?1, 1, 'offline', ?2, ?2, 1, ?2, ?2, ?2)",
                 params![source_id, now],
             )
             .expect("insert source notification state");

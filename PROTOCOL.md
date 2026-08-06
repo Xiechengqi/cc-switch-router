@@ -2,7 +2,7 @@
 
 本文档记录 `cc-switch-router`(以下简称 Router)与 `cc-switch-server`(以下简称 Server)之间的接口契约。
 
-Server 是 Router 的**唯一客户端**。早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已全部移除,详见 [MIGRATION.md](MIGRATION.md)。
+Server 是唯一可以注册为 **Client installation**、建立隧道并出现在 Client 监控中的程序。Dashboard 浏览器和 Market 服务使用独立的 **auth device** 身份,不会创建 Client。
 
 本文所有断言均标注 Router 侧源码位置(`file:line`),便于与实现对账。
 
@@ -13,24 +13,27 @@ Server 是 Router 的**唯一客户端**。早期的 `cc-switch` Tauri 桌面版
 | 常量 | 值 | 出处 |
 |---|---|---|
 | `PROTOCOL_EPOCH` | `namespace-flat-1` | `src/namespace.rs:1` |
-| 注册 proof 版本 | `2`(仅接受此值) | `src/store.rs:22077-22080` |
+| Client 注册动作 | `register_installation` | `src/store.rs::verify_registration_signature` |
+| Auth device 注册动作 | `register_auth_device` | `src/store.rs::verify_auth_device_registration_signature` |
 | Ingress 签名域 | `cc-switch-router-ingress-v1` | `src/ingress_context.rs:11` |
 
-Epoch 参与所有 Ed25519 签名的规范串。两侧 epoch 不一致时**硬失败**,不做协商降级。
+Epoch 参与所有 Ed25519 签名的规范串。两侧 epoch 不一致时**硬失败**,不做协商降级。注册协议没有独立 proof 版本字段或其他版本分支,当前规范串就是唯一格式。
 
 ---
 
-## 2. 注册:Ed25519 设备身份
+## 2. 注册:两类 Ed25519 身份
+
+### 2.1 Client installation
 
 `POST /v1/installations/register`
 
 Server 首次启动时生成 Ed25519 密钥对,公钥随注册请求上送。请求体字段见 `RegisterInstallationRequest`(`src/models.rs:118-130`):
-`protocolEpoch`、`publicKey`、`platform`、`appVersion`、`instanceNonce`、`timestampMs`、`signature`、`proofVersion`。
+`protocolEpoch`、`publicKey`、`platform`、`appVersion`、`instanceNonce`、`timestampMs`、`signature`。所有字段必填,未知字段会被拒绝。
 
-**签名规范串**(proof_version = 2,`src/store.rs:28772`):
+**签名规范串**:
 
 ```
-{PROTOCOL_EPOCH}\nregister_installation_v2\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}
+{PROTOCOL_EPOCH}\nregister_installation\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}
 ```
 
 公钥与签名均为标准 base64。注册时 `installation_id` 尚不存在,故不入签名串;后续所有签名请求改用第 3 节的通用规范串。
@@ -44,37 +47,57 @@ Server 首次启动时生成 Ed25519 密钥对,公钥随注册请求上送。请
 
 > `control_secret` 是 Router → Server 方向的认证凭据;Ed25519 私钥是 Server → Router 方向的认证凭据。两者用途不可混用。
 
+注册成功只建立 installation 控制身份,不会立即形成可见 Client。Server 还必须完成 owner 验证、启用同 owner 的 Client tunnel,并签名上报 setup 完成;Router 随后写入 `client_activated_at`。Dashboard、Metrics、Server logs、Client chat、公开地图和 Share 清单只读取已经激活的 Client。在线状态只由 `/v1/installations/heartbeat` 更新,其他签名控制请求只更新一般活动时间。
+
+### 2.2 Auth device
+
+`POST /v1/auth/devices/register`
+
+Dashboard、公开 Share Web 和 Market 服务生成独立 Ed25519 密钥对并注册 auth device。请求字段为:
+`protocolEpoch`、`publicKey`、`kind`、`platform`、`appVersion`、`instanceNonce`、`timestampMs`、`signature`;`kind` 只允许 `browser` 或 `service`。
+
+**签名规范串**:
+
+```
+{PROTOCOL_EPOCH}\nregister_auth_device\n{public_key}\n{kind}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}
+```
+
+响应只返回 `authDeviceId`。Auth device 没有 `controlSecret`、隧道、Share、Client presence 或 Client 可见性语义,其记录位于 `auth_devices`,不会写入 `installations`。
+
 ### 准入限流
 
-注册受四层限流约束,详见 [ARCHITECTURE.md](ARCHITECTURE.md) 第 4 节。触发时返回 `429` 并携带 `Retry-After`。使用**已有公钥**恢复既有 installation 仍受尝试速率保护,但不消耗新身份额度。
+两类注册都受尝试速率保护,新 installation 与新 auth device 使用独立的持久化额度事件。触发时返回 `429` 并携带 `Retry-After`。使用已有公钥恢复同类身份仍受尝试速率保护,但不消耗新身份额度。
 
 ---
 
 ## 3. 通用签名请求
 
-注册之后的所有 Server → Router 签名请求,统一使用以下规范串(`src/store.rs:22565-22568`):
+注册之后的 installation 和 auth device 签名请求统一使用以下规范串:
 
 ```
-{PROTOCOL_EPOCH}\n{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}
+{PROTOCOL_EPOCH}\n{identity_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}
 ```
 
+- Client installation 的 `identity_id` 是 `installationId`;auth device 的 `identity_id` 是 `authDeviceId`
 - `payload_json` 是该请求业务载荷的 JSON 序列化结果,字段顺序必须与结构体声明一致
 - `action` 为动作名,例如 `installation_setup_completed_v1`
 - 签名为 Ed25519 签名的标准 base64
-- `nonce` 由 Router 侧 `request_nonces` 表做重放拦截
+- installation nonce 由 `request_nonces` 拦截;auth device nonce 由 `auth_device_nonces` 拦截
 
 ### 3.1 Dashboard 邮箱登录 challenge
 
-Dashboard 浏览器同样通过 `POST /v1/installations/register` 建立 Ed25519 installation 身份。该身份是验证码 challenge、Session 和 refresh token 的设备边界，必须满足以下约束：
+Dashboard 浏览器通过 `POST /v1/auth/devices/register` 建立 `kind=browser` 的 auth device。该身份是验证码 challenge 的设备边界,必须满足以下约束：
 
-- 同一浏览器 profile 的并发初始化必须收敛到同一组 `installationId`、公钥和私钥。单标签页使用 single-flight；支持 Web Locks API 时，跨标签页以 `cc-switch-router-installation-identity-v1` 锁串行初始化，并在持锁后重新读取持久化身份。
-- `POST /v1/auth/email/request-code` 使用 action `auth_request_code` 和 `{ email, purpose: "login" }` 签名。前端必须保存该次请求实际使用的完整 installation 身份快照。
-- challenge 的逻辑作用域是 `email_normalized + installation_id + purpose`。同一邮箱可在多个 installation 上同时持有有效 challenge；重发只消费同一作用域的旧 challenge，不得影响其他设备。
-- 同一邮箱和 installation 的并发发码在 Router 进程内串行执行，后到请求必须在前一请求落盘后重新经过冷却检查；等待邮件供应商时不得持有业务数据库连接锁。
+- 同一浏览器 profile 的并发初始化必须收敛到同一组 `authDeviceId`、公钥和私钥。单标签页使用 single-flight；支持 Web Locks API 时,跨标签页以 auth-device identity lock 串行初始化,并在持锁后重新读取持久化身份。身份失效后的自动替换也在同一把锁内执行,且只替换发起失败请求的旧 ID。
+- `POST /v1/auth/email/request-code` 使用 action `auth_request_code` 和 `{ email, purpose: "login" }` 签名。前端必须保存该次请求实际使用的完整 auth device 身份快照。
+- challenge 的逻辑作用域是 `email_normalized + auth_source_kind + auth_source_id + purpose`。同一邮箱可在多个 auth device 或 Client Web 上同时持有有效 challenge；重发只消费同一作用域的旧 challenge,不得影响其他设备。
+- 同一邮箱和认证来源的并发发码在 Router 进程内串行执行,后到请求必须在前一请求落盘后重新经过冷却检查；等待邮件供应商时不得持有业务数据库连接锁。
 - challenge 的 `created_at`、过期时间和重发冷却从邮件供应商确认发送成功后开始计算，发信耗时不占用验证码有效期。
-- `POST /v1/auth/email/verify-code` 必须提交发送 challenge 时保存的 `installationId`，不得在校验时重新解析可能已变化的浏览器身份。
+- `POST /v1/auth/email/verify-code` 必须提交发送 challenge 时保存的 `authDeviceId`,不得在校验时重新解析可能已变化的浏览器身份。
 - 正确验证码的消费、用户 upsert、Session 创建和默认 API Token 创建位于同一个 libSQL `IMMEDIATE` 事务；任一写入失败时全部回滚。错误验证码的 `attempt_count` 独立提交。
-- 客户端只接收通用安全错误。Router 日志仅记录 `expired`、`consumed`、`installation_mismatch`、`not_found`、`invalid_code` 或 `attempt_limit` 原因码，不记录邮箱、验证码或验证码 hash。
+- 客户端只接收通用安全错误。Router 日志仅记录 `expired`、`consumed`、`source_mismatch`、`not_found`、`invalid_code` 或 `attempt_limit` 原因码，不记录邮箱、验证码或验证码 hash。
+
+Client Web 邮箱登录使用 `/v1/client-web/auth/email/request-code` 和 `/v1/client-web/auth/email/verify-code`,由 Server 使用自己的 installation 私钥签名,因此 challenge 来源是 `client_installation`。Session 创建后只由 access/refresh token 标识；refresh 请求只提交 `refreshToken`,不会把 Session 生命周期绑到来源记录是否仍存在。
 
 ---
 
@@ -362,8 +385,10 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 
 ---
 
-## 11. 兼容策略
+## 11. 协议严格性
 
 - **Epoch 不匹配硬失败**,不降级
+- Client installation 注册只接受 `register_installation` 规范串;auth device 注册只接受 `register_auth_device` 规范串
+- 注册字段全部必填且拒绝未知字段,不存在注册 proof 版本字段、无签名注册或旧签名串分支
+- Client installation 注册响应必须包含 `controlSecret`;Server 不接受缺少该字段的成功响应
 - Share descriptor 同步:Server 优先调用 `POST /v1/shares/descriptor-batch-sync`;收到 404 时回落至 `POST /v1/shares/batch-sync`,并剥离 `descriptorGeneration` / `descriptorFingerprint` 字段
-- 注册仅接受 `proofVersion = 2`,其余值返回错误(`src/store.rs:22077-22080`)

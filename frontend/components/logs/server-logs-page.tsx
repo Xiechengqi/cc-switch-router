@@ -424,6 +424,8 @@ function accessLabel(
 }
 
 function formatLogLine(event: ServerLogEvent, locale: string) {
+  if (event.rawLine) return event.rawLine;
+
   const timestamp = new Intl.DateTimeFormat(locale, {
     year: "numeric",
     month: "2-digit",

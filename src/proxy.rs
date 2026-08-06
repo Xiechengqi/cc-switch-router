@@ -4375,9 +4375,41 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use axum::routing::any;
+    use ed25519_dalek::Signer;
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    fn signed_registration_request(
+        signing_key: &ed25519_dalek::SigningKey,
+        nonce: &str,
+    ) -> crate::models::RegisterInstallationRequest {
+        let public_key = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().to_bytes());
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let platform = "test";
+        let app_version = "test";
+        let canonical = format!(
+            "{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
+            crate::namespace::PROTOCOL_EPOCH,
+            public_key,
+            platform,
+            app_version,
+            nonce,
+            timestamp_ms,
+        );
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.sign(canonical.as_bytes()).to_bytes());
+        crate::models::RegisterInstallationRequest {
+            protocol_epoch: crate::namespace::PROTOCOL_EPOCH.into(),
+            public_key,
+            platform: platform.into(),
+            app_version: app_version.into(),
+            instance_nonce: nonce.into(),
+            timestamp_ms,
+            signature,
+        }
+    }
 
     #[tokio::test]
     async fn forged_health_check_header_cannot_reach_share_backend() {
@@ -4509,17 +4541,7 @@ mod tests {
         let registered = state
             .store
             .register_installation(
-                crate::models::RegisterInstallationRequest {
-                    protocol_epoch: crate::namespace::PROTOCOL_EPOCH.into(),
-                    public_key: base64::engine::general_purpose::STANDARD
-                        .encode(signing_key.verifying_key().to_bytes()),
-                    platform: "test".into(),
-                    app_version: "test".into(),
-                    instance_nonce: "nonce-register-signed-route".into(),
-                    timestamp_ms: None,
-                    signature: None,
-                    proof_version: None,
-                },
+                signed_registration_request(&signing_key, "nonce-register-signed-route"),
                 crate::models::ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -4527,7 +4549,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let control_secret = registered.control_secret.unwrap();
+        let control_secret = registered.control_secret;
         proxy
             .set_route_with_kind(
                 "share-a".into(),
@@ -4684,7 +4706,7 @@ mod tests {
             auth_max_verify_attempts: 8,
             auth_email_hourly_limit: 10,
             auth_ip_hourly_limit: 30,
-            auth_installation_hourly_limit: 15,
+            auth_source_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
@@ -4718,17 +4740,7 @@ mod tests {
         let registered = state
             .store
             .register_installation(
-                crate::models::RegisterInstallationRequest {
-                    protocol_epoch: crate::namespace::PROTOCOL_EPOCH.into(),
-                    public_key: base64::engine::general_purpose::STANDARD
-                        .encode(signing_key.verifying_key().to_bytes()),
-                    platform: "test".into(),
-                    app_version: "test".into(),
-                    instance_nonce: "nonce-market-client-web-auth".into(),
-                    timestamp_ms: None,
-                    signature: None,
-                    proof_version: None,
-                },
+                signed_registration_request(&signing_key, "nonce-market-client-web-auth"),
                 crate::models::ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -4751,9 +4763,11 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO user_sessions
-                    (id, user_id, installation_id, access_token_hash, refresh_token_hash,
+                    (id, user_id, auth_source_kind, auth_source_id,
+                     access_token_hash, refresh_token_hash,
                      access_expires_at, refresh_expires_at, created_at, last_used_at)
-                 VALUES ('router-session', 'router-user', ?1, ?2, 'refresh-hash',
+                 VALUES ('router-session', 'router-user', 'client_installation', ?1,
+                         ?2, 'refresh-hash',
                          ?3, ?4, ?5, ?5)",
                 crate::db::params![
                     registered.installation_id,

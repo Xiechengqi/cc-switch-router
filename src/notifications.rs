@@ -1073,7 +1073,7 @@ pub struct OfflineEmailData {
     pub owner_email: Option<String>,
     pub version: Option<String>,
     pub client_url: Option<String>,
-    pub last_authenticated_seen_at: String,
+    pub last_heartbeat_at: String,
     pub offline_since: String,
     pub dashboard_url: String,
 }
@@ -1179,7 +1179,7 @@ pub fn render_offline_email(data: &OfflineEmailData) -> RenderedNotificationEmai
         ("Version", display_value(data.version.as_deref())),
         (
             "Last authenticated heartbeat",
-            display_value(Some(&data.last_authenticated_seen_at)),
+            display_value(Some(&data.last_heartbeat_at)),
         ),
         (
             "Offline confirmed",
@@ -1800,7 +1800,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             version: Some("1.2.3".into()),
             client_url: Some("https://client.example.com/".into()),
-            last_authenticated_seen_at: "2026-07-15T12:00:00Z".into(),
+            last_heartbeat_at: "2026-07-15T12:00:00Z".into(),
             offline_since: "2026-07-15T12:03:00Z".into(),
             dashboard_url: "https://router.example.com".into(),
         });

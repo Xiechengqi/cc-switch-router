@@ -7,7 +7,6 @@ export type SessionStatus = {
   authenticated: boolean;
   user?: AuthUser;
   expiresAt?: string;
-  installationOwnerEmail?: string;
   isAdmin: boolean;
 };
 
@@ -1218,7 +1217,7 @@ export type ClientMetricsItem = {
   platform: string;
   appVersion: string;
   countryCode?: string | null;
-  lastAuthenticatedSeenAt?: number | null;
+  lastHeartbeatAt?: number | null;
   offlineSince?: number | null;
   lastRecoveredAt?: number | null;
   offlineEpisode: number;
@@ -2132,6 +2131,7 @@ export type ServerLogEvent = {
   level: "info" | "warn" | "error" | string;
   target: string;
   message: string;
+  rawLine?: string;
   fields?: Record<string, unknown>;
   file?: string;
   line?: number;

@@ -1583,9 +1583,11 @@ mod tests {
         conn.execute(
             "INSERT INTO installations (
                 id, public_key, platform, app_version, owner_email,
-                created_at, last_seen_at, provision_source, provision_host_id
+                created_at, last_seen_at, client_activated_at, control_secret_b64,
+                provision_source, provision_host_id
              ) VALUES ('installation-1', 'recovery-public-key', 'linux', 'test',
-                       'client@example.com', ?1, ?1, 'router_market', 'host-1')",
+                       'client@example.com', ?1, ?1, ?1, 'recovery-control-secret',
+                       'router_market', 'host-1')",
             params![now],
         )
         .expect("insert recovery installation");
@@ -1625,7 +1627,8 @@ mod tests {
             session_id: format!("session-{user_id}"),
             user_id: user_id.into(),
             email: email.into(),
-            installation_id: "browser-installation".into(),
+            auth_source_kind: "auth_device".into(),
+            auth_source_id: "browser-device".into(),
             access_token_hash: "access".into(),
             refresh_token_hash: "refresh".into(),
             access_expires_at: now + ChronoDuration::hours(1),

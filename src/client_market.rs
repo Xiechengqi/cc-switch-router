@@ -8035,7 +8035,7 @@ mod tests {
             auth_max_verify_attempts: 8,
             auth_email_hourly_limit: 10,
             auth_ip_hourly_limit: 30,
-            auth_installation_hourly_limit: 15,
+            auth_source_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
@@ -8474,7 +8474,8 @@ mod tests {
             session_id: format!("session-{user_id}"),
             user_id: user_id.to_string(),
             email: email.to_string(),
-            installation_id: format!("browser-{user_id}"),
+            auth_source_kind: "auth_device".into(),
+            auth_source_id: format!("browser-{user_id}"),
             access_token_hash: format!("access-{user_id}"),
             refresh_token_hash: format!("refresh-{user_id}"),
             access_expires_at: now + chrono::Duration::hours(1),
@@ -8588,13 +8589,15 @@ mod tests {
         conn.execute(
             "INSERT INTO installations (
                 id, public_key, platform, app_version, owner_email, owner_verified_at,
-                created_at, last_seen_at, provision_source, provision_host_id
-             ) VALUES (?1, ?2, 'linux', 'test', ?3, ?4, ?4, ?4, NULL, NULL)",
+                created_at, last_seen_at, client_activated_at, control_secret_b64,
+                provision_source, provision_host_id
+             ) VALUES (?1, ?2, 'linux', 'test', ?3, ?4, ?4, ?4, ?4, ?5, NULL, NULL)",
             params![
                 installation_id,
                 format!("test-public-key-{installation_id}"),
                 owner,
-                now
+                now,
+                format!("test-control-secret-{installation_id}"),
             ],
         )
         .expect("insert installation");

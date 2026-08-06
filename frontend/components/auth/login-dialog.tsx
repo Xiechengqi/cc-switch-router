@@ -3,8 +3,8 @@
 import * as React from "react";
 import { Alert, Button, Form, Input, InputOTP, Modal, REGEXP_ONLY_DIGITS } from "@heroui/react";
 import { Loader2, Mail } from "lucide-react";
-import { requestEmailCode, resetInstallationIdentityState, shouldResetInstallationIdentity, verifyEmailCode } from "@/lib/auth";
-import type { InstallationIdentity } from "@/lib/auth";
+import { requestEmailCode, verifyEmailCode } from "@/lib/auth";
+import type { AuthDeviceIdentity } from "@/lib/auth";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 
@@ -27,7 +27,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const [busy, setBusy] = React.useState(false);
   const [resending, setResending] = React.useState(false);
   const [maskedDestination, setMaskedDestination] = React.useState("");
-  const [challengeIdentity, setChallengeIdentity] = React.useState<InstallationIdentity | null>(null);
+  const [challengeIdentity, setChallengeIdentity] = React.useState<AuthDeviceIdentity | null>(null);
   const [error, setError] = React.useState("");
   const sendingRef = React.useRef(false);
   const verifyingRef = React.useRef(false);
@@ -51,15 +51,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
     else setBusy(true);
     setError("");
     try {
-      let data;
-      try {
-        data = await requestEmailCode(source);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!shouldResetInstallationIdentity(msg)) throw err;
-        resetInstallationIdentityState();
-        data = await requestEmailCode(source);
-      }
+      const data = await requestEmailCode(source);
       setEmail(source);
       setMaskedDestination(data.maskedDestination || fallbackMask(source));
       setChallengeIdentity(data.identity);

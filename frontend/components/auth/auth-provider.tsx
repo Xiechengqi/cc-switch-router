@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { clearSessionTokens, ensureInstallationIdentity, logoutSession, sessionStatus } from "@/lib/auth";
+import { clearSessionTokens, ensureAuthDeviceIdentity, logoutSession, sessionStatus } from "@/lib/auth";
 import type { SessionStatus } from "@/lib/types";
 
 type AuthContextValue = {
@@ -22,7 +22,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const initial = !bootstrappedRef.current;
     if (initial) setLoading(true);
     try {
-      await ensureInstallationIdentity();
+      await ensureAuthDeviceIdentity();
       setSession(await sessionStatus());
       bootstrappedRef.current = true;
     } finally {

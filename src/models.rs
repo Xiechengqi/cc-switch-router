@@ -43,6 +43,8 @@ pub struct Installation {
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     #[serde(default)]
+    pub client_activated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub delegate_upgrade_to_router_owner: Option<bool>,
     #[serde(default)]
     pub app_commit_id: Option<String>,
@@ -70,7 +72,8 @@ pub struct AuthSession {
     pub session_id: String,
     pub user_id: String,
     pub email: String,
-    pub installation_id: String,
+    pub auth_source_kind: String,
+    pub auth_source_id: String,
     pub access_token_hash: String,
     pub refresh_token_hash: String,
     pub access_expires_at: DateTime<Utc>,
@@ -109,19 +112,15 @@ pub struct TunnelLease {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegisterInstallationRequest {
     pub protocol_epoch: String,
     pub public_key: String,
     pub platform: String,
     pub app_version: String,
     pub instance_nonce: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proof_version: Option<i64>,
+    pub timestamp_ms: i64,
+    pub signature: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,8 +131,26 @@ pub struct RegisterInstallationResponse {
     /// makes back to this installation's local `/_ctl/*` API. Independent of the
     /// client's Ed25519 keypair. Clients must persist it and verify inbound
     /// control calls against it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub control_secret: Option<String>,
+    pub control_secret: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegisterAuthDeviceRequest {
+    pub protocol_epoch: String,
+    pub public_key: String,
+    pub kind: String,
+    pub platform: String,
+    pub app_version: String,
+    pub instance_nonce: String,
+    pub timestamp_ms: i64,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterAuthDeviceResponse {
+    pub auth_device_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -174,8 +191,18 @@ pub struct InstallationSetupCompletedResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestEmailCodeRequest {
+    pub email: String,
+    pub auth_device_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientWebRequestEmailCodeRequest {
     pub email: String,
     pub installation_id: String,
     pub timestamp_ms: i64,
@@ -192,8 +219,16 @@ pub struct RequestEmailCodeResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VerifyEmailCodeRequest {
+    pub email: String,
+    pub code: String,
+    pub auth_device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientWebVerifyEmailCodeRequest {
     pub email: String,
     pub code: String,
     pub installation_id: String,
@@ -271,10 +306,9 @@ pub struct ShareApiShareResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RefreshSessionRequest {
     pub refresh_token: String,
-    pub installation_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -285,8 +319,6 @@ pub struct SessionStatusResponse {
     pub user: Option<AuthUser>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installation_owner_email: Option<String>,
     #[serde(default)]
     pub is_admin: bool,
 }

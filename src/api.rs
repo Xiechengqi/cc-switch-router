@@ -42,6 +42,7 @@ use crate::models::{
     ClientChatReadResponse, ClientChatRoomListResponse, ClientChatRoomLookupRequest,
     ClientChatRoomResponse, ClientChatVisitImportRequest, ClientChatVisitImportResponse,
     ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
+    ClientWebRequestEmailCodeRequest, ClientWebVerifyEmailCodeRequest,
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
@@ -56,9 +57,10 @@ use crate::models::{
     MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
     MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse,
     PostClientChatMessageRequest, ProviderUsageResponse, PublicMapPointsResponse,
-    PublicNetworkStatsResponse, RefreshSessionRequest, RegisterGatewayRequest,
-    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
-    RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, ReportInstallationStatusRequest,
+    PublicNetworkStatsResponse, RefreshSessionRequest, RegisterAuthDeviceRequest,
+    RegisterAuthDeviceResponse, RegisterGatewayRequest, RegisterGatewayResponse,
+    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
+    RenewLeaseRequest, RenewLeaseResponse, ReportInstallationStatusRequest,
     ReportInstallationStatusResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
     ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
@@ -137,12 +139,6 @@ mod ui_assets {
 struct RegionOption {
     name: String,
     url: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionStatusQuery {
-    installation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +289,10 @@ pub fn router(state: ServerState) -> Router {
             installation_control_body_limited(post(register_installation)),
         )
         .route(
+            "/v1/auth/devices/register",
+            installation_control_body_limited(post(register_auth_device)),
+        )
+        .route(
             "/v1/installations/heartbeat",
             installation_control_body_limited(post(installation_heartbeat)),
         )
@@ -346,6 +346,10 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/auth/email/request-code", post(request_email_code))
         .route("/v1/auth/email/verify-code", post(verify_email_code))
+        .route(
+            "/v1/client-web/auth/email/request-code",
+            post(request_client_web_email_code),
+        )
         .route(
             "/v1/client-web/auth/email/verify-code",
             post(verify_client_web_email_code),
@@ -1150,6 +1154,32 @@ async fn register_installation(
         )
         .await?;
     Ok(Json(response))
+}
+
+async fn register_auth_device(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<RegisterAuthDeviceRequest>,
+) -> Result<Json<RegisterAuthDeviceResponse>, AppError> {
+    let metadata = extract_client_metadata(&headers, addr);
+    state
+        .registration_admission
+        .check_attempt(metadata.ip.as_deref(), &input.public_key)
+        .map_err(|rejection| AppError::RateLimited {
+            message: "auth device registration rate limit exceeded".into(),
+            retry_after_secs: rejection.retry_after_secs,
+        })?;
+    Ok(Json(
+        state
+            .store
+            .register_auth_device_with_admission(
+                input,
+                metadata,
+                state.registration_admission.policy(),
+            )
+            .await?,
+    ))
 }
 
 async fn report_installation_status(
@@ -2559,6 +2589,25 @@ async fn request_email_code(
     ))
 }
 
+async fn request_client_web_email_code(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ClientWebRequestEmailCodeRequest>,
+) -> Result<Json<RequestEmailCodeResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .request_client_web_email_code(
+                &state.config,
+                state.resend.as_deref(),
+                input,
+                extract_client_metadata(&headers, addr),
+            )
+            .await?,
+    ))
+}
+
 async fn verify_email_code(
     State(state): State<ServerState>,
     Json(input): Json<VerifyEmailCodeRequest>,
@@ -2569,10 +2618,13 @@ async fn verify_email_code(
 
 async fn verify_client_web_email_code(
     State(state): State<ServerState>,
-    Json(input): Json<VerifyEmailCodeRequest>,
+    Json(input): Json<ClientWebVerifyEmailCodeRequest>,
 ) -> Result<Json<VerifyEmailCodeResponse>, AppError> {
     Ok(Json(
-        state.store.verify_email_code(&state.config, input).await?,
+        state
+            .store
+            .verify_client_web_email_code(&state.config, input)
+            .await?,
     ))
 }
 
@@ -2609,16 +2661,12 @@ async fn logout_session(
 async fn session_me(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Query(query): Query<SessionStatusQuery>,
 ) -> Result<Json<SessionStatusResponse>, AppError> {
     if dev_auth_bypass_enabled() && extract_session_token(&headers).is_none() {
         return Ok(Json(dev_session_status()));
     }
     let session_token = resolve_session_auth_token(&state, &headers).await?;
-    let mut response = state
-        .store
-        .session_status(session_token.as_deref(), query.installation_id.as_deref())
-        .await?;
+    let mut response = state.store.session_status(session_token.as_deref()).await?;
     if let Some(user) = response.user.as_ref() {
         response.is_admin = state.dynamic.read().await.is_admin(&user.email);
     }
@@ -4777,7 +4825,8 @@ fn dev_auth_session() -> AuthSession {
         session_id: "dev-auth-bypass-session".into(),
         user_id: "dev-auth-bypass-user".into(),
         email,
-        installation_id: "dev-auth-bypass-installation".into(),
+        auth_source_kind: "auth_device".into(),
+        auth_source_id: "dev-auth-bypass-device".into(),
         access_token_hash: String::new(),
         refresh_token_hash: String::new(),
         access_expires_at: now + chrono::Duration::days(365),
@@ -4796,7 +4845,6 @@ fn dev_session_status() -> SessionStatusResponse {
             email: session.email,
         }),
         expires_at: Some(session.access_expires_at),
-        installation_owner_email: None,
         is_admin: true,
     }
 }

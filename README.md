@@ -65,7 +65,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/admin/*` | 约 43 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`logs/batch`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
-| `/v1/server-logs/*` | 3 | 公开读 / 已验证 Client owner / Router owner | `meta`、`events`、`export`；匿名与非 owner 每 Client 仅可读脱敏后的最近 10 行，完整日志权限方可导出 |
+| `/v1/server-logs/*` | 3 | 公开读 / 已验证 Client owner / Router owner | `meta`、`events`、`export`；匿名与非 owner 每 Client 仅可读脱敏后的最近 10 行，完整日志权限方可查看进程原始格式并导出 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
@@ -144,12 +144,12 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_REGISTRATION_BUCKET_IDLE_SECS` | `600` | 来源/公钥尝试计数器的空闲释放时间(秒) |
 | `CC_SWITCH_ROUTER_REGISTRATION_MAX_SOURCE_BUCKETS` | `8192` | 内存中同时保留的来源尝试计数器上限 |
 | `CC_SWITCH_ROUTER_REGISTRATION_MAX_KEY_BUCKETS` | `16384` | 内存中同时保留的公钥尝试计数器上限 |
-| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT` | `30` | 单来源 10 分钟内持久化新 installation 身份额度 |
-| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT` | `100` | 单来源每小时持久化新 installation 身份额度 |
-| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT` | `300` | 单来源每日持久化新 installation 身份额度 |
-| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT` | `300` | Router 全局 10 分钟内持久化新 installation 身份额度 |
-| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT` | `1000` | Router 全局每小时持久化新 installation 身份额度 |
-| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT` | `5000` | Router 全局每日持久化新 installation 身份额度 |
+| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT` | `30` | 单来源 10 分钟内持久化每类新身份的额度 |
+| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT` | `100` | 单来源每小时持久化每类新身份的额度 |
+| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT` | `300` | 单来源每日持久化每类新身份的额度 |
+| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT` | `300` | Router 全局 10 分钟内持久化每类新身份的额度 |
+| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT` | `1000` | Router 全局每小时持久化每类新身份的额度 |
+| `CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT` | `5000` | Router 全局每日持久化每类新身份的额度 |
 | `CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK` | `50000` | 未绑定 Owner 的 installation 记录达到该水位后暂停新身份准入 |
 | `CC_SWITCH_ROUTER_RESEND_API_KEY` | 空 | Resend API Key,用于验证码、Client 生命周期/聊天室邮件和 dashboard 用量读取;未配置时禁止发送聊天消息 |
 | `CC_SWITCH_ROUTER_RESEND_FROM` | 空 | 邮件发件人,可填裸邮箱或 `TokenSwitch <noreply@example.com>`;裸邮箱会自动显示为 `TokenSwitch <邮箱>` |
@@ -175,7 +175,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_AUTH_MAX_VERIFY_ATTEMPTS` | `5` | 单挑战最大输错次数 |
 | `CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT` | `30` | 单邮箱每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT` | `20` | 单 IP 每小时最大发送次数 |
-| `CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT` | `10` | 单 installation 每小时最大发送次数 |
+| `CC_SWITCH_ROUTER_AUTH_SOURCE_HOURLY_LIMIT` | `10` | 单认证来源每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `for_sale = Free` share 共用的单真实用户 IP 并发上限;设为 `0` 可关闭 |
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
@@ -188,7 +188,7 @@ Router 的 `日志`（英文 `Log`）顶级页面仅列出已经建立日志 str
 
 匿名投影不包含邮箱、IP、完整 URL、日志 fields、源文件、stream、sequence 或 installation 标识;Router 在持久化前还会清除常见凭据。每个 Client 的全部 stream 共用一个原子替换的 `events.jsonl`,只保留最新 100 行;每个 stream 的 sequence cursor 单独持久化,启动时会从已落盘事件补齐缺失或落后的 cursor。日志不按时间或全局容量清理,因此长时间没有新日志的现存 Client 不会被清空;业务库已删除的 installation 日志目录会随常规 cleanup 一并删除。日志正文、stream cursor 和 alias HMAC 密钥均位于 Router 本地日志目录,不写业务数据库;生产部署应使用持久盘并按 Client 数量预留空间。
 
-注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 installation 身份执行业务库持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复已注册 installation 仍受尝试速率保护,但不消耗新身份额度,也不受未绑定 installation 水位线阻断。
+注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 Client installation 与新 auth device 分别执行业务库持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复同类身份仍受尝试速率保护,但不消耗新身份额度。只有新 Client installation 还受未绑定 installation 水位线约束。
 
 ### Turso Cloud 模式
 
@@ -344,7 +344,7 @@ listener。日志使用 append 模式;生产环境应由 `logrotate` 或 journal
 **协议与功能**
 
 - 仅实现 HTTP/WebSocket tunnel,不支持任意 TCP 转发
-- 邮件验证码登录是基于服务端持久化 session 的 bearer token,不是 JWT。验证码按邮箱、installation 和用途隔离；同一邮箱的多设备验证码可并存，校验必须使用发码时的 installation 身份
+- 邮件验证码登录是基于服务端持久化 session 的 bearer token,不是 JWT。Dashboard/Market 验证码按邮箱、auth device 和用途隔离；Client Web 验证码按邮箱、Client installation 和用途隔离。校验必须提交发码时对应的认证来源 ID
 - Resend 用量展示依赖官方响应头 `x-resend-daily-quota`;该 header 通常只对 free plan 返回,不返回时页脚不会显示用量
 
 **Share 数据一致性**

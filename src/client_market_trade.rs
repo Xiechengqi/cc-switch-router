@@ -2150,7 +2150,9 @@ impl AppStore {
                     COUNT(DISTINCT CASE WHEN h.status = 'allocated' THEN h.id END),
                     COUNT(DISTINCT CASE WHEN s.status != 'released' AND s.client_user_id != s.provider_id
                                         THEN s.installation_id END),
-                    COUNT(DISTINCT CASE WHEN s.status != 'released' AND i.last_seen_at >= ?2
+                    COUNT(DISTINCT CASE WHEN s.status != 'released'
+                                             AND i.client_activated_at IS NOT NULL
+                                             AND ns.last_heartbeat_at >= ?2
                                         THEN s.installation_id END),
                     COUNT(DISTINCT CASE WHEN s.status != 'released' THEN s.installation_id END),
                     COUNT(DISTINCT CASE WHEN h.last_error IS NOT NULL AND TRIM(h.last_error) != ''
@@ -2160,6 +2162,7 @@ impl AppStore {
              LEFT JOIN router_ssh_hosts h ON h.provider_id = p.provider_id
              LEFT JOIN client_market_subscriptions s ON s.provider_id = p.provider_id
              LEFT JOIN installations i ON i.id = s.installation_id
+             LEFT JOIN installation_notification_state ns ON ns.installation_id = s.installation_id
              GROUP BY p.provider_id
              ON CONFLICT(provider_id, stat_date) DO UPDATE SET
                 host_total = excluded.host_total,
@@ -4088,7 +4091,8 @@ mod tests {
             session_id: format!("session-{user_id}"),
             user_id: user_id.into(),
             email: email.into(),
-            installation_id: format!("browser-{user_id}"),
+            auth_source_kind: "auth_device".into(),
+            auth_source_id: format!("browser-{user_id}"),
             access_token_hash: format!("access-{user_id}"),
             refresh_token_hash: format!("refresh-{user_id}"),
             access_expires_at: now + Duration::hours(1),
@@ -4140,6 +4144,86 @@ mod tests {
             .expect("read sanitized Client Market audit");
         assert!(!detail.contains("fake-audit-secret"));
         assert!(detail.contains("[credential omitted]"));
+    }
+
+    #[tokio::test]
+    async fn provider_daily_online_samples_require_activation_and_fresh_heartbeat() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let stale_heartbeat = (now - Duration::seconds(901)).to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO host_provider_profiles (
+                    provider_id, owner_email, created_at, updated_at
+                 ) VALUES ('provider-heartbeat', 'provider@example.com', ?1, ?1)",
+                params![now_text],
+            )
+            .expect("insert heartbeat Provider");
+
+            for (installation_id, activated_at, heartbeat_at) in [
+                ("inst-online", Some(now_text.as_str()), now_text.as_str()),
+                (
+                    "inst-stale",
+                    Some(now_text.as_str()),
+                    stale_heartbeat.as_str(),
+                ),
+                ("inst-unactivated", None, now_text.as_str()),
+            ] {
+                conn.execute(
+                    "INSERT INTO installations (
+                        id, public_key, platform, app_version, owner_email, owner_verified_at,
+                        created_at, last_seen_at, client_activated_at, control_secret_b64
+                     ) VALUES (?1, ?2, 'linux', '1.0.0', 'client@example.com', ?3,
+                               ?3, ?3, ?4, ?5)",
+                    params![
+                        installation_id,
+                        format!("key-{installation_id}"),
+                        now_text,
+                        activated_at,
+                        format!("secret-{installation_id}"),
+                    ],
+                )
+                .expect("insert Provider sample installation");
+                conn.execute(
+                    "INSERT INTO installation_notification_state (
+                        installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
+                        created_at, updated_at
+                     ) VALUES (?1, 1, 'online', ?2, ?3, ?3)",
+                    params![installation_id, heartbeat_at, now_text],
+                )
+                .expect("insert Provider sample heartbeat");
+                conn.execute(
+                    "INSERT INTO client_market_subscriptions (
+                        installation_id, host_id, provider_id, host_owner_email,
+                        client_user_id, client_owner_email, status, offer_revision,
+                        created_at, updated_at
+                     ) VALUES (?1, ?2, 'provider-heartbeat', 'provider@example.com',
+                               'external-client', 'client@example.com', 'active', 1, ?3, ?3)",
+                    params![installation_id, format!("host-{installation_id}"), now_text,],
+                )
+                .expect("insert Provider sample subscription");
+            }
+        }
+
+        store
+            .client_market_record_provider_daily_stats(now, 900)
+            .await
+            .expect("record Provider daily stats");
+
+        let conn = store.conn.lock().await;
+        let (online_samples, observed_samples): (i64, i64) = conn
+            .query_row(
+                "SELECT online_samples, observed_samples
+                 FROM host_provider_daily_stats
+                 WHERE provider_id = 'provider-heartbeat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read Provider daily stats");
+        assert_eq!(online_samples, 1);
+        assert_eq!(observed_samples, 3);
     }
 
     #[test]
