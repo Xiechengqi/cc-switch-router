@@ -1,7 +1,7 @@
 "use client";
 
-import { Button, Modal } from "@heroui/react";
-import { LoaderCircle, RefreshCw, TriangleAlert } from "lucide-react";
+import { Button, Modal, Tooltip } from "@heroui/react";
+import { LoaderCircle, RefreshCw, RefreshCwOff, TriangleAlert } from "lucide-react";
 import * as React from "react";
 
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -9,7 +9,7 @@ import { getClientLogs } from "@/lib/api";
 import type { ClientLogsResponse, DashboardClient } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 
-const POLL_INTERVAL_MS = 3_000;
+const POLL_INTERVAL_MS = 10_000;
 const MAX_ERROR_BACKOFF_MS = 30_000;
 const BOTTOM_THRESHOLD_PX = 32;
 
@@ -33,14 +33,18 @@ export function ClientLogsDialog({
   const [response, setResponse] = React.useState<ClientLogsResponse | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [autoRefresh, setAutoRefresh] = React.useState(true);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const timerRef = React.useRef<number | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
   const generationRef = React.useRef(0);
   const failureCountRef = React.useRef(0);
   const inFlightRef = React.useRef(false);
+  const autoRefreshRef = React.useRef(true);
   const fetchRef = React.useRef<() => void>(() => undefined);
   const pendingScrollRef = React.useRef<PendingScroll | null>(null);
+
+  autoRefreshRef.current = autoRefresh;
 
   const clearTimer = React.useCallback(() => {
     if (timerRef.current == null) return;
@@ -51,6 +55,7 @@ export function ClientLogsDialog({
   const schedule = React.useCallback(
     (delayMs: number) => {
       clearTimer();
+      if (!autoRefreshRef.current) return;
       timerRef.current = window.setTimeout(() => fetchRef.current(), delayMs);
     },
     [clearTimer],
@@ -110,6 +115,8 @@ export function ClientLogsDialog({
     setResponse(null);
     setError("");
     setLoading(false);
+    setAutoRefresh(true);
+    autoRefreshRef.current = true;
     pendingScrollRef.current = null;
     if (open && installationId) {
       fetchRef.current();
@@ -131,18 +138,29 @@ export function ClientLogsDialog({
     pendingScrollRef.current = null;
   }, [response?.content]);
 
-  const refresh = () => {
-    if (inFlightRef.current) return;
+  const toggleAutoRefresh = () => {
+    if (autoRefresh) {
+      autoRefreshRef.current = false;
+      clearTimer();
+      setAutoRefresh(false);
+      return;
+    }
     failureCountRef.current = 0;
-    clearTimer();
-    fetchRef.current();
+    autoRefreshRef.current = true;
+    setAutoRefresh(true);
+    if (!inFlightRef.current) {
+      clearTimer();
+      fetchRef.current();
+    }
   };
+
+  const refreshActionLabel = autoRefresh ? t("clientLogs.pauseAutoRefresh") : t("clientLogs.resumeAutoRefresh");
 
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
       <Modal.Container placement="center" size="lg">
         <Modal.Dialog className="light w-[min(900px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-          <Modal.CloseTrigger />
+          <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
           <Modal.Header>
             <div className="min-w-0 pr-10">
               <Modal.Heading className="!text-slate-900">{t("clientLogs.title")}</Modal.Heading>
@@ -167,17 +185,27 @@ export function ClientLogsDialog({
                   </span>
                 ) : null}
               </div>
-              <Button
-                isIconOnly
-                variant="ghost"
-                size="sm"
-                className="h-8 w-8 min-w-8 rounded-md text-slate-600"
-                onClick={refresh}
-                isDisabled={loading}
-                aria-label={t("clientLogs.refresh")}
-              >
-                <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} aria-hidden />
-              </Button>
+              <Tooltip>
+                <Tooltip.Trigger>
+                  <Button
+                    isIconOnly
+                    variant="ghost"
+                    size="sm"
+                    className={`h-8 w-8 min-w-8 rounded-md ${autoRefresh ? "text-slate-600" : "text-rose-600 hover:bg-rose-50 hover:text-rose-700"}`}
+                    onClick={toggleAutoRefresh}
+                    isDisabled={loading && autoRefresh}
+                    aria-label={refreshActionLabel}
+                    aria-pressed={!autoRefresh}
+                  >
+                    {autoRefresh ? (
+                      <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} aria-hidden />
+                    ) : (
+                      <RefreshCwOff className="h-4 w-4" aria-hidden />
+                    )}
+                  </Button>
+                </Tooltip.Trigger>
+                <Tooltip.Content>{refreshActionLabel}</Tooltip.Content>
+              </Tooltip>
             </div>
 
             {error ? (

@@ -28,6 +28,7 @@ import {
   getVisitedClientChatRooms,
   importClientChatVisits,
   lookupClientChatRooms,
+  markClientChatRead,
   removeClientChatVisit,
   recordClientChatVisit,
 } from "@/lib/api";
@@ -57,6 +58,7 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
   const [rooms, setRooms] = React.useState<ClientChatRoom[]>([]);
   const [totalUnread, setTotalUnread] = React.useState(0);
   const [listLoading, setListLoading] = React.useState(false);
+  const [markingAllRead, setMarkingAllRead] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const importedSessionRef = React.useRef<string | null>(null);
   const openRequestRef = React.useRef(0);
@@ -148,6 +150,34 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
   const refreshRooms = React.useCallback(() => {
     void loadRooms().catch(console.error);
   }, [loadRooms]);
+
+  const markAllRead = React.useCallback(async () => {
+    const unreadRooms = rooms.filter((room) => room.unreadCount > 0 && room.latestSeq > 0);
+    if (!unreadRooms.length || markingAllRead) return;
+    setMarkingAllRead(true);
+    setRooms((current) => current.map((room) => (room.unreadCount > 0 ? { ...room, unreadCount: 0 } : room)));
+    setTotalUnread(0);
+    try {
+      if (session?.authenticated) {
+        const results = await Promise.allSettled(
+          unreadRooms.map((room) => markClientChatRead(room.id, room.latestSeq)),
+        );
+        for (const result of results) {
+          if (result.status === "rejected") console.error(result.reason);
+        }
+      } else {
+        for (const room of unreadRooms) {
+          upsertAnonymousVisit(room.installationId, room.latestSeq);
+        }
+      }
+      await loadRooms();
+    } catch (cause) {
+      console.error(cause);
+      void loadRooms().catch(console.error);
+    } finally {
+      setMarkingAllRead(false);
+    }
+  }, [loadRooms, markingAllRead, rooms, session?.authenticated]);
 
   const removeFromRecent = React.useCallback(
     async (room: ClientChatRoom) => {
@@ -267,12 +297,14 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
         totalUnread={totalUnread}
         selectedRoom={selectedRoom}
         listLoading={listLoading}
+        markingAllRead={markingAllRead}
         error={error}
         onFabClick={handleFabClick}
         onSelectRoom={(room) => void openClientChat(room.installationId)}
         onOpenInstallation={(installationId) => void openClientChat(installationId)}
         onRoomChange={setSelectedRoom}
         onRoomsRefresh={refreshRooms}
+        onMarkAllRead={() => void markAllRead()}
         onBackToList={backToList}
         onMinimize={minimize}
         onClose={close}
@@ -295,12 +327,14 @@ function ClientChatDock({
   totalUnread,
   selectedRoom,
   listLoading,
+  markingAllRead,
   error,
   onFabClick,
   onSelectRoom,
   onOpenInstallation,
   onRoomChange,
   onRoomsRefresh,
+  onMarkAllRead,
   onBackToList,
   onMinimize,
   onClose,
@@ -312,12 +346,14 @@ function ClientChatDock({
   totalUnread: number;
   selectedRoom: ClientChatRoom | null;
   listLoading: boolean;
+  markingAllRead: boolean;
   error: string | null;
   onFabClick: () => void;
   onSelectRoom: (room: ClientChatRoom) => void;
   onOpenInstallation: (installationId: string) => void;
   onRoomChange: (room: ClientChatRoom) => void;
   onRoomsRefresh: () => void;
+  onMarkAllRead: () => void;
   onBackToList: () => void;
   onMinimize: () => void;
   onClose: () => void;
@@ -401,6 +437,19 @@ function ClientChatDock({
             </h2>
             <p className="truncate text-[11px] text-slate-500">{t("chat.subtitle")}</p>
           </div>
+          {totalUnread > 0 || markingAllRead ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 shrink-0 rounded-md px-2 text-xs font-medium text-slate-600"
+              onClick={onMarkAllRead}
+              isDisabled={markingAllRead}
+              aria-label={t("chat.markAllRead")}
+            >
+              {markingAllRead ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+              {t("chat.markAllRead")}
+            </Button>
+          ) : null}
           <Button isIconOnly variant="ghost" size="sm" className="rounded-md" onClick={onClose} aria-label={t("chat.close")}>
             <X className="h-4 w-4" />
           </Button>
