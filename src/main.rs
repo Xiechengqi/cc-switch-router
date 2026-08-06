@@ -4,6 +4,7 @@ mod alerting;
 mod api;
 mod cf;
 mod client_chat;
+mod client_logs;
 mod client_market;
 mod client_market_recovery;
 mod client_market_terminal;
@@ -33,7 +34,6 @@ mod recent_traffic;
 mod registration_admission;
 mod scheduling_signals;
 mod schema;
-mod server_logs;
 mod server_state;
 mod share_market;
 mod ssh;
@@ -181,13 +181,11 @@ async fn main() -> Result<()> {
         dynamic.clone(),
         &config,
     )?;
-    let server_logs = Arc::new(server_logs::ServerLogStore::from_env(&config.data_dir)?);
-
     let state = ServerState {
         config: config.clone(),
         server_geo: server_geo.clone(),
         store: AppStore::new(&config)?,
-        server_logs,
+        client_logs: Arc::new(crate::client_logs::ClientLogAccessLimiter::default()),
         proxy: Arc::new(ProxyRegistry::default()),
         proxy_http,
         resend,
@@ -265,7 +263,6 @@ async fn main() -> Result<()> {
     let cleanup_dynamic = state.dynamic.clone();
     let cleanup_proxy = state.proxy.clone();
     let cleanup_overrides = state.scheduling_overrides.clone();
-    let cleanup_server_logs = state.server_logs.clone();
     let market_reconcile_state = state.clone();
     let ip_blacklist_stats = state.ip_blacklist_stats.clone();
     let probe_store = state.store.clone();
@@ -354,7 +351,7 @@ async fn main() -> Result<()> {
             let mut cycle_config = cleanup_config.clone();
             cycle_config.client_notifications =
                 cleanup_dynamic.read().await.client_notifications.clone();
-            let cleanup_succeeded = match cleanup_store
+            match cleanup_store
                 .cleanup_expired_data(&cycle_config, &cleanup_proxy)
                 .await
             {
@@ -370,46 +367,10 @@ async fn main() -> Result<()> {
                         routes = result.removed_routes,
                         "cleanup removed stale data"
                     );
-                    true
                 }
-                Ok(_) => true,
+                Ok(_) => {}
                 Err(err) => {
                     tracing::warn!("cleanup failed: {err}");
-                    false
-                }
-            };
-            if cleanup_succeeded {
-                let logged_installation_ids =
-                    match cleanup_server_logs.installation_ids_with_log_state() {
-                        Ok(installation_ids) => installation_ids,
-                        Err(err) => {
-                            tracing::warn!("snapshot Server logs for cleanup failed: {err}");
-                            continue;
-                        }
-                    };
-                match cleanup_store.list_all_installation_ids().await {
-                    Ok(installation_ids) => {
-                        let existing_installation_ids =
-                            installation_ids.into_iter().collect::<HashSet<_>>();
-                        let orphaned_installation_ids = logged_installation_ids
-                            .difference(&existing_installation_ids)
-                            .cloned()
-                            .collect();
-                        match cleanup_server_logs
-                            .remove_installations(orphaned_installation_ids)
-                            .await
-                        {
-                            Ok(removed) if removed > 0 => {
-                                info!(
-                                    installations = removed,
-                                    "cleanup removed orphaned Server logs"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(err) => tracing::warn!("Server log orphan cleanup failed: {err}"),
-                        }
-                    }
-                    Err(err) => tracing::warn!("list installations for log cleanup failed: {err}"),
                 }
             }
             if let Err(err) =

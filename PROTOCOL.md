@@ -47,7 +47,7 @@ Server 首次启动时生成 Ed25519 密钥对,公钥随注册请求上送。请
 
 > `control_secret` 是 Router → Server 方向的认证凭据;Ed25519 私钥是 Server → Router 方向的认证凭据。两者用途不可混用。
 
-注册成功只建立 installation 控制身份,不会立即形成可见 Client。Server 还必须完成 owner 验证、启用同 owner 的 Client tunnel,并签名上报 setup 完成;Router 随后写入 `client_activated_at`。Dashboard、Metrics、Server logs、Client chat、公开地图和 Share 清单只读取已经激活的 Client。在线状态只由 `/v1/installations/heartbeat` 更新,其他签名控制请求只更新一般活动时间。
+注册成功只建立 installation 控制身份,不会立即形成可见 Client。Server 还必须完成 owner 验证、启用同 owner 的 Client tunnel,并签名上报 setup 完成;Router 随后写入 `client_activated_at`。Dashboard、Metrics、Client 日志入口、Client chat、公开地图和 Share 清单只读取已经激活的 Client。在线状态只由 `/v1/installations/heartbeat` 更新,其他签名控制请求只更新一般活动时间。
 
 ### 2.2 Auth device
 

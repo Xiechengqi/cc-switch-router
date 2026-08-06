@@ -1,14 +1,14 @@
 "use client";
 
 import { Button, Card, Drawer, toast } from "@heroui/react";
-import { ArrowRightLeft, ChevronDown, ListFilter, MessageCircle, Plus, Search, X } from "lucide-react";
+import { ArrowRightLeft, ChevronDown, ListFilter, MessageCircle, Plus, ScrollText, Search, X } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
-import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, summarizeShareAvailability, useStableOperationalRanks } from "@/components/dashboard/operational-status";
+import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, operationalReasonLabel, operationalStateLabel, shareIsEnabled, shareOperationalSummary, summarizeShareAvailability, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useClientConsole } from "@/components/dashboard/client-console";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
@@ -47,6 +47,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { clientMarketMineHref } from "@/lib/dashboard-nav";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ClientSubdomainTakeoverDialog } from "@/components/dashboard/client-subdomain-takeover-dialog";
+import { ClientLogsDialog } from "@/components/dashboard/client-logs-dialog";
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -176,6 +177,20 @@ function ClientDetailsButton({ onOpen }: { onOpen: () => void }) {
   );
 }
 
+function ClientLogsButton({ onOpen }: { onOpen: () => void }) {
+  const { t } = useLocaleText();
+  return (
+    <ClientHeaderInlineButton
+      label={t("clientLogs.button")}
+      onClick={onOpen}
+      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 text-[11px] font-medium text-slate-700 transition-colors hover:border-slate-300 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+    >
+      <ScrollText className="h-3 w-3" aria-hidden />
+      <span>{t("clientLogs.button")}</span>
+    </ClientHeaderInlineButton>
+  );
+}
+
 function ClientTakeoverButton({ onOpen }: { onOpen: () => void }) {
   const { t } = useLocaleText();
   return (
@@ -293,6 +308,7 @@ function ClientCard({
   collapsed,
   onToggleCollapsed,
   onOpenTakeover,
+  onOpenLogs,
 }: {
   client: DashboardClient;
   shares: ShareView[];
@@ -306,6 +322,7 @@ function ClientCard({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   onOpenTakeover?: () => void;
+  onOpenLogs: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
@@ -376,7 +393,11 @@ function ClientCard({
         >
           <div className="grid min-w-0 gap-1.5">
             <div className="flex min-w-0 items-center gap-2">
-              <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "reconnecting" ? "bg-sky-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "reconnecting" ? "bg-sky-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`}
+                title={operationalStateLabel(state, t)}
+                aria-label={operationalStateLabel(state, t)}
+              />
               <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
               {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
               {owner && owner !== "-" ? (
@@ -395,7 +416,7 @@ function ClientCard({
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
-              <OperationalStatusPill summary={summary} />
+              <ClientDetailsButton onOpen={openClientDrawer} />
               <ClientMarketRentalBanner
                 rental={rental}
                 onChanged={onRentalChanged}
@@ -406,7 +427,7 @@ function ClientCard({
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
               {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
-              <ClientDetailsButton onOpen={openClientDrawer} />
+              {client.logCollectionEnabled ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
               <ClientChatButton client={client} />
             </div>
           </div>
@@ -490,6 +511,7 @@ export function ClientBoard({
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
   const [createClientOpen, setCreateClientOpen] = React.useState(false);
   const [takeoverTargetId, setTakeoverTargetId] = React.useState("");
+  const [logClientId, setLogClientId] = React.useState("");
   const [filtersOpen, setFiltersOpen] = React.useState(false);
   const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
@@ -728,6 +750,7 @@ export function ClientBoard({
 
   const selectedClient = selectedClientId ? clientById.get(selectedClientId) || null : null;
   const takeoverTarget = takeoverTargetId ? clientById.get(takeoverTargetId) || null : null;
+  const logClient = logClientId ? clientById.get(logClientId) || null : null;
   const takeoverSources = React.useMemo(
     () => (takeoverTarget ? takeoverSourcesFor(takeoverTarget) : []),
     [takeoverSourcesFor, takeoverTarget],
@@ -737,6 +760,10 @@ export function ClientBoard({
   const currentConnectShare = connectShareId ? shareById.get(connectShareId) || null : null;
   const selectedClientUrl = clientTunnelDisplayUrl(selectedClient?.clientTunnel?.tunnelUrl);
   const selectedApi = shareApiParts(selectedShare ?? undefined);
+
+  React.useEffect(() => {
+    if (logClientId && !logClient?.logCollectionEnabled) setLogClientId("");
+  }, [logClient, logClientId]);
 
   React.useEffect(() => {
     if (connectShareId && !shareById.has(connectShareId)) setConnectShare(null);
@@ -868,7 +895,7 @@ export function ClientBoard({
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={() => setLogClientId(client.installation.id)} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
@@ -982,6 +1009,11 @@ export function ClientBoard({
           setTakeoverTargetId("");
           await refreshRentalsAndDashboard();
         }}
+      />
+      <ClientLogsDialog
+        client={logClient}
+        open={!!logClient?.logCollectionEnabled}
+        onOpenChange={(open) => !open && setLogClientId("")}
       />
     </section>
   );

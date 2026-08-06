@@ -736,7 +736,7 @@ CREATE TABLE installations (
             lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active', 'fenced')),
             fenced_at TEXT,
             fence_reason TEXT
-        , delegate_upgrade_to_router_owner INTEGER, app_commit_id TEXT, update_available INTEGER, upgrade_capable INTEGER, status_reported_at TEXT, public_ip TEXT, provision_source TEXT, provision_host_id TEXT);
+        , delegate_upgrade_to_router_owner INTEGER, app_commit_id TEXT, update_available INTEGER, upgrade_capable INTEGER, status_reported_at TEXT, public_ip TEXT, provision_source TEXT, provision_host_id TEXT, log_collection_enabled INTEGER NOT NULL DEFAULT 0 CHECK(log_collection_enabled IN (0, 1)), log_collection_reported_at TEXT);
 CREATE TABLE auth_devices (
             id TEXT PRIMARY KEY,
             public_key TEXT NOT NULL UNIQUE,

@@ -64,8 +64,8 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/client-market/*` | 33 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
 | `/v1/admin/*` | 约 43 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
-| `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`logs/batch`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
-| `/v1/server-logs/*` | 3 | 公开读 / 已验证 Client owner / Router owner | `meta`、`events`、`export`；匿名与非 owner 每 Client 仅可读脱敏后的最近 10 行，完整日志权限方可查看进程原始格式并导出 |
+| `/v1/installations/*` | 11 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
+| `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner / Router owner | 通过在线 Client tunnel 按需读取日志；匿名与非 owner 最多 10 行，Client owner 与 Router owner 最多 100 行 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
@@ -127,8 +127,6 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID` | 空 | Telegram 私聊、群组、超级群组或频道 ID |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID` | 空 | 论坛模式超级群组的可选 `message_thread_id` |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY` | `warning` | Telegram 最低投递级别：`info`、`warning` 或 `critical` |
-| `CC_SWITCH_ROUTER_SERVER_LOG_INGEST_ENABLED` | `true` | 是否接收已注册 Server 的 Ed25519 签名日志批次;修改后需重启 |
-| `CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR` | `$CC_SWITCH_ROUTER_DATA_DIR/server-logs` | 每个 Client 最近 100 行 Server 日志与独立 stream cursor 的文件目录;不按时间清理且不会写入业务库;修改后需重启 |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔(秒) |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `86400` | 过期 lease 保留时长(秒) |
 | `CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS` | `30` | Share 请求记录和图片请求历史保留天数,范围 1-365;不影响累计 Token 用量 |
@@ -180,13 +178,11 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
-### Server 日志
+### Client 日志
 
-Server 仅在本地日志已开启、级别为 `info` 且“日志采集”开关开启时上传 `INFO/WARN/ERROR`;`DEBUG/TRACE` 不进入上传 channel。断网期间待传日志保存在 Server 本机最多 16 MiB、最长 6 小时的 JSONL spool 中,恢复后按最多 200 条、256 KiB 的签名批次续传。
+Server 本地日志开启、级别为 `info` 且“日志采集”开关开启时，会在 installation heartbeat 中报告允许 Router 按需读取日志。Router 不接收后台上传，也不持久化或缓存 Client 日志。
 
-Router 的 `日志`（英文 `Log`）顶级页面仅列出已经建立日志 stream/cursor 的 Client,按 Client 形成表格。点击一行会展开白色只读日志文本区,展开期间每 3 秒刷新。匿名用户和非该 Client owner 的登录用户只能查看该 Client 最近 10 行的脱敏投影;已验证 Client owner 与 `CC_SWITCH_ROUTER_OWNER_EMAIL` 对应的 Router owner 可查看该 Client 全部 100 行保留日志及完整结构字段。额外 admin 不会自动获得完整日志权限,除非同时是该 Client owner。完整日志权限方仍可使用 JSONL 导出接口。
-
-匿名投影不包含邮箱、IP、完整 URL、日志 fields、源文件、stream、sequence 或 installation 标识;Router 在持久化前还会清除常见凭据。每个 Client 的全部 stream 共用一个原子替换的 `events.jsonl`,只保留最新 100 行;每个 stream 的 sequence cursor 单独持久化,启动时会从已落盘事件补齐缺失或落后的 cursor。日志不按时间或全局容量清理,因此长时间没有新日志的现存 Client 不会被清空;业务库已删除的 installation 日志目录会随常规 cleanup 一并删除。日志正文、stream cursor 和 alias HMAC 密钥均位于 Router 本地日志目录,不写业务数据库;生产部署应使用持久盘并按 Client 数量预留空间。
+Client 页面仅对报告已开启日志采集的 Client 显示“日志”按钮。弹窗打开期间，Router 每 3 秒通过在线 Client Web tunnel 请求最新日志；匿名用户和非该 Client owner 的登录用户最多查看最近 10 行并额外隐藏邮箱、IP、URL 和超长值，已验证 Client owner 与 Router owner 最多查看最近 100 行。关闭弹窗即停止读取并清空浏览器中的日志内容。
 
 注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 Client installation 与新 auth device 分别执行业务库持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复同类身份仍受尝试速率保护,但不消耗新身份额度。只有新 Client installation 还受未绑定 installation 水位线约束。
 

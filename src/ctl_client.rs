@@ -14,6 +14,7 @@
 //! Ed25519 keypair and does not require the server to hold any private key.
 
 use base64::Engine;
+use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -28,7 +29,9 @@ const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
 const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/prepare";
 const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
 const ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/abort";
+const CLIENT_LOG_TAIL_PATH: &str = "/_ctl/logs/tail";
 const CTL_TIMEOUT: Duration = Duration::from_secs(3);
+const CLIENT_LOG_RESPONSE_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +107,17 @@ pub struct RefreshShareUsageReply {
     pub ok: bool,
     #[serde(default)]
     pub refreshed: Vec<RefreshShareUsageItem>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientLogTailReply {
+    #[serde(default)]
+    pub ok: bool,
+    pub lines: usize,
+    #[serde(default)]
+    pub truncated: bool,
+    pub content: String,
 }
 
 /// Why a control RPC did not produce an authoritative result. The caller maps
@@ -282,6 +296,65 @@ async fn post_control<T: serde::de::DeserializeOwned>(
     resp.json()
         .await
         .map_err(|e| CtlError::Malformed(e.to_string()))
+}
+
+pub async fn fetch_client_log_tail(
+    http: &reqwest::Client,
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    lines: usize,
+) -> Result<ClientLogTailReply, CtlError> {
+    let path = format!("{CLIENT_LOG_TAIL_PATH}?lines={lines}");
+    let response = authorize_control_request(
+        http.get(format!("http://{backend}{path}")),
+        "GET",
+        &path,
+        installation_id,
+        control_secret,
+        &[],
+    )
+    .timeout(CTL_TIMEOUT)
+    .send()
+    .await
+    .map_err(|error| {
+        if error.is_timeout() {
+            CtlError::Timeout
+        } else {
+            CtlError::Unreachable(error.to_string())
+        }
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(CtlError::Rejected {
+            status: status.as_u16(),
+            body: "Client log request rejected".into(),
+        });
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            if error.is_timeout() {
+                CtlError::Timeout
+            } else {
+                CtlError::Unreachable(error.to_string())
+            }
+        })?;
+        if body.len().saturating_add(chunk.len()) > CLIENT_LOG_RESPONSE_MAX_BYTES {
+            return Err(CtlError::Malformed(
+                "Client log response exceeds size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let reply: ClientLogTailReply =
+        serde_json::from_slice(&body).map_err(|error| CtlError::Malformed(error.to_string()))?;
+    if !reply.ok {
+        return Err(CtlError::Malformed("Client replied ok=false".into()));
+    }
+    Ok(reply)
 }
 
 /// Synchronously ask the installation behind `backend` (a `host:port` tunnel
@@ -524,6 +597,27 @@ mod tests {
                 nonce,
             )
         );
+    }
+
+    #[test]
+    fn log_line_limit_is_part_of_control_signature() {
+        let signature_10 = signature_for_method(
+            "GET",
+            "/_ctl/logs/tail?lines=10",
+            "secret-a",
+            &[],
+            1_700_000_000_000,
+            "nonce-a",
+        );
+        let signature_100 = signature_for_method(
+            "GET",
+            "/_ctl/logs/tail?lines=100",
+            "secret-a",
+            &[],
+            1_700_000_000_000,
+            "nonce-a",
+        );
+        assert_ne!(signature_10, signature_100);
     }
 
     #[test]

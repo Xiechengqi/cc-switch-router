@@ -81,10 +81,9 @@ import type {
   MarketAccessPricingKind,
   MarketAccessProductKind,
   MarketCreditKind,
-  ServerLogEventsResponse,
-  ServerLogMeta,
   ClientSubdomainTakeoverRequest,
   ClientSubdomainTakeoverResponse,
+  ClientLogsResponse,
 } from "@/lib/types";
 
 
@@ -122,6 +121,15 @@ export async function parseJson<T>(response: Response): Promise<T> {
 
 export async function getDashboard() {
   return parseJson<DashboardResponse>(await authFetch("/v1/dashboard", { cache: "no-store" }));
+}
+
+export async function getClientLogs(installationId: string, signal?: AbortSignal) {
+  return parseJson<ClientLogsResponse>(
+    await authFetch(`/v1/clients/${encodeURIComponent(installationId)}/logs`, {
+      cache: "no-store",
+      signal,
+    }),
+  );
 }
 
 export async function takeOverClientSubdomain(input: ClientSubdomainTakeoverRequest) {
@@ -1427,42 +1435,6 @@ export async function releaseShareMarketSubscription(subscriptionId: string) {
       method: "POST",
     }),
   );
-}
-
-export async function getServerLogMeta() {
-  return parseJson<ServerLogMeta>(
-    await authFetch("/v1/server-logs/meta", { cache: "no-store" }),
-  );
-}
-
-export async function getServerLogs(input: {
-  clientAlias: string;
-  level?: string;
-  search?: string;
-  limit?: number;
-}) {
-  const params = new URLSearchParams({ clientAlias: input.clientAlias });
-  if (input.level) params.set("level", input.level);
-  if (input.search) params.set("search", input.search);
-  if (input.limit) params.set("limit", String(input.limit));
-  return parseJson<ServerLogEventsResponse>(
-    await authFetch(`/v1/server-logs/events?${params}`, { cache: "no-store" }),
-  );
-}
-
-export async function exportServerLogs(input: {
-  clientAlias: string;
-  level?: string;
-  search?: string;
-}) {
-  const params = new URLSearchParams({ clientAlias: input.clientAlias });
-  if (input.level) params.set("level", input.level);
-  if (input.search) params.set("search", input.search);
-  const response = await authFetch(`/v1/server-logs/export?${params}`, {
-    cache: "no-store",
-  });
-  if (!response.ok) await parseJson(response);
-  return response.blob();
 }
 
 export async function forceRevokeShareMarketSubscription(

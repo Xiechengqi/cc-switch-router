@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use crate::abuse::AbuseTracker;
 use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::alerting::AlertingService;
+use crate::client_logs::ClientLogAccessLimiter;
 use crate::client_market::ClientMarketJobSecrets;
 use crate::client_market_terminal::TerminalSessionManager;
 use crate::config::Config;
@@ -19,7 +20,6 @@ use crate::proxy::ProxyRegistry;
 use crate::recent_traffic::RecentTraffic;
 use crate::registration_admission::RegistrationAdmissionLimiter;
 use crate::scheduling_signals::OverrideStore;
-use crate::server_logs::ServerLogStore;
 use crate::store::AppStore;
 
 #[derive(Clone)]
@@ -27,8 +27,8 @@ pub struct ServerState {
     pub config: Config,
     pub server_geo: ServerGeo,
     pub store: AppStore,
-    /// Router-owned file store for uploaded cc-switch-server process logs.
-    pub server_logs: Arc<ServerLogStore>,
+    /// Bounds on-demand Client log reads without retaining log content.
+    pub client_logs: Arc<ClientLogAccessLimiter>,
     pub proxy: Arc<ProxyRegistry>,
     /// Shared HTTP client for proxied tunnel traffic. It keeps connection pools
     /// bounded and avoids allocating a new client for every request.

@@ -177,6 +177,7 @@ export type OperationalSummary = {
 
 export type DashboardClient = {
   chatAvailable?: boolean;
+  logCollectionEnabled?: boolean;
   installation: {
     id: string;
     platform: string;
@@ -216,6 +217,16 @@ export type DashboardClient = {
   healthTimeline?: HealthTimelineBucket[];
   operationalSummary?: OperationalSummary;
   removalAt?: string;
+};
+
+export type ClientLogsResponse = {
+  installationId: string;
+  content: string;
+  lines: number;
+  limit: number;
+  truncated: boolean;
+  fullLogAccess: boolean;
+  fetchedAt: string;
 };
 
 export type ClientSubdomainTakeoverRequest = {
@@ -2090,57 +2101,4 @@ export type ShareMarketOwnedShare = {
   shareStatus: string;
   alreadyListed: boolean;
   supportedUserTokenPeriods: ShareTokenPeriod[];
-};
-
-export type ServerLogClient = {
-  installationId?: string;
-  clientAlias: string;
-  owned: boolean;
-  fullLogAccess: boolean;
-  subdomain?: string;
-  tunnelUrl?: string;
-  ownerEmail?: string;
-  platform: string;
-  appVersion: string;
-  countryCode?: string;
-  region?: string;
-  createdAt: string;
-  lastSeenAt: string;
-  tunnelEnabled?: boolean;
-};
-
-export type ServerLogMeta = {
-  ingestEnabled: boolean;
-  authenticated: boolean;
-  isRouterOwner: boolean;
-  clients: ServerLogClient[];
-  retainedLineLimit: number;
-  publicLineLimit: number;
-  pollIntervalSeconds: number;
-};
-
-export type ServerLogEvent = {
-  eventId: string;
-  clientAlias: string;
-  clientSubdomain?: string;
-  installationId?: string;
-  streamId?: string;
-  sequence?: number;
-  occurredAtMs: number;
-  receivedAtMs: number;
-  level: "info" | "warn" | "error" | string;
-  target: string;
-  message: string;
-  rawLine?: string;
-  fields?: Record<string, unknown>;
-  file?: string;
-  line?: number;
-  serverVersion?: string;
-  commitId?: string;
-};
-
-export type ServerLogEventsResponse = {
-  events: ServerLogEvent[];
-  visibleLineLimit: number;
-  retainedLineLimit: number;
 };

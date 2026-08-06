@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, Toast } from "@heroui/react";
-import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, ScrollText, Settings, Share2, Store, UserRound } from "lucide-react";
+import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, Settings, Share2, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -19,7 +19,6 @@ import {
   DASHBOARD_MARKETS_PATH,
   DASHBOARD_SHARE_MARKET_PATH,
   DASHBOARD_CLIENT_MARKET_PATH,
-  DASHBOARD_LOGS_PATH,
   type DashboardShellActive,
 } from "@/lib/dashboard-nav";
 import { getMarketAccessInboxSummary } from "@/lib/api";
@@ -155,7 +154,7 @@ function DashboardNav({
   authed,
   pendingAccessRequests,
 }: {
-  active: "clients" | "markets" | "share-market" | "client-market" | "logs" | "account";
+  active: "clients" | "markets" | "share-market" | "client-market" | "account";
   authed: boolean;
   pendingAccessRequests: number;
 }) {
@@ -164,8 +163,6 @@ function DashboardNav({
   const selectedKey =
     authed && (active === "account" || pathname.startsWith("/account"))
       ? "account"
-      : active === "logs" || pathname.startsWith("/logs")
-        ? "logs"
       : active === "client-market" || pathname.startsWith("/client-market")
         ? "client-market"
         : active === "share-market" || pathname.startsWith("/share-market")
@@ -188,12 +185,6 @@ function DashboardNav({
       href: DASHBOARD_CLIENT_MARKET_PATH,
       icon: Network,
       label: t("nav.clientMarketTab"),
-    },
-    {
-      id: "logs" as const,
-      href: DASHBOARD_LOGS_PATH,
-      icon: ScrollText,
-      label: t("nav.logsTab"),
     },
     ...(authed
       ? [{ id: "account" as const, href: DASHBOARD_ACCOUNT_PATH, icon: UserRound, label: t("nav.accountTab"), pending: pendingAccessRequests }]
@@ -254,7 +245,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const authed = !!session?.authenticated;
   const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
-  const showDashboardNav = active === "clients" || active === "markets" || active === "share-market" || active === "client-market" || active === "logs" || active === "account";
+  const showDashboardNav = active === "clients" || active === "markets" || active === "share-market" || active === "client-market" || active === "account";
 
   React.useEffect(() => {
     if (!authed || active === "account") {

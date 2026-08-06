@@ -59,6 +59,10 @@ pub struct Installation {
     pub public_ip: Option<String>,
     #[serde(default)]
     pub provision_source: Option<String>,
+    #[serde(default)]
+    pub log_collection_enabled: bool,
+    #[serde(default)]
+    pub log_collection_reported_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2662,6 +2666,7 @@ pub struct InstallationHeartbeatPayload {
     /// Optional self-reported public IPv4. Absent/empty keeps the previous value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
+    pub log_collection_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2731,6 +2736,8 @@ pub struct DashboardClientView {
     pub installation: InstallationView,
     #[serde(default)]
     pub chat_available: bool,
+    #[serde(default)]
+    pub log_collection_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_tunnel: Option<DashboardClientTunnelView>,
     /// 该 installation 名下挂的所有 active share id 列表。

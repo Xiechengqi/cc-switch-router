@@ -918,20 +918,6 @@ pub struct AppStore {
     market_usd_cny_rate_micros: Arc<AtomicI64>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ServerLogClientRecord {
-    pub installation_id: String,
-    pub owner_email: Option<String>,
-    pub platform: String,
-    pub app_version: String,
-    pub country_code: Option<String>,
-    pub region: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub last_seen_at: DateTime<Utc>,
-    pub subdomain: Option<String>,
-    pub tunnel_enabled: Option<bool>,
-}
-
 fn map_database_error(context: &str, error: crate::db::Error) -> AppError {
     if error.is_unavailable() {
         AppError::ServiceUnavailable(format!("{context}: {error}"))
@@ -1099,6 +1085,13 @@ pub struct ShareRouteTarget {
 pub struct ClientTunnelRouteTarget {
     pub installation_id: String,
     pub subdomain: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClientLogTarget {
+    pub subdomain: String,
+    pub control_secret: String,
+    pub log_collection_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1359,60 +1352,56 @@ impl AppStore {
         })
     }
 
-    pub async fn authenticate_installation_log_batch(
+    pub async fn is_verified_installation_owner(
         &self,
-        input: &crate::server_logs::InstallationLogBatchRequest,
-    ) -> Result<(), AppError> {
-        let conn = self.conn.lock().await;
-        let installation = get_installation(&conn, &input.installation_id)?
-            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-        let skew = Utc::now().timestamp_millis().abs_diff(input.timestamp_ms);
-        if skew > SIGNED_REQUEST_MAX_SKEW_MS as u64 {
-            return Err(AppError::Unauthorized("stale signed request".into()));
+        installation_id: &str,
+        owner_email: &str,
+    ) -> Result<bool, AppError> {
+        let owner_email = owner_email.trim().to_ascii_lowercase();
+        if installation_id.trim().is_empty() || owner_email.is_empty() {
+            return Ok(false);
         }
-        // Sequence cursors make batch replay idempotent, so log authentication
-        // deliberately avoids nonce and presence writes on the business DB hot path.
-        verify_signed_payload(
-            &installation.public_key,
-            &input.installation_id,
-            crate::server_logs::INSTALLATION_LOG_BATCH_ACTION,
-            &input.payload,
-            input.timestamp_ms,
-            &input.nonce,
-            &input.signature,
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM installations
+                  WHERE id = ?1
+                    AND lifecycle = 'active'
+                    AND client_activated_at IS NOT NULL
+                    AND owner_verified_at IS NOT NULL
+                    AND owner_email IS NOT NULL
+                    AND LOWER(TRIM(owner_email)) = ?2
+             )",
+            params![installation_id, owner_email],
+            |row| row.get::<_, i64>(0),
         )
+        .map(|matched| matched != 0)
+        .map_err(|error| AppError::Internal(format!("query verified Client owner failed: {error}")))
     }
 
-    pub async fn list_verified_installation_ids_for_owner(
+    pub(crate) async fn client_log_target(
         &self,
-        owner_email: &str,
-    ) -> Result<Vec<String>, AppError> {
-        let owner_email = owner_email.trim().to_ascii_lowercase();
-        if owner_email.is_empty() {
-            return Ok(Vec::new());
-        }
+        installation_id: &str,
+    ) -> Result<Option<ClientLogTarget>, AppError> {
         let conn = self.conn.lock().await;
-        let mut statement = conn
-            .prepare(
-                "SELECT id FROM installations
-                 WHERE lifecycle = 'active'
-                   AND client_activated_at IS NOT NULL
-                   AND owner_verified_at IS NOT NULL
-                   AND owner_email IS NOT NULL
-                   AND LOWER(TRIM(owner_email)) = ?1
-                 ORDER BY created_at DESC, id ASC",
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("prepare owner installation query failed: {error}"))
-            })?;
-        let rows = statement
-            .query_map(params![owner_email], |row| row.get::<_, String>(0))
-            .map_err(|error| {
-                AppError::Internal(format!("query owner installations failed: {error}"))
-            })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
-            AppError::Internal(format!("read owner installation row failed: {error}"))
-        })
+        conn.query_row(
+            "SELECT t.subdomain, i.control_secret_b64, i.log_collection_enabled
+               FROM installations i
+               JOIN installation_client_tunnels t ON t.installation_id = i.id
+              WHERE i.id = ?1
+                AND i.lifecycle = 'active'
+                AND i.client_activated_at IS NOT NULL",
+            params![installation_id],
+            |row| {
+                Ok(ClientLogTarget {
+                    subdomain: row.get(0)?,
+                    control_secret: row.get(1)?,
+                    log_collection_enabled: row.get::<_, i64>(2)? != 0,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("query Client log target failed: {error}")))
     }
 
     pub async fn list_all_installation_ids(&self) -> Result<Vec<String>, AppError> {
@@ -1434,100 +1423,6 @@ impl AppStore {
             })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
             AppError::Internal(format!("read installation id row failed: {error}"))
-        })
-    }
-
-    pub(crate) async fn list_server_log_client_records(
-        &self,
-        installation_ids: Option<&HashSet<String>>,
-    ) -> Result<Vec<ServerLogClientRecord>, AppError> {
-        if installation_ids.is_some_and(HashSet::is_empty) {
-            return Ok(Vec::new());
-        }
-        let mut installation_ids = installation_ids
-            .map(|values| values.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        installation_ids.sort_unstable();
-        let installation_filter = (!installation_ids.is_empty())
-            .then(|| format!("AND i.id IN ({})", repeat_vars(installation_ids.len())));
-        let conn = self.conn.lock().await;
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT i.id,
-                        COALESCE(NULLIF(TRIM(t.owner_email), ''), i.owner_email),
-                        i.platform, i.app_version, i.country_code, i.region,
-                        i.created_at, i.last_seen_at,
-                        NULLIF(TRIM(t.subdomain), ''), t.enabled
-                  FROM installations i
-              LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
-                  WHERE i.lifecycle = 'active'
-                    AND i.client_activated_at IS NOT NULL
-                     {}
-               ORDER BY i.created_at DESC, i.id ASC",
-                installation_filter.as_deref().unwrap_or_default()
-            ))
-            .map_err(|error| {
-                AppError::Internal(format!("prepare server log client query failed: {error}"))
-            })?;
-        let rows = statement
-            .query_map(params_from_iter(installation_ids), |row| {
-                Ok(ServerLogClientRecord {
-                    installation_id: row.get(0)?,
-                    owner_email: row.get(1)?,
-                    platform: row.get(2)?,
-                    app_version: row.get(3)?,
-                    country_code: row.get(4)?,
-                    region: row.get(5)?,
-                    created_at: parse_dt_sql(&row.get::<_, String>(6)?)?,
-                    last_seen_at: parse_dt_sql(&row.get::<_, String>(7)?)?,
-                    subdomain: row.get(8)?,
-                    tunnel_enabled: row.get::<_, Option<i64>>(9)?.map(|value| value != 0),
-                })
-            })
-            .map_err(|error| {
-                AppError::Internal(format!("query server log clients failed: {error}"))
-            })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
-            AppError::Internal(format!("read server log client row failed: {error}"))
-        })
-    }
-
-    pub(crate) async fn list_client_tunnel_subdomains_for_installations(
-        &self,
-        installation_ids: &HashSet<String>,
-    ) -> Result<HashMap<String, String>, AppError> {
-        if installation_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut installation_ids = installation_ids.iter().collect::<Vec<_>>();
-        installation_ids.sort_unstable();
-        let placeholders = repeat_vars(installation_ids.len());
-        let conn = self.conn.lock().await;
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT installation_id, subdomain
-                   FROM installation_client_tunnels
-                  WHERE installation_id IN ({placeholders})
-                    AND TRIM(subdomain) != ''"
-            ))
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "prepare server log client subdomain query failed: {error}"
-                ))
-            })?;
-        let rows = statement
-            .query_map(params_from_iter(installation_ids), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "query server log client subdomains failed: {error}"
-                ))
-            })?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(|error| {
-            AppError::Internal(format!(
-                "read server log client subdomain row failed: {error}"
-            ))
         })
     }
 
@@ -1769,6 +1664,8 @@ impl AppStore {
                     status_reported_at: None,
                     public_ip: None,
                     provision_source: None,
+                    log_collection_enabled: false,
+                    log_collection_reported_at: None,
                 };
                 tx.execute(
             "INSERT INTO installations (
@@ -2742,7 +2639,9 @@ impl AppStore {
              SET app_version = ?2,
                  app_commit_id = CASE WHEN ?3 = '' THEN app_commit_id ELSE ?3 END,
                  last_seen_at = ?4,
-                 public_ip = COALESCE(?5, public_ip)
+                 public_ip = COALESCE(?5, public_ip),
+                 log_collection_enabled = ?6,
+                 log_collection_reported_at = ?4
              WHERE id = ?1",
             params![
                 input.installation_id,
@@ -2750,6 +2649,7 @@ impl AppStore {
                 input.payload.commit_id,
                 now.to_rfc3339(),
                 public_ip,
+                i64::from(input.payload.log_collection_enabled),
             ],
         )
         .map_err(|error| {
@@ -8989,7 +8889,10 @@ impl AppStore {
 
         let mut installation_views = Vec::new();
         let mut active_installations = Vec::<ActiveInstallationGeo>::new();
+        let mut log_collection_by_installation = HashMap::<String, bool>::new();
         for installation in installations {
+            log_collection_by_installation
+                .insert(installation.id.clone(), installation.log_collection_enabled);
             let verified_owner_email = installation
                 .owner_verified_at
                 .is_some()
@@ -9292,6 +9195,10 @@ impl AppStore {
                 }
                 let mut view = DashboardClientView {
                     chat_available: installation.owner_email.is_some(),
+                    log_collection_enabled: log_collection_by_installation
+                        .get(&installation.id)
+                        .copied()
+                        .unwrap_or(false),
                     share_count,
                     share_ids,
                     client_tunnel,
@@ -14998,7 +14905,8 @@ const INSTALLATION_SELECT_COLUMNS: &str = "id, public_key, platform, app_version
                 geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
                 geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
                 geo_last_changed_at, created_at, last_seen_at, client_activated_at,
-                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip, provision_source";
+                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip, provision_source,
+                log_collection_enabled, log_collection_reported_at";
 
 fn map_installation_row(row: &crate::db::Row<'_>) -> crate::db::Result<Installation> {
     Ok(Installation {
@@ -15096,6 +15004,18 @@ fn map_installation_row(row: &crate::db::Row<'_>) -> crate::db::Result<Installat
             })?,
         public_ip: row.get(30)?,
         provision_source: row.get(31)?,
+        log_collection_enabled: row.get::<_, i64>(32)? != 0,
+        log_collection_reported_at: row
+            .get::<_, Option<String>>(33)?
+            .map(|value| parse_dt_sql(&value))
+            .transpose()
+            .map_err(|error| {
+                crate::db::Error::FromSqlConversionFailure(
+                    33,
+                    crate::db::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
     })
 }
 
@@ -28870,6 +28790,7 @@ mod tests {
             app_version: "1.0.1".into(),
             commit_id: "setup-commit".into(),
             public_ip: None,
+            log_collection_enabled: false,
         };
         let heartbeat_timestamp_ms = Utc::now().timestamp_millis();
         let heartbeat_nonce = "setup-heartbeat-1";
@@ -30041,6 +29962,7 @@ mod tests {
             app_version: "1.2.3".into(),
             commit_id: "abcdef123456".into(),
             public_ip: None,
+            log_collection_enabled: true,
         };
         verify_signed_payload(
             public_key,
@@ -30049,7 +29971,7 @@ mod tests {
             &heartbeat,
             1_700_000_000_456,
             "fixture-heartbeat-123",
-            "Ax5dl8lsVWD1wh/8qxs72+hrPtRjjMdJzX/22gQDLxpwClbmIcUThVrGVQH5n1hVuwZsvKfYuoLCINMuGbg8Cg==",
+            "/d9Ky3UEESHcGKMe34fhXc3muioSt9q1M+BtHZQyEKamXA3WGRd/KHsStpyvrWHTlFRVZUS1F0PluI9ZHRo1Ag==",
         )
         .unwrap();
     }
@@ -30993,6 +30915,7 @@ mod tests {
             app_version: "3.0.0".into(),
             commit_id: "abc123".into(),
             public_ip: None,
+            log_collection_enabled: true,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -31020,6 +30943,7 @@ mod tests {
             app_version: "3.0.0".into(),
             commit_id: "abc123".into(),
             public_ip: None,
+            log_collection_enabled: true,
         };
         let replay = store
             .record_installation_heartbeat(crate::models::InstallationHeartbeatRequest {
@@ -31041,6 +30965,16 @@ mod tests {
             )
             .expect("read heartbeat state");
         assert_eq!(state, (1, "online".into(), Some("boot-1".into())));
+        let log_collection: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT log_collection_enabled, log_collection_reported_at
+                 FROM installations WHERE id = 'inst-heartbeat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read heartbeat log collection state");
+        assert_eq!(log_collection.0, 1);
+        assert!(log_collection.1.is_some());
         drop(conn);
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -31056,6 +30990,7 @@ mod tests {
             app_version: "3.0.0".into(),
             commit_id: "abc123".into(),
             public_ip: Some("203.0.113.10".into()),
+            log_collection_enabled: false,
         };
         let first_ts = Utc::now().timestamp_millis();
         let first_nonce = Uuid::new_v4().to_string();
@@ -31084,6 +31019,7 @@ mod tests {
             app_version: "3.0.0".into(),
             commit_id: "abc123".into(),
             public_ip: None,
+            log_collection_enabled: false,
         };
         let second_ts = Utc::now().timestamp_millis();
         let second_nonce = Uuid::new_v4().to_string();
@@ -31131,6 +31067,7 @@ mod tests {
             app_version: "1.0.0".into(),
             commit_id: "commit".into(),
             public_ip: None,
+            log_collection_enabled: false,
         };
         let heartbeat_at = Utc::now();
         let nonce = Uuid::new_v4().to_string();
@@ -41142,53 +41079,6 @@ mod tests {
                 .contains("sibling that must still be delivered")
         );
         assert!(!rebuilt.html.contains("message that will be deleted"));
-        let _ = std::fs::remove_file(config.database.path);
-    }
-
-    #[tokio::test]
-    async fn server_log_client_queries_return_current_tunnel_metadata() {
-        let (store, config) = setup_store("server-log-client-metadata").await;
-        insert_installation(&store, "log-client-a").await;
-        insert_installation(&store, "log-client-b").await;
-        insert_setup_client_tunnel(&store, "log-client-a", "logs-alpha").await;
-
-        let records = store
-            .list_server_log_client_records(None)
-            .await
-            .expect("list server log clients");
-        let alpha = records
-            .iter()
-            .find(|record| record.installation_id == "log-client-a")
-            .expect("client with tunnel");
-        assert_eq!(alpha.subdomain.as_deref(), Some("logs-alpha"));
-        assert_eq!(alpha.tunnel_enabled, Some(true));
-        let without_tunnel = records
-            .iter()
-            .find(|record| record.installation_id == "log-client-b")
-            .expect("client without tunnel");
-        assert!(without_tunnel.subdomain.is_none());
-        assert!(without_tunnel.tunnel_enabled.is_none());
-
-        let restricted = store
-            .list_server_log_client_records(Some(&HashSet::from(["log-client-b".to_string()])))
-            .await
-            .expect("list restricted server log clients");
-        assert_eq!(restricted.len(), 1);
-        assert_eq!(restricted[0].installation_id, "log-client-b");
-
-        let subdomains = store
-            .list_client_tunnel_subdomains_for_installations(&HashSet::from([
-                "log-client-a".to_string(),
-                "log-client-b".to_string(),
-            ]))
-            .await
-            .expect("list server log client subdomains");
-        assert_eq!(
-            subdomains.get("log-client-a").map(String::as_str),
-            Some("logs-alpha")
-        );
-        assert!(!subdomains.contains_key("log-client-b"));
-
         let _ = std::fs::remove_file(config.database.path);
     }
 

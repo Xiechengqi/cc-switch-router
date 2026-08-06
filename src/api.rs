@@ -229,7 +229,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::share_market::router())
         .merge(crate::market_access::router())
         .merge(crate::market_billing::router())
-        .merge(crate::server_logs::router())
+        .merge(crate::client_logs::router())
         .route("/", any(root_handler))
         .route("/install-client.sh", get(install_client_script))
         .route("/favicon.ico", get(favicon))
