@@ -2141,6 +2141,26 @@ impl AppStore {
             &row.target_original_subdomain,
             &row.adopted_subdomain,
         )?;
+        let client_route_id = format!("client:{}", row.target_installation_id);
+        let mut target_route_rebindings = Vec::with_capacity(target_shares.len() + 1);
+        target_route_rebindings.push((client_route_id.clone(), row.adopted_subdomain.clone()));
+        target_route_rebindings.extend(target_shares.iter().zip(&target_new_routes).map(
+            |((share_id, _), new_subdomain)| (format!("share:{share_id}"), new_subdomain.clone()),
+        ));
+        let target_route_heads =
+            snapshot_takeover_target_route_heads_tx(&tx, &target_route_rebindings)?;
+        let mut takeover_route_ids = target_route_rebindings
+            .iter()
+            .map(|(route_id, _)| route_id.clone())
+            .collect::<Vec<_>>();
+        takeover_route_ids.push(format!("client:{}", row.source_installation_id));
+        takeover_route_ids.extend(
+            source_share_ids
+                .iter()
+                .map(|share_id| format!("share:{share_id}")),
+        );
+        takeover_route_ids.sort();
+        takeover_route_ids.dedup();
         let now = Utc::now().to_rfc3339();
         crate::share_market::terminate_installation_for_takeover_tx(
             &tx,
@@ -2210,7 +2230,6 @@ impl AppStore {
             Utc::now(),
         )?;
 
-        let client_route_id = format!("client:{}", row.target_installation_id);
         crate::public_hosts::takeover_rebind(
             &tx,
             crate::public_hosts::NewPublicHost {
@@ -2274,6 +2293,16 @@ impl AppStore {
             params![row.target_installation_id, row.source_installation_id],
         )
         .map_err(|error| AppError::Internal(format!("retire route heads failed: {error}")))?;
+        for route_id in &takeover_route_ids {
+            tx.execute(
+                "DELETE FROM tunnel_route_heads WHERE route_id = ?1",
+                params![route_id],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("retire authoritative route head failed: {error}"))
+            })?;
+        }
+        restore_takeover_target_route_heads_tx(&tx, &target_route_heads, &now)?;
         tx.execute(
             "UPDATE leases
              SET state = 'retired', retired_at = COALESCE(retired_at, ?3)
@@ -20782,6 +20811,16 @@ struct ClientSubdomainTakeoverJobRow {
     new_routes_json: String,
 }
 
+#[derive(Debug, Clone)]
+struct TakeoverRouteHeadSnapshot {
+    router_id: String,
+    route_id: String,
+    subdomain: String,
+    active_generation: i64,
+    active_connection_id: String,
+    active_rotation_id: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientSubdomainTakeoverAuthorizationPayload<'a> {
@@ -20859,6 +20898,74 @@ fn takeover_share_routes_tx(
             AppError::Internal(format!("query takeover Share routes failed: {error}"))
         })?;
     collect_rows(rows)
+}
+
+fn snapshot_takeover_target_route_heads_tx(
+    conn: &Connection,
+    route_rebindings: &[(String, String)],
+) -> Result<Vec<TakeoverRouteHeadSnapshot>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT router_id, route_id, active_generation,
+                    active_connection_id, active_rotation_id
+             FROM tunnel_route_heads WHERE route_id = ?1",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "prepare target takeover route head snapshot failed: {error}"
+            ))
+        })?;
+    let mut snapshots = Vec::new();
+    for (route_id, new_subdomain) in route_rebindings {
+        let rows = statement
+            .query_map(params![route_id], |row| {
+                Ok(TakeoverRouteHeadSnapshot {
+                    router_id: row.get(0)?,
+                    route_id: row.get(1)?,
+                    subdomain: new_subdomain.clone(),
+                    active_generation: row.get(2)?,
+                    active_connection_id: row.get(3)?,
+                    active_rotation_id: row.get(4)?,
+                })
+            })
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "snapshot target takeover route head failed: {error}"
+                ))
+            })?;
+        snapshots.extend(collect_rows(rows)?);
+    }
+    Ok(snapshots)
+}
+
+fn restore_takeover_target_route_heads_tx(
+    conn: &Connection,
+    snapshots: &[TakeoverRouteHeadSnapshot],
+    updated_at: &str,
+) -> Result<(), AppError> {
+    for snapshot in snapshots {
+        conn.execute(
+            "INSERT INTO tunnel_route_heads (
+                router_id, route_id, subdomain, active_generation,
+                active_connection_id, active_rotation_id, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                snapshot.router_id,
+                snapshot.route_id,
+                snapshot.subdomain,
+                snapshot.active_generation,
+                snapshot.active_connection_id,
+                snapshot.active_rotation_id,
+                updated_at,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "restore target takeover route head failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn takeover_active_share_routes_tx(
@@ -41151,6 +41258,78 @@ mod tests {
                 )
                 .expect("claim takeover Share host");
             }
+            let seed_route_head =
+                |installation_id: &str, route_id: &str, subdomain: &str, generation: i64| {
+                    let lease_id = format!("lease-{route_id}");
+                    let connection_id = format!("connection-{route_id}");
+                    let rotation_id = format!("rotation-{route_id}");
+                    conn.execute(
+                        "INSERT INTO leases (
+                            id, installation_id, connection_id, protocol_epoch, router_id,
+                            route_id, rotation_id, generation, expected_generation, state,
+                            subdomain, tunnel_type, ssh_username, ssh_password,
+                            issued_at, expires_at, used_at, ready_at, activated_at
+                         ) VALUES (
+                            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active',
+                            ?10, ?11, ?12, 'test-password', ?13,
+                            '2099-12-31T23:59:59Z', ?13, ?13, ?13
+                         )",
+                        params![
+                            lease_id,
+                            installation_id,
+                            connection_id,
+                            PROTOCOL_EPOCH,
+                            config.router_id(),
+                            route_id,
+                            rotation_id,
+                            generation,
+                            generation.saturating_sub(1),
+                            subdomain,
+                            if route_id.starts_with("client:") {
+                                "client-web-http"
+                            } else {
+                                "http"
+                            },
+                            format!("ssh-{route_id}"),
+                            now,
+                        ],
+                    )
+                    .expect("seed takeover lease");
+                    conn.execute(
+                        "INSERT INTO tunnel_route_heads (
+                            router_id, route_id, subdomain, active_generation,
+                            active_connection_id, active_rotation_id, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            config.router_id(),
+                            route_id,
+                            subdomain,
+                            generation,
+                            connection_id,
+                            rotation_id,
+                            now,
+                        ],
+                    )
+                    .expect("seed takeover route head");
+                };
+            for (installation_id, route_id, label, generation) in [
+                (target_id, "client:takeover-target", "targeta", 7),
+                (target_id, "share:target-share", "sharedslug--targeta", 4),
+                (target_id, "share:target-paused", "pausedslug--targeta", 5),
+                (target_id, "share:target-deleted", "deletedslug--targeta", 9),
+                (source_id, "client:takeover-source", "sourceb", 11),
+                (source_id, "share:source-share", "sharedslug--sourceb", 6),
+            ] {
+                seed_route_head(installation_id, route_id, label, generation);
+            }
+            conn.execute(
+                "DELETE FROM leases
+                 WHERE route_id IN (
+                    'share:target-paused', 'client:takeover-source', 'share:source-share'
+                 )",
+                [],
+            )
+            .expect("simulate retained heads after lease cleanup");
             for (listing_id, share_id, installation_id) in [
                 ("target-listing", "target-share", target_id),
                 ("source-listing", "source-share", source_id),
@@ -41435,7 +41614,212 @@ mod tests {
             .expect("adopted Client host");
         assert_eq!(adopted_host.subject_id, target_id);
         assert_eq!(adopted_host.installation_id.as_deref(), Some(target_id));
+        for (route_id, expected_subdomain, expected_generation) in [
+            ("client:takeover-target", "sourceb", 7),
+            ("share:target-share", "sharedslug--sourceb", 4),
+            ("share:target-paused", "pausedslug--sourceb", 5),
+        ] {
+            let head: (String, i64) = conn
+                .query_row(
+                    "SELECT subdomain, active_generation FROM tunnel_route_heads
+                     WHERE router_id = ?1 AND route_id = ?2",
+                    params![config.router_id(), route_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read preserved target route head");
+            assert_eq!(head, (expected_subdomain.into(), expected_generation));
+        }
+        let removed_route_heads: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tunnel_route_heads
+                 WHERE route_id IN (
+                    'client:takeover-source', 'share:source-share', 'share:target-deleted'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count removed takeover route heads");
+        assert_eq!(removed_route_heads, 0);
+        let unretired_takeover_leases: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM leases
+                 WHERE installation_id IN (?1, ?2) AND state != 'retired'",
+                params![target_id, source_id],
+                |row| row.get(0),
+            )
+            .expect("count unretired takeover leases");
+        assert_eq!(unretired_takeover_leases, 0);
         drop(conn);
+
+        let proxy = ProxyRegistry::default();
+        let mut request = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: config.router_id(),
+            installation_id: target_id.into(),
+            route_id: "client:takeover-target".into(),
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 8,
+            expected_generation: 7,
+            requested_subdomain: "sourceb".into(),
+            tunnel_type: "client-web-http".into(),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            nonce: Uuid::new_v4().to_string(),
+            signature: String::new(),
+            share: None,
+            signed_share: None,
+        };
+        request.signature = sign_issue_lease_request(&target_signing_key, &request);
+        let replacement = store
+            .issue_lease(
+                &config,
+                &proxy,
+                request,
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("issue first post-takeover lease without generation reset");
+        assert_eq!(replacement.expected_generation, 7);
+        proxy
+            .register_candidate_with_kind(
+                replacement.subdomain.clone(),
+                "127.0.0.1:65530".into(),
+                RouteKind::ClientWeb,
+                Some(target_id.into()),
+                Some(replacement.connection_id.clone()),
+                None,
+                None,
+                false,
+                -1,
+                None,
+                replacement.generation,
+                replacement.rotation_id.clone(),
+            )
+            .await
+            .expect("register post-takeover Client candidate");
+        let promoted = proxy
+            .promote_candidate(
+                &replacement.subdomain,
+                &replacement.connection_id,
+                &replacement.rotation_id,
+                replacement.generation,
+                replacement.expected_generation,
+            )
+            .await
+            .expect("promote candidate against preserved persisted head");
+        assert_eq!(promoted.active_generation, Some(8));
+
+        {
+            let conn = store.conn.lock().await;
+            let updated = conn
+                .execute(
+                    "UPDATE tunnel_route_heads
+                     SET active_generation = ?3, active_connection_id = ?4,
+                         active_rotation_id = ?5, updated_at = ?6
+                     WHERE router_id = ?1 AND route_id = ?2",
+                    params![
+                        config.router_id(),
+                        replacement.route_id,
+                        replacement.generation as i64,
+                        replacement.connection_id,
+                        replacement.rotation_id,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .expect("persist first post-takeover route head");
+            assert_eq!(updated, 1);
+        }
+        store
+            .complete_client_subdomain_takeover(&plan.id, true, None)
+            .await
+            .expect("complete first takeover before consecutive takeover");
+
+        let second_source_id = "takeover-source-two";
+        insert_installation(&store, second_source_id).await;
+        insert_setup_client_tunnel(&store, second_source_id, "sourcec").await;
+        {
+            let conn = store.conn.lock().await;
+            crate::public_hosts::claim(
+                &conn,
+                crate::public_hosts::NewPublicHost {
+                    label: "sourcec",
+                    route_id: "client:takeover-source-two",
+                    kind: PublicHostKind::Client,
+                    subject_id: second_source_id,
+                    installation_id: Some(second_source_id),
+                    target_lane_id: second_source_id,
+                },
+            )
+            .expect("claim consecutive takeover Client host");
+        }
+        let second_plan = store
+            .begin_client_subdomain_takeover(
+                "owner@example.com",
+                target_id,
+                second_source_id,
+                Utc::now().timestamp_millis() + 10_000,
+            )
+            .await
+            .expect("prepare consecutive takeover");
+        store
+            .mark_client_subdomain_takeover_server_prepared(&second_plan.id)
+            .await
+            .expect("mark consecutive takeover Server prepared");
+        let second_committed = store
+            .commit_client_subdomain_takeover(&second_plan.id)
+            .await
+            .expect("commit consecutive takeover");
+        assert_eq!(second_committed.adopted_subdomain, "sourcec");
+        {
+            let conn = store.conn.lock().await;
+            let head: (String, i64) = conn
+                .query_row(
+                    "SELECT subdomain, active_generation FROM tunnel_route_heads
+                     WHERE router_id = ?1 AND route_id = ?2",
+                    params![config.router_id(), "client:takeover-target"],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read consecutive takeover route head");
+            assert_eq!(head, ("sourcec".into(), 8));
+        }
+
+        let mut consecutive_request = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: config.router_id(),
+            installation_id: target_id.into(),
+            route_id: "client:takeover-target".into(),
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 9,
+            expected_generation: 8,
+            requested_subdomain: "sourcec".into(),
+            tunnel_type: "client-web-http".into(),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            nonce: Uuid::new_v4().to_string(),
+            signature: String::new(),
+            share: None,
+            signed_share: None,
+        };
+        consecutive_request.signature =
+            sign_issue_lease_request(&target_signing_key, &consecutive_request);
+        let consecutive_replacement = store
+            .issue_lease(
+                &config,
+                &proxy,
+                consecutive_request,
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("issue lease after consecutive takeover");
+        assert_eq!(consecutive_replacement.expected_generation, 8);
+        assert_eq!(consecutive_replacement.generation, 9);
+        assert_eq!(consecutive_replacement.subdomain, "sourcec");
         let metrics = store
             .client_metrics_snapshot(Utc::now())
             .await
