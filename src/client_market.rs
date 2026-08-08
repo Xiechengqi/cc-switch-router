@@ -939,11 +939,13 @@ async fn list_hosts(
             } else {
                 None
             };
-            // An allocated machine belongs to the renter's security boundary. Its Provider
-            // needs an explicit, unexpired renter authorization before opening a root shell.
-            let can_web_terminal = is_host_owner
-                && (host_is_unallocated_for_terminal(&host)
-                    || terminal_authorized_host_ids.contains(&host.id));
+            // An allocated machine belongs to the renter's security boundary. A third-party
+            // Provider needs explicit renter authorization; a self-rented Host does not.
+            let can_web_terminal = viewer.as_ref().is_some_and(|session| {
+                is_host_owner
+                    && (provider_has_implicit_terminal_access(&host, &session.user_id)
+                        || terminal_authorized_host_ids.contains(&host.id))
+            });
             let seller_approval_required = host_seller_approval_required(
                 viewer.is_some(),
                 is_host_owner,
@@ -5641,6 +5643,16 @@ pub(crate) fn host_is_unallocated_for_terminal(host: &RouterSshHostRecord) -> bo
     host.installation_id.is_none()
         && host.client_owner_user_id.is_none()
         && matches!(host.status.as_str(), "idle" | "abnormal" | "unreachable")
+}
+
+pub(crate) fn provider_has_implicit_terminal_access(
+    host: &RouterSshHostRecord,
+    provider_id: &str,
+) -> bool {
+    host.provider_id.as_deref() == Some(provider_id)
+        && (host_is_unallocated_for_terminal(host)
+            || (host.installation_id.is_some()
+                && host.client_owner_user_id.as_deref() == Some(provider_id)))
 }
 
 fn placeholders(count: usize) -> String {

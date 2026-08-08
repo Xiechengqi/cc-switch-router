@@ -504,16 +504,40 @@ async fn bridge_ssh_session(
                 }
                 _ = authorization_timer.tick(), if ticket.installation_id.is_some() => {
                     let installation_id = ticket.installation_id.as_deref().unwrap_or_default();
-                    let authorized = state
+                    let current_host = state
                         .store
-                        .client_market_provider_terminal_authorized_until(
-                            installation_id,
-                            &ticket.host_id,
+                        .client_market_get_host(&ticket.host_id)
+                        .await
+                        .map_err(|error| format!("read terminal Host failed: {error}"))?;
+                    let provider_still_owns_host = current_host.as_ref().is_some_and(|host| {
+                        host.installation_id.as_deref() == Some(installation_id)
+                            && host.provider_id.as_deref()
+                                == Some(ticket.owner_user_id.as_str())
+                    });
+                    let implicit_access = current_host.as_ref().is_some_and(|host| {
+                        crate::client_market::provider_has_implicit_terminal_access(
+                            host,
                             &ticket.owner_user_id,
                         )
-                        .await
-                        .map_err(|error| format!("check terminal authorization failed: {error}"))?
-                        .is_some();
+                    });
+                    let authorized = if !provider_still_owns_host {
+                        false
+                    } else if implicit_access {
+                        true
+                    } else {
+                        state
+                            .store
+                            .client_market_provider_terminal_authorized_until(
+                                installation_id,
+                                &ticket.host_id,
+                                &ticket.owner_user_id,
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!("check terminal authorization failed: {error}")
+                            })?
+                            .is_some()
+                    };
                     if !authorized {
                         return Err("renter authorization for Provider terminal access ended".into());
                     }
@@ -612,7 +636,7 @@ async fn authorize_web_terminal(
             "web terminal is only available to the host Provider".into(),
         ));
     }
-    if crate::client_market::host_is_unallocated_for_terminal(host) {
+    if crate::client_market::provider_has_implicit_terminal_access(host, &session.user_id) {
         return Ok(None);
     }
     let installation_id = host.installation_id.as_deref().ok_or_else(|| {
@@ -707,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn unallocated_terminal_access_uses_stable_provider_identity() {
+    fn implicit_terminal_access_uses_stable_provider_and_client_identity() {
         let idle = sample_host(None, None);
         assert!(crate::client_market::host_is_unallocated_for_terminal(
             &idle
@@ -725,6 +749,22 @@ mod tests {
         assert!(!crate::client_market::host_is_unallocated_for_terminal(
             &allocated
         ));
+        assert!(
+            !crate::client_market::provider_has_implicit_terminal_access(&allocated, "provider-1",)
+        );
+
+        let mut self_allocated = allocated;
+        self_allocated.client_owner_user_id = Some("provider-1".into());
+        assert!(crate::client_market::provider_has_implicit_terminal_access(
+            &self_allocated,
+            "provider-1",
+        ));
+        assert!(
+            !crate::client_market::provider_has_implicit_terminal_access(
+                &self_allocated,
+                "other-provider",
+            )
+        );
     }
 
     #[test]
