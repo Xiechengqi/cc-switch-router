@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically verify the cc-switch Router host clock
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+RandomizedDelaySec=30s
+Persistent=true
+Unit=cc-switch-http-timesync.service
+
+[Install]
+WantedBy=timers.target

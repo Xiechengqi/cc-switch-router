@@ -6,25 +6,71 @@ use crate::error::AppError;
 
 const BASELINE_VERSION: i64 = 1;
 const BASELINE_SQL: &str = include_str!("../schema/0001_baseline.sql");
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        2,
+        include_str!("../schema/0002_security_and_market_indexes.sql"),
+    ),
+    (3, include_str!("../schema/0003_share_descriptor_sync.sql")),
+    (
+        4,
+        include_str!("../schema/0004_market_billing_integrity.sql"),
+    ),
+    (
+        5,
+        include_str!("../schema/0005_market_transaction_integrity.sql"),
+    ),
+    (
+        6,
+        include_str!("../schema/0006_share_control_reliability.sql"),
+    ),
+    (
+        7,
+        include_str!("../schema/0007_client_market_job_leases.sql"),
+    ),
+    (
+        8,
+        include_str!("../schema/0008_client_market_terminal_authorizations.sql"),
+    ),
+    (
+        9,
+        include_str!("../schema/0009_share_market_price_changes.sql"),
+    ),
+    (
+        10,
+        include_str!("../schema/0010_share_market_reconciliation_cursor.sql"),
+    ),
+];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
-    let checksum = baseline_checksum();
-    let has_migration_table = conn
+    if !has_migration_table(conn)? {
+        reject_nonempty_unmanaged_database(conn)?;
+        install_baseline(conn, &migration_checksum(BASELINE_SQL))?;
+    }
+    let applied_versions = validate_migration_history(conn)?;
+    apply_pending_migrations(conn, applied_versions)
+}
+
+pub fn check_compatibility(conn: &Connection) -> Result<(), AppError> {
+    if !has_migration_table(conn)? {
+        return reject_nonempty_unmanaged_database(conn);
+    }
+    validate_migration_history(conn).map(|_| ())
+}
+
+fn has_migration_table(conn: &Connection) -> Result<bool, AppError> {
+    let table_count = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type = 'table' AND name = 'schema_migrations'",
             [],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| AppError::Internal(format!("inspect database schema failed: {error}")))?
-        != 0;
+        .map_err(|error| AppError::Internal(format!("inspect database schema failed: {error}")))?;
+    Ok(table_count != 0)
+}
 
-    if !has_migration_table {
-        reject_nonempty_unmanaged_database(conn)?;
-        install_baseline(conn, &checksum)?;
-        return Ok(());
-    }
-
+fn validate_migration_history(conn: &Connection) -> Result<usize, AppError> {
     let mut statement = conn
         .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
         .map_err(|error| {
@@ -40,18 +86,73 @@ pub fn apply(conn: &Connection) -> Result<(), AppError> {
             AppError::Internal(format!("read schema migration row failed: {error}"))
         })?;
 
-    match migrations.as_slice() {
-        [(BASELINE_VERSION, recorded_checksum)] if recorded_checksum == &checksum => Ok(()),
-        [(BASELINE_VERSION, recorded_checksum)] => Err(AppError::Internal(format!(
-            "database baseline checksum mismatch: expected {checksum}, found {recorded_checksum}"
-        ))),
-        [] => Err(AppError::Internal(
+    if migrations.is_empty() {
+        return Err(AppError::Internal(
             "schema_migrations is empty; partial or legacy databases are unsupported".into(),
-        )),
-        _ => Err(AppError::Internal(format!(
-            "unsupported database migration history: expected only version {BASELINE_VERSION}"
-        ))),
+        ));
     }
+    let known = std::iter::once((BASELINE_VERSION, BASELINE_SQL))
+        .chain(MIGRATIONS.iter().copied())
+        .collect::<Vec<_>>();
+    if migrations.len() > known.len() {
+        return Err(AppError::Internal(format!(
+            "database schema version {} is newer than this binary supports",
+            migrations.last().map(|row| row.0).unwrap_or_default()
+        )));
+    }
+    for ((recorded_version, recorded_checksum), (expected_version, sql)) in
+        migrations.iter().zip(known.iter())
+    {
+        if recorded_version != expected_version {
+            return Err(AppError::Internal(format!(
+                "unsupported database migration history: expected version {expected_version}, found {recorded_version}"
+            )));
+        }
+        let expected_checksum = migration_checksum(sql);
+        if recorded_checksum != &expected_checksum {
+            return Err(AppError::Internal(format!(
+                "database migration {recorded_version} checksum mismatch: expected {expected_checksum}, found {recorded_checksum}"
+            )));
+        }
+    }
+    Ok(migrations.len())
+}
+
+fn apply_pending_migrations(conn: &Connection, applied_versions: usize) -> Result<(), AppError> {
+    for (version, sql) in MIGRATIONS
+        .iter()
+        .copied()
+        .skip(applied_versions.saturating_sub(1))
+    {
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin database migration {version} failed: {error}"
+                ))
+            })?;
+        transaction.execute_batch(sql).map_err(|error| {
+            AppError::Internal(format!(
+                "apply database migration {version} failed: {error}"
+            ))
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+                params![version, migration_checksum(sql), Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "record database migration {version} failed: {error}"
+                ))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit database migration {version} failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn reject_nonempty_unmanaged_database(conn: &Connection) -> Result<(), AppError> {
@@ -101,8 +202,8 @@ fn install_baseline(conn: &Connection, checksum: &str) -> Result<(), AppError> {
         .map_err(|error| AppError::Internal(format!("commit database baseline failed: {error}")))
 }
 
-fn baseline_checksum() -> String {
-    hex::encode(Sha256::digest(BASELINE_SQL.as_bytes()))
+fn migration_checksum(sql: &str) -> String {
+    hex::encode(Sha256::digest(sql.as_bytes()))
 }
 
 #[cfg(test)]
@@ -127,15 +228,27 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 104);
-        let checksum = conn
-            .query_row(
-                "SELECT checksum FROM schema_migrations WHERE version = 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("read baseline checksum");
-        assert_eq!(checksum, baseline_checksum());
+        assert_eq!(table_count, 110);
+        let versions = conn
+            .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+            .expect("prepare migration history")
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query migration history")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migration history");
+        assert_eq!(versions.len(), 10);
+        assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
+        assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
+        assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
+        assert_eq!(versions[3], (4, migration_checksum(MIGRATIONS[2].1)));
+        assert_eq!(versions[4], (5, migration_checksum(MIGRATIONS[3].1)));
+        assert_eq!(versions[5], (6, migration_checksum(MIGRATIONS[4].1)));
+        assert_eq!(versions[6], (7, migration_checksum(MIGRATIONS[5].1)));
+        assert_eq!(versions[7], (8, migration_checksum(MIGRATIONS[6].1)));
+        assert_eq!(versions[8], (9, migration_checksum(MIGRATIONS[7].1)));
+        assert_eq!(versions[9], (10, migration_checksum(MIGRATIONS[8].1)));
     }
 
     #[test]
@@ -162,5 +275,25 @@ mod tests {
         .expect("modify checksum fixture");
         let error = apply(&conn).expect_err("checksum mismatch must be rejected");
         assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn upgrades_a_valid_baseline_with_pending_migrations() {
+        let conn = memory_connection();
+        install_baseline(&conn, &migration_checksum(BASELINE_SQL)).expect("install version 1");
+        check_compatibility(&conn).expect("version 1 is compatible with this binary");
+        apply(&conn).expect("apply pending migration");
+        let index_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                    'idx_market_credit_accounts_buyer_currency_updated',
+                    'idx_market_credit_accounts_supplier_currency_updated'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count market credit indexes");
+        assert_eq!(index_count, 2);
     }
 }

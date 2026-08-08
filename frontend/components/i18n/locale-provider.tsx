@@ -31,10 +31,12 @@ export function LocaleProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     const next = readStoredLocale() || detectBrowserLocale();
     setLocaleState((current) => (current === next ? current : next));
+    document.documentElement.lang = next;
   }, []);
 
   const setLocale = React.useCallback((nextLocale: AppLocale) => {
     writeStoredLocale(nextLocale);
+    document.documentElement.lang = nextLocale;
     setLocaleState(nextLocale);
   }, []);
 

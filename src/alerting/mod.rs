@@ -72,10 +72,27 @@ impl AlertingService {
         conditions: Vec<AlertCondition>,
         now: i64,
     ) -> Result<(), AppError> {
+        self.reconcile_scope("metrics", conditions, now).await
+    }
+
+    pub async fn reconcile_clock(
+        &self,
+        conditions: Vec<AlertCondition>,
+        now: i64,
+    ) -> Result<(), AppError> {
+        self.reconcile_scope("clock", conditions, now).await
+    }
+
+    async fn reconcile_scope(
+        &self,
+        scope: &str,
+        conditions: Vec<AlertCondition>,
+        now: i64,
+    ) -> Result<(), AppError> {
         let settings = self.settings().await;
         self.store
             .reconcile_conditions(
-                "metrics".into(),
+                scope.into(),
                 conditions,
                 now,
                 settings.repeat_interval_secs,

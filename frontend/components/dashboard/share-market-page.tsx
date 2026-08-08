@@ -52,7 +52,9 @@ import {
 import { subdomainTunnelUrl, providerQuotaStatusLine, providerStatusIdentity, providerActualModelNames } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  acceptShareMarketPriceChange,
   addShareMarketSeat,
+  cancelShareMarketPriceChange,
   closeShareMarketListing,
   createShareMarketListing,
   deleteShareMarketListing,
@@ -60,6 +62,8 @@ import {
   forceRevokeShareMarketSubscription,
   getShareMarketCatalog,
   getShareMarketOwnedShares,
+  proposeShareMarketPriceChange,
+  rejectShareMarketPriceChange,
   releaseShareMarketSubscription,
   rentShareMarketSeat,
   updateShareMarketSeat,
@@ -79,7 +83,7 @@ import type {
   MarketEligibility,
 } from "@/lib/types";
 import type { AppLocale } from "@/lib/i18n";
-import { cn, compactTokens } from "@/lib/utils";
+import { cn, compactTokens, preferredScrollBehavior } from "@/lib/utils";
 
 type MarketTab = ShareMarketTabParam;
 type TFn = ReturnType<typeof useLocaleText>["t"];
@@ -174,12 +178,7 @@ function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
       freeDurationDays,
     };
   }
-  const price = draft.price.trim();
-  const amount = Number(price);
-  const dailyRateMinor = Math.round(amount * 100);
-  if (!/^\d+(?:\.\d{1,2})?$/.test(price) || amount <= 0 || !Number.isSafeInteger(dailyRateMinor)) {
-    throw new Error(t("shareMarket.error.price"));
-  }
+  const dailyRateMinor = parseDailyRateMinor(draft.price, t);
   return {
     parallelLimit,
     tokenLimit,
@@ -187,6 +186,16 @@ function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
     dailyRateMinor,
     currency: MARKET_CURRENCY,
   };
+}
+
+function parseDailyRateMinor(value: string, t: TFn) {
+  const price = value.trim();
+  const amount = Number(price);
+  const dailyRateMinor = Math.round(amount * 100);
+  if (!/^\d+(?:\.\d{1,2})?$/.test(price) || amount <= 0 || !Number.isSafeInteger(dailyRateMinor)) {
+    throw new Error(t("shareMarket.error.price"));
+  }
+  return dailyRateMinor;
 }
 
 function fieldClass() {
@@ -490,6 +499,103 @@ function SeatDialog({
           <Modal.Footer>
             <Button variant="outline" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
             <Button variant="primary" isDisabled={busy} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.save")}</Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+  );
+}
+
+function PriceChangeDialog({
+  subscription,
+  onOpenChange,
+  onSaved,
+}: {
+  subscription: ShareMarketSubscription | null;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const { t, locale } = useLocaleText();
+  const [price, setPrice] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    setPrice(subscription?.dailyRateMinor == null ? "" : (subscription.dailyRateMinor / 100).toFixed(2));
+    setError("");
+  }, [subscription]);
+
+  const save = async () => {
+    if (!subscription) return;
+    setBusy(true);
+    setError("");
+    try {
+      const dailyRateMinor = parseDailyRateMinor(price, t);
+      if (dailyRateMinor === subscription.dailyRateMinor) {
+        throw new Error(t("shareMarket.priceChange.samePrice"));
+      }
+      await proposeShareMarketPriceChange(subscription.id, dailyRateMinor, subscription.offerRevision);
+      onOpenChange(false);
+      onSaved();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal.Backdrop isOpen={!!subscription} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light w-[min(480px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+          <Modal.Header>
+            <Modal.Heading>{t("shareMarket.priceChange.title")}</Modal.Heading>
+          </Modal.Header>
+          <Modal.Body className="grid gap-4">
+            {subscription ? (
+              <>
+                <div className="grid gap-1 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
+                  <span className="text-xs text-slate-500">{subscription.shareName}</span>
+                  <span className="font-medium tabular-nums text-slate-900">
+                    {t("shareMarket.priceChange.current", {
+                      amount: formatUsdMoney(subscription.dailyRateMinor || 0, locale),
+                    })}
+                  </span>
+                </div>
+                <label className="grid gap-1 text-xs text-slate-500">
+                  {t("shareMarket.priceChange.newDailyPrice")}
+                  <div className="grid grid-cols-[minmax(0,1fr)_5rem] gap-2">
+                    <input
+                      autoFocus
+                      className={fieldClass()}
+                      inputMode="decimal"
+                      value={price}
+                      onChange={(event) => setPrice(event.target.value)}
+                    />
+                    <div className="flex h-10 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-sm font-medium text-slate-900">
+                      {MARKET_CURRENCY}
+                    </div>
+                  </div>
+                </label>
+                <p className="text-sm leading-6 text-slate-600">
+                  {t("shareMarket.priceChange.consentNotice")}
+                </p>
+                {error ? (
+                  <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                    {error}
+                  </p>
+                ) : null}
+              </>
+            ) : null}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="outline" isDisabled={busy} onClick={() => onOpenChange(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button variant="primary" isDisabled={busy || !subscription} onClick={() => void save()}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {t("shareMarket.priceChange.propose")}
+            </Button>
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
@@ -860,6 +966,7 @@ export function ShareMarketPage() {
   const [sortPrefs, setSortPrefs] = usePersistentState<SeatSortPrefs>(SORT_PREFS_KEY, CLEARED_SEAT_SORT);
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
+  const [priceDialog, setPriceDialog] = React.useState<ShareMarketSubscription | null>(null);
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
   const [rentDialog, setRentDialog] = React.useState<{
     listing: ShareMarketListing;
@@ -927,12 +1034,12 @@ export function ShareMarketPage() {
   React.useEffect(() => { void load(); }, [load, session?.user?.id]);
   React.useEffect(() => {
     const timer = window.setInterval(() => {
-      if (!addOpen && !seatDialog && !confirmAction && !accessDialog && !rentDialog && !busyId) {
+      if (!addOpen && !seatDialog && !priceDialog && !confirmAction && !accessDialog && !rentDialog && !busyId) {
         void load(true);
       }
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [accessDialog, addOpen, busyId, confirmAction, load, rentDialog, seatDialog]);
+  }, [accessDialog, addOpen, busyId, confirmAction, load, priceDialog, rentDialog, seatDialog]);
 
   const act = async (
     id: string,
@@ -1143,7 +1250,7 @@ export function ShareMarketPage() {
       document.querySelector(`[data-share-id="${CSS.escape(focusShareId)}"]`) ||
       document.querySelector(`[data-subscription-share-id="${CSS.escape(focusShareId)}"]`);
     if (target instanceof HTMLElement) {
-      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      target.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
       focusedRef.current = focusShareId;
     }
   }, [catalog, focusShareId, layout, tab]);
@@ -1155,6 +1262,73 @@ export function ShareMarketPage() {
       else next.add(seatId);
       return next;
     });
+  };
+
+  const renderPriceChangeControls = (subscription: ShareMarketSubscription) => {
+    const change = subscription.priceChange;
+    if (!change) {
+      return subscription.canProposePriceChange ? (
+        <Button
+          size="sm"
+          variant="outline"
+          isDisabled={!!busyId}
+          onClick={() => setPriceDialog(subscription)}
+        >
+          <CircleDollarSign className="h-4 w-4" />
+          {t("shareMarket.priceChange.action")}
+        </Button>
+      ) : null;
+    }
+    const previous = formatUsdMoney(change.previousDailyRateMinor, locale);
+    const proposed = formatUsdMoney(change.proposedDailyRateMinor, locale);
+    return (
+      <div className="flex max-w-full flex-wrap items-center justify-end gap-1.5">
+        <span className="rounded-sm bg-amber-50 px-2 py-1 text-xs tabular-nums text-amber-800">
+          {t("shareMarket.priceChange.summary", { previous, proposed })}
+          {" · "}
+          {t(`shareMarket.priceChange.status.${change.status}`)}
+        </span>
+        {change.canAccept ? (
+          <Button
+            size="sm"
+            variant="primary"
+            isDisabled={!!busyId}
+            onClick={() =>
+              setConfirmAction({
+                id: `price-accept-${change.id}`,
+                title: t("shareMarket.priceChange.acceptTitle"),
+                description: t("shareMarket.priceChange.acceptDescription", { previous, proposed }),
+                confirmLabel: t("shareMarket.priceChange.accept"),
+                tone: "warning",
+                run: () => acceptShareMarketPriceChange(change.id),
+              })
+            }
+          >
+            {t("shareMarket.priceChange.accept")}
+          </Button>
+        ) : null}
+        {change.canReject ? (
+          <Button
+            size="sm"
+            variant="outline"
+            isDisabled={!!busyId}
+            onClick={() => void act(`price-reject-${change.id}`, () => rejectShareMarketPriceChange(change.id))}
+          >
+            {t("shareMarket.priceChange.reject")}
+          </Button>
+        ) : null}
+        {change.canCancel ? (
+          <Button
+            size="sm"
+            variant="outline"
+            isDisabled={!!busyId}
+            onClick={() => void act(`price-cancel-${change.id}`, () => cancelShareMarketPriceChange(change.id))}
+          >
+            {t("shareMarket.priceChange.cancel")}
+          </Button>
+        ) : null}
+      </div>
+    );
   };
 
   const renderSubscription = (subscription: ShareMarketSubscription, ownerView = false) => {
@@ -1204,6 +1378,7 @@ export function ShareMarketPage() {
             {t("marketBilling.open")}
           </Link>
         ) : null}
+        {renderPriceChangeControls(subscription)}
         {!ownerView && subscription.canRelease ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.releaseTitle"), description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }), confirmLabel: t("shareMarket.release"), tone: "warning", run: () => releaseShareMarketSubscription(subscription.id) })}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button> : null}
         {ownerView && subscription.canForceRevoke ? (
           <>
@@ -1266,6 +1441,7 @@ export function ShareMarketPage() {
             {t("marketBilling.open")}
           </Link>
         ) : null}
+        {subscription ? renderPriceChangeControls(subscription) : null}
         {subscription?.canRelease ? (
           <Button
             size="sm"
@@ -1487,7 +1663,7 @@ export function ShareMarketPage() {
                 <tr key={seat.id} className={`border-t border-slate-100 first:border-0 ${seat.readOnly ? "bg-slate-50/60 text-slate-500" : ""}`}>
                   <td className="px-4 py-3 font-medium tabular-nums">{seat.position}</td>
                   <td className="px-3 py-3 text-slate-600">{seat.parallelLimit ?? t("common.unlimited")}</td>
-                  <td className="px-3 py-3 text-slate-600">{seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")} · {tokenPeriod(seat.tokenPeriod)}</td>
+                  <td className="px-3 py-3 text-slate-600">{seat.tokenLimit == null ? t("common.unlimited") : new Intl.NumberFormat(locale).format(seat.tokenLimit)} · {tokenPeriod(seat.tokenPeriod)}</td>
                   <td className="px-3 py-3 font-medium">{formatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
                   <td className="max-w-[14rem] px-3 py-3"><span className="block truncate text-slate-600" title={seat.subscription?.renterEmail}>{seat.subscription?.renterEmail || "—"}</span></td>
                   <td className="px-3 py-3"><span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{seatStatusLabel(seat, seat.subscription, t)}</span></td>
@@ -1656,7 +1832,7 @@ export function ShareMarketPage() {
                     </td>
                     <td className="px-3 py-3 text-slate-600">{seat.parallelLimit ?? t("common.unlimited")}</td>
                     <td className="px-3 py-3 text-slate-600">
-                      {seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")}
+                      {seat.tokenLimit == null ? t("common.unlimited") : new Intl.NumberFormat(locale).format(seat.tokenLimit)}
                       {seat.tokenPeriod ? ` · ${tokenPeriod(seat.tokenPeriod)}` : ""}
                     </td>
                     <td className="px-3 py-3 font-medium">{formatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
@@ -1708,7 +1884,8 @@ export function ShareMarketPage() {
   ];
 
   return (
-    <div className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
+    <main className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
+      <h1 className="sr-only">{t("shareMarket.title")}</h1>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <SegmentedControl
@@ -1786,6 +1963,11 @@ export function ShareMarketPage() {
 
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
       <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
+      <PriceChangeDialog
+        subscription={priceDialog}
+        onOpenChange={(next) => !next && setPriceDialog(null)}
+        onSaved={() => void load(true)}
+      />
       <Modal.Backdrop
         isOpen={!!rentDialog}
         onOpenChange={(next) => {
@@ -1896,6 +2078,6 @@ export function ShareMarketPage() {
         onConfirm={() => void runConfirmedAction()}
         onOpenChange={(next) => !next && !busyId && setConfirmAction(null)}
       />
-    </div>
+    </main>
   );
 }

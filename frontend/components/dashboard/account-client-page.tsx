@@ -125,6 +125,8 @@ function synthesizeRentalFromHost(
     isClientOwner,
     canRelease: !!host.installationId,
     canFinalizeRelease: false,
+    providerTerminalAccessActive: false,
+    canManageProviderTerminal: false,
     updatedAt: host.updatedAt || host.createdAt || new Date(0).toISOString(),
   };
 }

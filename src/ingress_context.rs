@@ -8,6 +8,10 @@ use crate::namespace::PROTOCOL_EPOCH;
 
 pub const INGRESS_CONTEXT_HEADER: &str = "x-cc-switch-ingress-context";
 pub const INGRESS_SIGNATURE_HEADER: &str = "x-cc-switch-ingress-signature";
+pub const INTERNAL_INGRESS_ERROR_HEADER: &str = "x-cc-switch-internal-ingress-error";
+pub const INTERNAL_INGRESS_AGE_MS_HEADER: &str = "x-cc-switch-internal-ingress-age-ms";
+pub const INTERNAL_INGRESS_SERVER_TIME_MS_HEADER: &str =
+    "x-cc-switch-internal-ingress-server-time-ms";
 const SIGNING_DOMAIN: &str = "cc-switch-router-ingress-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,11 +77,12 @@ fn validate(context: &IngressContext, control_secret: &str) -> Result<(), &'stat
     {
         return Err("ingress context contains an empty required field");
     }
-    if context
-        .user_email
-        .as_deref()
-        .is_some_and(|value| value != value.trim() || value.is_empty())
-    {
+    if context.user_email.as_deref().is_some_and(|value| {
+        value != value.trim()
+            || value.is_empty()
+            || value != value.to_ascii_lowercase()
+            || !value.contains('@')
+    }) {
         return Err("ingress user email is not normalized");
     }
     if context
@@ -130,5 +135,26 @@ mod tests {
         let mut missing_route = context();
         missing_route.route_id.clear();
         assert!(sign(missing_route, &"x".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn signed_user_email_is_canonical_and_signature_bound() {
+        let secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGH";
+        let signed = sign(context(), secret).unwrap();
+
+        let mut changed = context();
+        changed.user_email = Some("buyer@example.com".into());
+        assert_ne!(sign(changed, secret).unwrap().signature, signed.signature);
+
+        for email in [
+            "Owner@example.com",
+            " owner@example.com",
+            "owner.example.com",
+            "",
+        ] {
+            let mut invalid = context();
+            invalid.user_email = Some(email.into());
+            assert!(sign(invalid, secret).is_err(), "accepted {email:?}");
+        }
     }
 }

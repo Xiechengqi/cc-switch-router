@@ -147,7 +147,7 @@ pub fn require_provision_ssh_keys(private_key_path: &Path, public_key_path: &Pat
     Ok(())
 }
 
-fn derive_public_key(private_key_path: &Path) -> Result<String> {
+pub(crate) fn derive_public_key(private_key_path: &Path) -> Result<String> {
     let output = Command::new("ssh-keygen")
         .arg("-y")
         .arg("-f")

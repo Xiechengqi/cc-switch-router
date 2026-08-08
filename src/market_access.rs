@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::db::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -847,6 +849,33 @@ impl AppStore {
         actor: &MarketAccessActor,
     ) -> Result<MarketAccessDashboardView, AppError> {
         let conn = self.conn.lock().await;
+        let stored_policies = conn
+            .prepare(
+                "SELECT product_kind, pricing_kind, mode, revision,
+                        risk_acknowledged_at, updated_at
+                 FROM market_supplier_access_policies
+                 WHERE supplier_user_id = ?1",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![actor.user_id], |row| {
+                        let product_kind = row.get::<_, String>(0)?;
+                        let pricing_kind = row.get::<_, String>(1)?;
+                        Ok((
+                            (product_kind.clone(), pricing_kind.clone()),
+                            AccessPolicyView {
+                                product_kind,
+                                pricing_kind,
+                                mode: row.get(2)?,
+                                revision: row.get(3)?,
+                                risk_acknowledged_at: row.get(4)?,
+                                updated_at: row.get(5)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<HashMap<_, _>, _>>()
+            })
+            .map_err(map_db("list market access policies"))?;
         let policies = [PRODUCT_SHARE, PRODUCT_CLIENT_HOST]
             .into_iter()
             .flat_map(|product_kind| {
@@ -855,40 +884,191 @@ impl AppStore {
                     .map(move |pricing_kind| (product_kind, pricing_kind))
             })
             .map(|(product_kind, pricing_kind)| {
-                policy_view_tx(&conn, &actor.user_id, product_kind, pricing_kind)
+                stored_policies
+                    .get(&(product_kind.to_string(), pricing_kind.to_string()))
+                    .cloned()
+                    .unwrap_or_else(|| AccessPolicyView {
+                        product_kind: product_kind.into(),
+                        pricing_kind: pricing_kind.into(),
+                        mode: default_access_mode(pricing_kind).into(),
+                        revision: 0,
+                        risk_acknowledged_at: None,
+                        updated_at: String::new(),
+                    })
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let ids = conn
+            .collect();
+
+        let mut counterparties = conn
             .prepare(
-                "SELECT id FROM market_counterparties WHERE supplier_user_id = ?1
+                "SELECT id, buyer_email, buyer_user_id, status, revision, created_at, updated_at
+                 FROM market_counterparties WHERE supplier_user_id = ?1
                  ORDER BY updated_at DESC, id",
             )
             .and_then(|mut statement| {
                 statement
-                    .query_map(params![actor.user_id], |row| row.get::<_, String>(0))?
+                    .query_map(params![actor.user_id], |row| {
+                        Ok(CounterpartyView {
+                            id: row.get(0)?,
+                            buyer_email: row.get(1)?,
+                            buyer_user_id: row.get(2)?,
+                            status: row.get(3)?,
+                            revision: row.get(4)?,
+                            access_rules: Vec::new(),
+                            credit_lines: Vec::new(),
+                            exposures: Vec::new(),
+                            created_at: row.get(5)?,
+                            updated_at: row.get(6)?,
+                        })
+                    })?
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("list market counterparties"))?;
-        let counterparties = ids
-            .iter()
-            .map(|id| counterparty_view_tx(&conn, id))
-            .collect::<Result<Vec<_>, _>>()?;
-        let request_ids = conn
+        let mut access_rules = conn
             .prepare(
-                "SELECT id FROM market_access_requests
+                "SELECT rule.counterparty_id, rule.product_kind,
+                        rule.pricing_kind, rule.decision
+                 FROM market_counterparty_access_rules rule
+                 JOIN market_counterparties counterparty ON counterparty.id = rule.counterparty_id
+                 WHERE counterparty.supplier_user_id = ?1
+                 ORDER BY rule.counterparty_id, rule.product_kind, rule.pricing_kind",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![actor.user_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            CounterpartyAccessRuleView {
+                                product_kind: row.get(1)?,
+                                pricing_kind: row.get(2)?,
+                                decision: row.get(3)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("list market counterparty access rules"))?
+            .into_iter()
+            .fold(HashMap::<String, Vec<_>>::new(), |mut map, (id, rule)| {
+                map.entry(id).or_default().push(rule);
+                map
+            });
+        let mut credit_lines = conn
+            .prepare(
+                "SELECT grant.counterparty_id, grant.currency, grant.kind,
+                        grant.limit_minor, grant.revision, grant.updated_at
+                 FROM market_credit_grants grant
+                 JOIN market_counterparties counterparty ON counterparty.id = grant.counterparty_id
+                 WHERE counterparty.supplier_user_id = ?1 AND grant.currency = 'USD'
+                 ORDER BY grant.counterparty_id, grant.currency",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![actor.user_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            CreditLineView {
+                                currency: row.get(1)?,
+                                kind: row.get(2)?,
+                                limit_minor: row.get(3)?,
+                                revision: row.get(4)?,
+                                updated_at: row.get(5)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("list market counterparty credit lines"))?
+            .into_iter()
+            .fold(HashMap::<String, Vec<_>>::new(), |mut map, (id, line)| {
+                map.entry(id).or_default().push(line);
+                map
+            });
+        let mut exposures = conn
+            .prepare(
+                "SELECT counterparty.id, account.currency,
+                        (account.balance_units + 86399) / 86400,
+                        account.status, COUNT(contract.id)
+                 FROM market_counterparties counterparty
+                 JOIN market_credit_accounts account
+                   ON account.supplier_user_id = counterparty.supplier_user_id
+                  AND account.buyer_user_id = counterparty.buyer_user_id
+                 LEFT JOIN market_service_contracts contract
+                   ON contract.account_id = account.id
+                  AND contract.status IN ('trial', 'active', 'billing_suspended')
+                 WHERE counterparty.supplier_user_id = ?1
+                   AND counterparty.buyer_user_id IS NOT NULL
+                   AND account.currency = 'USD'
+                 GROUP BY counterparty.id, account.id
+                 ORDER BY counterparty.id, account.currency",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![actor.user_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            CounterpartyExposureView {
+                                currency: row.get(1)?,
+                                balance_minor: row.get(2)?,
+                                status: row.get(3)?,
+                                active_service_count: row.get(4)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("list market counterparty exposures"))?
+            .into_iter()
+            .fold(
+                HashMap::<String, Vec<_>>::new(),
+                |mut map, (id, exposure)| {
+                    map.entry(id).or_default().push(exposure);
+                    map
+                },
+            );
+        for counterparty in &mut counterparties {
+            counterparty.access_rules = access_rules.remove(&counterparty.id).unwrap_or_default();
+            counterparty.credit_lines = credit_lines.remove(&counterparty.id).unwrap_or_default();
+            counterparty.exposures = exposures.remove(&counterparty.id).unwrap_or_default();
+        }
+
+        let access_requests = conn
+            .prepare(
+                "SELECT id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
+                        product_kind, pricing_kind, target_kind, target_id, target_label,
+                        daily_rate_minor, currency, status, revision, requested_at, resolved_at,
+                        resolved_by_user_id, resolution_reason, resolution_note
+                 FROM market_access_requests
                  WHERE supplier_user_id = ?1 AND status = 'requested'
                  ORDER BY requested_at DESC, id",
             )
             .and_then(|mut statement| {
                 statement
-                    .query_map(params![actor.user_id], |row| row.get::<_, String>(0))?
+                    .query_map(params![actor.user_id], |row| {
+                        Ok(AccessRequestView {
+                            id: row.get(0)?,
+                            supplier_user_id: row.get(1)?,
+                            supplier_email: row.get(2)?,
+                            buyer_user_id: row.get(3)?,
+                            buyer_email: row.get(4)?,
+                            product_kind: row.get(5)?,
+                            pricing_kind: row.get(6)?,
+                            target_kind: row.get(7)?,
+                            target_id: row.get(8)?,
+                            target_label: row.get(9)?,
+                            daily_rate_minor: row.get(10)?,
+                            currency: row.get(11)?,
+                            status: row.get(12)?,
+                            revision: row.get(13)?,
+                            requested_at: row.get(14)?,
+                            resolved_at: row.get(15)?,
+                            resolved_by_user_id: row.get(16)?,
+                            resolution_reason: row.get(17)?,
+                            resolution_note: row.get(18)?,
+                        })
+                    })?
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("list market access requests"))?;
-        let access_requests = request_ids
-            .iter()
-            .map(|id| access_request_view_tx(&conn, id))
-            .collect::<Result<Vec<_>, _>>()?;
         let mut public_credit_lines = conn
             .prepare(
                 "SELECT currency, enabled, limit_minor, revision, updated_at

@@ -9,6 +9,7 @@ type DashboardDataValue = {
   data: DashboardResponse | null;
   error: string;
   loading: boolean;
+  refreshing: boolean;
   fresh: boolean;
   refresh: () => Promise<void>;
 };
@@ -19,24 +20,32 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
   const [data, setData] = React.useState<DashboardResponse | null>(null);
   const [error, setError] = React.useState("");
   const [loading, setLoading] = React.useState(enabled);
+  const [refreshing, setRefreshing] = React.useState(false);
   const [clock, setClock] = React.useState(() => Date.now());
   const requestSeq = React.useRef(0);
+  const dataRef = React.useRef<DashboardResponse | null>(null);
   const { loading: authLoading, session } = useAuth();
 
   const refresh = React.useCallback(async () => {
     if (!enabled || authLoading) return;
     const seq = ++requestSeq.current;
-    setLoading(true);
+    const initialLoad = dataRef.current == null;
+    if (initialLoad) setLoading(true);
+    else setRefreshing(true);
     try {
       const next = await getDashboard();
       if (seq !== requestSeq.current) return;
+      dataRef.current = next;
       setData(next);
       setError("");
       setClock(Date.now());
     } catch (err) {
       if (seq === requestSeq.current) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (seq === requestSeq.current) setLoading(false);
+      if (seq === requestSeq.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [authLoading, enabled]);
 
@@ -53,7 +62,10 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
 
   const generatedAt = data ? Date.parse(data.generatedAt) : 0;
   const fresh = Boolean(data && !error && Number.isFinite(generatedAt) && clock - generatedAt < 20_000);
-  const value = React.useMemo(() => ({ data, error, loading, fresh, refresh }), [data, error, fresh, loading, refresh]);
+  const value = React.useMemo(
+    () => ({ data, error, loading, refreshing, fresh, refresh }),
+    [data, error, fresh, loading, refresh, refreshing],
+  );
   return <DashboardDataContext.Provider value={value}>{children}</DashboardDataContext.Provider>;
 }
 

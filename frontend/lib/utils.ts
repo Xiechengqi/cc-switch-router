@@ -5,9 +5,20 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export function formatNumber(value: unknown) {
+export function preferredScrollBehavior(): ScrollBehavior {
+  if (typeof window === "undefined") return "auto";
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+}
+
+function activeLocale(locale?: string) {
+  if (locale) return locale;
+  if (typeof document !== "undefined") return document.documentElement.lang || undefined;
+  return undefined;
+}
+
+export function formatNumber(value: unknown, locale?: string) {
   const n = Number(value || 0);
-  return Number.isFinite(n) ? new Intl.NumberFormat().format(n) : "0";
+  return Number.isFinite(n) ? new Intl.NumberFormat(activeLocale(locale)).format(n) : "0";
 }
 
 export function formatRelativeTime(value?: string | number | Date | null, locale?: string) {
@@ -22,7 +33,7 @@ export function formatRelativeTime(value?: string | number | Date | null, locale
     ["minute", 60000],
     ["second", 1000],
   ];
-  const rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+  const rtf = new Intl.RelativeTimeFormat(activeLocale(locale), { numeric: "auto" });
   for (const [unit, ms] of units) {
     if (abs >= ms || unit === "second") {
       return rtf.format(Math.round(-diff / ms), unit);
@@ -31,28 +42,32 @@ export function formatRelativeTime(value?: string | number | Date | null, locale
   return "--";
 }
 
-export function formatDateTime(value?: string | number | Date | null) {
+export function formatDateTime(value?: string | number | Date | null, locale?: string) {
   if (!value) return "--";
   const date = value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(date.getTime())) return "--";
-  return date.toLocaleString();
+  return new Intl.DateTimeFormat(activeLocale(locale), {
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(date);
 }
 
-export function compactTokens(value: unknown) {
+export function compactTokens(value: unknown, locale?: string) {
   const n = Number(value || 0);
   if (!Number.isFinite(n)) return "0";
-  if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
+  return new Intl.NumberFormat(activeLocale(locale), {
+    notation: Math.abs(n) >= 1_000 ? "compact" : "standard",
+    maximumFractionDigits: 1,
+  }).format(n);
 }
 
-export function compactNumber(value: unknown) {
+export function compactNumber(value: unknown, locale?: string) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "0";
-  if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  if (Number.isInteger(n)) return String(n);
-  return n.toFixed(Math.abs(n) >= 10 ? 0 : 1);
+  return new Intl.NumberFormat(activeLocale(locale), {
+    notation: Math.abs(n) >= 1_000 ? "compact" : "standard",
+    maximumFractionDigits: Number.isInteger(n) || Math.abs(n) >= 10 ? 0 : 1,
+  }).format(n);
 }
 
 export function fixed(value: unknown) {

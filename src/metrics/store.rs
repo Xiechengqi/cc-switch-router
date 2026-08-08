@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::task::spawn_blocking;
 
+use crate::clock_health::ClockHealthStatus;
 use crate::error::AppError;
 
 use super::models::{
-    ClearMetricsResponse, ClientMetricsPoint, ClientMetricsSnapshot, HostMetricsPoint,
-    HostMetricsStatus, LlmMetricsPoint, LlmRequestMetric, LlmTopItem, LlmTopResponse, MetricEvent,
-    MetricsSeriesResponse, RouterMetricsPoint, RouterMetricsStatus,
+    ClearMetricsResponse, ClientMetricsPoint, ClientMetricsSnapshot, ClockMetricsPoint,
+    HostMetricsPoint, HostMetricsStatus, LlmMetricsPoint, LlmRequestMetric, LlmTopItem,
+    LlmTopResponse, MetricEvent, MetricsSeriesResponse, RouterMetricsPoint, RouterMetricsStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,36 @@ impl MetricsStore {
         })
         .await
         .map_err(|err| AppError::Internal(format!("metrics sample task failed: {err}")))?
+    }
+
+    pub async fn insert_clock_sample(&self, sample: ClockHealthStatus) -> Result<(), AppError> {
+        let store = self.clone();
+        spawn_blocking(move || {
+            let Some(timestamp) = sample.sampled_at else {
+                return Ok(());
+            };
+            let conn = store.open()?;
+            conn.execute(
+                "INSERT INTO clock_metrics (
+                    timestamp, offset_ms, uncertainty_ms, status, confidence,
+                    valid_sources, total_sources, ntp_synchronized
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    timestamp,
+                    sample.offset_ms,
+                    sample.uncertainty_ms.map(|value| value as i64),
+                    sample.status,
+                    sample.confidence,
+                    sample.valid_sources as i64,
+                    sample.total_sources as i64,
+                    sample.ntp_synchronized.map(i64::from),
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("insert clock metrics failed: {error}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Internal(format!("clock metrics task failed: {error}")))?
     }
 
     pub async fn prune(&self) -> Result<(), AppError> {
@@ -210,6 +241,7 @@ impl MetricsStore {
             Ok(MetricsSeriesResponse {
                 range: range_label,
                 step: step_label,
+                clock: load_clock_series(&conn, start_ts, end_ts, step_secs)?,
                 host: load_host_series(&conn, start_ts, end_ts, step_secs)?,
                 router: load_router_series(&conn, start_ts, end_ts, step_secs)?,
                 clients: load_client_series(&conn, start_ts, end_ts, step_secs)?,
@@ -304,6 +336,7 @@ impl MetricsStore {
             let conn = store.open()?;
             let mut deleted_rows = HashMap::new();
             for table in [
+                "clock_metrics",
                 "host_metrics",
                 "router_metrics",
                 "client_metrics",
@@ -387,6 +420,18 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
             process_uptime_secs INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_host_metrics_ts ON host_metrics(timestamp);
+
+        CREATE TABLE IF NOT EXISTS clock_metrics (
+            timestamp INTEGER NOT NULL,
+            offset_ms INTEGER,
+            uncertainty_ms INTEGER,
+            status TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            valid_sources INTEGER NOT NULL,
+            total_sources INTEGER NOT NULL,
+            ntp_synchronized INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_clock_metrics_ts ON clock_metrics(timestamp);
 
         CREATE TABLE IF NOT EXISTS router_metrics (
             timestamp INTEGER NOT NULL,
@@ -627,7 +672,13 @@ fn insert_llm_request_metric(conn: &Connection, metric: &LlmRequestMetric) -> Re
             requested_model = COALESCE(excluded.requested_model, llm_request_metrics.requested_model),
             actual_model = COALESCE(excluded.actual_model, llm_request_metrics.actual_model),
             status = excluded.status,
-            error_kind = COALESCE(excluded.error_kind, llm_request_metrics.error_kind),
+            error_kind = CASE
+                WHEN excluded.error_kind = 'concurrency_limited'
+                    THEN excluded.error_kind
+                WHEN llm_request_metrics.error_kind = 'concurrency_limited'
+                    THEN llm_request_metrics.error_kind
+                ELSE COALESCE(excluded.error_kind, llm_request_metrics.error_kind)
+            END,
             http_status = COALESCE(excluded.http_status, llm_request_metrics.http_status),
             latency_ms = COALESCE(excluded.latency_ms, llm_request_metrics.latency_ms),
             ttft_ms = COALESCE(excluded.ttft_ms, llm_request_metrics.ttft_ms),
@@ -677,6 +728,7 @@ fn prune_old_metrics(conn: &Connection, now_ts: i64, retention_days: u32) -> Res
     }
     let cutoff = now_ts - retention_days as i64 * 86_400;
     for (table, column) in [
+        ("clock_metrics", "timestamp"),
         ("host_metrics", "timestamp"),
         ("router_metrics", "timestamp"),
         ("client_metrics", "timestamp"),
@@ -756,6 +808,55 @@ fn opt_f64_to_u64(value: Option<f64>) -> Option<u64> {
         return None;
     }
     Some(value.round() as u64)
+}
+
+fn load_clock_series(
+    conn: &Connection,
+    start_ts: i64,
+    end_ts: i64,
+    step_secs: i64,
+) -> Result<Vec<ClockMetricsPoint>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT
+                (timestamp / ?1) * ?1 AS bucket_ts,
+                AVG(offset_ms),
+                AVG(uncertainty_ms),
+                AVG(valid_sources)
+             FROM clock_metrics
+             WHERE timestamp >= ?2 AND timestamp <= ?3
+             GROUP BY bucket_ts
+             ORDER BY bucket_ts ASC",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare clock metrics series failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map(params![step_secs, start_ts, end_ts], |row| {
+            Ok(ClockMetricsPoint {
+                timestamp: row.get(0)?,
+                offset_ms: row.get(1)?,
+                uncertainty_ms: row.get(2)?,
+                valid_sources: row.get(3)?,
+            })
+        })
+        .map_err(|error| {
+            AppError::Internal(format!("query clock metrics series failed: {error}"))
+        })?;
+    let buckets = collect_rows(rows, "clock metrics series")?;
+    Ok(fill_time_axis(
+        start_ts,
+        end_ts,
+        step_secs,
+        buckets,
+        |point| point.timestamp,
+        |timestamp| ClockMetricsPoint {
+            timestamp,
+            offset_ms: None,
+            uncertainty_ms: None,
+            valid_sources: None,
+        },
+    ))
 }
 
 fn load_host_series(
@@ -948,6 +1049,7 @@ fn load_llm_series(
                 COUNT(*) AS requests,
                 SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS errors,
                 SUM(CASE WHEN error_kind = 'rate_limited' OR http_status = 429 THEN 1 ELSE 0 END) AS rate_limited,
+                SUM(CASE WHEN error_kind = 'concurrency_limited' THEN 1 ELSE 0 END) AS concurrency_limited,
                 COALESCE(SUM(input_tokens), 0) AS input_tokens,
                 COALESCE(SUM(output_tokens), 0) AS output_tokens,
                 COALESCE(SUM(total_tokens), 0) AS total_tokens
@@ -989,6 +1091,7 @@ fn load_llm_series(
             agg.requests,
             agg.errors,
             agg.rate_limited,
+            agg.concurrency_limited,
             agg.input_tokens,
             agg.output_tokens,
             agg.total_tokens,
@@ -1003,9 +1106,9 @@ fn load_llm_series(
         .query_map(params![step_secs, start_ts, end_ts], |row| {
             let requests = row.get::<_, i64>(1)?.max(0) as f64;
             let errors = row.get::<_, i64>(2)?.max(0) as f64;
-            let input_tokens = row.get::<_, i64>(4)?.max(0) as f64;
-            let output_tokens = row.get::<_, i64>(5)?.max(0) as f64;
-            let total_tokens = row.get::<_, i64>(6)?.max(0) as f64;
+            let input_tokens = row.get::<_, i64>(5)?.max(0) as f64;
+            let output_tokens = row.get::<_, i64>(6)?.max(0) as f64;
+            let total_tokens = row.get::<_, i64>(7)?.max(0) as f64;
             let factor = 60.0 / step_secs as f64;
             Ok(LlmMetricsPoint {
                 timestamp: row.get(0)?,
@@ -1019,8 +1122,9 @@ fn load_llm_series(
                     0.0
                 },
                 rate_limited: row.get::<_, i64>(3)?.max(0) as u64,
-                p95_latency_ms: opt_i64_to_u64(row.get(7)?),
-                p95_ttft_ms: opt_i64_to_u64(row.get(8)?),
+                concurrency_limited: row.get::<_, i64>(4)?.max(0) as u64,
+                p95_latency_ms: opt_i64_to_u64(row.get(8)?),
+                p95_ttft_ms: opt_i64_to_u64(row.get(9)?),
             })
         })
         .map_err(|err| AppError::Internal(format!("query llm metrics series failed: {err}")))?;
@@ -1039,6 +1143,7 @@ fn load_llm_series(
             output_tpm: 0.0,
             error_rate: 0.0,
             rate_limited: 0,
+            concurrency_limited: 0,
             p95_latency_ms: None,
             p95_ttft_ms: None,
         },
@@ -1463,6 +1568,68 @@ mod tests {
         assert_eq!(series[0].online, 2);
         assert_eq!(series[0].recovering, 1);
         assert_eq!(series[0].offline, 1);
+    }
+
+    #[test]
+    fn concurrency_classification_survives_metric_enrichment_in_any_order() {
+        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        init_metrics_db(&conn).expect("init metrics db");
+
+        for (request_id, first_kind, second_kind) in [
+            (
+                "generic-then-concurrency",
+                "upstream_error",
+                "concurrency_limited",
+            ),
+            (
+                "concurrency-then-generic",
+                "concurrency_limited",
+                "upstream_error",
+            ),
+        ] {
+            insert_llm_request_metric(&conn, &llm_metric(request_id, first_kind))
+                .expect("insert first metric");
+            insert_llm_request_metric(&conn, &llm_metric(request_id, second_kind))
+                .expect("enrich metric");
+
+            let stored: String = conn
+                .query_row(
+                    "SELECT error_kind FROM llm_request_metrics WHERE request_id = ?1",
+                    params![request_id],
+                    |row| row.get(0),
+                )
+                .expect("read merged classification");
+            assert_eq!(stored, "concurrency_limited");
+        }
+    }
+
+    fn llm_metric(request_id: &str, error_kind: &str) -> LlmRequestMetric {
+        LlmRequestMetric {
+            timestamp: 900,
+            request_id: Some(request_id.to_string()),
+            route_type: "direct".into(),
+            market_email: None,
+            share_id: Some("share-1".into()),
+            subdomain: Some("share-1".into()),
+            app_type: Some("codex".into()),
+            provider: None,
+            requested_model: None,
+            actual_model: None,
+            status: "error".into(),
+            error_kind: Some(error_kind.to_string()),
+            http_status: Some(409),
+            latency_ms: Some(0),
+            ttft_ms: None,
+            stream_started: false,
+            stream_completed: false,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            estimated_cost_usd: None,
+        }
     }
 
     fn host_sample(timestamp: i64, rss_bytes: u64) -> HostMetricsStatus {

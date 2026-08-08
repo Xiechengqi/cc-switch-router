@@ -1,7 +1,9 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration as StdDuration;
 
-use crate::db::{Connection, OptionalExtension, Transaction, params};
+use crate::db::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, patch, post};
@@ -26,7 +28,11 @@ const SERVICE_CYCLE_SECS: u64 = 5;
 const MAX_SEATS_PER_LISTING: usize = 20;
 const MAX_FREE_DURATION_DAYS: u32 = 365;
 const MAX_CONTROL_ATTEMPTS: i64 = 8;
+const MAX_SUBSCRIPTIONS_PER_RECONCILE: usize = 200;
 const CONTROL_DISPATCH_WAKE_RETRY_SECS: i64 = 30;
+const CONTROL_EDIT_TTL_SECS: i64 = 5 * 60;
+const CONTROL_RETRY_BASE_SECS: i64 = 15;
+const CONTROL_RETRY_MAX_SECS: i64 = 15 * 60;
 pub(crate) const SHARE_MARKET_CONTROL_ACTOR_EMAIL: &str = "share-market@router.internal";
 
 const SEAT_AVAILABLE: &str = "available";
@@ -44,6 +50,11 @@ const SUB_BILLING_SUSPEND_PENDING: &str = "billing_suspend_pending";
 const SUB_BILLING_SUSPENDED: &str = "billing_suspended";
 const SUB_BILLING_RESUME_PENDING: &str = "billing_resume_pending";
 const SUB_BILLING_CONTROL_FAILED: &str = "billing_control_failed";
+
+const PRICE_CHANGE_PENDING: &str = "pending";
+const PRICE_CHANGE_ACCEPTED: &str = "accepted";
+const PRICE_CHANGE_REJECTED: &str = "rejected";
+const PRICE_CHANGE_CANCELLED: &str = "cancelled";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,12 +149,33 @@ pub struct SubscriptionView {
     pub contacts: Vec<PaymentContact>,
     pub can_release: bool,
     pub can_force_revoke: bool,
+    pub can_propose_price_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_change: Option<PriceChangeView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceChangeView {
+    pub id: String,
+    pub previous_daily_rate_minor: i64,
+    pub proposed_daily_rate_minor: i64,
+    pub currency: String,
+    pub base_offer_revision: i64,
+    pub status: String,
+    pub can_accept: bool,
+    pub can_reject: bool,
+    pub can_cancel: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responded_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +229,13 @@ pub struct ForceRevokeRequest {
     pub deny_future_access: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProposePriceChangeRequest {
+    pub daily_rate_minor: i64,
+    pub offer_revision: i64,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedSeat {
     parallel_limit: Option<u32>,
@@ -210,6 +249,39 @@ struct NormalizedSeat {
 impl NormalizedSeat {
     fn is_free(&self) -> bool {
         self.daily_rate_minor.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PriceChangeAction {
+    Accept,
+    Reject,
+    Cancel,
+}
+
+impl PriceChangeAction {
+    fn target_status(self) -> &'static str {
+        match self {
+            Self::Accept => PRICE_CHANGE_ACCEPTED,
+            Self::Reject => PRICE_CHANGE_REJECTED,
+            Self::Cancel => PRICE_CHANGE_CANCELLED,
+        }
+    }
+
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::Accept => "price_change_accepted",
+            Self::Reject => "price_change_rejected",
+            Self::Cancel => "price_change_cancelled",
+        }
+    }
+
+    fn resolution_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Accept => None,
+            Self::Reject => Some("renter_rejected"),
+            Self::Cancel => Some("owner_cancelled"),
+        }
     }
 }
 
@@ -235,6 +307,22 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/share-market/subscriptions/:id/force-revoke",
             post(force_revoke_subscription),
+        )
+        .route(
+            "/v1/share-market/subscriptions/:id/price-changes",
+            post(propose_price_change),
+        )
+        .route(
+            "/v1/share-market/price-changes/:id/accept",
+            post(accept_price_change),
+        )
+        .route(
+            "/v1/share-market/price-changes/:id/reject",
+            post(reject_price_change),
+        )
+        .route(
+            "/v1/share-market/price-changes/:id/cancel",
+            post(cancel_price_change),
         )
 }
 
@@ -784,7 +872,7 @@ fn enqueue_share_market_system_event_tx(
 
 #[allow(clippy::too_many_arguments)]
 fn event_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     listing_id: Option<&str>,
     seat_id: Option<&str>,
     subscription_id: Option<&str>,
@@ -975,6 +1063,242 @@ pub(crate) fn enqueue_subscription_lifecycle_event_tx(
     Ok(stored_event_id)
 }
 
+pub(crate) fn cancel_open_price_changes_tx(
+    conn: &Connection,
+    subscription_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    let proposal_ids = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM share_market_price_changes
+                 WHERE subscription_id = ?1 AND status IN ('pending', 'accepted')
+                 ORDER BY created_at",
+            )
+            .map_err(map_db("prepare open Share price changes for cancellation"))?;
+        statement
+            .query_map(params![subscription_id], |row| row.get::<_, String>(0))
+            .map_err(map_db("query open Share price changes for cancellation"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read open Share price changes for cancellation"))?
+    };
+    for proposal_id in proposal_ids {
+        let changed = conn
+            .execute(
+                "UPDATE share_market_price_changes
+                 SET status = 'cancelled', resolution_reason = ?2,
+                     responded_at = COALESCE(responded_at, ?3), updated_at = ?3
+                 WHERE id = ?1 AND status IN ('pending', 'accepted')",
+                params![proposal_id, reason, now],
+            )
+            .map_err(map_db("cancel open Share price change"))?;
+        if changed == 1 {
+            event_tx(
+                conn,
+                None,
+                None,
+                Some(subscription_id),
+                None,
+                "price_change_cancelled",
+                serde_json::json!({
+                    "proposalId": proposal_id,
+                    "reason": reason,
+                }),
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_accepted_price_changes_tx(
+    tx: &Transaction<'_>,
+    now: &str,
+) -> Result<(), AppError> {
+    let proposals = {
+        let mut statement = tx
+            .prepare(
+                "SELECT change.id, change.subscription_id, sub.seat_id, sub.listing_id,
+                        sub.status, sub.daily_rate_minor, sub.currency, sub.offer_revision,
+                        change.previous_daily_rate_minor,
+                        change.proposed_daily_rate_minor, change.currency,
+                        change.base_offer_revision, contract.id, contract.account_id,
+                        contract.status, contract.daily_rate_minor, contract.offer_revision
+                 FROM share_market_price_changes change
+                 JOIN share_market_subscriptions sub ON sub.id = change.subscription_id
+                 LEFT JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 WHERE change.status = 'accepted'
+                 ORDER BY change.created_at, change.id",
+            )
+            .map_err(map_db("prepare accepted Share price changes"))?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                ))
+            })
+            .map_err(map_db("query accepted Share price changes"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read accepted Share price changes"))?
+    };
+
+    for (
+        proposal_id,
+        subscription_id,
+        seat_id,
+        listing_id,
+        subscription_status,
+        subscription_rate,
+        subscription_currency,
+        subscription_revision,
+        previous_rate,
+        proposed_rate,
+        proposal_currency,
+        base_revision,
+        contract_id,
+        account_id,
+        contract_status,
+        contract_rate,
+        contract_revision,
+    ) in proposals
+    {
+        if matches!(
+            subscription_status.as_str(),
+            SUB_RELEASED | SUB_GRANT_FAILED | SUB_REVOKE_PENDING | SUB_REVOKE_FAILED
+        ) || contract_status.as_deref() == Some("terminated")
+            || contract_id.is_none()
+        {
+            cancel_open_price_changes_tx(tx, &subscription_id, "subscription_inactive", now)?;
+            continue;
+        }
+        if subscription_rate != Some(previous_rate)
+            || subscription_revision != base_revision
+            || subscription_currency.as_deref() != Some(proposal_currency.as_str())
+            || proposal_currency != crate::market_billing::MARKET_CURRENCY
+            || contract_rate != Some(previous_rate)
+            || contract_revision != Some(base_revision)
+        {
+            return Err(AppError::Internal(format!(
+                "accepted Share price change {proposal_id} no longer matches its contract"
+            )));
+        }
+        let applied_revision = base_revision.checked_add(1).ok_or_else(|| {
+            AppError::Internal("Share price change offer revision overflowed".into())
+        })?;
+        let subscription_changed = tx
+            .execute(
+                "UPDATE share_market_subscriptions
+                 SET daily_rate_minor = ?2, offer_revision = ?3, updated_at = ?4
+                 WHERE id = ?1 AND daily_rate_minor = ?5 AND offer_revision = ?6",
+                params![
+                    subscription_id,
+                    proposed_rate,
+                    applied_revision,
+                    now,
+                    previous_rate,
+                    base_revision,
+                ],
+            )
+            .map_err(map_db("apply Share subscription price change"))?;
+        let seat_changed = tx
+            .execute(
+                "UPDATE share_market_seats
+                 SET daily_rate_minor = ?2, offer_revision = ?3, updated_at = ?4
+                 WHERE id = ?1 AND current_subscription_id = ?5
+                   AND daily_rate_minor = ?6 AND offer_revision = ?7",
+                params![
+                    seat_id,
+                    proposed_rate,
+                    applied_revision,
+                    now,
+                    subscription_id,
+                    previous_rate,
+                    base_revision,
+                ],
+            )
+            .map_err(map_db("apply occupied Share seat price change"))?;
+        let contract_id = contract_id.expect("checked active Share price change contract");
+        let contract_changed = tx
+            .execute(
+                "UPDATE market_service_contracts
+                 SET daily_rate_minor = ?2, offer_revision = ?3, updated_at = ?4
+                 WHERE id = ?1 AND status != 'terminated'
+                   AND daily_rate_minor = ?5 AND offer_revision = ?6",
+                params![
+                    contract_id,
+                    proposed_rate,
+                    applied_revision,
+                    now,
+                    previous_rate,
+                    base_revision,
+                ],
+            )
+            .map_err(map_db("apply Share billing contract price change"))?;
+        if subscription_changed != 1 || seat_changed != 1 || contract_changed != 1 {
+            return Err(AppError::Internal(format!(
+                "accepted Share price change {proposal_id} lost its atomic update race"
+            )));
+        }
+        tx.execute(
+            "UPDATE share_market_price_changes
+             SET status = 'applied', applied_offer_revision = ?2,
+                 applied_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND status = 'accepted'",
+            params![proposal_id, applied_revision, now],
+        )
+        .map_err(map_db("complete Share price change"))?;
+        let detail = serde_json::json!({
+            "proposalId": proposal_id,
+            "previousDailyRateMinor": previous_rate,
+            "dailyRateMinor": proposed_rate,
+            "currency": proposal_currency,
+            "previousOfferRevision": base_revision,
+            "offerRevision": applied_revision,
+            "effectiveAt": now,
+        });
+        event_tx(
+            tx,
+            Some(&listing_id),
+            Some(&seat_id),
+            Some(&subscription_id),
+            None,
+            "price_change_applied",
+            detail.clone(),
+            now,
+        )?;
+        crate::market_billing::record_event_tx(
+            tx,
+            account_id.as_deref(),
+            Some(&contract_id),
+            None,
+            None,
+            "service_contract_price_changed",
+            detail,
+            &format!("contract-price-changed:{proposal_id}"),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct SubscriptionRecord {
     id: String,
@@ -994,6 +1318,7 @@ struct SubscriptionRecord {
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
     free_duration_days: Option<u32>,
+    free_usage_seconds: Option<i64>,
     offer_revision: i64,
     release_reason: Option<String>,
     activated_at: Option<String>,
@@ -1014,7 +1339,7 @@ fn subscription_record(
                 sub.entitlement_id, sub.owner_user_id, sub.owner_email,
                 sub.renter_user_id, sub.renter_email, sub.status,
                 sub.daily_rate_minor, sub.currency, sub.free_duration_days,
-                sub.offer_revision, sub.release_reason, sub.activated_at, sub.expires_at,
+                sub.free_usage_seconds, sub.offer_revision, sub.release_reason, sub.activated_at, sub.expires_at,
                 sub.released_at,
                 sub.created_at, sub.updated_at
          FROM share_market_subscriptions sub
@@ -1042,13 +1367,14 @@ fn subscription_record(
                 free_duration_days: row
                     .get::<_, Option<i64>>(16)?
                     .and_then(|value| u32::try_from(value).ok()),
-                offer_revision: row.get(17)?,
-                release_reason: row.get(18)?,
-                activated_at: row.get(19)?,
-                expires_at: row.get(20)?,
-                released_at: row.get(21)?,
-                created_at: row.get(22)?,
-                updated_at: row.get(23)?,
+                free_usage_seconds: row.get(17)?,
+                offer_revision: row.get(18)?,
+                release_reason: row.get(19)?,
+                activated_at: row.get(20)?,
+                expires_at: row.get(21)?,
+                released_at: row.get(22)?,
+                created_at: row.get(23)?,
+                updated_at: row.get(24)?,
             })
         },
     )
@@ -1056,26 +1382,189 @@ fn subscription_record(
     .map_err(map_db("read Share Market subscription"))
 }
 
-fn payment_profile(
+fn catalog_subscription_records(
     conn: &Connection,
-    owner_user_id: &str,
-) -> Result<Option<(Vec<PaymentMethod>, Vec<PaymentContact>, String)>, AppError> {
-    let row: Option<(String, String, String)> = conn
-        .query_row(
-            "SELECT methods_json, COALESCE(contacts_json, '[]'), updated_at
-             FROM account_payment_profiles WHERE user_id = ?1",
-            params![owner_user_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    viewer_user_id: &str,
+) -> Result<HashMap<String, SubscriptionRecord>, AppError> {
+    conn.prepare(
+        "WITH visible_listings AS (
+            SELECT listing.id
+            FROM share_market_listings listing
+            LEFT JOIN shares share ON share.share_id = listing.share_id
+            WHERE listing.deleted_at IS NULL
+              AND ((listing.status = 'active'
+                    AND lower(COALESCE(share.owner_email, '')) = lower(listing.owner_email))
+                   OR listing.owner_user_id = ?1
+                   OR EXISTS (
+                       SELECT 1 FROM share_market_subscriptions viewer_sub
+                       WHERE viewer_sub.listing_id = listing.id
+                         AND viewer_sub.renter_user_id = ?1
+                   ))
+         ), referenced_subscriptions AS (
+            SELECT seat.current_subscription_id AS id
+            FROM share_market_seats seat
+            WHERE seat.listing_id IN (SELECT id FROM visible_listings)
+              AND seat.current_subscription_id IS NOT NULL
+            UNION
+            SELECT seat.retired_subscription_id AS id
+            FROM share_market_seats seat
+            WHERE seat.listing_id IN (SELECT id FROM visible_listings)
+              AND seat.retired_subscription_id IS NOT NULL
+         )
+         SELECT sub.id, sub.seat_id, sub.listing_id, sub.share_id, sub.installation_id,
+                COALESCE(share.share_name, sub.share_id), COALESCE(share.app_type, ''),
+                COALESCE(share.subdomain, ''), sub.entitlement_id,
+                sub.owner_user_id, sub.owner_email, sub.renter_user_id,
+                sub.renter_email, sub.status, sub.daily_rate_minor, sub.currency,
+                sub.free_duration_days, sub.free_usage_seconds, sub.offer_revision,
+                sub.release_reason, sub.activated_at, sub.expires_at, sub.released_at,
+                sub.created_at, sub.updated_at
+         FROM share_market_subscriptions sub
+         LEFT JOIN shares share ON share.share_id = sub.share_id
+         WHERE sub.id IN (SELECT id FROM referenced_subscriptions)
+            OR (?1 != '' AND sub.renter_user_id = ?1)",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![viewer_user_id], |row| {
+                let record = SubscriptionRecord {
+                    id: row.get(0)?,
+                    seat_id: row.get(1)?,
+                    listing_id: row.get(2)?,
+                    share_id: row.get(3)?,
+                    installation_id: row.get(4)?,
+                    share_name: row.get(5)?,
+                    app_type: row.get(6)?,
+                    subdomain: row.get(7)?,
+                    entitlement_id: row.get(8)?,
+                    owner_user_id: row.get(9)?,
+                    owner_email: row.get(10)?,
+                    renter_user_id: row.get(11)?,
+                    renter_email: row.get(12)?,
+                    status: row.get(13)?,
+                    daily_rate_minor: row.get(14)?,
+                    currency: row.get(15)?,
+                    free_duration_days: row
+                        .get::<_, Option<i64>>(16)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                    free_usage_seconds: row.get(17)?,
+                    offer_revision: row.get(18)?,
+                    release_reason: row.get(19)?,
+                    activated_at: row.get(20)?,
+                    expires_at: row.get(21)?,
+                    released_at: row.get(22)?,
+                    created_at: row.get(23)?,
+                    updated_at: row.get(24)?,
+                };
+                Ok((record.id.clone(), record))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()
+    })
+    .map_err(map_db("read Share Market catalog subscriptions"))
+}
+
+#[derive(Debug)]
+struct CatalogSeatRecord {
+    id: String,
+    position: i64,
+    status: String,
+    parallel_limit: Option<i64>,
+    token_limit: Option<i64>,
+    token_period_json: String,
+    daily_rate_minor: Option<i64>,
+    currency: Option<String>,
+    free_duration_days: Option<i64>,
+    offer_revision: i64,
+    current_subscription_id: Option<String>,
+    retired_subscription_id: Option<String>,
+    retired_at: Option<String>,
+}
+
+fn catalog_seats(
+    conn: &Connection,
+    viewer_user_id: &str,
+) -> Result<HashMap<String, Vec<CatalogSeatRecord>>, AppError> {
+    let rows = conn
+        .prepare(
+            "SELECT seat.listing_id, seat.id, seat.position, seat.status,
+                    seat.parallel_limit, seat.token_limit, seat.token_period_json,
+                    seat.daily_rate_minor, seat.currency, seat.free_duration_days,
+                    seat.offer_revision, seat.current_subscription_id,
+                    seat.retired_subscription_id, seat.retired_at
+             FROM share_market_seats seat
+             JOIN share_market_listings listing ON listing.id = seat.listing_id
+             LEFT JOIN shares share ON share.share_id = listing.share_id
+             WHERE seat.status != 'deleted' AND listing.deleted_at IS NULL
+               AND ((listing.status = 'active'
+                     AND lower(COALESCE(share.owner_email, '')) = lower(listing.owner_email))
+                    OR listing.owner_user_id = ?1
+                    OR EXISTS (
+                        SELECT 1 FROM share_market_subscriptions viewer_sub
+                        WHERE viewer_sub.listing_id = listing.id
+                          AND viewer_sub.renter_user_id = ?1
+                    ))
+             ORDER BY seat.listing_id,
+                      CASE WHEN seat.retired_at IS NULL THEN 0 ELSE 1 END,
+                      seat.position",
         )
-        .optional()
-        .map_err(map_db("read Share Market payment profile"))?;
-    Ok(row.map(|(methods, contacts, updated_at)| {
-        (
-            serde_json::from_str::<Vec<PaymentMethod>>(&methods).unwrap_or_default(),
-            serde_json::from_str::<Vec<PaymentContact>>(&contacts).unwrap_or_default(),
-            updated_at,
-        )
-    }))
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![viewer_user_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CatalogSeatRecord {
+                            id: row.get(1)?,
+                            position: row.get(2)?,
+                            status: row.get(3)?,
+                            parallel_limit: row.get(4)?,
+                            token_limit: row.get(5)?,
+                            token_period_json: row.get(6)?,
+                            daily_rate_minor: row.get(7)?,
+                            currency: row.get(8)?,
+                            free_duration_days: row.get(9)?,
+                            offer_revision: row.get(10)?,
+                            current_subscription_id: row.get(11)?,
+                            retired_subscription_id: row.get(12)?,
+                            retired_at: row.get(13)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read Share Market catalog seats"))?;
+    let mut by_listing = HashMap::<String, Vec<CatalogSeatRecord>>::new();
+    for (listing_id, seat) in rows {
+        by_listing.entry(listing_id).or_default().push(seat);
+    }
+    Ok(by_listing)
+}
+
+type PaymentProfileSnapshot = (Vec<PaymentMethod>, Vec<PaymentContact>, String);
+
+fn payment_profiles(
+    conn: &Connection,
+) -> Result<HashMap<String, PaymentProfileSnapshot>, AppError> {
+    conn.prepare(
+        "SELECT user_id, methods_json, COALESCE(contacts_json, '[]'), updated_at
+         FROM account_payment_profiles",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map([], |row| {
+                let methods = row.get::<_, String>(1)?;
+                let contacts = row.get::<_, String>(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        serde_json::from_str::<Vec<PaymentMethod>>(&methods).unwrap_or_default(),
+                        serde_json::from_str::<Vec<PaymentContact>>(&contacts).unwrap_or_default(),
+                        row.get::<_, String>(3)?,
+                    ),
+                ))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()
+    })
+    .map_err(map_db("read Share Market payment profiles"))
 }
 
 fn payment_method_kinds(methods: &[PaymentMethod]) -> Vec<String> {
@@ -1088,17 +1577,88 @@ fn payment_method_kinds(methods: &[PaymentMethod]) -> Vec<String> {
     kinds
 }
 
-fn subscription_view(
+#[derive(Debug, Clone)]
+struct ActivePriceChangeRecord {
+    id: String,
+    previous_daily_rate_minor: i64,
+    proposed_daily_rate_minor: i64,
+    currency: String,
+    base_offer_revision: i64,
+    status: String,
+    created_at: String,
+    updated_at: String,
+    responded_at: Option<String>,
+}
+
+fn active_price_changes(
     conn: &Connection,
+) -> Result<HashMap<String, ActivePriceChangeRecord>, AppError> {
+    conn.prepare(
+        "SELECT subscription_id, id, previous_daily_rate_minor,
+                proposed_daily_rate_minor, currency, base_offer_revision,
+                status, created_at, updated_at, responded_at
+         FROM share_market_price_changes
+         WHERE status IN ('pending', 'accepted')",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ActivePriceChangeRecord {
+                        id: row.get(1)?,
+                        previous_daily_rate_minor: row.get(2)?,
+                        proposed_daily_rate_minor: row.get(3)?,
+                        currency: row.get(4)?,
+                        base_offer_revision: row.get(5)?,
+                        status: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        responded_at: row.get(9)?,
+                    },
+                ))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()
+    })
+    .map_err(map_db("read active Share price changes"))
+}
+
+fn active_price_change_view(
+    record: Option<&ActivePriceChangeRecord>,
+    is_owner: bool,
+    is_renter: bool,
+) -> Option<PriceChangeView> {
+    if !is_owner && !is_renter {
+        return None;
+    }
+    record.map(|record| PriceChangeView {
+        id: record.id.clone(),
+        previous_daily_rate_minor: record.previous_daily_rate_minor,
+        proposed_daily_rate_minor: record.proposed_daily_rate_minor,
+        currency: record.currency.clone(),
+        base_offer_revision: record.base_offer_revision,
+        can_accept: is_renter && record.status == PRICE_CHANGE_PENDING,
+        can_reject: is_renter && record.status == PRICE_CHANGE_PENDING,
+        can_cancel: is_owner && record.status == PRICE_CHANGE_PENDING,
+        status: record.status.clone(),
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        responded_at: record.responded_at.clone(),
+    })
+}
+
+fn subscription_view(
     record: SubscriptionRecord,
     viewer: Option<&AuthSession>,
-    active_subdomains: &[String],
-) -> Result<SubscriptionView, AppError> {
+    active_subdomains: &HashSet<String>,
+    payment_profile: Option<&PaymentProfileSnapshot>,
+    price_change: Option<&ActivePriceChangeRecord>,
+) -> SubscriptionView {
     let is_renter = viewer.is_some_and(|session| session.user_id == record.renter_user_id);
     let is_owner = viewer.is_some_and(|session| session.user_id == record.owner_user_id);
     let (payment_method_kinds, contacts) = if is_renter || is_owner {
-        payment_profile(conn, &record.owner_user_id)?
-            .map(|(methods, contacts, _)| (payment_method_kinds(&methods), contacts))
+        payment_profile
+            .map(|(methods, contacts, _)| (payment_method_kinds(methods), contacts.clone()))
             .unwrap_or_default()
     } else {
         (Vec::new(), Vec::new())
@@ -1111,9 +1671,14 @@ fn subscription_view(
     // Allow retry while revoke is stuck (e.g. earlier grant edit blocked dispatch).
     let can_force_revoke =
         is_owner && !matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED);
+    let price_change = active_price_change_view(price_change, is_owner, is_renter);
+    let can_propose_price_change = is_owner
+        && record.status == SUB_ACTIVE_POSTPAID
+        && record.daily_rate_minor.is_some()
+        && price_change.is_none();
     let share_online =
         !record.subdomain.is_empty() && active_subdomains.contains(&record.subdomain);
-    Ok(SubscriptionView {
+    SubscriptionView {
         id: record.id,
         seat_id: record.seat_id,
         listing_id: record.listing_id,
@@ -1136,11 +1701,13 @@ fn subscription_view(
         contacts,
         can_release,
         can_force_revoke,
+        can_propose_price_change,
+        price_change,
         release_reason: record.release_reason,
         released_at: record.released_at,
         created_at: record.created_at,
         updated_at: record.updated_at,
-    })
+    }
 }
 
 impl AppStore {
@@ -1246,6 +1813,27 @@ impl AppStore {
             .map_err(map_db("read Share Market catalog"))?;
         drop(listings_statement);
 
+        let active_subdomains = active_subdomains.iter().cloned().collect::<HashSet<_>>();
+        let mut seats_by_listing = catalog_seats(&conn, viewer_user_id)?;
+        let subscription_records = catalog_subscription_records(&conn, viewer_user_id)?;
+        let payment_profiles = payment_profiles(&conn)?;
+        let price_changes = active_price_changes(&conn)?;
+        let viewer_active_share_ids = viewer
+            .map(|session| {
+                subscription_records
+                    .values()
+                    .filter(|record| {
+                        record.renter_user_id == session.user_id
+                            && !matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED)
+                    })
+                    .map(|record| record.share_id.clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut eligibility_by_supplier_pricing = HashMap::<
+            (String, String, Option<String>),
+            crate::market_access::MarketEligibilityView,
+        >::new();
         let mut listings = Vec::with_capacity(listing_rows.len());
         for (
             id,
@@ -1271,21 +1859,7 @@ impl AppStore {
         {
             let is_owner = viewer.is_some_and(|value| value.user_id == owner_user_id);
             let share_online = !subdomain.is_empty() && active_subdomains.contains(&subdomain);
-            let viewer_already_renting = if let Some(session) = viewer {
-                conn.query_row(
-                    "SELECT 1 FROM share_market_subscriptions
-                     WHERE renter_user_id = ?1 AND share_id = ?2
-                       AND status NOT IN ('released', 'grant_failed')
-                     LIMIT 1",
-                    params![session.user_id, share_id],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(map_db("check Share Market catalog rental"))?
-                .is_some()
-            } else {
-                false
-            };
+            let viewer_already_renting = viewer_active_share_ids.contains(&share_id);
             let viewer_has_direct_grant = viewer.is_some_and(|session| {
                 let grants: BTreeMap<String, ShareUserGrant> =
                     serde_json::from_str(&grants_json).unwrap_or_default();
@@ -1293,84 +1867,67 @@ impl AppStore {
                     .get(&session.email.to_ascii_lowercase())
                     .is_some_and(|grant| grant.active)
             });
-            let mut seat_statement = conn
-                .prepare(
-                    "SELECT id, position, status, parallel_limit, token_limit,
-                            token_period_json, daily_rate_minor, currency, free_duration_days,
-                            offer_revision, current_subscription_id,
-                            retired_subscription_id, retired_at
-                     FROM share_market_seats
-                     WHERE listing_id = ?1 AND status != 'deleted'
-                     ORDER BY CASE WHEN retired_at IS NULL THEN 0 ELSE 1 END, position",
-                )
-                .map_err(map_db("prepare Share Market seats"))?;
-            let seat_rows = seat_statement
-                .query_map(params![id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, Option<i64>>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
-                        row.get::<_, Option<String>>(12)?,
-                    ))
-                })
-                .map_err(map_db("query Share Market seats"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(map_db("read Share Market seats"))?;
-            drop(seat_statement);
+            let seat_rows = seats_by_listing.remove(&id).unwrap_or_default();
             let mut seats = Vec::with_capacity(seat_rows.len());
-            for (
-                seat_id,
-                position,
-                seat_status,
-                parallel_limit,
-                token_limit,
-                token_period_json,
-                daily_rate_minor,
-                currency,
-                free_duration_days,
-                offer_revision,
-                current_subscription_id,
-                retired_subscription_id,
-                retired_at,
-            ) in seat_rows
-            {
+            for seat in seat_rows {
+                let pricing_kind =
+                    crate::market_access::pricing_kind_for_rate(seat.daily_rate_minor);
+                let eligibility_key = (
+                    owner_user_id.clone(),
+                    pricing_kind.to_string(),
+                    seat.currency.clone(),
+                );
                 let eligibility = match viewer {
                     Some(session) if session.user_id == owner_user_id => {
                         crate::market_access::MarketEligibilityView::allowed()
                     }
-                    Some(session) => crate::market_access::market_eligibility_tx(
-                        &conn,
-                        &owner_user_id,
-                        &session.user_id,
-                        &session.email,
-                        crate::market_access::PRODUCT_SHARE,
-                        daily_rate_minor,
-                        currency.as_deref(),
-                    )?,
+                    Some(session) => {
+                        if let Some(eligibility) =
+                            eligibility_by_supplier_pricing.get(&eligibility_key)
+                        {
+                            eligibility.clone()
+                        } else {
+                            let eligibility = crate::market_access::market_eligibility_tx(
+                                &conn,
+                                &owner_user_id,
+                                &session.user_id,
+                                &session.email,
+                                crate::market_access::PRODUCT_SHARE,
+                                seat.daily_rate_minor,
+                                seat.currency.as_deref(),
+                            )?;
+                            eligibility_by_supplier_pricing
+                                .insert(eligibility_key, eligibility.clone());
+                            eligibility
+                        }
+                    }
                     None => crate::market_access::MarketEligibilityView::login_required(),
                 };
-                let subscription = match current_subscription_id.or(retired_subscription_id) {
-                    Some(subscription_id) => subscription_record(&conn, &subscription_id)?
-                        .map(|record| subscription_view(&conn, record, viewer, active_subdomains))
-                        .transpose()?,
-                    None => None,
-                };
+                let subscription_id = seat
+                    .current_subscription_id
+                    .as_ref()
+                    .or(seat.retired_subscription_id.as_ref());
+                let subscription = subscription_id
+                    .and_then(|subscription_id| subscription_records.get(subscription_id))
+                    .cloned()
+                    .map(|record| {
+                        let payment_profile = payment_profiles.get(&record.owner_user_id);
+                        let price_change = price_changes.get(&record.id);
+                        subscription_view(
+                            record,
+                            viewer,
+                            &active_subdomains,
+                            payment_profile,
+                            price_change,
+                        )
+                    });
                 let base_rent_prerequisites = viewer.is_some_and(|session| {
                     status == "active"
                         && share_status == "active"
                         && share_online
                         && current_owner_email.eq_ignore_ascii_case(&owner_email)
-                        && seat_status == SEAT_AVAILABLE
-                        && retired_at.is_none()
+                        && seat.status == SEAT_AVAILABLE
+                        && seat.retired_at.is_none()
                         && session.user_id != owner_user_id
                         && !viewer_already_renting
                         && !viewer_has_direct_grant
@@ -1378,36 +1935,40 @@ impl AppStore {
                 let seller_approval_required =
                     base_rent_prerequisites && eligibility.status == "access_required";
                 let can_rent = base_rent_prerequisites && eligibility.allowed;
-                let read_only = retired_at.is_some();
+                let read_only = seat.retired_at.is_some();
                 seats.push(SeatView {
-                    id: seat_id,
-                    position,
+                    id: seat.id,
+                    position: seat.position,
                     status: if read_only {
                         SEAT_RETIRED_VIEW.to_string()
                     } else {
-                        seat_status
+                        seat.status
                     },
-                    parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
-                    token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
-                    token_period: serde_json::from_str(&token_period_json)
-                        .unwrap_or(ShareTokenPeriod::Lifetime),
-                    daily_rate_minor,
-                    currency,
-                    free_duration_days: free_duration_days
+                    parallel_limit: seat
+                        .parallel_limit
                         .and_then(|value| u32::try_from(value).ok()),
-                    offer_revision,
-                    is_free: daily_rate_minor.is_none(),
+                    token_limit: seat.token_limit.and_then(|value| u64::try_from(value).ok()),
+                    token_period: serde_json::from_str(&seat.token_period_json)
+                        .unwrap_or(ShareTokenPeriod::Lifetime),
+                    daily_rate_minor: seat.daily_rate_minor,
+                    currency: seat.currency,
+                    free_duration_days: seat
+                        .free_duration_days
+                        .and_then(|value| u32::try_from(value).ok()),
+                    offer_revision: seat.offer_revision,
+                    is_free: seat.daily_rate_minor.is_none(),
                     can_rent,
                     rent_prerequisites_met: base_rent_prerequisites,
                     seller_approval_required,
                     eligibility,
                     read_only,
-                    retired_at,
+                    retired_at: seat.retired_at,
                     subscription,
                 });
             }
-            let (payment_method_kinds, contacts) = payment_profile(&conn, &owner_user_id)?
-                .map(|(methods, contacts, _)| (payment_method_kinds(&methods), contacts))
+            let (payment_method_kinds, contacts) = payment_profiles
+                .get(&owner_user_id)
+                .map(|(methods, contacts, _)| (payment_method_kinds(methods), contacts.clone()))
                 .unwrap_or_default();
             listings.push(ListingView {
                 id,
@@ -1437,32 +1998,35 @@ impl AppStore {
             });
         }
 
-        let mut my_subscriptions = Vec::new();
-        if let Some(viewer) = viewer {
-            let mut statement = conn
-                .prepare(
-                    "SELECT id FROM share_market_subscriptions
-                     WHERE renter_user_id = ?1
-                     ORDER BY created_at DESC",
+        let mut my_subscription_records = viewer
+            .map(|viewer| {
+                subscription_records
+                    .values()
+                    .filter(|record| record.renter_user_id == viewer.user_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        my_subscription_records.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let my_subscriptions = my_subscription_records
+            .into_iter()
+            .map(|record| {
+                let payment_profile = payment_profiles.get(&record.owner_user_id);
+                let price_change = price_changes.get(&record.id);
+                subscription_view(
+                    record,
+                    viewer,
+                    &active_subdomains,
+                    payment_profile,
+                    price_change,
                 )
-                .map_err(map_db("prepare renter subscriptions"))?;
-            let ids = statement
-                .query_map(params![viewer.user_id], |row| row.get::<_, String>(0))
-                .map_err(map_db("query renter subscriptions"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(map_db("read renter subscriptions"))?;
-            drop(statement);
-            for id in ids {
-                if let Some(record) = subscription_record(&conn, &id)? {
-                    my_subscriptions.push(subscription_view(
-                        &conn,
-                        record,
-                        Some(viewer),
-                        active_subdomains,
-                    )?);
-                }
-            }
-        }
+            })
+            .collect();
         Ok(ShareMarketCatalog {
             listings,
             my_subscriptions,
@@ -1614,17 +2178,27 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share Market listing"))?;
-        let share: Option<(String, String, String, String)> = tx
+        let share: Option<(String, String, String, String, String)> = tx
             .query_row(
                 "SELECT owner_email, share_status,
-                        COALESCE(supported_user_token_periods_json, '[]'), installation_id
+                        COALESCE(supported_user_token_periods_json, '[]'), installation_id,
+                        for_sale
                  FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_db("read listing Share"))?;
-        let Some((owner_email, share_status, periods_json, installation_id)) = share else {
+        let Some((owner_email, share_status, periods_json, installation_id, for_sale)) = share
+        else {
             return Err(AppError::NotFound("Share not found".into()));
         };
         if !owner_email.eq_ignore_ascii_case(&session.email) {
@@ -1635,6 +2209,11 @@ impl AppStore {
         if share_status != "active" {
             return Err(AppError::Conflict(
                 "Share must be active before it can be listed".into(),
+            ));
+        }
+        if for_sale == "Yes" {
+            return Err(AppError::Conflict(
+                "disable federated Share sale before listing it in Share Market".into(),
             ));
         }
         let supported: Vec<ShareTokenPeriod> = serde_json::from_str(&periods_json)
@@ -1744,12 +2323,21 @@ impl AppStore {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(map_db("begin add Share seat"))?;
-        let owner: Option<(String, String, String, String, String, String, String)> = tx
+        let owner: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = tx
             .query_row(
                 "SELECT listing.owner_user_id, listing.owner_email, s.owner_email,
                         s.share_status,
                         COALESCE(s.supported_user_token_periods_json, '[]'), listing.share_id,
-                        listing.status
+                        listing.status, s.for_sale
                  FROM share_market_listings listing
                  JOIN shares s ON s.share_id = listing.share_id
                  WHERE listing.id = ?1",
@@ -1763,6 +2351,7 @@ impl AppStore {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -1776,6 +2365,7 @@ impl AppStore {
             periods_json,
             share_id,
             listing_status,
+            for_sale,
         )) = owner
         else {
             return Err(AppError::NotFound("listing not found".into()));
@@ -1789,6 +2379,11 @@ impl AppStore {
         {
             return Err(AppError::Conflict(
                 "listing Share is no longer active or owned by this account".into(),
+            ));
+        }
+        if for_sale == "Yes" {
+            return Err(AppError::Conflict(
+                "disable federated Share sale before adding or reopening Share Market seats".into(),
             ));
         }
         let count: i64 = tx
@@ -1979,6 +2574,337 @@ impl AppStore {
         )?;
         tx.commit().map_err(map_db("commit update Share seat"))?;
         Ok(())
+    }
+
+    pub async fn share_market_propose_price_change(
+        &self,
+        session: &AuthSession,
+        subscription_id: &str,
+        input: ProposePriceChangeRequest,
+    ) -> Result<String, AppError> {
+        if input.daily_rate_minor <= 0
+            || input.daily_rate_minor > crate::market_billing::MAX_DAILY_RATE_MINOR
+        {
+            return Err(AppError::BadRequest(
+                "proposed daily price is outside the supported range".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Share price change proposal"))?;
+        let row = tx
+            .query_row(
+                "SELECT sub.seat_id, sub.listing_id, sub.owner_user_id, sub.renter_user_id,
+                        sub.status, sub.daily_rate_minor, sub.currency, sub.offer_revision,
+                        contract.id, contract.status, contract.daily_rate_minor,
+                        contract.offer_revision
+                 FROM share_market_subscriptions sub
+                 LEFT JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share'
+                  AND contract.product_ref = sub.id
+                  AND contract.status != 'terminated'
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Share subscription for price change"))?;
+        let Some((
+            seat_id,
+            listing_id,
+            owner_user_id,
+            _renter_user_id,
+            subscription_status,
+            current_rate,
+            currency,
+            offer_revision,
+            contract_id,
+            contract_status,
+            contract_rate,
+            contract_revision,
+        )) = row
+        else {
+            return Err(AppError::NotFound("Share subscription not found".into()));
+        };
+        if owner_user_id != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the Share owner can propose a price change".into(),
+            ));
+        }
+        if subscription_status != SUB_ACTIVE_POSTPAID {
+            return Err(AppError::Conflict(
+                "only active paid Share subscriptions can be repriced".into(),
+            ));
+        }
+        if offer_revision != input.offer_revision {
+            return Err(AppError::Conflict(
+                "Share subscription price changed; reload and retry".into(),
+            ));
+        }
+        let current_rate = current_rate.ok_or_else(|| {
+            AppError::Conflict("free Share subscriptions cannot be repriced".into())
+        })?;
+        let currency = currency
+            .filter(|value| value == crate::market_billing::MARKET_CURRENCY)
+            .ok_or_else(|| AppError::Internal("paid Share currency is invalid".into()))?;
+        if current_rate == input.daily_rate_minor {
+            return Err(AppError::BadRequest(
+                "proposed daily price must differ from the current price".into(),
+            ));
+        }
+        if contract_id.is_none()
+            || !matches!(contract_status.as_deref(), Some("trial" | "active"))
+            || contract_rate != Some(current_rate)
+            || contract_revision != Some(offer_revision)
+        {
+            return Err(AppError::Conflict(
+                "the active billing contract is not available for repricing".into(),
+            ));
+        }
+        let open_exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM share_market_price_changes
+                 WHERE subscription_id = ?1 AND status IN ('pending', 'accepted'))",
+                params![subscription_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("check open Share price change"))?
+            != 0;
+        if open_exists {
+            return Err(AppError::Conflict(
+                "this Share subscription already has an open price change".into(),
+            ));
+        }
+        let proposal_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO share_market_price_changes (
+                id, subscription_id, previous_daily_rate_minor,
+                proposed_daily_rate_minor, currency, base_offer_revision,
+                applied_offer_revision, status, proposed_by_user_id,
+                responded_by_user_id, resolution_reason, created_at, updated_at,
+                responded_at, applied_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'pending', ?7,
+                       NULL, NULL, ?8, ?8, NULL, NULL)",
+            params![
+                proposal_id,
+                subscription_id,
+                current_rate,
+                input.daily_rate_minor,
+                currency,
+                offer_revision,
+                session.user_id,
+                now,
+            ],
+        )
+        .map_err(map_db("create Share price change"))?;
+        event_tx(
+            &tx,
+            Some(&listing_id),
+            Some(&seat_id),
+            Some(subscription_id),
+            Some(session),
+            "price_change_proposed",
+            serde_json::json!({
+                "proposalId": proposal_id,
+                "previousDailyRateMinor": current_rate,
+                "proposedDailyRateMinor": input.daily_rate_minor,
+                "currency": crate::market_billing::MARKET_CURRENCY,
+                "baseOfferRevision": offer_revision,
+            }),
+            &now,
+        )?;
+        tx.commit()
+            .map_err(map_db("commit Share price change proposal"))?;
+        Ok(proposal_id)
+    }
+
+    async fn share_market_resolve_price_change(
+        &self,
+        session: &AuthSession,
+        proposal_id: &str,
+        action: PriceChangeAction,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Share price change response"))?;
+        let row = tx
+            .query_row(
+                "SELECT change.subscription_id, sub.seat_id, sub.listing_id,
+                        sub.owner_user_id, sub.renter_user_id, sub.status,
+                        sub.daily_rate_minor, sub.offer_revision,
+                        change.previous_daily_rate_minor,
+                        change.proposed_daily_rate_minor, change.currency,
+                        change.base_offer_revision, change.status,
+                        contract.status, contract.daily_rate_minor, contract.offer_revision
+                 FROM share_market_price_changes change
+                 JOIN share_market_subscriptions sub ON sub.id = change.subscription_id
+                 LEFT JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share'
+                  AND contract.product_ref = sub.id
+                  AND contract.status != 'terminated'
+                 WHERE change.id = ?1",
+                params![proposal_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Share price change response"))?;
+        let Some((
+            subscription_id,
+            seat_id,
+            listing_id,
+            owner_user_id,
+            renter_user_id,
+            subscription_status,
+            subscription_rate,
+            subscription_revision,
+            previous_rate,
+            proposed_rate,
+            currency,
+            base_revision,
+            current_status,
+            contract_status,
+            contract_rate,
+            contract_revision,
+        )) = row
+        else {
+            return Err(AppError::NotFound("Share price change not found".into()));
+        };
+        let authorized = match action {
+            PriceChangeAction::Accept | PriceChangeAction::Reject => {
+                renter_user_id == session.user_id
+            }
+            PriceChangeAction::Cancel => owner_user_id == session.user_id,
+        };
+        if !authorized {
+            return Err(AppError::Forbidden(match action {
+                PriceChangeAction::Accept | PriceChangeAction::Reject => {
+                    "only the renter can respond to this Share price change".into()
+                }
+                PriceChangeAction::Cancel => {
+                    "only the Share owner can cancel this price change".into()
+                }
+            }));
+        }
+        if current_status == action.target_status() {
+            tx.commit()
+                .map_err(map_db("commit idempotent Share price change response"))?;
+            return Ok(());
+        }
+        if current_status != PRICE_CHANGE_PENDING {
+            return Err(AppError::Conflict(
+                "this Share price change is no longer pending".into(),
+            ));
+        }
+        if matches!(action, PriceChangeAction::Accept)
+            && (subscription_status != SUB_ACTIVE_POSTPAID
+                || subscription_rate != Some(previous_rate)
+                || subscription_revision != base_revision
+                || !matches!(contract_status.as_deref(), Some("trial" | "active"))
+                || contract_rate != Some(previous_rate)
+                || contract_revision != Some(base_revision))
+        {
+            return Err(AppError::Conflict(
+                "the active Share price changed or its billing contract is unavailable".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE share_market_price_changes
+             SET status = ?2, responded_by_user_id = ?3, resolution_reason = ?4,
+                 responded_at = ?5, updated_at = ?5
+             WHERE id = ?1 AND status = 'pending'",
+            params![
+                proposal_id,
+                action.target_status(),
+                session.user_id,
+                action.resolution_reason(),
+                now,
+            ],
+        )
+        .map_err(map_db("resolve Share price change"))?;
+        event_tx(
+            &tx,
+            Some(&listing_id),
+            Some(&seat_id),
+            Some(&subscription_id),
+            Some(session),
+            action.event_type(),
+            serde_json::json!({
+                "proposalId": proposal_id,
+                "previousDailyRateMinor": previous_rate,
+                "proposedDailyRateMinor": proposed_rate,
+                "currency": currency,
+                "baseOfferRevision": base_revision,
+            }),
+            &now,
+        )?;
+        tx.commit()
+            .map_err(map_db("commit Share price change response"))?;
+        Ok(())
+    }
+
+    pub async fn share_market_accept_price_change(
+        &self,
+        session: &AuthSession,
+        proposal_id: &str,
+    ) -> Result<(), AppError> {
+        self.share_market_resolve_price_change(session, proposal_id, PriceChangeAction::Accept)
+            .await
+    }
+
+    pub async fn share_market_reject_price_change(
+        &self,
+        session: &AuthSession,
+        proposal_id: &str,
+    ) -> Result<(), AppError> {
+        self.share_market_resolve_price_change(session, proposal_id, PriceChangeAction::Reject)
+            .await
+    }
+
+    pub async fn share_market_cancel_price_change(
+        &self,
+        session: &AuthSession,
+        proposal_id: &str,
+    ) -> Result<(), AppError> {
+        self.share_market_resolve_price_change(session, proposal_id, PriceChangeAction::Cancel)
+            .await
     }
 
     pub async fn share_market_delete_seat(
@@ -2249,7 +3175,7 @@ async fn delete_listing(
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_control_operation_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     share_id: &str,
     subscription_id: &str,
     entitlement_id: &str,
@@ -2258,6 +3184,11 @@ fn enqueue_control_operation_tx(
     policy: Option<&ShareUserPolicy>,
     now: &str,
 ) -> Result<String, AppError> {
+    if action == "revoke" && has_terminal_revoke_operation_tx(tx, subscription_id)? {
+        return Err(AppError::Conflict(
+            "Share revoke is dead-lettered and requires operator intervention".into(),
+        ));
+    }
     if tx
         .query_row(
             "SELECT 1 FROM share_control_operations
@@ -2280,6 +3211,30 @@ fn enqueue_control_operation_tx(
             )
             .map_err(map_db("read pending Share control operation"));
     }
+    if action == "revoke" {
+        let retry_id = tx
+            .query_row(
+                "SELECT id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'revoke' AND status = 'rejected'
+                   AND dead_lettered_at IS NULL AND attempts < ?2
+                 ORDER BY share_sequence DESC LIMIT 1",
+                params![subscription_id, MAX_CONTROL_ATTEMPTS],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("read retryable rejected Share revoke"))?;
+        if let Some(retry_id) = retry_id {
+            tx.execute(
+                "UPDATE share_control_operations
+                 SET status = 'pending', edit_id = NULL, next_attempt_at = ?2,
+                     last_error = NULL, updated_at = ?2
+                 WHERE id = ?1 AND status = 'rejected' AND dead_lettered_at IS NULL",
+                params![retry_id, now],
+            )
+            .map_err(map_db("requeue rejected Share revoke"))?;
+            return Ok(retry_id);
+        }
+    }
     let sequence: i64 = tx
         .query_row(
             "SELECT COALESCE(MAX(share_sequence), 0) + 1
@@ -2299,8 +3254,9 @@ fn enqueue_control_operation_tx(
         "INSERT INTO share_control_operations (
             id, share_id, share_sequence, entitlement_id, subscription_id,
             action, email, policy_json, status, edit_id, attempts, last_error,
-            created_at, updated_at, applied_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', NULL, 0, NULL, ?9, ?9, NULL)",
+            created_at, updated_at, applied_at, next_attempt_at, dead_lettered_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', NULL, 0, NULL,
+                   ?9, ?9, NULL, ?9, NULL)",
         params![
             id,
             share_id,
@@ -2315,6 +3271,23 @@ fn enqueue_control_operation_tx(
     )
     .map_err(map_db("enqueue Share control operation"))?;
     Ok(id)
+}
+
+fn has_terminal_revoke_operation_tx(
+    conn: &Connection,
+    subscription_id: &str,
+) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM share_control_operations
+             WHERE subscription_id = ?1 AND action = 'revoke' AND status = 'rejected'
+               AND (dead_lettered_at IS NOT NULL OR attempts >= ?2)
+         )",
+        params![subscription_id, MAX_CONTROL_ATTEMPTS],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(map_db("check terminal Share revoke"))
 }
 
 impl AppStore {
@@ -2470,6 +3443,32 @@ impl AppStore {
                 currency,
             )?;
         }
+        let free_usage_seconds = if daily_rate_minor.is_none() {
+            match free_duration_days {
+                Some(days) => {
+                    let days = u32::try_from(days)
+                        .map_err(|_| AppError::Internal("free Share duration is invalid".into()))?;
+                    let seconds = crate::market_billing::claim_free_usage_tx(
+                        &tx,
+                        &session.user_id,
+                        &owner_user_id,
+                        crate::market_access::PRODUCT_SHARE,
+                        &share_id,
+                        days,
+                        &now,
+                    )?;
+                    if seconds == 0 {
+                        return Err(AppError::Conflict(
+                            "the free experience for this Provider has already been used".into(),
+                        ));
+                    }
+                    Some(seconds)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let token_period: ShareTokenPeriod = serde_json::from_str(&token_period_json)
             .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
         let policy = ShareUserPolicy {
@@ -2487,10 +3486,11 @@ impl AppStore {
                 owner_user_id, owner_email, renter_user_id, renter_email, status,
                 parallel_limit, token_limit, token_period_json, daily_rate_minor, currency,
                 free_duration_days, offer_revision, release_reason,
-                activated_at, expires_at, created_at, updated_at, released_at
+                activated_at, expires_at, created_at, updated_at, released_at,
+                free_usage_seconds
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'grant_pending',
                        ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                       NULL, NULL, NULL, ?18, ?18, NULL)",
+                       NULL, NULL, NULL, ?18, ?18, NULL, ?19)",
             params![
                 subscription_id,
                 seat_id,
@@ -2510,6 +3510,7 @@ impl AppStore {
                 free_duration_days,
                 offer_revision,
                 now,
+                free_usage_seconds,
             ],
         )
         .map_err(|error| {
@@ -2640,7 +3641,7 @@ impl AppStore {
             renter_user_id,
             renter_email,
             _subscription_status,
-            daily_rate_minor,
+            _daily_rate_minor,
         )) = row
         else {
             return Err(AppError::NotFound("active subscription not found".into()));
@@ -2692,18 +3693,23 @@ impl AppStore {
             )?;
         }
         if deny_future_access {
-            crate::market_access::set_product_access_decision_tx(
-                &tx,
-                &owner_user_id,
-                &session.email,
-                &renter_user_id,
-                &renter_email,
-                crate::market_access::PRODUCT_SHARE,
-                crate::market_access::pricing_kind_for_rate(daily_rate_minor),
-                crate::market_access::DECISION_DENY,
-                &session.user_id,
-                &now,
-            )?;
+            for pricing_kind in [
+                crate::market_access::PRICING_FREE,
+                crate::market_access::PRICING_PAID,
+            ] {
+                crate::market_access::set_product_access_decision_tx(
+                    &tx,
+                    &owner_user_id,
+                    &session.email,
+                    &renter_user_id,
+                    &renter_email,
+                    crate::market_access::PRODUCT_SHARE,
+                    pricing_kind,
+                    crate::market_access::DECISION_DENY,
+                    &session.user_id,
+                    &now,
+                )?;
+            }
         }
         event_tx(
             &tx,
@@ -2801,6 +3807,62 @@ async fn force_revoke_subscription(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn propose_price_change(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(subscription_id): Path<String>,
+    Json(input): Json<ProposePriceChangeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let proposal_id = state
+        .store
+        .share_market_propose_price_change(&session, &subscription_id, input)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "proposalId": proposal_id,
+    })))
+}
+
+async fn accept_price_change(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(proposal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    state
+        .store
+        .share_market_accept_price_change(&session, &proposal_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn reject_price_change(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(proposal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    state
+        .store
+        .share_market_reject_price_change(&session, &proposal_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn cancel_price_change(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(proposal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    state
+        .store
+        .share_market_cancel_price_change(&session, &proposal_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 fn active_entitlement(grants_json: Option<&str>, entitlement_id: &str) -> bool {
     grants_json
         .and_then(|value| serde_json::from_str::<BTreeMap<String, ShareUserGrant>>(value).ok())
@@ -2870,7 +3932,7 @@ struct RetireUnconfirmedGrant {
 /// revoke can dispatch. Callers that know the grant never reached the Client can
 /// finish without a revoke when `had_dispatched` is false.
 fn retire_unconfirmed_grant_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     subscription_id: &str,
     reason: &str,
     now: &str,
@@ -2923,10 +3985,7 @@ fn retire_unconfirmed_grant_tx(
     Ok(RetireUnconfirmedGrant { had_dispatched })
 }
 
-fn entitlement_was_activated_tx(
-    tx: &Transaction<'_>,
-    subscription_id: &str,
-) -> Result<bool, AppError> {
+fn entitlement_was_activated_tx(tx: &Connection, subscription_id: &str) -> Result<bool, AppError> {
     let exists: i64 = tx
         .query_row(
             "SELECT EXISTS (
@@ -2989,7 +4048,7 @@ fn recover_orphaned_control_edits_tx(tx: &Transaction<'_>, now: &str) -> Result<
             tx.execute(
                 "UPDATE share_control_operations
                  SET status = 'pending', edit_id = NULL,
-                     attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                     next_attempt_at = ?2,
                      last_error = 'Share control edit was retired before acknowledgement',
                      updated_at = ?2
                  WHERE id = ?1 AND status = 'dispatched'",
@@ -3011,8 +4070,65 @@ fn recover_orphaned_control_edits_tx(tx: &Transaction<'_>, now: &str) -> Result<
     Ok(())
 }
 
-fn finish_release_tx(
+fn expire_stale_control_edits_tx(
     tx: &Transaction<'_>,
+    now_dt: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let now = now_dt.to_rfc3339();
+    let expired = {
+        let mut statement = tx
+            .prepare(
+                "SELECT edit.id
+                 FROM share_edit_requests edit
+                 INNER JOIN share_control_operations operation ON operation.edit_id = edit.id
+                 WHERE edit.status = 'pending' AND edit.retired_at IS NULL
+                   AND edit.expires_at IS NOT NULL AND edit.expires_at <= ?1
+                   AND operation.status = 'dispatched'
+                 ORDER BY edit.expires_at, edit.created_at",
+            )
+            .map_err(map_db("prepare expired Share control edits"))?;
+        statement
+            .query_map(params![now], |row| row.get::<_, String>(0))
+            .map_err(map_db("query expired Share control edits"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read expired Share control edits"))?
+    };
+    for edit_id in expired {
+        let changed = tx
+            .execute(
+                "UPDATE share_edit_requests
+                 SET status = 'rejected', retired_at = ?2, updated_at = ?2,
+                     error_message = 'Share control acknowledgement timed out',
+                     error_code = 'control_ack_timeout'
+                 WHERE id = ?1 AND status = 'pending' AND retired_at IS NULL",
+                params![edit_id, now],
+            )
+            .map_err(map_db("expire Share control edit"))?;
+        if changed == 1 {
+            handle_control_edit_ack_with_metadata(
+                tx,
+                &edit_id,
+                "rejected",
+                Some("Share control acknowledgement timed out"),
+                Some("control_ack_timeout"),
+                Some(true),
+                &now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn control_retry_at(now: &str, attempts: i64) -> Result<String, AppError> {
+    let exponent = u32::try_from(attempts.saturating_sub(1).clamp(0, 16)).unwrap_or(0);
+    let delay = CONTROL_RETRY_BASE_SECS
+        .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(CONTROL_RETRY_MAX_SECS);
+    Ok((parse_time(now)? + Duration::seconds(delay)).to_rfc3339())
+}
+
+fn finish_release_tx(
+    tx: &Connection,
     subscription_id: &str,
     seat_id: &str,
     listing_id: &str,
@@ -3029,7 +4145,7 @@ fn finish_release_tx(
             params![subscription_id, reason, now],
         )
         .map_err(map_db("release Share subscription"))?;
-    let retired = retire_seat(tx, seat_id, subscription_id, now)?;
+    let recycled = recycle_released_seat(tx, seat_id, subscription_id, now)?;
     if released > 0 {
         event_tx(
             tx,
@@ -3042,19 +4158,64 @@ fn finish_release_tx(
             now,
         )?;
     }
-    if retired {
+    if recycled {
         event_tx(
             tx,
             Some(listing_id),
             Some(seat_id),
             Some(subscription_id),
             None,
-            "seat_retired",
+            "seat_available",
             serde_json::json!({ "reason": reason }),
             now,
         )?;
     }
     Ok(())
+}
+
+fn recycle_released_seat(
+    conn: &Connection,
+    seat_id: &str,
+    subscription_id: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    let reusable = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM share_market_seats seat
+                INNER JOIN share_market_listings listing ON listing.id = seat.listing_id
+                INNER JOIN shares share ON share.share_id = listing.share_id
+                INNER JOIN share_market_subscriptions subscription
+                  ON subscription.id = seat.current_subscription_id
+                WHERE seat.id = ?1 AND seat.current_subscription_id = ?2
+                  AND seat.status NOT IN ('disabled', 'deleted')
+                  AND listing.status = 'active' AND listing.deleted_at IS NULL
+                  AND share.share_status = 'active'
+                  AND lower(listing.owner_email) = lower(share.owner_email)
+                  AND COALESCE(subscription.release_reason, '') NOT IN
+                      ('share_missing', 'share_unavailable', 'installation_takeover',
+                       'share_deleted', 'listing_deleted')
+             )",
+            params![seat_id, subscription_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("check released Share seat reuse"))?
+        != 0;
+    if reusable {
+        let changed = conn
+            .execute(
+                "UPDATE share_market_seats
+                 SET status = 'available', current_subscription_id = NULL,
+                     retired_subscription_id = NULL, retired_at = NULL, updated_at = ?3
+                 WHERE id = ?1 AND current_subscription_id = ?2
+                   AND status NOT IN ('disabled', 'deleted')",
+                params![seat_id, subscription_id, now],
+            )
+            .map_err(map_db("recycle released Share seat"))?;
+        return Ok(changed > 0);
+    }
+    retire_seat(conn, seat_id, subscription_id, now)
 }
 
 pub(crate) fn terminate_installation_for_takeover_tx(
@@ -3141,6 +4302,240 @@ pub(crate) fn terminate_installation_for_takeover_tx(
     Ok(())
 }
 
+pub(crate) fn retire_deleted_share_market_tx(
+    conn: &Connection,
+    share_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE market_access_requests
+         SET status = 'cancelled', revision = revision + 1, resolved_at = ?2,
+             resolution_reason = ?3
+         WHERE status = 'requested' AND target_kind = 'share_seat'
+           AND target_id IN (
+               SELECT seat.id
+               FROM share_market_seats seat
+               INNER JOIN share_market_listings listing ON listing.id = seat.listing_id
+               WHERE listing.share_id = ?1
+           )",
+        params![share_id, now, reason],
+    )
+    .map_err(map_db("cancel deleted Share access requests"))?;
+
+    let subscriptions = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, seat_id, listing_id
+                 FROM share_market_subscriptions
+                 WHERE share_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+            )
+            .map_err(map_db("prepare deleted Share subscriptions"))?;
+        statement
+            .query_map(params![share_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(map_db("query deleted Share subscriptions"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read deleted Share subscriptions"))?
+    };
+    for (subscription_id, seat_id, listing_id) in subscriptions {
+        crate::market_billing::terminate_contract_tx(conn, "share", &subscription_id, reason, now)?;
+        conn.execute(
+            "UPDATE share_control_operations
+             SET status = 'rejected', last_error = ?2, updated_at = ?3
+             WHERE subscription_id = ?1 AND status IN ('pending', 'dispatched')",
+            params![subscription_id, reason, now],
+        )
+        .map_err(map_db("retire deleted Share control operations"))?;
+        conn.execute(
+            "UPDATE share_market_subscriptions
+             SET status = 'released', release_reason = ?2, updated_at = ?3, released_at = ?3
+             WHERE id = ?1 AND status NOT IN ('released', 'grant_failed')",
+            params![subscription_id, reason, now],
+        )
+        .map_err(map_db("release deleted Share subscription"))?;
+        conn.execute(
+            "UPDATE share_market_seats
+             SET status = 'deleted', current_subscription_id = NULL,
+                 retired_subscription_id = COALESCE(retired_subscription_id, ?2),
+                 retired_at = COALESCE(retired_at, ?3), updated_at = ?3
+             WHERE id = ?1",
+            params![seat_id, subscription_id, now],
+        )
+        .map_err(map_db("retire deleted Share seat"))?;
+        event_tx(
+            conn,
+            Some(&listing_id),
+            Some(&seat_id),
+            Some(&subscription_id),
+            None,
+            "subscription_released",
+            serde_json::json!({ "reason": reason }),
+            now,
+        )?;
+    }
+    conn.execute(
+        "UPDATE share_market_seats
+         SET status = 'deleted', current_subscription_id = NULL,
+             retired_at = COALESCE(retired_at, ?2), updated_at = ?2
+         WHERE listing_id IN (
+             SELECT id FROM share_market_listings WHERE share_id = ?1
+         ) AND status != 'deleted'",
+        params![share_id, now],
+    )
+    .map_err(map_db("delete remaining Share listing seats"))?;
+    conn.execute(
+        "UPDATE share_market_listings
+         SET status = 'closed', deleted_at = COALESCE(deleted_at, ?2), updated_at = ?2
+         WHERE share_id = ?1",
+        params![share_id, now],
+    )
+    .map_err(map_db("close deleted Share listings"))?;
+    Ok(())
+}
+
+pub(crate) fn rebind_share_market_owner_tx(
+    conn: &Connection,
+    share_id: &str,
+    new_owner_user_id: &str,
+    new_owner_email: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    let listings = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM share_market_listings
+                 WHERE share_id = ?1 AND deleted_at IS NULL",
+            )
+            .map_err(map_db("prepare transferred Share listings"))?;
+        statement
+            .query_map(params![share_id], |row| row.get::<_, String>(0))
+            .map_err(map_db("query transferred Share listings"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read transferred Share listings"))?
+    };
+    if listings.is_empty() {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE market_access_requests
+         SET status = 'cancelled', revision = revision + 1, resolved_at = ?2,
+             resolution_reason = 'Share ownership changed; request access from the new owner'
+         WHERE status = 'requested' AND target_kind = 'share_seat'
+           AND target_id IN (
+               SELECT seat.id FROM share_market_seats seat
+               INNER JOIN share_market_listings listing ON listing.id = seat.listing_id
+               WHERE listing.share_id = ?1
+           )",
+        params![share_id, now],
+    )
+    .map_err(map_db("cancel transferred Share access requests"))?;
+    conn.execute(
+        "UPDATE share_market_listings
+         SET owner_user_id = ?2, owner_email = ?3, updated_at = ?4
+         WHERE share_id = ?1 AND deleted_at IS NULL",
+        params![share_id, new_owner_user_id, new_owner_email, now],
+    )
+    .map_err(map_db("rebind transferred Share listings"))?;
+
+    let grants_json = conn
+        .query_row(
+            "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+            params![share_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_db("read transferred Share grants"))?
+        .flatten();
+    let subscriptions = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, seat_id, listing_id, entitlement_id, renter_email
+                 FROM share_market_subscriptions
+                 WHERE share_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+            )
+            .map_err(map_db("prepare transferred Share subscriptions"))?;
+        statement
+            .query_map(params![share_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(map_db("query transferred Share subscriptions"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read transferred Share subscriptions"))?
+    };
+    for (subscription_id, seat_id, listing_id, entitlement_id, renter_email) in subscriptions {
+        crate::market_billing::terminate_contract_tx(
+            conn,
+            "share",
+            &subscription_id,
+            "share_owner_changed",
+            now,
+        )?;
+        let retired =
+            retire_unconfirmed_grant_tx(conn, &subscription_id, "share_owner_changed", now)?;
+        let has_entitlement = active_entitlement(grants_json.as_deref(), &entitlement_id);
+        let grant_never_reached_client = !entitlement_was_activated_tx(conn, &subscription_id)?
+            && !has_entitlement
+            && !retired.had_dispatched;
+        if grant_never_reached_client {
+            finish_release_tx(
+                conn,
+                &subscription_id,
+                &seat_id,
+                &listing_id,
+                "share_owner_changed",
+                now,
+            )?;
+        } else {
+            request_revoke_tx(
+                conn,
+                &subscription_id,
+                share_id,
+                &seat_id,
+                &entitlement_id,
+                &renter_email,
+                "share_owner_changed",
+                now,
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE share_market_subscriptions
+         SET owner_user_id = ?2, owner_email = ?3, updated_at = ?4
+         WHERE share_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+        params![share_id, new_owner_user_id, new_owner_email, now],
+    )
+    .map_err(map_db("rebind transferred Share subscriptions"))?;
+    for listing_id in listings {
+        event_tx(
+            conn,
+            Some(&listing_id),
+            None,
+            None,
+            None,
+            "listing_owner_rebound",
+            serde_json::json!({
+                "newOwnerUserId": new_owner_user_id,
+                "newOwnerEmail": new_owner_email,
+            }),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 fn retire_seat(
     conn: &Connection,
     seat_id: &str,
@@ -3162,7 +4557,7 @@ fn retire_seat(
 
 #[allow(clippy::too_many_arguments)]
 fn request_revoke_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     subscription_id: &str,
     share_id: &str,
     seat_id: &str,
@@ -3209,6 +4604,48 @@ fn request_revoke_tx(
     Ok(())
 }
 
+fn next_reconcile_subscription_ids(conn: &Connection) -> Result<Vec<String>, AppError> {
+    conn.prepare(
+        "SELECT id FROM share_market_subscriptions
+         WHERE status NOT IN ('released', 'grant_failed')
+         ORDER BY COALESCE(last_reconciled_at, ''), created_at, id
+         LIMIT ?1",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![MAX_SUBSCRIPTIONS_PER_RECONCILE], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .map_err(map_db("read Share subscriptions for reconciliation"))
+}
+
+fn advance_reconcile_subscription_cursor(
+    conn: &Connection,
+    subscription_ids: &[String],
+    reconciled_at: &str,
+) -> Result<(), AppError> {
+    if subscription_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", subscription_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "UPDATE share_market_subscriptions SET last_reconciled_at = ?
+         WHERE id IN ({placeholders})"
+    );
+    conn.execute(
+        &sql,
+        params_from_iter(
+            std::iter::once(reconciled_at.to_string()).chain(subscription_ids.iter().cloned()),
+        ),
+    )
+    .map_err(map_db("advance Share reconciliation cursor"))?;
+    Ok(())
+}
+
 impl AppStore {
     pub async fn share_market_reconcile_and_dispatch(
         &self,
@@ -3219,21 +4656,11 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share Market reconciliation"))?;
+        expire_stale_control_edits_tx(&tx, now_dt)?;
         recover_orphaned_control_edits_tx(&tx, &now)?;
 
-        let subscription_ids = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT id FROM share_market_subscriptions
-                     WHERE status NOT IN ('released', 'grant_failed') ORDER BY created_at",
-                )
-                .map_err(map_db("prepare Share subscriptions for reconciliation"))?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(map_db("query Share subscriptions for reconciliation"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(map_db("read Share subscriptions for reconciliation"))?
-        };
+        let subscription_ids = next_reconcile_subscription_ids(&tx)?;
+        advance_reconcile_subscription_cursor(&tx, &subscription_ids, &now)?;
         for subscription_id in subscription_ids {
             let Some(record) = subscription_record(&tx, &subscription_id)? else {
                 continue;
@@ -3310,10 +4737,17 @@ impl AppStore {
                 record.status.as_str(),
                 SUB_REVOKE_PENDING | SUB_REVOKE_FAILED
             ) {
-                if share.is_some()
-                    && !has_entitlement
-                    && can_confirm_absent_entitlement_tx(&tx, &record.id)?
-                {
+                if share.is_none() {
+                    confirm_control_effect_tx(&tx, &record.id, "revoke", &now)?;
+                    finish_release_tx(
+                        &tx,
+                        &record.id,
+                        &record.seat_id,
+                        &record.listing_id,
+                        "share_missing",
+                        &now,
+                    )?;
+                } else if !has_entitlement && can_confirm_absent_entitlement_tx(&tx, &record.id)? {
                     confirm_control_effect_tx(&tx, &record.id, "revoke", &now)?;
                     finish_release_tx(
                         &tx,
@@ -3350,7 +4784,9 @@ impl AppStore {
                         serde_json::json!({}),
                         &now,
                     )?;
-                } else if record.status == SUB_BILLING_CONTROL_FAILED {
+                } else if record.status == SUB_BILLING_CONTROL_FAILED
+                    && !has_terminal_revoke_operation_tx(&tx, &record.id)?
+                {
                     enqueue_control_operation_tx(
                         &tx,
                         &record.share_id,
@@ -3423,8 +4859,8 @@ impl AppStore {
                     confirm_control_effect_tx(&tx, &record.id, "upsert", &now)?;
                     if record.daily_rate_minor.is_none() {
                         let expires_at = record
-                            .free_duration_days
-                            .map(|days| (now_dt + Duration::days(i64::from(days))).to_rfc3339());
+                            .free_usage_seconds
+                            .map(|seconds| (now_dt + Duration::seconds(seconds)).to_rfc3339());
                         tx.execute(
                             "UPDATE share_market_subscriptions
                              SET status = 'active_free', activated_at = ?2,
@@ -3512,13 +4948,11 @@ impl AppStore {
 
             if !has_entitlement {
                 if share.is_none() {
-                    request_revoke_tx(
+                    finish_release_tx(
                         &tx,
                         &record.id,
-                        &record.share_id,
                         &record.seat_id,
-                        &record.entitlement_id,
-                        &record.renter_email,
+                        &record.listing_id,
                         "share_missing",
                         &now,
                     )?;
@@ -3555,6 +4989,8 @@ impl AppStore {
                     "SELECT op.id
                      FROM share_control_operations op
                      WHERE op.status = 'pending' AND op.attempts < ?1
+                       AND op.dead_lettered_at IS NULL
+                       AND COALESCE(op.next_attempt_at, op.created_at) <= ?2
                        AND NOT EXISTS (
                            SELECT 1 FROM share_control_operations earlier
                            WHERE earlier.share_id = op.share_id
@@ -3570,7 +5006,9 @@ impl AppStore {
                 )
                 .map_err(map_db("prepare Share control dispatch"))?;
             statement
-                .query_map(params![MAX_CONTROL_ATTEMPTS], |row| row.get::<_, String>(0))
+                .query_map(params![MAX_CONTROL_ATTEMPTS, now], |row| {
+                    row.get::<_, String>(0)
+                })
                 .map_err(map_db("query Share control dispatch"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(map_db("read Share control dispatch"))?
@@ -3632,6 +5070,24 @@ impl AppStore {
                 .map_err(map_db("read Share control target"))?;
             let Some((installation_id, config_revision)) = target else {
                 if action == "revoke" {
+                    tx.execute(
+                        "UPDATE share_control_operations
+                         SET status = 'applied', applied_at = ?2, updated_at = ?2,
+                             last_error = NULL
+                         WHERE id = ?1 AND status = 'pending'",
+                        params![operation_id, now],
+                    )
+                    .map_err(map_db("complete missing Share revoke operation"))?;
+                    if let Some(record) = subscription_record(&tx, &subscription_id)? {
+                        finish_release_tx(
+                            &tx,
+                            &record.id,
+                            &record.seat_id,
+                            &record.listing_id,
+                            "share_missing",
+                            &now,
+                        )?;
+                    }
                     continue;
                 }
                 tx.execute(
@@ -3690,13 +5146,15 @@ impl AppStore {
                 )
                 .map_err(map_db("allocate Share edit revision"))?;
             let edit_id = Uuid::new_v4().to_string();
+            let edit_expires_at = (now_dt + Duration::seconds(CONTROL_EDIT_TTL_SECS)).to_rfc3339();
             tx.execute(
                 "INSERT INTO share_edit_requests (
                     id, share_id, installation_id, owner_email, revision, status,
                     patch_json, created_by_email, created_at, updated_at,
-                    applied_at, error_message, retired_at
+                    applied_at, error_message, retired_at, expires_at,
+                    dead_lettered_at, error_code
                  ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending',
-                           ?6, ?4, ?7, ?7, NULL, NULL, NULL)",
+                           ?6, ?4, ?7, ?7, NULL, NULL, NULL, ?8, NULL, NULL)",
                 params![
                     edit_id,
                     share_id,
@@ -3704,14 +5162,16 @@ impl AppStore {
                     SHARE_MARKET_CONTROL_ACTOR_EMAIL,
                     edit_revision,
                     patch_json,
-                    now
+                    now,
+                    edit_expires_at,
                 ],
             )
             .map_err(map_db("dispatch Share control edit"))?;
             tx.execute(
                 "UPDATE share_control_operations
                  SET status = 'dispatched', edit_id = ?2, attempts = attempts + 1,
-                     last_error = NULL, updated_at = ?3 WHERE id = ?1 AND status = 'pending'",
+                     next_attempt_at = NULL, last_error = NULL, updated_at = ?3
+                 WHERE id = ?1 AND status = 'pending'",
                 params![operation_id, edit_id, now],
             )
             .map_err(map_db("mark Share control dispatched"))?;
@@ -3733,11 +5193,12 @@ impl AppStore {
                      WHERE op.status = 'dispatched'
                        AND edit.status = 'pending'
                        AND edit.retired_at IS NULL
+                       AND (edit.expires_at IS NULL OR edit.expires_at > ?1)
                      ORDER BY op.updated_at, op.created_at",
                 )
                 .map_err(map_db("prepare dispatched Share control wake retries"))?;
             statement
-                .query_map([], |row| {
+                .query_map(params![now], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -3790,6 +5251,18 @@ pub(crate) fn handle_control_edit_ack(
     error_message: Option<&str>,
     now: &str,
 ) -> Result<(), AppError> {
+    handle_control_edit_ack_with_metadata(conn, edit_id, status, error_message, None, None, now)
+}
+
+pub(crate) fn handle_control_edit_ack_with_metadata(
+    conn: &Connection,
+    edit_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+    error_code: Option<&str>,
+    retryable: Option<bool>,
+    now: &str,
+) -> Result<(), AppError> {
     let operation: Option<(
         String,
         String,
@@ -3839,9 +5312,9 @@ pub(crate) fn handle_control_edit_ack(
     if status == "rejected" {
         conn.execute(
             "UPDATE share_edit_requests
-             SET retired_at = COALESCE(retired_at, ?2)
+             SET retired_at = COALESCE(retired_at, ?2), error_code = COALESCE(?3, error_code)
              WHERE id = ?1 AND status = 'rejected'",
-            params![edit_id, now],
+            params![edit_id, now, error_code],
         )
         .map_err(map_db("retire rejected Share control edit"))?;
     }
@@ -3872,26 +5345,32 @@ pub(crate) fn handle_control_edit_ack(
         .map_err(map_db("complete Share control operation"))?;
         return Ok(());
     }
-    let retryable = error_message
-        .is_some_and(|message| message.contains("expected config revision"))
-        && attempts < MAX_CONTROL_ATTEMPTS;
+    let retry_requested = retryable == Some(true);
+    let explicitly_nonretryable = retryable == Some(false);
+    let should_retry = retry_requested && attempts < MAX_CONTROL_ATTEMPTS;
     let sanitized_error = error_message.map(crate::store::client_chat::sanitize_system_event_text);
     let error_message = sanitized_error.as_deref();
-    if retryable {
+    if should_retry {
+        let next_attempt_at = control_retry_at(now, attempts)?;
         conn.execute(
             "UPDATE share_control_operations
-             SET status = 'pending', edit_id = NULL, updated_at = ?2, last_error = ?3
+             SET status = 'pending', edit_id = NULL, updated_at = ?2, last_error = ?3,
+                 next_attempt_at = ?4
              WHERE id = ?1 AND status = 'dispatched'",
-            params![operation_id, now, error_message],
+            params![operation_id, now, error_message, next_attempt_at],
         )
         .map_err(map_db("retry Share control operation"))?;
         return Ok(());
     }
+    let dead_letter =
+        action == "revoke" && (explicitly_nonretryable || attempts >= MAX_CONTROL_ATTEMPTS);
     conn.execute(
         "UPDATE share_control_operations
-         SET status = 'rejected', updated_at = ?2, last_error = ?3
+         SET status = 'rejected', updated_at = ?2, last_error = ?3,
+             dead_lettered_at = CASE WHEN ?4 THEN ?2 ELSE dead_lettered_at END,
+             next_attempt_at = NULL
          WHERE id = ?1 AND status = 'dispatched'",
-        params![operation_id, now, error_message],
+        params![operation_id, now, error_message, dead_letter],
     )
     .map_err(map_db("reject Share control operation"))?;
     if action == "upsert" {
@@ -3986,6 +5465,42 @@ pub(crate) fn handle_control_edit_ack(
                 now,
             )?;
         }
+    }
+    if dead_letter {
+        conn.execute(
+            "UPDATE share_edit_requests SET dead_lettered_at = ?2 WHERE id = ?1",
+            params![edit_id, now],
+        )
+        .map_err(map_db("dead-letter Share control edit"))?;
+        let occurred_at = parse_time(now)?;
+        crate::store::enqueue_operator_alert_signal_tx(
+            conn,
+            &format!("share-control-dead-letter:{operation_id}"),
+            &format!("share_control_dead_letter:share:{share_id}"),
+            "firing",
+            "share_control_dead_letter",
+            "share",
+            Some(&share_id),
+            if action == "revoke" {
+                "critical"
+            } else {
+                "warning"
+            },
+            "Share control operation exhausted retries",
+            &format!(
+                "Share {share_id} {action} control operation failed after {attempts} attempts."
+            ),
+            serde_json::json!({
+                "operationId": operation_id,
+                "subscriptionId": subscription_id,
+                "shareId": share_id,
+                "action": action,
+                "attempts": attempts,
+                "errorCode": error_code,
+                "error": error_message,
+            }),
+            occurred_at,
+        )?;
     }
     Ok(())
 }
@@ -4384,7 +5899,9 @@ async fn try_apply_dispatched_edit_via_ctl(
             Ok(false)
         }
         Err(error) => {
-            let message = error.to_string();
+            let message = error.client_message();
+            let error_code = error.error_code().map(str::to_string);
+            let retryable = error.retryable();
             tracing::warn!(
                 share_id = %event.share_id,
                 edit_id = %edit.id,
@@ -4393,7 +5910,12 @@ async fn try_apply_dispatched_edit_via_ctl(
             );
             let _ = state
                 .store
-                .mark_share_edit_rejected(&edit.id, &message)
+                .mark_share_edit_rejected_with_metadata(
+                    &edit.id,
+                    &message,
+                    error_code.as_deref(),
+                    Some(retryable),
+                )
                 .await;
             Ok(false)
         }
@@ -4448,7 +5970,6 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn session(user_id: &str, email: &str) -> AuthSession {
         let now = Utc::now();
@@ -4679,6 +6200,20 @@ mod tests {
         );
     }
 
+    async fn record_share_health(store: &AppStore, share_id: &str, now: DateTime<Utc>) {
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO share_health_checks (
+                    share_id, checked_at, is_healthy, status, reason, router_epoch
+                 ) VALUES (?1, ?2, 1, 'healthy', 'test_observation', 'test')",
+                params![share_id, now.timestamp()],
+            )
+            .expect("insert Share health observation");
+    }
+
     async fn subscription_status(store: &AppStore, subscription_id: &str) -> String {
         store
             .conn
@@ -4690,6 +6225,77 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read subscription status")
+    }
+
+    #[tokio::test]
+    async fn reconciliation_cursor_rotates_past_the_first_batch() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let created_at = "2026-01-01T00:00:00+00:00";
+        let first_reconciled_at = "2026-01-01T00:01:00+00:00";
+        let conn = store.conn.lock().await;
+        for index in 0..=MAX_SUBSCRIPTIONS_PER_RECONCILE {
+            let listing_id = format!("listing-{index:03}");
+            let seat_id = format!("seat-{index:03}");
+            let subscription_id = format!("subscription-{index:03}");
+            let share_id = format!("share-{index:03}");
+            conn.execute(
+                "INSERT INTO share_market_listings (
+                    id, share_id, installation_id, owner_user_id, owner_email,
+                    status, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'owner', 'owner@example.com',
+                           'active', ?4, ?4)",
+                params![
+                    listing_id,
+                    share_id,
+                    format!("installation-{index:03}"),
+                    created_at
+                ],
+            )
+            .expect("insert reconciliation listing");
+            conn.execute(
+                "INSERT INTO share_market_seats (
+                    id, listing_id, position, status, token_period_json,
+                    offer_revision, current_subscription_id, created_at, updated_at
+                 ) VALUES (?1, ?2, 1, 'occupied', '\"day\"', 1, ?3, ?4, ?4)",
+                params![seat_id, listing_id, subscription_id, created_at],
+            )
+            .expect("insert reconciliation seat");
+            conn.execute(
+                "INSERT INTO share_market_subscriptions (
+                    id, seat_id, listing_id, share_id, installation_id,
+                    entitlement_id, owner_user_id, owner_email, renter_user_id,
+                    renter_email, status, token_period_json, offer_revision,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'owner',
+                           'owner@example.com', ?7, ?8, 'grant_pending',
+                           '\"day\"', 1, ?9, ?9)",
+                params![
+                    subscription_id,
+                    seat_id,
+                    listing_id,
+                    share_id,
+                    format!("installation-{index:03}"),
+                    format!("entitlement-{index:03}"),
+                    format!("renter-{index:03}"),
+                    format!("renter-{index:03}@example.com"),
+                    created_at,
+                ],
+            )
+            .expect("insert reconciliation subscription");
+        }
+
+        let first_batch = next_reconcile_subscription_ids(&conn).expect("load first batch");
+        assert_eq!(first_batch.len(), MAX_SUBSCRIPTIONS_PER_RECONCILE);
+        assert!(!first_batch.contains(&"subscription-200".to_string()));
+        advance_reconcile_subscription_cursor(&conn, &first_batch, first_reconciled_at)
+            .expect("advance first batch");
+
+        let second_batch = next_reconcile_subscription_ids(&conn).expect("load second batch");
+        assert_eq!(second_batch.len(), MAX_SUBSCRIPTIONS_PER_RECONCILE);
+        assert_eq!(
+            second_batch.first().map(String::as_str),
+            Some("subscription-200")
+        );
     }
 
     #[tokio::test]
@@ -4710,7 +6316,7 @@ mod tests {
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
             .expect("rent wake-retry seat");
-        let now = Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap();
+        let now = Utc::now();
 
         let first = store
             .share_market_reconcile_and_dispatch(now)
@@ -5132,7 +6738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_seats_do_not_consume_listing_capacity() {
+    async fn released_seats_are_reused_without_expanding_listing_capacity() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-capacity", "owner-capacity@example.com");
         let renter = session("renter-capacity", "renter-capacity@example.com");
@@ -5189,11 +6795,13 @@ mod tests {
             .await
             .expect("release undispatched capacity seat");
 
-        let replacement = store
-            .share_market_add_seat(&owner, &listing_id, free_seat())
-            .await
-            .expect("retired seat frees effective capacity");
-        let (active_count, retired_count, replacement_position): (i64, i64, i64) = store
+        assert!(matches!(
+            store
+                .share_market_add_seat(&owner, &listing_id, free_seat())
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let (active_count, available_count, retired_count): (i64, i64, i64) = store
             .conn
             .lock()
             .await
@@ -5201,16 +6809,27 @@ mod tests {
                 "SELECT
                     SUM(CASE WHEN retired_at IS NULL AND status IN
                         ('available', 'reserved', 'occupied', 'revoking') THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN retired_at IS NOT NULL THEN 1 ELSE 0 END),
-                    MAX(CASE WHEN id = ?2 THEN position ELSE 0 END)
+                    SUM(CASE WHEN id = ?2 AND status = 'available'
+                                  AND current_subscription_id IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN retired_at IS NOT NULL THEN 1 ELSE 0 END)
                  FROM share_market_seats WHERE listing_id = ?1",
-                params![listing_id, replacement],
+                params![listing_id, first_seat],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read effective listing capacity");
         assert_eq!(active_count, MAX_SEATS_PER_LISTING as i64);
-        assert_eq!(retired_count, 1);
-        assert_eq!(replacement_position, MAX_SEATS_PER_LISTING as i64 + 1);
+        assert_eq!(available_count, 1);
+        assert_eq!(retired_count, 0);
+
+        let next_renter = session("renter-capacity-next", "renter-capacity-next@example.com");
+        store
+            .share_market_rent_seat(
+                &next_renter,
+                &first_seat,
+                RentSeatRequest { offer_revision: 1 },
+            )
+            .await
+            .expect("reuse released capacity seat");
     }
 
     #[tokio::test]
@@ -5449,7 +7068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_share_keeps_an_active_entitlement_fenced_until_a_fresh_descriptor_returns() {
+    async fn missing_share_terminates_active_subscription_without_waiting_for_descriptor() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-missing", "owner-missing@example.com");
         let renter = session("renter-missing", "renter-missing@example.com");
@@ -5460,7 +7079,7 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
-        let (listing_id, seat_id) =
+        let (_listing_id, seat_id) =
             create_listing(&store, &owner, "share-missing", free_seat()).await;
         let subscription_id = store
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
@@ -5482,61 +7101,29 @@ mod tests {
                 .expect("fence missing active Share")
                 .is_empty()
         );
-        let (status_after_missing, seat_status, revoke_status): (String, String, String) = store
-            .conn
-            .lock()
-            .await
-            .query_row(
-                "SELECT sub.status, seat.status, operation.status
-                 FROM share_market_subscriptions sub
-                 JOIN share_market_seats seat ON seat.id = sub.seat_id
-                 JOIN share_control_operations operation
-                   ON operation.subscription_id = sub.id AND operation.action = 'revoke'
-                 WHERE sub.id = ?1",
-                params![subscription_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read fenced missing Share");
-        assert_eq!(status_after_missing, SUB_REVOKE_PENDING);
-        assert_eq!(seat_status, "revoking");
-        assert_eq!(revoke_status, "pending");
-
-        insert_share(
-            &store,
-            "share-missing",
-            &owner.email,
-            &[ShareTokenPeriod::Day],
-        )
-        .await;
-        store
-            .share_market_reconcile_and_dispatch(now + Duration::seconds(2))
-            .await
-            .expect("confirm absent entitlement from fresh descriptor");
-        assert_eq!(
-            subscription_status(&store, &subscription_id).await,
-            SUB_RELEASED
-        );
-        let (seat_status, retired_subscription_id, retired_at): (
+        let (status_after_missing, seat_status, retired_subscription_id): (
             String,
-            Option<String>,
+            String,
             Option<String>,
         ) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT status, retired_subscription_id, retired_at
-                 FROM share_market_seats WHERE id = ?1 AND listing_id = ?2",
-                params![seat_id, listing_id],
+                "SELECT sub.status, seat.status, seat.retired_subscription_id
+                 FROM share_market_subscriptions sub
+                 JOIN share_market_seats seat ON seat.id = sub.seat_id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("read released missing Share seat");
+            .expect("read terminated missing Share");
+        assert_eq!(status_after_missing, SUB_RELEASED);
         assert_eq!(seat_status, SEAT_DISABLED);
         assert_eq!(
             retired_subscription_id.as_deref(),
             Some(subscription_id.as_str())
         );
-        assert!(retired_at.is_some());
     }
 
     #[tokio::test]
@@ -5602,37 +7189,8 @@ mod tests {
             )
             .expect("read recovered orphaned grant");
         assert_eq!(upsert_status, "rejected");
-        assert_eq!(revoke_status, "pending");
-        assert_eq!(subscription_status, SUB_REVOKE_PENDING);
-
-        insert_share(
-            &store,
-            "share-retired",
-            &owner.email,
-            &[ShareTokenPeriod::Day],
-        )
-        .await;
-        set_entitlement(&store, &subscription_id).await;
-        assert_eq!(
-            store
-                .share_market_reconcile_and_dispatch(now + Duration::seconds(3))
-                .await
-                .expect("dispatch revoke after Share returns")
-                .len(),
-            1
-        );
-        let revoke_status: String = store
-            .conn
-            .lock()
-            .await
-            .query_row(
-                "SELECT status FROM share_control_operations
-                 WHERE subscription_id = ?1 AND action = 'revoke'",
-                params![subscription_id],
-                |row| row.get(0),
-            )
-            .expect("read dispatched recovered revoke");
-        assert_eq!(revoke_status, "dispatched");
+        assert_eq!(revoke_status, "applied");
+        assert_eq!(subscription_status, SUB_RELEASED);
     }
 
     #[tokio::test]
@@ -5641,7 +7199,8 @@ mod tests {
         let owner = session("owner", "owner@example.com");
         let renter = session("renter", "renter@example.com");
         insert_share(&store, "share-free", &owner.email, &[ShareTokenPeriod::Day]).await;
-        let (listing_id, seat_id) = create_listing(&store, &owner, "share-free", free_seat()).await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-free", free_seat()).await;
         let subscription_id = store
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
@@ -5720,75 +7279,34 @@ mod tests {
             )
             .expect("read released free rental");
         assert_eq!(subscription_status, "released");
-        assert_eq!(seat_status, SEAT_DISABLED);
-        assert_eq!(
-            retired_subscription_id.as_deref(),
-            Some(subscription_id.as_str())
-        );
-        assert!(retired_at.is_some());
+        assert_eq!(seat_status, "available");
+        assert!(retired_subscription_id.is_none());
+        assert!(retired_at.is_none());
         assert_eq!(revoke_status, "applied");
         assert_eq!(revoke_attempts, 0);
-        assert!(matches!(
-            store.share_market_delete_seat(&owner, &seat_id).await,
-            Err(AppError::Conflict(_))
-        ));
-        assert!(matches!(
-            store
-                .share_market_rent_seat(
-                    &session("other", "other@example.com"),
-                    &seat_id,
-                    RentSeatRequest { offer_revision: 1 },
-                )
-                .await,
-            Err(AppError::Conflict(_))
-        ));
+        let other = session("other", "other@example.com");
+        store
+            .share_market_rent_seat(&other, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("reuse released seat");
 
         let owner_catalog = store
             .share_market_catalog(Some(&owner), &[])
             .await
             .expect("read owner catalog after release");
-        let retired = owner_catalog.listings[0]
+        let reused = owner_catalog.listings[0]
             .seats
             .iter()
             .find(|seat| seat.id == seat_id)
-            .expect("retired owner seat");
-        assert_eq!(retired.status, SEAT_RETIRED_VIEW);
-        assert!(retired.read_only);
+            .expect("reused owner seat");
+        assert_eq!(reused.status, "reserved");
+        assert!(!reused.read_only);
         assert_eq!(
-            retired
+            reused
                 .subscription
                 .as_ref()
                 .map(|subscription| subscription.renter_email.as_str()),
-            Some(renter.email.as_str())
-        );
-
-        let unrelated = session("unrelated", "unrelated@example.com");
-        let unrelated_catalog = store
-            .share_market_catalog(Some(&unrelated), &[])
-            .await
-            .expect("read unrelated catalog after release");
-        let public_retired = unrelated_catalog.listings[0]
-            .seats
-            .iter()
-            .find(|seat| seat.id == seat_id)
-            .expect("retired public seat");
-        assert_eq!(
-            public_retired
-                .subscription
-                .as_ref()
-                .map(|subscription| subscription.renter_email.as_str()),
-            Some(renter.email.as_str())
-        );
-        let anonymous_catalog = store
-            .share_market_catalog(None, &[])
-            .await
-            .expect("read anonymous catalog after release");
-        assert_eq!(
-            anonymous_catalog.listings[0].seats[0]
-                .subscription
-                .as_ref()
-                .map(|subscription| subscription.renter_email.as_str()),
-            Some(renter.email.as_str())
+            Some(other.email.as_str())
         );
 
         let renter_catalog = store
@@ -5801,35 +7319,7 @@ mod tests {
                 .iter()
                 .any(|subscription| subscription.id == subscription_id)
         );
-        assert_eq!(
-            renter_catalog.listings[0].seats[0]
-                .subscription
-                .as_ref()
-                .map(|subscription| subscription.renter_email.as_str()),
-            Some(renter.email.as_str())
-        );
-
-        let replacement_seat = store
-            .share_market_add_seat(&owner, &listing_id, free_seat())
-            .await
-            .expect("add replacement seat");
-        let catalog_after_add = store
-            .share_market_catalog(Some(&owner), &[])
-            .await
-            .expect("read lifecycle ordering");
-        assert_eq!(catalog_after_add.listings[0].seats.len(), 2);
-        assert_eq!(catalog_after_add.listings[0].seats[0].id, replacement_seat);
-        assert_eq!(catalog_after_add.listings[0].seats[0].position, 2);
-        assert_eq!(catalog_after_add.listings[0].seats[1].id, seat_id);
-        assert!(catalog_after_add.listings[0].seats[1].read_only);
-        store
-            .share_market_close_listing(&owner, &listing_id)
-            .await
-            .expect("close listing with rental history");
-        assert!(matches!(
-            store.share_market_delete_listing(&owner, &listing_id).await,
-            Err(AppError::Conflict(_))
-        ));
+        assert_eq!(renter_catalog.listings[0].seats[0].status, "reserved");
     }
 
     #[tokio::test]
@@ -5994,6 +7484,274 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_price_change_applies_after_old_rate_accrual_boundary() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-reprice", "owner-reprice@example.com");
+        let renter = session("renter-reprice", "renter-reprice@example.com");
+        configure_payment_profile(&store, &owner, "account-reprice", "profile-reprice").await;
+        insert_share(
+            &store,
+            "share-reprice",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-reprice", paid_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent paid Share for repricing");
+        let activated_at = Utc::now();
+        activate_subscription(&store, &subscription_id, activated_at).await;
+        let contract_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT id FROM market_service_contracts
+                 WHERE product_kind = 'share' AND product_ref = ?1",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read repriced Share contract");
+        let rate_started_at = activated_at + Duration::seconds(1);
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE market_service_contracts
+                 SET status = 'active', trial_seconds_remaining = 0,
+                     last_evaluated_at = ?2, updated_at = ?2 WHERE id = ?1",
+                params![contract_id, rate_started_at.to_rfc3339()],
+            )
+            .expect("finish repriced Share trial");
+
+        let proposal_id = store
+            .share_market_propose_price_change(
+                &owner,
+                &subscription_id,
+                ProposePriceChangeRequest {
+                    daily_rate_minor: 2_400,
+                    offer_revision: 1,
+                },
+            )
+            .await
+            .expect("propose Share price change");
+        store
+            .share_market_accept_price_change(&renter, &proposal_id)
+            .await
+            .expect("accept Share price change");
+        let before_reconcile: (i64, i64, i64, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.daily_rate_minor, seat.daily_rate_minor,
+                        contract.daily_rate_minor, change.status
+                 FROM share_market_subscriptions sub
+                 JOIN share_market_seats seat ON seat.id = sub.seat_id
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 JOIN share_market_price_changes change ON change.subscription_id = sub.id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read accepted unapplied Share price change");
+        assert_eq!(before_reconcile, (1_200, 1_200, 1_200, "accepted".into()));
+
+        let first_boundary = rate_started_at + Duration::seconds(10);
+        record_share_health(&store, "share-reprice", first_boundary).await;
+        store
+            .market_billing_reconcile(first_boundary)
+            .await
+            .expect("apply Share price change after old-rate accrual");
+        let after_reconcile: (i64, i64, i64, i64, i64, i64, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.daily_rate_minor, sub.offer_revision,
+                        seat.daily_rate_minor, seat.offer_revision,
+                        contract.daily_rate_minor, contract.offer_revision, change.status
+                 FROM share_market_subscriptions sub
+                 JOIN share_market_seats seat ON seat.id = sub.seat_id
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 JOIN share_market_price_changes change ON change.subscription_id = sub.id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read applied Share price change");
+        assert_eq!(
+            after_reconcile,
+            (2_400, 2, 2_400, 2, 2_400, 2, "applied".into())
+        );
+
+        let second_boundary = first_boundary + Duration::seconds(10);
+        record_share_health(&store, "share-reprice", second_boundary).await;
+        store
+            .market_billing_reconcile(second_boundary)
+            .await
+            .expect("accrue at new Share price");
+        let (balance_units, accruals): (i64, Vec<(i64, i64, i64)>) = {
+            let conn = store.conn.lock().await;
+            let balance_units = conn
+                .query_row(
+                    "SELECT account.balance_units
+                     FROM market_credit_accounts account
+                     JOIN market_service_contracts contract ON contract.account_id = account.id
+                     WHERE contract.id = ?1",
+                    params![contract_id],
+                    |row| row.get(0),
+                )
+                .expect("read repriced Share balance");
+            let accruals = conn
+                .prepare(
+                    "SELECT daily_rate_minor, billable_seconds, amount_units
+                     FROM market_accrual_entries WHERE contract_id = ?1
+                     ORDER BY created_at, id",
+                )
+                .expect("prepare repriced Share accruals")
+                .query_map(params![contract_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("query repriced Share accruals")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read repriced Share accruals");
+            (balance_units, accruals)
+        };
+        assert_eq!(balance_units, 1_200_i64 * 10_i64 + 2_400_i64 * 10_i64);
+        assert_eq!(
+            accruals,
+            vec![
+                (1_200, 10, 1_200_i64 * 10_i64),
+                (2_400, 10, 2_400_i64 * 10_i64),
+            ]
+        );
+        let event_count: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM market_billing_events
+                 WHERE contract_id = ?1 AND event_type = 'service_contract_price_changed'",
+                params![contract_id],
+                |row| row.get(0),
+            )
+            .expect("count Share contract price events");
+        assert_eq!(event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn price_change_roles_and_terminal_cancellation_are_enforced() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-price-flow", "owner-price-flow@example.com");
+        let renter = session("renter-price-flow", "renter-price-flow@example.com");
+        let stranger = session("stranger-price-flow", "stranger-price-flow@example.com");
+        configure_payment_profile(&store, &owner, "account-price-flow", "profile-price-flow").await;
+        insert_share(
+            &store,
+            "share-price-flow",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-price-flow", paid_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent Share for price flow");
+        activate_subscription(&store, &subscription_id, Utc::now()).await;
+
+        let proposal_id = store
+            .share_market_propose_price_change(
+                &owner,
+                &subscription_id,
+                ProposePriceChangeRequest {
+                    daily_rate_minor: 1_500,
+                    offer_revision: 1,
+                },
+            )
+            .await
+            .expect("propose rejected Share price");
+        assert!(matches!(
+            store
+                .share_market_accept_price_change(&stranger, &proposal_id)
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+        store
+            .share_market_reject_price_change(&renter, &proposal_id)
+            .await
+            .expect("reject Share price change");
+
+        let cancelled_id = store
+            .share_market_propose_price_change(
+                &owner,
+                &subscription_id,
+                ProposePriceChangeRequest {
+                    daily_rate_minor: 1_800,
+                    offer_revision: 1,
+                },
+            )
+            .await
+            .expect("propose cancelled Share price");
+        store
+            .share_market_cancel_price_change(&owner, &cancelled_id)
+            .await
+            .expect("cancel Share price change");
+
+        let accepted_id = store
+            .share_market_propose_price_change(
+                &owner,
+                &subscription_id,
+                ProposePriceChangeRequest {
+                    daily_rate_minor: 2_100,
+                    offer_revision: 1,
+                },
+            )
+            .await
+            .expect("propose terminal Share price");
+        store
+            .share_market_accept_price_change(&renter, &accepted_id)
+            .await
+            .expect("accept terminal Share price");
+        store
+            .share_market_request_release(&renter, &subscription_id, false, false)
+            .await
+            .expect("release Share with accepted price change");
+        let statuses = store
+            .conn
+            .lock()
+            .await
+            .prepare(
+                "SELECT status FROM share_market_price_changes
+                 WHERE subscription_id = ?1 ORDER BY created_at, id",
+            )
+            .expect("prepare Share price flow statuses")
+            .query_map(params![subscription_id], |row| row.get::<_, String>(0))
+            .expect("query Share price flow statuses")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read Share price flow statuses");
+        assert_eq!(statuses, vec!["rejected", "cancelled", "cancelled"]);
+    }
+
+    #[tokio::test]
     async fn rejected_paid_grant_terminates_precreated_billing_contract() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-paid-reject", "owner-paid-reject@example.com");
@@ -6147,6 +7905,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nonretryable_billing_revoke_is_dead_lettered_without_recreation() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session(
+            "owner-billing-terminal",
+            "owner-billing-terminal@example.com",
+        );
+        let renter = session(
+            "renter-billing-terminal",
+            "renter-billing-terminal@example.com",
+        );
+        insert_share(
+            &store,
+            "share-billing-terminal",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-billing-terminal", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent terminal billing seat");
+        let now = Utc::now();
+        activate_subscription(&store, &subscription_id, now).await;
+        {
+            let conn = store.conn.lock().await;
+            let (share_id, entitlement_id, renter_email): (String, String, String) = conn
+                .query_row(
+                    "SELECT share_id, entitlement_id, renter_email
+                     FROM share_market_subscriptions WHERE id = ?1",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read subscription for terminal billing suspension");
+            let tx = conn
+                .transaction()
+                .expect("begin terminal billing suspension");
+            enqueue_control_operation_tx(
+                &tx,
+                &share_id,
+                &subscription_id,
+                &entitlement_id,
+                "revoke",
+                &renter_email,
+                None,
+                &now.to_rfc3339(),
+            )
+            .expect("enqueue terminal billing revoke");
+            tx.execute(
+                "UPDATE share_market_subscriptions
+                 SET status = 'billing_suspend_pending' WHERE id = ?1",
+                params![subscription_id],
+            )
+            .expect("request terminal billing suspension");
+            tx.commit().expect("commit terminal billing suspension");
+        }
+        let dispatched_at = now + Duration::seconds(1);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(dispatched_at)
+                .await
+                .expect("dispatch terminal billing revoke")
+                .len(),
+            1
+        );
+        {
+            let conn = store.conn.lock().await;
+            let edit_id: String = conn
+                .query_row(
+                    "SELECT edit_id FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'revoke'",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read terminal billing revoke edit");
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
+                params![edit_id],
+            )
+            .expect("reject terminal billing revoke edit");
+            handle_control_edit_ack_with_metadata(
+                &conn,
+                &edit_id,
+                "rejected",
+                Some("permission denied"),
+                Some("permission_denied"),
+                Some(false),
+                &(dispatched_at + Duration::seconds(1)).to_rfc3339(),
+            )
+            .expect("record nonretryable billing revoke failure");
+        }
+
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(dispatched_at + Duration::days(1))
+                .await
+                .expect("reconcile terminal billing revoke")
+                .is_empty()
+        );
+        let terminal: (String, Option<String>, String, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT operation.status, operation.dead_lettered_at, sub.status,
+                        COUNT(operation.id),
+                        (SELECT COUNT(*) FROM operator_alert_signal_outbox signal
+                         WHERE signal.source_event_id =
+                               'share-control-dead-letter:' || operation.id)
+                 FROM share_control_operations operation
+                 INNER JOIN share_market_subscriptions sub ON sub.id = operation.subscription_id
+                 WHERE operation.subscription_id = ?1 AND operation.action = 'revoke'
+                 GROUP BY sub.id",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read terminal nonretryable billing revoke");
+        assert_eq!(terminal.0, "rejected");
+        assert!(terminal.1.is_some());
+        assert_eq!(terminal.2, SUB_BILLING_CONTROL_FAILED);
+        assert_eq!(terminal.3, 1);
+        assert_eq!(terminal.4, 1);
+
+        let conn = store.conn.lock().await;
+        let (entitlement_id, renter_email): (String, String) = conn
+            .query_row(
+                "SELECT entitlement_id, renter_email FROM share_market_subscriptions WHERE id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read terminal revoke identity");
+        let error = enqueue_control_operation_tx(
+            &conn,
+            "share-billing-terminal",
+            &subscription_id,
+            &entitlement_id,
+            "revoke",
+            &renter_email,
+            None,
+            &(dispatched_at + Duration::days(2)).to_rfc3339(),
+        )
+        .expect_err("terminal revoke cannot be recreated through another entry point");
+        assert!(error.to_string().contains("requires operator intervention"));
+    }
+
+    #[tokio::test]
     async fn concurrent_rent_allows_only_one_subscription() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-race", "owner-race@example.com");
@@ -6206,10 +8119,11 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
+        configure_payment_profile(&store, &owner, "account-control", "profile-control").await;
         let (listing_a, seat_a) =
             create_listing(&store, &owner, "share-control-a", free_seat()).await;
         let (_listing_b, seat_b) =
-            create_listing(&store, &owner, "share-control-b", free_seat()).await;
+            create_listing(&store, &owner, "share-control-b", paid_seat()).await;
         let subscription_id = store
             .share_market_rent_seat(&renter, &seat_a, RentSeatRequest { offer_revision: 1 })
             .await
@@ -6263,6 +8177,17 @@ mod tests {
                 )
                 .expect("read denied Share access")
             );
+            assert!(
+                !crate::market_access::product_access_allowed_tx(
+                    &conn,
+                    &owner.user_id,
+                    &renter.user_id,
+                    &renter.email,
+                    crate::market_access::PRODUCT_SHARE,
+                    crate::market_access::PRICING_PAID,
+                )
+                .expect("read denied paid Share access")
+            );
             crate::market_access::set_product_access_decision_tx(
                 &conn,
                 &owner.user_id,
@@ -6270,7 +8195,7 @@ mod tests {
                 &renter.user_id,
                 &renter.email,
                 crate::market_access::PRODUCT_SHARE,
-                crate::market_access::PRICING_FREE,
+                crate::market_access::PRICING_PAID,
                 crate::market_access::DECISION_ALLOW,
                 &owner.user_id,
                 &Utc::now().to_rfc3339(),
@@ -6345,11 +8270,13 @@ mod tests {
                 params![first_edit],
             )
             .expect("reject first edit");
-            handle_control_edit_ack(
+            handle_control_edit_ack_with_metadata(
                 &conn,
                 &first_edit,
                 "rejected",
                 Some("expected config revision 1 but found 2"),
+                Some("config_revision_conflict"),
+                Some(true),
                 &now.to_rfc3339(),
             )
             .expect("retry config conflict");
@@ -6369,7 +8296,9 @@ mod tests {
         }
         assert_eq!(
             store
-                .share_market_reconcile_and_dispatch(now + Duration::seconds(1))
+                .share_market_reconcile_and_dispatch(
+                    now + Duration::seconds(CONTROL_RETRY_BASE_SECS),
+                )
                 .await
                 .expect("redispatch grant")
                 .len(),
@@ -6424,7 +8353,7 @@ mod tests {
                 &second_edit,
                 "applied",
                 None,
-                &(now + Duration::seconds(2)).to_rfc3339(),
+                &(now + Duration::seconds(CONTROL_RETRY_BASE_SECS + 1)).to_rfc3339(),
             )
             .expect("apply retried control operation");
             handle_control_edit_ack(
@@ -6432,7 +8361,7 @@ mod tests {
                 &second_edit,
                 "rejected",
                 Some("late duplicate rejection"),
-                &(now + Duration::seconds(3)).to_rfc3339(),
+                &(now + Duration::seconds(CONTROL_RETRY_BASE_SECS + 2)).to_rfc3339(),
             )
             .expect("ignore late terminal ack");
         }
@@ -6453,13 +8382,98 @@ mod tests {
         assert_eq!(delayed_subscription_status, SUB_GRANT_PENDING);
         set_entitlement(&store, &subscription_id).await;
         store
-            .share_market_reconcile_and_dispatch(now + Duration::seconds(4))
+            .share_market_reconcile_and_dispatch(
+                now + Duration::seconds(CONTROL_RETRY_BASE_SECS + 3),
+            )
             .await
             .expect("confirm delayed descriptor");
         assert_eq!(
             subscription_status(&store, &subscription_id).await,
             "active_free"
         );
+    }
+
+    #[tokio::test]
+    async fn applied_ack_rolls_back_descriptor_and_edit_when_control_update_fails() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-ack-rollback", "owner-ack-rollback@example.com");
+        let renter = session("renter-ack-rollback", "renter-ack-rollback@example.com");
+        insert_share(
+            &store,
+            "share-ack-rollback",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-ack-rollback", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent rollback seat");
+        let now = Utc::now();
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(now)
+                .await
+                .expect("dispatch rollback grant")
+                .len(),
+            1
+        );
+        let entitlement_id = subscription_entitlement(&store, &subscription_id).await;
+        let conn = store.conn.lock().await;
+        let edit_id: String = conn
+            .query_row(
+                "SELECT edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read rollback grant edit");
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_share_control_ack
+             BEFORE UPDATE OF status ON share_control_operations
+             WHEN NEW.status = 'applied'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected Share control ACK failure');
+             END;",
+        )
+        .expect("install ACK failure trigger");
+        {
+            let tx = conn
+                .unchecked_transaction()
+                .expect("begin failing ACK transaction");
+            tx.execute(
+                "UPDATE share_edit_requests
+                 SET status = 'applied', updated_at = ?2, applied_at = ?2
+                 WHERE id = ?1 AND status = 'pending'",
+                params![edit_id, now.to_rfc3339()],
+            )
+            .expect("stage applied edit before injected failure");
+            let error = handle_control_edit_ack(&tx, &edit_id, "applied", None, &now.to_rfc3339())
+                .expect_err("control operation update must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected Share control ACK failure")
+            );
+        }
+        conn.execute_batch("DROP TRIGGER fail_share_control_ack;")
+            .expect("remove ACK failure trigger");
+        let (edit_status, operation_status, grants_json): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT edit.status, operation.status, share.user_grants_json
+                 FROM share_edit_requests edit
+                 JOIN share_control_operations operation ON operation.edit_id = edit.id
+                 JOIN shares share ON share.share_id = operation.share_id
+                 WHERE edit.id = ?1",
+                params![edit_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read rolled back ACK state");
+        assert_eq!(edit_status, "pending");
+        assert_eq!(operation_status, "dispatched");
+        assert!(!active_entitlement(grants_json.as_deref(), &entitlement_id));
     }
 
     #[tokio::test]
@@ -6758,11 +8772,8 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("read retried revoke retirement");
-        assert_eq!(replacement_retirement.0, SEAT_DISABLED);
-        assert_eq!(
-            replacement_retirement.1.as_deref(),
-            Some(second_subscription.as_str())
-        );
+        assert_eq!(replacement_retirement.0, "available");
+        assert!(replacement_retirement.1.is_none());
     }
 
     #[tokio::test]
@@ -7345,5 +9356,374 @@ mod tests {
                 .status,
             "credit_limit_reached"
         );
+    }
+
+    #[tokio::test]
+    async fn federated_sale_blocks_share_market_listing_and_reopen() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-federated", "owner-federated@example.com");
+        insert_share(
+            &store,
+            "share-federated",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(
+                &conn,
+                &owner,
+                "USD",
+                50_000,
+                &Utc::now().to_rfc3339(),
+            );
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes' WHERE share_id = 'share-federated'",
+                [],
+            )
+            .expect("enable federated sale");
+        }
+        assert!(matches!(
+            store
+                .share_market_create_listing(
+                    &owner,
+                    CreateListingRequest {
+                        share_id: "share-federated".into(),
+                        seats: vec![free_seat()],
+                    },
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET for_sale = 'No' WHERE share_id = 'share-federated'",
+                [],
+            )
+            .expect("disable federated sale");
+        let (listing_id, _) = create_listing(&store, &owner, "share-federated", free_seat()).await;
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("close listing before reopen test");
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET for_sale = 'Yes' WHERE share_id = 'share-federated'",
+                [],
+            )
+            .expect("re-enable federated sale");
+        assert!(matches!(
+            store
+                .share_market_add_seat(&owner, &listing_id, free_seat())
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn share_retirement_cascades_market_state_and_billing() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-delete", "owner-delete@example.com");
+        let renter = session("renter-delete", "renter-delete@example.com");
+        configure_payment_profile(&store, &owner, "account-delete", "profile-delete").await;
+        insert_share(
+            &store,
+            "share-delete",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-delete", paid_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent Share before deletion");
+        activate_subscription(&store, &subscription_id, Utc::now()).await;
+
+        {
+            let conn = store.conn.lock().await;
+            crate::store::retire_share_tx(&conn, "share-delete", "installation-share-delete")
+                .expect("retire Share transactionally");
+        }
+        let state: (i64, String, Option<String>, String, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM shares WHERE share_id = 'share-delete'),
+                    listing.status, listing.deleted_at, seat.status, sub.status,
+                    (SELECT COUNT(*) FROM share_control_operations operation
+                     WHERE operation.subscription_id = sub.id
+                       AND operation.status IN ('pending', 'dispatched'))
+                 FROM share_market_listings listing
+                 INNER JOIN share_market_seats seat ON seat.listing_id = listing.id
+                 INNER JOIN share_market_subscriptions sub ON sub.seat_id = seat.id
+                 WHERE listing.id = ?1",
+                params![listing_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read retired Share market state");
+        assert_eq!(state.0, 0);
+        assert_eq!(state.1, "closed");
+        assert!(state.2.is_some());
+        assert_eq!(state.3, SEAT_DELETED);
+        assert_eq!(state.4, SUB_RELEASED);
+        assert_eq!(state.5, 0);
+        let contract_status: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status FROM market_service_contracts
+                 WHERE product_kind = 'share' AND product_ref = ?1",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read terminated Share contract");
+        assert_eq!(contract_status, "terminated");
+    }
+
+    #[tokio::test]
+    async fn share_owner_rebind_ends_old_billing_and_transfers_control() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-transfer", "owner-transfer@example.com");
+        let new_owner = session("new-owner-transfer", "new-owner-transfer@example.com");
+        let renter = session("renter-transfer", "renter-transfer@example.com");
+        configure_payment_profile(&store, &owner, "account-transfer", "profile-transfer").await;
+        insert_share(
+            &store,
+            "share-transfer",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-transfer", paid_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent Share before owner transfer");
+        activate_subscription(&store, &subscription_id, Utc::now()).await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET owner_email = ?2 WHERE share_id = ?1",
+                params!["share-transfer", new_owner.email],
+            )
+            .expect("transfer Share descriptor owner");
+            rebind_share_market_owner_tx(
+                &conn,
+                "share-transfer",
+                &new_owner.user_id,
+                &new_owner.email,
+                &now,
+            )
+            .expect("rebind Share market owner");
+        }
+        let state: (String, String, String, String, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT listing.owner_user_id, listing.owner_email, sub.owner_user_id,
+                        sub.status, contract.status
+                 FROM share_market_listings listing
+                 INNER JOIN share_market_subscriptions sub ON sub.listing_id = listing.id
+                 INNER JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 WHERE listing.id = ?1",
+                params![listing_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read rebound Share market state");
+        assert_eq!(state.0, new_owner.user_id);
+        assert_eq!(state.1, new_owner.email);
+        assert_eq!(state.2, new_owner.user_id);
+        assert_eq!(state.3, SUB_REVOKE_PENDING);
+        assert_eq!(state.4, "terminated");
+    }
+
+    #[tokio::test]
+    async fn revoke_retries_back_off_then_dead_letter_and_alert() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-dead-letter", "owner-dead-letter@example.com");
+        let renter = session("renter-dead-letter", "renter-dead-letter@example.com");
+        insert_share(
+            &store,
+            "share-dead-letter",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-dead-letter", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent dead-letter Share seat");
+        activate_subscription(&store, &subscription_id, Utc::now()).await;
+        store
+            .share_market_request_release(&owner, &subscription_id, true, false)
+            .await
+            .expect("request revoke before retry exhaustion");
+        let mut dispatched_at = Utc::now() + Duration::seconds(1);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(dispatched_at)
+                .await
+                .expect("dispatch initial revoke")
+                .len(),
+            1
+        );
+
+        for attempt in 1..=MAX_CONTROL_ATTEMPTS {
+            let edit_id: String = store
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT edit_id FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'revoke'",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read retry revoke edit");
+            let rejected_at = dispatched_at + Duration::seconds(1);
+            {
+                let conn = store.conn.lock().await;
+                conn.execute(
+                    "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
+                    params![edit_id],
+                )
+                .expect("reject retry revoke edit");
+                handle_control_edit_ack_with_metadata(
+                    &conn,
+                    &edit_id,
+                    "rejected",
+                    Some("temporary control failure"),
+                    Some("temporary_failure"),
+                    Some(true),
+                    &rejected_at.to_rfc3339(),
+                )
+                .expect("record retryable revoke failure");
+            }
+            if attempt == MAX_CONTROL_ATTEMPTS {
+                break;
+            }
+            let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0);
+            let delay = CONTROL_RETRY_BASE_SECS
+                .saturating_mul(2_i64.saturating_pow(exponent))
+                .min(CONTROL_RETRY_MAX_SECS);
+            assert!(
+                store
+                    .share_market_reconcile_and_dispatch(
+                        rejected_at + Duration::seconds(delay - 1),
+                    )
+                    .await
+                    .expect("respect revoke retry backoff")
+                    .is_empty()
+            );
+            dispatched_at = rejected_at + Duration::seconds(delay);
+            assert_eq!(
+                store
+                    .share_market_reconcile_and_dispatch(dispatched_at)
+                    .await
+                    .expect("dispatch backed-off revoke")
+                    .len(),
+                1
+            );
+        }
+
+        let terminal: (String, i64, Option<String>, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT operation.status, operation.attempts, operation.dead_lettered_at,
+                        sub.status,
+                        (SELECT COUNT(*) FROM operator_alert_signal_outbox signal
+                         WHERE signal.source_event_id = 'share-control-dead-letter:' || operation.id)
+                 FROM share_control_operations operation
+                 INNER JOIN share_market_subscriptions sub ON sub.id = operation.subscription_id
+                 WHERE operation.subscription_id = ?1 AND operation.action = 'revoke'",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read dead-lettered revoke");
+        assert_eq!(terminal.0, "rejected");
+        assert_eq!(terminal.1, MAX_CONTROL_ATTEMPTS);
+        assert!(terminal.2.is_some());
+        assert_eq!(terminal.3, SUB_REVOKE_FAILED);
+        assert_eq!(terminal.4, 1);
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET status = 'billing_control_failed' WHERE id = ?1",
+                params![subscription_id],
+            )
+            .expect("seed exhausted billing suspension");
+        }
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(dispatched_at + Duration::days(1))
+                .await
+                .expect("reconcile exhausted billing suspension")
+                .is_empty()
+        );
+        let preserved: (String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, COUNT(operation.id)
+                 FROM share_market_subscriptions sub
+                 LEFT JOIN share_control_operations operation
+                   ON operation.subscription_id = sub.id AND operation.action = 'revoke'
+                 WHERE sub.id = ?1
+                 GROUP BY sub.id",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read preserved dead-lettered billing suspension");
+        assert_eq!(preserved.0, SUB_BILLING_CONTROL_FAILED);
+        assert_eq!(preserved.1, 1);
     }
 }

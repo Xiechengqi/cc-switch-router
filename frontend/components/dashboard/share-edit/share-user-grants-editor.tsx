@@ -1,7 +1,7 @@
 "use client";
 
-import { Button, Input, ListBox, Modal, Select } from "@heroui/react";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Button, Input, ListBox, Modal, Select, Tooltip } from "@heroui/react";
+import { Info, Pencil, Plus, Trash2 } from "lucide-react";
 import * as React from "react";
 
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
@@ -11,6 +11,7 @@ import type {
   ShareUserPolicy,
 } from "@/lib/types";
 import { routerShareMarketManagedEmails } from "@/lib/share-settings";
+import { formatDateTime, formatNumber } from "@/lib/utils";
 import type { PriceApp, ShareEditDraft } from "./share-edit-draft";
 
 type GrantDraft = {
@@ -218,15 +219,31 @@ export function ShareUserGrantsEditor({
   };
 
   const limit = (value?: number) =>
-    value == null ? t("common.unlimited") : value.toLocaleString();
+    value == null ? t("common.unlimited") : formatNumber(value);
   const expiry = (value?: number) =>
-    value == null ? t("dashboard.permanent") : new Date(value).toLocaleString();
+    value == null ? t("dashboard.permanent") : formatDateTime(value);
 
   return (
     <div className="grid gap-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="mono-label text-muted-foreground">{t("dashboard.userLimit.title")}</div>
+          <div className="flex items-center gap-1">
+            <div className="mono-label text-muted-foreground">{t("dashboard.userLimit.title")}</div>
+            <Tooltip>
+              <Tooltip.Trigger>
+                <Button
+                  isIconOnly
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 w-6 min-w-6 text-muted-foreground"
+                  aria-label={t("dashboard.userLimit.parallelScopeHint")}
+                >
+                  <Info className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip.Trigger>
+              <Tooltip.Content>{t("dashboard.userLimit.parallelScopeHint")}</Tooltip.Content>
+            </Tooltip>
+          </div>
           <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.userLimit.hint")}</p>
         </div>
         <Button size="sm" variant="outline" onClick={openAdd}>

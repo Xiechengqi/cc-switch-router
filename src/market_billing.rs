@@ -1,7 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration as StdDuration;
 
-use crate::db::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use crate::db::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
@@ -25,9 +27,13 @@ const MAX_USD_CNY_RATE_MICROS: i64 = 100 * USD_CNY_RATE_SCALE;
 const MONEY_UNITS_PER_MINOR: i64 = 86_400;
 const NEAR_CREDIT_LIMIT_BPS: i64 = 8_000;
 const DEFAULT_SETTLEMENT_GRACE_HOURS: i64 = 24;
+const DISPUTE_RESPONSE_HOURS: i64 = 72;
+const DISPUTE_AUTO_RESOLVE_DAYS: i64 = 7;
 const HEALTH_FRESHNESS_SECS: i64 = 90;
 const MAX_ACCRUAL_GAP_SECS: i64 = 20;
 const BILLING_CYCLE_SECS: u64 = 5;
+const MAX_ACCOUNTS_PER_RECONCILE: usize = 100;
+const MAX_MAINTENANCE_ROWS_PER_RECONCILE: usize = 200;
 pub(crate) const MAX_DAILY_RATE_MINOR: i64 = 100_000_000;
 
 const ACCOUNT_ACTIVE: &str = "active";
@@ -174,6 +180,23 @@ pub struct BillingInvoiceView {
     pub lines: Vec<BillingInvoiceLineView>,
     pub declaration: Option<PaymentDeclarationView>,
     pub dispute: Option<BillingDisputeView>,
+    pub credit_notes: Vec<CreditNoteView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditNoteView {
+    pub id: String,
+    pub kind: String,
+    pub amount_minor: i64,
+    pub amount_usd_minor: i64,
+    pub amount_cny_minor: i64,
+    pub currency: String,
+    pub reason: String,
+    pub external_reference: Option<String>,
+    pub status: String,
+    pub created_by_email: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +207,9 @@ pub struct BillingDisputeView {
     pub status: String,
     pub resolution: Option<String>,
     pub created_at: String,
+    pub respond_by: Option<String>,
+    pub escalated_at: Option<String>,
+    pub auto_resolve_at: Option<String>,
     pub resolved_at: Option<String>,
 }
 
@@ -290,6 +316,15 @@ struct VoidInvoiceRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateCreditNoteRequest {
+    kind: String,
+    amount_minor: i64,
+    reason: String,
+    external_reference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InvoiceHistoryQuery {
     before_sequence: Option<i64>,
     limit: Option<usize>,
@@ -316,6 +351,9 @@ struct ContractRow {
     trial_seconds_remaining: i64,
     health_state: String,
     last_evaluated_at: String,
+    buyer_user_id: String,
+    supplier_user_id: String,
+    currency: String,
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +429,10 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/market-billing/invoices/:invoice_id/disputes",
             post(open_dispute),
+        )
+        .route(
+            "/v1/market-billing/invoices/:invoice_id/credit-notes",
+            post(create_credit_note),
         )
         .route(
             "/v1/admin/market-billing/disputes",
@@ -690,7 +732,40 @@ async fn open_dispute(
     state
         .store
         .market_billing_open_dispute(&session, &invoice_id, &reason)
+        .await
+        .map(|actions| dispatch_actions(&state, actions))?
+        .await;
+    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+}
+
+async fn create_credit_note(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(invoice_id): Path<String>,
+    Json(input): Json<CreateCreditNoteRequest>,
+) -> Result<Json<BillingDashboardView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let kind = input.kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "service_credit" | "external_refund") {
+        return Err(AppError::BadRequest(
+            "credit note kind must be service_credit or external_refund".into(),
+        ));
+    }
+    let reason = clean_optional(Some(input.reason), 2_000, "reason")?
+        .ok_or_else(|| AppError::BadRequest("reason is required".into()))?;
+    let external_reference = clean_optional(input.external_reference, 200, "externalReference")?;
+    let actions = state
+        .store
+        .market_billing_create_credit_note(
+            &session,
+            &invoice_id,
+            &kind,
+            input.amount_minor,
+            &reason,
+            external_reference.as_deref(),
+        )
         .await?;
+    dispatch_actions(&state, actions).await;
     Ok(Json(state.store.market_billing_dashboard(&session).await?))
 }
 
@@ -841,7 +916,7 @@ pub(crate) async fn dispatch_actions(state: &ServerState, actions: Vec<BillingAc
     }
 }
 
-fn record_event_tx(
+pub(crate) fn record_event_tx(
     tx: &Connection,
     account_id: Option<&str>,
     contract_id: Option<&str>,
@@ -1449,18 +1524,19 @@ pub(crate) fn activate_contract_tx(
         &currency,
     )?;
     let account_id = ensure_account_tx(tx, &normalized, &grant, now)?;
-    let trial_seconds = if let Some(replacement_of) = normalized.replacement_of {
-        tx.query_row(
-            "SELECT trial_seconds_remaining FROM market_service_contracts WHERE id = ?1",
-            params![replacement_of],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(map_db("read replacement trial balance"))?
-        .unwrap_or(0)
-    } else {
-        TRIAL_SECONDS
-    };
+    let mut trial_seconds = ensure_trial_ledger_tx(tx, &normalized, now)?;
+    if let Some(replacement_of) = normalized.replacement_of {
+        let replacement_remaining = tx
+            .query_row(
+                "SELECT trial_seconds_remaining FROM market_service_contracts WHERE id = ?1",
+                params![replacement_of],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_db("read replacement trial balance"))?
+            .unwrap_or(0);
+        trial_seconds = trial_seconds.min(replacement_remaining);
+    }
     let status = if trial_seconds > 0 {
         CONTRACT_TRIAL
     } else {
@@ -1518,6 +1594,190 @@ pub(crate) fn activate_contract_tx(
     Ok(id)
 }
 
+fn ensure_trial_ledger_tx(
+    tx: &Transaction<'_>,
+    input: &ActivateContractInput<'_>,
+    now: &str,
+) -> Result<i64, AppError> {
+    tx.execute(
+        "INSERT INTO market_trial_ledgers (
+            buyer_user_id, supplier_user_id, product_kind, service_ref, currency,
+            allowance_seconds, consumed_seconds, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
+         ON CONFLICT(buyer_user_id, supplier_user_id, product_kind, service_ref, currency)
+         DO UPDATE SET allowance_seconds = MAX(market_trial_ledgers.allowance_seconds,
+                                                excluded.allowance_seconds),
+                       updated_at = excluded.updated_at",
+        params![
+            input.buyer_user_id,
+            input.supplier_user_id,
+            input.product_kind,
+            input.service_ref,
+            input.currency,
+            TRIAL_SECONDS,
+            now,
+        ],
+    )
+    .map_err(map_db("ensure persistent market trial ledger"))?;
+    tx.query_row(
+        "SELECT MAX(allowance_seconds - consumed_seconds, 0)
+         FROM market_trial_ledgers
+         WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+           AND product_kind = ?3 AND service_ref = ?4 AND currency = ?5",
+        params![
+            input.buyer_user_id,
+            input.supplier_user_id,
+            input.product_kind,
+            input.service_ref,
+            input.currency,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(map_db("read persistent market trial balance"))
+}
+
+fn free_usage_allowance_seconds(free_duration_days: u32) -> Result<i64, AppError> {
+    i64::from(free_duration_days)
+        .checked_mul(86_400)
+        .ok_or_else(|| AppError::BadRequest("free usage duration is too large".into()))
+}
+
+fn ensure_free_usage_scope_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    product_kind: &str,
+    scope_kind: &str,
+    scope_ref: &str,
+    allowance_seconds: i64,
+    now: &str,
+) -> Result<i64, AppError> {
+    conn.execute(
+        "INSERT INTO market_free_usage_ledgers (
+            buyer_user_id, supplier_user_id, product_kind, scope_kind, scope_ref,
+            allowance_seconds, granted_seconds, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
+         ON CONFLICT(buyer_user_id, supplier_user_id, product_kind, scope_kind, scope_ref)
+         DO UPDATE SET allowance_seconds = MAX(market_free_usage_ledgers.allowance_seconds,
+                                                excluded.allowance_seconds),
+                       updated_at = excluded.updated_at",
+        params![
+            buyer_user_id,
+            supplier_user_id,
+            product_kind,
+            scope_kind,
+            scope_ref,
+            allowance_seconds,
+            now,
+        ],
+    )
+    .map_err(map_db("ensure persistent free usage ledger"))?;
+    conn.query_row(
+        "SELECT MAX(allowance_seconds - granted_seconds, 0)
+         FROM market_free_usage_ledgers
+         WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND product_kind = ?3
+           AND scope_kind = ?4 AND scope_ref = ?5",
+        params![
+            buyer_user_id,
+            supplier_user_id,
+            product_kind,
+            scope_kind,
+            scope_ref,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(map_db("read persistent free usage balance"))
+}
+
+pub(crate) fn free_usage_available_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    product_kind: &str,
+    service_ref: &str,
+    free_duration_days: u32,
+    now: &str,
+) -> Result<bool, AppError> {
+    let allowance_seconds = free_usage_allowance_seconds(free_duration_days)?;
+    let service_remaining = ensure_free_usage_scope_tx(
+        conn,
+        buyer_user_id,
+        supplier_user_id,
+        product_kind,
+        "service",
+        service_ref,
+        allowance_seconds,
+        now,
+    )?;
+    let supplier_remaining = ensure_free_usage_scope_tx(
+        conn,
+        buyer_user_id,
+        supplier_user_id,
+        product_kind,
+        "supplier",
+        supplier_user_id,
+        allowance_seconds,
+        now,
+    )?;
+    Ok(service_remaining > 0 && supplier_remaining > 0)
+}
+
+pub(crate) fn claim_free_usage_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    product_kind: &str,
+    service_ref: &str,
+    free_duration_days: u32,
+    now: &str,
+) -> Result<i64, AppError> {
+    let allowance_seconds = free_usage_allowance_seconds(free_duration_days)?;
+    let service_remaining = ensure_free_usage_scope_tx(
+        conn,
+        buyer_user_id,
+        supplier_user_id,
+        product_kind,
+        "service",
+        service_ref,
+        allowance_seconds,
+        now,
+    )?;
+    let supplier_remaining = ensure_free_usage_scope_tx(
+        conn,
+        buyer_user_id,
+        supplier_user_id,
+        product_kind,
+        "supplier",
+        supplier_user_id,
+        allowance_seconds,
+        now,
+    )?;
+    let granted_seconds = service_remaining.min(supplier_remaining);
+    if granted_seconds <= 0 {
+        return Ok(0);
+    }
+    for (scope_kind, scope_ref) in [("service", service_ref), ("supplier", supplier_user_id)] {
+        conn.execute(
+            "UPDATE market_free_usage_ledgers
+             SET granted_seconds = MIN(allowance_seconds, granted_seconds + ?6),
+                 updated_at = ?7
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND product_kind = ?3
+               AND scope_kind = ?4 AND scope_ref = ?5",
+            params![
+                buyer_user_id,
+                supplier_user_id,
+                product_kind,
+                scope_kind,
+                scope_ref,
+                granted_seconds,
+                now,
+            ],
+        )
+        .map_err(map_db("claim persistent free usage"))?;
+    }
+    Ok(granted_seconds)
+}
+
 pub(crate) fn terminate_contract_tx(
     tx: &Connection,
     product_kind: &str,
@@ -1537,6 +1797,9 @@ pub(crate) fn terminate_contract_tx(
     let Some((contract_id, account_id)) = row else {
         return Ok(());
     };
+    if product_kind == "share" {
+        crate::share_market::cancel_open_price_changes_tx(tx, product_ref, reason, now)?;
+    }
     tx.execute(
         "UPDATE market_service_contracts
          SET status = 'terminated', desired_control_state = 'terminated',
@@ -1927,42 +2190,59 @@ impl AppStore {
     }
 }
 
-fn service_views_for_account(
+fn service_views_for_actor_accounts(
     conn: &Connection,
-    account_id: &str,
-) -> Result<Vec<BillingServiceView>, AppError> {
+    actor_user_id: &str,
+) -> Result<HashMap<String, Vec<BillingServiceView>>, AppError> {
     conn.prepare(
-        "SELECT id, product_kind, product_ref, service_ref, service_label, status,
-                health_state, daily_rate_minor, offer_revision, trial_seconds_remaining,
-                activated_at, suspended_at, terminated_at
-         FROM market_service_contracts
-         WHERE account_id = ?1 AND status != 'terminated'
-         ORDER BY activated_at, id",
+        "SELECT contract.account_id, contract.id, contract.product_kind,
+                contract.product_ref, contract.service_ref, contract.service_label,
+                contract.status, contract.health_state, contract.daily_rate_minor,
+                contract.offer_revision, contract.trial_seconds_remaining,
+                contract.activated_at, contract.suspended_at, contract.terminated_at
+         FROM market_service_contracts contract
+         JOIN market_credit_accounts account ON account.id = contract.account_id
+         WHERE (account.buyer_user_id = ?1 OR account.supplier_user_id = ?1)
+           AND account.currency = 'USD' AND contract.status != 'terminated'
+         ORDER BY contract.account_id, contract.activated_at, contract.id",
     )
     .and_then(|mut statement| {
         statement
-            .query_map(params![account_id], |row| {
-                Ok(BillingServiceView {
-                    id: row.get(0)?,
-                    product_kind: row.get(1)?,
-                    product_ref: row.get(2)?,
-                    service_ref: row.get(3)?,
-                    service_label: row.get(4)?,
-                    status: row.get(5)?,
-                    health_state: row.get(6)?,
-                    daily_rate_minor: row.get(7)?,
-                    offer_revision: row.get(8)?,
-                    trial_seconds_remaining: row.get(9)?,
-                    activated_at: row.get(10)?,
-                    suspended_at: row.get(11)?,
-                    terminated_at: row.get(12)?,
-                })
+            .query_map(params![actor_user_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    BillingServiceView {
+                        id: row.get(1)?,
+                        product_kind: row.get(2)?,
+                        product_ref: row.get(3)?,
+                        service_ref: row.get(4)?,
+                        service_label: row.get(5)?,
+                        status: row.get(6)?,
+                        health_state: row.get(7)?,
+                        daily_rate_minor: row.get(8)?,
+                        offer_revision: row.get(9)?,
+                        trial_seconds_remaining: row.get(10)?,
+                        activated_at: row.get(11)?,
+                        suspended_at: row.get(12)?,
+                        terminated_at: row.get(13)?,
+                    },
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()
+    })
+    .map(|rows| {
+        rows.into_iter().fold(
+            HashMap::<String, Vec<BillingServiceView>>::new(),
+            |mut map, (account_id, service)| {
+                map.entry(account_id).or_default().push(service);
+                map
+            },
+        )
     })
     .map_err(map_db("read billing dashboard services"))
 }
 
+#[cfg(test)]
 fn declaration_view_for_invoice(
     conn: &Connection,
     invoice_id: &str,
@@ -1992,12 +2272,14 @@ fn declaration_view_for_invoice(
     .map_err(map_db("read billing dashboard payment declaration"))
 }
 
+#[cfg(test)]
 fn dispute_view_for_invoice(
     conn: &Connection,
     invoice_id: &str,
 ) -> Result<Option<BillingDisputeView>, AppError> {
     conn.query_row(
-        "SELECT id, reason, status, resolution, created_at, resolved_at
+        "SELECT id, reason, status, resolution, created_at, respond_by,
+                escalated_at, auto_resolve_at, resolved_at
          FROM market_billing_disputes
          WHERE invoice_id = ?1
          ORDER BY created_at DESC LIMIT 1",
@@ -2009,7 +2291,10 @@ fn dispute_view_for_invoice(
                 status: row.get(2)?,
                 resolution: row.get(3)?,
                 created_at: row.get(4)?,
-                resolved_at: row.get(5)?,
+                respond_by: row.get(5)?,
+                escalated_at: row.get(6)?,
+                auto_resolve_at: row.get(7)?,
+                resolved_at: row.get(8)?,
             })
         },
     )
@@ -2017,6 +2302,53 @@ fn dispute_view_for_invoice(
     .map_err(map_db("read billing dashboard dispute"))
 }
 
+#[cfg(test)]
+fn credit_notes_for_invoice(
+    conn: &Connection,
+    invoice_id: &str,
+) -> Result<Vec<CreditNoteView>, AppError> {
+    conn.prepare(
+        "SELECT id, kind, amount_minor, currency, reason, external_reference,
+                status, created_by_email, created_at
+         FROM market_credit_notes WHERE invoice_id = ?1 ORDER BY created_at, id",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![invoice_id], |row| {
+                let amount_minor = row.get::<_, i64>(2)?;
+                Ok(CreditNoteView {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    amount_minor,
+                    amount_usd_minor: amount_minor,
+                    amount_cny_minor: 0,
+                    currency: row.get(3)?,
+                    reason: row.get(4)?,
+                    external_reference: row.get(5)?,
+                    status: row.get(6)?,
+                    created_by_email: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .map(|mut notes| {
+        let rate = conn
+            .query_row(
+                "SELECT usd_cny_rate_micros FROM market_invoices WHERE id = ?1",
+                params![invoice_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(DEFAULT_USD_CNY_RATE_MICROS);
+        for note in &mut notes {
+            note.amount_cny_minor = usd_minor_to_cny_minor(note.amount_minor, rate);
+        }
+        notes
+    })
+    .map_err(map_db("read market invoice credit notes"))
+}
+
+#[cfg(test)]
 fn invoice_view(
     conn: &Connection,
     invoice_id: &str,
@@ -2112,8 +2444,256 @@ fn invoice_view(
         payment_profile_updated_at: header.14,
         declaration: declaration_view_for_invoice(conn, invoice_id)?,
         dispute: dispute_view_for_invoice(conn, invoice_id)?,
+        credit_notes: credit_notes_for_invoice(conn, invoice_id)?,
         lines,
     }))
+}
+
+fn invoice_views(
+    conn: &Connection,
+    invoice_ids: &[String],
+) -> Result<HashMap<String, BillingInvoiceView>, AppError> {
+    const CHUNK_SIZE: usize = 200;
+    let mut views = HashMap::new();
+    for chunk in invoice_ids.chunks(CHUNK_SIZE) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let headers_sql = format!(
+            "SELECT id, sequence, status, amount_minor, amount_cny_minor,
+                    usd_cny_rate_micros, currency, due_at, deadline_at,
+                    opened_at, declared_at, paid_at, payment_methods_json,
+                    payment_contacts_json, payment_profile_updated_at
+             FROM market_invoices WHERE id IN ({placeholders})"
+        );
+        let headers = conn
+            .prepare(&headers_sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params_from_iter(chunk.iter().cloned()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, Option<String>>(10)?,
+                            row.get::<_, Option<String>>(11)?,
+                            row.get::<_, String>(12)?,
+                            row.get::<_, String>(13)?,
+                            row.get::<_, String>(14)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read billing invoice headers batch"))?;
+        for header in headers {
+            let currency = normalize_currency(&header.6)?;
+            let payment_methods = serde_json::from_str(&header.12).map_err(|_| {
+                AppError::Internal("stored invoice payment methods are invalid".into())
+            })?;
+            let contacts = serde_json::from_str(&header.13).map_err(|_| {
+                AppError::Internal("stored invoice payment contacts are invalid".into())
+            })?;
+            views.insert(
+                header.0.clone(),
+                BillingInvoiceView {
+                    id: header.0,
+                    sequence: header.1,
+                    status: header.2,
+                    amount_minor: header.3,
+                    amount_usd_minor: header.3,
+                    amount_cny_minor: header.4,
+                    usd_cny_rate_micros: header.5,
+                    currency,
+                    due_at: header.7,
+                    deadline_at: header.8,
+                    opened_at: header.9,
+                    declared_at: header.10,
+                    paid_at: header.11,
+                    payment_methods,
+                    contacts,
+                    payment_profile_updated_at: header.14,
+                    lines: Vec::new(),
+                    declaration: None,
+                    dispute: None,
+                    credit_notes: Vec::new(),
+                },
+            );
+        }
+
+        let lines_sql = format!(
+            "SELECT invoice_id, id, contract_id, product_kind, product_ref,
+                    service_ref, service_label, daily_rate_minor, billable_seconds,
+                    amount_minor, amount_cny_minor, service_started_at,
+                    service_ended_at, evidence_json
+             FROM market_invoice_lines WHERE invoice_id IN ({placeholders})
+             ORDER BY invoice_id, service_started_at, id"
+        );
+        let lines = conn
+            .prepare(&lines_sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params_from_iter(chunk.iter().cloned()), |row| {
+                        let evidence_json = row.get::<_, String>(13)?;
+                        let amount_minor = row.get::<_, i64>(9)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            BillingInvoiceLineView {
+                                id: row.get(1)?,
+                                contract_id: row.get(2)?,
+                                product_kind: row.get(3)?,
+                                product_ref: row.get(4)?,
+                                service_ref: row.get(5)?,
+                                service_label: row.get(6)?,
+                                daily_rate_minor: row.get(7)?,
+                                billable_seconds: row.get(8)?,
+                                amount_minor,
+                                amount_usd_minor: amount_minor,
+                                amount_cny_minor: row.get(10)?,
+                                service_started_at: row.get(11)?,
+                                service_ended_at: row.get(12)?,
+                                evidence: serde_json::from_str(&evidence_json)
+                                    .unwrap_or_else(|_| serde_json::json!({})),
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read billing invoice lines batch"))?;
+        for (invoice_id, line) in lines {
+            if let Some(invoice) = views.get_mut(&invoice_id) {
+                invoice.lines.push(line);
+            }
+        }
+
+        let declarations_sql = format!(
+            "SELECT invoice_id, id, status, payment_method_kind, payment_reference,
+                    note, evidence_url, declared_at, rejected_at, rejection_reason
+             FROM market_payment_declarations
+             WHERE invoice_id IN ({placeholders})
+             ORDER BY invoice_id, declared_at DESC, id DESC"
+        );
+        let declarations = conn
+            .prepare(&declarations_sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params_from_iter(chunk.iter().cloned()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            PaymentDeclarationView {
+                                id: row.get(1)?,
+                                status: row.get(2)?,
+                                payment_method_kind: row.get(3)?,
+                                payment_reference: row.get(4)?,
+                                note: row.get(5)?,
+                                evidence_url: row.get(6)?,
+                                declared_at: row.get(7)?,
+                                rejected_at: row.get(8)?,
+                                rejection_reason: row.get(9)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read billing payment declarations batch"))?;
+        for (invoice_id, declaration) in declarations {
+            if let Some(invoice) = views.get_mut(&invoice_id)
+                && invoice.declaration.is_none()
+            {
+                invoice.declaration = Some(declaration);
+            }
+        }
+
+        let disputes_sql = format!(
+            "SELECT invoice_id, id, reason, status, resolution, created_at,
+                    respond_by, escalated_at, auto_resolve_at, resolved_at
+             FROM market_billing_disputes WHERE invoice_id IN ({placeholders})
+             ORDER BY invoice_id, created_at DESC, id DESC"
+        );
+        let disputes = conn
+            .prepare(&disputes_sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params_from_iter(chunk.iter().cloned()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            BillingDisputeView {
+                                id: row.get(1)?,
+                                reason: row.get(2)?,
+                                status: row.get(3)?,
+                                resolution: row.get(4)?,
+                                created_at: row.get(5)?,
+                                respond_by: row.get(6)?,
+                                escalated_at: row.get(7)?,
+                                auto_resolve_at: row.get(8)?,
+                                resolved_at: row.get(9)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read billing disputes batch"))?;
+        for (invoice_id, dispute) in disputes {
+            if let Some(invoice) = views.get_mut(&invoice_id)
+                && invoice.dispute.is_none()
+            {
+                invoice.dispute = Some(dispute);
+            }
+        }
+
+        let credit_notes_sql = format!(
+            "SELECT note.invoice_id, note.id, note.kind, note.amount_minor,
+                    note.currency, note.reason, note.external_reference,
+                    note.status, note.created_by_email, note.created_at,
+                    invoice.usd_cny_rate_micros
+             FROM market_credit_notes note
+             JOIN market_invoices invoice ON invoice.id = note.invoice_id
+             WHERE note.invoice_id IN ({placeholders})
+             ORDER BY note.invoice_id, note.created_at, note.id"
+        );
+        let credit_notes = conn
+            .prepare(&credit_notes_sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params_from_iter(chunk.iter().cloned()), |row| {
+                        let amount_minor = row.get::<_, i64>(3)?;
+                        let rate = row.get::<_, i64>(10)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            CreditNoteView {
+                                id: row.get(1)?,
+                                kind: row.get(2)?,
+                                amount_minor,
+                                amount_usd_minor: amount_minor,
+                                amount_cny_minor: usd_minor_to_cny_minor(amount_minor, rate),
+                                currency: row.get(4)?,
+                                reason: row.get(5)?,
+                                external_reference: row.get(6)?,
+                                status: row.get(7)?,
+                                created_by_email: row.get(8)?,
+                                created_at: row.get(9)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read billing credit notes batch"))?;
+        for (invoice_id, note) in credit_notes {
+            if let Some(invoice) = views.get_mut(&invoice_id) {
+                invoice.credit_notes.push(note);
+            }
+        }
+    }
+    Ok(views)
 }
 
 impl AppStore {
@@ -2161,10 +2741,16 @@ impl AppStore {
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("read market billing dashboard accounts"))?;
+        let mut services_by_account = service_views_for_actor_accounts(&conn, &session.user_id)?;
+        let open_invoice_ids = account_rows
+            .iter()
+            .filter_map(|row| row.8.clone())
+            .collect::<Vec<_>>();
+        let mut open_invoices = invoice_views(&conn, &open_invoice_ids)?;
         let mut accounts = Vec::with_capacity(account_rows.len());
         let now = Utc::now();
         for row in account_rows {
-            let services = service_views_for_account(&conn, &row.0)?;
+            let services = services_by_account.remove(&row.0).unwrap_or_default();
             let daily_rate_minor = services
                 .iter()
                 .filter(|service| service.status == CONTRACT_ACTIVE)
@@ -2199,9 +2785,7 @@ impl AppStore {
             let open_invoice = row
                 .8
                 .as_deref()
-                .map(|invoice_id| invoice_view(&conn, invoice_id))
-                .transpose()?
-                .flatten();
+                .and_then(|invoice_id| open_invoices.remove(invoice_id));
             let is_buyer = row.1 == session.user_id;
             let is_supplier = row.3 == session.user_id;
             accounts.push(CreditAccountView {
@@ -2310,9 +2894,11 @@ impl AppStore {
             })
             .map_err(map_db("read market invoice history"))?;
         let has_more = invoice_ids.len() > limit;
-        let mut invoices = Vec::with_capacity(invoice_ids.len().min(limit));
-        for invoice_id in invoice_ids.into_iter().take(limit) {
-            invoices.push(invoice_view(&tx, &invoice_id)?.ok_or_else(|| {
+        let selected_invoice_ids = invoice_ids.into_iter().take(limit).collect::<Vec<_>>();
+        let mut invoices_by_id = invoice_views(&tx, &selected_invoice_ids)?;
+        let mut invoices = Vec::with_capacity(selected_invoice_ids.len());
+        for invoice_id in selected_invoice_ids {
+            invoices.push(invoices_by_id.remove(&invoice_id).ok_or_else(|| {
                 AppError::Internal("market invoice history entry is missing".into())
             })?);
         }
@@ -2853,12 +3439,187 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn market_billing_create_credit_note(
+        &self,
+        session: &AuthSession,
+        invoice_id: &str,
+        kind: &str,
+        amount_minor: i64,
+        reason: &str,
+        external_reference: Option<&str>,
+    ) -> Result<Vec<BillingAction>, AppError> {
+        if amount_minor <= 0 {
+            return Err(AppError::BadRequest(
+                "credit note amountMinor must be positive".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin market credit note"))?;
+        let (account_id, invoice_status, _, buyer_user_id, _, is_supplier) =
+            invoice_actor_tx(&tx, invoice_id, &session.user_id)?;
+        if !is_supplier {
+            return Err(AppError::Forbidden(
+                "only the supplier can issue a credit note or record a refund".into(),
+            ));
+        }
+        let (invoice_amount_minor, invoice_amount_units, currency, rate_micros) = tx
+            .query_row(
+                "SELECT amount_minor, amount_units, currency, usd_cny_rate_micros
+                 FROM market_invoices WHERE id = ?1",
+                params![invoice_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(map_db("read market invoice for credit note"))?;
+        let amount_units = amount_minor
+            .checked_mul(MONEY_UNITS_PER_MINOR)
+            .ok_or_else(|| AppError::BadRequest("credit note amount is too large".into()))?;
+        let credit_note_status = if kind == "service_credit" {
+            if !matches!(
+                invoice_status.as_str(),
+                INVOICE_OPEN | INVOICE_OVERDUE | INVOICE_DISPUTED
+            ) {
+                return Err(AppError::Conflict(
+                    "service credits can only be applied to an unpaid invoice without an active payment declaration"
+                        .into(),
+                ));
+            }
+            if amount_minor > invoice_amount_minor || amount_units > invoice_amount_units {
+                return Err(AppError::BadRequest(
+                    "service credit exceeds the remaining invoice amount".into(),
+                ));
+            }
+            "applied"
+        } else {
+            if invoice_status != INVOICE_PAID {
+                return Err(AppError::Conflict(
+                    "external refunds can only be recorded against a paid invoice".into(),
+                ));
+            }
+            if external_reference.is_none() {
+                return Err(AppError::BadRequest(
+                    "externalReference is required for an external refund".into(),
+                ));
+            }
+            let already_refunded = tx
+                .query_row(
+                    "SELECT COALESCE(SUM(amount_minor), 0) FROM market_credit_notes
+                     WHERE invoice_id = ?1 AND kind = 'external_refund'",
+                    params![invoice_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(map_db("read recorded external refunds"))?;
+            if already_refunded.saturating_add(amount_minor) > invoice_amount_minor {
+                return Err(AppError::BadRequest(
+                    "recorded external refunds exceed the paid invoice amount".into(),
+                ));
+            }
+            "recorded"
+        };
+        let credit_note_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO market_credit_notes (
+                id, account_id, invoice_id, kind, amount_units, amount_minor, currency,
+                reason, external_reference, status, created_by_user_id,
+                created_by_email, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                credit_note_id,
+                account_id,
+                invoice_id,
+                kind,
+                amount_units,
+                amount_minor,
+                currency,
+                reason,
+                external_reference,
+                credit_note_status,
+                session.user_id,
+                session.email,
+                now,
+            ],
+        )
+        .map_err(map_db("insert market credit note"))?;
+        if kind == "service_credit" {
+            let remaining_minor = invoice_amount_minor - amount_minor;
+            let remaining_units = invoice_amount_units - amount_units;
+            if remaining_minor == 0 || remaining_units == 0 {
+                void_invoice_tx(
+                    &tx,
+                    invoice_id,
+                    &account_id,
+                    &buyer_user_id,
+                    session,
+                    reason,
+                    &now,
+                )?;
+                tx.execute(
+                    "UPDATE market_billing_disputes
+                     SET status = 'resolved', resolution = 'service_credit', resolved_at = ?2
+                     WHERE invoice_id = ?1 AND status = 'open'",
+                    params![invoice_id, now],
+                )
+                .map_err(map_db("resolve fully credited market dispute"))?;
+            } else {
+                tx.execute(
+                    "UPDATE market_invoices
+                     SET amount_minor = ?2, amount_cny_minor = ?3, amount_units = ?4
+                     WHERE id = ?1",
+                    params![
+                        invoice_id,
+                        remaining_minor,
+                        usd_minor_to_cny_minor(remaining_minor, rate_micros),
+                        remaining_units,
+                    ],
+                )
+                .map_err(map_db("apply partial market service credit"))?;
+                tx.execute(
+                    "UPDATE market_credit_accounts
+                     SET balance_units = MAX(balance_units - ?2, 0),
+                         version = version + 1, updated_at = ?3
+                     WHERE id = ?1",
+                    params![account_id, amount_units, now],
+                )
+                .map_err(map_db("reduce market account after service credit"))?;
+            }
+        }
+        record_event_tx(
+            &tx,
+            Some(&account_id),
+            None,
+            Some(invoice_id),
+            Some(&session.user_id),
+            "invoice_credit_note_issued",
+            serde_json::json!({
+                "creditNoteId": credit_note_id,
+                "kind": kind,
+                "amountMinor": amount_minor,
+                "reason": reason,
+                "externalReference": external_reference,
+            }),
+            &format!("invoice-credit-note:{credit_note_id}"),
+            &now,
+        )?;
+        let actions = pending_control_actions_tx(&tx)?;
+        tx.commit().map_err(map_db("commit market credit note"))?;
+        Ok(actions)
+    }
+
     pub async fn market_billing_open_dispute(
         &self,
         session: &AuthSession,
         invoice_id: &str,
         reason: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<Vec<BillingAction>, AppError> {
         let reason = crate::store::client_chat::sanitize_system_event_text(reason);
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
@@ -2895,11 +3656,22 @@ impl AppStore {
             ));
         }
         let dispute_id = Uuid::new_v4().to_string();
+        let respond_by = (now_dt + Duration::hours(DISPUTE_RESPONSE_HOURS)).to_rfc3339();
+        let auto_resolve_at = (now_dt + Duration::days(DISPUTE_AUTO_RESOLVE_DAYS)).to_rfc3339();
         tx.execute(
             "INSERT INTO market_billing_disputes (
-                id, invoice_id, opened_by_user_id, reason, status, created_at
-             ) VALUES (?1, ?2, ?3, ?4, 'open', ?5)",
-            params![dispute_id, invoice_id, session.user_id, reason, now],
+                id, invoice_id, opened_by_user_id, reason, status, created_at,
+                respond_by, auto_resolve_at
+             ) VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7)",
+            params![
+                dispute_id,
+                invoice_id,
+                session.user_id,
+                reason,
+                now,
+                respond_by,
+                auto_resolve_at,
+            ],
         )
         .map_err(map_db("open market billing dispute"))?;
         tx.execute(
@@ -2912,6 +3684,19 @@ impl AppStore {
             params![account_id, now],
         )
         .map_err(map_db("mark market credit account disputed"))?;
+        tx.execute(
+            "UPDATE market_service_contracts
+             SET status = CASE WHEN status IN ('trial', 'active')
+                               THEN 'billing_suspended' ELSE status END,
+                 desired_control_state = CASE WHEN status IN ('trial', 'active')
+                                              THEN 'suspended' ELSE desired_control_state END,
+                 suspended_at = CASE WHEN status IN ('trial', 'active')
+                                     THEN COALESCE(suspended_at, ?2) ELSE suspended_at END,
+                 last_evaluated_at = ?2, updated_at = ?2
+             WHERE account_id = ?1 AND status != 'terminated'",
+            params![account_id, now],
+        )
+        .map_err(map_db("suspend services during market dispute"))?;
         record_event_tx(
             &tx,
             Some(&account_id),
@@ -2919,13 +3704,19 @@ impl AppStore {
             Some(invoice_id),
             Some(&session.user_id),
             "invoice_disputed",
-            serde_json::json!({ "disputeId": dispute_id, "reason": reason }),
+            serde_json::json!({
+                "disputeId": dispute_id,
+                "reason": reason,
+                "respondBy": respond_by,
+                "autoResolveAt": auto_resolve_at,
+            }),
             &format!("invoice-disputed:{dispute_id}"),
             &now,
         )?;
+        let actions = pending_control_actions_tx(&tx)?;
         tx.commit()
             .map_err(map_db("commit market billing dispute"))?;
-        Ok(())
+        Ok(actions)
     }
 
     async fn market_billing_admin_disputes(
@@ -2935,7 +3726,8 @@ impl AppStore {
         let rows = conn
             .prepare(
                 "SELECT dispute.id, dispute.invoice_id, dispute.reason, dispute.status,
-                        dispute.resolution, dispute.created_at, dispute.resolved_at,
+                        dispute.resolution, dispute.created_at, dispute.respond_by,
+                        dispute.escalated_at, dispute.auto_resolve_at, dispute.resolved_at,
                         account.id, account.buyer_email, account.supplier_email
                  FROM market_billing_disputes dispute
                  JOIN market_invoices invoice ON invoice.id = dispute.invoice_id
@@ -2953,21 +3745,26 @@ impl AppStore {
                                 status: row.get(3)?,
                                 resolution: row.get(4)?,
                                 created_at: row.get(5)?,
-                                resolved_at: row.get(6)?,
+                                respond_by: row.get(6)?,
+                                escalated_at: row.get(7)?,
+                                auto_resolve_at: row.get(8)?,
+                                resolved_at: row.get(9)?,
                             },
                             row.get::<_, String>(1)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, String>(8)?,
-                            row.get::<_, String>(9)?,
+                            row.get::<_, String>(10)?,
+                            row.get::<_, String>(11)?,
+                            row.get::<_, String>(12)?,
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("read open market billing disputes"))?;
+        let invoice_ids = rows.iter().map(|row| row.1.clone()).collect::<Vec<_>>();
+        let mut invoices = invoice_views(&conn, &invoice_ids)?;
         rows.into_iter()
             .map(
                 |(dispute, invoice_id, account_id, buyer_email, supplier_email)| {
-                    let invoice = invoice_view(&conn, &invoice_id)?.ok_or_else(|| {
+                    let invoice = invoices.remove(&invoice_id).ok_or_else(|| {
                         AppError::Internal("disputed market invoice is missing".into())
                     })?;
                     Ok(AdminBillingDisputeView {
@@ -3327,14 +4124,24 @@ fn load_reconcile_contracts_tx(tx: &Transaction<'_>) -> Result<Vec<ContractRow>,
     tx.prepare(
         "SELECT id, account_id, product_kind, product_ref, service_ref,
                 daily_rate_minor, trial_seconds_remaining,
-                health_state, last_evaluated_at
+                health_state, last_evaluated_at, buyer_user_id, supplier_user_id, currency
          FROM market_service_contracts
          WHERE status IN ('trial', 'active')
+           AND account_id IN (
+               SELECT contract.account_id
+               FROM market_service_contracts contract
+               JOIN market_credit_accounts account ON account.id = contract.account_id
+               WHERE contract.status IN ('trial', 'active')
+                 AND account.status IN ('active', 'near_credit_limit')
+               GROUP BY contract.account_id
+               ORDER BY MIN(contract.last_evaluated_at), contract.account_id
+               LIMIT ?1
+           )
          ORDER BY account_id, id",
     )
     .and_then(|mut statement| {
         statement
-            .query_map([], |row| {
+            .query_map(params![MAX_ACCOUNTS_PER_RECONCILE], |row| {
                 Ok(ContractRow {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
@@ -3345,6 +4152,9 @@ fn load_reconcile_contracts_tx(tx: &Transaction<'_>) -> Result<Vec<ContractRow>,
                     trial_seconds_remaining: row.get(6)?,
                     health_state: row.get(7)?,
                     last_evaluated_at: row.get(8)?,
+                    buyer_user_id: row.get(9)?,
+                    supplier_user_id: row.get(10)?,
+                    currency: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -3411,7 +4221,7 @@ fn build_accrual_candidate_tx(
         Some((_, _, reason)) => ("unknown".to_string(), reason),
         None => ("unknown".to_string(), "no_router_observation".to_string()),
     };
-    let elapsed_seconds = if gap <= MAX_ACCRUAL_GAP_SECS { gap } else { 0 };
+    let elapsed_seconds = gap;
     let effective_state = if gap > MAX_ACCRUAL_GAP_SECS {
         "unknown".to_string()
     } else {
@@ -3462,16 +4272,23 @@ fn append_service_interval_tx(
     }
     let reusable = tx
         .query_row(
-            "SELECT interval.id, interval.invoice_id
+            "SELECT interval.id, interval.invoice_id, accrual.daily_rate_minor
              FROM market_service_intervals interval
+             LEFT JOIN market_accrual_entries accrual ON accrual.interval_id = interval.id
              WHERE interval.contract_id = ?1
              ORDER BY interval.updated_at DESC, interval.created_at DESC LIMIT 1",
             params![candidate.contract.id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(map_db("read current service interval"))?;
-    let interval_id = if let Some((interval_id, None)) = reusable {
+    let interval_id = if let Some((interval_id, None, accrual_rate)) = reusable {
         let state: String = tx
             .query_row(
                 "SELECT state FROM market_service_intervals WHERE id = ?1",
@@ -3479,7 +4296,9 @@ fn append_service_interval_tx(
                 |row| row.get(0),
             )
             .map_err(map_db("read service interval state"))?;
-        if state == candidate.observed_state {
+        if state == candidate.observed_state
+            && accrual_rate.is_none_or(|rate| rate == candidate.contract.daily_rate_minor)
+        {
             tx.execute(
                 "UPDATE market_service_intervals
                  SET observation_reason = ?2, ended_at = ?3,
@@ -3531,6 +4350,25 @@ fn append_service_interval_tx(
             ],
         )
         .map_err(map_db("append market accrual entry"))?;
+    }
+    if candidate.trial_seconds > 0 {
+        tx.execute(
+            "UPDATE market_trial_ledgers
+             SET consumed_seconds = MIN(allowance_seconds, consumed_seconds + ?6),
+                 updated_at = ?7
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+               AND product_kind = ?3 AND service_ref = ?4 AND currency = ?5",
+            params![
+                candidate.contract.buyer_user_id,
+                candidate.contract.supplier_user_id,
+                candidate.contract.product_kind,
+                candidate.contract.service_ref,
+                candidate.contract.currency,
+                candidate.trial_seconds,
+                now,
+            ],
+        )
+        .map_err(map_db("consume persistent market trial balance"))?;
     }
     Ok(())
 }
@@ -3846,11 +4684,11 @@ fn pending_control_actions_tx(tx: &Transaction<'_>) -> Result<Vec<BillingAction>
          FROM market_service_contracts
          WHERE desired_control_state != applied_control_state
            AND desired_control_state IN ('active', 'suspended', 'terminated')
-         ORDER BY updated_at, id",
+         ORDER BY updated_at, id LIMIT ?1",
     )
     .and_then(|mut statement| {
         statement
-            .query_map([], |row| {
+            .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
                 let desired: String = row.get(1)?;
                 Ok(BillingAction {
                     contract_id: row.get(0)?,
@@ -3877,11 +4715,12 @@ fn mark_overdue_invoices_tx(tx: &Transaction<'_>, now: &str) -> Result<(), AppEr
              FROM market_invoices invoice
              JOIN market_credit_accounts account ON account.id = invoice.account_id
              WHERE invoice.status IN ('open', 'payment_declared', 'disputed')
-               AND invoice.overdue_at IS NULL AND invoice.deadline_at <= ?1",
+               AND invoice.overdue_at IS NULL AND invoice.deadline_at <= ?1
+             ORDER BY invoice.deadline_at, invoice.id LIMIT ?2",
         )
         .and_then(|mut statement| {
             statement
-                .query_map(params![now], |row| {
+                .query_map(params![now, MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -3952,11 +4791,13 @@ fn open_final_invoices_tx(
                    WHERE contract.account_id = account.id
                      AND contract.status IN ('trial', 'active')
                )
-             ORDER BY account.updated_at, account.id",
+             ORDER BY account.updated_at, account.id LIMIT ?1",
         )
         .and_then(|mut statement| {
             statement
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
+                    row.get::<_, String>(0)
+                })?
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(map_db("load final market settlements"))?;
@@ -3974,6 +4815,132 @@ fn open_final_invoices_tx(
     Ok(())
 }
 
+fn process_dispute_sla_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<(), AppError> {
+    let now_text = now.to_rfc3339();
+    let escalations = tx
+        .prepare(
+            "SELECT dispute.id, dispute.invoice_id, invoice.account_id
+             FROM market_billing_disputes dispute
+             JOIN market_invoices invoice ON invoice.id = dispute.invoice_id
+             WHERE dispute.status = 'open' AND dispute.escalated_at IS NULL
+               AND dispute.respond_by IS NOT NULL AND dispute.respond_by <= ?1
+             ORDER BY dispute.respond_by, dispute.id LIMIT ?2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![now_text, MAX_MAINTENANCE_ROWS_PER_RECONCILE],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("load market disputes due for escalation"))?;
+    for (dispute_id, invoice_id, account_id) in escalations {
+        let changed = tx
+            .execute(
+                "UPDATE market_billing_disputes SET escalated_at = ?2
+                 WHERE id = ?1 AND status = 'open' AND escalated_at IS NULL",
+                params![dispute_id, now_text],
+            )
+            .map_err(map_db("escalate market billing dispute"))?;
+        if changed == 1 {
+            record_event_tx(
+                tx,
+                Some(&account_id),
+                None,
+                Some(&invoice_id),
+                None,
+                "invoice_dispute_escalated",
+                serde_json::json!({ "disputeId": dispute_id }),
+                &format!("invoice-dispute-escalated:{dispute_id}"),
+                &now_text,
+            )?;
+        }
+    }
+
+    let auto_resolutions = tx
+        .prepare(
+            "SELECT dispute.id, dispute.invoice_id, invoice.account_id,
+                    account.buyer_user_id
+             FROM market_billing_disputes dispute
+             JOIN market_invoices invoice ON invoice.id = dispute.invoice_id
+             JOIN market_credit_accounts account ON account.id = invoice.account_id
+             WHERE dispute.status = 'open' AND invoice.status = 'disputed'
+               AND dispute.auto_resolve_at IS NOT NULL AND dispute.auto_resolve_at <= ?1
+             ORDER BY dispute.auto_resolve_at, dispute.id LIMIT ?2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![now_text, MAX_MAINTENANCE_ROWS_PER_RECONCILE],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("load market disputes due for automatic resolution"))?;
+    let actor = AuthSession {
+        session_id: "system:market-billing".into(),
+        user_id: "system:market-billing".into(),
+        email: "market-billing@router.invalid".into(),
+        auth_source_kind: "system".into(),
+        auth_source_id: "market-billing".into(),
+        access_token_hash: String::new(),
+        refresh_token_hash: String::new(),
+        access_expires_at: now,
+        refresh_expires_at: now,
+        created_at: now,
+        last_used_at: now,
+    };
+    for (dispute_id, invoice_id, account_id, buyer_user_id) in auto_resolutions {
+        void_invoice_tx(
+            tx,
+            &invoice_id,
+            &account_id,
+            &buyer_user_id,
+            &actor,
+            "supplier did not resolve the dispute before the published SLA",
+            &now_text,
+        )?;
+        tx.execute(
+            "UPDATE market_billing_disputes
+             SET status = 'resolved', resolution = 'auto_void', resolved_at = ?2,
+                 escalated_at = COALESCE(escalated_at, ?2)
+             WHERE id = ?1 AND status = 'open'",
+            params![dispute_id, now_text],
+        )
+        .map_err(map_db("automatically resolve market billing dispute"))?;
+        record_event_tx(
+            tx,
+            Some(&account_id),
+            None,
+            Some(&invoice_id),
+            Some(&actor.user_id),
+            "invoice_dispute_resolved",
+            serde_json::json!({
+                "disputeId": dispute_id,
+                "resolution": "auto_void",
+                "reason": "sla_expired",
+            }),
+            &format!("invoice-dispute-auto-resolved:{dispute_id}"),
+            &now_text,
+        )?;
+    }
+    Ok(())
+}
+
 impl AppStore {
     pub async fn market_billing_reconcile(
         &self,
@@ -3984,6 +4951,7 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market billing reconciliation"))?;
+        process_dispute_sla_tx(&tx, now)?;
         let contracts = load_reconcile_contracts_tx(&tx)?;
         let mut grouped = BTreeMap::<String, Vec<AccrualCandidate>>::new();
         for contract in contracts {
@@ -4148,6 +5116,7 @@ impl AppStore {
             params![now_text],
         )
         .map_err(map_db("terminate services with revoked market credit"))?;
+        crate::share_market::apply_accepted_price_changes_tx(&tx, &now_text)?;
         open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
         mark_overdue_invoices_tx(&tx, &now_text)?;
         let actions = pending_control_actions_tx(&tx)?;
@@ -4218,6 +5187,77 @@ mod tests {
             "USD",
             credit_limit_minor,
             &now,
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_account_batch_rotates_to_waiting_accounts() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let conn = store.conn.lock().await;
+        let tx = conn.transaction().expect("begin reconciliation fixture");
+        let initial_evaluated_at = "2026-01-01T00:00:00+00:00";
+        for index in 0..=MAX_ACCOUNTS_PER_RECONCILE {
+            let account_id = format!("account-{index:03}");
+            let contract_id = format!("contract-{index:03}");
+            tx.execute(
+                "INSERT INTO market_credit_accounts (
+                    id, buyer_user_id, buyer_email, supplier_user_id,
+                    supplier_email, currency, status, credit_kind,
+                    credit_limit_minor, credit_source, credit_revision,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'supplier', 'supplier@example.com',
+                           'USD', 'active', 'limited', 10000,
+                           'counterparty', 1, ?4, ?4)",
+                params![
+                    account_id,
+                    format!("buyer-{index:03}"),
+                    format!("buyer-{index:03}@example.com"),
+                    initial_evaluated_at,
+                ],
+            )
+            .expect("insert reconciliation account");
+            tx.execute(
+                "INSERT INTO market_service_contracts (
+                    id, account_id, product_kind, product_ref, service_ref,
+                    service_label, buyer_user_id, buyer_email, supplier_user_id,
+                    supplier_email, currency, daily_rate_minor, offer_revision,
+                    status, trial_seconds_remaining, last_evaluated_at,
+                    activated_at, created_at, updated_at
+                 ) VALUES (?1, ?2, 'client_host', ?3, ?3, ?3, ?4, ?5,
+                           'supplier', 'supplier@example.com', 'USD', 100, 1,
+                           'active', 0, ?6, ?6, ?6, ?6)",
+                params![
+                    contract_id,
+                    account_id,
+                    format!("installation-{index:03}"),
+                    format!("buyer-{index:03}"),
+                    format!("buyer-{index:03}@example.com"),
+                    initial_evaluated_at,
+                ],
+            )
+            .expect("insert reconciliation contract");
+        }
+
+        let first_batch = load_reconcile_contracts_tx(&tx).expect("load first account batch");
+        let first_account_ids = first_batch
+            .iter()
+            .map(|contract| contract.account_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(first_account_ids.len(), MAX_ACCOUNTS_PER_RECONCILE);
+        assert!(!first_account_ids.contains("account-100"));
+        for contract in first_batch {
+            tx.execute(
+                "UPDATE market_service_contracts SET last_evaluated_at = ?2 WHERE id = ?1",
+                params![contract.id, "2026-01-01T00:01:00+00:00"],
+            )
+            .expect("advance reconciled contract");
+        }
+
+        let second_batch = load_reconcile_contracts_tx(&tx).expect("load second account batch");
+        assert!(
+            second_batch
+                .iter()
+                .any(|contract| contract.account_id == "account-100")
         );
     }
 
@@ -5247,6 +6287,22 @@ mod tests {
             invoice.amount_cny_minor
         );
         assert!(invoice.lines.iter().all(|line| line.billable_seconds == 1));
+        let invoice_id_for_batch_check = invoice.id.clone();
+        {
+            let conn = store.conn.lock().await;
+            let single = invoice_view(&conn, &invoice_id_for_batch_check)
+                .expect("load single invoice view")
+                .expect("single invoice exists");
+            let mut batch = invoice_views(&conn, &[invoice_id_for_batch_check.clone()])
+                .expect("load invoice batch");
+            let batched = batch
+                .remove(&invoice_id_for_batch_check)
+                .expect("batched invoice exists");
+            assert_eq!(
+                serde_json::to_value(batched).expect("serialize batched invoice"),
+                serde_json::to_value(single).expect("serialize single invoice")
+            );
+        }
         store.set_market_usd_cny_rate_micros(8_000_000);
         let refreshed = store
             .market_billing_dashboard(&buyer)

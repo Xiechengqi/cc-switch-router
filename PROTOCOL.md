@@ -360,10 +360,46 @@ Router 转发到 Server 的每个请求都会剥离客户端可伪造的凭据�
 Server 侧必须:
 
 1. 校验签名
-2. **校验 `issuedAtMs` 新鲜度**(Server 当前实现为 30 秒窗口)
+2. **校验 `issuedAtMs` 新鲜度**:允许 `server_now - issuedAtMs <= 30000ms`,同时只允许 `issuedAtMs - server_now <= 5000ms`;两个边界值本身有效
 3. 剥离客户端自带的所有 `x-cc-switch-*` 头,再由已验证的上下文重新注入
 
 > Router 侧 `sign` 只校验 `issued_at_ms > 0`(`src/ingress_context.rs:72`),**不做接收侧重放窗口检查**。新鲜度判定完全依赖 Server 实现;若 Server 放宽该窗口,历史签名上下文可被重放。
+
+这个窗口要求 Router 和 Server 主机都保持可信 UTC 时间,但不能通过简单扩大窗口掩盖校时故障。Router 使用外部 HTTPS Date 仲裁观测主机偏差:本机慢 15/25 秒分别告警 warning/critical,本机快 2/4 秒分别告警 warning/critical,为接收边界保留余量。Router 进程不负责改系统时间。
+
+Server 拒绝带 ingress 的请求时仍返回空正文 `401`,并仅向 Router 附加以下内部诊断头:
+
+| Header | 内容 |
+|---|---|
+| `x-cc-switch-internal-ingress-error` | 稳定原因码；时间类为 `expired` 或 `future_timestamp`,其余为签名、身份、epoch、字段或配置契约错误 |
+| `x-cc-switch-internal-ingress-age-ms` | 仅时间类错误存在,值为 `server_now - issuedAtMs`,可以为负数 |
+| `x-cc-switch-internal-ingress-server-time-ms` | 仅时间类错误存在,Server 校验时的 Unix 毫秒时间 |
+
+Router 对所有上游响应无条件剥离 `x-cc-switch-internal-*`。带 typed freshness 原因的 `401` 映射为 `503 ingress-clock-skew` 并附 `Retry-After: 5`;其他 typed ingress `401` 映射为 `502 ingress-contract-rejected`;没有 typed 头的普通业务 `401` 保持不变。不得根据空正文或 URL 猜测时钟偏差。
+
+滚动发布必须先部署剥离/识别这些内部头的 Router,再部署发送诊断头的 Server；回滚先 Server 后 Router。
+
+### 9.1 推理身份与本地并发错误
+
+- Direct Share 使用 Router API Token 解析出的规范化邮箱作为 `IngressContext.userEmail`。
+- Market 使用已认证 Market Session 的规范化邮箱作为 `IngressContext.userEmail`。不得只在 Router 做授权后向 Server 签发空用户身份。
+- Gateway 不伪造终端用户邮箱。非免费 Share 缺少 `userEmail` 时由 Server fail closed,返回 `cc_switch_user_identity_required`；`/_share-router/*` 健康探测不进入 Share 用户授权与并发校验。
+- Router 必须剥离调用方提供的 `x-user-email` / `x-user-country*` 等旧身份头；Server 推理上下文只接受签名上下文重新注入的 `x-cc-switch-user-*` 头。
+- Email grant 的 `parallelLimit` 由 Server 统一执行,并在同一 Share 下跨 Claude、Codex、Gemini Surface 共用。Router 的 email inflight 仅用于观测,不得成为第二套授权或限额权威。
+
+本地并发槽位冲突使用 `409 Conflict`,不复用 `429 Too Many Requests`。`429` 仅表示上游限流、RPM/TPM 或时间窗口配额。槽位释放时间未知,并发冲突不得发送虚假的 `Retry-After`。
+
+| 稳定错误码 | scope | 执行方 |
+|---|---|---|
+| `cc_switch_user_concurrency_limit_exceeded` | `user` | Server email grant |
+| `cc_switch_share_concurrency_limit_exceeded` | `share` | Router / Server Share 池 |
+| `cc_switch_provider_account_concurrency_limit_exceeded` | `provider_account` | Server Provider account |
+| `cc_switch_free_share_ip_concurrency_limit_exceeded` | `free_share_ip` | Router 免费 Share IP 池 |
+| `cc_switch_image_concurrency_limit_exceeded` | `image` | Router 图片任务池 |
+
+所有本地推理错误返回 `x-cc-switch-error-code`、可用时返回 `x-cc-switch-error-scope`，并同时返回 `x-cc-switch-request-id` 与 `x-request-id`。OpenAI/Codex 使用 `error.message/type/code/param/details`；Anthropic 使用 `type=error`、`error.type/message/code/details` 和 `request_id`,本地并发错误附 `x-should-retry: false`；Gemini 使用 HTTP `409`、RPC `ABORTED` 与 `google.rpc.ErrorInfo`。并发详情只公开锁内捕获的 `current/limit`,不得包含用户邮箱。
+
+Router 原样转发 Server 的公开错误头与响应体,不得按状态码重写真实上游错误。指标只在稳定本地错误码匹配时记为 `concurrency_limited`;普通 `409` 仍按上游错误处理。
 
 ---
 

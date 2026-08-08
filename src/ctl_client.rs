@@ -48,6 +48,13 @@ struct ApplyShareSettingsReply {
     share: Option<ShareDescriptor>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ControlErrorReply {
+    error: Option<String>,
+    code: Option<String>,
+    retryable: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RefreshShareUsageBody<'a> {
@@ -130,7 +137,12 @@ pub enum CtlError {
     /// Connected but the client did not answer within the deadline.
     Timeout,
     /// Client answered with a non-success HTTP status.
-    Rejected { status: u16, body: String },
+    Rejected {
+        status: u16,
+        body: String,
+        code: Option<String>,
+        retryable: Option<bool>,
+    },
     /// Client answered 2xx but the payload was missing/!ok/unparseable.
     Malformed(String),
 }
@@ -140,7 +152,7 @@ impl std::fmt::Display for CtlError {
         match self {
             CtlError::Unreachable(msg) => write!(f, "control client unreachable: {msg}"),
             CtlError::Timeout => write!(f, "control client timed out"),
-            CtlError::Rejected { status, body } => {
+            CtlError::Rejected { status, body, .. } => {
                 write!(f, "control client rejected ({status}): {body}")
             }
             CtlError::Malformed(msg) => write!(f, "control client malformed reply: {msg}"),
@@ -154,6 +166,33 @@ impl CtlError {
     /// failing the dashboard request.
     pub fn is_transport(&self) -> bool {
         matches!(self, CtlError::Unreachable(_) | CtlError::Timeout)
+    }
+
+    pub fn error_code(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Rejected {
+                retryable: Some(true),
+                ..
+            }
+        )
+    }
+
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::Rejected { body, .. } => serde_json::from_str::<ControlErrorReply>(body)
+                .ok()
+                .and_then(|reply| reply.error)
+                .unwrap_or_else(|| body.clone()),
+            _ => self.to_string(),
+        }
     }
 }
 
@@ -222,14 +261,18 @@ pub(crate) fn verify_control_request_signature(
     };
     let expected =
         signature_bytes_for_method(method, path, control_secret, body, timestamp_ms, nonce);
-    expected.len() == provided.len()
-        && expected
-            .iter()
-            .zip(provided.iter())
-            .fold(0_u8, |difference, (left, right)| {
-                difference | (left ^ right)
-            })
-            == 0
+    constant_time_eq(&expected, &provided)
+}
+
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let compared_len = left.len().max(right.len());
+    for index in 0..compared_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 pub(crate) fn authorize_control_request(
@@ -288,9 +331,12 @@ async fn post_control<T: serde::de::DeserializeOwned>(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let structured = serde_json::from_str::<ControlErrorReply>(&body).ok();
         return Err(CtlError::Rejected {
             status: status.as_u16(),
             body: body.chars().take(500).collect(),
+            code: structured.as_ref().and_then(|reply| reply.code.clone()),
+            retryable: structured.and_then(|reply| reply.retryable),
         });
     }
     resp.json()
@@ -329,6 +375,8 @@ pub async fn fetch_client_log_tail(
         return Err(CtlError::Rejected {
             status: status.as_u16(),
             body: "Client log request rejected".into(),
+            code: None,
+            retryable: Some(false),
         });
     }
 
@@ -664,13 +712,22 @@ mod tests {
     }
 
     #[test]
+    fn constant_time_comparison_rejects_length_and_content_changes() {
+        assert!(constant_time_eq(b"same-value", b"same-value"));
+        assert!(!constant_time_eq(b"same-value", b"same-valuE"));
+        assert!(!constant_time_eq(b"same-value", b"same-value-longer"));
+    }
+
+    #[test]
     fn transport_errors_fall_back_others_do_not() {
         assert!(CtlError::Timeout.is_transport());
         assert!(CtlError::Unreachable("x".into()).is_transport());
         assert!(
             !CtlError::Rejected {
                 status: 422,
-                body: "x".into()
+                body: "x".into(),
+                code: None,
+                retryable: Some(false),
             }
             .is_transport()
         );

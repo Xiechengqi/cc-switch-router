@@ -13,6 +13,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   deleteClientMarketHost,
   exportMyClientMarketHosts,
+  getClientMarketHostImport,
   getClientMarketHosts,
   getClientMarketJob,
   getMyClientMarketRentals,
@@ -22,6 +23,7 @@ import {
 import { mergeHosts } from "@/lib/client-market-refresh";
 import type { ClientMarketHost, ClientMarketHostImportResponse, ClientMarketRental, MarketEligibility } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
+import { preferredScrollBehavior } from "@/lib/utils";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
 import { HostRow } from "@/components/dashboard/client-market/host-row";
@@ -183,6 +185,27 @@ export function ClientMarketPage() {
       refreshAbortRef.current?.abort();
     };
   }, [load, viewerUserId]);
+
+  React.useEffect(() => {
+    if (!importResult || importResult.status === "completed") return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const next = await getClientMarketHostImport(importResult.jobId, controller.signal);
+        if (controller.signal.aborted) return;
+        setImportResult(next);
+        if (next.status === "completed") await silentRefresh();
+      } catch (reason) {
+        if (!controller.signal.aborted) {
+          toast.danger(reason instanceof Error ? reason.message : String(reason));
+        }
+      }
+    }, 1_000);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [importResult, silentRefresh]);
 
   const ownerOptions = React.useMemo(() => {
     const emails = Array.from(new Set(hosts.map((host) => host.hostOwnerEmail))).sort((a, b) =>
@@ -353,7 +376,7 @@ export function ClientMarketPage() {
     const timer = window.setTimeout(() => {
       document
         .getElementById(`client-market-host-${focusInstallationId}`)
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        ?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
     }, 80);
     return () => window.clearTimeout(timer);
   }, [focusInstallationId, loading, page, visibleHosts]);
@@ -458,7 +481,8 @@ export function ClientMarketPage() {
   );
 
   return (
-    <div className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
+    <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
+      <h1 className="sr-only">{t("clientMarket.title")}</h1>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <SegmentedControl
@@ -960,7 +984,7 @@ export function ClientMarketPage() {
           <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header><Modal.Heading>{t("clientMarket.importResult")}</Modal.Heading></Modal.Header>
             <Modal.Body className="grid max-h-[65vh] gap-3 overflow-y-auto">
-              {importResult ? <div className="flex flex-wrap gap-2 text-sm"><Chip size="sm" variant="soft">{t("clientMarket.importedCount", { count: importResult.imported })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.skippedCount", { count: importResult.skipped })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.failedCount", { count: importResult.failed })}</Chip></div> : null}
+              {importResult ? <div className="flex flex-wrap items-center gap-2 text-sm" aria-live="polite">{importResult.status !== "completed" ? <Chip size="sm" variant="soft"><Loader2 className="h-3.5 w-3.5 animate-spin" />{t("clientMarket.importRunning")}</Chip> : null}<Chip size="sm" variant="soft">{t("clientMarket.importedCount", { count: importResult.imported })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.skippedCount", { count: importResult.skipped })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.failedCount", { count: importResult.failed })}</Chip></div> : null}
               <div className="grid gap-1.5">{importResult?.items.map((item) => <div key={`${item.ip}:${item.port}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-md border px-3 py-2 text-xs"><span className="min-w-0 truncate font-mono">{item.ip}:{item.port}</span><span className={item.status === "failed" ? "text-rose-600" : item.status === "imported" ? "text-emerald-700" : "text-muted-foreground"}>{item.error || item.status}</span></div>)}</div>
             </Modal.Body>
             <Modal.Footer><Button variant="outline" onClick={() => setImportResult(null)}>{t("common.close")}</Button></Modal.Footer>
@@ -1050,6 +1074,6 @@ export function ClientMarketPage() {
         </Modal.Container>
       </Modal.Backdrop>
 
-    </div>
+    </main>
   );
 }

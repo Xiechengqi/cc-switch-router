@@ -17,6 +17,13 @@ pub const MAX_REQUEST_LOG_RETENTION_DAYS: u32 = 365;
 const DEFAULT_IP_INTEL_ENDPOINTS: &[&str] = &["http://3.0.3.0", "http://3.0.2.1", "http://3.0.2.9"];
 
 pub const DEFAULT_DB_SYNC_INTERVAL_SECS: u64 = 60;
+pub const DEFAULT_CLOCK_PROBE_INTERVAL_SECS: u64 = 60;
+pub const DEFAULT_CLOCK_PROBE_TIMEOUT_SECS: u64 = 4;
+pub const DEFAULT_CLOCK_SOURCES: &[&str] = &[
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://www.apple.com/library/test/success.html",
+    "https://checkip.amazonaws.com/",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseMode {
@@ -141,6 +148,73 @@ pub struct MetricsConfig {
     pub retention_days: u32,
     pub sample_interval_secs: u64,
     pub alerting: AlertingSettings,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClockHealthConfig {
+    pub enabled: bool,
+    pub probe_interval_secs: u64,
+    pub probe_timeout_secs: u64,
+    pub sources: Vec<String>,
+}
+
+impl Default for ClockHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            probe_interval_secs: DEFAULT_CLOCK_PROBE_INTERVAL_SECS,
+            probe_timeout_secs: DEFAULT_CLOCK_PROBE_TIMEOUT_SECS,
+            sources: DEFAULT_CLOCK_SOURCES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }
+    }
+}
+
+impl ClockHealthConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(15..=3_600).contains(&self.probe_interval_secs) {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_CLOCK_PROBE_INTERVAL_SECS must be between 15 and 3600, got: {}",
+                self.probe_interval_secs
+            ));
+        }
+        if !(1..=15).contains(&self.probe_timeout_secs) {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_CLOCK_PROBE_TIMEOUT_SECS must be between 1 and 15, got: {}",
+                self.probe_timeout_secs
+            ));
+        }
+        if self.sources.len() < 3 || self.sources.len() > 5 {
+            return Err(
+                "CC_SWITCH_ROUTER_CLOCK_SOURCES must contain between 3 and 5 HTTPS URLs".into(),
+            );
+        }
+        let mut hosts = HashSet::new();
+        for source in &self.sources {
+            let parsed = url::Url::parse(source)
+                .map_err(|_| format!("invalid clock source URL: {source}"))?;
+            if parsed.scheme() != "https" || parsed.host_str().is_none() {
+                return Err(format!("clock source must be an HTTPS URL: {source}"));
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(format!(
+                    "clock source must not contain credentials: {source}"
+                ));
+            }
+            if parsed.query().is_some() || parsed.fragment().is_some() {
+                return Err(format!(
+                    "clock source must not contain a query or fragment: {source}"
+                ));
+            }
+            let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+            if !hosts.insert(host) {
+                return Err("clock sources must use distinct hosts".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -280,6 +354,7 @@ pub struct Config {
     pub ux_telemetry_retention_days: u32,
     pub footer_telegram_url: String,
     pub metrics: MetricsConfig,
+    pub clock_health: ClockHealthConfig,
 }
 
 impl Config {
@@ -499,6 +574,30 @@ impl Config {
                         .unwrap_or_else(|| "warning".into()),
                 },
             },
+            clock_health: ClockHealthConfig {
+                enabled: env_bool("CC_SWITCH_ROUTER_CLOCK_MONITOR_ENABLED", true),
+                probe_interval_secs: env_var("CC_SWITCH_ROUTER_CLOCK_PROBE_INTERVAL_SECS")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_CLOCK_PROBE_INTERVAL_SECS),
+                probe_timeout_secs: env_var("CC_SWITCH_ROUTER_CLOCK_PROBE_TIMEOUT_SECS")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_CLOCK_PROBE_TIMEOUT_SECS),
+                sources: env_var("CC_SWITCH_ROUTER_CLOCK_SOURCES")
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        DEFAULT_CLOCK_SOURCES
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect()
+                    }),
+            },
         }
     }
 
@@ -534,6 +633,10 @@ impl Config {
             return Err("business database and metrics database must use different paths".into());
         }
         Ok(())
+    }
+
+    pub fn validate_clock_health_config(&self) -> std::result::Result<(), String> {
+        self.clock_health.validate()
     }
 
     pub fn tunnel_url(&self, subdomain: &str) -> String {
@@ -732,6 +835,10 @@ CC_SWITCH_ROUTER_METRICS_ENABLED=true
 CC_SWITCH_ROUTER_METRICS_DB_PATH={}
 CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS=7
 CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS=5
+CC_SWITCH_ROUTER_CLOCK_MONITOR_ENABLED=true
+CC_SWITCH_ROUTER_CLOCK_PROBE_INTERVAL_SECS=60
+CC_SWITCH_ROUTER_CLOCK_PROBE_TIMEOUT_SECS=4
+CC_SWITCH_ROUTER_CLOCK_SOURCES=https://www.cloudflare.com/cdn-cgi/trace,https://www.apple.com/library/test/success.html,https://checkip.amazonaws.com/
 CC_SWITCH_ROUTER_ALERTING_ENABLED=true
 CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS=1800
 CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS=90
@@ -947,6 +1054,7 @@ mod tests {
                 sample_interval_secs: 5,
                 alerting: AlertingSettings::default(),
             },
+            clock_health: ClockHealthConfig::default(),
         };
 
         assert!(config.free_share_ip_limit_enabled());
@@ -1065,6 +1173,23 @@ mod tests {
         let debug = format!("{database:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("do-not-log-this-token"));
+    }
+
+    #[test]
+    fn clock_health_sources_require_distinct_credential_free_https_hosts() {
+        assert!(ClockHealthConfig::default().validate().is_ok());
+
+        let mut config = ClockHealthConfig::default();
+        config.sources[0] = "http://time.example.test/".into();
+        assert!(config.validate().is_err());
+
+        let mut config = ClockHealthConfig::default();
+        config.sources[1] = "https://www.cloudflare.com/other".into();
+        assert!(config.validate().is_err());
+
+        let mut config = ClockHealthConfig::default();
+        config.sources[2] = "https://time.example.test/?token=secret".into();
+        assert!(config.validate().is_err());
     }
 
     #[test]

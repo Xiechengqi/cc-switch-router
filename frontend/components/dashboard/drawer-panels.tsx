@@ -691,7 +691,7 @@ export function ShareEmailUsagePanel({
 }
 
 function displayUserLimitValue(value: number | undefined, unlimited: string) {
-  return value == null ? unlimited : value.toLocaleString();
+  return value == null ? unlimited : formatNumber(value);
 }
 
 function displayUserLimitExpiry(value: number | undefined, permanent: string) {

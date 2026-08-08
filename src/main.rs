@@ -11,6 +11,7 @@ mod client_market_terminal;
 mod client_market_trade;
 mod client_meta;
 mod client_subdomain_takeover;
+mod clock_health;
 mod config;
 mod ctl_client;
 mod db;
@@ -27,6 +28,7 @@ mod metrics;
 mod models;
 mod namespace;
 mod notifications;
+mod process_lock;
 mod provision_ssh;
 mod proxy;
 mod public_hosts;
@@ -43,6 +45,7 @@ mod usage_account;
 
 use std::collections::HashSet;
 use std::env;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -78,10 +81,11 @@ pub use crate::server_state::{ResendUsageCache, ServerGeo, ServerState};
 const APP_NAME: &str = "cc-switch-router";
 const HTTP_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if try_handle_cli()? {
+    if try_handle_cli().await? {
         return Ok(());
     }
 
@@ -101,6 +105,10 @@ async fn main() -> Result<()> {
     config
         .validate_official_provider_config()
         .map_err(anyhow::Error::msg)?;
+    config
+        .validate_clock_health_config()
+        .map_err(anyhow::Error::msg)?;
+    let _process_lock = crate::process_lock::ProcessLock::acquire(&config.data_dir)?;
     let server_geo = resolve_server_geo().await;
     info!(
         api_addr = %config.api_addr,
@@ -175,6 +183,7 @@ async fn main() -> Result<()> {
         .build()
         .context("build proxy http client failed")?;
     let metrics = MetricsRegistry::new(config.metrics.clone());
+    let clock_health = crate::clock_health::ClockHealthService::new(config.clock_health.clone())?;
     let dynamic = Arc::new(RwLock::new(DynamicSettings::from_config(&config)));
     let alerting = crate::alerting::AlertingService::new(
         config.metrics.db_path.clone(),
@@ -215,6 +224,7 @@ async fn main() -> Result<()> {
         start_instant: Instant::now(),
         scheduling_overrides: OverrideStore::new(),
         metrics: metrics.clone(),
+        clock_health: clock_health.clone(),
         alerting: alerting.clone(),
         registration_admission: Arc::new(RegistrationAdmissionLimiter::from_env()),
     };
@@ -281,6 +291,8 @@ async fn main() -> Result<()> {
     let metrics_registry = state.metrics.clone();
     let metrics_store = state.store.clone();
     let metrics_alerting = state.alerting.clone();
+    let clock_metrics = state.metrics.clone();
+    let clock_alerting = state.alerting.clone();
     let alerting_service = state.alerting.clone();
     let alerting_store = state.store.clone();
     let notification_store = state.store.clone();
@@ -293,242 +305,315 @@ async fn main() -> Result<()> {
     let share_market_state = state.clone();
     let market_billing_state = state.clone();
     let database_sync_store = state.store.clone();
+    let shutdown_database_sync_store = state.store.clone();
     let database_sync_interval_secs = config.database.sync_interval_secs;
     let database_sync_enabled = config.database.mode == DatabaseMode::Turso;
+    let shutdown_ip_blacklist_stats = state.ip_blacklist_stats.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
     info!("http listening on {}", config.api_addr);
     info!("ssh listener bound on {}", config.ssh_addr);
 
-    let ip_blacklist_log_task = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(600)).await;
-            if let Some(summary) = ip_blacklist_stats.flush() {
-                tracing::warn!(
-                    blocked = summary.blocked,
-                    unique_ips = summary.unique_ips,
-                    window_secs = summary.window_secs,
-                    top_ips = %format_top_counts(&summary.top_ips),
-                    top_paths = %format_top_counts(&summary.top_paths),
-                    "IP blacklist summary"
-                );
+    let (background_shutdown_tx, background_shutdown_rx) = watch::channel(false);
+
+    let ip_blacklist_log_task = spawn_background_task(
+        "IP blacklist logger",
+        background_shutdown_rx.clone(),
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                if let Some(summary) = ip_blacklist_stats.flush() {
+                    tracing::warn!(
+                        blocked = summary.blocked,
+                        unique_ips = summary.unique_ips,
+                        window_secs = summary.window_secs,
+                        top_ips = %format_top_counts(&summary.top_ips),
+                        top_paths = %format_top_counts(&summary.top_paths),
+                        "IP blacklist summary"
+                    );
+                }
             }
-        }
-    });
+            #[allow(unreachable_code)]
+            Ok(())
+        },
+    );
 
     let database_sync_task = database_sync_enabled.then(|| {
-        tokio::spawn(async move {
+        spawn_background_task(
+            "database sync",
+            background_shutdown_rx.clone(),
+            async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(database_sync_interval_secs));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match database_sync_store.sync_database() {
+                        Ok(health) => {
+                            tracing::debug!(
+                                frames_synced = health.last_frames_synced,
+                                "Turso Embedded Replica synchronized"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Turso Embedded Replica sync failed");
+                        }
+                    }
+                }
+                #[allow(unreachable_code)]
+                Ok(())
+            },
+        )
+    });
+
+    let cleanup_task =
+        spawn_background_task("cleanup", background_shutdown_rx.clone(), async move {
+            tokio::time::sleep(startup_reconnect_grace).await;
             let mut interval =
-                tokio::time::interval(Duration::from_secs(database_sync_interval_secs));
+                tokio::time::interval(Duration::from_secs(cleanup_config.cleanup_interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                cleanup_overrides.cleanup_expired();
+                let mut cycle_config = cleanup_config.clone();
+                cycle_config.client_notifications =
+                    cleanup_dynamic.read().await.client_notifications.clone();
+                match cleanup_store
+                    .cleanup_expired_data(&cycle_config, &cleanup_proxy)
+                    .await
+                {
+                    Ok(result) if result.has_changes() => {
+                        info!(
+                            leases = result.deleted_leases,
+                            shares = result.deleted_shares,
+                            installations = result.deleted_installations,
+                            notification_batches = result.deleted_notification_batches,
+                            notification_events = result.deleted_notification_events,
+                            notification_send_logs = result.deleted_notification_send_logs,
+                            chat_rooms = result.deleted_chat_rooms,
+                            routes = result.removed_routes,
+                            "cleanup removed stale data"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!("cleanup failed: {err}");
+                    }
+                }
+                if let Err(err) = crate::client_market::reconcile_stale_market_hosts(
+                    market_reconcile_state.clone(),
+                )
+                .await
+                {
+                    tracing::warn!("client market host reconcile failed: {err}");
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+    let probe_task = spawn_background_task(
+        "route health probe",
+        background_shutdown_rx.clone(),
+        async move {
+            let client = reqwest::Client::builder()
+                .user_agent("cc-switch-router/0.1 route-probe")
+                .timeout(Duration::from_secs(5))
+                .build()?;
+
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let reconnect_grace = crate::notifications::route_reconnect_grace(
+                    &probe_dynamic.read().await.client_notifications,
+                );
+                if let Err(err) = run_route_health_probe_cycle(
+                    &probe_store,
+                    &probe_proxy,
+                    &probe_config,
+                    &client,
+                    reconnect_grace,
+                    &router_epoch,
+                )
+                .await
+                {
+                    tracing::warn!("route health probe failed: {err}");
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
+    let runtime_task = spawn_background_task(
+        "Share runtime refresh",
+        background_shutdown_rx.clone(),
+        async move {
+            let client = reqwest::Client::builder()
+                .user_agent("cc-switch-router/0.1 share-runtime")
+                .timeout(Duration::from_secs(5))
+                .build()?;
+
+            let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                match database_sync_store.sync_database() {
-                    Ok(health) => {
-                        tracing::debug!(
-                            frames_synced = health.last_frames_synced,
-                            "Turso Embedded Replica synchronized"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "Turso Embedded Replica sync failed");
-                    }
-                }
-            }
-        })
-    });
-
-    let cleanup_task = tokio::spawn(async move {
-        tokio::time::sleep(startup_reconnect_grace).await;
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(cleanup_config.cleanup_interval_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            cleanup_overrides.cleanup_expired();
-            let mut cycle_config = cleanup_config.clone();
-            cycle_config.client_notifications =
-                cleanup_dynamic.read().await.client_notifications.clone();
-            match cleanup_store
-                .cleanup_expired_data(&cycle_config, &cleanup_proxy)
+                if let Err(err) = run_share_runtime_refresh_cycle(
+                    &runtime_store,
+                    &runtime_proxy,
+                    &runtime_config,
+                    &runtime_traffic,
+                    &client,
+                )
                 .await
-            {
-                Ok(result) if result.has_changes() => {
-                    info!(
-                        leases = result.deleted_leases,
-                        shares = result.deleted_shares,
-                        installations = result.deleted_installations,
-                        notification_batches = result.deleted_notification_batches,
-                        notification_events = result.deleted_notification_events,
-                        notification_send_logs = result.deleted_notification_send_logs,
-                        chat_rooms = result.deleted_chat_rooms,
-                        routes = result.removed_routes,
-                        "cleanup removed stale data"
-                    );
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!("cleanup failed: {err}");
+                {
+                    tracing::warn!("share runtime refresh failed: {err}");
                 }
             }
-            if let Err(err) =
-                crate::client_market::reconcile_stale_market_hosts(market_reconcile_state.clone())
-                    .await
-            {
-                tracing::warn!("client market host reconcile failed: {err}");
-            }
-        }
-    });
-    let probe_task = tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .user_agent("cc-switch-router/0.1 route-probe")
-            .timeout(Duration::from_secs(5))
-            .build()?;
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
+    let resend_usage_task = spawn_background_task(
+        "Resend usage refresh",
+        background_shutdown_rx.clone(),
+        async move {
+            let client = reqwest::Client::builder()
+                .user_agent("cc-switch-router/0.1 resend-usage")
+                .timeout(Duration::from_secs(10))
+                .build()?;
 
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let reconnect_grace = crate::notifications::route_reconnect_grace(
-                &probe_dynamic.read().await.client_notifications,
-            );
-            if let Err(err) = run_route_health_probe_cycle(
-                &probe_store,
-                &probe_proxy,
-                &probe_config,
-                &client,
-                reconnect_grace,
-                &router_epoch,
-            )
-            .await
-            {
-                tracing::warn!("route health probe failed: {err}");
+            let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
+            loop {
+                interval.tick().await;
+                match refresh_resend_usage_cache(
+                    resend_usage_cache.clone(),
+                    resend_usage_api_key.as_deref(),
+                    &client,
+                )
+                .await
+                {
+                    Ok(Some(label)) => {
+                        info!(resend_daily_usage = %label, "updated resend daily usage")
+                    }
+                    Ok(None) => info!("resend daily quota header missing, footer hidden"),
+                    Err(err) => tracing::warn!("refresh resend usage failed: {err}"),
+                }
             }
-        }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
-    });
-    let runtime_task = tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .user_agent("cc-switch-router/0.1 share-runtime")
-            .timeout(Duration::from_secs(5))
-            .build()?;
-
-        let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if let Err(err) = run_share_runtime_refresh_cycle(
-                &runtime_store,
-                &runtime_proxy,
-                &runtime_config,
-                &runtime_traffic,
-                &client,
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
+    let metrics_task = spawn_background_task(
+        "metrics collector",
+        background_shutdown_rx.clone(),
+        async move {
+            crate::metrics::run_collector(
+                metrics_registry,
+                metrics_config,
+                metrics_proxy,
+                metrics_store,
+                metrics_alerting,
             )
-            .await
-            {
-                tracing::warn!("share runtime refresh failed: {err}");
-            }
-        }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
-    });
-    let resend_usage_task = tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .user_agent("cc-switch-router/0.1 resend-usage")
-            .timeout(Duration::from_secs(10))
-            .build()?;
-
-        let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
-        loop {
-            interval.tick().await;
-            match refresh_resend_usage_cache(
-                resend_usage_cache.clone(),
-                resend_usage_api_key.as_deref(),
-                &client,
+            .await;
+            Ok::<_, anyhow::Error>(())
+        },
+    );
+    let clock_health_task =
+        spawn_background_task("clock health", background_shutdown_rx.clone(), async move {
+            crate::clock_health::run_clock_health_service(
+                clock_health,
+                clock_metrics,
+                clock_alerting,
             )
-            .await
-            {
-                Ok(Some(label)) => info!(resend_daily_usage = %label, "updated resend daily usage"),
-                Ok(None) => info!("resend daily quota header missing, footer hidden"),
-                Err(err) => tracing::warn!("refresh resend usage failed: {err}"),
+            .await;
+            Ok(())
+        });
+    let alerting_task = spawn_background_task(
+        "operator alerting",
+        background_shutdown_rx.clone(),
+        async move {
+            let result =
+                crate::alerting::run_alerting_service(alerting_service, alerting_store).await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "operator alert service stopped");
             }
-        }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
-    });
-    let metrics_task = tokio::spawn(async move {
-        crate::metrics::run_collector(
-            metrics_registry,
-            metrics_config,
-            metrics_proxy,
-            metrics_store,
-            metrics_alerting,
-        )
-        .await;
-        Ok::<_, anyhow::Error>(())
-    });
-    let alerting_task = tokio::spawn(async move {
-        let result = crate::alerting::run_alerting_service(alerting_service, alerting_store).await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "operator alert service stopped");
-        }
-        result
-    });
-    let notification_task = tokio::spawn(async move {
-        let result = crate::notifications::run_client_notification_service(
-            notification_store,
-            notification_dynamic,
-            notification_config,
-            startup_reconnect_grace,
-        )
-        .await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "client notification service stopped");
-        }
-        result
-    });
-    let chat_notification_task = tokio::spawn(async move {
-        let result = crate::client_chat::run_client_chat_email_service(
-            chat_notification_store,
-            chat_notification_config,
-        )
-        .await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "client chat email service stopped");
-        }
-        result
-    });
-    let client_market_trade_task = tokio::spawn(async move {
-        let result = crate::client_market_trade::run_trade_service(client_market_trade_state).await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "Client Market trade service stopped");
-        }
-        result
-    });
-    let client_market_recovery_task = tokio::spawn(async move {
-        let result = crate::client_market_recovery::run_service(client_market_recovery_state).await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "Client Market recovery service stopped");
-        }
-        result
-    });
-    let share_market_task = tokio::spawn(async move {
-        let result = crate::share_market::run_service(share_market_state).await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "Share Market service stopped");
-        }
-        result
-    });
-    let market_billing_task = tokio::spawn(async move {
-        let result = crate::market_billing::run_service(market_billing_state).await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "Market billing service stopped");
-        }
-        result
-    });
+            result
+        },
+    );
+    let notification_task = spawn_background_task(
+        "client notifications",
+        background_shutdown_rx.clone(),
+        async move {
+            let result = crate::notifications::run_client_notification_service(
+                notification_store,
+                notification_dynamic,
+                notification_config,
+                startup_reconnect_grace,
+            )
+            .await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "client notification service stopped");
+            }
+            result
+        },
+    );
+    let chat_notification_task = spawn_background_task(
+        "chat email notifications",
+        background_shutdown_rx.clone(),
+        async move {
+            let result = crate::client_chat::run_client_chat_email_service(
+                chat_notification_store,
+                chat_notification_config,
+            )
+            .await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "client chat email service stopped");
+            }
+            result
+        },
+    );
+    let client_market_trade_task = spawn_background_task(
+        "Client Market trade",
+        background_shutdown_rx.clone(),
+        async move {
+            let result =
+                crate::client_market_trade::run_trade_service(client_market_trade_state).await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "Client Market trade service stopped");
+            }
+            result
+        },
+    );
+    let client_market_recovery_task = spawn_background_task(
+        "Client Market recovery",
+        background_shutdown_rx.clone(),
+        async move {
+            let result =
+                crate::client_market_recovery::run_service(client_market_recovery_state).await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "Client Market recovery service stopped");
+            }
+            result.map_err(anyhow::Error::new)
+        },
+    );
+    let share_market_task =
+        spawn_background_task("Share Market", background_shutdown_rx.clone(), async move {
+            let result = crate::share_market::run_service(share_market_state).await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "Share Market service stopped");
+            }
+            result
+        });
+    let market_billing_task =
+        spawn_background_task("Market billing", background_shutdown_rx, async move {
+            let result = crate::market_billing::run_service(market_billing_state).await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "Market billing service stopped");
+            }
+            result
+        });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
     let mut ssh_task = tokio::spawn(async move {
@@ -557,6 +642,7 @@ async fn main() -> Result<()> {
         result = &mut ssh_task => ServiceExit::Ssh(result),
         result = &mut http_task => ServiceExit::Http(result),
     };
+    let _ = background_shutdown_tx.send(true);
 
     let service_result = match exit {
         ServiceExit::Signal(signal) => {
@@ -584,23 +670,93 @@ async fn main() -> Result<()> {
         }
     };
 
-    cleanup_task.abort();
+    let mut background_tasks = vec![
+        ("cleanup", cleanup_task),
+        ("IP blacklist logger", ip_blacklist_log_task),
+        ("route health probe", probe_task),
+        ("Share runtime refresh", runtime_task),
+        ("Resend usage refresh", resend_usage_task),
+        ("metrics collector", metrics_task),
+        ("clock health", clock_health_task),
+        ("operator alerting", alerting_task),
+        ("client notifications", notification_task),
+        ("chat email notifications", chat_notification_task),
+        ("Client Market trade", client_market_trade_task),
+        ("Client Market recovery", client_market_recovery_task),
+        ("Share Market", share_market_task),
+        ("Market billing", market_billing_task),
+    ];
     if let Some(task) = database_sync_task {
-        task.abort();
+        background_tasks.push(("database sync", task));
     }
-    ip_blacklist_log_task.abort();
-    probe_task.abort();
-    runtime_task.abort();
-    resend_usage_task.abort();
-    metrics_task.abort();
-    alerting_task.abort();
-    notification_task.abort();
-    chat_notification_task.abort();
-    client_market_trade_task.abort();
-    client_market_recovery_task.abort();
-    share_market_task.abort();
-    market_billing_task.abort();
-    service_result
+    let background_result =
+        stop_background_tasks(background_tasks, BACKGROUND_SHUTDOWN_TIMEOUT).await;
+    if database_sync_enabled && let Err(error) = shutdown_database_sync_store.sync_database() {
+        tracing::warn!(error = %error, "final Turso Embedded Replica sync failed");
+    }
+    if let Some(summary) = shutdown_ip_blacklist_stats.flush() {
+        tracing::warn!(
+            blocked = summary.blocked,
+            unique_ips = summary.unique_ips,
+            window_secs = summary.window_secs,
+            top_ips = %format_top_counts(&summary.top_ips),
+            top_paths = %format_top_counts(&summary.top_paths),
+            "final IP blacklist summary"
+        );
+    }
+    combine_service_results(service_result, background_result)
+}
+
+fn spawn_background_task<F>(
+    service: &'static str,
+    shutdown: watch::Receiver<bool>,
+    future: F,
+) -> tokio::task::JoinHandle<Result<()>>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => {
+                info!(service, "background service received shutdown");
+                Ok(())
+            }
+            result = future => result.with_context(|| format!("{service} background service stopped")),
+        }
+    })
+}
+
+async fn stop_background_tasks(
+    tasks: Vec<(&'static str, tokio::task::JoinHandle<Result<()>>)>,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut first_error = None;
+    for (service, mut task) in tasks {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(service, "background shutdown deadline reached");
+            task.abort();
+            let _ = task.await;
+            continue;
+        }
+        match tokio::time::timeout(remaining, &mut task).await {
+            Ok(result) => {
+                if let Err(error) = service_task_result(service, result)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            Err(_) => {
+                tracing::warn!(service, "background shutdown deadline reached");
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn service_task_result(
@@ -1051,7 +1207,7 @@ async fn resolve_server_geo_from_ip_im(client: &reqwest::Client) -> Option<Serve
     None
 }
 
-fn try_handle_cli() -> Result<bool> {
+async fn try_handle_cli() -> Result<bool> {
     let mut args = env::args().skip(1);
     let Some(arg) = args.next() else {
         return Ok(false);
@@ -1074,6 +1230,34 @@ fn try_handle_cli() -> Result<bool> {
             ensure_startup_config(&env_path, StartupConfigMode::CheckOnly)?;
             Ok(true)
         }
+        "check-db" => {
+            let env_path = ensure_default_env_file()?;
+            load_env_file(&env_path)?;
+            let config = Config::from_env();
+            config
+                .validate_database_config()
+                .map_err(anyhow::Error::msg)?;
+            check_database_compatibility(&config)?;
+            println!("database schema is compatible");
+            Ok(true)
+        }
+        "rotate-provision-ssh-key" => {
+            let env_path = ensure_default_env_file()?;
+            load_env_file(&env_path)?;
+            let config = Config::from_env();
+            config
+                .validate_database_config()
+                .map_err(anyhow::Error::msg)?;
+            let _process_lock = crate::process_lock::ProcessLock::acquire(&config.data_dir)?;
+            let store = AppStore::new(&config)?;
+            let report =
+                crate::client_market::rotate_provision_ssh_key_offline(&config, &store).await?;
+            println!(
+                "provisioning SSH key rotation completed for {} Host(s)",
+                report.host_count
+            );
+            Ok(true)
+        }
         other => anyhow::bail!("unknown command: {other}\n\nRun `{APP_NAME} help` for usage."),
     }
 }
@@ -1087,6 +1271,8 @@ Usage:
   cc-switch-router
   cc-switch-router setup
   cc-switch-router check-config
+  cc-switch-router check-db
+  cc-switch-router rotate-provision-ssh-key
   cc-switch-router help
   cc-switch-router --help
   cc-switch-router -h
@@ -1117,6 +1303,26 @@ Default env file:
   The file is auto-created on first start when missing.
 "
     );
+}
+
+fn check_database_compatibility(config: &Config) -> Result<()> {
+    let connection =
+        match config.database.mode {
+            DatabaseMode::Local => crate::db::Connection::open(&config.database.path),
+            DatabaseMode::Turso => crate::db::Connection::open_remote_replica(
+                &config.database.path,
+                config
+                    .database
+                    .turso_url
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Turso database URL is not configured"))?,
+                config.database.turso_auth_token.clone().ok_or_else(|| {
+                    anyhow::anyhow!("Turso database auth token is not configured")
+                })?,
+            ),
+        }?;
+    crate::schema::check_compatibility(&connection)?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -110,7 +110,7 @@ export function ModelSubstitutionPanel({ data }: { data: LlmReliabilityResponse 
   return (
     <Card className="rounded-2xl">
       <Card.Header>
-        <Card.Title className="text-base font-semibold tracking-[-0.01em]">
+        <Card.Title className="text-base font-semibold">
           {t("metrics.panel.substitution")}
         </Card.Title>
         <Card.Description>{t("metrics.panel.substitutionDesc")}</Card.Description>
@@ -161,7 +161,7 @@ export function MetricEventsList({ events, full = false }: { events: MetricEvent
   return (
     <Card className="rounded-2xl">
       <Card.Header>
-        <Card.Title className="text-base font-semibold tracking-[-0.01em]">
+        <Card.Title className="text-base font-semibold">
           {t("metrics.panel.recentAlerts")}
         </Card.Title>
         <Card.Description>{t("metrics.panel.eventsCount", { count: events.length })}</Card.Description>
@@ -176,12 +176,12 @@ export function MetricEventsList({ events, full = false }: { events: MetricEvent
               {events.map((event, index) => (
                 <li
                   key={`${event.timestamp}-${event.kind}-${index}`}
-                  className="relative grid grid-cols-[16px_1fr] gap-3 rounded-lg py-2 pl-0.5 pr-2 transition-colors hover:bg-gradient-to-r hover:from-accent/[0.04] hover:to-transparent"
+                  className="relative grid grid-cols-[16px_1fr] gap-3 rounded-lg py-2 pl-0.5 pr-2 transition-colors hover:bg-accent/[0.04]"
                 >
                   <span className={`relative z-10 mt-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-card ${dotFor(event.severity)}`} />
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="font-mono text-xs uppercase tracking-[0.1em] text-foreground/80">
+                      <span className="font-mono text-xs uppercase text-foreground/80">
                         {event.kind}
                       </span>
                       <span className="text-xs text-muted-foreground">

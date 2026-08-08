@@ -44,6 +44,7 @@ import type {
 import { compactTokens, fixed, formatBytes, formatDateTime, formatNumber, formatUptime, percent } from "@/lib/utils";
 import { deltaSeries, diskPercent, memoryPercent, mergeMetricEvents, pipelineState, toneFor } from "./metrics-utils";
 import {
+  ClockHealthPanel,
   DiskUsageList,
   HostInfoPanel,
   KpiGrid,
@@ -52,7 +53,7 @@ import {
   ProcessPanel,
   StatusChip,
 } from "./metrics-cards";
-import { type ChartState, ResourceTrendChart } from "./metrics-charts";
+import { ClockOffsetChart, type ChartState, ResourceTrendChart } from "./metrics-charts";
 import { CountersTable, MetricEventsList, ModelSubstitutionPanel, TopConsumersTable } from "./metrics-tables";
 import { AlertsTab, ClientsTab } from "./metrics-client-alerts";
 
@@ -85,7 +86,7 @@ const TAB_LABELS: Record<MetricsTab, MessageKey> = {
 
 export function MetricsPage() {
   const { session, loading, refresh: refreshAuth } = useAuth();
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [activeTab, setActiveTab] = React.useState<MetricsTab>("overview");
   const [range, setRange] = React.useState("1h");
   const [autoRefresh, setAutoRefresh] = React.useState(true);
@@ -187,7 +188,9 @@ export function MetricsPage() {
     );
   }
 
-  const lastSample = snapshot?.sampledAt ? formatDateTime(snapshot.sampledAt * 1000) : "--";
+  const lastSample = snapshot?.sampledAt
+    ? formatDateTime(snapshot.sampledAt * 1000, locale)
+    : "--";
   const showSkeleton = snapshot === null && busy === "load";
   const alertEvents = mergeMetricEvents(snapshot?.alerts, events);
   const chartState = pipelineState(snapshot, busy === "load");
@@ -198,9 +201,7 @@ export function MetricsPage() {
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <StatusChip status={snapshot?.status || "healthy"} />
-            <h1 className="font-display text-3xl">
-              <span className="gradient-text">{t("metrics.title")}</span>
-            </h1>
+            <h1 className="font-display text-3xl">{t("metrics.title")}</h1>
             {chartState === "disabled" ? (
               <span className="rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-xs text-amber-700">
                 {t("metrics.chart.disabled")}
@@ -214,7 +215,7 @@ export function MetricsPage() {
           <p className="mt-2 text-sm text-muted-foreground">{t("metrics.subtitle")}</p>
           <p className="mt-1 text-xs text-muted-foreground">
             {t("metrics.lastSample")}: {lastSample}
-            <span className="ml-2 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground/70">
+            <span className="ml-2 font-mono text-[10px] uppercase text-muted-foreground/70">
               {range} · {defaultStepLabel(range)} bucket
             </span>
           </p>
@@ -442,6 +443,8 @@ function HostTab({
   const { t } = useLocaleText();
   const host = snapshot?.host;
   const hostPts = series?.host || [];
+  const clockPts = series?.clock || [];
+  const clockChartState = snapshot?.clock?.enabled === false ? "disabled" : state;
   return (
     <div className="grid animate-fade-in-up gap-5">
       <KpiGrid>
@@ -474,6 +477,15 @@ function HostTab({
           spark={hostPts.map((p) => p.rxBytesPerSec || 0)}
         />
       </KpiGrid>
+      <div className="grid gap-5 xl:grid-cols-[2fr_1fr]">
+        <ClockOffsetChart
+          title={t("metrics.chart.clockOffset")}
+          state={clockChartState}
+          values={clockPts.map((point) => point.offsetMs)}
+          timestamps={clockPts.map((point) => point.timestamp)}
+        />
+        <ClockHealthPanel clock={snapshot?.clock} />
+      </div>
       <div className="grid gap-5 xl:grid-cols-[2fr_1fr]">
         <ResourceTrendChart
           title={t("metrics.chart.hostPerformance")}
@@ -640,7 +652,8 @@ function LlmTab({
           state={state}
           series={[
             { label: "RPM", color: "#06B6D4", values: series?.llm.map((p) => p.rpm) || [] },
-            { label: "429", color: "#F59E0B", values: series?.llm.map((p) => p.rateLimited) || [] },
+            { label: t("metrics.series.rateLimited"), color: "#F59E0B", values: series?.llm.map((p) => p.rateLimited) || [] },
+            { label: t("metrics.series.concurrencyLimited"), color: "#0F766E", values: series?.llm.map((p) => p.concurrencyLimited) || [] },
             { label: "Error %", color: "#EF4444", values: series?.llm.map((p) => p.errorRate * 100) || [] },
           ]}
           timestamps={series?.llm.map((p) => p.timestamp) || []}

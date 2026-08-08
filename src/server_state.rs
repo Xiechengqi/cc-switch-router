@@ -11,6 +11,7 @@ use crate::alerting::AlertingService;
 use crate::client_logs::ClientLogAccessLimiter;
 use crate::client_market::ClientMarketJobSecrets;
 use crate::client_market_terminal::TerminalSessionManager;
+use crate::clock_health::ClockHealthService;
 use crate::config::Config;
 use crate::dynamic_settings::DynamicSettings;
 use crate::ip_blacklist_stats::IpBlacklistStats;
@@ -75,6 +76,8 @@ pub struct ServerState {
     pub scheduling_overrides: Arc<OverrideStore>,
     /// Separate metrics collector/store for host, router, and LLM observability.
     pub metrics: Arc<MetricsRegistry>,
+    /// Independent external-reference clock monitor used by ingress diagnostics.
+    pub clock_health: Arc<ClockHealthService>,
     /// Persistent operator incidents and channel-neutral delivery outbox.
     pub alerting: Arc<AlertingService>,
     /// Bounded in-memory admission limiter for the public installation registration endpoint.

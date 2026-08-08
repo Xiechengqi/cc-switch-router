@@ -12,7 +12,7 @@ import { useDashboardViewState } from "@/components/dashboard/dashboard-view-sta
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
 import { getMarketLinkedShares, getMarketSharePriority, getMarketShareSessionLoads, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance } from "@/lib/api";
 import type { DashboardMarket, MarketRequestLog, MarketShare, MarketShareRuntimeState, OperationalState, ShareAppRuntimes, ShareUpstreamProvider } from "@/lib/types";
-import { cn, compactTokens, formatDateTime, formatRelativeTime } from "@/lib/utils";
+import { cn, compactTokens, formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { drawerDialogClassName, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, isUnlimited, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
@@ -98,11 +98,11 @@ function MarketActivitySparkline({ market }: { market: DashboardMarket }) {
   );
 }
 
-function MarketIdentityCell({ market, t }: { market: DashboardMarket; t: TFn }) {
+function MarketIdentityCell({ market, t, linkUrl = true }: { market: DashboardMarket; t: TFn; linkUrl?: boolean }) {
   return (
     <div className="grid min-w-0 gap-1">
       <strong className="truncate text-sm font-semibold text-foreground" title={market.displayName || market.subdomain || market.id}>{market.displayName || market.subdomain || market.id}</strong>
-      {market.publicBaseUrl ? (
+      {market.publicBaseUrl && linkUrl ? (
         <a
           href={market.publicBaseUrl}
           target="_blank"
@@ -114,6 +114,10 @@ function MarketIdentityCell({ market, t }: { market: DashboardMarket; t: TFn }) 
           <span className="min-w-0 truncate">{market.publicBaseUrl}</span>
           <ExternalLink className="h-3 w-3 shrink-0" />
         </a>
+      ) : market.publicBaseUrl ? (
+        <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground" title={market.publicBaseUrl}>
+          {market.publicBaseUrl}
+        </span>
       ) : (
         <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground">{market.id}</span>
       )}
@@ -190,7 +194,11 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
     lastLocatedFocusRef.current = focusKey;
     const marketId = focus.target.kind === "market" ? focus.target.id : Array.from(focus.relatedMarketIds)[0];
     if (!marketId) return;
-    window.requestAnimationFrame(() => document.getElementById(`dashboard-market-${marketId}`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+    window.requestAnimationFrame(() => {
+      const row = document.getElementById(`dashboard-market-${marketId}`)
+        || document.getElementById(`dashboard-market-table-${marketId}`);
+      row?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
+    });
     if (focus.target.kind === "share") void recordDashboardUxEvent({ eventType: "market_located_from_share", source: "client-board", targetType: "market" });
   }, [focus.relatedMarketIds, focus.target]);
 
@@ -200,29 +208,82 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
     if (market) setSelected(market);
   }, [focus.drawerTarget, stableMarkets]);
 
+  const openMarket = React.useCallback((market: DashboardMarket, keyboard = false) => {
+    focus.setFocus({ kind: "market", id: market.id, source: "market-table" });
+    focus.openDrawer("market", market.id);
+    setSelected(market);
+    void recordDashboardUxEvent({
+      eventType: "drawer_opened",
+      source: "market-table",
+      targetType: "market",
+      keyboard,
+    });
+  }, [focus]);
+
   return (
     <section className="grid gap-3">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex max-w-full items-center gap-3 overflow-x-auto pb-1 sm:overflow-visible sm:pb-0">
+          <div className="inline-flex shrink-0 rounded-lg bg-slate-100 p-1 text-[11px]">
             {([["all", t("dashboard.all"), stableMarkets.length], ["available", t("dashboard.available"), summary.available], ["issues", t("dashboard.issues"), summary.issues], ["disabled", t("common.disabled"), summary.disabled]] as const).map(([value, label, count]) => (
-              <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "available" || value === "disabled") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "issues" ? "text-rose-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+              <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "available" || value === "disabled") setIssuesOnly(false); }} className={`whitespace-nowrap rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "issues" ? "text-rose-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
           <SectionInstallButton label={t("dashboard.installMarket")} onClick={() => setInstallOpen(true)} />
         </div>
-        <div className="flex items-center gap-2">
-          <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
+        <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto">
+          <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 sm:min-w-64">
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchMarkets")} aria-label={t("dashboard.searchMarkets")} />
           </label>
-          <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "capacity", label: t("dashboard.sortCapacity") }, { value: "activity", label: t("dashboard.sortActivity") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "updated", label: t("dashboard.sortUpdated") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
+          <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "capacity", label: t("dashboard.sortCapacity") }, { value: "activity", label: t("dashboard.sortActivity") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "updated", label: t("dashboard.sortUpdated") }]} ariaLabel={t("dashboard.sortBy")} className="w-36 shrink-0 sm:w-44" />
         </div>
       </div>
-      <Card className="overflow-hidden rounded-lg border bg-white shadow-sm">
+      <div className="grid gap-2 md:hidden">
+        {rows.length ? rows.map(({ market, state, summary: operational }) => {
+          const capacityLimit = isUnlimited(market.parallelCapacity) ? "∞" : market.parallelCapacity > 0 ? String(market.parallelCapacity) : "-";
+          const focused = focus.isFocused("market", market.id);
+          const related = focus.isRelated("market", market.id);
+          const dimmed = Boolean(focus.target) && !related;
+          const rowTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : state === "maintenance" ? "border-l-blue-400" : state === "disabled" ? "border-l-slate-300 opacity-70" : "border-l-transparent";
+          return (
+            <div
+              id={`dashboard-market-${market.id}`}
+              key={market.id}
+              role="button"
+              tabIndex={0}
+              aria-label={market.displayName || market.subdomain || market.id}
+              className={`grid gap-3 rounded-md border border-l-[3px] bg-white p-3 outline-none focus-visible:ring-2 focus-visible:ring-primary/30 ${rowTone} ${focused ? "ring-2 ring-primary/30" : ""} ${dimmed ? "opacity-50" : ""}`}
+              onClick={(event) => { if (shouldOpenRowDrawer(event)) openMarket(market); }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  openMarket(market, true);
+                }
+              }}
+            >
+              <MarketIdentityCell market={market} t={t} linkUrl={false} />
+              <div>
+                <strong className={`text-xs ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : state === "degraded" ? "text-amber-700" : state === "maintenance" ? "text-blue-700" : "text-emerald-700"}`}>{operationalStateLabel(state, t)}</strong>
+                <p className="mt-0.5 text-xs text-muted-foreground">{operationalReasonLabel(operational.primaryReason, t)}</p>
+              </div>
+              <dl className="grid grid-cols-3 gap-3 border-t border-border pt-3 text-xs">
+                <div><dt className="text-muted-foreground">{t("dashboard.capacity")}</dt><dd className="mt-0.5 font-semibold tabular-nums">{market.activeRequests || 0}/{capacityLimit}</dd></div>
+                <div><dt className="text-muted-foreground">{t("dashboard.shares")}</dt><dd className="mt-0.5 font-semibold tabular-nums">{market.onlineShareCount || 0}/{market.shareCount || 0}</dd></div>
+                <div className="text-right"><dt className="text-muted-foreground">{t("dashboard.updated")}</dt><dd className="mt-0.5 font-medium">{formatRelativeTime(market.lastSeenAt, locale)}</dd></div>
+              </dl>
+            </div>
+          );
+        }) : (
+          <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+            {stableMarkets.length ? t("dashboard.noFilterResults") : t("dashboard.noMarkets")}
+          </div>
+        )}
+      </div>
+      <Card className="hidden overflow-hidden rounded-lg border bg-white shadow-sm md:block">
         <Card.Content className="p-0">
           <table className="w-full table-fixed border-collapse text-sm">
-            <thead className="bg-slate-50 text-left font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            <thead className="bg-slate-50 text-left font-mono text-[10px] font-semibold uppercase text-muted-foreground">
               <tr>
                 <th className="w-[25%] px-3 py-2.5">{t("dashboard.market")}</th>
                 <th className="w-[22%] px-3 py-2.5">{t("dashboard.status")} / {t("dashboard.health")}</th>
@@ -243,7 +304,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                 const related = focus.isRelated("market", market.id);
                 const dimmed = Boolean(focus.target) && !related;
                 return (
-                  <tr id={`dashboard-market-${market.id}`} key={market.id} tabIndex={0} className={`cursor-pointer border-b border-l-[3px] outline-none transition-opacity last:border-b-0 hover:bg-primary/[0.03] focus-visible:bg-primary/[0.05] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30 ${rowTone} ${focused ? "bg-primary/[0.07] ring-2 ring-inset ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`} onClick={(event) => { if (shouldOpenRowDrawer(event)) { focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market" }); } }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market", keyboard: true }); } }}>
+                  <tr id={`dashboard-market-table-${market.id}`} key={market.id} tabIndex={0} className={`cursor-pointer border-b border-l-[3px] outline-none transition-opacity last:border-b-0 hover:bg-primary/[0.03] focus-visible:bg-primary/[0.05] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30 ${rowTone} ${focused ? "bg-primary/[0.07] ring-2 ring-inset ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`} onClick={(event) => { if (shouldOpenRowDrawer(event)) openMarket(market); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openMarket(market, true); } }}>
                     <td className="px-3 py-2.5 align-middle"><MarketIdentityCell market={market} t={t} /></td>
                     <td className="px-3 py-2.5 align-middle">
                       <strong className={`block text-xs ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : state === "degraded" ? "text-amber-700" : state === "maintenance" ? "text-blue-700" : "text-emerald-700"}`}>{operationalStateLabel(state, t)}</strong>

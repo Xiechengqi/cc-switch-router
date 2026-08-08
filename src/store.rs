@@ -61,17 +61,18 @@ use crate::models::{
     RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess, ShareAppAvailability,
     ShareAppProviders, ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest,
     ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareModelHealthCheckEntry,
-    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
-    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota,
-    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant,
-    ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareUserPolicy, ShareView,
-    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
-    TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
-    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareDescriptorSyncAck, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
+    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
+    SharePendingEditsResponse, SharePruneRequest, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest, ShareTokenPeriod,
+    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
+    ShareUsageEmailRow, ShareUserGrant, ShareUserLimitStatusResponse, ShareUserLimitStatusRow,
+    ShareUserPolicy, ShareView, SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease,
+    TunnelStateRequest, TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -4893,8 +4894,14 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin owner email change failed: {e}")))?;
-        let updated_shares =
-            rebind_installation_shares_to_owner(&tx, &input.installation_id, &new_email)?;
+        let new_owner = upsert_user_by_email(&tx, &new_email, now)?;
+        let updated_shares = rebind_installation_shares_to_owner(
+            &tx,
+            &input.installation_id,
+            &new_owner.id,
+            &new_email,
+            now,
+        )?;
         tx.execute(
             "UPDATE installations
                  SET owner_email = ?2, owner_verified_at = ?3
@@ -7208,6 +7215,7 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("insert lease failed: {e}")))?;
+        drop(conn);
 
         proxy
             .mark_route_pending(
@@ -7368,20 +7376,41 @@ impl AppStore {
         if lease.expires_at < now {
             return Err(AppError::Unauthorized("lease expired".into()));
         }
-        if lease.ssh_password != password {
+        if !crate::ctl_client::constant_time_eq(lease.ssh_password.as_bytes(), password.as_bytes())
+        {
             return Err(AppError::Unauthorized("invalid ssh credentials".into()));
         }
         ensure_tunnel_protocol_epoch(&lease.protocol_epoch)?;
+        let updated = conn
+            .execute(
+                "UPDATE leases
+             SET used_at = ?2,
+                 state = 'authenticated'
+             WHERE connection_id = ?1 AND used_at IS NULL AND state = 'issued'",
+                params![username, now.to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("update lease use failed: {e}")))?;
+        if updated != 1 {
+            return Err(AppError::Unauthorized("lease already used".into()));
+        }
         lease.used_at = Some(now);
-        conn.execute(
-            "UPDATE leases
-             SET used_at = COALESCE(used_at, ?2),
-                 state = CASE WHEN state = 'issued' THEN 'authenticated' ELSE state END
-             WHERE connection_id = ?1",
-            params![username, now.to_rfc3339()],
-        )
-        .map_err(|e| AppError::Internal(format!("update lease use failed: {e}")))?;
         Ok(lease)
+    }
+
+    pub async fn consume_control_request_nonce(
+        &self,
+        installation_id: &str,
+        nonce: &str,
+    ) -> Result<(), AppError> {
+        validate_request_nonce(nonce)?;
+        let conn = self.conn.lock().await;
+        consume_request_nonce(
+            &conn,
+            installation_id,
+            "ctl_control_request",
+            nonce,
+            Utc::now(),
+        )
     }
 
     pub async fn mark_lease_ready(
@@ -8151,6 +8180,27 @@ impl AppStore {
         metadata: ClientMetadata,
         _current_user_email: &str,
     ) -> Result<(), AppError> {
+        self.batch_sync_shares_inner(input, metadata, "share_batch_sync", false)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn batch_sync_share_descriptors(
+        &self,
+        input: ShareBatchSyncRequest,
+        metadata: ClientMetadata,
+    ) -> Result<Vec<ShareDescriptorSyncAck>, AppError> {
+        self.batch_sync_shares_inner(input, metadata, "share_descriptor_batch_sync", true)
+            .await
+    }
+
+    async fn batch_sync_shares_inner(
+        &self,
+        input: ShareBatchSyncRequest,
+        metadata: ClientMetadata,
+        signature_action: &str,
+        strict_descriptors: bool,
+    ) -> Result<Vec<ShareDescriptorSyncAck>, AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
         let Some(installation) = installation else {
@@ -8165,7 +8215,7 @@ impl AppStore {
             &conn,
             &installation.public_key,
             &input.installation_id,
-            "share_batch_sync",
+            signature_action,
             &input.ops,
             input.timestamp_ms,
             &input.nonce,
@@ -8190,12 +8240,24 @@ impl AppStore {
             .filter(|op| op.kind == "upsert")
             .filter_map(|op| op.share.as_ref().map(|share| share.share_id.clone()))
             .collect::<HashSet<_>>();
+        let mut acks = Vec::new();
         for op in input.ops {
             match op.kind.as_str() {
                 "upsert" => {
                     let mut share = op.share.ok_or_else(|| {
                         AppError::BadRequest("share is required for upsert".into())
                     })?;
+                    let descriptor_applied = if strict_descriptors {
+                        validate_strict_share_descriptor_tx(&tx, &share)?
+                    } else {
+                        false
+                    };
+                    let ack = strict_descriptors.then(|| ShareDescriptorSyncAck {
+                        share_id: share.share_id.clone(),
+                        descriptor_generation: share.descriptor_generation,
+                        descriptor_fingerprint: share.descriptor_fingerprint.clone(),
+                        applied: descriptor_applied,
+                    });
                     ensure_share_id_writable_by_installation(
                         &tx,
                         &share.share_id,
@@ -8208,6 +8270,9 @@ impl AppStore {
                     )?;
                     normalize_self_reported_share_owner(&mut share, &installation_owner)?;
                     upsert_share_tx(&tx, &input.installation_id, share)?;
+                    if let Some(ack) = ack {
+                        acks.push(ack);
+                    }
                 }
                 "delete" => {
                     let share_id = op.share_id.ok_or_else(|| {
@@ -8231,7 +8296,7 @@ impl AppStore {
         }
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit batch sync failed: {e}")))?;
-        Ok(())
+        Ok(acks)
     }
 
     pub async fn create_share_settings_edit(
@@ -8425,14 +8490,14 @@ impl AppStore {
                 "share edit was no longer pending".into(),
             ));
         }
-        tx.commit().map_err(map_share_constraint_error)?;
         crate::share_market::handle_control_edit_ack(
-            &conn,
+            &tx,
             edit_id,
             "applied",
             None,
             &now.to_rfc3339(),
         )?;
+        tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
     }
 
@@ -8455,23 +8520,44 @@ impl AppStore {
         edit_id: &str,
         error_message: &str,
     ) -> Result<(), AppError> {
+        self.mark_share_edit_rejected_with_metadata(edit_id, error_message, None, None)
+            .await
+    }
+
+    pub async fn mark_share_edit_rejected_with_metadata(
+        &self,
+        edit_id: &str,
+        error_message: &str,
+        error_code: Option<&str>,
+        retryable: Option<bool>,
+    ) -> Result<(), AppError> {
         let error_message = client_chat::sanitize_system_event_text(error_message);
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
-        conn.execute(
+        let tx = conn.unchecked_transaction().map_err(|error| {
+            AppError::Internal(format!(
+                "begin reject share edit transaction failed: {error}"
+            ))
+        })?;
+        tx.execute(
             "UPDATE share_edit_requests
              SET status = 'rejected', updated_at = ?2, error_message = ?3
              WHERE id = ?1 AND status = 'pending'",
             params![edit_id, now, error_message],
         )
         .map_err(|e| AppError::Internal(format!("reject share edit failed: {e}")))?;
-        crate::share_market::handle_control_edit_ack(
-            &conn,
+        crate::share_market::handle_control_edit_ack_with_metadata(
+            &tx,
             edit_id,
             "rejected",
             Some(&error_message),
+            error_code,
+            retryable,
             &now,
         )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit rejected share edit failed: {error}"))
+        })?;
         Ok(())
     }
 
@@ -8541,7 +8627,10 @@ impl AppStore {
             .error_message
             .as_deref()
             .map(client_chat::sanitize_system_event_text);
-        let changed = conn
+        let tx = conn.unchecked_transaction().map_err(|error| {
+            AppError::Internal(format!("begin share edit ack transaction failed: {error}"))
+        })?;
+        let changed = tx
             .execute(
                 "UPDATE share_edit_requests
                  SET status = ?4,
@@ -8563,7 +8652,7 @@ impl AppStore {
             )
             .map_err(|e| AppError::Internal(format!("ack share edit failed: {e}")))?;
         if changed == 0 {
-            let existing_status: Option<String> = conn
+            let existing_status: Option<String> = tx
                 .query_row(
                     "SELECT status FROM share_edit_requests
                      WHERE id = ?1 AND installation_id = ?2 AND revision = ?3",
@@ -8580,13 +8669,18 @@ impl AppStore {
                 ));
             }
         }
-        crate::share_market::handle_control_edit_ack(
-            &conn,
+        crate::share_market::handle_control_edit_ack_with_metadata(
+            &tx,
             &ack_edit_id,
             status,
             ack_error.as_deref(),
+            input.ack.error_code.as_deref(),
+            input.ack.retryable,
             &now,
         )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit share edit ack failed: {error}"))
+        })?;
         Ok(())
     }
 
@@ -8648,6 +8742,9 @@ impl AppStore {
             (Option<String>, Option<String>, Option<String>),
         >,
     ) -> Result<(), AppError> {
+        if input.logs.len() > 500 {
+            return Err(AppError::BadRequest("too many Share request logs".into()));
+        }
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
         let Some(installation) = installation else {
@@ -8676,8 +8773,43 @@ impl AppStore {
         let tx = conn.unchecked_transaction().map_err(|e| {
             AppError::Internal(format!("begin request log batch sync tx failed: {e}"))
         })?;
+        let requested_share_ids = input
+            .logs
+            .iter()
+            .map(|log| log.share_id.trim().to_string())
+            .filter(|share_id| !share_id.is_empty())
+            .collect::<HashSet<_>>();
+        let owned_share_ids = if requested_share_ids.is_empty() {
+            HashSet::new()
+        } else {
+            let placeholders = std::iter::repeat_n("?", requested_share_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT share_id FROM shares
+                 WHERE installation_id = ? AND share_id IN ({placeholders})"
+            );
+            let values = std::iter::once(input.installation_id.clone())
+                .chain(requested_share_ids.iter().cloned());
+            tx.prepare(&sql)
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params_from_iter(values), |row| row.get::<_, String>(0))?
+                        .collect::<Result<HashSet<_>, _>>()
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "read Share request log ownership batch failed: {error}"
+                    ))
+                })?
+        };
+        if owned_share_ids.len() != requested_share_ids.len() {
+            return Err(AppError::Unauthorized(
+                "only share installation can sync request logs".into(),
+            ));
+        }
         for mut log in input.logs {
-            if !share_belongs_to_installation(&tx, &log.share_id, &input.installation_id)? {
+            if !owned_share_ids.contains(log.share_id.trim()) {
                 return Err(AppError::Unauthorized(
                     "only share installation can sync request logs".into(),
                 ));
@@ -10622,11 +10754,72 @@ impl AppStore {
         let tx = conn.unchecked_transaction().map_err(|e| {
             AppError::Internal(format!("begin market request log sync tx failed: {e}"))
         })?;
+        for log in &input.logs {
+            validate_market_request_log(log)?;
+        }
+        let mut existing_request_ids = if input.logs.is_empty() {
+            HashSet::new()
+        } else {
+            let request_ids = input
+                .logs
+                .iter()
+                .map(|log| log.request_id.clone())
+                .collect::<HashSet<_>>();
+            let placeholders = std::iter::repeat_n("?", request_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT request_id FROM market_request_logs WHERE request_id IN ({placeholders})"
+            );
+            tx.prepare(&sql)
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params_from_iter(request_ids), |row| row.get::<_, String>(0))?
+                        .collect::<Result<HashSet<_>, _>>()
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "read existing market request log batch failed: {error}"
+                    ))
+                })?
+        };
+        let market_email = market.email.trim().to_ascii_lowercase();
+        let mut recent_results_by_model = tx
+            .prepare(
+                "SELECT share_id, app_type, requested_model, recent_results_json
+                 FROM market_share_model_failure_state
+                 WHERE market_email = ?1",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![market_email], |row| {
+                        Ok((
+                            (
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ),
+                            parse_recent_results(row.get(3)?)?,
+                        ))
+                    })?
+                    .collect::<Result<HashMap<_, _>, _>>()
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("read market failure state batch failed: {error}"))
+            })?;
         let mut count = 0;
         for log in input.logs {
-            validate_market_request_log(&log)?;
-            record_market_share_model_failure_state_conn(&tx, &market.email, &log)?;
+            let request_already_exists = existing_request_ids.contains(&log.request_id);
+            record_market_share_model_failure_state_conn(
+                &tx,
+                &market.email,
+                &log,
+                request_already_exists,
+                &mut recent_results_by_model,
+            )?;
+            let request_id = log.request_id.clone();
             upsert_market_request_log_tx(&tx, market, log)?;
+            existing_request_ids.insert(request_id);
             count += 1;
         }
         tx.commit().map_err(|e| {
@@ -11450,23 +11643,17 @@ impl AppStore {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE shares
-             SET enabled_claude = ?2,
-                 enabled_codex = ?3,
-                 enabled_gemini = ?4,
-                 app_runtimes_json = ?5,
-                 app_providers_json = ?6,
-                 runtime_refreshed_at = ?7,
-                 token_limit = COALESCE(?8, token_limit),
-                 tokens_used = COALESCE(?9, tokens_used),
-                 requests_count = COALESCE(?10, requests_count),
-                 share_status = COALESCE(?11, share_status),
-                 updated_at = ?12
+             SET app_runtimes_json = ?2,
+                 app_providers_json = ?3,
+                 runtime_refreshed_at = ?4,
+                 token_limit = COALESCE(?5, token_limit),
+                 tokens_used = COALESCE(?6, tokens_used),
+                 requests_count = COALESCE(?7, requests_count),
+                 share_status = COALESCE(?8, share_status),
+                 updated_at = ?9
              WHERE share_id = ?1",
             params![
                 snapshot.share_id,
-                i64::from(snapshot.support.claude as u8),
-                i64::from(snapshot.support.codex as u8),
-                i64::from(snapshot.support.gemini as u8),
                 app_runtimes_json,
                 app_providers_json,
                 refreshed_at,
@@ -11760,6 +11947,63 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) {
     }
 }
 
+fn validate_strict_share_descriptor_tx(
+    conn: &Connection,
+    share: &ShareDescriptor,
+) -> Result<bool, AppError> {
+    if share.descriptor_generation == 0 {
+        return Err(AppError::BadRequest(
+            "strict Share descriptor generation must be positive".into(),
+        ));
+    }
+    if share.descriptor_fingerprint.len() != 64
+        || !share
+            .descriptor_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::BadRequest(
+            "strict Share descriptor fingerprint must be a lowercase SHA-256 hex digest".into(),
+        ));
+    }
+    let current = conn
+        .query_row(
+            "SELECT descriptor_generation, descriptor_fingerprint
+             FROM shares WHERE share_id = ?1",
+            params![share.share_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, String>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read current Share descriptor version failed: {error}"
+            ))
+        })?;
+    let Some((current_generation, current_fingerprint)) = current else {
+        return Ok(true);
+    };
+    if share.descriptor_generation < current_generation {
+        return Err(AppError::Conflict(format!(
+            "Share descriptor generation regressed from {current_generation} to {}",
+            share.descriptor_generation
+        )));
+    }
+    if share.descriptor_generation == current_generation {
+        if current_fingerprint != share.descriptor_fingerprint {
+            return Err(AppError::Conflict(
+                "Share descriptor fingerprint changed without a generation increment".into(),
+            ));
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn validate_share_descriptor_bindings(share: &ShareDescriptor) -> Result<(), AppError> {
     if share.capacity_pool_id.trim().is_empty() || share.capacity_pool_id.len() > 128 {
         return Err(AppError::BadRequest(
@@ -11953,8 +12197,9 @@ fn upsert_share_tx(
         "INSERT INTO shares (
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at, capacity_pool_id, for_sale_official_price_percent_by_app_json
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at, capacity_pool_id, for_sale_official_price_percent_by_app_json,
+            descriptor_generation, descriptor_fingerprint
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -11968,9 +12213,9 @@ fn upsert_share_tx(
             subdomain = excluded.subdomain,
             app_type = excluded.app_type,
             provider_id = excluded.provider_id,
-            enabled_claude = shares.enabled_claude,
-            enabled_codex = shares.enabled_codex,
-            enabled_gemini = shares.enabled_gemini,
+            enabled_claude = excluded.enabled_claude,
+            enabled_codex = excluded.enabled_codex,
+            enabled_gemini = excluded.enabled_gemini,
             token_limit = excluded.token_limit,
             parallel_limit = excluded.parallel_limit,
             tokens_used = excluded.tokens_used,
@@ -11987,9 +12232,16 @@ fn upsert_share_tx(
             supported_user_token_periods_json = excluded.supported_user_token_periods_json,
             capacity_pool_id = excluded.capacity_pool_id,
             for_sale_official_price_percent_by_app_json = excluded.for_sale_official_price_percent_by_app_json,
+            descriptor_generation = excluded.descriptor_generation,
+            descriptor_fingerprint = excluded.descriptor_fingerprint,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at
-        WHERE excluded.config_revision >= shares.config_revision",
+        WHERE excluded.descriptor_generation > shares.descriptor_generation
+           OR (
+                excluded.descriptor_generation = shares.descriptor_generation
+                AND excluded.descriptor_fingerprint = shares.descriptor_fingerprint
+                AND excluded.config_revision >= shares.config_revision
+           )",
         params![
             share.share_id,
             installation_id,
@@ -12024,6 +12276,8 @@ fn upsert_share_tx(
             Utc::now().to_rfc3339(),
             share.capacity_pool_id,
             official_price_percent_by_app_json,
+            i64::try_from(share.descriptor_generation).unwrap_or(i64::MAX),
+            share.descriptor_fingerprint,
         ],
     )
     .map_err(map_share_constraint_error)?;
@@ -12287,6 +12541,7 @@ pub(crate) fn purge_installation_data_tx(
         collect_rows(rows)?
     };
     for share_id in &share_ids {
+        retire_share_tx(conn, share_id, installation_id)?;
         delete_share_auxiliary_rows_tx(conn, share_id)?;
     }
     conn.execute(
@@ -12322,11 +12577,15 @@ pub(crate) fn purge_installation_data_tx(
         params![installation_id],
     )
     .map_err(|e| AppError::Internal(format!("delete installation leases failed: {e}")))?;
-    conn.execute(
-        "DELETE FROM shares WHERE installation_id = ?1",
-        params![installation_id],
-    )
-    .map_err(|e| AppError::Internal(format!("delete installation shares failed: {e}")))?;
+    debug_assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM shares WHERE installation_id = ?1",
+            params![installation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| AppError::Internal(format!("verify installation shares purge failed: {e}")))?,
+        0
+    );
     conn.execute(
         "DELETE FROM installation_health_checks WHERE installation_id = ?1",
         params![installation_id],
@@ -12404,20 +12663,38 @@ pub(crate) fn retire_share_tx(
     share_id: &str,
     installation_id: &str,
 ) -> Result<bool, AppError> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM shares WHERE share_id = ?1 AND installation_id = ?2",
+            params![share_id, installation_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read Share before retirement failed: {error}"))
+        })?
+        .is_some();
+    if !exists {
+        return Ok(false);
+    }
+    let retired_at = Utc::now().to_rfc3339();
+    crate::share_market::retire_deleted_share_market_tx(
+        conn,
+        share_id,
+        "share_deleted",
+        &retired_at,
+    )?;
     let deleted = conn
         .execute(
             "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
             params![share_id, installation_id],
         )
         .map_err(|e| AppError::Internal(format!("retire share failed: {e}")))?;
-    if deleted == 0 {
-        return Ok(false);
-    }
+    debug_assert_eq!(deleted, 1);
 
     crate::public_hosts::tombstone_subject(conn, PublicHostKind::Share, share_id)
         .map_err(map_public_host_error)?;
 
-    let retired_at = Utc::now().to_rfc3339();
     conn.execute(
         "UPDATE share_edit_requests
          SET status = CASE WHEN status = 'pending' THEN 'cancelled' ELSE status END,
@@ -14690,7 +14967,7 @@ fn enqueue_client_offline_chat_event_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enqueue_operator_alert_signal_tx(
+pub(crate) fn enqueue_operator_alert_signal_tx(
     conn: &Connection,
     source_event_id: &str,
     fingerprint: &str,
@@ -16065,7 +16342,8 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
                     s.bindings_json, s.config_revision, COALESCE(s.user_grants_json, '{}'),
                     COALESCE(s.supported_user_token_periods_json, '[]'), s.capacity_pool_id,
-                    COALESCE(s.for_sale_official_price_percent_by_app_json, '{}')
+                    COALESCE(s.for_sale_official_price_percent_by_app_json, '{}'),
+                    s.descriptor_generation, s.descriptor_fingerprint
              FROM shares s
              INNER JOIN installations i ON i.id = s.installation_id
              WHERE i.lifecycle = 'active'
@@ -16113,6 +16391,8 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     model_health: ShareModelHealthSummary::default(),
                     auto_start: false,
                     config_revision: row.get::<_, i64>(27)?.max(0) as u64,
+                    descriptor_generation: row.get::<_, i64>(32)?.max(0) as u64,
+                    descriptor_fingerprint: row.get(33)?,
                     user_grants: parse_share_user_grants(row.get(28)?)?,
                     supported_user_token_periods: parse_supported_user_token_periods(
                         &row.get::<_, String>(29)?,
@@ -18506,6 +18786,8 @@ fn record_market_share_model_failure_state_conn(
     conn: &Connection,
     market_email: &str,
     log: &MarketRequestLogEntry,
+    request_already_exists: bool,
+    recent_results_by_model: &mut HashMap<(String, String, String), Vec<String>>,
 ) -> Result<(), AppError> {
     let Some(status) = market_model_status(log) else {
         return Ok(());
@@ -18522,16 +18804,7 @@ fn record_market_share_model_failure_state_conn(
     if !matches!(app_type.as_str(), "claude" | "codex" | "gemini") {
         return Ok(());
     }
-    if conn
-        .query_row(
-            "SELECT 1 FROM market_request_logs WHERE request_id = ?1",
-            params![log.request_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("check existing market request log failed: {e}")))?
-        .is_some()
-    {
+    if request_already_exists {
         return Ok(());
     }
 
@@ -18554,16 +18827,14 @@ fn record_market_share_model_failure_state_conn(
     let checked_at = DateTime::parse_from_rfc3339(&log.created_at)
         .map(|dt| dt.timestamp())
         .unwrap_or_else(|_| Utc::now().timestamp());
-    let existing_recent = conn
-        .query_row(
-            "SELECT recent_results_json
-             FROM market_share_model_failure_state
-             WHERE market_email = ?1 AND share_id = ?2 AND app_type = ?3 AND requested_model = ?4",
-            params![market_email, share_id, app_type, requested_model],
-            |row| parse_recent_results(row.get(0)?),
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("read market failure state failed: {e}")))?
+    let state_key = (
+        share_id.to_string(),
+        app_type.clone(),
+        requested_model.clone(),
+    );
+    let existing_recent = recent_results_by_model
+        .get(&state_key)
+        .cloned()
         .unwrap_or_default();
     let mut recent_results = Vec::with_capacity(3);
     recent_results.push(status.to_string());
@@ -18617,6 +18888,7 @@ fn record_market_share_model_failure_state_conn(
         ],
     )
     .map_err(|e| AppError::Internal(format!("upsert market failure state failed: {e}")))?;
+    recent_results_by_model.insert(state_key, recent_results);
     Ok(())
 }
 
@@ -20568,23 +20840,6 @@ fn get_share_owner_binding(
     .map_err(|e| AppError::Internal(format!("query share owner binding failed: {e}")))
 }
 
-fn share_belongs_to_installation(
-    conn: &Connection,
-    share_id: &str,
-    installation_id: &str,
-) -> Result<bool, AppError> {
-    let exists = conn
-        .query_row(
-            "SELECT 1 FROM shares WHERE share_id = ?1 AND installation_id = ?2 LIMIT 1",
-            params![share_id, installation_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("query share installation ownership failed: {e}")))?
-        .is_some();
-    Ok(exists)
-}
-
 fn ensure_share_id_writable_by_installation(
     conn: &Connection,
     share_id: &str,
@@ -20635,7 +20890,9 @@ fn normalize_self_reported_share_owner(
 fn rebind_installation_shares_to_owner(
     conn: &Connection,
     installation_id: &str,
+    new_owner_user_id: &str,
     new_owner: &str,
+    now: DateTime<Utc>,
 ) -> Result<usize, AppError> {
     let mut statement = conn
         .prepare(
@@ -20716,7 +20973,7 @@ fn rebind_installation_shares_to_owner(
         let settings = serde_json::to_string(&settings).map_err(|error| {
             AppError::Internal(format!("serialize app settings rebind failed: {error}"))
         })?;
-        updated += conn
+        let changed = conn
             .execute(
                 "UPDATE shares
                  SET owner_email = ?2, share_name = ?2, shared_with_emails_json = ?3,
@@ -20728,10 +20985,20 @@ fn rebind_installation_shares_to_owner(
                     shared,
                     access,
                     settings,
-                    Utc::now().to_rfc3339()
+                    now.to_rfc3339()
                 ],
             )
             .map_err(|error| AppError::Internal(format!("rebind share owner failed: {error}")))?;
+        if changed == 1 {
+            crate::share_market::rebind_share_market_owner_tx(
+                conn,
+                &share_id,
+                new_owner_user_id,
+                new_owner,
+                &now.to_rfc3339(),
+            )?;
+        }
+        updated += changed;
     }
     Ok(updated)
 }
@@ -24398,6 +24665,7 @@ mod tests {
                 sample_interval_secs: 5,
                 alerting: crate::config::AlertingSettings::default(),
             },
+            clock_health: crate::config::ClockHealthConfig::default(),
         }
     }
 
@@ -25402,6 +25670,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         }
@@ -25931,6 +26201,45 @@ mod tests {
         log.error_message = Some("upstream failed".into());
         log.usage_amount_usd = None;
         log
+    }
+
+    #[tokio::test]
+    async fn duplicate_market_request_ids_update_failure_state_once() {
+        let (store, config) = setup_store("market-log-duplicate-state").await;
+        let market = test_market();
+        let log = test_failed_market_request_log("req_market_duplicate_state_1", "share-1");
+
+        store
+            .batch_sync_market_request_logs(
+                &market,
+                MarketRequestLogBatchSyncRequest {
+                    logs: vec![log.clone(), log.clone()],
+                },
+            )
+            .await
+            .expect("sync duplicate request ids");
+
+        let conn = store.conn.lock().await;
+        let (request_count, recent_results_json): (i64, String) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM market_request_logs
+                     WHERE request_id = 'req_market_duplicate_state_1'),
+                    recent_results_json
+                 FROM market_share_model_failure_state
+                 WHERE lower(market_email) = 'market@example.com'
+                   AND share_id = 'share-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read duplicate request state");
+        let recent_results: Vec<String> =
+            serde_json::from_str(&recent_results_json).expect("parse recent results");
+        assert_eq!(request_count, 1);
+        assert_eq!(recent_results.len(), 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -34035,11 +34344,11 @@ mod tests {
         assert_eq!(consumed.tunnel_type, "market-http");
         assert!(consumed.share.is_none());
 
-        let reconnected = store
+        let replay = store
             .consume_lease(&lease.ssh_username, &lease.ssh_password)
             .await
-            .expect("market lease may reconnect during its TTL");
-        assert_eq!(reconnected.connection_id, lease.connection_id);
+            .expect_err("market lease credentials are single use");
+        assert!(replay.to_string().contains("lease already used"));
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -34236,6 +34545,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -34321,6 +34632,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -35111,6 +35424,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -35202,6 +35517,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -35293,6 +35610,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -35421,6 +35740,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -35514,6 +35835,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -35627,6 +35950,8 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
@@ -35725,6 +36050,137 @@ mod tests {
                 .to_string()
                 .contains("signature verification failed")
         );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn strict_share_descriptor_sync_is_monotonic_and_blocks_legacy_overwrite() {
+        let (store, config) = setup_store("strict-share-descriptor-sync").await;
+        let installation_id = "inst-strict-descriptor";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+
+        let make_request = |share: ShareDescriptor, action: &str| {
+            let ops = vec![ShareSyncOperation {
+                kind: "upsert".into(),
+                share: Some(share),
+                share_id: None,
+            }];
+            let timestamp_ms = Utc::now().timestamp_millis();
+            let nonce = Uuid::new_v4().to_string();
+            let signature = sign_test_payload(
+                &signing_key,
+                installation_id,
+                action,
+                &ops,
+                timestamp_ms,
+                &nonce,
+            );
+            ShareBatchSyncRequest {
+                installation_id: installation_id.into(),
+                timestamp_ms,
+                nonce,
+                signature,
+                ops,
+            }
+        };
+        let metadata = || ClientMetadata {
+            ip: Some("127.0.0.1".into()),
+            country_code: None,
+        };
+
+        let mut descriptor = test_share_descriptor(
+            "share-strict-descriptor",
+            &test_share_host("strict-descriptor"),
+        );
+        descriptor.share_name = "strict descriptor".into();
+        descriptor.config_revision = 4;
+        descriptor.descriptor_generation = 2;
+        descriptor.descriptor_fingerprint = "a".repeat(64);
+
+        let first = store
+            .batch_sync_share_descriptors(
+                make_request(descriptor.clone(), "share_descriptor_batch_sync"),
+                metadata(),
+            )
+            .await
+            .expect("accept first strict descriptor");
+        assert_eq!(first.len(), 1);
+        assert!(first[0].applied);
+        assert_eq!(first[0].descriptor_generation, 2);
+
+        let replay = store
+            .batch_sync_share_descriptors(
+                make_request(descriptor.clone(), "share_descriptor_batch_sync"),
+                metadata(),
+            )
+            .await
+            .expect("accept exact descriptor replay");
+        assert!(!replay[0].applied);
+
+        let mut regressed = descriptor.clone();
+        regressed.descriptor_generation = 1;
+        let regression_error = store
+            .batch_sync_share_descriptors(
+                make_request(regressed, "share_descriptor_batch_sync"),
+                metadata(),
+            )
+            .await
+            .expect_err("reject descriptor generation regression");
+        assert!(regression_error.to_string().contains("regressed"));
+
+        let mut changed_without_generation = descriptor.clone();
+        changed_without_generation.descriptor_fingerprint = "b".repeat(64);
+        let fingerprint_error = store
+            .batch_sync_share_descriptors(
+                make_request(changed_without_generation, "share_descriptor_batch_sync"),
+                metadata(),
+            )
+            .await
+            .expect_err("reject fingerprint change without generation");
+        assert!(
+            fingerprint_error
+                .to_string()
+                .contains("fingerprint changed")
+        );
+
+        let mut legacy = descriptor;
+        legacy.share_name = "legacy overwrite".into();
+        legacy.config_revision = 999;
+        legacy.descriptor_generation = 0;
+        legacy.descriptor_fingerprint.clear();
+        store
+            .batch_sync_shares(
+                make_request(legacy, "share_batch_sync"),
+                metadata(),
+                "owner@example.com",
+            )
+            .await
+            .expect("legacy sync remains accepted as a no-op");
+
+        let conn = store.conn.lock().await;
+        let persisted = conn
+            .query_row(
+                "SELECT share_name, descriptor_generation, descriptor_fingerprint
+                 FROM shares WHERE share_id = 'share-strict-descriptor'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("read persisted strict descriptor");
+        assert_eq!(persisted, ("owner@example.com".into(), 2, "a".repeat(64)));
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -37320,6 +37776,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_request_log_batch_rejects_foreign_share_atomically() {
+        let (store, config) = setup_store("signed-log-batch-ownership").await;
+        let signing_key = insert_signed_installation(&store, "inst-owner").await;
+        insert_signed_installation(&store, "inst-foreign").await;
+        insert_share(&store, "inst-owner", "share-owned", "owned-sub", "active").await;
+        insert_share(
+            &store,
+            "inst-foreign",
+            "share-foreign",
+            "foreign-sub",
+            "active",
+        )
+        .await;
+        let now = Utc::now().timestamp();
+        let logs = vec![
+            test_share_request_log_entry("req-owned", "share-owned", now),
+            test_share_request_log_entry("req-foreign", "share-foreign", now),
+        ];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-owner",
+            "share_request_logs_batch_sync",
+            &logs,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let error = store
+            .batch_sync_share_request_logs(
+                ShareRequestLogBatchSyncRequest {
+                    installation_id: "inst-owner".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    logs,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+                HashMap::new(),
+            )
+            .await
+            .expect_err("foreign Share log should reject the whole batch");
+        assert!(error.to_string().contains("only share installation"));
+
+        let stored_count: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM share_request_logs
+                 WHERE request_id IN ('req-owned', 'req-foreign')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rejected request logs");
+        assert_eq!(stored_count, 0);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn dashboard_snapshot_does_not_count_paused_share_as_active() {
         let (store, config) = setup_store("dashboard-paused").await;
         insert_installation(&store, "inst-1").await;
@@ -38214,6 +38736,8 @@ mod tests {
             revision: response.edit.revision,
             status: "applied".into(),
             error_message: None,
+            error_code: None,
+            retryable: None,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();

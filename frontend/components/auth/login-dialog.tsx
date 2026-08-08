@@ -124,6 +124,8 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                       maxLength={6}
                       pattern={REGEXP_ONLY_DIGITS}
                       inputMode="numeric"
+                      autoComplete="one-time-code"
+                      aria-label={t("auth.code")}
                       autoFocus
                     >
                       <InputOTP.Group>
@@ -158,10 +160,20 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                 ) : (
                   <label className="grid gap-2 text-sm">
                     <span className="mono-label text-muted-foreground">{t("auth.email")}</span>
-                    <Input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="email@example.com" type="email" autoFocus />
+                    <Input
+                      value={email}
+                      onChange={(event) => setEmail(event.target.value)}
+                      placeholder="email@example.com"
+                      type="email"
+                      name="email"
+                      autoComplete="email"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                      autoFocus
+                    />
                   </label>
                 )}
-                {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
+                {error ? <Alert status="danger" className="!text-slate-900" role="alert">{error}</Alert> : null}
               </Modal.Body>
               <Modal.Footer>
                 {isCodeStep ? (

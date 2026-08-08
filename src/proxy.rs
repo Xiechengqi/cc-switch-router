@@ -7,7 +7,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
@@ -47,6 +47,23 @@ pub(crate) enum RouteKind {
     Share,
     Market,
     ClientWeb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InferenceSurface {
+    OpenAi,
+    Anthropic,
+    Gemini,
+}
+
+impl InferenceSurface {
+    fn from_app(app: &str) -> Self {
+        match app {
+            "claude" => Self::Anthropic,
+            "gemini" => Self::Gemini,
+            _ => Self::OpenAi,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +391,12 @@ struct KeyedConcurrencyPermit {
     key: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConcurrencyLimitExceeded {
+    current: usize,
+    limit: usize,
+}
+
 #[derive(Debug)]
 struct ShareConcurrencyPermit {
     _share: KeyedConcurrencyPermit,
@@ -436,6 +459,7 @@ struct ShareLlmProxyMetricsGuard {
     subdomain: String,
     app_type: Option<String>,
     status: u16,
+    error_kind: Option<String>,
     started: Instant,
 }
 
@@ -459,13 +483,7 @@ impl Drop for ShareLlmProxyMetricsGuard {
             } else {
                 "error".into()
             },
-            error_kind: if self.status == 429 {
-                Some("rate_limited".into())
-            } else if success {
-                None
-            } else {
-                Some("upstream_error".into())
-            },
+            error_kind: self.error_kind.clone(),
             http_status: Some(self.status),
             latency_ms: Some(latency_ms),
             ttft_ms: None,
@@ -502,6 +520,7 @@ fn share_llm_proxy_metrics_guard(
     skips_share_edge_auth: bool,
     request_id: Option<&str>,
     status: u16,
+    error_kind: Option<String>,
     started: Instant,
     app_type: Option<String>,
 ) -> Option<ShareLlmProxyMetricsGuard> {
@@ -522,8 +541,36 @@ fn share_llm_proxy_metrics_guard(
         subdomain: route.subdomain.clone(),
         app_type,
         status,
+        error_kind,
         started,
     })
+}
+
+fn llm_error_kind(status: StatusCode, headers: &HeaderMap) -> Option<String> {
+    let error_code = headers
+        .get("x-cc-switch-error-code")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if error_code.is_some_and(|code| {
+        matches!(
+            code,
+            "cc_switch_user_concurrency_limit_exceeded"
+                | "cc_switch_share_concurrency_limit_exceeded"
+                | "cc_switch_provider_account_concurrency_limit_exceeded"
+                | "cc_switch_free_share_ip_concurrency_limit_exceeded"
+                | "cc_switch_image_concurrency_limit_exceeded"
+        )
+    }) {
+        return Some("concurrency_limited".into());
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Some("rate_limited".into());
+    }
+    if status.is_success() {
+        None
+    } else {
+        Some("upstream_error".into())
+    }
 }
 
 impl KeyedConcurrencyLimiter {
@@ -535,17 +582,20 @@ impl KeyedConcurrencyLimiter {
         self: &Arc<Self>,
         key: &str,
         parallel_limit: i64,
-    ) -> Option<KeyedConcurrencyPermit> {
+    ) -> Result<KeyedConcurrencyPermit, ConcurrencyLimitExceeded> {
         let mut counters = self.counters.lock().await;
         let inflight = counters.entry(key.to_string()).or_insert(0);
         if parallel_limit >= 0 {
             let limit = parallel_limit as usize;
             if *inflight >= limit {
-                return None;
+                return Err(ConcurrencyLimitExceeded {
+                    current: *inflight,
+                    limit,
+                });
             }
         }
         *inflight += 1;
-        Some(KeyedConcurrencyPermit {
+        Ok(KeyedConcurrencyPermit {
             limiter: self.clone(),
             key: key.to_string(),
         })
@@ -1344,7 +1394,7 @@ impl ProxyRegistry {
     #[cfg(test)]
     pub async fn set_share_inflight_for_test(&self, share_id: &str, count: usize) {
         for _ in 0..count {
-            if let Some(permit) = self
+            if let Ok(permit) = self
                 .try_acquire_share_permit(share_id, None, -1, None)
                 .await
             {
@@ -1372,7 +1422,7 @@ impl ProxyRegistry {
         app_type: Option<&str>,
         parallel_limit: i64,
         user_email: Option<&str>,
-    ) -> Option<ShareConcurrencyPermit> {
+    ) -> Result<ShareConcurrencyPermit, ConcurrencyLimitExceeded> {
         let share = self
             .share_limiter
             .try_acquire(share_id, parallel_limit)
@@ -1384,7 +1434,7 @@ impl ProxyRegistry {
         let app_permit = match app.as_deref() {
             Some(app) => {
                 let key = format!("{share_id}:{app}");
-                self.share_app_limiter.try_acquire(&key, -1).await
+                self.share_app_limiter.try_acquire(&key, -1).await.ok()
             }
             None => None,
         };
@@ -1392,11 +1442,11 @@ impl ProxyRegistry {
             Some(email) => {
                 let app_key = app.clone().unwrap_or_else(|| "_".to_string());
                 let key = format!("{share_id}:{app_key}:{}", email.to_ascii_lowercase());
-                self.share_user_inflight.try_acquire(&key, -1).await
+                self.share_user_inflight.try_acquire(&key, -1).await.ok()
             }
             None => None,
         };
-        Some(ShareConcurrencyPermit {
+        Ok(ShareConcurrencyPermit {
             _share: share,
             _app: app_permit,
             _user: user,
@@ -1407,7 +1457,7 @@ impl ProxyRegistry {
         &self,
         user_ip: &str,
         parallel_limit: i64,
-    ) -> Option<KeyedConcurrencyPermit> {
+    ) -> Result<KeyedConcurrencyPermit, ConcurrencyLimitExceeded> {
         self.free_share_ip_limiter
             .try_acquire(user_ip, parallel_limit)
             .await
@@ -1417,7 +1467,7 @@ impl ProxyRegistry {
         &self,
         share_id: &str,
         parallel_limit: i64,
-    ) -> Option<KeyedConcurrencyPermit> {
+    ) -> Result<KeyedConcurrencyPermit, ConcurrencyLimitExceeded> {
         self.image_limiter
             .try_acquire(share_id, parallel_limit)
             .await
@@ -1504,7 +1554,7 @@ pub async fn market_proxy_handler(
             return simple_response(StatusCode::UNAUTHORIZED, "invalid-market-session");
         }
     };
-    let market_email = market.email.clone();
+    let market_email = market.email.trim().to_ascii_lowercase();
     let market_subdomain = market.subdomain.clone();
 
     if subdomain_for_host(&host, &state.config.tunnel_domain).as_deref()
@@ -1538,6 +1588,12 @@ pub async fn market_proxy_handler(
     let Some(request_app) = infer_share_request_app(&path_and_query) else {
         return simple_response(StatusCode::BAD_REQUEST, "unsupported-share-api-path");
     };
+    let admission_request_id = header_str(&parts.headers, MARKET_REQUEST_ID_HEADER)
+        .split_whitespace()
+        .next()
+        .filter(|value| is_valid_market_request_id(value))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
     let inflight_by_share = state.proxy.inflight_by_share().await;
@@ -1579,13 +1635,15 @@ pub async fn market_proxy_handler(
 
     let metrics_permit = state.metrics.proxy_request_started();
     let mut builder = state.proxy_http.request(method.clone(), target);
+    let connection_listed_headers = connection_listed_header_names(&parts.headers);
     for (name, value) in &parts.headers {
         let n = name.as_str();
         if n.eq_ignore_ascii_case("host")
-            || n.eq_ignore_ascii_case("authorization")
+            || is_sensitive_upstream_credential_header(n)
             || n.eq_ignore_ascii_case(MARKET_REQUEST_ID_HEADER)
             || is_internal_share_context_header(n)
             || is_hop_by_hop_header(n)
+            || connection_listed_headers.contains(n)
         {
             continue;
         }
@@ -1605,8 +1663,8 @@ pub async fn market_proxy_handler(
         )
         .await
     {
-        Some(permit) => permit,
-        None => {
+        Ok(permit) => permit,
+        Err(exceeded) => {
             warn!(
                 method = %method,
                 host = %host,
@@ -1619,9 +1677,25 @@ pub async fn market_proxy_handler(
                 user_agent = %user_agent,
                 "market proxy rejected: share concurrency limit exceeded"
             );
-            return simple_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "share-concurrency-limit-exceeded",
+            record_llm_admission_rejection(
+                &state,
+                &route,
+                &admission_request_id,
+                &request_app,
+                "market",
+                Some(&market_email),
+            );
+            return llm_concurrency_response(
+                &request_app,
+                "cc_switch_share_concurrency_limit_exceeded",
+                "share",
+                exceeded.current,
+                exceeded.limit,
+                &admission_request_id,
+                format!(
+                    "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                    exceeded.current, exceeded.limit
+                ),
             );
         }
     };
@@ -1633,11 +1707,27 @@ pub async fn market_proxy_handler(
             .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
             .await
         {
-            Some(permit) => Some(permit),
-            None => {
-                return simple_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "free-share-ip-concurrency-limit-exceeded",
+            Ok(permit) => Some(permit),
+            Err(exceeded) => {
+                record_llm_admission_rejection(
+                    &state,
+                    &route,
+                    &admission_request_id,
+                    &request_app,
+                    "market",
+                    Some(&market_email),
+                );
+                return llm_concurrency_response(
+                    &request_app,
+                    "cc_switch_free_share_ip_concurrency_limit_exceeded",
+                    "free_share_ip",
+                    exceeded.current,
+                    exceeded.limit,
+                    &admission_request_id,
+                    format!(
+                        "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                        exceeded.current, exceeded.limit
+                    ),
                 );
             }
         }
@@ -1649,39 +1739,18 @@ pub async fn market_proxy_handler(
     // reflects requests that actually traversed the market proxy.
     let market_permit = state.proxy.acquire_market_permit(&market_email).await;
 
-    let live_request_id = if let Some(request_id) =
-        header_str(&parts.headers, MARKET_REQUEST_ID_HEADER)
-            .split_whitespace()
-            .next()
-            .filter(|value| is_valid_market_request_id(value))
-            .map(ToOwned::to_owned)
-    {
-        state
-            .recent_traffic
-            .record_with_id(
-                request_id.clone(),
-                share_id.clone(),
-                route.share_name.clone(),
-                Some(route.subdomain.clone()),
-                client_metadata.country_code.clone(),
-                None,
-            )
-            .await;
-        Some(request_id)
-    } else {
-        Some(
-            state
-                .recent_traffic
-                .record(
-                    share_id.clone(),
-                    route.share_name.clone(),
-                    Some(route.subdomain.clone()),
-                    client_metadata.country_code.clone(),
-                    None,
-                )
-                .await,
+    state
+        .recent_traffic
+        .record_with_id(
+            admission_request_id.clone(),
+            share_id.clone(),
+            route.share_name.clone(),
+            Some(route.subdomain.clone()),
+            client_metadata.country_code.clone(),
+            Some(market_email.clone()),
         )
-    };
+        .await;
+    let live_request_id = Some(admission_request_id);
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
@@ -1732,7 +1801,7 @@ pub async fn market_proxy_handler(
                 public_host: format!("{}.{}", route.subdomain, state.config.tunnel_domain),
                 share_id: route.share_id.clone(),
                 request_id,
-                user_email: None,
+                user_email: Some(market_email.clone()),
                 user_role: None,
                 user_country: client_metadata.country_code.clone(),
                 issued_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -1793,8 +1862,26 @@ pub async fn market_proxy_handler(
     };
 
     let status = upstream.status();
-    state.metrics.record_proxy_status(status);
     let response_headers = upstream.headers().clone();
+    if let Some(response) =
+        ingress_rejection_response(&state, status, &response_headers, &route, &path_and_query)
+    {
+        state.metrics.record_proxy_status(response.status());
+        return response;
+    }
+    state.metrics.record_proxy_status(status);
+    if llm_error_kind(status, &response_headers).as_deref() == Some("concurrency_limited") {
+        record_llm_admission_rejection(
+            &state,
+            &route,
+            live_request_id
+                .as_deref()
+                .expect("market Share requests always have a request id"),
+            &request_app,
+            "market",
+            Some(&market_email),
+        );
+    }
     let is_event_stream = is_event_stream_response(&response_headers);
     let body_stream = upstream
         .bytes_stream()
@@ -1813,13 +1900,7 @@ pub async fn market_proxy_handler(
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response.headers_mut().clear();
-    for (name, value) in &response_headers {
-        if is_hop_by_hop_header(name.as_str()) {
-            continue;
-        }
-        response.headers_mut().append(name.clone(), value.clone());
-    }
-    strip_connection_listed_headers(response.headers_mut());
+    copy_upstream_response_headers(&response_headers, response.headers_mut());
     if is_event_stream {
         response.headers_mut().remove(header::CONTENT_LENGTH);
     }
@@ -1921,6 +2002,7 @@ pub async fn gateway_proxy_handler(
     let Some(request_app) = infer_share_request_app(&path_and_query) else {
         return simple_response(StatusCode::BAD_REQUEST, "unsupported-share-api-path");
     };
+    let admission_request_id = Uuid::new_v4().to_string();
 
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
     let inflight_by_share = state.proxy.inflight_by_share().await;
@@ -1958,8 +2040,8 @@ pub async fn gateway_proxy_handler(
         .try_acquire_share_permit(&share_id, Some(&request_app), route.parallel_limit, None)
         .await
     {
-        Some(permit) => permit,
-        None => {
+        Ok(permit) => permit,
+        Err(exceeded) => {
             warn!(
                 method = %method,
                 host = %host,
@@ -1972,9 +2054,25 @@ pub async fn gateway_proxy_handler(
                 user_agent = %user_agent,
                 "gateway proxy rejected: share concurrency limit exceeded"
             );
-            return simple_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "share-concurrency-limit-exceeded",
+            record_llm_admission_rejection(
+                &state,
+                &route,
+                &admission_request_id,
+                &request_app,
+                "gateway",
+                None,
+            );
+            return llm_concurrency_response(
+                &request_app,
+                "cc_switch_share_concurrency_limit_exceeded",
+                "share",
+                exceeded.current,
+                exceeded.limit,
+                &admission_request_id,
+                format!(
+                    "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                    exceeded.current, exceeded.limit
+                ),
             );
         }
     };
@@ -1985,11 +2083,27 @@ pub async fn gateway_proxy_handler(
             .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
             .await
         {
-            Some(permit) => Some(permit),
-            None => {
-                return simple_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "free-share-ip-concurrency-limit-exceeded",
+            Ok(permit) => Some(permit),
+            Err(exceeded) => {
+                record_llm_admission_rejection(
+                    &state,
+                    &route,
+                    &admission_request_id,
+                    &request_app,
+                    "gateway",
+                    None,
+                );
+                return llm_concurrency_response(
+                    &request_app,
+                    "cc_switch_free_share_ip_concurrency_limit_exceeded",
+                    "free_share_ip",
+                    exceeded.current,
+                    exceeded.limit,
+                    &admission_request_id,
+                    format!(
+                        "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                        exceeded.current, exceeded.limit
+                    ),
                 );
             }
         }
@@ -1998,16 +2112,14 @@ pub async fn gateway_proxy_handler(
     };
 
     let mut builder = state.proxy_http.request(method.clone(), target);
+    let connection_listed_headers = connection_listed_header_names(&parts.headers);
     for (name, value) in &parts.headers {
         let n = name.as_str();
         if n.eq_ignore_ascii_case("host")
-            || n.eq_ignore_ascii_case("authorization")
-            || n.eq_ignore_ascii_case("x-api-key")
-            || n.eq_ignore_ascii_case("x-goog-api-key")
-            || n.eq_ignore_ascii_case("api-key")
-            || n.starts_with("x-cc-gateway-")
+            || is_sensitive_upstream_credential_header(n)
             || is_internal_share_context_header(n)
             || is_hop_by_hop_header(n)
+            || connection_listed_headers.contains(n)
         {
             continue;
         }
@@ -2018,9 +2130,10 @@ pub async fn gateway_proxy_handler(
     builder = builder.header(SHARE_DATA_SOURCE_HEADER, "gateway");
     builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
 
-    let live_request_id = state
+    state
         .recent_traffic
-        .record(
+        .record_with_id(
+            admission_request_id.clone(),
             share_id.clone(),
             route.share_name.clone(),
             Some(route.subdomain.clone()),
@@ -2028,6 +2141,7 @@ pub async fn gateway_proxy_handler(
             None,
         )
         .await;
+    let live_request_id = admission_request_id;
     builder = builder.header("X-CC-Switch-Request-Id", live_request_id.as_str());
     builder = match with_signed_ingress_context(
         &state,
@@ -2045,7 +2159,7 @@ pub async fn gateway_proxy_handler(
     };
     let recent_traffic_guard = RecentTrafficGuard {
         traffic: state.recent_traffic.clone(),
-        request_id: live_request_id,
+        request_id: live_request_id.clone(),
     };
 
     let upstream = match builder.body(reqwest::Body::from(body_bytes)).send().await {
@@ -2073,8 +2187,24 @@ pub async fn gateway_proxy_handler(
     };
 
     let status = upstream.status();
-    state.metrics.record_proxy_status(status);
     let response_headers = upstream.headers().clone();
+    if let Some(response) =
+        ingress_rejection_response(&state, status, &response_headers, &route, &path_and_query)
+    {
+        state.metrics.record_proxy_status(response.status());
+        return response;
+    }
+    state.metrics.record_proxy_status(status);
+    if llm_error_kind(status, &response_headers).as_deref() == Some("concurrency_limited") {
+        record_llm_admission_rejection(
+            &state,
+            &route,
+            &live_request_id,
+            &request_app,
+            "gateway",
+            None,
+        );
+    }
     let body_stream = {
         use futures_util::StreamExt;
 
@@ -2092,13 +2222,7 @@ pub async fn gateway_proxy_handler(
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response.headers_mut().clear();
-    for (name, value) in &response_headers {
-        if is_hop_by_hop_header(name.as_str()) {
-            continue;
-        }
-        response.headers_mut().append(name.clone(), value.clone());
-    }
-    strip_connection_listed_headers(response.headers_mut());
+    copy_upstream_response_headers(&response_headers, response.headers_mut());
     info!(
         method = %method,
         host = %host,
@@ -2581,9 +2705,13 @@ pub async fn proxy_handler(
 
     let metrics_permit = state.metrics.proxy_request_started();
     let mut builder = state.proxy_http.request(method.clone(), target);
+    let connection_listed_headers = connection_listed_header_names(&parts.headers);
     for (name, value) in &parts.headers {
         let n = name.as_str();
-        if n.eq_ignore_ascii_case("host") || is_hop_by_hop_header(n) {
+        if n.eq_ignore_ascii_case("host")
+            || is_hop_by_hop_header(n)
+            || connection_listed_headers.contains(n)
+        {
             continue;
         }
         // Strip client-supplied user/share credentials on share routes; router
@@ -2592,12 +2720,7 @@ pub async fn proxy_handler(
         if is_internal_share_context_header(n) {
             continue;
         }
-        if route.is_share()
-            && (n.eq_ignore_ascii_case("authorization")
-                || n.eq_ignore_ascii_case("x-api-key")
-                || n.eq_ignore_ascii_case("x-goog-api-key")
-                || n.eq_ignore_ascii_case("api-key"))
-        {
+        if route.is_share() && is_sensitive_upstream_credential_header(n) {
             continue;
         }
         if route.is_client_web()
@@ -2649,6 +2772,8 @@ pub async fn proxy_handler(
         .as_deref()
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
+    let admission_request_id =
+        (!skips_share_edge_auth && route.is_share()).then(|| Uuid::new_v4().to_string());
 
     let share_permit = if skips_share_edge_auth {
         None
@@ -2664,8 +2789,8 @@ pub async fn proxy_handler(
             )
             .await
         {
-            Some(permit) => Some(permit),
-            None => {
+            Ok(permit) => Some(permit),
+            Err(exceeded) => {
                 warn!(
                     method = %method,
                     host = %host,
@@ -2678,9 +2803,22 @@ pub async fn proxy_handler(
                     user_agent = %user_agent,
                     "proxy request rejected: share concurrency limit exceeded"
                 );
-                return simple_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "share-concurrency-limit-exceeded",
+                let request_id = admission_request_id
+                    .as_deref()
+                    .expect("Share admission requests always have a request id");
+                let app = request_app.as_deref().unwrap_or("codex");
+                record_llm_admission_rejection(&state, &route, request_id, app, "direct", None);
+                return llm_concurrency_response(
+                    app,
+                    "cc_switch_share_concurrency_limit_exceeded",
+                    "share",
+                    exceeded.current,
+                    exceeded.limit,
+                    request_id,
+                    format!(
+                        "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                        exceeded.current, exceeded.limit
+                    ),
                 );
             }
         }
@@ -2720,8 +2858,8 @@ pub async fn proxy_handler(
             .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
             .await
         {
-            Some(permit) => Some(permit),
-            None => {
+            Ok(permit) => Some(permit),
+            Err(exceeded) => {
                 warn!(
                     method = %method,
                     host = %host,
@@ -2733,9 +2871,22 @@ pub async fn proxy_handler(
                     user_agent = %user_agent,
                     "proxy request rejected: free share ip concurrency limit exceeded"
                 );
-                return simple_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "free-share-ip-concurrency-limit-exceeded",
+                let request_id = admission_request_id
+                    .as_deref()
+                    .expect("Share admission requests always have a request id");
+                let app = infer_share_request_app(&path).unwrap_or_else(|| "codex".to_string());
+                record_llm_admission_rejection(&state, &route, request_id, &app, "direct", None);
+                return llm_concurrency_response(
+                    &app,
+                    "cc_switch_free_share_ip_concurrency_limit_exceeded",
+                    "free_share_ip",
+                    exceeded.current,
+                    exceeded.limit,
+                    request_id,
+                    format!(
+                        "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                        exceeded.current, exceeded.limit
+                    ),
                 );
             }
         }
@@ -2748,18 +2899,21 @@ pub async fn proxy_handler(
     // in their request logs.
     let live_request_id = if !skips_share_edge_auth && !is_share_router_probe {
         if let Some(share_id) = route.share_id.as_deref() {
-            Some(
-                state
-                    .recent_traffic
-                    .record(
-                        share_id.to_string(),
-                        route.share_name.clone(),
-                        Some(route.subdomain.clone()),
-                        client_metadata.country_code.clone(),
-                        api_user_email.clone(),
-                    )
-                    .await,
-            )
+            let request_id = admission_request_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            state
+                .recent_traffic
+                .record_with_id(
+                    request_id.clone(),
+                    share_id.to_string(),
+                    route.share_name.clone(),
+                    Some(route.subdomain.clone()),
+                    client_metadata.country_code.clone(),
+                    api_user_email.clone(),
+                )
+                .await;
+            Some(request_id)
         } else {
             None
         }
@@ -2911,6 +3065,7 @@ pub async fn proxy_handler(
                 skips_share_edge_auth,
                 live_request_id.as_deref(),
                 StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                Some("upstream_error".into()),
                 share_proxy_started,
                 share_request_app.clone(),
             );
@@ -2921,7 +3076,19 @@ pub async fn proxy_handler(
         }
     };
 
-    let status = upstream.status();
+    let upstream_status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    let ingress_rejection = ingress_rejection_response(
+        &state,
+        upstream_status,
+        &response_headers,
+        &route,
+        &path_and_query,
+    );
+    let status = ingress_rejection
+        .as_ref()
+        .map(Response::status)
+        .unwrap_or(upstream_status);
     state.metrics.record_proxy_status(status);
     let share_llm_metrics_guard = share_llm_proxy_metrics_guard(
         &state,
@@ -2931,6 +3098,7 @@ pub async fn proxy_handler(
         skips_share_edge_auth,
         live_request_id.as_deref(),
         status.as_u16(),
+        llm_error_kind(status, &response_headers),
         share_proxy_started,
         share_request_app,
     );
@@ -2940,7 +3108,9 @@ pub async fn proxy_handler(
             .clear_health_probe_failure(&route.subdomain)
             .await;
     }
-    let response_headers = upstream.headers().clone();
+    if let Some(response) = ingress_rejection {
+        return response;
+    }
     let is_event_stream = is_event_stream_response(&response_headers);
     if is_invalid_auth_status(status) && is_abuse_tracked_api_path(&path) {
         if let Some(decision) = state.abuse.record_invalid_auth(&user_ip).await {
@@ -2985,13 +3155,7 @@ pub async fn proxy_handler(
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response.headers_mut().clear();
-    for (name, value) in &response_headers {
-        if is_hop_by_hop_header(name.as_str()) {
-            continue;
-        }
-        response.headers_mut().append(name.clone(), value.clone());
-    }
-    strip_connection_listed_headers(response.headers_mut());
+    copy_upstream_response_headers(&response_headers, response.headers_mut());
     if is_event_stream {
         response.headers_mut().remove(header::CONTENT_LENGTH);
     }
@@ -3067,15 +3231,35 @@ async fn handle_image_generation_stream_submit(
             "codex image generation is not enabled for the bound provider",
         );
     };
-    let Some(image_permit) = state
+    let admission_request_id = Uuid::new_v4().to_string();
+    let image_permit = match state
         .proxy
         .try_acquire_image_permit(share_id, IMAGE_JOB_MAX_RUNNING_PER_SHARE as i64)
         .await
-    else {
-        return json_error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "image-generation-stream-busy",
-        );
+    {
+        Ok(permit) => permit,
+        Err(exceeded) => {
+            record_llm_admission_rejection(
+                state,
+                route,
+                &admission_request_id,
+                "codex",
+                "direct",
+                None,
+            );
+            return llm_concurrency_response(
+                "codex",
+                "cc_switch_image_concurrency_limit_exceeded",
+                "image",
+                exceeded.current,
+                exceeded.limit,
+                &admission_request_id,
+                format!(
+                    "Image generation concurrency limit has been reached ({}/{}). Wait for the active image request to finish.",
+                    exceeded.current, exceeded.limit
+                ),
+            );
+        }
     };
 
     let mut payload = match serde_json::from_slice::<Value>(&body) {
@@ -3178,9 +3362,10 @@ async fn handle_image_generation_stream_submit(
     builder = with_share_user_country_headers(builder, Some(user_country.as_str()));
 
     let metrics_permit = state.metrics.proxy_request_started();
-    let request_id = state
+    state
         .recent_traffic
-        .record(
+        .record_with_id(
+            admission_request_id.clone(),
             share_id.to_string(),
             route.share_name.clone(),
             Some(route.subdomain.clone()),
@@ -3188,6 +3373,7 @@ async fn handle_image_generation_stream_submit(
             api_user_email.clone(),
         )
         .await;
+    let request_id = admission_request_id;
     builder = match with_signed_ingress_context(
         state,
         builder,
@@ -3204,7 +3390,7 @@ async fn handle_image_generation_stream_submit(
     };
     let recent_traffic_guard = Some(RecentTrafficGuard {
         traffic: state.recent_traffic.clone(),
-        request_id,
+        request_id: request_id.clone(),
     });
 
     let request_started = Instant::now();
@@ -3246,13 +3432,55 @@ async fn handle_image_generation_stream_submit(
         }
     };
     let status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    if let Some(response) = ingress_rejection_response(
+        state,
+        status,
+        &response_headers,
+        route,
+        "/v1/images/generations",
+    ) {
+        let mapped_status = response.status();
+        state.metrics.record_proxy_status(mapped_status);
+        let error_message = header_str(response.headers(), "x-share-router-error-reason");
+        if let Err(err) = record_image_stream_log(
+            &state.store,
+            &state.config,
+            &log_meta,
+            ImageStreamLogOutcome {
+                status: "failed",
+                status_code: Some(mapped_status.as_u16()),
+                latency_ms: request_started.elapsed().as_millis() as u64,
+                completed_at: Some(chrono::Utc::now().timestamp()),
+                error_message: Some(error_message.to_string()),
+                result_mime_type: None,
+                result_size_bytes: None,
+                result_storage_key: None,
+                result_access_token: None,
+            },
+        )
+        .await
+        {
+            warn!(request_id = %log_meta.request_id, error = %err, "record image stream ingress rejection failed");
+        }
+        return response;
+    }
     state.metrics.record_proxy_status(status);
+    if llm_error_kind(status, &response_headers).as_deref() == Some("concurrency_limited") {
+        record_llm_admission_rejection(state, route, &request_id, "codex", "direct", None);
+    }
     if !status.is_success() {
         let status_code = status;
-        let text = upstream
-            .text()
-            .await
-            .unwrap_or_else(|err| format!("failed to read upstream error: {err}"));
+        let (response_body, error_message) = match upstream.bytes().await {
+            Ok(body) => {
+                let message = compact_prompt_preview(&String::from_utf8_lossy(&body), 1000);
+                (Some(body), message)
+            }
+            Err(error) => (
+                None,
+                format!("failed to read upstream error response: {error}"),
+            ),
+        };
         if let Err(err) = record_image_stream_log(
             &state.store,
             &state.config,
@@ -3262,7 +3490,7 @@ async fn handle_image_generation_stream_submit(
                 status_code: Some(status_code.as_u16()),
                 latency_ms: request_started.elapsed().as_millis() as u64,
                 completed_at: Some(chrono::Utc::now().timestamp()),
-                error_message: Some(compact_prompt_preview(&text, 1000)),
+                error_message: Some(error_message.clone()),
                 result_mime_type: None,
                 result_size_bytes: None,
                 result_storage_key: None,
@@ -3273,7 +3501,10 @@ async fn handle_image_generation_stream_submit(
         {
             warn!(request_id = %log_meta.request_id, error = %err, "record image stream upstream failure log failed");
         }
-        return json_error_response(status_code, &compact_prompt_preview(&text, 1000));
+        return match response_body {
+            Some(body) => buffered_upstream_response(status_code, &response_headers, body),
+            None => json_error_response(StatusCode::BAD_GATEWAY, &error_message),
+        };
     }
 
     let mut upstream_stream = upstream.bytes_stream();
@@ -3898,6 +4129,132 @@ fn infer_share_request_app(path: &str) -> Option<String> {
     None
 }
 
+fn llm_concurrency_response(
+    app: &str,
+    code: &'static str,
+    scope: &'static str,
+    current: usize,
+    limit: usize,
+    request_id: &str,
+    message: String,
+) -> Response {
+    let surface = InferenceSurface::from_app(app);
+    let body = match surface {
+        InferenceSurface::OpenAi => serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "concurrency_limit_error",
+                "code": code,
+                "param": Value::Null,
+                "details": {
+                    "retryable": false,
+                    "scope": scope,
+                    "current": current,
+                    "limit": limit,
+                },
+            },
+            "request_id": request_id,
+        }),
+        InferenceSurface::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "concurrency_limit_error",
+                "message": message,
+                "code": code,
+                "details": {
+                    "retryable": false,
+                    "scope": scope,
+                    "current": current,
+                    "limit": limit,
+                },
+            },
+            "request_id": request_id,
+        }),
+        InferenceSurface::Gemini => serde_json::json!({
+            "error": {
+                "code": StatusCode::CONFLICT.as_u16(),
+                "message": message,
+                "status": "ABORTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": code.to_ascii_uppercase(),
+                    "domain": "cc-switch",
+                    "metadata": {
+                        "code": code,
+                        "retryable": "false",
+                        "scope": scope,
+                        "current": current.to_string(),
+                        "limit": limit.to_string(),
+                        "requestId": request_id,
+                    },
+                }],
+            }
+        }),
+    };
+    let mut response = json_response(StatusCode::CONFLICT, body);
+    response
+        .headers_mut()
+        .insert("x-share-router-error", HeaderValue::from_static("true"));
+    response.headers_mut().insert(
+        "x-share-router-error-reason",
+        HeaderValue::from_static(code),
+    );
+    response
+        .headers_mut()
+        .insert("x-cc-switch-error-code", HeaderValue::from_static(code));
+    response
+        .headers_mut()
+        .insert("x-cc-switch-error-scope", HeaderValue::from_static(scope));
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert("x-cc-switch-request-id", value.clone());
+        response.headers_mut().insert("x-request-id", value);
+    }
+    if surface == InferenceSurface::Anthropic {
+        response
+            .headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("false"));
+    }
+    response
+}
+
+fn record_llm_admission_rejection(
+    state: &ServerState,
+    route: &RouteEntry,
+    request_id: &str,
+    app_type: &str,
+    route_type: &str,
+    market_email: Option<&str>,
+) {
+    state.metrics.record_llm_request(LlmRequestMetric {
+        timestamp: chrono::Utc::now().timestamp(),
+        request_id: Some(request_id.to_string()),
+        route_type: route_type.to_string(),
+        market_email: market_email.map(str::to_string),
+        share_id: route.share_id.clone(),
+        subdomain: Some(route.subdomain.clone()),
+        app_type: Some(app_type.to_string()),
+        provider: None,
+        requested_model: None,
+        actual_model: None,
+        status: "error".into(),
+        error_kind: Some("concurrency_limited".into()),
+        http_status: Some(StatusCode::CONFLICT.as_u16()),
+        latency_ms: Some(0),
+        ttft_ms: None,
+        stream_started: false,
+        stream_completed: false,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        estimated_cost_usd: None,
+    });
+}
+
 fn simple_response(status: StatusCode, reason: &str) -> Response {
     let mut response = Response::new(Body::from(reason.to_string()));
     *response.status_mut() = status;
@@ -3909,6 +4266,92 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
             .headers_mut()
             .insert("x-share-router-error-reason", value.clone());
     }
+    response
+}
+
+fn ingress_rejection_response(
+    state: &ServerState,
+    upstream_status: StatusCode,
+    upstream_headers: &HeaderMap,
+    route: &RouteEntry,
+    path: &str,
+) -> Option<Response> {
+    if upstream_status != StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let reason = upstream_headers
+        .get(crate::ingress_context::INTERNAL_INGRESS_ERROR_HEADER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if reason.is_empty() {
+        return None;
+    }
+    let reason = reason.chars().take(64).collect::<String>();
+    let age_ms = internal_i64_header(
+        upstream_headers,
+        crate::ingress_context::INTERNAL_INGRESS_AGE_MS_HEADER,
+    );
+    let server_time_ms = internal_i64_header(
+        upstream_headers,
+        crate::ingress_context::INTERNAL_INGRESS_SERVER_TIME_MS_HEADER,
+    );
+    let is_freshness = matches!(reason.as_str(), "expired" | "future_timestamp");
+    if state.clock_health.record_ingress_rejection(&reason) {
+        warn!(
+            ingress_error = %reason,
+            ingress_age_ms = ?age_ms,
+            ingress_server_time_ms = ?server_time_ms,
+            installation_id = route.installation_id().unwrap_or("-"),
+            share_id = route.share_id().unwrap_or("-"),
+            subdomain = %route.subdomain,
+            path,
+            "client rejected Router ingress context"
+        );
+    }
+
+    let (status, public_reason) = if is_freshness {
+        (StatusCode::SERVICE_UNAVAILABLE, "ingress-clock-skew")
+    } else {
+        (StatusCode::BAD_GATEWAY, "ingress-contract-rejected")
+    };
+    let mut response = simple_response(status, public_reason);
+    if is_freshness {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    Some(response)
+}
+
+fn internal_i64_header(headers: &HeaderMap, name: &'static str) -> Option<i64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn is_internal_upstream_response_header(name: &str) -> bool {
+    name.starts_with("x-cc-switch-internal-")
+}
+
+fn copy_upstream_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    let connection_listed_headers = connection_listed_header_names(source);
+    for (name, value) in source {
+        if is_hop_by_hop_header(name.as_str())
+            || is_internal_upstream_response_header(name.as_str())
+            || connection_listed_headers.contains(name.as_str())
+        {
+            continue;
+        }
+        target.append(name.clone(), value.clone());
+    }
+}
+
+fn buffered_upstream_response(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    copy_upstream_response_headers(headers, response.headers_mut());
     response
 }
 
@@ -4013,24 +4456,38 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
 }
 
 fn is_internal_share_context_header(name: &str) -> bool {
-    matches!(
-        name,
-        "x-cc-switch-share-id"
-            | "x-cc-switch-share-subdomain"
-            | "x-cc-switch-request-id"
-            | "x-cc-switch-user-email"
-            | "x-cc-switch-user-country"
-            | "x-cc-switch-user-country-iso3"
-            | "x-cc-switch-data-source"
-            | "x-cc-switch-source"
-            | "x-cc-switch-health-check"
-            | "x-cc-switch-web-user-email"
-            | "x-cc-switch-web-role"
-            | "x-cc-switch-installation-id"
-            | "x-cc-switch-client-tunnel-subdomain"
-            | "x-share-router-health-check"
-            | "x-share-router-probe"
-    )
+    name.starts_with("x-ctl-")
+        || name.starts_with("x-cc-gateway-")
+        || matches!(
+            name,
+            "x-cc-switch-share-id"
+                | "x-cc-switch-share-subdomain"
+                | "x-cc-switch-request-id"
+                | "x-cc-switch-user-email"
+                | "x-cc-switch-user-country"
+                | "x-cc-switch-user-country-iso3"
+                | "x-cc-switch-data-source"
+                | "x-cc-switch-source"
+                | "x-cc-switch-health-check"
+                | "x-cc-switch-web-user-email"
+                | "x-cc-switch-web-role"
+                | "x-cc-switch-installation-id"
+                | "x-cc-switch-client-tunnel-subdomain"
+                | "x-user-email"
+                | "x-user-country"
+                | "x-user-country-iso3"
+                | "x-share-router-health-check"
+                | "x-share-router-probe"
+                | crate::ingress_context::INGRESS_CONTEXT_HEADER
+                | crate::ingress_context::INGRESS_SIGNATURE_HEADER
+        )
+}
+
+fn is_sensitive_upstream_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("x-goog-api-key")
+        || name.eq_ignore_ascii_case("api-key")
 }
 
 fn is_internal_share_router_path(path: &str) -> bool {
@@ -4077,7 +4534,7 @@ async fn authorize_internal_share_router_get(
     else {
         return false;
     };
-    crate::ctl_client::verify_control_request_signature(
+    if !crate::ctl_client::verify_control_request_signature(
         "GET",
         path_and_query,
         &control_secret,
@@ -4086,7 +4543,24 @@ async fn authorize_internal_share_router_get(
         nonce,
         signature,
         chrono::Utc::now().timestamp_millis(),
-    )
+    ) {
+        return false;
+    }
+    match state
+        .store
+        .consume_control_request_nonce(route_installation_id, nonce)
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                installation_id = route_installation_id,
+                error = %error,
+                "rejected replayed or invalid control request nonce"
+            );
+            false
+        }
+    }
 }
 
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -4353,19 +4827,15 @@ fn proxy_body_chunk<E: std::fmt::Display>(
     }
 }
 
-fn strip_connection_listed_headers(headers: &mut HeaderMap) {
-    let connection_values = headers
+fn connection_listed_header_names(headers: &HeaderMap) -> HashSet<String> {
+    headers
         .get_all("connection")
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .map(|value| value.trim().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-
-    headers.remove("connection");
-    for header in connection_values {
-        headers.remove(header);
-    }
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -4646,6 +5116,8 @@ mod tests {
             env_path: std::env::temp_dir().join("cc-switch-router-proxy-test.env"),
             start_instant: Instant::now(),
             scheduling_overrides: crate::scheduling_signals::OverrideStore::new(),
+            clock_health: crate::clock_health::ClockHealthService::new(config.clock_health.clone())
+                .unwrap(),
             metrics,
             alerting,
             registration_admission: Arc::new(
@@ -4724,6 +5196,7 @@ mod tests {
                 sample_interval_secs: 5,
                 alerting: crate::config::AlertingSettings::default(),
             },
+            clock_health: crate::config::ClockHealthConfig::default(),
         }
     }
 
@@ -4831,6 +5304,127 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn typed_ingress_rejections_are_mapped_without_leaking_internal_headers() {
+        let config = proxy_test_config("typed-ingress-rejection");
+        let proxy = Arc::new(ProxyRegistry::default());
+        proxy
+            .set_route_with_kind(
+                "share-a".into(),
+                "127.0.0.1:1".into(),
+                RouteKind::Share,
+                Some("inst-a".into()),
+                None,
+                Some("share-a".into()),
+                Some("Share A".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let route = proxy.route_by_share_id("share-a").await.unwrap();
+        let state = proxy_test_state(&config, proxy);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::ingress_context::INTERNAL_INGRESS_ERROR_HEADER,
+            HeaderValue::from_static("expired"),
+        );
+        headers.insert(
+            crate::ingress_context::INTERNAL_INGRESS_AGE_MS_HEADER,
+            HeaderValue::from_static("31001"),
+        );
+        headers.insert(
+            crate::ingress_context::INTERNAL_INGRESS_SERVER_TIME_MS_HEADER,
+            HeaderValue::from_static("1750000000000"),
+        );
+        let response = ingress_rejection_response(
+            &state,
+            StatusCode::UNAUTHORIZED,
+            &headers,
+            &route,
+            "/web-api/auth/methods",
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("5"))
+        );
+        assert!(
+            response
+                .headers()
+                .get(crate::ingress_context::INTERNAL_INGRESS_ERROR_HEADER)
+                .is_none()
+        );
+        assert_eq!(state.clock_health.snapshot().await.ingress_expired_total, 1);
+
+        headers.insert(
+            crate::ingress_context::INTERNAL_INGRESS_ERROR_HEADER,
+            HeaderValue::from_static("invalid_signature"),
+        );
+        let response = ingress_rejection_response(
+            &state,
+            StatusCode::UNAUTHORIZED,
+            &headers,
+            &route,
+            "/web-api/auth/methods",
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            state
+                .clock_health
+                .snapshot()
+                .await
+                .ingress_contract_error_total,
+            1
+        );
+
+        assert!(
+            ingress_rejection_response(
+                &state,
+                StatusCode::UNAUTHORIZED,
+                &HeaderMap::new(),
+                &route,
+                "/web-api/auth/methods",
+            )
+            .is_none()
+        );
+        assert!(is_internal_upstream_response_header(
+            "x-cc-switch-internal-anything"
+        ));
+        assert!(!is_internal_upstream_response_header(
+            "x-application-header"
+        ));
+        headers.insert("x-application-header", HeaderValue::from_static("kept"));
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("x-private-hop, x-second-hop"),
+        );
+        headers.insert("x-private-hop", HeaderValue::from_static("removed"));
+        headers.insert("x-second-hop", HeaderValue::from_static("removed"));
+        let mut copied = HeaderMap::new();
+        copy_upstream_response_headers(&headers, &mut copied);
+        assert_eq!(
+            copied.get("x-application-header"),
+            Some(&HeaderValue::from_static("kept"))
+        );
+        assert!(
+            copied
+                .get(crate::ingress_context::INTERNAL_INGRESS_ERROR_HEADER)
+                .is_none()
+        );
+        assert!(copied.get("x-private-hop").is_none());
+        assert!(copied.get("x-second-hop").is_none());
+        assert_eq!(
+            connection_listed_header_names(&headers),
+            HashSet::from(["x-private-hop".to_string(), "x-second-hop".to_string()])
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
     #[test]
     fn request_app_is_inferred_only_from_protocol_path() {
         for path in ["/v1/messages", "/anthropic/v1/messages"] {
@@ -4867,6 +5461,130 @@ mod tests {
             br#"{"stream":false,"prompt":"draw"}"#
         ));
         assert!(!image_generation_request_wants_stream(b"not json"));
+    }
+
+    #[tokio::test]
+    async fn concurrency_rejections_use_surface_native_bodies_and_stable_headers() {
+        for (app, pointer, expected) in [
+            (
+                "codex",
+                "/error/code",
+                "cc_switch_share_concurrency_limit_exceeded",
+            ),
+            (
+                "claude",
+                "/error/code",
+                "cc_switch_share_concurrency_limit_exceeded",
+            ),
+            ("gemini", "/error/status", "ABORTED"),
+        ] {
+            let response = llm_concurrency_response(
+                app,
+                "cc_switch_share_concurrency_limit_exceeded",
+                "share",
+                4,
+                4,
+                "request-123",
+                "Share concurrency limit has been reached (4/4).".to_string(),
+            );
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-cc-switch-error-code")
+                    .and_then(|value| value.to_str().ok()),
+                Some("cc_switch_share_concurrency_limit_exceeded")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("request-123")
+            );
+            assert!(!response.headers().contains_key(header::RETRY_AFTER));
+            if app == "claude" {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-should-retry")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("false")
+                );
+            }
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body.pointer(pointer).and_then(Value::as_str),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_upstream_errors_preserve_native_contract() {
+        let body = Bytes::from_static(
+            br#"{"error":{"message":"Account concurrency reached","code":"cc_switch_provider_account_concurrency_limit_exceeded"}}"#,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "x-cc-switch-error-code",
+            HeaderValue::from_static("cc_switch_provider_account_concurrency_limit_exceeded"),
+        );
+        headers.insert(
+            crate::ingress_context::INTERNAL_INGRESS_ERROR_HEADER,
+            HeaderValue::from_static("must-not-leak"),
+        );
+
+        let response = buffered_upstream_response(StatusCode::CONFLICT, &headers, body.clone());
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-cc-switch-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("cc_switch_provider_account_concurrency_limit_exceeded")
+        );
+        assert!(
+            response
+                .headers()
+                .get(crate::ingress_context::INTERNAL_INGRESS_ERROR_HEADER)
+                .is_none()
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn metric_error_kind_only_treats_stable_local_codes_as_concurrency() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-error-code",
+            HeaderValue::from_static("cc_switch_user_concurrency_limit_exceeded"),
+        );
+        assert_eq!(
+            llm_error_kind(StatusCode::CONFLICT, &headers).as_deref(),
+            Some("concurrency_limited")
+        );
+        assert_eq!(
+            llm_error_kind(StatusCode::CONFLICT, &HeaderMap::new()).as_deref(),
+            Some("upstream_error")
+        );
+        assert_eq!(
+            llm_error_kind(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new()).as_deref(),
+            Some("rate_limited")
+        );
     }
 
     #[test]
@@ -4907,7 +5625,13 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
             .await
             .expect("third permit");
 
-        assert!(limiter.try_acquire("share-1", 3).await.is_none());
+        assert!(matches!(
+            limiter.try_acquire("share-1", 3).await,
+            Err(ConcurrencyLimitExceeded {
+                current: 3,
+                limit: 3,
+            })
+        ));
 
         drop(permit_1);
         tokio::task::yield_now().await;
@@ -5611,6 +6335,9 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
             "x-cc-switch-web-role",
             "x-cc-switch-installation-id",
             "x-cc-switch-client-tunnel-subdomain",
+            "x-user-email",
+            "x-user-country",
+            "x-user-country-iso3",
             "x-share-router-health-check",
             "x-share-router-probe",
         ] {

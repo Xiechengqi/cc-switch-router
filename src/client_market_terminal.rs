@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::HeaderMap;
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{HeaderMap, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
@@ -35,17 +36,22 @@ const TICKET_TTL: Duration = Duration::from_secs(60);
 const MAX_SESSIONS_PER_OWNER: usize = 2;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const MAX_SESSION_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+const AUTHORIZATION_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
 const PTY_READ_CHUNK: usize = 8192;
+const WEBTTY_PROTOCOL: &str = "webtty";
+const TICKET_PROTOCOL_PREFIX: &str = "ticket.";
 
 #[derive(Debug, Clone)]
 struct TerminalTicket {
     host_id: String,
+    installation_id: Option<String>,
     owner_user_id: String,
     /// Carried purely so the audit trail names a human, not just an opaque id.
     owner_email: String,
     ip: String,
     port: u16,
     expires_at: Instant,
+    authorization_expires_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +59,34 @@ pub struct TerminalSessionManager {
     tickets: HashMap<String, TerminalTicket>,
     /// Stable owner user id -> active websocket session count.
     active_sessions: HashMap<String, usize>,
+}
+
+struct ActiveTerminalSession {
+    manager: Arc<Mutex<TerminalSessionManager>>,
+    owner_user_id: Option<String>,
+}
+
+impl ActiveTerminalSession {
+    fn new(manager: Arc<Mutex<TerminalSessionManager>>, owner_user_id: String) -> Self {
+        Self {
+            manager,
+            owner_user_id: Some(owner_user_id),
+        }
+    }
+}
+
+impl Drop for ActiveTerminalSession {
+    fn drop(&mut self) {
+        let Some(owner_user_id) = self.owner_user_id.take() else {
+            return;
+        };
+        let manager = Arc::clone(&self.manager);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                manager.lock().await.end_session(&owner_user_id);
+            });
+        }
+    }
 }
 
 impl TerminalSessionManager {
@@ -126,11 +160,6 @@ struct TerminalSessionResponse {
     expires_in_sec: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct TerminalWsQuery {
-    ticket: String,
-}
-
 async fn create_terminal_session(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -142,18 +171,27 @@ async fn create_terminal_session(
         .client_market_get_host(&host_id)
         .await?
         .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-    authorize_web_terminal(&host, &session)?;
+    authorize_web_terminal(&state, &host, &session).await?;
     let host = crate::client_market::prepare_web_terminal_host(&state, &host).await?;
-    authorize_web_terminal(&host, &session)?;
+    let authorization_expires_at = authorize_web_terminal(&state, &host, &session)
+        .await?
+        .and_then(|expires_at| {
+            (expires_at - Utc::now())
+                .to_std()
+                .ok()
+                .map(|remaining| Instant::now() + remaining)
+        });
 
     let mut manager = state.client_market_terminal.lock().await;
     let ticket = manager.issue_ticket(TerminalTicket {
         host_id: host.id.clone(),
+        installation_id: host.installation_id.clone(),
         owner_user_id: session.user_id.clone(),
         owner_email: session.email.clone(),
         ip: host.ip.clone(),
         port: host.port,
         expires_at: Instant::now() + TICKET_TTL,
+        authorization_expires_at,
     });
     info!(
         host_id = %host.id,
@@ -169,23 +207,73 @@ async fn create_terminal_session(
 async fn terminal_ws(
     ws: WebSocketUpgrade,
     State(state): State<ServerState>,
-    Query(query): Query<TerminalWsQuery>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
+    let ticket_id = terminal_ticket_from_protocols(&headers)?;
     let ticket = {
         let mut manager = state.client_market_terminal.lock().await;
-        let ticket = manager.redeem_ticket(query.ticket.trim())?;
-        manager.try_begin_session(&ticket.owner_user_id)?;
-        ticket
+        manager.redeem_ticket(&ticket_id)?
     };
 
     Ok(ws
-        .protocols(["webtty"])
+        .protocols([WEBTTY_PROTOCOL])
         .on_upgrade(move |socket| async move {
-            run_terminal_session(state, socket, ticket).await;
+            let session_result = {
+                let mut manager = state.client_market_terminal.lock().await;
+                manager.try_begin_session(&ticket.owner_user_id)
+            };
+            if let Err(error) = session_result {
+                let _ = send_ws_notice(socket, &error.to_string()).await;
+                return;
+            }
+            let lease = ActiveTerminalSession::new(
+                Arc::clone(&state.client_market_terminal),
+                ticket.owner_user_id.clone(),
+            );
+            run_terminal_session(state, socket, ticket, lease).await;
         }))
 }
 
-async fn run_terminal_session(state: ServerState, socket: WebSocket, ticket: TerminalTicket) {
+fn terminal_ticket_from_protocols(headers: &HeaderMap) -> Result<String, AppError> {
+    let mut has_webtty = false;
+    let mut ticket_id = None;
+    for value in headers.get_all(header::SEC_WEBSOCKET_PROTOCOL) {
+        let value = value
+            .to_str()
+            .map_err(|_| AppError::BadRequest("invalid websocket protocol header".into()))?;
+        for protocol in value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if protocol == WEBTTY_PROTOCOL {
+                has_webtty = true;
+                continue;
+            }
+            if let Some(candidate) = protocol.strip_prefix(TICKET_PROTOCOL_PREFIX) {
+                if ticket_id.is_some() || Uuid::parse_str(candidate).is_err() {
+                    return Err(AppError::BadRequest(
+                        "invalid terminal ticket protocol".into(),
+                    ));
+                }
+                ticket_id = Some(candidate.to_string());
+            }
+        }
+    }
+    if !has_webtty {
+        return Err(AppError::BadRequest(
+            "webtty websocket protocol is required".into(),
+        ));
+    }
+    ticket_id.ok_or_else(|| AppError::Unauthorized("terminal ticket is required".into()))
+}
+
+async fn run_terminal_session(
+    state: ServerState,
+    socket: WebSocket,
+    ticket: TerminalTicket,
+    _lease: ActiveTerminalSession,
+) {
     let owner = ticket.owner_user_id.clone();
     let owner_email = ticket.owner_email.clone();
     let host_id = ticket.host_id.clone();
@@ -197,7 +285,7 @@ async fn run_terminal_session(state: ServerState, socket: WebSocket, ticket: Ter
     if let Err(error) = state
         .store
         .client_market_record_audit_event(
-            None,
+            ticket.installation_id.as_deref(),
             Some(&host_id),
             Some(&owner),
             Some(&owner_email),
@@ -223,16 +311,11 @@ async fn run_terminal_session(state: ServerState, socket: WebSocket, ticket: Ter
         Ok(()) => None,
     };
 
-    state
-        .client_market_terminal
-        .lock()
-        .await
-        .end_session(&owner);
     let duration_ms = started.elapsed().as_millis() as u64;
     if let Err(error) = state
         .store
         .client_market_record_audit_event(
-            None,
+            ticket.installation_id.as_deref(),
             Some(&host_id),
             Some(&owner),
             Some(&owner_email),
@@ -350,8 +433,14 @@ async fn bridge_ssh_session(
     });
 
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let session_deadline = Instant::now() + MAX_SESSION_DURATION;
+    let session_deadline = ticket
+        .authorization_expires_at
+        .map(|expires_at| expires_at.min(Instant::now() + MAX_SESSION_DURATION))
+        .unwrap_or_else(|| Instant::now() + MAX_SESSION_DURATION);
     let mut last_activity = Instant::now();
+    let mut authorization_timer = tokio::time::interval(AUTHORIZATION_RECHECK_INTERVAL);
+    authorization_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    authorization_timer.tick().await;
 
     let bridge_result = async {
         loop {
@@ -411,6 +500,22 @@ async fn bridge_ssh_session(
                         Some(Ok(Message::Close(_))) | None => return Ok(()),
                         Some(Ok(Message::Pong(_))) => {}
                         Some(Err(e)) => return Err(format!("websocket receive failed: {e}")),
+                    }
+                }
+                _ = authorization_timer.tick(), if ticket.installation_id.is_some() => {
+                    let installation_id = ticket.installation_id.as_deref().unwrap_or_default();
+                    let authorized = state
+                        .store
+                        .client_market_provider_terminal_authorized_until(
+                            installation_id,
+                            &ticket.host_id,
+                            &ticket.owner_user_id,
+                        )
+                        .await
+                        .map_err(|error| format!("check terminal authorization failed: {error}"))?
+                        .is_some();
+                    if !authorized {
+                        return Err("renter authorization for Provider terminal access ended".into());
                     }
                 }
             }
@@ -497,20 +602,38 @@ async fn send_ws_notice(mut socket: WebSocket, message: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn authorize_web_terminal(
+async fn authorize_web_terminal(
+    state: &ServerState,
     host: &RouterSshHostRecord,
     session: &crate::models::AuthSession,
-) -> Result<(), AppError> {
-    if crate::client_market::session_is_host_owner(
-        session,
-        host.provider_id.as_deref(),
-        &host.host_owner_email,
-    ) {
-        return Ok(());
+) -> Result<Option<DateTime<Utc>>, AppError> {
+    if !crate::client_market::session_is_host_owner(session, host.provider_id.as_deref()) {
+        return Err(AppError::Forbidden(
+            "web terminal is only available to the host Provider".into(),
+        ));
     }
-    Err(AppError::Forbidden(
-        "web terminal is only available to the host owner".into(),
-    ))
+    if crate::client_market::host_is_unallocated_for_terminal(host) {
+        return Ok(None);
+    }
+    let installation_id = host.installation_id.as_deref().ok_or_else(|| {
+        AppError::Forbidden(
+            "web terminal is unavailable while this Host is being allocated or cleaned".into(),
+        )
+    })?;
+    state
+        .store
+        .client_market_provider_terminal_authorized_until(
+            installation_id,
+            &host.id,
+            &session.user_id,
+        )
+        .await?
+        .map(Some)
+        .ok_or_else(|| {
+            AppError::Forbidden(
+                "the renter has not authorized Provider terminal access to this Host".into(),
+            )
+        })
 }
 
 async fn require_session(
@@ -548,7 +671,11 @@ mod tests {
             country_code: Some("US".into()),
             hostname: Some("box".into()),
             ssh_host_key_fingerprint: None,
-            status: "allocated".into(),
+            status: if installation.is_some() {
+                "allocated".into()
+            } else {
+                "idle".into()
+            },
             client_subdomain: Some("demo".into()),
             client_owner_email: client_owner.map(str::to_string),
             installation_id: installation.map(str::to_string),
@@ -580,21 +707,24 @@ mod tests {
     }
 
     #[test]
-    fn authorize_allows_host_owner_only() {
-        let host = sample_host(Some("client@example.com"), Some("inst-1"));
-        assert!(authorize_web_terminal(&host, &session("provider-1", "host@example.com")).is_ok());
-        assert!(authorize_web_terminal(&host, &session("client-1", "client@example.com")).is_err());
-        assert!(
-            authorize_web_terminal(&host, &session("other-user", "other@example.com")).is_err()
-        );
-        // Admins (including router owner) are intentionally excluded unless they own the host.
-        assert!(authorize_web_terminal(&host, &session("admin-1", "admin@example.com")).is_err());
-        // Legacy ownership: email matches even when provider_id differs.
-        assert!(authorize_web_terminal(&host, &session("uuid-host", "host@example.com")).is_ok());
-
+    fn unallocated_terminal_access_uses_stable_provider_identity() {
         let idle = sample_host(None, None);
-        assert!(authorize_web_terminal(&idle, &session("provider-1", "host@example.com")).is_ok());
-        assert!(authorize_web_terminal(&idle, &session("client-1", "client@example.com")).is_err());
+        assert!(crate::client_market::host_is_unallocated_for_terminal(
+            &idle
+        ));
+        assert!(crate::client_market::session_is_host_owner(
+            &session("provider-1", "host@example.com"),
+            idle.provider_id.as_deref(),
+        ));
+        assert!(!crate::client_market::session_is_host_owner(
+            &session("uuid-host", "host@example.com"),
+            idle.provider_id.as_deref(),
+        ));
+
+        let allocated = sample_host(Some("client@example.com"), Some("inst-1"));
+        assert!(!crate::client_market::host_is_unallocated_for_terminal(
+            &allocated
+        ));
     }
 
     #[test]
@@ -602,22 +732,26 @@ mod tests {
         let mut manager = TerminalSessionManager::default();
         let id = manager.issue_ticket(TerminalTicket {
             host_id: "h".into(),
+            installation_id: None,
             owner_user_id: "user-a".into(),
             owner_email: "user-a@example.com".into(),
             ip: "1.2.3.4".into(),
             port: 22,
             expires_at: Instant::now() + Duration::from_secs(30),
+            authorization_expires_at: None,
         });
         assert!(manager.redeem_ticket(&id).is_ok());
         assert!(manager.redeem_ticket(&id).is_err());
 
         let expired = manager.issue_ticket(TerminalTicket {
             host_id: "h".into(),
+            installation_id: None,
             owner_user_id: "user-a".into(),
             owner_email: "user-a@example.com".into(),
             ip: "1.2.3.4".into(),
             port: 22,
             expires_at: Instant::now() - Duration::from_secs(1),
+            authorization_expires_at: None,
         });
         assert!(manager.redeem_ticket(&expired).is_err());
     }
@@ -630,6 +764,48 @@ mod tests {
         assert!(manager.try_begin_session("a@b.co").is_err());
         manager.end_session("a@b.co");
         assert!(manager.try_begin_session("a@b.co").is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_lease_releases_counter_when_dropped() {
+        let manager = Arc::new(Mutex::new(TerminalSessionManager::default()));
+        manager
+            .lock()
+            .await
+            .try_begin_session("provider-1")
+            .unwrap();
+        let lease = ActiveTerminalSession::new(Arc::clone(&manager), "provider-1".into());
+        drop(lease);
+        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            if !manager
+                .lock()
+                .await
+                .active_sessions
+                .contains_key("provider-1")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("terminal session counter was not released");
+    }
+
+    #[test]
+    fn websocket_ticket_is_carried_in_subprotocol_header() {
+        let ticket = Uuid::new_v4().to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            format!("webtty, ticket.{ticket}").parse().unwrap(),
+        );
+        assert_eq!(terminal_ticket_from_protocols(&headers).unwrap(), ticket);
+
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            "webtty, ticket.not-a-uuid".parse().unwrap(),
+        );
+        assert!(terminal_ticket_from_protocols(&headers).is_err());
     }
 
     #[test]

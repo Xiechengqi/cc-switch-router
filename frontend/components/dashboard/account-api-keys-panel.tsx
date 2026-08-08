@@ -4,9 +4,11 @@ import * as React from "react";
 import { Button } from "@heroui/react";
 import { Copy, Eye, EyeOff, KeyRound, Loader2, RotateCcw } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import type { UserApiTokenStatus } from "@/lib/types";
+import { formatDateTime } from "@/lib/utils";
 
 function buildShareCurlExample(host: string, apiToken: string) {
   const bearer = apiToken ? `Bearer ${apiToken}` : "Bearer <your-api-token>";
@@ -22,7 +24,7 @@ function buildShareCurlExample(host: string, apiToken: string) {
 }
 
 export function AccountApiKeysPanel() {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
 
@@ -34,6 +36,7 @@ export function AccountApiKeysPanel() {
   const [copiedToken, setCopiedToken] = React.useState(false);
   const [copiedCurl, setCopiedCurl] = React.useState(false);
   const [host, setHost] = React.useState("router.example.com");
+  const [resetConfirmOpen, setResetConfirmOpen] = React.useState(false);
 
   const maskedToken = React.useMemo(() => {
     if (rawToken) {
@@ -84,6 +87,7 @@ export function AccountApiKeysPanel() {
       setToken(response.token);
       setRawToken(response.apiToken);
       setShowToken(true);
+      setResetConfirmOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -129,18 +133,18 @@ export function AccountApiKeysPanel() {
       </div>
 
       {error ? (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{error}</div>
       ) : null}
 
       <section className="grid gap-3 rounded-xl border border-border bg-card p-4 sm:p-5">
         <div className="grid gap-2 text-sm">
           <div className="flex justify-between gap-3">
             <span className="text-muted-foreground">{t("account.apiKeys.created")}</span>
-            <span>{token?.createdAt ? new Date(token.createdAt).toLocaleString() : "-"}</span>
+            <span className="tabular-nums">{token?.createdAt ? formatDateTime(token.createdAt, locale) : "-"}</span>
           </div>
           <div className="flex justify-between gap-3">
             <span className="text-muted-foreground">{t("account.apiKeys.lastUsed")}</span>
-            <span>{token?.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : "-"}</span>
+            <span className="tabular-nums">{token?.lastUsedAt ? formatDateTime(token.lastUsedAt, locale) : "-"}</span>
           </div>
         </div>
 
@@ -165,7 +169,7 @@ export function AccountApiKeysPanel() {
             <Copy className="h-4 w-4" />
             {copiedToken ? t("account.apiKeys.copied") : t("account.apiKeys.copy")}
           </Button>
-          <Button variant="primary" size="sm" onClick={() => void reset()} isDisabled={busy}>
+          <Button variant="outline" size="sm" className="text-rose-700" onClick={() => setResetConfirmOpen(true)} isDisabled={busy}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
             {t("account.apiKeys.reset")}
           </Button>
@@ -192,6 +196,18 @@ export function AccountApiKeysPanel() {
           </pre>
         </div>
       </section>
+
+      <ConfirmAlertDialog
+        open={resetConfirmOpen}
+        title={t("account.apiKeys.resetConfirmTitle")}
+        description={t("account.apiKeys.resetConfirmDescription")}
+        confirmLabel={t("account.apiKeys.resetConfirmAction")}
+        cancelLabel={t("common.cancel")}
+        tone="danger"
+        busy={busy}
+        onConfirm={() => void reset()}
+        onOpenChange={(next) => !busy && setResetConfirmOpen(next)}
+      />
     </div>
   );
 }

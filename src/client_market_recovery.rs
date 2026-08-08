@@ -33,6 +33,7 @@ const RECOVERY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const INITIAL_OFFLINE_DELAY: ChronoDuration = ChronoDuration::seconds(30);
 const STABLE_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
 const TUNNEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(90);
+const RECOVERY_JOB_MAX_RUNTIME: Duration = Duration::from_secs(5 * 60);
 const TUNNEL_CONFIRM_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_RECOVERIES: usize = 4;
 const TERMINAL_JOB_RETENTION: ChronoDuration = ChronoDuration::days(30);
@@ -299,12 +300,44 @@ pub(crate) async fn resume_interrupted_job(state: ServerState, job: Provisioning
     run_recovery_job_task(state, job.id, "interrupted").await;
 }
 
+pub(crate) async fn expire_stale_job(state: &ServerState, job_id: &str) {
+    if let Err(error) = state
+        .store
+        .client_market_finish_recovery_attempt(
+            job_id,
+            FinishAttempt {
+                kind: FinishKind::Failed,
+                outcome: "worker_timeout",
+                failure_code: Some("recovery_worker_timeout"),
+                method: None,
+                event_type: "client_recovery_attempt_failed",
+            },
+            Utc::now(),
+        )
+        .await
+    {
+        warn!(job_id, error = %error, "failed to expire stale Client recovery job");
+    }
+}
+
 async fn run_recovery_job_task(state: ServerState, job_id: String, source: &'static str) {
     let Ok(_slot) = state.client_market_recovery.slots.acquire().await else {
         warn!(job_id = %job_id, %source, "Client recovery concurrency limiter closed");
         return;
     };
-    if let Err(error) = run_recovery_job(state.clone(), job_id.clone()).await {
+    let result = crate::client_market::run_job_with_lease(
+        &state,
+        &job_id,
+        JOB_TYPE_RECOVER,
+        source == "interrupted",
+        RECOVERY_JOB_MAX_RUNTIME,
+        run_recovery_job(state.clone(), job_id.clone()),
+    )
+    .await;
+    if let Err(error) = result {
+        if crate::client_market::job_lease_was_revoked(&error) {
+            return;
+        }
         warn!(job_id = %job_id, %source, error = %error, "Client recovery job stopped unexpectedly");
         let mut retry_delay = Duration::from_secs(1);
         loop {
@@ -942,7 +975,7 @@ impl AppStore {
                         status, phase, log_blob, secret_ref, failure_code, created_at, updated_at,
                         client_owner_user_id
                      ) VALUES (?1, 'recover', ?2, ?3, ?4, '[]', '[]', ?5, ?6,
-                               'running', 'recovery_checking',
+                               'pending', 'recovery_checking',
                                'claimed persistent Client recovery attempt\n', NULL, NULL, ?7, ?7, ?8)",
                     params![
                         job_id,
@@ -1279,9 +1312,9 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("read controlled Client recovery failed: {error}"))
             })?;
-        let (installation_id, provider_id, host_owner_email) =
+        let (installation_id, provider_id, _host_owner_email) =
             row.ok_or_else(|| AppError::NotFound("eligible Client recovery not found".into()))?;
-        if !is_admin && !session_is_host_owner(session, provider_id.as_deref(), &host_owner_email) {
+        if !is_admin && !session_is_host_owner(session, provider_id.as_deref()) {
             return Err(AppError::Forbidden(
                 "only the Host Provider or Router administrator may control recovery".into(),
             ));
@@ -1319,9 +1352,9 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("validate Client recovery control failed: {error}"))
             })?;
-        let (installation_id, provider_id, host_owner_email, subdomain) =
+        let (installation_id, provider_id, _host_owner_email, subdomain) =
             row.ok_or_else(|| AppError::NotFound("eligible Client recovery not found".into()))?;
-        if !is_admin && !session_is_host_owner(session, provider_id.as_deref(), &host_owner_email) {
+        if !is_admin && !session_is_host_owner(session, provider_id.as_deref()) {
             return Err(AppError::Forbidden(
                 "only the Host Provider or Router administrator may control recovery".into(),
             ));
@@ -1775,6 +1808,27 @@ mod tests {
                 .is_empty(),
             "the active provisioning_jobs row must serialize the Host"
         );
+        {
+            let conn = store.conn.lock().await;
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM provisioning_jobs WHERE id = ?1",
+                    params![claims[0]],
+                    |row| row.get(0),
+                )
+                .expect("read pending recovery claim");
+            assert_eq!(status, "pending");
+        }
+        store
+            .client_market_claim_job_execution(
+                &claims[0],
+                JOB_TYPE_RECOVER,
+                "test-recovery-worker",
+                false,
+                RECOVERY_JOB_MAX_RUNTIME,
+            )
+            .await
+            .expect("claim recovery execution lease");
         let conn = store.conn.lock().await;
         let (job_type, status, attempt_level): (String, String, i64) = conn
             .query_row(
@@ -1843,6 +1897,16 @@ mod tests {
             .unwrap()
             .pop()
             .expect("claim recovery");
+        store
+            .client_market_claim_job_execution(
+                &job_id,
+                JOB_TYPE_RECOVER,
+                "test-recovery-worker",
+                false,
+                RECOVERY_JOB_MAX_RUNTIME,
+            )
+            .await
+            .expect("claim recovery execution lease");
         let finished_at = observed_at + ChronoDuration::minutes(5);
         store
             .client_market_finish_recovery_attempt(
@@ -1884,6 +1948,16 @@ mod tests {
             .unwrap()
             .pop()
             .expect("claim recovery");
+        store
+            .client_market_claim_job_execution(
+                &job_id,
+                JOB_TYPE_RECOVER,
+                "test-recovery-worker",
+                false,
+                RECOVERY_JOB_MAX_RUNTIME,
+            )
+            .await
+            .expect("claim recovery execution lease");
         store
             .client_market_finish_recovery_attempt(
                 &job_id,

@@ -22,9 +22,9 @@ const MSG_OUTPUT = "1";
 const TERMINAL_FONT_FAMILY =
   'var(--font-source-code-pro), "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
 
-function terminalWsUrl(ticket: string) {
+function terminalWsUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/v1/client-market/terminal/ws?ticket=${encodeURIComponent(ticket)}`;
+  return `${protocol}//${window.location.host}/v1/client-market/terminal/ws`;
 }
 
 function encodeInput(data: string) {
@@ -60,7 +60,7 @@ export function WebTerminalSession({
 }: {
   hostId: string;
   hostLabel?: string;
-  /** When false (minimized / off-route), keep session but skip fit churn. */
+  /** Minimized and off-route terminals disconnect; restoring creates a new ticket. */
   active: boolean;
 }) {
   const { t } = useLocaleText();
@@ -103,6 +103,7 @@ export function WebTerminalSession({
   }, [sendResize]);
 
   React.useEffect(() => {
+    if (!active) return;
     let cancelled = false;
     setStatus("connecting");
     setError("");
@@ -120,6 +121,7 @@ export function WebTerminalSession({
         const term = new Terminal({
           cursorBlink: true,
           convertEol: true,
+          scrollback: 2000,
           fontFamily: TERMINAL_FONT_FAMILY,
           fontSize: adaptiveFontSize(container),
           theme: {
@@ -153,7 +155,7 @@ export function WebTerminalSession({
         termRef.current = term;
         fitRef.current = fit;
 
-        const socket = new WebSocket(terminalWsUrl(session.ticket), ["webtty"]);
+        const socket = new WebSocket(terminalWsUrl(), ["webtty", `ticket.${session.ticket}`]);
         socket.binaryType = "arraybuffer";
         socketRef.current = socket;
         let opened = false;
@@ -258,7 +260,7 @@ export function WebTerminalSession({
       }
       fitRef.current = null;
     };
-  }, [fitTerminal, hostId, retryGeneration, t]);
+  }, [active, fitTerminal, hostId, retryGeneration, t]);
 
   React.useEffect(() => {
     if (!active) return;

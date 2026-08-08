@@ -28,7 +28,7 @@ import {
   type CoreShareApp,
 } from "@/components/dashboard/data-tables";
 import type { ShareRequestLog, ShareView } from "@/lib/types";
-import { compactTokens, formatDateTime } from "@/lib/utils";
+import { compactTokens, formatDateTime, preferredScrollBehavior } from "@/lib/utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { resolveShareCoreApp, shareAccessApps } from "@/lib/share-app";
 import { recordDashboardUxEvent } from "@/lib/api";
@@ -146,7 +146,7 @@ export const ShareCard = React.memo(function ShareCard({
 
   React.useEffect(() => {
     if (!focused || focus.target?.source === "client-board") return;
-    cardRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    cardRef.current?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "nearest", inline: "center" });
     if (focus.target?.kind === "request") void recordDashboardUxEvent({ eventType: "share_located_from_request", source: "activity", targetType: "share" });
   }, [focus.target?.source, focused]);
 

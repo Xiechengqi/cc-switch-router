@@ -733,6 +733,22 @@ pub struct ShareBatchSyncRequest {
     pub ops: Vec<ShareSyncOperation>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareDescriptorSyncAck {
+    pub share_id: String,
+    pub descriptor_generation: u64,
+    pub descriptor_fingerprint: String,
+    pub applied: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareDescriptorBatchSyncResponse {
+    pub ok: bool,
+    pub acks: Vec<ShareDescriptorSyncAck>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareRequestLogBatchSyncRequest {
@@ -1103,6 +1119,10 @@ pub struct ShareEditAckPayload {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2266,6 +2286,10 @@ pub struct ShareDescriptor {
     pub auto_start: bool,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero_revision")]
+    pub descriptor_generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub descriptor_fingerprint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

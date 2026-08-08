@@ -1,0 +1,22 @@
+[Unit]
+Description=cc-switch Router HTTPS clock fallback
+Documentation=file:///opt/cc-switch-router/docs/runbook-clock-skew-401.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cc-switch-router/scripts/ops/http-timesync.sh
+User=root
+Group=root
+CapabilityBoundingSet=CAP_SYS_TIME
+AmbientCapabilities=CAP_SYS_TIME
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

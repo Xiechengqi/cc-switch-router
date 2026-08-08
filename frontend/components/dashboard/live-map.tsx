@@ -11,7 +11,7 @@ import type { CountryBoard, CountryMapPoint, DashboardResponse, MapPoint, Market
 import { cn } from "@/lib/utils";
 import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
 import { usePersistentState } from "@/lib/use-persistent-state";
-import { CountryFlag, countryFlagIso2 } from "@/components/common/country-flag";
+import { countryFlagIso2 } from "@/components/common/country-flag";
 import { StatsStrip } from "@/components/dashboard/stats-strip";
 
 type PlacedPoint = { x: number; y: number; xPct: number; yPct: number };
@@ -27,6 +27,13 @@ type TickerUsageMeta = {
   usageState?: string;
   status?: string;
 };
+
+/** Regional-indicator emoji flags (wavy glyphs on Apple/common emoji fonts). */
+function countryFlagEmoji(code?: string | null) {
+  const iso2 = countryFlagIso2(code);
+  if (!iso2) return "";
+  return String.fromCodePoint(...[...iso2].map((ch) => 127397 + ch.charCodeAt(0)));
+}
 
 const REQUEST_TICKER_LIMIT = 100;
 const REQUEST_TICKER_VISIBLE_ROWS = 5;
@@ -75,7 +82,7 @@ function resolveTickerCountry(
   return strictIso2(event.countryCode);
 }
 
-function formatTickerTime(value?: string | number, fallbackSeconds?: string | number) {
+function formatTickerTime(value?: string | number, fallbackSeconds?: string | number, locale?: string) {
   let timestamp = typeof value === "number" ? value : Date.parse(value || "");
   const fallback = Number(fallbackSeconds || 0);
   if (!Number.isFinite(timestamp) && Number.isFinite(fallback) && fallback > 0) {
@@ -83,7 +90,7 @@ function formatTickerTime(value?: string | number, fallbackSeconds?: string | nu
   }
   const date = Number.isFinite(timestamp) ? new Date(timestamp) : new Date();
   if (!Number.isFinite(date.getTime())) return "--:--:--";
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(locale, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -405,7 +412,7 @@ function resolveIso3FromElement(element: Element | null) {
 }
 
 function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [expanded, setExpanded] = usePersistentState(MAP_REQUEST_TICKER_EXPANDED_KEY, true);
   const [isHovering, setIsHovering] = React.useState(false);
   const tickerScrollRef = React.useRef<HTMLDivElement | null>(null);
@@ -483,7 +490,7 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                 isInflight: event.isInflight,
               };
               const countryCode = resolveTickerCountry(event, mergedItem, data);
-              const flagCode = countryFlagIso2(countryCode);
+              const flag = countryFlagEmoji(countryCode);
               const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
               const eventKey = [event.requestId, event.startedAt || event.createdAt || ""].join(":");
               const statusCode = Number(mergedItem?.statusCode || 0);
@@ -496,9 +503,9 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                   key={eventKey}
                   className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === visibleEvents.length - 1 && event.requestId === newestRequestId ? "activity-feed-enter" : ""}`}
                 >
-                  <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
+                  <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt, locale)}</span>
                   <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
-                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong>{flagCode ? <> · <CountryFlag code={flagCode} title={flagCode} /></> : null} · {tickerDetail(mergedItem)}</span>
+                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong>{flag ? <> · <span role="img" title={countryCode || undefined} aria-label={countryCode || undefined}>{flag}</span></> : null} · {tickerDetail(mergedItem)}</span>
                 </div>
               );
             })}

@@ -1200,6 +1200,33 @@ export type HostMetricsStatus = {
   };
 };
 
+export type ClockSourceResult = {
+  url: string;
+  ok: boolean;
+  offsetMs?: number | null;
+  rttMs?: number | null;
+  error?: string | null;
+};
+
+export type ClockHealthStatus = {
+  enabled: boolean;
+  status: "healthy" | "warning" | "critical" | "degraded" | "unknown" | "disabled" | string;
+  direction: "ahead" | "behind" | "aligned" | "unknown" | string;
+  confidence: "quorum" | "single_source" | "unavailable" | string;
+  offsetMs?: number | null;
+  uncertaintyMs?: number | null;
+  validSources: number;
+  totalSources: number;
+  ntpSynchronized?: boolean | null;
+  sampledAt?: number | null;
+  lastSuccessAt?: number | null;
+  probeAgeSecs?: number | null;
+  ingressExpiredTotal: number;
+  ingressFutureTotal: number;
+  ingressContractErrorTotal: number;
+  sources: ClockSourceResult[];
+};
+
 export type RouterMetricsStatus = {
   activeRoutes: number;
   pendingRoutes: number;
@@ -1267,12 +1294,20 @@ export type MetricsSnapshot = {
   enabled: boolean;
   sampleIntervalSecs: number;
   lastPersistedAt?: number | null;
+  clock: ClockHealthStatus;
   host: HostMetricsStatus;
   router: RouterMetricsStatus;
   clients: ClientMetricsSnapshot;
   llm: LlmMetricsSnapshot;
   alerts: MetricEvent[];
   incidents: AlertIncident[];
+};
+
+export type ClockMetricsPoint = {
+  timestamp: number;
+  offsetMs?: number | null;
+  uncertaintyMs?: number | null;
+  validSources?: number | null;
 };
 
 export type HostMetricsPoint = {
@@ -1313,6 +1348,7 @@ export type LlmMetricsPoint = {
   outputTpm: number;
   errorRate: number;
   rateLimited: number;
+  concurrencyLimited: number;
   p95LatencyMs?: number | null;
   p95TtftMs?: number | null;
 };
@@ -1320,6 +1356,7 @@ export type LlmMetricsPoint = {
 export type MetricsSeriesResponse = {
   range: string;
   step: string;
+  clock: ClockMetricsPoint[];
   host: HostMetricsPoint[];
   router: RouterMetricsPoint[];
   clients: ClientMetricsPoint[];
@@ -1681,7 +1718,24 @@ export type MarketBillingDispute = {
   status: string;
   resolution?: string;
   createdAt: string;
+  respondBy?: string;
+  escalatedAt?: string;
+  autoResolveAt?: string;
   resolvedAt?: string;
+};
+
+export type MarketBillingCreditNote = {
+  id: string;
+  kind: "service_credit" | "external_refund" | string;
+  amountMinor: number;
+  amountUsdMinor: number;
+  amountCnyMinor: number;
+  currency: "USD";
+  reason: string;
+  externalReference?: string;
+  status: string;
+  createdByEmail: string;
+  createdAt: string;
 };
 
 export type MarketBillingInvoice = {
@@ -1704,6 +1758,7 @@ export type MarketBillingInvoice = {
   lines: MarketBillingInvoiceLine[];
   declaration?: MarketBillingPaymentDeclaration;
   dispute?: MarketBillingDispute;
+  creditNotes: MarketBillingCreditNote[];
 };
 
 export type MarketBillingInvoiceHistory = {
@@ -1944,6 +1999,15 @@ export type ClientMarketCommitQuoteResponse = {
   jobIds: string[];
 };
 
+export type ClientMarketBatch = {
+  id: string;
+  quoteId: string;
+  status: "running" | "succeeded" | "partial_failed" | "failed" | string;
+  createdAt: string;
+  updatedAt: string;
+  jobs: ProvisioningJob[];
+};
+
 export type ClientMarketRental = {
   installationId: string;
   hostId: string;
@@ -1964,6 +2028,9 @@ export type ClientMarketRental = {
   canFinalizeRelease: boolean;
   /** Pending/running cleanup job — used to resume progress UI after refresh. */
   activeCleanupJobId?: string;
+  providerTerminalAuthorizedUntil?: string;
+  providerTerminalAccessActive: boolean;
+  canManageProviderTerminal: boolean;
   updatedAt: string;
 };
 
@@ -1984,6 +2051,7 @@ export type ClientMarketHostTransferDocument = {
 
 export type ClientMarketHostImportResponse = {
   jobId: string;
+  status: "pending" | "running" | "completed" | string;
   imported: number;
   skipped: number;
   failed: number;
@@ -2043,10 +2111,27 @@ export type ShareMarketSubscription = {
   contacts?: PaymentContact[];
   canRelease: boolean;
   canForceRevoke: boolean;
+  canProposePriceChange: boolean;
+  priceChange?: ShareMarketPriceChange;
   releaseReason?: string;
   releasedAt?: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type ShareMarketPriceChange = {
+  id: string;
+  previousDailyRateMinor: number;
+  proposedDailyRateMinor: number;
+  currency: "USD";
+  baseOfferRevision: number;
+  status: "pending" | "accepted";
+  canAccept: boolean;
+  canReject: boolean;
+  canCancel: boolean;
+  createdAt: string;
+  updatedAt: string;
+  respondedAt?: string;
 };
 
 export type ShareMarketSeat = ShareMarketSeatInput & {

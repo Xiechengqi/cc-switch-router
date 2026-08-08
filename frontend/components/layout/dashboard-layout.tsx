@@ -7,6 +7,7 @@ import { DashboardFocusProvider } from "@/components/dashboard/dashboard-focus";
 import { OperationVerificationProvider } from "@/components/dashboard/operation-verification";
 import { useDashboardData } from "@/components/dashboard/dashboard-data";
 import { DashboardViewStateProvider } from "@/components/dashboard/dashboard-view-state";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   WebTerminalDock,
   WebTerminalManagerProvider,
@@ -14,7 +15,8 @@ import {
 } from "@/components/dashboard/web-terminal";
 
 export function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const { data } = useDashboardData();
+  const { data, error, loading, refreshing } = useDashboardData();
+  const { t } = useLocaleText();
 
   return (
     <DashboardFocusProvider data={data}>
@@ -23,7 +25,10 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
           <ClientConsoleManagerProvider>
             <WebTerminalManagerProvider>
               <ClientChatProvider>
-                <div className="flex flex-1 flex-col">
+                <div className="flex flex-1 flex-col" aria-busy={loading || refreshing}>
+                  <div className="sr-only" role="status" aria-live="polite">
+                    {loading ? t("common.loading") : error}
+                  </div>
                   <div className="flex-1">{children}</div>
                   <PresenceFooter />
                 </div>

@@ -64,10 +64,10 @@ use crate::models::{
     ReportInstallationStatusResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
     ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
-    ShareHeartbeatRequest, SharePendingEditsRequest, SharePruneRequest,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
-    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
+    ShareDescriptorBatchSyncResponse, ShareEditAckRequest, ShareEditAvailableEvent,
+    ShareEditEventSignaturePayload, ShareHeartbeatRequest, SharePendingEditsRequest,
+    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRuntimeRefreshRequest, ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
     SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
     UpdateUserProfileRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
     UpgradeInstallationStatusResponse, UserApiTokenResetResponse, UserApiTokenResponse,
@@ -379,6 +379,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/tunnels/state", post(tunnel_state))
         .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
         .route("/v1/shares/sync", post(sync_share))
+        .route(
+            "/v1/shares/descriptor-batch-sync",
+            post(batch_sync_share_descriptors),
+        )
         .route("/v1/shares/batch-sync", post(batch_sync_share))
         .route("/v1/shares/runtime-refresh", post(refresh_share_runtime))
         .route(
@@ -4177,6 +4181,19 @@ async fn batch_sync_share(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn batch_sync_share_descriptors(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ShareBatchSyncRequest>,
+) -> Result<Json<ShareDescriptorBatchSyncResponse>, AppError> {
+    let acks = state
+        .store
+        .batch_sync_share_descriptors(input, extract_client_metadata(&headers, addr))
+        .await?;
+    Ok(Json(ShareDescriptorBatchSyncResponse { ok: true, acks }))
+}
+
 async fn update_share_settings(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -5825,7 +5842,13 @@ async fn admin_metrics_snapshot(
     Ok(Json(
         state
             .metrics
-            .snapshot(&state.config, &state.proxy, &state.store, &state.alerting)
+            .snapshot(
+                &state.config,
+                &state.proxy,
+                &state.store,
+                &state.alerting,
+                &state.clock_health,
+            )
             .await?,
     ))
 }

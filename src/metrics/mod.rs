@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use crate::clock_health::{ClockHealthService, ClockHealthStatus};
 use crate::config::{Config, MetricsConfig};
 use crate::error::AppError;
 use crate::models::{MarketRequestLogEntry, ShareRequestLogEntry};
@@ -139,12 +140,20 @@ impl MetricsRegistry {
         Ok(())
     }
 
+    pub async fn record_clock_sample(&self, sample: ClockHealthStatus) -> Result<(), AppError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.store.insert_clock_sample(sample).await
+    }
+
     pub async fn snapshot(
         &self,
         config: &Config,
         proxy: &ProxyRegistry,
         app_store: &AppStore,
         alerting: &AlertingService,
+        clock_health: &ClockHealthService,
     ) -> Result<MetricsSnapshot, AppError> {
         let host = self.current_host_status(config).await;
         let router = self.router_status(proxy).await;
@@ -198,6 +207,7 @@ impl MetricsRegistry {
             enabled: self.enabled,
             sample_interval_secs: self.sample_interval_secs,
             last_persisted_at,
+            clock: clock_health.snapshot().await,
             host,
             router,
             clients,
@@ -700,6 +710,20 @@ fn normalize_llm_status(status: &str, status_code: Option<u16>) -> String {
 }
 
 fn error_kind_from_status(status: &str, status_code: Option<u16>) -> Option<String> {
+    const LOCAL_CONCURRENCY_CODES: &[&str] = &[
+        "cc_switch_user_concurrency_limit_exceeded",
+        "cc_switch_share_concurrency_limit_exceeded",
+        "cc_switch_provider_account_concurrency_limit_exceeded",
+        "cc_switch_free_share_ip_concurrency_limit_exceeded",
+        "cc_switch_image_concurrency_limit_exceeded",
+    ];
+    if status == "concurrency_limited"
+        || LOCAL_CONCURRENCY_CODES
+            .iter()
+            .any(|code| status.contains(code))
+    {
+        return Some("concurrency_limited".into());
+    }
     if status_code == Some(429) || status.contains("rate_limit") || status.contains("rate_limited")
     {
         return Some("rate_limited".into());
@@ -711,5 +735,31 @@ fn error_kind_from_status(status: &str, status_code: Option<u16>) -> Option<Stri
         _ if status.contains("timeout") => Some("timeout".into()),
         _ if status.contains("error") || status.contains("failed") => Some("upstream_error".into()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_kind_from_status;
+
+    #[test]
+    fn concurrency_metrics_require_a_stable_local_code() {
+        assert_eq!(
+            error_kind_from_status("cc_switch_user_concurrency_limit_exceeded", Some(409))
+                .as_deref(),
+            Some("concurrency_limited")
+        );
+        assert_eq!(
+            error_kind_from_status("concurrency_limited", Some(409)).as_deref(),
+            Some("concurrency_limited")
+        );
+        assert_eq!(
+            error_kind_from_status("provider concurrency limit exceeded", Some(409)).as_deref(),
+            None
+        );
+        assert_eq!(
+            error_kind_from_status("error", Some(409)).as_deref(),
+            Some("upstream_error")
+        );
     }
 }

@@ -28,6 +28,10 @@ import { cn } from "@/lib/utils";
 const NAV_ITEMS: {
   id: string;
   href: AccountNavHref;
+  groupLabelKey:
+    | "account.nav.group.security"
+    | "account.nav.group.usage"
+    | "account.nav.group.market";
   labelKey:
     | "account.nav.apiKeys"
     | "account.nav.providerUsage"
@@ -44,6 +48,7 @@ const NAV_ITEMS: {
   {
     id: "api-keys",
     href: DASHBOARD_ACCOUNT_API_KEYS_PATH,
+    groupLabelKey: "account.nav.group.security",
     labelKey: "account.nav.apiKeys",
     icon: KeyRound,
     match: (pathname: string) =>
@@ -52,6 +57,7 @@ const NAV_ITEMS: {
   {
     id: "provider-usage",
     href: DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
+    groupLabelKey: "account.nav.group.usage",
     labelKey: "account.nav.providerUsage",
     icon: BarChart3,
     match: (pathname: string) => pathname.startsWith("/account/provider-usage"),
@@ -59,6 +65,7 @@ const NAV_ITEMS: {
   {
     id: "consumer-usage",
     href: DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
+    groupLabelKey: "account.nav.group.usage",
     labelKey: "account.nav.consumerUsage",
     icon: Activity,
     match: (pathname: string) => pathname.startsWith("/account/consumer-usage"),
@@ -66,20 +73,15 @@ const NAV_ITEMS: {
   {
     id: "market-readiness",
     href: DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
+    groupLabelKey: "account.nav.group.market",
     labelKey: "account.nav.marketReadiness",
     icon: ClipboardCheck,
     match: (pathname: string) => pathname.startsWith("/account/market-readiness"),
   },
   {
-    id: "billing",
-    href: DASHBOARD_ACCOUNT_BILLING_PATH,
-    labelKey: "account.nav.billing",
-    icon: HandCoins,
-    match: (pathname: string) => pathname.startsWith("/account/billing"),
-  },
-  {
     id: "market-access",
     href: DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
+    groupLabelKey: "account.nav.group.market",
     labelKey: "account.nav.marketAccess",
     icon: ShieldCheck,
     match: (pathname: string) => pathname.startsWith("/account/market-access"),
@@ -87,13 +89,23 @@ const NAV_ITEMS: {
   {
     id: "payments",
     href: DASHBOARD_ACCOUNT_PAYMENTS_PATH,
+    groupLabelKey: "account.nav.group.market",
     labelKey: "account.nav.payments",
     icon: WalletCards,
     match: (pathname: string) => pathname.startsWith("/account/payments"),
   },
   {
+    id: "billing",
+    href: DASHBOARD_ACCOUNT_BILLING_PATH,
+    groupLabelKey: "account.nav.group.market",
+    labelKey: "account.nav.billing",
+    icon: HandCoins,
+    match: (pathname: string) => pathname.startsWith("/account/billing"),
+  },
+  {
     id: "share",
     href: DASHBOARD_ACCOUNT_SHARE_PATH,
+    groupLabelKey: "account.nav.group.market",
     labelKey: "account.nav.share",
     icon: Share2,
     match: (pathname: string) => pathname.startsWith("/account/share"),
@@ -101,6 +113,7 @@ const NAV_ITEMS: {
   {
     id: "client",
     href: DASHBOARD_ACCOUNT_CLIENT_PATH,
+    groupLabelKey: "account.nav.group.market",
     labelKey: "account.nav.client",
     icon: Receipt,
     match: (pathname: string) =>
@@ -119,6 +132,7 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
   const authed = !!session?.authenticated;
+  const activeItem = NAV_ITEMS.find((item) => item.match(pathname));
 
   React.useEffect(() => {
     if (isAccountIndexPath(pathname)) {
@@ -153,36 +167,45 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
         className="min-w-0 md:sticky md:top-4 md:self-start"
       >
         <div className="flex gap-1 overflow-x-auto rounded-lg bg-slate-100/90 p-1 ring-1 ring-inset ring-slate-200/80 md:grid md:grid-cols-1 md:overflow-visible">
-          {NAV_ITEMS.map((item) => {
+          {NAV_ITEMS.map((item, index) => {
             const active = item.match(pathname);
             const Icon = item.icon;
             return (
-              <Link
-                key={item.id}
-                href={item.href}
-                onClick={() => writeStoredAccountNavHref(item.href)}
-                className={cn(
-                  "inline-flex h-9 shrink-0 items-center gap-2 rounded-md px-3 text-sm font-medium transition-colors",
-                  active
-                    ? "bg-white text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-                aria-current={active ? "page" : undefined}
-              >
-                <Icon className="h-4 w-4 shrink-0" aria-hidden />
-                <span className="whitespace-nowrap">{t(item.labelKey)}</span>
-                {(item.id === "market-readiness" || item.id === "market-access") && pendingAccessRequests > 0 ? (
-                  <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-rose-100 px-1.5 text-[10px] font-semibold text-rose-700">
-                    {pendingAccessRequests > 99 ? "99+" : pendingAccessRequests}
-                  </span>
+              <React.Fragment key={item.id}>
+                {index === 0 || NAV_ITEMS[index - 1].groupLabelKey !== item.groupLabelKey ? (
+                  <div className="hidden px-3 pb-1 pt-3 text-xs font-semibold text-slate-500 first:pt-1 md:block">
+                    {t(item.groupLabelKey)}
+                  </div>
                 ) : null}
-              </Link>
+                <Link
+                  href={item.href}
+                  onClick={() => writeStoredAccountNavHref(item.href)}
+                  className={cn(
+                    "inline-flex h-9 shrink-0 items-center gap-2 rounded-md px-3 text-sm font-medium transition-colors",
+                    active
+                      ? "bg-white text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                  aria-current={active ? "page" : undefined}
+                >
+                  <Icon className="h-4 w-4 shrink-0" aria-hidden />
+                  <span className="whitespace-nowrap">{t(item.labelKey)}</span>
+                  {(item.id === "market-readiness" || item.id === "market-access") && pendingAccessRequests > 0 ? (
+                    <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-rose-100 px-1.5 text-[10px] font-semibold text-rose-700">
+                      {pendingAccessRequests > 99 ? "99+" : pendingAccessRequests}
+                    </span>
+                  ) : null}
+                </Link>
+              </React.Fragment>
             );
           })}
         </div>
       </nav>
 
-      <div className="min-w-0">{children}</div>
+      <div className="min-w-0">
+        <h1 className="sr-only">{activeItem ? t(activeItem.labelKey) : t("account.nav.sections")}</h1>
+        {children}
+      </div>
     </main>
   );
 }

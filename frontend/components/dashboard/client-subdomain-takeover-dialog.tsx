@@ -1,6 +1,6 @@
 "use client";
 
-import { Button, Modal, toast } from "@heroui/react";
+import { Button, Input, Modal, toast } from "@heroui/react";
 import { ArrowRightLeft, Loader2, TriangleAlert } from "lucide-react";
 import * as React from "react";
 
@@ -30,10 +30,12 @@ export function ClientSubdomainTakeoverDialog({
   const [sourceId, setSourceId] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [confirmation, setConfirmation] = React.useState("");
 
   React.useEffect(() => {
     if (!open) return;
     setSourceId(sources[0]?.installation.id || "");
+    setConfirmation("");
     setError("");
   }, [open, sources]);
 
@@ -62,6 +64,7 @@ export function ClientSubdomainTakeoverDialog({
 
   const targetSubdomain = target?.clientTunnel?.subdomain || "-";
   const sourceSubdomain = source?.clientTunnel?.subdomain || "-";
+  const confirmationMatches = sourceSubdomain !== "-" && confirmation.trim() === sourceSubdomain;
 
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
@@ -111,13 +114,25 @@ export function ClientSubdomainTakeoverDialog({
                 <p>{t("dashboard.subdomainTakeover.warningShares")}</p>
               </div>
             </div>
-            {error ? <p className="break-words text-sm text-rose-700">{error}</p> : null}
+            <label className="grid gap-1.5 text-sm text-slate-700">
+              <span>{t("dashboard.subdomainTakeover.confirmPrompt", { subdomain: sourceSubdomain })}</span>
+              <Input
+                value={confirmation}
+                onChange={(event) => setConfirmation(event.target.value)}
+                autoComplete="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                placeholder={sourceSubdomain}
+                aria-label={t("dashboard.subdomainTakeover.confirmInput")}
+              />
+            </label>
+            {error ? <p className="break-words text-sm text-rose-700" role="alert">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>
             <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>
               {t("common.cancel")}
             </Button>
-            <Button variant="danger" isDisabled={busy || !source} onClick={() => void submit()}>
+            <Button variant="danger" isDisabled={busy || !source || !confirmationMatches} onClick={() => void submit()}>
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRightLeft className="h-4 w-4" />}
               {busy ? t("dashboard.subdomainTakeover.running") : t("dashboard.subdomainTakeover.confirm")}
             </Button>

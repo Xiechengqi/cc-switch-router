@@ -48,6 +48,8 @@ struct ErrorBody {
     code: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<Value>,
+    #[serde(rename = "errorId", skip_serializing_if = "Option::is_none")]
+    error_id: Option<String>,
 }
 
 impl AppError {
@@ -106,19 +108,34 @@ impl IntoResponse for AppError {
             } => Some((*retry_after_secs).max(1)),
             _ => None,
         };
+        let server_error = status.is_server_error();
+        let error_id = server_error.then(|| uuid::Uuid::new_v4().to_string());
+        if let Some(error_id) = error_id.as_deref() {
+            tracing::error!(
+                error_id,
+                status = status.as_u16(),
+                error = %self,
+                "request failed with server error"
+            );
+        }
         let (code, details) = match &self {
+            _ if server_error => (database_unavailable.then_some("DATABASE_UNAVAILABLE"), None),
             AppError::Coded { code, details, .. } => (Some(*code), Some(details.clone())),
-            _ if database_unavailable => (Some("DATABASE_UNAVAILABLE"), None),
             _ => (None, None),
         };
         let body = ErrorBody {
             message: if database_unavailable {
                 "database unavailable".into()
+            } else if status == StatusCode::SERVICE_UNAVAILABLE {
+                "service unavailable".into()
+            } else if server_error {
+                "internal error".into()
             } else {
                 self.to_string()
             },
             code,
             details,
+            error_id,
         };
         if let Some(retry_after_secs) = retry_after_secs {
             return (
@@ -183,5 +200,31 @@ mod tests {
             serde_json::from_slice(&body).expect("decode database error response");
         assert_eq!(payload["message"], "database unavailable");
         assert_eq!(payload["code"], "DATABASE_UNAVAILABLE");
+        assert!(
+            payload["errorId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_error_is_not_exposed() {
+        let response =
+            AppError::Internal("query users failed: secret table name".into()).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read internal error response");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("decode internal error response");
+        assert_eq!(payload["message"], "internal error");
+        assert!(payload["code"].is_null());
+        assert!(payload["details"].is_null());
+        assert!(
+            payload["errorId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("secret table name"));
     }
 }

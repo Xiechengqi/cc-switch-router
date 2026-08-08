@@ -17,7 +17,7 @@ import {
   checkClientTunnelSubdomainAvailability,
   commitClientMarketQuote,
   createClientMarketQuote,
-  getClientMarketJob,
+  getClientMarketBatch,
   getClientMarketProviderSupply,
 } from "@/lib/api";
 import type {
@@ -154,6 +154,7 @@ export function CreateClientDialog({
   const [copied, setCopied] = React.useState(false);
   const [clock, setClock] = React.useState(0);
   const pollGeneration = React.useRef(0);
+  const commitKeyRef = React.useRef<{ quoteId: string; key: string } | null>(null);
   const subdomainCheckGeneration = React.useRef(0);
 
   const safeProviders = React.useMemo(() => normalizeProviderPersist(providerPersist), [providerPersist]);
@@ -270,6 +271,7 @@ export function CreateClientDialog({
     setPhase("form");
     setMode("online");
     setQuote(null);
+    commitKeyRef.current = null;
     setDrafts({});
     setSubdomainChecks({});
     subdomainCheckGeneration.current += 1;
@@ -468,14 +470,14 @@ export function CreateClientDialog({
     }
   };
 
-  const pollJobs = async (jobIds: string[], generation: number) => {
+  const pollBatch = async (batchId: string, generation: number) => {
     for (let attempt = 0; attempt < 1_000; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 1_500));
       if (pollGeneration.current !== generation) return;
-      const settled = await Promise.all(jobIds.map((id) => getClientMarketJob(id).catch(() => null)));
-      const available = settled.filter((job): job is ProvisioningJob => !!job);
-      setJobs(Object.fromEntries(available.map((job) => [job.id, job])));
-      if (available.length === jobIds.length && available.every((job) => job.status === "succeeded" || job.status === "failed")) {
+      const batch = await getClientMarketBatch(batchId).catch(() => null);
+      if (!batch) continue;
+      setJobs(Object.fromEntries(batch.jobs.map((job) => [job.id, job])));
+      if (batch.status !== "running") {
         setPhase("complete");
         onCreated?.();
         return;
@@ -538,13 +540,23 @@ export function CreateClientDialog({
         setError(t("createClient.subdomainTaken"));
         return;
       }
-      const response = await commitClientMarketQuote(quote.id, items);
+      if (commitKeyRef.current?.quoteId !== quote.id) {
+        commitKeyRef.current = {
+          quoteId: quote.id,
+          key: globalThis.crypto?.randomUUID?.() || `${quote.id}:${Date.now()}`,
+        };
+      }
+      const response = await commitClientMarketQuote(
+        quote.id,
+        items,
+        commitKeyRef.current.key,
+      );
       setDrafts({});
       setSubdomainChecks({});
       setJobs(Object.fromEntries(response.jobIds.map((id) => [id, { id, status: "pending", jobType: "create", phase: "pending", log: "", createdAt: "", updatedAt: "" } as ProvisioningJob])));
       setPhase("running");
       const generation = pollGeneration.current;
-      void pollJobs(response.jobIds, generation);
+      void pollBatch(response.batchId, generation);
     } catch (reason) {
       if (!routeMarketEligibilityError(reason)) {
         setError(reason instanceof Error ? reason.message : String(reason));

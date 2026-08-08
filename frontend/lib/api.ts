@@ -63,6 +63,7 @@ import type {
   ClientMarketProviderSupply,
   ClientMarketAllocationQuote,
   ClientMarketCommitQuoteResponse,
+  ClientMarketBatch,
   ClientMarketRental,
   ClientMarketHostTransferDocument,
   ClientMarketHostImportResponse,
@@ -1305,12 +1306,22 @@ export async function createClientMarketQuote(body: {
 export async function commitClientMarketQuote(
   quoteId: string,
   items: Array<{ quoteItemId: string; offerRevision: number; subdomain: string; password: string }>,
+  idempotencyKey: string,
 ) {
   return parseJson<ClientMarketCommitQuoteResponse>(
     await authFetch(`/v1/client-market/quotes/${encodeURIComponent(quoteId)}/commit`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items }),
+      body: JSON.stringify({ items, idempotencyKey }),
+    }),
+  );
+}
+
+export async function getClientMarketBatch(batchId: string, signal?: AbortSignal) {
+  return parseJson<ClientMarketBatch>(
+    await authFetch(`/v1/client-market/batches/${encodeURIComponent(batchId)}`, {
+      cache: "no-store",
+      signal,
     }),
   );
 }
@@ -1329,6 +1340,31 @@ export async function getMyClientMarketRentals(signal?: AbortSignal) {
   );
 }
 
+export async function grantClientMarketProviderTerminalAccess(
+  installationId: string,
+  durationMinutes: number,
+) {
+  return parseJson<{ active: boolean; expiresAt?: string; updatedAt: string }>(
+    await authFetch(
+      `/v1/client-market/clients/${encodeURIComponent(installationId)}/provider-terminal-authorization`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ durationMinutes }),
+      },
+    ),
+  );
+}
+
+export async function revokeClientMarketProviderTerminalAccess(installationId: string) {
+  return parseJson<{ active: boolean; expiresAt?: string; updatedAt: string }>(
+    await authFetch(
+      `/v1/client-market/clients/${encodeURIComponent(installationId)}/provider-terminal-authorization`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
 export async function exportMyClientMarketHosts() {
   return parseJson<ClientMarketHostTransferDocument>(
     await authFetch("/v1/client-market/hosts/export", { cache: "no-store" }),
@@ -1341,6 +1377,15 @@ export async function importMyClientMarketHosts(document: ClientMarketHostTransf
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(document),
+    }),
+  );
+}
+
+export async function getClientMarketHostImport(jobId: string, signal?: AbortSignal) {
+  return parseJson<ClientMarketHostImportResponse>(
+    await authFetch(`/v1/client-market/hosts/import/${encodeURIComponent(jobId)}`, {
+      cache: "no-store",
+      signal,
     }),
   );
 }
@@ -1448,4 +1493,45 @@ export async function forceRevokeShareMarketSubscription(
       body: JSON.stringify(input),
     }),
   );
+}
+
+export async function proposeShareMarketPriceChange(
+  subscriptionId: string,
+  dailyRateMinor: number,
+  offerRevision: number,
+) {
+  return parseJson<{ ok: true; proposalId: string }>(
+    await authFetch(
+      `/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/price-changes`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dailyRateMinor, offerRevision }),
+      },
+    ),
+  );
+}
+
+async function resolveShareMarketPriceChange(
+  proposalId: string,
+  action: "accept" | "reject" | "cancel",
+) {
+  return parseJson<{ ok: true }>(
+    await authFetch(
+      `/v1/share-market/price-changes/${encodeURIComponent(proposalId)}/${action}`,
+      { method: "POST" },
+    ),
+  );
+}
+
+export function acceptShareMarketPriceChange(proposalId: string) {
+  return resolveShareMarketPriceChange(proposalId, "accept");
+}
+
+export function rejectShareMarketPriceChange(proposalId: string) {
+  return resolveShareMarketPriceChange(proposalId, "reject");
+}
+
+export function cancelShareMarketPriceChange(proposalId: string) {
+  return resolveShareMarketPriceChange(proposalId, "cancel");
 }

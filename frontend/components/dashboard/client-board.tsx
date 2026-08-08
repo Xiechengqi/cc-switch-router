@@ -37,7 +37,7 @@ import {
   sortClients,
 } from "@/components/dashboard/data-tables";
 import type { ClientMarketRental, DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
-import { formatDateTime, formatRelativeTime } from "@/lib/utils";
+import { formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { getMyClientMarketRentals, recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
@@ -449,7 +449,7 @@ function ClientCard({
               value={clientTotalTokensLabel(allShares)}
               title={t("dashboard.clientTotalTokensDetail", {
                 count: allShares.length,
-                total: clientTotalTokensUsed(allShares).toLocaleString(),
+                total: new Intl.NumberFormat(locale).format(clientTotalTokensUsed(allShares)),
               })}
               preserveValue
             />
@@ -739,7 +739,7 @@ export function ClientBoard({
       : Array.from(focus.relatedClientIds)[0];
     if (!clientId) return;
     window.requestAnimationFrame(() => {
-      document.getElementById(`dashboard-client-${clientId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      document.getElementById(`dashboard-client-${clientId}`)?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
     });
   }, [focus.relatedClientIds, focus.target]);
 

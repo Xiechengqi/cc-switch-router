@@ -45,6 +45,7 @@ import {
 import type {
   AdminMarketBillingDispute,
   MarketBillingDashboard,
+  MarketBillingDispute,
   MarketBillingInvoice,
   MarketBillingPaymentDeclaration,
   MarketCreditAccount,
@@ -56,6 +57,7 @@ import {
   MARKET_CURRENCY,
   usdMinorToCnyMinor,
 } from "@/lib/market-money";
+import { preferredScrollBehavior } from "@/lib/utils";
 
 type Currency = typeof MARKET_CURRENCY;
 type BillingTab = "todo" | "payables" | "receivables" | "history" | "admin";
@@ -225,6 +227,83 @@ function PaymentDeclarationDetails({
       {declaration.rejectionReason ? (
         <p className="whitespace-pre-wrap break-words text-rose-700">{declaration.rejectionReason}</p>
       ) : null}
+    </div>
+  );
+}
+
+function DisputeDetails({ dispute, locale }: { dispute: MarketBillingDispute; locale: string }) {
+  const { t } = useLocaleText();
+  return (
+    <div className="grid gap-1.5 text-xs text-sky-900">
+      <p className="whitespace-pre-wrap break-words font-medium">
+        {t("marketBilling.dispute.summary", { reason: dispute.reason })}
+      </p>
+      <dl className="grid gap-x-4 gap-y-1 text-muted-foreground sm:grid-cols-2">
+        <div className="flex min-w-0 justify-between gap-3">
+          <dt>{t("marketBilling.dispute.openedAt")}</dt>
+          <dd className="text-right tabular-nums text-foreground">{formatDate(dispute.createdAt, locale)}</dd>
+        </div>
+        {dispute.respondBy ? (
+          <div className="flex min-w-0 justify-between gap-3">
+            <dt>{t("marketBilling.dispute.respondBy")}</dt>
+            <dd className="text-right tabular-nums text-foreground">{formatDate(dispute.respondBy, locale)}</dd>
+          </div>
+        ) : null}
+        {dispute.autoResolveAt ? (
+          <div className="flex min-w-0 justify-between gap-3">
+            <dt>{t("marketBilling.dispute.autoResolveAt")}</dt>
+            <dd className="text-right tabular-nums text-foreground">{formatDate(dispute.autoResolveAt, locale)}</dd>
+          </div>
+        ) : null}
+        {dispute.escalatedAt ? (
+          <div className="flex min-w-0 justify-between gap-3 text-amber-800">
+            <dt>{t("marketBilling.dispute.escalatedAt")}</dt>
+            <dd className="text-right tabular-nums">{formatDate(dispute.escalatedAt, locale)}</dd>
+          </div>
+        ) : null}
+        {dispute.resolvedAt ? (
+          <div className="flex min-w-0 justify-between gap-3">
+            <dt>{t("marketBilling.dispute.resolvedAt")}</dt>
+            <dd className="text-right tabular-nums text-foreground">{formatDate(dispute.resolvedAt, locale)}</dd>
+          </div>
+        ) : null}
+        {dispute.resolution ? (
+          <div className="flex min-w-0 justify-between gap-3">
+            <dt>{t("marketBilling.dispute.resolution")}</dt>
+            <dd className="break-words text-right text-foreground">{dispute.resolution}</dd>
+          </div>
+        ) : null}
+      </dl>
+    </div>
+  );
+}
+
+function CreditNoteDetails({ invoice, locale }: { invoice: MarketBillingInvoice; locale: string }) {
+  const { t } = useLocaleText();
+  if (!invoice.creditNotes?.length) return null;
+  return (
+    <div className="grid gap-2">
+      <strong className="text-xs text-foreground">{t("marketBilling.creditNotes.title")}</strong>
+      {invoice.creditNotes.map((note) => (
+        <div key={note.id} className="grid gap-1 border-t border-border pt-2 first:border-t-0 first:pt-0 text-xs">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <span className="font-medium text-foreground">
+              {note.kind === "external_refund"
+                ? t("marketBilling.creditNotes.externalRefund")
+                : t("marketBilling.creditNotes.serviceCredit")}
+            </span>
+            <strong className="tabular-nums text-emerald-700">
+              -{formatUsdCnyMoney(note.amountUsdMinor, locale, note.amountCnyMinor)}
+            </strong>
+          </div>
+          <p className="whitespace-pre-wrap break-words text-muted-foreground">{note.reason}</p>
+          <p className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+            <span>{formatDate(note.createdAt, locale)}</span>
+            <span>{note.createdByEmail}</span>
+            {note.externalReference ? <span>{t("marketBilling.creditNotes.reference", { reference: note.externalReference })}</span> : null}
+          </p>
+        </div>
+      ))}
     </div>
   );
 }
@@ -446,8 +525,13 @@ function CreditAccountPanel({
             </div>
           ) : null}
           {invoice.dispute ? (
-            <div className="border-t border-sky-200 bg-sky-50 px-4 py-3 text-xs text-sky-800 sm:px-5">
-              {t("marketBilling.dispute.summary", { reason: invoice.dispute.reason })}
+            <div className="border-t border-sky-200 bg-sky-50 px-4 py-3 sm:px-5">
+              <DisputeDetails dispute={invoice.dispute} locale={locale} />
+            </div>
+          ) : null}
+          {invoice.creditNotes?.length ? (
+            <div className="border-t border-emerald-200 bg-emerald-50/70 px-4 py-3 sm:px-5">
+              <CreditNoteDetails invoice={invoice} locale={locale} />
             </div>
           ) : null}
         </div>
@@ -498,9 +582,14 @@ function CreditAccountPanel({
                       </div>
                     ) : null}
                     {item.dispute ? (
-                      <p className="border-t border-border px-4 py-3 text-xs text-muted-foreground sm:px-5">
-                        {t("marketBilling.dispute.summary", { reason: item.dispute.reason })}
-                      </p>
+                      <div className="border-t border-sky-200 bg-sky-50 px-4 py-3 sm:px-5">
+                        <DisputeDetails dispute={item.dispute} locale={locale} />
+                      </div>
+                    ) : null}
+                    {item.creditNotes?.length ? (
+                      <div className="border-t border-emerald-200 bg-emerald-50/70 px-4 py-3 sm:px-5">
+                        <CreditNoteDetails invoice={item} locale={locale} />
+                      </div>
                     ) : null}
                   </details>
                 ))}
@@ -740,7 +829,7 @@ export function AccountBillingPage() {
     setTab("todo");
     if (!account) return;
     window.setTimeout(() => {
-      document.getElementById(`billing-account-${account.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById(`billing-account-${account.id}`)?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" });
     }, 0);
   };
 
@@ -917,7 +1006,9 @@ export function AccountBillingPage() {
                 </div>
                 <span className="text-xs text-muted-foreground">{formatDate(item.dispute.createdAt, locale)}</span>
               </div>
-              <p className="text-sm leading-6 text-sky-950">{item.dispute.reason}</p>
+              <div className="border-t border-sky-200 pt-3">
+                <DisputeDetails dispute={item.dispute} locale={locale} />
+              </div>
               <div className="flex flex-wrap justify-end gap-2">
                 <Button size="sm" variant="outline" onClick={() => openAction({ kind: "admin-uphold", dispute: item })}>
                   <Check className="h-4 w-4" />{t("marketBilling.admin.uphold")}

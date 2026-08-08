@@ -119,6 +119,10 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_METRICS_ENABLED` | `true` | 是否采集 Host、Router、Client 和 LLM metrics；修改后需重启 |
 | `CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS` | `7` | metrics 采样历史保留天数；事故历史使用独立配置 |
 | `CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS` | `5` | metrics 采样与条件判断间隔；修改后需重启 |
+| `CC_SWITCH_ROUTER_CLOCK_MONITOR_ENABLED` | `true` | 是否用 HTTPS Date 仲裁持续观测 Router 主机时钟；只观测和告警,不会修改系统时间 |
+| `CC_SWITCH_ROUTER_CLOCK_PROBE_INTERVAL_SECS` | `60` | 时钟健康探测间隔,范围 15-3600 秒 |
+| `CC_SWITCH_ROUTER_CLOCK_PROBE_TIMEOUT_SECS` | `4` | 每个 HTTPS 时间源的完整请求超时,范围 1-15 秒 |
+| `CC_SWITCH_ROUTER_CLOCK_SOURCES` | Cloudflare、Apple、AWS 三路 HTTPS URL | 逗号分隔的 3-5 个不同 HTTPS host；至少两路相符才形成可信偏差样本 |
 | `CC_SWITCH_ROUTER_ALERTING_ENABLED` | `true` | 是否为新事故流转创建 IM 投递；事故本身始终持久化，可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS` | `1800` | 未确认活跃事故的提醒间隔，范围 60 秒至 7 天 |
 | `CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS` | `90` | 已恢复事故、流转、投递尝试、渠道测试和已完成 Client 信号的保留天数 |
@@ -237,6 +241,8 @@ Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离�
 
 Metrics 采集器持续判断 FD、CPU、内存、磁盘、SSH route 生命周期、数据库/EMFILE 新增错误和 LLM 错误率/限流。Client 离线不另做心跳算法，而是复用 Client 生命周期通知的可信 presence 状态机：确认离线、稳定恢复和离线后最终删除会在同一业务事务写入 `operator_alert_signal_outbox`，再由告警 worker 幂等写入 metrics 数据库。
 
+Router 还会并发读取三路 HTTPS `Date` 响应,以两路仲裁和 RTT 中点估算主机时钟偏差。由于 Server 接受 ingress 最多慢 30 秒、最多快 5 秒,告警阈值也是非对称的:慢 15/25 秒进入 warning/critical,快 2/4 秒进入 warning/critical。Router 进程只监控,不持有 `CAP_SYS_TIME`;系统校时由独立的 systemd oneshot 与 timer 完成。完整部署、故障指纹和恢复步骤见 `docs/runbook-clock-skew-401.md`。
+
 每个 fingerprint 同时最多一个未恢复事故，状态为 `firing`、`acknowledged`、`silenced` 或 `resolved`。新建、升级、提醒、恢复通知、静默到期和手动恢复都会记录 transition；通知 payload 在 transition 创建时冻结。确认、静默或更新的可通知 transition 会把尚未发送的旧投递置为不可重试的 `superseded`，避免恢复后再送达过期 firing 消息；曾收到高等级告警的渠道仍会收到对应恢复通知。投递使用 claim lease、指数退避和最多 12 次自动尝试，失败后进入 dead-letter，可在 Metrics 页面手动重新排队。`DELETE /v1/admin/metrics` 只清采样与旧 metrics event，不删除事故、投递或待处理 Client 信号。
 
 告警投递、状态查询和测试 API 均以通用渠道 ID 工作，事故与 outbox 模型不依赖具体供应商；当前唯一注册的适配器是 Telegram，通过 Bot `sendMessage` 投递。Settings 页面可独立测试已注册渠道并显示最近真实投递/测试状态；Metrics 页面可确认、定时静默、恢复事故通知和重试失败投递。未来新增渠道只需增加配置、适配器和渠道注册，不需要重写事故状态机、投递存储或管理 API。
@@ -302,27 +308,7 @@ dashboard 当前行为:
 
 ### systemd 部署示例
 
-```ini
-[Unit]
-Description=cc-switch-router
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/cc-switch-router
-Environment=HOME=/root
-EnvironmentFile=%h/.cc-switch-router/.env
-ExecStart=/opt/cc-switch-router/cc-switch-router
-Restart=always
-RestartSec=3
-KillSignal=SIGTERM
-TimeoutStopSec=45
-StandardOutput=append:/var/log/cc-switch-router.log
-StandardError=inherit
-
-[Install]
-WantedBy=multi-user.target
-```
+生产 unit 位于 `deploy/systemd/cc-switch-router.service`,时钟兜底 unit/timer 位于同一目录,NTP 源配置位于 `deploy/timesyncd/60-cc-switch-router.conf`。Router unit 明确排除改系统时间能力；只有短生命周期的 HTTPS 校时 oneshot 具有 `CAP_SYS_TIME`。安装命令和验收步骤见 `docs/runbook-clock-skew-401.md`。
 
 ```bash
 sudo systemctl daemon-reload
@@ -332,8 +318,7 @@ sudo systemctl status cc-switch-router
 ```
 
 Router 收到 `SIGTERM` 后先停止 HTTP 接入并最多排空 30 秒,再关闭 SSH
-listener。日志使用 append 模式;生产环境应由 `logrotate` 或 journald 负责轮转,
-不要在重启脚本中截断日志。
+listener。示例 unit 将 stdout/stderr 交给 journald,由系统日志策略负责轮转。
 
 ## 当前限制
 

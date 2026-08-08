@@ -1,15 +1,154 @@
 "use client";
 
 import * as React from "react";
-import { Button, Chip } from "@heroui/react";
-import { MessageCircle } from "lucide-react";
+import { Button, Chip, toast } from "@heroui/react";
+import { Loader2, MessageCircle, ShieldCheck, ShieldOff } from "lucide-react";
 import { useClientChat } from "@/components/chat/client-chat";
+import { CompactSelect } from "@/components/common/compact-select";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { CountryFlag } from "@/components/common/country-flag";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recoveryStateLabelKey } from "@/components/dashboard/client-market/host-utils";
+import {
+  grantClientMarketProviderTerminalAccess,
+  revokeClientMarketProviderTerminalAccess,
+} from "@/lib/api";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
+
+function ProviderTerminalAccessControl({
+  rental,
+  onChanged,
+}: {
+  rental: ClientMarketRental;
+  onChanged: () => Promise<void> | void;
+}) {
+  const { locale, t } = useLocaleText();
+  const [durationMinutes, setDurationMinutes] = React.useState("60");
+  const [confirmAction, setConfirmAction] = React.useState<"grant" | "revoke" | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const expiresAt = rental.providerTerminalAuthorizedUntil
+    ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(
+        new Date(rental.providerTerminalAuthorizedUntil),
+      )
+    : null;
+  const durationOptions = [
+    { value: "30", label: t("clientMarket.terminalAccess.duration30m") },
+    { value: "60", label: t("clientMarket.terminalAccess.duration1h") },
+    { value: "240", label: t("clientMarket.terminalAccess.duration4h") },
+    { value: "1440", label: t("clientMarket.terminalAccess.duration24h") },
+  ];
+
+  const submit = async () => {
+    if (!confirmAction) return;
+    setBusy(true);
+    try {
+      if (confirmAction === "grant") {
+        await grantClientMarketProviderTerminalAccess(
+          rental.installationId,
+          Number(durationMinutes),
+        );
+        toast.success(t("clientMarket.terminalAccess.granted"));
+      } else {
+        await revokeClientMarketProviderTerminalAccess(rental.installationId);
+        toast.success(t("clientMarket.terminalAccess.revoked"));
+      }
+      setConfirmAction(null);
+      await onChanged();
+    } catch (error) {
+      toast.danger(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="flex flex-col gap-3 border-t border-border pt-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-start gap-2.5">
+          {rental.providerTerminalAccessActive ? (
+            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+          ) : (
+            <ShieldOff className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+          )}
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-foreground">
+              {t("clientMarket.terminalAccess.title")}
+            </p>
+            <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+              {rental.providerTerminalAccessActive && expiresAt
+                ? t("clientMarket.terminalAccess.activeUntil", { time: expiresAt })
+                : t("clientMarket.terminalAccess.description")}
+            </p>
+          </div>
+        </div>
+        {rental.canManageProviderTerminal ? (
+          <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+            <CompactSelect
+              value={durationMinutes}
+              options={durationOptions}
+              onChange={setDurationMinutes}
+              ariaLabel={t("clientMarket.terminalAccess.duration")}
+              disabled={busy}
+              className="w-32"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              isDisabled={busy}
+              onClick={() => setConfirmAction("grant")}
+            >
+              {busy && confirmAction === "grant" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+              {rental.providerTerminalAccessActive
+                ? t("clientMarket.terminalAccess.extend")
+                : t("clientMarket.terminalAccess.authorize")}
+            </Button>
+            {rental.providerTerminalAccessActive ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="text-rose-700"
+                isDisabled={busy}
+                onClick={() => setConfirmAction("revoke")}
+              >
+                <ShieldOff className="h-4 w-4" />
+                {t("clientMarket.terminalAccess.revoke")}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      <ConfirmAlertDialog
+        open={confirmAction != null}
+        title={
+          confirmAction === "revoke"
+            ? t("clientMarket.terminalAccess.revokeTitle")
+            : t("clientMarket.terminalAccess.authorizeTitle")
+        }
+        description={
+          confirmAction === "revoke"
+            ? t("clientMarket.terminalAccess.revokeConfirm")
+            : t("clientMarket.terminalAccess.authorizeConfirm", {
+                duration: durationOptions.find((option) => option.value === durationMinutes)?.label || "",
+              })
+        }
+        confirmLabel={
+          confirmAction === "revoke"
+            ? t("clientMarket.terminalAccess.revoke")
+            : t("clientMarket.terminalAccess.authorize")
+        }
+        cancelLabel={t("common.cancel")}
+        busy={busy}
+        tone={confirmAction === "revoke" ? "danger" : "warning"}
+        onConfirm={() => void submit()}
+        onOpenChange={(open) => {
+          if (!open && !busy) setConfirmAction(null);
+        }}
+      />
+    </>
+  );
+}
 
 /**
  * "My rentals" — the renter's side of the Client Market.
@@ -109,6 +248,7 @@ export function MyRentalsPanel({
               onChanged={onChanged}
               resumeRelease={false}
             />
+            <ProviderTerminalAccessControl rental={rental} onChanged={onChanged} />
           </section>
         );
       })}

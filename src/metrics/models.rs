@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::alerting::models::AlertIncident;
+use crate::clock_health::ClockHealthStatus;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,6 +13,7 @@ pub struct MetricsSnapshot {
     pub enabled: bool,
     pub sample_interval_secs: u64,
     pub last_persisted_at: Option<i64>,
+    pub clock: ClockHealthStatus,
     pub host: HostMetricsStatus,
     pub router: RouterMetricsStatus,
     pub clients: ClientMetricsSnapshot,
@@ -184,10 +186,20 @@ pub struct MetricEvent {
 pub struct MetricsSeriesResponse {
     pub range: String,
     pub step: String,
+    pub clock: Vec<ClockMetricsPoint>,
     pub host: Vec<HostMetricsPoint>,
     pub router: Vec<RouterMetricsPoint>,
     pub clients: Vec<ClientMetricsPoint>,
     pub llm: Vec<LlmMetricsPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockMetricsPoint {
+    pub timestamp: i64,
+    pub offset_ms: Option<f64>,
+    pub uncertainty_ms: Option<f64>,
+    pub valid_sources: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,6 +248,7 @@ pub struct LlmMetricsPoint {
     pub output_tpm: f64,
     pub error_rate: f64,
     pub rate_limited: u64,
+    pub concurrency_limited: u64,
     pub p95_latency_ms: Option<u64>,
     pub p95_ttft_ms: Option<u64>,
 }

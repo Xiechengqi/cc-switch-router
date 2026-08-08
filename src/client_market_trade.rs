@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use futures_util::StreamExt;
@@ -17,6 +17,7 @@ use image::{ImageFormat, ImageReader};
 use rand::seq::SliceRandom;
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
@@ -42,6 +43,8 @@ const SUBSCRIPTION_RELEASING: &str = "releasing";
 const SUBSCRIPTION_RELEASE_FAILED: &str = "release_failed";
 const SUBSCRIPTION_RELEASED: &str = "released";
 const MAX_PAYMENT_CONTACTS: usize = 10;
+const MIN_PROVIDER_TERMINAL_AUTH_MINUTES: u32 = 5;
+const MAX_PROVIDER_TERMINAL_AUTH_MINUTES: u32 = 24 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -201,6 +204,8 @@ pub struct AllocationQuoteView {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitQuoteRequest {
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     pub items: Vec<CommitQuoteItem>,
 }
 
@@ -208,6 +213,8 @@ pub struct CommitQuoteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CommitClientBatchRequest {
     pub quote_id: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     pub items: Vec<CommitQuoteItem>,
 }
 
@@ -225,6 +232,19 @@ pub struct CommitQuoteItem {
 pub struct CommitQuoteResponse {
     pub batch_id: String,
     pub job_ids: Vec<String>,
+    #[serde(skip)]
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientBatchView {
+    pub id: String,
+    pub quote_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub jobs: Vec<crate::client_market::JobView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +276,25 @@ pub struct RentalView {
     /// Latest pending/running cleanup job for this installation (page-refresh resume).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_cleanup_job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_terminal_authorized_until: Option<String>,
+    pub provider_terminal_access_active: bool,
+    pub can_manage_provider_terminal: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProviderTerminalAuthorizationRequest {
+    duration_minutes: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTerminalAuthorizationView {
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -288,11 +327,17 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/client-market/quotes/:id/cancel", post(cancel_quote))
         .route("/v1/client-market/quotes/:id/commit", post(commit_quote))
+        .route("/v1/client-market/batches/:id", get(get_client_batch))
         .route("/v1/client-market/my-rentals", get(list_my_rentals))
         .route("/v1/client-market/clients", post(commit_client_batch))
         .route(
             "/v1/client-market/clients/:installation_id/rental",
             get(get_client_rental),
+        )
+        .route(
+            "/v1/client-market/clients/:installation_id/provider-terminal-authorization",
+            put(grant_provider_terminal_authorization)
+                .delete(revoke_provider_terminal_authorization),
         )
         .route(
             "/v1/client-market/clients/:installation_id/finalize-release",
@@ -302,6 +347,39 @@ pub fn router() -> Router<ServerState> {
             "/v1/admin/client-market/subscriptions/:installation_id/force-release",
             post(admin_force_release_subscription),
         )
+}
+
+async fn grant_provider_terminal_authorization(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(installation_id): AxumPath<String>,
+    Json(request): Json<UpdateProviderTerminalAuthorizationRequest>,
+) -> Result<Json<ProviderTerminalAuthorizationView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .client_market_grant_provider_terminal_authorization(
+                &installation_id,
+                &session,
+                request.duration_minutes,
+            )
+            .await?,
+    ))
+}
+
+async fn revoke_provider_terminal_authorization(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(installation_id): AxumPath<String>,
+) -> Result<Json<ProviderTerminalAuthorizationView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .client_market_revoke_provider_terminal_authorization(&installation_id, &session)
+            .await?,
+    ))
 }
 
 async fn finalize_failed_release(
@@ -1174,7 +1252,10 @@ async fn commit_client_batch(
             &state,
             &input.quote_id,
             &session,
-            CommitQuoteRequest { items: input.items },
+            CommitQuoteRequest {
+                idempotency_key: input.idempotency_key,
+                items: input.items,
+            },
         )
         .await?,
     ))
@@ -1186,6 +1267,18 @@ async fn commit_quote_for_session(
     session: &AuthSession,
     input: CommitQuoteRequest,
 ) -> Result<CommitQuoteResponse, AppError> {
+    let idempotency_key = input
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("quote:{id}"));
+    if idempotency_key.len() > 128 || idempotency_key.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "idempotencyKey must contain at most 128 non-control characters".into(),
+        ));
+    }
     if input.items.is_empty() || input.items.len() > MAX_CREATE_COUNT {
         return Err(AppError::BadRequest(
             "a quote commit requires one or two items".into(),
@@ -1203,10 +1296,20 @@ async fn commit_quote_for_session(
             item.offer_revision,
         ));
     }
+    let request_fingerprint = commit_request_fingerprint(&prepared)?;
     let response = state
         .store
-        .client_market_commit_quote(id, session, &prepared)
+        .client_market_commit_quote_idempotent(
+            id,
+            session,
+            &idempotency_key,
+            &request_fingerprint,
+            &prepared,
+        )
         .await?;
+    if response.replayed {
+        return Ok(response);
+    }
     {
         let mut secrets = state.client_market_job_secrets.lock().await;
         for (job_id, (_, _, password, _)) in response.job_ids.iter().zip(prepared.iter()) {
@@ -1224,6 +1327,22 @@ async fn commit_quote_for_session(
         });
     }
     Ok(response)
+}
+
+async fn get_client_batch(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ClientBatchView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let mut batch = state.store.client_market_batch(&id, &session).await?;
+    for job in &mut batch.jobs {
+        job.client_url = job
+            .subdomain
+            .as_deref()
+            .map(|subdomain| crate::client_market::client_public_url(&state.config, subdomain));
+    }
+    Ok(Json(batch))
 }
 
 async fn cancel_quote(
@@ -2225,18 +2344,14 @@ impl AppStore {
             .map_err(|error| AppError::Internal(format!("read host offer failed: {error}")))?;
         let (
             provider_id,
-            host_owner_email,
+            _host_owner_email,
             old_price,
             old_currency,
             old_free_duration_days,
             old_revision,
             host_status,
         ) = host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if !crate::client_market::session_is_host_owner(
-            session,
-            provider_id.as_deref(),
-            &host_owner_email,
-        ) {
+        if !crate::client_market::session_is_host_owner(session, provider_id.as_deref()) {
             return Err(AppError::Forbidden(
                 "not allowed to edit this Host offer".into(),
             ));
@@ -2288,9 +2403,9 @@ impl AppStore {
                 offer_revision: old_revision,
             });
         }
-        if host_status == "locked" {
+        if matches!(host_status.as_str(), "reserved" | "locked") {
             return Err(AppError::Conflict(
-                "the Host offer is locked while provisioning is in progress; retry after it completes"
+                "the Host offer is reserved or locked by an active order; retry after it completes"
                     .into(),
             ));
         }
@@ -2480,15 +2595,37 @@ impl AppStore {
             let mut pool = pool
                 .into_iter()
                 .filter_map(|candidate| {
-                    match crate::market_access::product_access_allowed_tx(
+                    let access_allowed = crate::market_access::product_access_allowed_tx(
                         &tx,
                         &candidate.provider_id,
                         &session.user_id,
                         &session.email,
                         crate::market_access::PRODUCT_CLIENT_HOST,
                         crate::market_access::PRICING_FREE,
-                    ) {
-                        Ok(true) => Some(Ok(candidate)),
+                    );
+                    match access_allowed {
+                        Ok(true) => {
+                            let free_available = candidate
+                                .free_duration_days
+                                .filter(|_| candidate.provider_id != session.user_id)
+                                .map(|days| {
+                                    crate::market_billing::free_usage_available_tx(
+                                        &tx,
+                                        &session.user_id,
+                                        &candidate.provider_id,
+                                        crate::market_access::PRODUCT_CLIENT_HOST,
+                                        &candidate.host_id,
+                                        days,
+                                        &now_rfc,
+                                    )
+                                })
+                                .transpose();
+                            match free_available {
+                                Ok(Some(true) | None) => Some(Ok(candidate)),
+                                Ok(Some(false)) => None,
+                                Err(error) => Some(Err(error)),
+                            }
+                        }
                         Ok(false) => None,
                         Err(error) => Some(Err(error)),
                     }
@@ -2514,7 +2651,6 @@ impl AppStore {
             if candidate.provider_id == session.user_id {
                 candidate.daily_rate_minor = None;
                 candidate.currency = None;
-                candidate.free_duration_days = None;
             }
             crate::market_access::ensure_product_access_tx(
                 &tx,
@@ -2535,6 +2671,21 @@ impl AppStore {
                         AppError::Internal("paid quoted Host currency is missing".into())
                     })?,
                 )?;
+            } else if candidate.provider_id != session.user_id
+                && let Some(days) = candidate.free_duration_days
+                && !crate::market_billing::free_usage_available_tx(
+                    &tx,
+                    &session.user_id,
+                    &candidate.provider_id,
+                    crate::market_access::PRODUCT_CLIENT_HOST,
+                    &candidate.host_id,
+                    days,
+                    &now_rfc,
+                )?
+            {
+                return Err(AppError::Conflict(
+                    "the free experience for this Provider has already been used".into(),
+                ));
             }
         }
         let quote_id = Uuid::new_v4().to_string();
@@ -2635,6 +2786,25 @@ impl AppStore {
         session: &AuthSession,
         prepared: &[(String, String, String, i64)],
     ) -> Result<CommitQuoteResponse, AppError> {
+        let request_fingerprint = commit_request_fingerprint(prepared)?;
+        self.client_market_commit_quote_idempotent(
+            quote_id,
+            session,
+            &format!("quote:{quote_id}"),
+            &request_fingerprint,
+            prepared,
+        )
+        .await
+    }
+
+    pub async fn client_market_commit_quote_idempotent(
+        &self,
+        quote_id: &str,
+        session: &AuthSession,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        prepared: &[(String, String, String, i64)],
+    ) -> Result<CommitQuoteResponse, AppError> {
         let now = Utc::now();
         let conn = self.conn.lock().await;
         let tx = conn
@@ -2656,6 +2826,55 @@ impl AppStore {
             return Err(AppError::Forbidden(
                 "allocation quote belongs to another account".into(),
             ));
+        }
+        let existing_batch = tx
+            .query_row(
+                "SELECT id, quote_id, request_fingerprint
+                 FROM client_market_batches
+                 WHERE quote_id = ?1 OR (client_user_id = ?2 AND idempotency_key = ?3)
+                 ORDER BY CASE WHEN quote_id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+                params![quote_id, session.user_id, idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read idempotent Client batch failed: {error}"))
+            })?;
+        if let Some((batch_id, stored_quote_id, stored_fingerprint)) = existing_batch {
+            if stored_quote_id != quote_id || stored_fingerprint != request_fingerprint {
+                return Err(AppError::Conflict(
+                    "idempotency key was already used for a different Client batch request".into(),
+                ));
+            }
+            let job_ids = tx
+                .prepare(
+                    "SELECT id FROM provisioning_jobs
+                     WHERE batch_id = ?1 ORDER BY created_at, id",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params![batch_id], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("read idempotent Client batch jobs failed: {error}"))
+                })?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit idempotent Client batch read failed: {error}"
+                ))
+            })?;
+            return Ok(CommitQuoteResponse {
+                batch_id,
+                job_ids,
+                replayed: true,
+            });
         }
         if status != "active" || parse_time(&expires_at)? <= now {
             return Err(AppError::Gone(
@@ -2689,11 +2908,14 @@ impl AppStore {
                 .query_row(
                     "SELECT
                        EXISTS(SELECT 1 FROM public_hosts WHERE label = ?1 COLLATE NOCASE)
-                       OR EXISTS(SELECT 1 FROM subdomain_reservations WHERE subdomain = ?1 COLLATE NOCASE)",
-                    params![subdomain],
+                       OR EXISTS(SELECT 1 FROM subdomain_reservations
+                                 WHERE subdomain = ?1 COLLATE NOCASE AND expires_at_ms > ?2)",
+                    params![subdomain, now.timestamp_millis()],
                     |row| row.get(0),
                 )
-                .map_err(|error| AppError::Internal(format!("check quoted subdomain failed: {error}")))?;
+                .map_err(|error| {
+                    AppError::Internal(format!("check quoted subdomain failed: {error}"))
+                })?;
             if unavailable != 0 {
                 return Err(AppError::Conflict(format!(
                     "subdomain {subdomain} is already in use"
@@ -2703,14 +2925,17 @@ impl AppStore {
         let batch_id = Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO client_market_batches
-                (id, quote_id, client_user_id, client_owner_email, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?5)",
+                (id, quote_id, client_user_id, client_owner_email, status, created_at, updated_at,
+                 idempotency_key, request_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?5, ?6, ?7)",
             params![
                 batch_id,
                 quote_id,
                 session.user_id,
                 normalize_email(&session.email)?,
-                now.to_rfc3339()
+                now.to_rfc3339(),
+                idempotency_key,
+                request_fingerprint,
             ],
         )
         .map_err(|error| AppError::Internal(format!("insert Client batch failed: {error}")))?;
@@ -2845,7 +3070,11 @@ impl AppStore {
         )?;
         tx.commit()
             .map_err(|error| AppError::Internal(format!("commit Client batch failed: {error}")))?;
-        Ok(CommitQuoteResponse { batch_id, job_ids })
+        Ok(CommitQuoteResponse {
+            batch_id,
+            job_ids,
+            replayed: false,
+        })
     }
 
     pub async fn client_market_cancel_quote(
@@ -2932,7 +3161,12 @@ impl AppStore {
 
     pub async fn client_market_sync_batch_for_job(&self, job_id: &str) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
-        let batch_id: Option<String> = conn
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin Client batch sync failed: {error}"))
+            })?;
+        let batch_id: Option<String> = tx
             .query_row(
                 "SELECT batch_id FROM provisioning_jobs WHERE id = ?1",
                 params![job_id],
@@ -2944,7 +3178,7 @@ impl AppStore {
         let Some(batch_id) = batch_id else {
             return Ok(());
         };
-        let counts: (i64, i64, i64) = conn
+        let counts: (i64, i64, i64) = tx
             .query_row(
                 "SELECT COUNT(*),
                         SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END),
@@ -2964,12 +3198,91 @@ impl AppStore {
         } else {
             "failed"
         };
-        conn.execute(
-            "UPDATE client_market_batches SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        tx.execute(
+            "UPDATE client_market_batches SET status = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'running'",
             params![batch_id, status, Utc::now().to_rfc3339()],
         )
         .map_err(|error| AppError::Internal(format!("update Client batch failed: {error}")))?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit Client batch sync failed: {error}"))
+        })?;
         Ok(())
+    }
+
+    pub async fn client_market_batch(
+        &self,
+        batch_id: &str,
+        session: &AuthSession,
+    ) -> Result<ClientBatchView, AppError> {
+        let conn = self.conn.lock().await;
+        let header = conn
+            .query_row(
+                "SELECT id, quote_id, client_user_id, status, created_at, updated_at
+                 FROM client_market_batches WHERE id = ?1",
+                params![batch_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("read Client batch failed: {error}")))?
+            .ok_or_else(|| AppError::NotFound("Client batch not found".into()))?;
+        if header.2 != session.user_id {
+            return Err(AppError::Forbidden(
+                "Client batch belongs to another account".into(),
+            ));
+        }
+        let jobs = conn
+            .prepare(
+                "SELECT j.id, j.type, j.host_id, j.host_owner_email, j.client_owner_email,
+                        j.subdomain, j.installation_id, j.status, j.phase, j.failure_code,
+                        h.country_code, j.log_blob, j.created_at, j.updated_at
+                 FROM provisioning_jobs j
+                 LEFT JOIN router_ssh_hosts h ON h.id = j.host_id
+                 WHERE j.batch_id = ?1 ORDER BY j.created_at, j.id",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![batch_id], |row| {
+                        Ok(crate::client_market::JobView {
+                            id: row.get(0)?,
+                            job_type: row.get(1)?,
+                            host_id: row.get(2)?,
+                            host_owner_email: row.get(3)?,
+                            client_owner_email: row.get(4)?,
+                            subdomain: row.get(5)?,
+                            installation_id: row.get(6)?,
+                            status: row.get(7)?,
+                            phase: row.get(8)?,
+                            failure_code: row.get(9)?,
+                            country_code: row.get(10)?,
+                            client_url: None,
+                            log: row.get(11)?,
+                            created_at: row.get(12)?,
+                            updated_at: row.get(13)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("read Client batch jobs failed: {error}"))
+            })?;
+        Ok(ClientBatchView {
+            id: header.0,
+            quote_id: header.1,
+            status: header.3,
+            created_at: header.4,
+            updated_at: header.5,
+            jobs,
+        })
     }
 
     pub async fn client_market_list_rentals_for_viewer(
@@ -2978,6 +3291,277 @@ impl AppStore {
     ) -> Result<Vec<RentalView>, AppError> {
         let conn = self.conn.lock().await;
         load_rental_views(&conn, None, session)
+    }
+
+    pub async fn client_market_grant_provider_terminal_authorization(
+        &self,
+        installation_id: &str,
+        session: &AuthSession,
+        duration_minutes: u32,
+    ) -> Result<ProviderTerminalAuthorizationView, AppError> {
+        if !(MIN_PROVIDER_TERMINAL_AUTH_MINUTES..=MAX_PROVIDER_TERMINAL_AUTH_MINUTES)
+            .contains(&duration_minutes)
+        {
+            return Err(AppError::BadRequest(format!(
+                "provider terminal authorization must last between {MIN_PROVIDER_TERMINAL_AUTH_MINUTES} and {MAX_PROVIDER_TERMINAL_AUTH_MINUTES} minutes"
+            )));
+        }
+        let now = Utc::now();
+        let expires_at = now + Duration::minutes(i64::from(duration_minutes));
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin Provider terminal authorization failed: {error}"
+                ))
+            })?;
+        let subscription = tx
+            .query_row(
+                "SELECT host_id, provider_id, client_user_id, status
+                 FROM client_market_subscriptions WHERE installation_id = ?1",
+                params![installation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read rental for Provider terminal authorization failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| AppError::NotFound("Client Market rental not found".into()))?;
+        if subscription.2 != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the renter can authorize Provider terminal access".into(),
+            ));
+        }
+        if !matches!(subscription.3.as_str(), "active" | "billing_suspended") {
+            return Err(AppError::Conflict(
+                "Provider terminal access can only be authorized for an active rental".into(),
+            ));
+        }
+        let now_text = now.to_rfc3339();
+        let expires_at_text = expires_at.to_rfc3339();
+        tx.execute(
+            "INSERT INTO client_market_provider_terminal_authorizations (
+                installation_id, host_id, provider_id, client_user_id, expires_at,
+                revoked_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                host_id = excluded.host_id,
+                provider_id = excluded.provider_id,
+                client_user_id = excluded.client_user_id,
+                expires_at = excluded.expires_at,
+                revoked_at = NULL,
+                updated_at = excluded.updated_at",
+            params![
+                installation_id,
+                subscription.0,
+                subscription.1,
+                session.user_id,
+                expires_at_text,
+                now_text,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "save Provider terminal authorization failed: {error}"
+            ))
+        })?;
+        insert_audit_tx(
+            &tx,
+            Some(installation_id),
+            Some(&subscription.0),
+            Some(&session.user_id),
+            Some(&session.email),
+            "provider_terminal_authorized",
+            serde_json::json!({
+                "providerId": subscription.1,
+                "expiresAt": expires_at_text,
+                "durationMinutes": duration_minutes,
+            }),
+            now,
+        )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit Provider terminal authorization failed: {error}"
+            ))
+        })?;
+        Ok(ProviderTerminalAuthorizationView {
+            active: true,
+            expires_at: Some(expires_at_text),
+            updated_at: now_text,
+        })
+    }
+
+    pub async fn client_market_revoke_provider_terminal_authorization(
+        &self,
+        installation_id: &str,
+        session: &AuthSession,
+    ) -> Result<ProviderTerminalAuthorizationView, AppError> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin Provider terminal revocation failed: {error}"
+                ))
+            })?;
+        let subscription = tx
+            .query_row(
+                "SELECT host_id, provider_id, client_user_id
+                 FROM client_market_subscriptions WHERE installation_id = ?1",
+                params![installation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read rental for Provider terminal revocation failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| AppError::NotFound("Client Market rental not found".into()))?;
+        if subscription.2 != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the renter can revoke Provider terminal access".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE client_market_provider_terminal_authorizations
+             SET revoked_at = ?2, updated_at = ?2
+             WHERE installation_id = ?1 AND revoked_at IS NULL",
+            params![installation_id, now_text],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "revoke Provider terminal authorization failed: {error}"
+            ))
+        })?;
+        insert_audit_tx(
+            &tx,
+            Some(installation_id),
+            Some(&subscription.0),
+            Some(&session.user_id),
+            Some(&session.email),
+            "provider_terminal_revoked",
+            serde_json::json!({ "providerId": subscription.1 }),
+            now,
+        )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit Provider terminal revocation failed: {error}"
+            ))
+        })?;
+        Ok(ProviderTerminalAuthorizationView {
+            active: false,
+            expires_at: None,
+            updated_at: now_text,
+        })
+    }
+
+    pub async fn client_market_provider_terminal_authorized_until(
+        &self,
+        installation_id: &str,
+        host_id: &str,
+        provider_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, AppError> {
+        let conn = self.conn.lock().await;
+        let expires_at = conn
+            .query_row(
+                "SELECT a.expires_at
+             FROM client_market_provider_terminal_authorizations a
+             JOIN client_market_subscriptions s
+               ON s.installation_id = a.installation_id
+              AND s.host_id = a.host_id
+              AND s.provider_id = a.provider_id
+              AND s.client_user_id = a.client_user_id
+             WHERE a.installation_id = ?1
+               AND a.host_id = ?2
+               AND a.provider_id = ?3
+               AND a.revoked_at IS NULL
+               AND a.expires_at > ?4
+               AND s.status IN ('active', 'billing_suspended')",
+                params![
+                    installation_id,
+                    host_id,
+                    provider_id,
+                    Utc::now().to_rfc3339()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "check Provider terminal authorization failed: {error}"
+                ))
+            })?;
+        expires_at
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|value| value.with_timezone(&Utc))
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "read Provider terminal authorization expiry failed: {error}"
+                        ))
+                    })
+            })
+            .transpose()
+    }
+
+    pub async fn client_market_provider_terminal_authorized_host_ids(
+        &self,
+        provider_id: &str,
+    ) -> Result<std::collections::HashSet<String>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT a.host_id
+                 FROM client_market_provider_terminal_authorizations a
+                 JOIN client_market_subscriptions s
+                   ON s.installation_id = a.installation_id
+                  AND s.host_id = a.host_id
+                  AND s.provider_id = a.provider_id
+                  AND s.client_user_id = a.client_user_id
+                 WHERE a.provider_id = ?1
+                   AND a.revoked_at IS NULL
+                   AND a.expires_at > ?2
+                   AND s.status IN ('active', 'billing_suspended')",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare authorized Provider terminal Hosts failed: {error}"
+                ))
+            })?;
+        statement
+            .query_map(params![provider_id, Utc::now().to_rfc3339()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query authorized Provider terminal Hosts failed: {error}"
+                ))
+            })?
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read authorized Provider terminal Hosts failed: {error}"
+                ))
+            })
     }
 
     pub async fn client_market_rental_for_viewer(
@@ -3136,6 +3720,19 @@ fn normalize_email(value: &str) -> Result<String, AppError> {
     Ok(value)
 }
 
+fn commit_request_fingerprint(
+    prepared: &[(String, String, String, i64)],
+) -> Result<String, AppError> {
+    let fingerprint_payload = prepared
+        .iter()
+        .map(|(item_id, subdomain, _, revision)| (item_id, subdomain, revision))
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&fingerprint_payload).map_err(|error| {
+        AppError::Internal(format!("encode quote commit fingerprint failed: {error}"))
+    })?;
+    Ok(hex::encode(Sha256::digest(&encoded)))
+}
+
 fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -3176,6 +3773,21 @@ fn expire_quotes_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<(), AppE
         params![now.to_rfc3339()],
     )
     .map_err(|error| AppError::Internal(format!("expire allocation quotes failed: {error}")))?;
+    tx.execute(
+        "UPDATE router_ssh_hosts
+         SET status = 'idle', updated_at = ?1
+         WHERE status = ?2 AND NOT EXISTS (
+             SELECT 1
+             FROM client_market_allocation_quote_items qi
+             JOIN client_market_allocation_quotes q ON q.id = qi.quote_id
+             WHERE qi.host_id = router_ssh_hosts.id
+               AND q.status = 'active' AND q.expires_at > ?1
+         )",
+        params![now.to_rfc3339(), HOST_STATUS_RESERVED],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("release orphaned reserved Hosts failed: {error}"))
+    })?;
     Ok(())
 }
 
@@ -3237,6 +3849,8 @@ struct RentalRow {
     methods_json: String,
     contacts_json: String,
     active_cleanup_job_id: Option<String>,
+    provider_terminal_expires_at: Option<String>,
+    provider_terminal_revoked_at: Option<String>,
     updated_at: String,
 }
 
@@ -3259,8 +3873,15 @@ fn load_rental_views(
                    AND j.status IN ('pending', 'running')
                  ORDER BY j.updated_at DESC, j.created_at DESC
                  LIMIT 1),
+                a.expires_at,
+                a.revoked_at,
                 s.updated_at
-         FROM client_market_subscriptions s"
+         FROM client_market_subscriptions s
+         LEFT JOIN client_market_provider_terminal_authorizations a
+           ON a.installation_id = s.installation_id
+          AND a.host_id = s.host_id
+          AND a.provider_id = s.provider_id
+          AND a.client_user_id = s.client_user_id"
         .to_string();
     if installation_id.is_some() {
         sql.push_str(" WHERE s.installation_id = ?1");
@@ -3289,7 +3910,9 @@ fn load_rental_views(
             methods_json: row.get(13)?,
             contacts_json: row.get(14)?,
             active_cleanup_job_id: row.get(15)?,
-            updated_at: row.get(16)?,
+            provider_terminal_expires_at: row.get(16)?,
+            provider_terminal_revoked_at: row.get(17)?,
+            updated_at: row.get(18)?,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -3319,6 +3942,12 @@ fn load_rental_views(
             .collect::<Vec<_>>();
         kinds.sort();
         kinds.dedup();
+        let provider_terminal_access_active = row.provider_terminal_revoked_at.is_none()
+            && row
+                .provider_terminal_expires_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|expires_at| expires_at > Utc::now());
         output.push(RentalView {
             installation_id: row.installation_id,
             host_id: row.host_id,
@@ -3345,6 +3974,12 @@ fn load_rental_views(
                 )
                 && row.active_cleanup_job_id.is_none(),
             active_cleanup_job_id: row.active_cleanup_job_id,
+            provider_terminal_authorized_until: provider_terminal_access_active
+                .then_some(row.provider_terminal_expires_at)
+                .flatten(),
+            provider_terminal_access_active,
+            can_manage_provider_terminal: client_role
+                && matches!(row.status.as_str(), "active" | "billing_suspended"),
             updated_at: row.updated_at,
         });
     }
@@ -3782,23 +4417,49 @@ pub(crate) fn complete_provisioning_tx(
         ));
     };
     let (price, currency, free_duration_days) = if provider_id == client_user_id {
-        (None, None, None)
+        (None, None, free_duration_days)
     } else {
         (price, currency, free_duration_days)
     };
-    let expires_at = if price.is_none() {
-        free_duration_days.map(|days| now + Duration::days(days))
+    let free_usage_seconds = if price.is_none() {
+        match free_duration_days {
+            Some(days) if provider_id != client_user_id => {
+                let days = u32::try_from(days).map_err(|_| {
+                    AppError::Internal("free Client Host duration is invalid".into())
+                })?;
+                let seconds = crate::market_billing::claim_free_usage_tx(
+                    tx,
+                    &client_user_id,
+                    &provider_id,
+                    crate::market_access::PRODUCT_CLIENT_HOST,
+                    host_id,
+                    days,
+                    &now.to_rfc3339(),
+                )?;
+                if seconds == 0 {
+                    return Err(AppError::Conflict(
+                        "the free experience for this Provider has already been used".into(),
+                    ));
+                }
+                Some(seconds)
+            }
+            Some(days) => Some(days.checked_mul(86_400).ok_or_else(|| {
+                AppError::Internal("free Client Host duration overflowed".into())
+            })?),
+            None => None,
+        }
     } else {
         None
     };
+    let expires_at = free_usage_seconds.map(|seconds| now + Duration::seconds(seconds));
     let status = SUBSCRIPTION_ACTIVE;
     tx.execute(
         "INSERT INTO client_market_subscriptions
             (installation_id, host_id, provider_id, host_owner_email,
              client_user_id, client_owner_email, status, daily_rate_minor,
              currency, free_duration_days, offer_revision, activated_at, expires_at,
-             created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?12, ?12)",
+             created_at, updated_at, free_usage_seconds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?12, ?12, ?14)",
         params![
             installation_id,
             host_id,
@@ -3813,6 +4474,7 @@ pub(crate) fn complete_provisioning_tx(
             revision,
             now.to_rfc3339(),
             expires_at.map(|value| value.to_rfc3339()),
+            free_usage_seconds,
         ],
     )
     .map_err(|error| {
@@ -4144,6 +4806,108 @@ mod tests {
             .expect("read sanitized Client Market audit");
         assert!(!detail.contains("fake-audit-secret"));
         assert!(detail.contains("[credential omitted]"));
+    }
+
+    #[tokio::test]
+    async fn renter_controls_expiring_provider_terminal_authorization() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO router_ssh_hosts (
+                    id, ip, port, host_owner_email, status, installation_id,
+                    created_at, updated_at, provider_id, offer_revision
+                 ) VALUES (
+                    'host-terminal', '203.0.113.20', 22, 'provider@example.com',
+                    'allocated', 'installation-terminal', ?1, ?1, 'provider-terminal', 1
+                 )",
+                params![now],
+            )
+            .expect("insert terminal Host");
+            conn.execute(
+                "INSERT INTO client_market_subscriptions (
+                    installation_id, host_id, provider_id, host_owner_email,
+                    client_user_id, client_owner_email, status, offer_revision,
+                    created_at, updated_at
+                 ) VALUES (
+                    'installation-terminal', 'host-terminal', 'provider-terminal',
+                    'provider@example.com', 'renter-terminal', 'renter@example.com',
+                    'active', 1, ?1, ?1
+                 )",
+                params![now],
+            )
+            .expect("insert terminal rental");
+        }
+
+        let renter = session("renter-terminal", "renter@example.com");
+        let provider = session("provider-terminal", "provider@example.com");
+        assert!(
+            store
+                .client_market_grant_provider_terminal_authorization(
+                    "installation-terminal",
+                    &provider,
+                    60,
+                )
+                .await
+                .is_err()
+        );
+
+        let authorization = store
+            .client_market_grant_provider_terminal_authorization(
+                "installation-terminal",
+                &renter,
+                60,
+            )
+            .await
+            .expect("grant terminal authorization");
+        assert!(authorization.active);
+        assert!(authorization.expires_at.is_some());
+        assert!(
+            store
+                .client_market_provider_terminal_authorized_until(
+                    "installation-terminal",
+                    "host-terminal",
+                    "provider-terminal",
+                )
+                .await
+                .expect("check terminal authorization")
+                .is_some()
+        );
+        assert!(
+            store
+                .client_market_provider_terminal_authorized_host_ids("provider-terminal")
+                .await
+                .expect("list authorized terminal Hosts")
+                .contains("host-terminal")
+        );
+        let rental = store
+            .client_market_rental_for_viewer("installation-terminal", &renter)
+            .await
+            .expect("read authorized rental");
+        assert!(rental.provider_terminal_access_active);
+        assert!(rental.can_manage_provider_terminal);
+
+        store
+            .client_market_revoke_provider_terminal_authorization("installation-terminal", &renter)
+            .await
+            .expect("revoke terminal authorization");
+        assert!(
+            store
+                .client_market_provider_terminal_authorized_until(
+                    "installation-terminal",
+                    "host-terminal",
+                    "provider-terminal",
+                )
+                .await
+                .expect("check revoked terminal authorization")
+                .is_none()
+        );
+        let rental = store
+            .client_market_rental_for_viewer("installation-terminal", &renter)
+            .await
+            .expect("read revoked rental");
+        assert!(!rental.provider_terminal_access_active);
     }
 
     #[tokio::test]

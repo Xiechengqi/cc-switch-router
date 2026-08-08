@@ -1,3 +1,4 @@
+/* Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V3 */
 @import "tailwindcss";
 @import "@heroui/styles";
 
@@ -46,7 +47,7 @@
   --router-secondary: 241 245 249;
   --router-secondary-foreground: 15 23 42;
   --router-muted: 241 245 249;
-  --router-muted-foreground: 100 116 139;
+  --router-muted-foreground: 71 85 105;
   --router-accent: 0 82 255;
   --router-accent-secondary: 77 124 255;
   --router-accent-foreground: 255 255 255;
@@ -83,6 +84,12 @@
   border-color: rgb(var(--router-destructive));
 }
 
+:is(.input, .textarea, .select__trigger, .input-otp__slot, .input-group, .combo-box__input, .number-field__input):focus-visible,
+:is(.input, .textarea, .select__trigger, .input-otp__slot)[data-focus-visible="true"] {
+  outline: 2px solid rgb(var(--router-ring) / 0.45);
+  outline-offset: 2px;
+}
+
 * {
   border-color: rgb(var(--router-border));
 }
@@ -90,19 +97,20 @@
 html {
   background: rgb(var(--router-background));
   color-scheme: light;
+  overflow-x: clip;
 }
 
 body {
   margin: 0;
   min-height: 100vh;
-  background:
-    radial-gradient(circle at top left, rgba(0, 82, 255, 0.08), transparent 34rem),
-    rgb(var(--router-background));
+  overflow-x: clip;
+  background: rgb(var(--router-background));
   color: rgb(var(--router-foreground));
   color-scheme: light;
   font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
     "Microsoft YaHei", system-ui, sans-serif;
   font-synthesis: none;
+  font-variant-numeric: tabular-nums;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -127,6 +135,15 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
   .live-pulse,
   .activity-feed-enter {
     animation: none !important;
@@ -282,6 +299,11 @@ textarea:-webkit-autofill:focus {
   color: rgb(var(--router-muted-foreground)) !important;
 }
 
+/* Slate 400 is too faint for operational labels on white surfaces. */
+.text-slate-400 {
+  color: rgb(100 116 139) !important;
+}
+
 .modal__heading,
 .drawer__heading,
 .alert-dialog__heading,
@@ -307,7 +329,7 @@ textarea:-webkit-autofill:focus {
   font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
     "Microsoft YaHei", system-ui, sans-serif !important;
   font-weight: 700;
-  letter-spacing: -0.025em;
+  letter-spacing: 0;
 }
 
 /*
@@ -412,7 +434,7 @@ textarea:-webkit-autofill:focus {
     "Microsoft YaHei", system-ui, sans-serif !important;
   font-size: 1.25rem !important;
   font-weight: 600 !important;
-  letter-spacing: -0.025em;
+  letter-spacing: 0;
   color: rgb(100 116 139) !important;
 }
 
@@ -508,14 +530,12 @@ a {
 }
 
 .gradient-accent {
-  background: linear-gradient(135deg, rgb(var(--router-accent)), rgb(var(--router-accent-secondary)));
+  background: rgb(var(--router-accent));
 }
 
 .gradient-text {
-  background: linear-gradient(135deg, rgb(var(--router-accent)), rgb(var(--router-accent-secondary)));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  background: none;
+  color: rgb(var(--router-accent));
 }
 
 .section-label {
@@ -529,7 +549,7 @@ a {
   color: rgb(var(--router-accent));
   font-family: var(--font-jetbrains), "JetBrains Mono", monospace;
   font-size: 0.7rem;
-  letter-spacing: 0.14em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
@@ -538,8 +558,7 @@ a {
   width: 0.45rem;
   height: 0.45rem;
   border-radius: 999px;
-  background: linear-gradient(135deg, rgb(var(--router-accent)), rgb(var(--router-accent-secondary)));
-  box-shadow: 0 0 0 5px rgba(0, 82, 255, 0.1);
+  background: rgb(var(--router-accent));
 }
 
 .surface-elevated {
@@ -690,7 +709,7 @@ a {
 .mono-label {
   font-family: var(--font-jetbrains), "JetBrains Mono", monospace;
   font-size: 0.72rem;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 

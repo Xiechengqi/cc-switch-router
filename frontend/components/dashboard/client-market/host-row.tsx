@@ -106,7 +106,7 @@ function HostRowImpl({
     canCleanup && (host.status === "unreachable" || host.status === "draining");
   const canReverify = hostCanReverify(host, viewerEmail);
   const canRetireUnreachable = hostCanRetireUnreachable(host, viewerEmail);
-  const canOpenTerminal = host.canWebTerminal === true || canManageHost;
+  const canOpenTerminal = host.canWebTerminal === true;
   const recovery = host.recovery;
   const canControlRecovery =
     host.canControlRecovery === true && host.status === "allocated" && !!recovery;

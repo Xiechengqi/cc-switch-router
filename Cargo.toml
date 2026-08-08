@@ -16,7 +16,9 @@ chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
 flate2 = "1"
+fs2 = "0.4"
 hmac = "0.12"
+httpdate = "1"
 hex = "0.4"
 http = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

@@ -3,8 +3,21 @@
 import { Card, Chip } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { DiskUsage, HostMetricsInfo, MetricsHealth, MetricsSnapshot } from "@/lib/types";
-import { compactTokens, formatBytes, fixed, formatNumber, percent } from "@/lib/utils";
+import type {
+  ClockHealthStatus,
+  DiskUsage,
+  HostMetricsInfo,
+  MetricsHealth,
+  MetricsSnapshot,
+} from "@/lib/types";
+import {
+  compactTokens,
+  formatBytes,
+  formatDateTime,
+  fixed,
+  formatNumber,
+  percent,
+} from "@/lib/utils";
 import { diskPercent, type MetricTone, polyline } from "./metrics-utils";
 
 export function KpiGrid({ children }: { children: React.ReactNode }) {
@@ -59,7 +72,7 @@ export function MetricKpiCard({
       ? "before:bg-red-500"
       : tone === "warning"
         ? "before:bg-amber-500"
-        : "before:bg-gradient-to-b before:from-[var(--accent,#0052FF)] before:to-[#4D7CFF]";
+        : "before:bg-primary";
   const glow = tone === "critical" ? "after:bg-red-500/[0.06]" : "after:bg-transparent";
   return (
     <Card
@@ -69,7 +82,7 @@ export function MetricKpiCard({
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="text-sm text-muted-foreground">{label}</p>
-            <p className={`mt-1 truncate font-semibold ${emphasize ? "gradient-text text-2xl" : "text-lg"}`}>
+            <p className={`mt-1 truncate font-semibold ${emphasize ? "text-2xl text-foreground" : "text-lg"}`}>
               {value}
             </p>
             <p className="mt-1 truncate text-xs text-muted-foreground">{detail}</p>
@@ -203,6 +216,110 @@ export function HostInfoPanel({
   );
 }
 
+export function ClockHealthPanel({ clock }: { clock?: ClockHealthStatus }) {
+  const { locale, t } = useLocaleText();
+  const status = clock?.status || "unknown";
+  const chipColor =
+    status === "critical"
+      ? "danger"
+      : status === "warning" || status === "degraded"
+        ? "warning"
+        : status === "healthy"
+          ? "success"
+          : "default";
+  const statusLabel =
+    status === "healthy"
+      ? t("metrics.clock.status.healthy")
+      : status === "warning"
+        ? t("metrics.clock.status.warning")
+        : status === "critical"
+          ? t("metrics.clock.status.critical")
+          : status === "degraded"
+            ? t("metrics.clock.status.degraded")
+            : status === "disabled"
+              ? t("metrics.clock.status.disabled")
+              : t("metrics.clock.status.unknown");
+  const ntp =
+    clock?.ntpSynchronized === true
+      ? t("metrics.clock.synchronized")
+      : clock?.ntpSynchronized === false
+        ? t("metrics.clock.unsynchronized")
+        : t("metrics.clock.unknown");
+  const rows: Array<[string, React.ReactNode]> = [
+    [t("metrics.clock.offset"), formatClockOffset(clock?.offsetMs)],
+    [t("metrics.clock.ntp"), ntp],
+    [
+      t("metrics.clock.quorum"),
+      `${formatNumber(clock?.validSources)} / ${formatNumber(clock?.totalSources)}`,
+    ],
+    [t("metrics.clock.confidence"), clock?.confidence || "-"],
+    [
+      t("metrics.clock.lastSuccess"),
+      clock?.lastSuccessAt
+        ? formatDateTime(clock.lastSuccessAt * 1000, locale)
+        : "-",
+    ],
+    [
+      t("metrics.clock.rejections"),
+      `${formatNumber(clock?.ingressExpiredTotal)} / ${formatNumber(clock?.ingressFutureTotal)} / ${formatNumber(clock?.ingressContractErrorTotal)}`,
+    ],
+  ];
+
+  return (
+    <Card className="rounded-xl">
+      <Card.Header className="flex items-center justify-between gap-3">
+        <Card.Title>{t("metrics.panel.clockHealth")}</Card.Title>
+        <Chip color={chipColor} size="sm" variant="soft">
+          {statusLabel}
+        </Chip>
+      </Card.Header>
+      <Card.Content className="grid gap-3">
+        <div className="grid grid-cols-2 gap-2">
+          {rows.map(([label, value]) => (
+            <div key={label} className="min-w-0 rounded-lg bg-muted p-2.5">
+              <p className="text-xs text-muted-foreground">{label}</p>
+              <p className="mt-1 truncate text-sm font-medium" title={String(value)}>
+                {value}
+              </p>
+            </div>
+          ))}
+        </div>
+        <div className="grid gap-1.5 border-t pt-3">
+          {(clock?.sources || []).map((source) => (
+            <div
+              key={source.url}
+              className="flex min-w-0 items-center justify-between gap-3 text-xs"
+            >
+              <span className="truncate text-muted-foreground" title={source.url}>
+                {clockSourceName(source.url)}
+              </span>
+              <span className={source.ok ? "text-emerald-600" : "text-red-600"}>
+                {source.ok
+                  ? `${formatClockOffset(source.offsetMs)} · ${formatNumber(source.rttMs)} ms`
+                  : t("metrics.clock.sourceFailed")}
+              </span>
+            </div>
+          ))}
+        </div>
+      </Card.Content>
+    </Card>
+  );
+}
+
+function formatClockOffset(value: number | null | undefined) {
+  if (!Number.isFinite(value)) return "-";
+  const seconds = (value as number) / 1_000;
+  return `${seconds > 0 ? "+" : ""}${seconds.toFixed(Math.abs(seconds) < 10 ? 2 : 1)} s`;
+}
+
+function clockSourceName(url: string) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
 export function StatusChip({ status }: { status: MetricsHealth | string }) {
   const color = status === "critical" ? "danger" : status === "warning" ? "warning" : "success";
   const dot = status === "critical" ? "bg-red-500" : status === "warning" ? "bg-amber-500" : "bg-emerald-500";
@@ -246,7 +363,7 @@ export function LiveSummaryStrip({ snapshot }: { snapshot: MetricsSnapshot | nul
       <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
         {items.map(([label, value, hint]) => (
           <div key={label}>
-            <p className="font-mono text-[10px] uppercase tracking-[0.15em] text-muted-foreground">{label}</p>
+            <p className="font-mono text-[10px] uppercase text-muted-foreground">{label}</p>
             <p className="mt-1 font-display text-3xl leading-none">{value}</p>
             <p className="mt-1 text-xs text-muted-foreground">{hint}</p>
           </div>

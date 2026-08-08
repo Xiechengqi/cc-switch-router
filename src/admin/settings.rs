@@ -2567,6 +2567,7 @@ mod tests {
                 sample_interval_secs: 5,
                 alerting: crate::config::AlertingSettings::default(),
             },
+            clock_health: crate::config::ClockHealthConfig::default(),
         }
     }
 }

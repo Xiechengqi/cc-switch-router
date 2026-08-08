@@ -78,7 +78,7 @@ export function ShareEditDialog({
                   </div>
                 ) : null}
               </Modal.Body>
-              <Modal.Footer className="sticky bottom-0 shrink-0 border-t border-slate-200 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80">
+              <Modal.Footer className="sticky bottom-0 shrink-0 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80">
                 {readOnly ? (
                   <Button variant="outline" onClick={onClose} isDisabled={form?.busy}>
                     {t("common.close")}

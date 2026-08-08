@@ -23,6 +23,7 @@ const LOG_CHANNEL_CAPACITY: usize = 256;
 const TOTAL_STEPS: usize = 7;
 const DOWNLOAD_BUFFER_TICK_BYTES: u64 = 256 * 1024;
 const SANITY_TIMEOUT: Duration = Duration::from_secs(5);
+const DATABASE_SANITY_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -251,7 +252,7 @@ async fn run_upgrade(
         .await;
         return Err(err);
     }
-    if let Err(err) = sanity_exec(&tmp_path).await {
+    if let Err(err) = sanity_exec(&tmp_path, true).await {
         cleanup_tmp(&tmp_path);
         emit(
             handle,
@@ -267,7 +268,7 @@ async fn run_upgrade(
         handle,
         3,
         UpgradeLogLevel::Success,
-        "binary is executable and responds to --help",
+        "binary passed executable and database compatibility checks",
         Some(progress_pct(3, 100)),
     )
     .await;
@@ -447,7 +448,7 @@ fn chmod_exec(path: &Path) -> Result<(), AppError> {
         .map_err(|err| AppError::Internal(format!("chmod failed: {err}")))
 }
 
-async fn sanity_exec(path: &Path) -> Result<(), AppError> {
+async fn sanity_exec(path: &Path, check_database: bool) -> Result<(), AppError> {
     let output = tokio::time::timeout(SANITY_TIMEOUT, Command::new(path).arg("--help").output())
         .await
         .map_err(|_| AppError::Internal("sanity --help timed out".into()))?
@@ -457,6 +458,23 @@ async fn sanity_exec(path: &Path) -> Result<(), AppError> {
             "sanity --help exited with status {}",
             output.status
         )));
+    }
+    if check_database {
+        let output = tokio::time::timeout(
+            DATABASE_SANITY_TIMEOUT,
+            Command::new(path).arg("check-db").output(),
+        )
+        .await
+        .map_err(|_| AppError::Internal("sanity check-db timed out".into()))?
+        .map_err(|err| AppError::Internal(format!("sanity check-db exec failed: {err}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::Internal(format!(
+                "sanity check-db exited with status {}: {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
     }
     Ok(())
 }
@@ -537,7 +555,7 @@ pub async fn rollback_to_previous_binary() -> Result<RollbackResponse, AppError>
         )));
     }
     chmod_exec(bak)?;
-    sanity_exec(bak).await?;
+    sanity_exec(bak, false).await?;
 
     let rollback_tmp = target.with_file_name(format!(
         "cc-switch-router.rollback-current-{}",

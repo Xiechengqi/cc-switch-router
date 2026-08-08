@@ -110,7 +110,7 @@ function RouterSwitcher() {
         className="region-switcher-trigger inline-flex max-w-[11rem] shrink-0 items-center gap-1 outline-none"
       >
         <span className="min-w-0 truncate">{selected || t("nav.router")}</span>
-        <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" aria-hidden />
+        <ChevronDown className="h-4 w-4 shrink-0 text-slate-500" aria-hidden />
       </Dropdown.Trigger>
       <Dropdown.Popover placement="bottom start" className="min-w-[8.5rem]">
         <Dropdown.Menu aria-label={t("nav.routers")}>
@@ -141,7 +141,7 @@ function LanguageSwitcher() {
     <button
       type="button"
       aria-label={t("common.language")}
-      className="inline-flex h-9 shrink-0 items-center justify-center rounded-md px-2 text-sm font-medium tracking-wide text-slate-400 transition-colors hover:text-slate-600"
+      className="inline-flex h-9 shrink-0 items-center justify-center rounded-md px-2 text-sm font-medium text-slate-500 transition-colors hover:text-slate-700"
       onClick={() => setLocale(showEnglish ? "en" : "zh-CN")}
     >
       {showEnglish ? "EN" : "中"}
@@ -205,13 +205,13 @@ function DashboardNav({
               "inline-flex h-9 min-w-0 items-center gap-1.5 rounded-md px-2.5 text-sm transition-colors",
               selected
                 ? "font-semibold text-foreground"
-                : "font-medium text-slate-400 hover:text-slate-600",
+                : "font-medium text-slate-500 hover:text-slate-700",
             )}
           >
             <Icon
               className={cn(
                 "h-4 w-4 shrink-0",
-                selected ? "text-accent" : "text-slate-400",
+                selected ? "text-accent" : "text-slate-500",
               )}
               aria-hidden
             />
@@ -324,10 +324,10 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-9 max-w-[12rem] gap-1.5 px-2.5 text-sm font-medium text-slate-400 hover:text-slate-600 whitespace-nowrap [&_svg]:my-0"
+                    className="h-9 max-w-[12rem] gap-1.5 px-2.5 text-sm font-medium text-slate-500 hover:text-slate-700 whitespace-nowrap [&_svg]:my-0"
                     isDisabled={loading && !authed}
                   >
-                    <UserRound className="h-4 w-4 shrink-0 text-slate-400" />
+                    <UserRound className="h-4 w-4 shrink-0 text-slate-500" />
                     <span className="hidden min-w-0 truncate sm:inline">{displayEmail}</span>
                   </Button>
                 </Dropdown.Trigger>
@@ -365,7 +365,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-9 shrink-0 px-2.5 text-sm font-medium text-slate-400 hover:text-slate-600"
+                className="h-9 shrink-0 px-2.5 text-sm font-medium text-slate-500 hover:text-slate-700"
                 onClick={() => setLoginOpen(true)}
                 isDisabled={loading}
               >
@@ -389,12 +389,25 @@ export function AppShell({
   active: DashboardShellActive;
   children: React.ReactNode;
 }) {
+  const { t } = useLocaleText();
   const dashboardDataEnabled = active === "clients" || active === "markets";
   return (
     <DashboardDataProvider enabled={dashboardDataEnabled}>
+      <a
+        href="#main-content"
+        className="sr-only fixed left-3 top-3 z-[100] rounded-md bg-white px-3 py-2 text-sm font-semibold text-foreground shadow-md ring-2 ring-primary focus:not-sr-only"
+      >
+        {t("common.skipToContent")}
+      </a>
       <div className="flex min-h-dvh min-w-0 flex-col">
         <Topbar active={active} />
-        <div className="flex min-w-0 flex-1 flex-col pt-4 sm:pt-5">{children}</div>
+        <div
+          id="main-content"
+          tabIndex={-1}
+          className="flex min-w-0 flex-1 flex-col pt-4 outline-none sm:pt-5"
+        >
+          {children}
+        </div>
       </div>
       <AnnouncementDialog />
       <Toast.Provider placement="top end" />

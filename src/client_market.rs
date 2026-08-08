@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -8,11 +9,12 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
+use anyhow::{Context as _, bail};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{delete, get, post};
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -87,6 +89,14 @@ const CLEANUP_RECOVERY_BACKOFF: [Duration; 5] = [
 ];
 const CLEANUP_RECOVERY_CLAIM_LIMIT: usize = 4;
 const CLEANUP_RECOVERY_CLAIM_LEASE: Duration = Duration::from_secs(10 * 60);
+const HOST_REPROBE_CLAIM_LIMIT: usize = 4;
+const HOST_REPROBE_CLAIM_LEASE: Duration = Duration::from_secs(5 * 60);
+const HOST_REPROBE_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(60 * 60),
+    Duration::from_secs(6 * 60 * 60),
+    Duration::from_secs(24 * 60 * 60),
+];
 /// Hosts claimed for provisioning but with no active job for longer than this are
 /// stranded — the worker panicked, or the process died between claim and spawn.
 /// `locked` has no other exit, so without this sweep the Host leaves the pool for
@@ -109,6 +119,12 @@ const SSH_HOST_KEY_SCAN_TIMEOUT: Duration = Duration::from_secs(12);
 const SSH_HOST_KEY_SCAN_CONNECT_TIMEOUT_SECS: &str = "5";
 const SSH_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
+const JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const JOB_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(90);
+const JOB_WATCHDOG_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+const CREATE_JOB_MAX_RUNTIME: Duration = Duration::from_secs(30 * 60);
+const CLEANUP_JOB_MAX_RUNTIME: Duration = Duration::from_secs(10 * 60);
+const JOB_LEASE_REVOKED_MESSAGE: &str = "job execution lease was revoked";
 const SSH_OUTPUT_LIMIT: usize = 64 * 1024;
 const JOB_LOG_LIMIT: usize = 128 * 1024;
 const MAX_SELECTION_ITEMS: usize = 100;
@@ -628,7 +644,7 @@ pub fn router_public_url(config: &Config) -> String {
     format!("{scheme}://{}", config.tunnel_domain.trim_end_matches('/'))
 }
 
-fn client_public_url(config: &Config, subdomain: &str) -> String {
+pub(crate) fn client_public_url(config: &Config, subdomain: &str) -> String {
     let scheme = if config.use_localhost {
         "http"
     } else {
@@ -649,6 +665,10 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/client-market/hosts", get(list_hosts).post(create_host))
         .route("/v1/client-market/hosts/export", get(export_hosts))
         .route("/v1/client-market/hosts/import", post(import_hosts))
+        .route(
+            "/v1/client-market/hosts/import/:id",
+            get(get_host_import_job),
+        )
         .route("/v1/client-market/hosts/test-ssh", post(test_host_ssh))
         .route("/v1/client-market/hosts/ip-info", post(lookup_host_ip_info))
         .route("/v1/client-market/supply-summary", get(supply_summary))
@@ -827,11 +847,7 @@ async fn list_hosts(
                     .iter()
                     .filter(|host| {
                         viewer_is_admin
-                            || session_is_host_owner(
-                                session,
-                                host.provider_id.as_deref(),
-                                &host.host_owner_email,
-                            )
+                            || session_is_host_owner(session, host.provider_id.as_deref())
                             || host.client_owner_user_id.as_deref()
                                 == Some(session.user_id.as_str())
                     })
@@ -848,6 +864,14 @@ async fn list_hosts(
         .await?;
     let retirable_host_ids = if viewer.is_some() {
         state.store.client_market_retirable_host_ids().await?
+    } else {
+        HashSet::new()
+    };
+    let terminal_authorized_host_ids = if let Some(session) = viewer.as_ref() {
+        state
+            .store
+            .client_market_provider_terminal_authorized_host_ids(&session.user_id)
+            .await?
     } else {
         HashSet::new()
     };
@@ -893,9 +917,9 @@ async fn list_hosts(
         .map(|host| {
             // Host operations (port, SSH details, notes, etc.) are host-owner only.
             // Admins / Router owners do not get elevated market host privileges.
-            let is_host_owner = viewer.as_ref().is_some_and(|session| {
-                session_is_host_owner(session, host.provider_id.as_deref(), &host.host_owner_email)
-            });
+            let is_host_owner = viewer
+                .as_ref()
+                .is_some_and(|session| session_is_host_owner(session, host.provider_id.as_deref()));
             let is_client_owner = viewer.as_ref().is_some_and(|session| {
                 host.client_owner_user_id.as_deref() == Some(session.user_id.as_str())
             });
@@ -915,8 +939,11 @@ async fn list_hosts(
             } else {
                 None
             };
-            // Web Terminal is host-owner only — not admins or client owners.
-            let can_web_terminal = is_host_owner;
+            // An allocated machine belongs to the renter's security boundary. Its Provider
+            // needs an explicit, unexpired renter authorization before opening a root shell.
+            let can_web_terminal = is_host_owner
+                && (host_is_unallocated_for_terminal(&host)
+                    || terminal_authorized_host_ids.contains(&host.id));
             let seller_approval_required = host_seller_approval_required(
                 viewer.is_some(),
                 is_host_owner,
@@ -1073,6 +1100,7 @@ struct HostImportItemResult {
 #[serde(rename_all = "camelCase")]
 struct HostImportResponse {
     job_id: String,
+    status: String,
     imported: usize,
     skipped: usize,
     failed: usize,
@@ -1315,13 +1343,7 @@ async fn export_hosts(
         .await?;
     let hosts = hosts
         .into_iter()
-        .filter(|host| {
-            session_is_host_owner(
-                &session,
-                host.provider_id.as_deref(),
-                &host.host_owner_email,
-            )
-        })
+        .filter(|host| session_is_host_owner(&session, host.provider_id.as_deref()))
         .map(|host| HostTransferEntry {
             ip: host.ip,
             port: host.port,
@@ -1345,7 +1367,7 @@ async fn import_hosts(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<HostImportResponse>, AppError> {
+) -> Result<(StatusCode, Json<HostImportResponse>), AppError> {
     const MAX_IMPORT_BYTES: usize = 1024 * 1024;
     const MAX_IMPORT_HOSTS: usize = 100;
     if body.len() > MAX_IMPORT_BYTES {
@@ -1391,13 +1413,30 @@ async fn import_hosts(
         .await?;
     let runner_state = state.clone();
     let runner_job_id = job_id.clone();
-    let response =
-        tokio::spawn(async move { process_host_import_job(&runner_state, &runner_job_id).await })
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("Host import worker stopped: {error}"))
-            })??;
-    Ok(Json(response))
+    tokio::spawn(async move {
+        if let Err(error) = process_host_import_job(&runner_state, &runner_job_id).await {
+            warn!(job_id = %runner_job_id, error = %error, "Host import worker failed");
+        }
+    });
+    let response = state
+        .store
+        .client_market_host_import_job(&job_id, &session)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn get_host_import_job(
+    State(state): State<ServerState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<HostImportResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .client_market_host_import_job(&job_id, &session)
+            .await?,
+    ))
 }
 
 async fn process_host_import_job(
@@ -1861,7 +1900,7 @@ struct CleanupClientRequest {
     deny_client_access: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobView {
     pub id: String,
@@ -2124,14 +2163,73 @@ async fn redeem_provision_token(
 }
 
 pub(crate) async fn run_create_job(state: ServerState, job_id: String) -> Result<(), AppError> {
-    let result = run_create_job_inner(&state, &job_id).await;
-    if let Err(ref error) = result {
+    let result = run_job_with_lease(
+        &state,
+        &job_id,
+        JOB_TYPE_CREATE,
+        false,
+        CREATE_JOB_MAX_RUNTIME,
+        run_create_job_inner(&state, &job_id),
+    )
+    .await;
+    if let Err(ref error) = result
+        && !job_lease_was_revoked(error)
+    {
         handle_create_job_failure(&state, &job_id, error).await;
     }
     if let Err(error) = state.store.client_market_sync_batch_for_job(&job_id).await {
         warn!(job_id = %job_id, error = %error, "failed to synchronize Client Market batch state");
     }
     result
+}
+
+pub(crate) async fn run_job_with_lease<F>(
+    state: &ServerState,
+    job_id: &str,
+    expected_type: &str,
+    resume_running: bool,
+    max_runtime: Duration,
+    operation: F,
+) -> Result<(), AppError>
+where
+    F: Future<Output = Result<(), AppError>>,
+{
+    let worker_id = Uuid::new_v4().to_string();
+    state
+        .store
+        .client_market_claim_job_execution(
+            job_id,
+            expected_type,
+            &worker_id,
+            resume_running,
+            max_runtime,
+        )
+        .await?;
+    let mut heartbeat = tokio::time::interval(JOB_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let deadline = tokio::time::sleep(max_runtime);
+    tokio::pin!(deadline);
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = heartbeat.tick() => {
+                if !state.store.client_market_heartbeat_job(job_id, &worker_id).await? {
+                    return Err(AppError::Conflict(JOB_LEASE_REVOKED_MESSAGE.into()));
+                }
+            }
+            _ = &mut deadline => {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "{expected_type} job exceeded its runtime deadline"
+                )));
+            }
+        }
+    }
+}
+
+pub(crate) fn job_lease_was_revoked(error: &AppError) -> bool {
+    matches!(error, AppError::Conflict(message) if message == JOB_LEASE_REVOKED_MESSAGE)
 }
 
 pub async fn reconcile_interrupted_jobs(state: ServerState) -> Result<(), AppError> {
@@ -2155,13 +2253,15 @@ pub async fn reconcile_interrupted_jobs(state: ServerState) -> Result<(), AppErr
                 JOB_TYPE_CREATE => resume_interrupted_create_job(&runner_state, job).await,
                 JOB_TYPE_CLEANUP => {
                     let job_id = job.id.clone();
-                    let result = run_cleanup_job_inner(
+                    let result = run_cleanup_job_with_mode(
                         &runner_state,
                         &job_id,
                         job.status == JOB_STATUS_RUNNING,
                     )
                     .await;
-                    if let Err(ref error) = result {
+                    if let Err(ref error) = result
+                        && !job_lease_was_revoked(error)
+                    {
                         handle_cleanup_job_failure(&runner_state, &job_id, error).await;
                     }
                 }
@@ -2213,6 +2313,7 @@ pub async fn reconcile_interrupted_host_import_jobs(state: ServerState) -> Resul
 
 /// Periodic repair for stuck draining / remotely-clean unreachable hosts.
 pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppError> {
+    reconcile_expired_job_leases(&state, Utc::now()).await?;
     let draining = state
         .store
         .client_market_list_hosts_by_status(HOST_STATUS_DRAINING)
@@ -2314,8 +2415,119 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
         }
     }
 
+    let reprobe_claims = state
+        .store
+        .client_market_claim_due_quarantined_host_reprobes(now, HOST_REPROBE_CLAIM_LIMIT)
+        .await?;
+    let reprobe_results = stream::iter(reprobe_claims.into_iter().map(|claim| {
+        let runner_state = state.clone();
+        async move { reconcile_quarantined_host_reprobe(runner_state, claim).await }
+    }))
+    .buffer_unordered(HOST_REPROBE_CLAIM_LIMIT)
+    .collect::<Vec<_>>()
+    .await;
+    for result in reprobe_results {
+        if let Err(error) = result {
+            warn!(error = %error, "quarantined Host reprobe failed");
+        }
+    }
+
     reconcile_stranded_locked_hosts(&state, now).await?;
-    reconcile_stranded_reserved_hosts(&state, now).await?;
+    reconcile_stranded_reserved_hosts(&state.store, now).await?;
+    Ok(())
+}
+
+fn quarantined_host_reprobe_next_at(now: DateTime<Utc>, completed_attempts: u32) -> DateTime<Utc> {
+    let index = completed_attempts
+        .saturating_sub(1)
+        .min((HOST_REPROBE_BACKOFF.len() - 1) as u32) as usize;
+    now + chrono::Duration::from_std(HOST_REPROBE_BACKOFF[index])
+        .unwrap_or(chrono::Duration::hours(24))
+}
+
+async fn reconcile_quarantined_host_reprobe(
+    state: ServerState,
+    claim: QuarantinedHostReprobeClaim,
+) -> Result<(), AppError> {
+    let Some(host) = state.store.client_market_get_host(&claim.host_id).await? else {
+        return Ok(());
+    };
+    if host.installation_id.is_some()
+        || !matches!(
+            host.status.as_str(),
+            HOST_STATUS_UNREACHABLE | HOST_STATUS_ABNORMAL
+        )
+    {
+        return Ok(());
+    }
+    match ssh_remote_is_market_clean(&state, &host).await {
+        Ok(true) => {
+            state
+                .store
+                .client_market_complete_host_reverify(
+                    &host.id,
+                    host.hostname.as_deref(),
+                    host.ssh_host_key_fingerprint.as_deref(),
+                )
+                .await?;
+            info!(host_id = %host.id, attempt = claim.attempt_count, "returned clean quarantined Host to idle");
+            Ok(())
+        }
+        Ok(false) => {
+            state
+                .store
+                .client_market_finish_quarantined_host_reprobe(
+                    &claim,
+                    "remote_not_clean",
+                    true,
+                    Utc::now(),
+                )
+                .await
+        }
+        Err(error) => {
+            let outcome = format!("probe_failed:{}", classify_cleanup_failure(&error));
+            let retry = !cleanup_recovery_requires_manual_intervention(&outcome);
+            state
+                .store
+                .client_market_finish_quarantined_host_reprobe(&claim, &outcome, retry, Utc::now())
+                .await?;
+            Err(error)
+        }
+    }
+}
+
+async fn reconcile_expired_job_leases(
+    state: &ServerState,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let jobs = state
+        .store
+        .client_market_claim_expired_job_leases(now)
+        .await?;
+    for job in jobs {
+        let runner_state = state.clone();
+        tokio::spawn(async move {
+            let error = AppError::ServiceUnavailable(
+                "Client Market job stopped heartbeating or exceeded its deadline".into(),
+            );
+            warn!(job_id = %job.id, job_type = %job.job_type, "expiring stale Client Market job lease");
+            match job.job_type.as_str() {
+                JOB_TYPE_CREATE => handle_create_job_failure(&runner_state, &job.id, &error).await,
+                JOB_TYPE_CLEANUP => {
+                    handle_cleanup_job_failure(&runner_state, &job.id, &error).await
+                }
+                crate::client_market_recovery::JOB_TYPE_RECOVER => {
+                    crate::client_market_recovery::expire_stale_job(&runner_state, &job.id).await;
+                }
+                _ => {
+                    let _ = runner_state
+                        .store
+                        .client_market_fail_job(&job.id, "unsupported stale Client Market job\n")
+                        .await;
+                }
+            }
+        });
+    }
     Ok(())
 }
 
@@ -2455,11 +2667,10 @@ async fn reconcile_stranded_locked_hosts(
 /// (only when some quote endpoint is called), so a restart with quotes outstanding can
 /// strand Hosts indefinitely if no further quote traffic arrives.
 async fn reconcile_stranded_reserved_hosts(
-    state: &ServerState,
+    store: &AppStore,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), AppError> {
-    let reserved = state
-        .store
+    let reserved = store
         .client_market_list_hosts_by_status(crate::client_market_trade::HOST_STATUS_RESERVED)
         .await?;
     for host in reserved {
@@ -2475,17 +2686,12 @@ async fn reconcile_stranded_reserved_hosts(
         {
             continue;
         }
-        if state
-            .store
-            .client_market_host_has_live_quote(&host.id)
-            .await?
-        {
+        if store.client_market_host_has_live_quote(&host.id).await? {
             continue;
         }
         // No live quote can claim it, and a reserved Host was never touched remotely,
         // so returning it straight to the pool is safe.
-        match state
-            .store
+        match store
             .client_market_force_host_status(
                 &host.id,
                 crate::client_market_trade::HOST_STATUS_RESERVED,
@@ -2518,31 +2724,38 @@ async fn resume_interrupted_create_job(state: &ServerState, job: ProvisioningJob
             job.subdomain.as_deref(),
         )
     {
-        let resumed = async {
-            let ready_id = poll_for_installation(
-                state,
-                &job.id,
-                subdomain,
-                PROVISION_POLL_TIMEOUT,
-                PROVISION_POLL_INTERVAL,
-            )
-            .await?;
-            if ready_id != installation_id {
-                return Err(AppError::Conflict(
-                    "interrupted job installation binding changed".into(),
-                ));
-            }
-            state
-                .store
-                .client_market_complete_create_job(
+        let resumed = run_job_with_lease(
+            state,
+            &job.id,
+            JOB_TYPE_CREATE,
+            true,
+            CREATE_JOB_MAX_RUNTIME,
+            async {
+                let ready_id = poll_for_installation(
+                    state,
                     &job.id,
-                    host_id,
-                    installation_id,
-                    PROVISION_SOURCE_ROUTER_MARKET,
-                    &router_public_url(&state.config),
+                    subdomain,
+                    PROVISION_POLL_TIMEOUT,
+                    PROVISION_POLL_INTERVAL,
                 )
-                .await
-        }
+                .await?;
+                if ready_id != installation_id {
+                    return Err(AppError::Conflict(
+                        "interrupted job installation binding changed".into(),
+                    ));
+                }
+                state
+                    .store
+                    .client_market_complete_create_job(
+                        &job.id,
+                        host_id,
+                        installation_id,
+                        PROVISION_SOURCE_ROUTER_MARKET,
+                        &router_public_url(&state.config),
+                    )
+                    .await
+            },
+        )
         .await;
         if resumed.is_ok() {
             let _ = state
@@ -2552,6 +2765,12 @@ async fn resume_interrupted_create_job(state: &ServerState, job: ProvisioningJob
                     "provisioning recovered after router restart\n",
                 )
                 .await;
+            return;
+        }
+        if resumed
+            .as_ref()
+            .is_err_and(|error| job_lease_was_revoked(error))
+        {
             return;
         }
     }
@@ -2565,10 +2784,6 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
     state
         .store
         .client_market_append_job_log(job_id, "starting provisioning job\n")
-        .await?;
-    state
-        .store
-        .client_market_start_job(job_id, JOB_TYPE_CREATE)
         .await?;
     let job = state
         .store
@@ -2838,11 +3053,29 @@ async fn handle_create_job_failure(state: &ServerState, job_id: &str, error: &Ap
 }
 
 pub(crate) async fn run_cleanup_job(state: ServerState, job_id: String) -> Result<(), AppError> {
-    let result = run_cleanup_job_inner(&state, &job_id, false).await;
-    if let Err(ref error) = result {
+    let result = run_cleanup_job_with_mode(&state, &job_id, false).await;
+    if let Err(ref error) = result
+        && !job_lease_was_revoked(error)
+    {
         handle_cleanup_job_failure(&state, &job_id, error).await;
     }
     result
+}
+
+async fn run_cleanup_job_with_mode(
+    state: &ServerState,
+    job_id: &str,
+    resume_running: bool,
+) -> Result<(), AppError> {
+    run_job_with_lease(
+        state,
+        job_id,
+        JOB_TYPE_CLEANUP,
+        resume_running,
+        CLEANUP_JOB_MAX_RUNTIME,
+        run_cleanup_job_inner(state, job_id),
+    )
+    .await
 }
 
 fn is_cleanup_phase(phase: &str) -> bool {
@@ -2916,21 +3149,11 @@ fn cleanup_recovery_requires_manual_intervention(outcome: &str) -> bool {
     outcome.contains(CLEANUP_FAILURE_FINGERPRINT) || outcome.contains(CLEANUP_FAILURE_BINDING)
 }
 
-async fn run_cleanup_job_inner(
-    state: &ServerState,
-    job_id: &str,
-    resume_running: bool,
-) -> Result<(), AppError> {
+async fn run_cleanup_job_inner(state: &ServerState, job_id: &str) -> Result<(), AppError> {
     state
         .store
         .client_market_append_job_log(job_id, "starting cleanup job\n")
         .await?;
-    if !resume_running {
-        state
-            .store
-            .client_market_start_job(job_id, JOB_TYPE_CLEANUP)
-            .await?;
-    }
     let job = state
         .store
         .client_market_get_job_record(job_id)
@@ -3274,6 +3497,399 @@ fn install_provision_key_remote_command(authorized_keys_line: &str) -> String {
          printf 'ok\\n'",
         line = shell_quote(authorized_keys_line),
     )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProvisionSshRotationStage {
+    Distributing,
+    Activated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProvisionSshRotationState {
+    version: u32,
+    stage: ProvisionSshRotationStage,
+    old_public_key: String,
+    new_public_key: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisionSshRotationReport {
+    pub host_count: usize,
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn atomic_write_file_mode(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent directory: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create directory failed: {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("rotation-state");
+    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(&temporary)
+            .with_context(|| format!("create temporary file failed: {}", temporary.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write temporary file failed: {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temporary file failed: {}", temporary.display()))?;
+        drop(file);
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode)).with_context(|| {
+            format!(
+                "set temporary file permissions failed: {}",
+                temporary.display()
+            )
+        })?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("replace file failed: {}", path.display()))?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync directory failed: {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_provision_rotation_state(
+    path: &Path,
+    state: &ProvisionSshRotationState,
+) -> anyhow::Result<()> {
+    let mut serialized = serde_json::to_vec_pretty(state)?;
+    serialized.push(b'\n');
+    atomic_write_file_mode(path, &serialized, 0o600)
+}
+
+fn activate_provision_ssh_candidate(
+    private_key_path: &Path,
+    public_key_path: &Path,
+    candidate_private_path: &Path,
+    candidate_public_path: &Path,
+) -> anyhow::Result<()> {
+    let previous_private_path = path_with_suffix(private_key_path, ".previous");
+    let previous_public_path = path_with_suffix(public_key_path, ".previous");
+    if previous_private_path.exists() || previous_public_path.exists() {
+        bail!(
+            "previous provisioning SSH key backup already exists; inspect {} before retrying",
+            previous_private_path.display()
+        );
+    }
+    fs::copy(private_key_path, &previous_private_path).with_context(|| {
+        format!(
+            "back up active provisioning SSH private key failed: {}",
+            previous_private_path.display()
+        )
+    })?;
+    fs::set_permissions(&previous_private_path, fs::Permissions::from_mode(0o600))?;
+    fs::copy(public_key_path, &previous_public_path).with_context(|| {
+        format!(
+            "back up active provisioning SSH public key failed: {}",
+            previous_public_path.display()
+        )
+    })?;
+    fs::set_permissions(&previous_public_path, fs::Permissions::from_mode(0o644))?;
+
+    fs::rename(candidate_private_path, private_key_path).with_context(|| {
+        format!(
+            "activate candidate provisioning SSH private key failed: {}",
+            private_key_path.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(candidate_public_path, public_key_path) {
+        let _ = fs::copy(private_key_path, candidate_private_path);
+        let _ = fs::copy(&previous_private_path, private_key_path);
+        return Err(error).with_context(|| {
+            format!(
+                "activate candidate provisioning SSH public key failed: {}",
+                public_key_path.display()
+            )
+        });
+    }
+    crate::provision_ssh::require_provision_ssh_keys(private_key_path, public_key_path)?;
+    if let Some(parent) = private_key_path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| {
+                format!(
+                    "sync provisioning key directory failed: {}",
+                    parent.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn remove_old_provision_key_remote_command(
+    old_public_key: &str,
+    new_authorized_keys_line: &str,
+) -> anyhow::Result<String> {
+    let mut old_parts = old_public_key.split_whitespace();
+    let old_algorithm = old_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("old provisioning public key has no algorithm"))?;
+    let old_body = old_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("old provisioning public key has no body"))?;
+    let mut new_parts = new_authorized_keys_line.split_whitespace();
+    let new_algorithm = new_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("new provisioning public key has no algorithm"))?;
+    let new_body = new_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("new provisioning public key has no body"))?;
+    Ok(format!(
+        "set -eu; \
+         file=\"$HOME/.ssh/authorized_keys\"; \
+         test -f \"$file\"; \
+         tmp=\"$HOME/.ssh/.authorized_keys.rotate.$$\"; \
+         trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; \
+         awk -v oa={old_algorithm} -v ob={old_body} -v na={new_algorithm} -v nb={new_body} \
+           'function haskey(a,b, i) {{ for (i=1; i<NF; i++) if ($i==a && $(i+1)==b) return 1; return 0 }} \
+            !haskey(oa,ob) && !haskey(na,nb) {{ print }}' \"$file\" > \"$tmp\"; \
+         printf '%s\\n' {new_line} >> \"$tmp\"; \
+         chmod 600 \"$tmp\"; \
+         mv \"$tmp\" \"$file\"; \
+         trap - EXIT HUP INT TERM; \
+         printf 'CC_SWITCH_PROVISION_KEY_ROTATED=1\\n'",
+        old_algorithm = shell_quote(old_algorithm),
+        old_body = shell_quote(old_body),
+        new_algorithm = shell_quote(new_algorithm),
+        new_body = shell_quote(new_body),
+        new_line = shell_quote(new_authorized_keys_line),
+    ))
+}
+
+pub async fn rotate_provision_ssh_key_offline(
+    config: &Config,
+    store: &AppStore,
+) -> anyhow::Result<ProvisionSshRotationReport> {
+    let private_key_path = &config.provision_ssh_private_key_path;
+    let public_key_path = &config.provision_ssh_public_key_path;
+    let candidate_private_path = path_with_suffix(private_key_path, ".next");
+    let candidate_public_path = path_with_suffix(public_key_path, ".next");
+    let rotation_state_path = path_with_suffix(private_key_path, ".rotation.json");
+    let previous_private_path = path_with_suffix(private_key_path, ".previous");
+    let previous_public_path = path_with_suffix(public_key_path, ".previous");
+
+    let mut rotation = if rotation_state_path.is_file() {
+        serde_json::from_slice::<ProvisionSshRotationState>(
+            &fs::read(&rotation_state_path).with_context(|| {
+                format!(
+                    "read provisioning SSH rotation state failed: {}",
+                    rotation_state_path.display()
+                )
+            })?,
+        )?
+    } else {
+        crate::provision_ssh::require_provision_ssh_keys(private_key_path, public_key_path)?;
+        if candidate_private_path.exists()
+            || candidate_public_path.exists()
+            || previous_private_path.exists()
+            || previous_public_path.exists()
+        {
+            bail!(
+                "stale provisioning SSH rotation files exist beside {}; inspect them before starting",
+                private_key_path.display()
+            );
+        }
+        crate::provision_ssh::require_provision_ssh_keys(
+            &candidate_private_path,
+            &candidate_public_path,
+        )?;
+        let state = ProvisionSshRotationState {
+            version: 1,
+            stage: ProvisionSshRotationStage::Distributing,
+            old_public_key: crate::provision_ssh::public_key_openssh_from_public_path(
+                public_key_path,
+            )?,
+            new_public_key: crate::provision_ssh::public_key_openssh_from_public_path(
+                &candidate_public_path,
+            )?,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        write_provision_rotation_state(&rotation_state_path, &state)?;
+        state
+    };
+    if rotation.version != 1 {
+        bail!(
+            "unsupported provisioning SSH rotation state version {}",
+            rotation.version
+        );
+    }
+
+    let active_derived = crate::provision_ssh::derive_public_key(private_key_path)?;
+    if rotation.stage == ProvisionSshRotationStage::Distributing
+        && active_derived == rotation.new_public_key
+    {
+        atomic_write_file_mode(
+            public_key_path,
+            format!("{} cc-switch-router-provision\n", rotation.new_public_key).as_bytes(),
+            0o644,
+        )?;
+        rotation.stage = ProvisionSshRotationStage::Activated;
+        write_provision_rotation_state(&rotation_state_path, &rotation)?;
+    }
+
+    let hosts = store.client_market_list_hosts(None, None, None).await?;
+    let known_hosts = known_hosts_path(config);
+    if rotation.stage == ProvisionSshRotationStage::Distributing {
+        if active_derived != rotation.old_public_key {
+            bail!("active provisioning SSH key changed while rotation was staged");
+        }
+        crate::provision_ssh::require_provision_ssh_keys(
+            &candidate_private_path,
+            &candidate_public_path,
+        )?;
+        let candidate_line = format!(
+            "{} cc-switch-router-provision-next",
+            rotation.new_public_key
+        );
+        let install_command = install_provision_key_remote_command(&candidate_line);
+        for host in &hosts {
+            if host.ssh_host_key_fingerprint.is_none() {
+                bail!(
+                    "Host {} has no pinned SSH fingerprint; reverify it before rotating keys",
+                    host.id
+                );
+            }
+            require_pinned_host_fingerprint(host, &known_hosts).await?;
+            ssh_run_remote_with_input(
+                private_key_path,
+                &known_hosts,
+                &host.ip,
+                host.port,
+                &install_command,
+                None,
+                SSH_VERIFY_TIMEOUT,
+                SshHostKeyPolicy::RequireKnown,
+            )
+            .await?;
+            let verified = ssh_run_remote_with_input(
+                &candidate_private_path,
+                &known_hosts,
+                &host.ip,
+                host.port,
+                "printf 'CC_SWITCH_PROVISION_KEY_CANDIDATE=1\\n'",
+                None,
+                SSH_VERIFY_TIMEOUT,
+                SshHostKeyPolicy::RequireKnown,
+            )
+            .await?;
+            if !verified
+                .lines()
+                .any(|line| line.trim() == "CC_SWITCH_PROVISION_KEY_CANDIDATE=1")
+            {
+                bail!(
+                    "candidate provisioning SSH key verification failed for Host {}",
+                    host.id
+                );
+            }
+            store
+                .client_market_record_audit_event(
+                    host.installation_id.as_deref(),
+                    Some(&host.id),
+                    None,
+                    None,
+                    "provision_ssh_rotation_candidate_verified",
+                    serde_json::json!({}),
+                )
+                .await?;
+        }
+        activate_provision_ssh_candidate(
+            private_key_path,
+            public_key_path,
+            &candidate_private_path,
+            &candidate_public_path,
+        )?;
+        rotation.stage = ProvisionSshRotationStage::Activated;
+        write_provision_rotation_state(&rotation_state_path, &rotation)?;
+    }
+
+    crate::provision_ssh::require_provision_ssh_keys(private_key_path, public_key_path)?;
+    if crate::provision_ssh::derive_public_key(private_key_path)? != rotation.new_public_key {
+        bail!("activated provisioning SSH key does not match rotation state");
+    }
+    let active_line = format!("{} cc-switch-router-provision", rotation.new_public_key);
+    let cleanup_command =
+        remove_old_provision_key_remote_command(&rotation.old_public_key, &active_line)?;
+    for host in &hosts {
+        if host.ssh_host_key_fingerprint.is_none() {
+            bail!(
+                "Host {} has no pinned SSH fingerprint; cannot finish key cleanup",
+                host.id
+            );
+        }
+        require_pinned_host_fingerprint(host, &known_hosts).await?;
+        let output = ssh_run_remote_with_input(
+            private_key_path,
+            &known_hosts,
+            &host.ip,
+            host.port,
+            &cleanup_command,
+            None,
+            SSH_VERIFY_TIMEOUT,
+            SshHostKeyPolicy::RequireKnown,
+        )
+        .await?;
+        if !output
+            .lines()
+            .any(|line| line.trim() == "CC_SWITCH_PROVISION_KEY_ROTATED=1")
+        {
+            bail!(
+                "old provisioning SSH key cleanup failed for Host {}",
+                host.id
+            );
+        }
+        store
+            .client_market_record_audit_event(
+                host.installation_id.as_deref(),
+                Some(&host.id),
+                None,
+                None,
+                "provision_ssh_rotation_completed",
+                serde_json::json!({}),
+            )
+            .await?;
+    }
+
+    for path in [
+        previous_private_path,
+        previous_public_path,
+        candidate_private_path,
+        candidate_public_path,
+        rotation_state_path,
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("remove rotation artifact failed: {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(ProvisionSshRotationReport {
+        host_count: hosts.len(),
+    })
 }
 
 async fn ssh_test_login_with_password(
@@ -4980,12 +5596,22 @@ pub struct ProvisioningJobRecord {
     pub failure_code: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub started_at: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub deadline_at: Option<String>,
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanupRecoveryClaim {
     host_id: String,
     installation_id: String,
+    attempt_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuarantinedHostReprobeClaim {
+    host_id: String,
     attempt_count: u32,
 }
 
@@ -5003,24 +5629,18 @@ fn normalize_market_email(value: &str) -> Result<String, AppError> {
     Ok(email)
 }
 
-/// Host ownership for market ops: stable provider user id, legacy `email:` provider
-/// key, or current host_owner_email matching the session.
+/// Host ownership for market operations is bound to the stable Provider user id.
 pub(crate) fn session_is_host_owner(
     session: &crate::models::AuthSession,
     provider_id: Option<&str>,
-    host_owner_email: &str,
 ) -> bool {
-    if provider_id == Some(session.user_id.as_str()) {
-        return true;
-    }
-    let Ok(session_email) = normalize_market_email(&session.email) else {
-        return false;
-    };
-    let email_keyed = format!("email:{session_email}");
-    if provider_id == Some(email_keyed.as_str()) {
-        return true;
-    }
-    normalize_market_email(host_owner_email).is_ok_and(|host_email| host_email == session_email)
+    provider_id == Some(session.user_id.as_str())
+}
+
+pub(crate) fn host_is_unallocated_for_terminal(host: &RouterSshHostRecord) -> bool {
+    host.installation_id.is_none()
+        && host.client_owner_user_id.is_none()
+        && matches!(host.status.as_str(), "idle" | "abnormal" | "unreachable")
 }
 
 fn placeholders(count: usize) -> String {
@@ -5275,6 +5895,65 @@ impl AppStore {
         let failed = items.len().saturating_sub(imported + skipped);
         Ok(HostImportResponse {
             job_id: job_id.to_string(),
+            status: "completed".into(),
+            imported,
+            skipped,
+            failed,
+            items,
+        })
+    }
+
+    async fn client_market_host_import_job(
+        &self,
+        job_id: &str,
+        session: &crate::models::AuthSession,
+    ) -> Result<HostImportResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let (provider_id, status): (String, String) = conn
+            .query_row(
+                "SELECT provider_id, status FROM client_market_host_import_jobs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("read Host import job failed: {error}")))?
+            .ok_or_else(|| AppError::NotFound("Host import job not found".into()))?;
+        if provider_id != session.user_id {
+            return Err(AppError::Forbidden(
+                "Host import job belongs to another account".into(),
+            ));
+        }
+        let items = conn
+            .prepare(
+                "SELECT ip, port, status, host_id, error_message
+                 FROM client_market_host_import_items
+                 WHERE job_id = ?1 ORDER BY position ASC",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![job_id], |row| {
+                        Ok(HostImportItemResult {
+                            ip: row.get(0)?,
+                            port: row.get(1)?,
+                            status: row.get(2)?,
+                            host_id: row.get(3)?,
+                            error: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("read Host import items failed: {error}"))
+            })?;
+        let imported = items
+            .iter()
+            .filter(|item| item.status == "imported")
+            .count();
+        let skipped = items.iter().filter(|item| item.status == "skipped").count();
+        let failed = items.iter().filter(|item| item.status == "failed").count();
+        Ok(HostImportResponse {
+            job_id: job_id.to_string(),
+            status,
             imported,
             skipped,
             failed,
@@ -5526,7 +6205,7 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if !session_is_host_owner(session, host.provider_id.as_deref(), &host.host_owner_email) {
+        if !session_is_host_owner(session, host.provider_id.as_deref()) {
             return Err(AppError::Forbidden(
                 "not allowed to delete this host".into(),
             ));
@@ -5607,7 +6286,7 @@ impl AppStore {
             host_status,
             installation_id,
             provider_id,
-            host_owner_email,
+            _host_owner_email,
             provision_source,
             provision_host_id,
             tunnel_enabled,
@@ -5615,7 +6294,7 @@ impl AppStore {
             subscription_status,
             subscription_host_id,
         ) = row;
-        if !session_is_host_owner(session, provider_id.as_deref(), &host_owner_email) {
+        if !session_is_host_owner(session, provider_id.as_deref()) {
             return Err(AppError::Forbidden(
                 "only the Host Provider may permanently remove this lost Host".into(),
             ));
@@ -5940,7 +6619,8 @@ impl AppStore {
         conn.query_row(
             "SELECT id, type, host_id, host_owner_email, client_owner_email,
                     selection_owners_json, selection_regions_json, subdomain, installation_id,
-                    status, phase, log_blob, secret_ref, failure_code, created_at, updated_at
+                    status, phase, log_blob, secret_ref, failure_code, created_at, updated_at,
+                    started_at, heartbeat_at, deadline_at, worker_id
              FROM provisioning_jobs WHERE id = ?1",
             params![job_id],
             map_provisioning_job_row,
@@ -5957,7 +6637,8 @@ impl AppStore {
             .prepare(
                 "SELECT id, type, host_id, host_owner_email, client_owner_email,
                         selection_owners_json, selection_regions_json, subdomain, installation_id,
-                        status, phase, log_blob, secret_ref, failure_code, created_at, updated_at
+                        status, phase, log_blob, secret_ref, failure_code, created_at, updated_at,
+                        started_at, heartbeat_at, deadline_at, worker_id
                  FROM provisioning_jobs
                  WHERE status IN ('pending', 'running')
                  ORDER BY created_at ASC",
@@ -5968,6 +6649,96 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("query interrupted jobs failed: {e}")))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| AppError::Internal(format!("read interrupted job failed: {e}")))
+    }
+
+    async fn client_market_claim_expired_job_leases(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ProvisioningJobRecord>, AppError> {
+        let stale_before = now
+            - chrono::Duration::from_std(JOB_HEARTBEAT_STALE_AFTER).map_err(|error| {
+                AppError::Internal(format!("invalid heartbeat window: {error}"))
+            })?;
+        let watchdog_stale_before = now
+            - chrono::Duration::from_std(JOB_WATCHDOG_STALE_AFTER).map_err(|error| {
+                AppError::Internal(format!("invalid watchdog finalizer window: {error}"))
+            })?;
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin stale job claim failed: {error}"))
+            })?;
+        let candidates = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, type, host_id, host_owner_email, client_owner_email,
+                            selection_owners_json, selection_regions_json, subdomain, installation_id,
+                            status, phase, log_blob, secret_ref, failure_code, created_at, updated_at,
+                            started_at, heartbeat_at, deadline_at, worker_id
+                     FROM provisioning_jobs
+                     WHERE status = 'running' AND worker_id IS NOT NULL
+                       AND (
+                         (worker_id NOT LIKE 'watchdog:%'
+                          AND ((deadline_at IS NOT NULL AND deadline_at <= ?1)
+                               OR (heartbeat_at IS NOT NULL AND heartbeat_at <= ?2)))
+                         OR (worker_id LIKE 'watchdog:%'
+                             AND COALESCE(heartbeat_at, updated_at) <= ?3)
+                       )
+                     ORDER BY CASE WHEN worker_id LIKE 'watchdog:%'
+                                   THEN COALESCE(heartbeat_at, updated_at)
+                                   ELSE COALESCE(deadline_at, heartbeat_at) END,
+                              created_at
+                     LIMIT 32",
+                )
+                .map_err(|error| AppError::Internal(format!("prepare stale jobs failed: {error}")))?;
+            statement
+                .query_map(
+                    params![
+                        now.to_rfc3339(),
+                        stale_before.to_rfc3339(),
+                        watchdog_stale_before.to_rfc3339()
+                    ],
+                    map_provisioning_job_row,
+                )
+                .map_err(|error| AppError::Internal(format!("query stale jobs failed: {error}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Internal(format!("read stale jobs failed: {error}")))?
+        };
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for job in candidates {
+            let previous_worker = job.worker_id.as_deref().unwrap_or_default();
+            let watchdog_worker = format!("watchdog:{}", Uuid::new_v4());
+            let changed = tx
+                .execute(
+                    "UPDATE provisioning_jobs
+                     SET worker_id = ?3, heartbeat_at = ?4, updated_at = ?4
+                     WHERE id = ?1 AND status = 'running' AND worker_id = ?2
+                       AND (
+                         (worker_id NOT LIKE 'watchdog:%'
+                          AND ((deadline_at IS NOT NULL AND deadline_at <= ?4)
+                               OR (heartbeat_at IS NOT NULL AND heartbeat_at <= ?5)))
+                         OR (worker_id LIKE 'watchdog:%'
+                             AND COALESCE(heartbeat_at, updated_at) <= ?6)
+                       )",
+                    params![
+                        job.id,
+                        previous_worker,
+                        watchdog_worker,
+                        now.to_rfc3339(),
+                        stale_before.to_rfc3339(),
+                        watchdog_stale_before.to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| AppError::Internal(format!("claim stale job failed: {error}")))?;
+            if changed == 1 {
+                claimed.push(job);
+            }
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit stale job claims failed: {error}"))
+        })?;
+        Ok(claimed)
     }
 
     pub async fn client_market_append_job_log(
@@ -6013,6 +6784,61 @@ impl AppStore {
             return Err(AppError::Conflict("provisioning job is not pending".into()));
         }
         Ok(())
+    }
+
+    pub(crate) async fn client_market_claim_job_execution(
+        &self,
+        job_id: &str,
+        expected_type: &str,
+        worker_id: &str,
+        resume_running: bool,
+        max_runtime: Duration,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+        let deadline = now
+            + chrono::Duration::from_std(max_runtime)
+                .map_err(|error| AppError::Internal(format!("invalid job runtime: {error}")))?;
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE provisioning_jobs
+                 SET status = 'running', started_at = COALESCE(started_at, ?5),
+                     heartbeat_at = ?5, deadline_at = ?6, worker_id = ?3, updated_at = ?5
+                 WHERE id = ?1 AND type = ?2
+                   AND (status = 'pending' OR (?4 = 1 AND status = 'running'))",
+                params![
+                    job_id,
+                    expected_type,
+                    worker_id,
+                    i64::from(resume_running),
+                    now.to_rfc3339(),
+                    deadline.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("claim job execution failed: {error}")))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "provisioning job cannot be claimed for execution".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn client_market_heartbeat_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE provisioning_jobs SET heartbeat_at = ?3, updated_at = ?3
+                 WHERE id = ?1 AND status = 'running' AND worker_id = ?2
+                   AND deadline_at > ?3",
+                params![job_id, worker_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| AppError::Internal(format!("heartbeat job failed: {error}")))?;
+        Ok(changed == 1)
     }
 
     pub async fn client_market_set_job_phase(
@@ -6585,6 +7411,140 @@ impl AppStore {
         Ok(())
     }
 
+    async fn client_market_claim_due_quarantined_host_reprobes(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<QuarantinedHostReprobeClaim>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now_text = now.to_rfc3339();
+        let lease_until = (now
+            + chrono::Duration::from_std(HOST_REPROBE_CLAIM_LEASE).map_err(|error| {
+                AppError::Internal(format!("invalid Host reprobe lease: {error}"))
+            })?)
+        .to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin quarantined Host reprobe claim failed: {error}"
+                ))
+            })?;
+        tx.execute(
+            "DELETE FROM client_market_host_reprobe_state
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM router_ssh_hosts h
+                 WHERE h.id = client_market_host_reprobe_state.host_id
+                   AND h.installation_id IS NULL
+                   AND h.status IN ('unreachable', 'abnormal')
+             )",
+            [],
+        )
+        .map_err(|error| AppError::Internal(format!("prune Host reprobe state failed: {error}")))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO client_market_host_reprobe_state
+                (host_id, attempt_count, next_attempt_at, lease_until, last_outcome, updated_at)
+             SELECT h.id, 0, ?1, NULL, NULL, ?1
+             FROM router_ssh_hosts h
+             WHERE h.installation_id IS NULL
+               AND h.status IN ('unreachable', 'abnormal')
+               AND NOT EXISTS (
+                   SELECT 1 FROM provisioning_jobs j
+                   WHERE j.host_id = h.id AND j.status IN ('pending', 'running')
+               )",
+            params![now_text],
+        )
+        .map_err(|error| AppError::Internal(format!("seed Host reprobe state failed: {error}")))?;
+        let due = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT r.host_id, r.attempt_count
+                     FROM client_market_host_reprobe_state r
+                     JOIN router_ssh_hosts h ON h.id = r.host_id
+                     WHERE h.installation_id IS NULL
+                       AND h.status IN ('unreachable', 'abnormal')
+                       AND r.next_attempt_at IS NOT NULL AND r.next_attempt_at <= ?1
+                       AND (r.lease_until IS NULL OR r.lease_until <= ?1)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM provisioning_jobs j
+                           WHERE j.host_id = h.id AND j.status IN ('pending', 'running')
+                       )
+                     ORDER BY r.next_attempt_at, r.host_id LIMIT ?2",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("prepare Host reprobes failed: {error}"))
+                })?;
+            statement
+                .query_map(params![now_text, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("query Host reprobes failed: {error}"))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    AppError::Internal(format!("read Host reprobes failed: {error}"))
+                })?
+        };
+        let mut claimed = Vec::with_capacity(due.len());
+        for (host_id, previous_attempts) in due {
+            let next_attempt = previous_attempts.saturating_add(1);
+            let changed = tx
+                .execute(
+                    "UPDATE client_market_host_reprobe_state
+                     SET attempt_count = ?2, lease_until = ?3, last_outcome = 'probing', updated_at = ?4
+                     WHERE host_id = ?1 AND attempt_count = ?5
+                       AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?4
+                       AND (lease_until IS NULL OR lease_until <= ?4)",
+                    params![host_id, next_attempt, lease_until, now_text, previous_attempts],
+                )
+                .map_err(|error| AppError::Internal(format!("claim Host reprobe failed: {error}")))?;
+            if changed == 1 {
+                claimed.push(QuarantinedHostReprobeClaim {
+                    host_id,
+                    attempt_count: u32::try_from(next_attempt).unwrap_or(u32::MAX),
+                });
+            }
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit Host reprobe claims failed: {error}"))
+        })?;
+        Ok(claimed)
+    }
+
+    async fn client_market_finish_quarantined_host_reprobe(
+        &self,
+        claim: &QuarantinedHostReprobeClaim,
+        outcome: &str,
+        retry: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let outcome = crate::store::client_chat::sanitize_system_event_text(outcome)
+            .chars()
+            .take(500)
+            .collect::<String>();
+        let next_attempt_at =
+            retry.then(|| quarantined_host_reprobe_next_at(now, claim.attempt_count).to_rfc3339());
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE client_market_host_reprobe_state
+             SET next_attempt_at = ?3, lease_until = NULL, last_outcome = ?4, updated_at = ?5
+             WHERE host_id = ?1 AND attempt_count = ?2 AND last_outcome = 'probing'",
+            params![
+                claim.host_id,
+                i64::from(claim.attempt_count),
+                next_attempt_at,
+                outcome,
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| AppError::Internal(format!("finish Host reprobe failed: {error}")))?;
+        Ok(())
+    }
+
     async fn client_market_finalize_clean_unreachable_host(
         &self,
         host_id: &str,
@@ -6742,7 +7702,7 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if !session_is_host_owner(session, host.provider_id.as_deref(), &host.host_owner_email) {
+        if !session_is_host_owner(session, host.provider_id.as_deref()) {
             return Err(AppError::Forbidden(
                 "not allowed to operate this host".into(),
             ));
@@ -6878,6 +7838,11 @@ impl AppStore {
                 "host changed while it was being reverified".into(),
             ));
         }
+        tx.execute(
+            "DELETE FROM client_market_host_reprobe_state WHERE host_id = ?1",
+            params![id],
+        )
+        .map_err(|e| AppError::Internal(format!("clear Host reprobe state failed: {e}")))?;
         if let Some(installation_id) = detached_installation_id.as_deref() {
             let has_subscription: i64 = tx
                 .query_row(
@@ -7884,7 +8849,8 @@ fn get_provisioning_job(
     conn.query_row(
         "SELECT id, type, host_id, host_owner_email, client_owner_email,
                     selection_owners_json, selection_regions_json, subdomain, installation_id,
-                    status, phase, log_blob, secret_ref, failure_code, created_at, updated_at
+                    status, phase, log_blob, secret_ref, failure_code, created_at, updated_at,
+                    started_at, heartbeat_at, deadline_at, worker_id
              FROM provisioning_jobs WHERE id = ?1",
         params![job_id],
         map_provisioning_job_row,
@@ -7962,6 +8928,10 @@ fn map_provisioning_job_row(row: &crate::db::Row<'_>) -> crate::db::Result<Provi
         failure_code: row.get(13)?,
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
+        started_at: row.get(16)?,
+        heartbeat_at: row.get(17)?,
+        deadline_at: row.get(18)?,
+        worker_id: row.get(19)?,
     })
 }
 
@@ -8054,6 +9024,7 @@ mod tests {
                 sample_interval_secs: 5,
                 alerting: crate::config::AlertingSettings::default(),
             },
+            clock_health: crate::config::ClockHealthConfig::default(),
         };
         (config, root)
     }
@@ -8485,6 +9456,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_ownership_requires_the_stable_provider_user_id() {
+        let session = market_session("provider-stable", "provider@example.com");
+        assert!(session_is_host_owner(&session, Some("provider-stable")));
+        assert!(!session_is_host_owner(
+            &session,
+            Some("email:provider@example.com")
+        ));
+        assert!(!session_is_host_owner(&session, None));
+    }
+
     async fn add_provider_host(
         store: &AppStore,
         provider_id: &str,
@@ -8584,6 +9566,91 @@ mod tests {
             .expect("start job");
     }
 
+    async fn insert_running_job_with_watchdog(
+        store: &AppStore,
+        job_id: &str,
+        heartbeat_at: DateTime<Utc>,
+    ) {
+        let now = Utc::now();
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO provisioning_jobs (
+                    id, type, selection_owners_json, selection_regions_json,
+                    status, phase, log_blob, created_at, updated_at,
+                    started_at, heartbeat_at, deadline_at, worker_id
+                 ) VALUES (?1, 'create', '[]', '[]', 'running', 'pending', '',
+                           ?2, ?3, ?2, ?3, ?4, ?5)",
+                params![
+                    job_id,
+                    (now - chrono::Duration::minutes(30)).to_rfc3339(),
+                    heartbeat_at.to_rfc3339(),
+                    (now - chrono::Duration::minutes(1)).to_rfc3339(),
+                    format!("watchdog:{job_id}"),
+                ],
+            )
+            .expect("insert watchdog-owned job");
+    }
+
+    #[tokio::test]
+    async fn active_watchdog_finalizer_is_not_reclaimed() {
+        let (store, _, root) = test_store("active-watchdog-finalizer");
+        let now = Utc::now();
+        insert_running_job_with_watchdog(&store, "active-watchdog-job", now).await;
+
+        assert!(
+            store
+                .client_market_claim_expired_job_leases(now)
+                .await
+                .expect("scan active watchdog finalizer")
+                .is_empty()
+        );
+        let worker_id = store
+            .client_market_get_job_record("active-watchdog-job")
+            .await
+            .expect("read active watchdog job")
+            .expect("active watchdog job exists")
+            .worker_id;
+        assert_eq!(worker_id.as_deref(), Some("watchdog:active-watchdog-job"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_watchdog_finalizer_can_be_reclaimed_once() {
+        let (store, _, root) = test_store("stale-watchdog-finalizer");
+        let now = Utc::now();
+        let stale_at = now
+            - chrono::Duration::from_std(JOB_WATCHDOG_STALE_AFTER).expect("valid watchdog timeout")
+            - chrono::Duration::seconds(1);
+        insert_running_job_with_watchdog(&store, "stale-watchdog-job", stale_at).await;
+
+        let claimed = store
+            .client_market_claim_expired_job_leases(now)
+            .await
+            .expect("reclaim stale watchdog finalizer");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "stale-watchdog-job");
+        assert!(
+            store
+                .client_market_claim_expired_job_leases(now)
+                .await
+                .expect("avoid duplicate watchdog finalizer")
+                .is_empty()
+        );
+        let worker_id = store
+            .client_market_get_job_record("stale-watchdog-job")
+            .await
+            .expect("read reclaimed watchdog job")
+            .expect("reclaimed watchdog job exists")
+            .worker_id
+            .expect("reclaimed watchdog worker");
+        assert!(worker_id.starts_with("watchdog:"));
+        assert_ne!(worker_id, "watchdog:stale-watchdog-job");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn insert_installation(conn: &Connection, installation_id: &str, owner: &str) {
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -8678,6 +9745,19 @@ mod tests {
             )
             .await
             .expect("persist Host import job");
+        let owner = market_session("provider-import", "provider@example.com");
+        let pending = store
+            .client_market_host_import_job(&job_id, &owner)
+            .await
+            .expect("read pending Host import job");
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.items.len(), 2);
+        assert_eq!(pending.failed, 0);
+        let other = market_session("provider-other", "provider@example.com");
+        assert!(matches!(
+            store.client_market_host_import_job(&job_id, &other).await,
+            Err(AppError::Forbidden(_))
+        ));
         assert_eq!(
             store
                 .client_market_interrupted_host_import_jobs()
@@ -8734,6 +9814,7 @@ mod tests {
             .await
             .expect("complete Host import job");
         assert_eq!(completed.job_id, job_id);
+        assert_eq!(completed.status, "completed");
         assert_eq!(completed.imported, 1);
         assert_eq!(completed.skipped, 0);
         assert_eq!(completed.failed, 1);
@@ -9736,26 +10817,39 @@ mod tests {
             .market_billing_update_supplier_profile(&provider, "USD", 24)
             .await
             .expect("configure Provider payment grace");
-        let changed_offer = store
-            .client_market_update_host_offer(
-                &first.id,
-                &provider,
-                Some(900),
-                Some("USD".into()),
-                None,
-            )
-            .await
-            .expect("Provider may change an offer while a quote is reserved");
-        assert_eq!(changed_offer.offer_revision, 2);
-        assert_eq!(
+        assert!(matches!(
             store
-                .client_market_get_host(&first.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
+                .client_market_update_host_offer(
+                    &first.id,
+                    &provider,
+                    Some(900),
+                    Some("USD".into()),
+                    None,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let reserved_host = store
+            .client_market_get_host(&first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reserved_host.status,
             crate::client_market_trade::HOST_STATUS_RESERVED
         );
+        assert_eq!(reserved_host.offer_revision, 1);
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                conn.execute(
+                    "UPDATE router_ssh_hosts SET offer_revision = offer_revision + 1 WHERE id = ?1",
+                    params![first.id],
+                )
+                .expect("simulate an out-of-band offer revision change"),
+                1
+            );
+        }
         let stale_prepared = quote
             .items
             .iter()
@@ -9794,6 +10888,17 @@ mod tests {
                 HOST_STATUS_IDLE
             );
         }
+        let changed_offer = store
+            .client_market_update_host_offer(
+                &first.id,
+                &provider,
+                Some(900),
+                Some("USD".into()),
+                None,
+            )
+            .await
+            .expect("Provider may change an offer after the quote is cancelled");
+        assert_eq!(changed_offer.offer_revision, 3);
 
         let expiring = store
             .client_market_create_quote(
@@ -9855,11 +10960,36 @@ mod tests {
             .await
             .expect("commit quote");
         assert_eq!(committed.job_ids.len(), 1);
+        let replayed = store
+            .client_market_commit_quote(&fixed.id, &client, &prepared)
+            .await
+            .expect("replay identical quote commit");
+        assert_eq!(replayed.batch_id, committed.batch_id);
+        assert_eq!(replayed.job_ids, committed.job_ids);
+        assert!(replayed.replayed);
         assert!(matches!(
             store
-                .client_market_commit_quote(&fixed.id, &client, &prepared)
+                .client_market_commit_quote_idempotent(
+                    &fixed.id,
+                    &client,
+                    &format!("quote:{}", fixed.id),
+                    "different-request-fingerprint",
+                    &prepared,
+                )
                 .await,
-            Err(AppError::Gone(_))
+            Err(AppError::Conflict(_))
+        ));
+        let batch = store
+            .client_market_batch(&committed.batch_id, &client)
+            .await
+            .expect("batch owner reads committed jobs");
+        assert_eq!(batch.jobs.len(), 1);
+        let stranger = market_session("client-stranger", "stranger@example.com");
+        assert!(matches!(
+            store
+                .client_market_batch(&committed.batch_id, &stranger)
+                .await,
+            Err(AppError::Forbidden(_))
         ));
         assert_eq!(
             store
@@ -11847,6 +12977,27 @@ mod tests {
                 .await
                 .expect("cas call must not error"),
             "compare-and-set must refuse when the host already moved"
+        );
+        let old = Utc::now() - chrono::Duration::minutes(11);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE router_ssh_hosts SET updated_at = ?2 WHERE id = ?1",
+                params![host.id, old.to_rfc3339()],
+            )
+            .expect("age orphaned reservation");
+        }
+        reconcile_stranded_reserved_hosts(&store, Utc::now())
+            .await
+            .expect("recover orphaned reserved Host");
+        assert_eq!(
+            store
+                .client_market_get_host(&host.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            HOST_STATUS_IDLE
         );
         let _ = std::fs::remove_dir_all(root);
     }
