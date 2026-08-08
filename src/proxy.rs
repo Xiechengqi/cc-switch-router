@@ -2717,7 +2717,7 @@ pub async fn proxy_handler(
         // Strip client-supplied user/share credentials on share routes; router
         // authenticates the caller at the edge (user_api_token + email ACL)
         // and the cc-switch-server tunnel only needs the share id we inject below.
-        if is_internal_share_context_header(n) {
+        if should_strip_direct_proxy_internal_header(n, is_internal_share_router_path) {
             continue;
         }
         if route.is_share() && is_sensitive_upstream_credential_header(n) {
@@ -4483,6 +4483,14 @@ fn is_internal_share_context_header(name: &str) -> bool {
         )
 }
 
+fn should_strip_direct_proxy_internal_header(
+    name: &str,
+    is_internal_share_router_path: bool,
+) -> bool {
+    is_internal_share_context_header(name)
+        && !(is_internal_share_router_path && name.starts_with("x-ctl-"))
+}
+
 fn is_sensitive_upstream_credential_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("x-api-key")
@@ -4995,10 +5003,24 @@ mod tests {
             .unwrap();
         let backend_addr = backend_listener.local_addr().unwrap();
         let backend = axum::Router::new()
-            .fallback(any(|State(hits): State<Arc<AtomicUsize>>| async move {
-                hits.fetch_add(1, AtomicOrdering::SeqCst);
-                StatusCode::OK
-            }))
+            .fallback(any(
+                |State(hits): State<Arc<AtomicUsize>>, headers: HeaderMap| async move {
+                    hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    if [
+                        "x-ctl-installation-id",
+                        "x-ctl-timestamp-ms",
+                        "x-ctl-nonce",
+                        "x-ctl-signature",
+                    ]
+                    .iter()
+                    .all(|name| headers.contains_key(*name))
+                    {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    }
+                },
+            ))
             .with_state(backend_hits.clone());
         tokio::spawn(async move {
             axum::serve(backend_listener, backend).await.unwrap();
@@ -6345,6 +6367,27 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         }
         assert!(!is_internal_share_context_header("x-api-key"));
         assert!(!is_internal_share_context_header("anthropic-version"));
+    }
+
+    #[test]
+    fn signed_control_headers_reach_only_internal_share_router_endpoints() {
+        for name in [
+            "x-ctl-installation-id",
+            "x-ctl-timestamp-ms",
+            "x-ctl-nonce",
+            "x-ctl-signature",
+        ] {
+            assert!(should_strip_direct_proxy_internal_header(name, false));
+            assert!(!should_strip_direct_proxy_internal_header(name, true));
+        }
+        assert!(should_strip_direct_proxy_internal_header(
+            "x-cc-switch-share-id",
+            true
+        ));
+        assert!(should_strip_direct_proxy_internal_header(
+            "x-share-router-probe",
+            true
+        ));
     }
 
     #[test]

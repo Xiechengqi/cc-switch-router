@@ -78,7 +78,7 @@ use crate::models::{
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
 use crate::namespace::{
     PROTOCOL_EPOCH, PublicHostKind, build_share_label, normalize_client_subdomain,
-    normalize_market_slug, parse_share_label,
+    normalize_market_slug, normalize_share_slug, parse_share_label,
 };
 use crate::notifications::{
     ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
@@ -8447,16 +8447,43 @@ impl AppStore {
                 "control reply share_id does not match edit".into(),
             ));
         }
+        let (stored_subdomain, client_subdomain) = conn
+            .query_row(
+                "SELECT share.subdomain, tunnel.subdomain
+                 FROM shares share
+                 JOIN installation_client_tunnels tunnel
+                   ON tunnel.installation_id = share.installation_id
+                 WHERE share.share_id = ?1 AND share.installation_id = ?2",
+                params![edit.share_id, edit.installation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read Share namespace for direct edit failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| AppError::Conflict("Share namespace binding is unavailable".into()))?;
+        let share_slug = parse_share_label(&stored_subdomain)
+            .map(|parsed| parsed.share_slug)
+            .or_else(|_| normalize_share_slug(&stored_subdomain))
+            .map_err(|message| {
+                AppError::Conflict(format!("stored Share namespace is invalid: {message}"))
+            })?;
+        let expected_subdomain = build_share_label(&share_slug, &client_subdomain)
+            .map_err(|message| AppError::Conflict(message.into()))?;
+        if returned_share.subdomain != expected_subdomain {
+            let message = format!(
+                "client reply changed immutable Share subdomain: expected {expected_subdomain}, got {}",
+                returned_share.subdomain
+            );
+            reject_pending_share_edit_reply(&conn, edit_id, &now.to_rfc3339(), &message)?;
+            return Err(AppError::UnprocessableEntity(message));
+        }
         normalize_share_descriptor_fields(&mut returned_share);
         if let Err(field) = validate_returned_share_against_patch(&edit.patch, &returned_share) {
             let message = format!("client reply did not satisfy patch field: {field}");
-            conn.execute(
-                "UPDATE share_edit_requests
-                 SET status = 'rejected', updated_at = ?2, error_message = ?3
-                 WHERE id = ?1 AND status = 'pending'",
-                params![edit_id, now.to_rfc3339(), message],
-            )
-            .map_err(|e| AppError::Internal(format!("reject share edit failed: {e}")))?;
+            reject_pending_share_edit_reply(&conn, edit_id, &now.to_rfc3339(), &message)?;
             return Err(AppError::UnprocessableEntity(message));
         }
 
@@ -11945,6 +11972,22 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) {
             settings.expires_at = PERMANENT_SHARE_EXPIRES_AT.to_string();
         }
     }
+}
+
+fn reject_pending_share_edit_reply(
+    conn: &Connection,
+    edit_id: &str,
+    now: &str,
+    message: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE share_edit_requests
+         SET status = 'rejected', updated_at = ?2, error_message = ?3
+         WHERE id = ?1 AND status = 'pending'",
+        params![edit_id, now, message],
+    )
+    .map_err(|error| AppError::Internal(format!("reject share edit failed: {error}")))?;
+    Ok(())
 }
 
 fn validate_strict_share_descriptor_tx(
@@ -38773,6 +38816,142 @@ mod tests {
                 .await
                 .expect("query pending state after ack")
         );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn direct_share_edit_rejects_noncanonical_subdomain_reply() {
+        let (store, config) = setup_store("share-edit-reject-subdomain-change").await;
+        let installation_id = "inst-1";
+        let share_id = "share-edit";
+        let expected_subdomain = test_share_host("edit-sub");
+        insert_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+        insert_share(
+            &store,
+            installation_id,
+            share_id,
+            &expected_subdomain,
+            "active",
+        )
+        .await;
+        let edit = store
+            .create_share_settings_edit(
+                share_id,
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("updated".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create Share edit")
+            .edit;
+        let mut returned = test_share_descriptor(share_id, &expected_subdomain);
+        returned.description = Some("updated".into());
+        returned.subdomain = "edit-sub".into();
+        returned.config_revision = 1;
+        returned.descriptor_generation = 1;
+        returned.descriptor_fingerprint = "a".repeat(64);
+
+        let error = store
+            .apply_share_edit_directly(&edit.id, returned)
+            .await
+            .expect_err("bare Share slug must be rejected");
+        assert!(error.to_string().contains("immutable Share subdomain"));
+
+        let conn = store.conn.lock().await;
+        let stored: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT share.subdomain, edit.status, edit.error_message
+                 FROM shares share
+                 JOIN share_edit_requests edit ON edit.share_id = share.share_id
+                 WHERE edit.id = ?1",
+                params![edit.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read rejected Share edit");
+        assert_eq!(stored.0, expected_subdomain);
+        assert_eq!(stored.1, "rejected");
+        assert!(stored.2.unwrap_or_default().contains("expected"));
+        drop(conn);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn direct_share_edit_repairs_legacy_bare_subdomain() {
+        let (store, config) = setup_store("share-edit-repair-bare-subdomain").await;
+        let installation_id = "inst-1";
+        let share_id = "share-edit";
+        let expected_subdomain = test_share_host("edit-sub");
+        insert_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+        insert_share(
+            &store,
+            installation_id,
+            share_id,
+            &expected_subdomain,
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET subdomain = 'edit-sub' WHERE share_id = ?1",
+                params![share_id],
+            )
+            .expect("simulate legacy bare Share subdomain");
+        }
+        let edit = store
+            .create_share_settings_edit(
+                share_id,
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("updated".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create Share edit")
+            .edit;
+        let mut returned = test_share_descriptor(share_id, &expected_subdomain);
+        returned.description = Some("updated".into());
+        returned.config_revision = 1;
+        returned.descriptor_generation = 1;
+        returned.descriptor_fingerprint = "a".repeat(64);
+
+        store
+            .apply_share_edit_directly(&edit.id, returned)
+            .await
+            .expect("canonical reply must repair legacy bare Share subdomain");
+
+        let conn = store.conn.lock().await;
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT share.subdomain, edit.status
+                 FROM shares share
+                 JOIN share_edit_requests edit ON edit.share_id = share.share_id
+                 WHERE edit.id = ?1",
+                params![edit.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read applied Share edit");
+        assert_eq!(stored, (expected_subdomain, "applied".into()));
+        drop(conn);
 
         let _ = std::fs::remove_file(&config.database.path);
     }
