@@ -81,9 +81,10 @@ pub fn claim(
             return Ok(existing);
         }
         return Err(PublicHostCatalogError::Conflict(format!(
-            "label {label} is already assigned to {} {}",
+            "label {label} is already assigned to {} {} with lifecycle {}",
             kind_str(existing.kind),
-            existing.subject_id
+            existing.subject_id,
+            existing.lifecycle.as_str(),
         )));
     }
     if let Some(existing) = get_live_by_subject(conn, input.kind, input.subject_id)? {
@@ -113,6 +114,99 @@ pub fn claim(
     get_by_label(conn, &label)?.ok_or_else(|| {
         PublicHostCatalogError::Corrupt("inserted public host cannot be read back".into())
     })
+}
+
+pub(crate) fn reconcile_share_claim_in_transaction(
+    conn: &Connection,
+    input: NewPublicHost<'_>,
+) -> Result<PublicHostRecord, PublicHostCatalogError> {
+    validate_claim(&input)?;
+    if input.kind != PublicHostKind::Share {
+        return Err(PublicHostCatalogError::Invalid(
+            "share claim reconciliation only accepts Share hosts",
+        ));
+    }
+
+    let label = input.label.trim().to_ascii_lowercase();
+    if let Some(existing) = get_by_label(conn, &label)? {
+        if !same_claim(&existing, &input) {
+            return Err(PublicHostCatalogError::Conflict(format!(
+                "label {label} is already assigned to {} {} with lifecycle {}",
+                kind_str(existing.kind),
+                existing.subject_id,
+                existing.lifecycle.as_str(),
+            )));
+        }
+        if existing.lifecycle != PublicHostLifecycle::Tombstoned {
+            return Ok(existing);
+        }
+        if let Some(live) = get_live_by_subject(conn, input.kind, input.subject_id)? {
+            return Err(PublicHostCatalogError::Conflict(format!(
+                "{} {} already owns label {} with lifecycle {}",
+                kind_str(input.kind),
+                input.subject_id,
+                live.label,
+                live.lifecycle.as_str(),
+            )));
+        }
+        let latest =
+            get_latest_by_subject(conn, input.kind, input.subject_id)?.ok_or_else(|| {
+                PublicHostCatalogError::Corrupt(
+                    "tombstoned Share host is missing from its subject history".into(),
+                )
+            })?;
+        if latest.label != label {
+            return Err(PublicHostCatalogError::Conflict(format!(
+                "{} {} has a newer reserved label {} with lifecycle {}",
+                kind_str(input.kind),
+                input.subject_id,
+                latest.label,
+                latest.lifecycle.as_str(),
+            )));
+        }
+
+        let changed = conn.execute(
+            "UPDATE public_hosts
+             SET lifecycle = 'active', revision = revision + 1, updated_at = ?2
+             WHERE label = ?1 AND lifecycle = 'tombstoned'",
+            params![label, Utc::now().to_rfc3339()],
+        )?;
+        if changed != 1 {
+            return Err(PublicHostCatalogError::Corrupt(
+                "tombstoned Share host could not be restored".into(),
+            ));
+        }
+        return get_by_label(conn, &label)?.ok_or_else(|| {
+            PublicHostCatalogError::Corrupt("restored Share host cannot be read back".into())
+        });
+    }
+
+    if let Some(existing) = get_live_by_subject(conn, input.kind, input.subject_id)? {
+        if !same_claim(&existing, &input) {
+            return Err(PublicHostCatalogError::Conflict(format!(
+                "{} {} already owns label {} with lifecycle {} and a different identity",
+                kind_str(input.kind),
+                input.subject_id,
+                existing.label,
+                existing.lifecycle.as_str(),
+            )));
+        }
+        return replace_claim_in_transaction(conn, &existing.label, input);
+    }
+
+    if let Some(existing) = get_latest_by_subject(conn, input.kind, input.subject_id)?
+        && !same_claim(&existing, &input)
+    {
+        return Err(PublicHostCatalogError::Conflict(format!(
+            "{} {} was previously assigned to label {} with lifecycle {} and a different identity",
+            kind_str(input.kind),
+            input.subject_id,
+            existing.label,
+            existing.lifecycle.as_str(),
+        )));
+    }
+
+    claim(conn, input)
 }
 
 #[cfg(test)]
@@ -148,9 +242,10 @@ pub fn replace_claim_in_transaction(
             "old host claim does not belong to the requested subject".into(),
         ));
     }
-    if get_by_label(conn, &new_label)?.is_some() {
+    if let Some(existing) = get_by_label(conn, &new_label)? {
         return Err(PublicHostCatalogError::Conflict(format!(
-            "label {new_label} is already reserved"
+            "label {new_label} is already reserved with lifecycle {}",
+            existing.lifecycle.as_str(),
         )));
     }
     let now = Utc::now().to_rfc3339();
@@ -302,6 +397,25 @@ fn get_live_by_subject(
     .map_err(Into::into)
 }
 
+fn get_latest_by_subject(
+    conn: &Connection,
+    kind: PublicHostKind,
+    subject_id: &str,
+) -> Result<Option<PublicHostRecord>, PublicHostCatalogError> {
+    conn.query_row(
+        "SELECT label, route_id, kind, subject_id, installation_id, target_lane_id,
+                lifecycle, revision, created_at, updated_at
+         FROM public_hosts
+         WHERE kind = ?1 AND subject_id = ?2
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1",
+        params![kind_str(kind), subject_id],
+        map_record,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn validate_claim(input: &NewPublicHost<'_>) -> Result<(), PublicHostCatalogError> {
     if input.route_id.trim().is_empty()
         || input.subject_id.trim().is_empty()
@@ -412,6 +526,17 @@ mod tests {
         }
     }
 
+    fn share_claim<'a>(label: &'a str) -> NewPublicHost<'a> {
+        NewPublicHost {
+            label,
+            route_id: "share:share-1",
+            kind: PublicHostKind::Share,
+            subject_id: "share-1",
+            installation_id: Some("installation-1"),
+            target_lane_id: "installation-1",
+        }
+    }
+
     #[test]
     fn exact_label_claim_is_idempotent_but_conflicts_are_rejected() {
         let conn = database();
@@ -452,6 +577,106 @@ mod tests {
         .unwrap();
         assert_eq!(share.kind, PublicHostKind::Share);
         assert_eq!(share.target_lane_id, "installation-1:namespace-data");
+    }
+
+    #[test]
+    fn exact_tombstoned_share_claim_can_be_restored() {
+        let conn = database();
+        let label = build_share_label("codexx", "alpha-main").unwrap();
+        let original = claim(&conn, share_claim(&label)).unwrap();
+        assert!(tombstone_subject(&conn, PublicHostKind::Share, "share-1").unwrap());
+
+        let restored = reconcile_share_claim_in_transaction(&conn, share_claim(&label)).unwrap();
+
+        assert_eq!(restored.lifecycle, PublicHostLifecycle::Active);
+        assert_eq!(restored.revision, original.revision + 2);
+    }
+
+    #[test]
+    fn renamed_share_tombstone_cannot_be_restored() {
+        let conn = database();
+        let old_label = build_share_label("codexx", "alpha-main").unwrap();
+        let new_label = build_share_label("claudex", "alpha-main").unwrap();
+        claim(&conn, share_claim(&old_label)).unwrap();
+        reconcile_share_claim_in_transaction(&conn, share_claim(&new_label)).unwrap();
+
+        let error =
+            reconcile_share_claim_in_transaction(&conn, share_claim(&old_label)).unwrap_err();
+
+        assert!(matches!(error, PublicHostCatalogError::Conflict(_)));
+        assert_eq!(
+            get_by_label(&conn, &old_label).unwrap().unwrap().lifecycle,
+            PublicHostLifecycle::Tombstoned
+        );
+        assert_eq!(
+            get_by_label(&conn, &new_label).unwrap().unwrap().lifecycle,
+            PublicHostLifecycle::Active
+        );
+    }
+
+    #[test]
+    fn tombstoned_share_claim_rejects_a_different_installation() {
+        let conn = database();
+        let label = build_share_label("codexx", "alpha-main").unwrap();
+        claim(&conn, share_claim(&label)).unwrap();
+        assert!(tombstone_subject(&conn, PublicHostKind::Share, "share-1").unwrap());
+        let different_installation = NewPublicHost {
+            installation_id: Some("installation-2"),
+            target_lane_id: "installation-2",
+            ..share_claim(&label)
+        };
+
+        let error =
+            reconcile_share_claim_in_transaction(&conn, different_installation).unwrap_err();
+
+        assert!(matches!(error, PublicHostCatalogError::Conflict(_)));
+        assert_eq!(
+            get_by_label(&conn, &label).unwrap().unwrap().lifecycle,
+            PublicHostLifecycle::Tombstoned
+        );
+    }
+
+    #[test]
+    fn older_renamed_share_tombstone_stays_retired_after_current_label_is_tombstoned() {
+        let conn = database();
+        let old_label = build_share_label("codexx", "alpha-main").unwrap();
+        let new_label = build_share_label("claudex", "alpha-main").unwrap();
+        claim(&conn, share_claim(&old_label)).unwrap();
+        reconcile_share_claim_in_transaction(&conn, share_claim(&new_label)).unwrap();
+        assert!(tombstone_subject(&conn, PublicHostKind::Share, "share-1").unwrap());
+
+        let error =
+            reconcile_share_claim_in_transaction(&conn, share_claim(&old_label)).unwrap_err();
+        let restored =
+            reconcile_share_claim_in_transaction(&conn, share_claim(&new_label)).unwrap();
+
+        assert!(matches!(error, PublicHostCatalogError::Conflict(_)));
+        assert_eq!(restored.lifecycle, PublicHostLifecycle::Active);
+        assert_eq!(
+            get_by_label(&conn, &old_label).unwrap().unwrap().lifecycle,
+            PublicHostLifecycle::Tombstoned
+        );
+    }
+
+    #[test]
+    fn tombstoned_share_subject_rejects_new_label_from_a_different_installation() {
+        let conn = database();
+        let old_label = build_share_label("codexx", "alpha-main").unwrap();
+        let new_label = build_share_label("claudex", "alpha-main").unwrap();
+        claim(&conn, share_claim(&old_label)).unwrap();
+        assert!(tombstone_subject(&conn, PublicHostKind::Share, "share-1").unwrap());
+        let different_installation = NewPublicHost {
+            label: &new_label,
+            installation_id: Some("installation-2"),
+            target_lane_id: "installation-2",
+            ..share_claim(&old_label)
+        };
+
+        let error =
+            reconcile_share_claim_in_transaction(&conn, different_installation).unwrap_err();
+
+        assert!(matches!(error, PublicHostCatalogError::Conflict(_)));
+        assert!(get_by_label(&conn, &new_label).unwrap().is_none());
     }
 
     #[test]

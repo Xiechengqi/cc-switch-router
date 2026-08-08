@@ -8068,8 +8068,6 @@ impl AppStore {
         ensure_share_id_writable_by_installation(&tx, &share.share_id, &input.installation_id)?;
         normalize_self_reported_share_owner(&mut share, &installation_owner)?;
         share.subdomain = subdomain;
-        let previous_subdomain =
-            get_share_owned_subdomain(&tx, &input.installation_id, &share.share_id)?;
         release_reclaimable_subdomain_claim(
             &tx,
             &input.installation_id,
@@ -8086,15 +8084,8 @@ impl AppStore {
             installation_id: Some(&input.installation_id),
             target_lane_id: &input.installation_id,
         };
-        match previous_subdomain.as_deref() {
-            Some(previous) if previous != share.subdomain => {
-                crate::public_hosts::replace_claim_in_transaction(&tx, previous, host_claim)
-                    .map_err(map_public_host_error)?;
-            }
-            _ => {
-                crate::public_hosts::claim(&tx, host_claim).map_err(map_public_host_error)?;
-            }
-        }
+        crate::public_hosts::reconcile_share_claim_in_transaction(&tx, host_claim)
+            .map_err(map_public_host_error)?;
         upsert_share_tx(&tx, &input.installation_id, share)?;
         tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
@@ -35825,6 +35816,184 @@ mod tests {
             get_share_owner_email(&conn, "share-heal").expect("share owner"),
             Some("router@example.com".into())
         );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn claim_share_subdomain_repairs_legacy_bare_value_from_host_catalog() {
+        let (store, config) = setup_store("signed-share-repair-catalog-subdomain").await;
+        let installation_id = "inst-repair-catalog";
+        let share_id = "share-repair-catalog";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+        let expected_subdomain = test_share_host("repaircat");
+        insert_share(
+            &store,
+            installation_id,
+            share_id,
+            &expected_subdomain,
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET subdomain = 'repaircat' WHERE share_id = ?1",
+                params![share_id],
+            )
+            .expect("simulate legacy bare Share subdomain");
+        }
+
+        let share = test_share_descriptor(share_id, &expected_subdomain);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &share,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_share_subdomain(
+                &config,
+                ShareClaimSubdomainRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    claim: None,
+                    share,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("catalog claim should repair legacy Share subdomain");
+
+        let conn = store.conn.lock().await;
+        let stored_subdomain: String = conn
+            .query_row(
+                "SELECT subdomain FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .expect("read repaired Share subdomain");
+        let host = crate::public_hosts::get_by_label(&conn, &expected_subdomain)
+            .expect("read canonical public host")
+            .expect("canonical public host exists");
+        assert_eq!(stored_subdomain, expected_subdomain);
+        assert_eq!(
+            host.lifecycle,
+            crate::public_hosts::PublicHostLifecycle::Active
+        );
+        drop(conn);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn claim_share_subdomain_restores_exact_host_after_stale_cleanup() {
+        let (store, config) = setup_store("signed-share-restore-after-cleanup").await;
+        let installation_id = "inst-restore-cleanup";
+        let share_id = "share-restore-cleanup";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+        let subdomain = test_share_host("restoregc");
+        insert_share(&store, installation_id, share_id, &subdomain, "active").await;
+        {
+            let stale =
+                (Utc::now() - Duration::seconds(config.client_stale_secs + 600)).to_rfc3339();
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET updated_at = ?2 WHERE share_id = ?1",
+                params![share_id, stale],
+            )
+            .expect("backdate Share before cleanup");
+        }
+
+        let cleanup = store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("retire stale offline Share");
+        assert_eq!(cleanup.deleted_shares, 1);
+        {
+            let conn = store.conn.lock().await;
+            let host = crate::public_hosts::get_by_label(&conn, &subdomain)
+                .expect("read retired public host")
+                .expect("retired public host remains reserved");
+            assert_eq!(
+                host.lifecycle,
+                crate::public_hosts::PublicHostLifecycle::Tombstoned
+            );
+        }
+
+        let share = test_share_descriptor(share_id, &subdomain);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &share,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_share_subdomain(
+                &config,
+                ShareClaimSubdomainRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    claim: None,
+                    share,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("exact signed Share identity should restore its host");
+
+        let conn = store.conn.lock().await;
+        let rebuilt_subdomain: String = conn
+            .query_row(
+                "SELECT subdomain FROM shares WHERE share_id = ?1 AND installation_id = ?2",
+                params![share_id, installation_id],
+                |row| row.get(0),
+            )
+            .expect("read rebuilt Share");
+        let host = crate::public_hosts::get_by_label(&conn, &subdomain)
+            .expect("read restored public host")
+            .expect("restored public host exists");
+        assert_eq!(rebuilt_subdomain, subdomain);
+        assert_eq!(
+            host.lifecycle,
+            crate::public_hosts::PublicHostLifecycle::Active
+        );
+        assert_eq!(host.revision, 3);
+        drop(conn);
 
         let _ = std::fs::remove_file(&config.database.path);
     }
