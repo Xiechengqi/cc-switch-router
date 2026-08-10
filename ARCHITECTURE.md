@@ -80,26 +80,29 @@ for_sale_official_price_percent_by_app: BTreeMap<String, u16>
 - `share_request_logs`、`llm_request_metrics` —— 逐请求计量(模型、Token 数、延迟、估算成本)
 - `share_model_health_state` —— 滚动健康度,支撑 Share 间自动 failover
 - `free_share_ip_parallel_limit` —— 免费档按真实用户 IP 限并发
+- Server Provider Bundle 的有效模型策略随 Share descriptor 同步。Router 按 `bundleId` 合并 Client/Share 侧边栏供应商；全局策略只合并展示一次，按 App 独立策略逐 App 展示，Profile 固定策略始终作为只读例外单列。
 
 > **关键性质:Router 不持有上游凭证。** `ShareUpstreamProvider` 绑定在卖方 Server 侧,凭据始终留在卖方机器上。Router 只做路由、计量、鉴权和脱敏,不是凭证托管方。
 
 ### ② Share Market —— 固定拼车位租用
 
-Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制以及每日价格。
+Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,候选项同时展示 subdomain、owner 和已绑定应用，并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制、每日价格和服务期限。
 
-- 每日价格留空时是免费拼车位；不要求信用额度、不进入账务系统。Owner 可设置 1–365 天固定期限或永久，固定期限从 managed grant 实际生效时开始，到期自动走 revoke 回收。
+- Token 限额留空表示不限额，此时周期固定归一为累计且 UI 不显示周期；设置限额后才选择累计不重置、每天、自然周、每 7 天、自然月或每 30 天。Token 重置周期与服务期限相互独立。
+- 免费和付费拼车位都可设置 1–365 天固定服务期限或无固定期限。固定期限从买家确认租用成功时开始，绝对到期时间同时冻结到 Subscription 和 Server grant policy；授权延迟或账单暂停不会顺延，到期后任何状态都不得恢复服务。
+- 每日价格留空时是免费拼车位；不要求信用额度、不进入账务系统。付费固定期限到期时会立即终止账务合约，并通过现有 revoke 流程安全回收授权；回收失败时座位不会提前恢复为可租。
 - 准入按 `share/free`、`share/paid`、`client_host/free`、`client_host/paid` 四个作用域独立配置。免费默认黑名单，未知用户可先体验；付费默认白名单，需 Owner 明确允许并授予信用额度。
 - 付费拼车位先授权服务,前 12 小时不计费。体验期结束后,Router 只按实际健康服务区间累计费用,未知或不可用时间不计费。
 - 付费 Share 与 Client Host 共用按「买家 + 供应商」聚合的 USD 赊账账户。有限信用额度使用达到 80% 时向买卖双方预警,用满、任一方主动清账或最后一个服务结束时生成合并账单并暂停相关服务；无限额度只接受主动清账。美元兑人民币汇率由动态 Settings 管理并默认 `1:7`；未出账估算使用当前汇率，账单冻结出账时的汇率、人民币总额和明细，CNY 不参与记账。
 - 用户按供应商收款资料线下付款并声明,供应商确认后恢复仍有效的服务；逾期会限制用户继续使用市场赊账。争议由 Router 管理员裁决,账单也可由管理员作废。
 - 出账时会把供应商当时的收款方式和联系方式冻结到该账单,避免后续资料修改改变未结账单的付款依据或争议证据。
 - 供应商可随时永久关闭某个买方的赊账关系；即使已有待处理账单,关闭意图也会立即锁定并终止服务,清账或作废后不会恢复,未来也禁止双方再次建立付费租约。
-- 买家点击租用先经过交易确认，确认内容固定展示 Owner、服务、在线状态、免费期限或 USD 日费，以及付费服务的 12 小时健康时长试用和按供应商聚合账单语义；提交继续携带 `offerRevision` 防止确认后报价被替换。
+- 买家点击租用先经过交易确认，确认内容固定展示 Owner、服务、在线状态、USD 日费或免费报价、独立服务期限，以及付费服务的 12 小时健康时长试用和按供应商聚合账单语义；提交继续携带 `offerRevision` 防止确认后报价被替换。
 - 租用后,Router 才通过 pending Share edit 在 Server 上创建 `routerShareMarket` 管理的 `shareto` entitlement。普通 Share 编辑不能修改或删除这类 entitlement。
 - Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
 - **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
 
-市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `free_duration_days`，Subscription 另存 `activated_at` / `expires_at`。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
+市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `service_duration_days`，Subscription 另存从租用成功时计算的绝对 `expires_at`，`activated_at` 只记录授权实际生效时间。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
 
 账户 UI 以 `/account/market-readiness` 作为供应商运营摘要，聚合收款资料、待准入数量、账务待办与四项准入策略；实际写操作仍分别归属收款信息、市场准入和市场账务页面。账务页以待处理、应付、应收、历史和管理员争议分区，不引入独立的前端账务状态。
 
@@ -233,7 +236,7 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 通知 | `client_notification_events`、`email_delivery_batches` 等 9 张 |
 | 运维告警信号 | `operator_alert_signal_outbox` |
 | 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
-| 认证 | `users`、`user_sessions`、`user_api_tokens`、`email_login_challenges`、`user_profiles` |
+| 认证 | `users`（含用量卡片公开开关）、`user_sessions`、`user_api_tokens`、`email_login_challenges` |
 
 ### 账户用量（Provider / Consumer）
 
@@ -241,7 +244,8 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 - **Provider**：`owner_email` 下多 installation / share 的被消耗量 → `GET /v1/me/usage/provider`
 - **Consumer**：`user_email` 跨 share 的调用量 → `GET /v1/me/usage/consumer`
-- **公开 SVG**：`GET /v1/public/embed/global.svg`（全站）、`GET /v1/public/embed/usage/:username`（opt-in 个人）
+- **用量卡片设置**：`GET/PATCH /v1/me/usage-card`；公开统计默认开启，卡片身份直接使用账号邮箱，公开 URL 使用稳定的用户 UUID
+- **公开 SVG**：`GET /v1/public/embed/global.svg`（全站）、`GET /v1/public/embed/usage/:user_id`（可关闭的个人卡片）；默认 `24h`、浅色主题
 - 数据来自现有 `share_request_logs` / `market_request_logs` 短窗口聚合（24h / 7d / 30d），见 `usage_account.rs` / `embed_usage.rs`
 
 ### 已知限制

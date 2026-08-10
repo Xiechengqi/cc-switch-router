@@ -36,7 +36,7 @@ import {
   shareApiParts,
   sortClients,
 } from "@/components/dashboard/data-tables";
-import type { ClientMarketRental, DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
+import type { ClientMarketRental, DashboardClient, DashboardMarket, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { getMyClientMarketRentals, recordDashboardUxEvent } from "@/lib/api";
@@ -63,6 +63,32 @@ function sortShares(shares: ShareView[]) {
 }
 
 const CLIENT_EXPANDED_STORAGE_KEY = "cc_switch_router_client_expanded_v2";
+const CLIENT_LIST_TABS = ["mine", "all", "online", "reconnecting", "degraded", "offline"] as const;
+
+type ClientListTab = (typeof CLIENT_LIST_TABS)[number];
+
+function normalizeEmail(value?: string) {
+  return value?.trim().toLowerCase() || "";
+}
+
+function normalizeClientListTab(value: unknown, hasViewerIdentity: boolean): ClientListTab {
+  if (typeof value !== "string" || !(CLIENT_LIST_TABS as readonly string[]).includes(value)) return "all";
+  return value === "mine" && !hasViewerIdentity ? "all" : value as ClientListTab;
+}
+
+function clientBelongsToViewer(
+  client: DashboardClient,
+  shareById: ReadonlyMap<string, ShareView>,
+  viewerEmail: string,
+) {
+  if (!viewerEmail) return false;
+  const ownerEmail = normalizeEmail(client.clientTunnel?.ownerEmail || client.installation.ownerEmail);
+  if (ownerEmail === viewerEmail) return true;
+  return (client.shareIds || []).some((shareId) => {
+    const grant = shareById.get(shareId)?.userGrants?.[viewerEmail];
+    return grant?.role === "shareto" && grant.active === true;
+  });
+}
 
 function includesQuery(values: Array<string | undefined>, query: string) {
   return values.some((value) => String(value || "").toLocaleLowerCase().includes(query));
@@ -502,6 +528,8 @@ export function ClientBoard({
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
   const authed = !!session?.authenticated;
+  const sessionEmail = normalizeEmail(session?.user?.email);
+  const hasViewerIdentity = authed && !!sessionEmail;
   const focus = useDashboardFocus();
   const { issuesOnly, setIssuesOnly, regionFilters, setRegionFilters, clearRegionFilters } = useDashboardViewState();
   const { trackOperation } = useOperationVerification();
@@ -515,7 +543,8 @@ export function ClientBoard({
   const [filtersOpen, setFiltersOpen] = React.useState(false);
   const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "reconnecting" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
+  const [statusFilterRaw, setStatusFilter] = usePersistentState<ClientListTab>("cc_switch_router_client_status_v1", "all");
+  const statusFilter = normalizeClientListTab(statusFilterRaw, hasViewerIdentity);
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "tokens");
   const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
     CLIENT_EXPANDED_STORAGE_KEY,
@@ -553,6 +582,10 @@ export function ClientBoard({
   }, [setSortOrder, sortOrder]);
 
   React.useEffect(() => {
+    if (statusFilterRaw !== statusFilter) setStatusFilter(statusFilter);
+  }, [setStatusFilter, statusFilter, statusFilterRaw]);
+
+  React.useEffect(() => {
     if (issuesOnly) setStatusFilter("all");
   }, [issuesOnly, setStatusFilter]);
 
@@ -565,16 +598,23 @@ export function ClientBoard({
     [defaultExpandedClientId, expandedClientIds],
   );
   const shareById = React.useMemo(() => new Map(shares.map((share) => [share.shareId, share])), [shares]);
+  const mineClientIds = React.useMemo(() => {
+    if (!hasViewerIdentity) return new Set<string>();
+    return new Set(
+      sortedClients
+        .filter((client) => clientBelongsToViewer(client, shareById, sessionEmail))
+        .map((client) => client.installation.id),
+    );
+  }, [hasViewerIdentity, sessionEmail, shareById, sortedClients]);
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
-  const sessionEmail = session?.user?.email?.trim().toLocaleLowerCase() || "";
   const takeoverSourcesFor = React.useCallback(
     (target: DashboardClient) => {
       if (!sessionEmail || target.clientTunnel?.routeState !== "active" || !target.clientTunnel.enabled) return [];
-      const targetOwner = (target.clientTunnel.ownerEmail || target.installation.ownerEmail || "").trim().toLocaleLowerCase();
+      const targetOwner = normalizeEmail(target.clientTunnel.ownerEmail || target.installation.ownerEmail);
       if (targetOwner !== sessionEmail) return [];
       return clients.filter((candidate) => {
         if (candidate.installation.id === target.installation.id || !candidate.clientTunnel?.subdomain) return false;
-        const owner = (candidate.clientTunnel.ownerEmail || candidate.installation.ownerEmail || "").trim().toLocaleLowerCase();
+        const owner = normalizeEmail(candidate.clientTunnel.ownerEmail || candidate.installation.ownerEmail);
         return owner === sessionEmail;
       });
     },
@@ -635,7 +675,8 @@ export function ClientBoard({
       if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
       const region = row.client.installation.countryCode || row.client.installation.region || "";
       if (regionFilters.length > 0 && !regionFilters.includes(region)) return false;
-      if (statusFilter !== "all" && row.state !== statusFilter) return false;
+      if (statusFilter === "mine" && !mineClientIds.has(row.client.installation.id)) return false;
+      if (statusFilter !== "mine" && statusFilter !== "all" && row.state !== statusFilter) return false;
       if (issuesOnly && row.state === "online") return false;
       return true;
     });
@@ -665,20 +706,22 @@ export function ClientBoard({
       return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
     return rows;
-  }, [focus.target, issuesOnly, query, regionFilters, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
+  }, [focus.target, issuesOnly, mineClientIds, query, regionFilters, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
 
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
     return {
+      mine: mineClientIds.size,
       online: states.filter((state) => state === "online").length,
       reconnecting: states.filter((state) => state === "reconnecting").length,
       degraded: states.filter((state) => state === "degraded").length,
       offline: states.filter((state) => state === "offline").length,
       issues: states.filter((state) => state !== "online").length,
     };
-  }, [sharesForClient, sortedClients]);
+  }, [mineClientIds, sharesForClient, sortedClients]);
 
   const visibleOrphanShares = React.useMemo(() => {
+    if (statusFilter === "mine") return [];
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return orphanShares.filter((share) => {
       if (normalizedQuery && !shareMatchesQuery(share, normalizedQuery)) return false;
@@ -784,16 +827,23 @@ export function ClientBoard({
   }, [filtersOpen]);
 
   const activeFilterCount = regionFilters.length;
+  const clientTabs: Array<{ value: ClientListTab; label: string; count: number }> = [
+    ...(hasViewerIdentity ? [{ value: "mine" as const, label: t("dashboard.mine"), count: clientSummary.mine }] : []),
+    { value: "all", label: t("dashboard.all"), count: sortedClients.length },
+    { value: "online", label: t("common.online"), count: clientSummary.online },
+    { value: "reconnecting", label: t("dashboard.reconnecting"), count: clientSummary.reconnecting },
+    { value: "degraded", label: t("dashboard.degraded"), count: clientSummary.degraded },
+    { value: "offline", label: t("common.offline"), count: clientSummary.offline },
+  ];
+  const mineIsEmpty = statusFilter === "mine" && mineClientIds.size === 0;
 
   return (
     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-4">
         <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
-            {([[
-              "all", t("dashboard.all"), sortedClients.length,
-            ], ["online", t("common.online"), clientSummary.online], ["reconnecting", t("dashboard.reconnecting"), clientSummary.reconnecting], ["degraded", t("dashboard.degraded"), clientSummary.degraded], ["offline", t("common.offline"), clientSummary.offline]] as const).map(([value, label, count]) => (
-              <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+            {clientTabs.map(({ value, label, count }) => (
+              <button key={value} type="button" aria-pressed={statusFilter === value} onClick={() => { setStatusFilter(value); if (value === "mine" || value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
           <Button variant="outline" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
@@ -899,8 +949,8 @@ export function ClientBoard({
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
-              <span>{sortedClients.length ? t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
-              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); clearRegionFilters(); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
+              <span>{sortedClients.length ? mineIsEmpty ? t("dashboard.noMyClients") : t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
+              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); clearRegionFilters(); setIssuesOnly(false); }}>{mineIsEmpty ? t("dashboard.showAll") : t("dashboard.clearFilters")}</button> : null}
             </div>
           </EmptyBlock>
         )}

@@ -11,13 +11,10 @@ use serde::Serialize;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::ServerState;
-use crate::ctl_client::{ClientLogTailReply, CtlError};
 use crate::error::AppError;
 
 const PUBLIC_LOG_LINE_LIMIT: usize = 10;
 const FULL_LOG_LINE_LIMIT: usize = 100;
-const LOG_RESPONSE_MAX_BYTES: usize = 256 * 1024;
-const LOG_LINE_MAX_BYTES: usize = 16 * 1024;
 const GLOBAL_CONCURRENCY_LIMIT: usize = 16;
 const PER_CLIENT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const RATE_ENTRY_TTL: Duration = Duration::from_secs(5 * 60);
@@ -39,13 +36,13 @@ impl Default for ClientLogAccessLimiter {
     }
 }
 
-struct ClientLogAccessPermit {
+pub(crate) struct ClientLogAccessPermit {
     _global: OwnedSemaphorePermit,
     _client: OwnedSemaphorePermit,
 }
 
 impl ClientLogAccessLimiter {
-    async fn try_acquire(
+    pub(crate) async fn try_acquire(
         self: &Arc<Self>,
         installation_id: &str,
     ) -> Result<ClientLogAccessPermit, AppError> {
@@ -140,17 +137,13 @@ async fn client_logs_inner(
             "invalid Client installation id".into(),
         ));
     }
-    let target = state
+    let exists = state
         .store
-        .client_log_target(installation_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Client not found".into()))?;
-    if !target.log_collection_enabled {
-        return Err(AppError::Conflict(
-            "Client log collection is disabled".into(),
-        ));
+        .client_log_installation_exists(installation_id)
+        .await?;
+    if !exists {
+        return Err(AppError::NotFound("Client not found".into()));
     }
-
     let session = crate::api::resolve_router_session(state, headers).await?;
     let is_router_owner = session.as_ref().is_some_and(|session| {
         state
@@ -167,165 +160,35 @@ async fn client_logs_inner(
         false
     };
     let full_log_access = is_router_owner || is_client_owner;
+    if !full_log_access && !state.dynamic.read().await.server_log_public_enabled {
+        return Err(AppError::Forbidden(
+            "public server logs are disabled".into(),
+        ));
+    }
     let limit = if full_log_access {
         FULL_LOG_LINE_LIMIT
     } else {
         PUBLIC_LOG_LINE_LIMIT
     };
     let _permit = state.client_logs.try_acquire(installation_id).await?;
-    let route = state
-        .proxy
-        .active_client_route(&target.subdomain)
-        .await
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(
-                "Client logs are unavailable while the Client is offline".into(),
-            )
-        })?;
-    if route.installation_id() != Some(installation_id) {
-        return Err(AppError::ServiceUnavailable(
-            "Client log route does not match the installation".into(),
-        ));
-    }
-    let reply = crate::ctl_client::fetch_client_log_tail(
-        &state.proxy_http,
-        route.route_target(),
-        installation_id,
-        &target.control_secret,
-        limit,
-    )
-    .await
-    .map_err(map_control_error)?;
-    let mut content = validate_client_reply(&reply, limit)?;
-    if !full_log_access {
-        content = public_log_projection(&content);
-    }
-    let lines = content.lines().count();
+    let tail = state
+        .server_logs
+        .client_text_tail(installation_id, !full_log_access, limit)
+        .await?;
     Ok(ClientLogsResponse {
         installation_id: installation_id.to_string(),
-        content,
-        lines,
+        content: tail.content,
+        lines: tail.lines,
         limit,
-        truncated: reply.truncated,
+        truncated: tail.truncated,
         full_log_access,
         fetched_at: chrono::Utc::now().to_rfc3339(),
     })
 }
 
-fn map_control_error(error: CtlError) -> AppError {
-    match error {
-        CtlError::Unreachable(_) | CtlError::Timeout => {
-            AppError::ServiceUnavailable("Client logs are temporarily unavailable".into())
-        }
-        CtlError::Rejected { .. } => {
-            AppError::ServiceUnavailable("Client rejected the log request".into())
-        }
-        CtlError::Malformed(_) => {
-            AppError::Internal("Client returned an invalid log response".into())
-        }
-    }
-}
-
-fn validate_client_reply(reply: &ClientLogTailReply, limit: usize) -> Result<String, AppError> {
-    if reply.content.len() > LOG_RESPONSE_MAX_BYTES {
-        return Err(AppError::Internal(
-            "Client log response is too large".into(),
-        ));
-    }
-    let lines = reply.content.lines().collect::<Vec<_>>();
-    if lines.len() > limit
-        || reply.lines != lines.len()
-        || lines.iter().any(|line| line.len() > LOG_LINE_MAX_BYTES)
-    {
-        return Err(AppError::Internal(
-            "Client returned an invalid log response".into(),
-        ));
-    }
-    Ok(lines
-        .into_iter()
-        .map(|line| line.trim_end_matches('\r'))
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
-fn public_log_projection(content: &str) -> String {
-    content
-        .lines()
-        .map(public_log_line)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn public_log_line(line: &str) -> String {
-    line.split_whitespace()
-        .map(|token| {
-            let trimmed = token.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
-                )
-            });
-            let value = trimmed
-                .rsplit_once('=')
-                .map(|(_, value)| value)
-                .unwrap_or(trimmed)
-                .trim_matches(|character: char| {
-                    matches!(
-                        character,
-                        ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
-                    )
-                });
-            if value.contains('@') {
-                "[email]"
-            } else if contains_ip_address(value) {
-                "[ip]"
-            } else if value.contains("http://") || value.contains("https://") {
-                "[url]"
-            } else if value.len() > 96 {
-                "[value]"
-            } else {
-                token
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn contains_ip_address(value: &str) -> bool {
-    value.parse::<std::net::IpAddr>().is_ok()
-        || value.parse::<std::net::SocketAddr>().is_ok()
-        || value
-            .split(|character: char| {
-                !(character.is_ascii_hexdigit() || matches!(character, '.' | ':' | '%'))
-            })
-            .filter(|candidate| candidate.contains('.') || candidate.contains(':'))
-            .map(|candidate| candidate.split('%').next().unwrap_or(candidate))
-            .any(|candidate| candidate.parse::<std::net::IpAddr>().is_ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn public_projection_removes_identity_and_network_values() {
-        let projected = public_log_projection(
-            "owner=user@example.com ip=203.0.113.4 wrapped=Some(198.51.100.8) socket=[2001:db8::1]:443 url=https://client.example/path ordinary=value",
-        );
-        assert_eq!(projected, "[email] [ip] [ip] [ip] [url] ordinary=value");
-    }
-
-    #[test]
-    fn client_reply_must_match_the_authorized_limit() {
-        let reply = ClientLogTailReply {
-            ok: true,
-            lines: 2,
-            truncated: false,
-            content: "one\ntwo".into(),
-        };
-        assert_eq!(validate_client_reply(&reply, 2).unwrap(), "one\ntwo");
-        assert!(validate_client_reply(&reply, 1).is_err());
-    }
 
     #[tokio::test]
     async fn limiter_rejects_immediate_repeat_for_one_client() {

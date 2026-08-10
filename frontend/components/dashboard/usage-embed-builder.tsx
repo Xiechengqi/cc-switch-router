@@ -4,77 +4,55 @@ import * as React from "react";
 import { Button } from "@heroui/react";
 import { Copy } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { AccountUsagePeriod } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { USAGE_PERIODS } from "@/components/dashboard/account-usage-shared";
-
-export type EmbedTheme = "dark" | "light";
-export type EmbedNumberFormat = "compact" | "full";
-
-export type UsageEmbedOptions = {
-  period: AccountUsagePeriod;
-  theme: EmbedTheme;
-  models: number;
-  showBreakdown: boolean;
-  showModels: boolean;
-  compact: boolean;
-  format: EmbedNumberFormat;
-};
-
-export const DEFAULT_EMBED_OPTIONS: UsageEmbedOptions = {
-  period: "7d",
-  theme: "dark",
-  models: 8,
-  showBreakdown: true,
-  showModels: true,
-  compact: false,
-  format: "compact",
-};
+import type { UsageEmbedOptions } from "@/lib/usage-card-preferences";
 
 function buildEmbedQuery(options: UsageEmbedOptions, stamp?: number) {
   const params = new URLSearchParams();
   params.set("period", options.period);
-  if (options.theme !== "dark") params.set("theme", options.theme);
-  if (options.models !== 8) params.set("models", String(options.models));
-  if (!options.showBreakdown) params.set("showBreakdown", "0");
-  if (!options.showModels) params.set("showModels", "0");
-  if (options.compact) params.set("compact", "1");
-  if (options.format !== "compact") params.set("format", options.format);
+  params.set("theme", options.theme);
+  params.set("models", String(options.models));
+  params.set("showBreakdown", options.showBreakdown ? "1" : "0");
+  params.set("showModels", options.showModels ? "1" : "0");
+  params.set("compact", options.compact ? "1" : "0");
+  params.set("format", options.format);
   if (stamp != null) params.set("t", String(stamp));
   return params.toString();
 }
 
 export function buildUsageEmbedUrl(
   host: string,
-  username: string,
+  userId: string,
   options: UsageEmbedOptions,
   stamp?: number,
 ) {
   const query = buildEmbedQuery(options, stamp);
-  return `https://${host}/v1/public/embed/usage/${encodeURIComponent(username)}.svg?${query}`;
+  return `https://${host}/v1/public/embed/usage/${encodeURIComponent(userId)}.svg?${query}`;
 }
 
-export function buildUsageEmbedMarkdown(host: string, username: string, options: UsageEmbedOptions) {
-  return `![TokenSwitch Usage](${buildUsageEmbedUrl(host, username, options)})`;
+export function buildUsageEmbedMarkdown(host: string, userId: string, options: UsageEmbedOptions) {
+  const src = buildUsageEmbedUrl(host, userId, options);
+  return `[![TokenSwitch Usage](${src})](${src})`;
 }
 
-export function buildUsageEmbedHtml(host: string, username: string, options: UsageEmbedOptions) {
-  const src = buildUsageEmbedUrl(host, username, options);
-  return `<img src="${src}" alt="TokenSwitch Usage" width="680" />`;
+export function buildUsageEmbedHtml(host: string, userId: string, options: UsageEmbedOptions) {
+  const src = buildUsageEmbedUrl(host, userId, options);
+  return `<object data="${src}" type="image/svg+xml" width="680" aria-label="TokenSwitch Usage"><img src="${src}" alt="TokenSwitch Usage" width="680" /></object>`;
 }
 
 type Translate = ReturnType<typeof useLocaleText>["t"];
 
 export function UsageEmbedBuilder({
   host,
-  username,
+  userId,
   enabled,
   options,
   onChange,
   t,
 }: {
   host: string;
-  username: string;
+  userId: string;
   enabled: boolean;
   options: UsageEmbedOptions;
   onChange: (next: UsageEmbedOptions) => void;
@@ -82,19 +60,36 @@ export function UsageEmbedBuilder({
 }) {
   const [copied, setCopied] = React.useState<"md" | "html" | "url" | null>(null);
   const [previewStamp, setPreviewStamp] = React.useState(() => Date.now());
+  const previewRef = React.useRef<HTMLObjectElement>(null);
 
   React.useEffect(() => {
     setPreviewStamp(Date.now());
-  }, [options, enabled, username]);
+  }, [options, enabled, userId]);
 
   const patch = (partial: Partial<UsageEmbedOptions>) => {
     onChange({ ...options, ...partial });
   };
 
-  const markdown = enabled ? buildUsageEmbedMarkdown(host, username, options) : "";
-  const html = enabled ? buildUsageEmbedHtml(host, username, options) : "";
-  const url = enabled ? buildUsageEmbedUrl(host, username, options) : "";
-  const previewSrc = enabled ? buildUsageEmbedUrl(host, username, options, previewStamp) : "";
+  const markdown = enabled ? buildUsageEmbedMarkdown(host, userId, options) : "";
+  const html = enabled ? buildUsageEmbedHtml(host, userId, options) : "";
+  const url = enabled ? buildUsageEmbedUrl(host, userId, options) : "";
+  const previewSrc = enabled ? buildUsageEmbedUrl(host, userId, options, previewStamp) : "";
+
+  const syncPeriodFromPreview = () => {
+    try {
+      const loadedUrl = previewRef.current?.contentDocument?.URL;
+      if (!loadedUrl) return;
+      const nextPeriod = new URL(loadedUrl).searchParams.get("period");
+      if (
+        (nextPeriod === "24h" || nextPeriod === "7d" || nextPeriod === "30d")
+        && nextPeriod !== options.period
+      ) {
+        patch({ period: nextPeriod });
+      }
+    } catch {
+      // Cross-origin embeds still navigate internally; only control-state syncing is unavailable.
+    }
+  };
 
   const copy = async (kind: "md" | "html" | "url", value: string) => {
     if (!value) return;
@@ -219,14 +214,18 @@ export function UsageEmbedBuilder({
 
       <div className="grid gap-2">
         <div className="text-sm font-semibold text-foreground">{t("account.consumerUsage.preview")}</div>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
+        <object
+          ref={previewRef}
           key={previewSrc}
-          src={previewSrc}
-          alt={t("account.consumerUsage.preview")}
-          className="max-w-full rounded-lg border border-border bg-muted/20"
+          data={previewSrc}
+          type="image/svg+xml"
+          aria-label={t("account.consumerUsage.preview")}
+          className="w-full max-w-[680px] rounded-lg border border-border bg-muted/20"
           width={680}
-        />
+          onLoad={syncPeriodFromPreview}
+        >
+          {t("account.consumerUsage.previewUnavailable")}
+        </object>
       </div>
 
       <SnippetBlock

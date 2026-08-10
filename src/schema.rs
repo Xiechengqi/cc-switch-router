@@ -228,7 +228,16 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 110);
+        assert_eq!(table_count, 109);
+        let legacy_profile_table_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'user_profiles'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count legacy profile tables");
+        assert_eq!(legacy_profile_table_count, 0);
         let versions = conn
             .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
             .expect("prepare migration history")

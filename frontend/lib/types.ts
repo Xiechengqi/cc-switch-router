@@ -137,7 +137,14 @@ export type CountryBoard = {
 
 export type RouteState = "active" | "reconnecting" | "offline";
 
-export type OperationalState = "available" | "online" | "reconnecting" | "degraded" | "offline" | "maintenance" | "disabled";
+export type OperationalState =
+  | "available"
+  | "online"
+  | "reconnecting"
+  | "degraded"
+  | "offline"
+  | "maintenance"
+  | "disabled";
 
 export type OperationalReasonCode =
   | "route_reconnecting"
@@ -229,6 +236,67 @@ export type ClientLogsResponse = {
   fetchedAt: string;
 };
 
+export type ServerLogScope = "public" | "mine" | "all";
+
+export type ServerLogClient = {
+  installationId?: string;
+  clientAlias: string;
+  subdomain?: string;
+  ownerEmail?: string;
+  platform: string;
+  appVersion: string;
+  countryCode?: string;
+  region?: string;
+  createdAt: string;
+  lastSeenAt: string;
+  tunnelEnabled?: boolean;
+};
+
+export type ServerLogMeta = {
+  ingestEnabled: boolean;
+  publicEnabled: boolean;
+  authenticated: boolean;
+  isRouterOwner: boolean;
+  scopes: ServerLogScope[];
+  clients: ServerLogClient[];
+  retentionDays: number;
+  publicWindowSeconds: number;
+};
+
+export type ServerLogEvent = {
+  eventId: string;
+  clientAlias: string;
+  clientSubdomain?: string;
+  installationId?: string;
+  streamId?: string;
+  sequence?: number;
+  occurredAtMs: number;
+  receivedAtMs: number;
+  level: string;
+  target: string;
+  message: string;
+  fields?: Record<string, unknown>;
+  file?: string;
+  line?: number;
+  serverVersion?: string;
+  commitId?: string;
+};
+
+export type ServerLogEventsResponse = {
+  events: ServerLogEvent[];
+  nextCursor?: string;
+  publicWindowSeconds?: number;
+  serverTimeMs: number;
+};
+
+export type LiveClientLogTail = {
+  installationId: string;
+  content: string;
+  lines: number;
+  truncated: boolean;
+  fetchedAt: string;
+};
+
 export type ClientSubdomainTakeoverRequest = {
   targetInstallationId: string;
   sourceInstallationId: string;
@@ -246,12 +314,7 @@ export type ClientSubdomainTakeoverResponse = {
 };
 
 export type ShareTokenPeriod =
-  | "lifetime"
-  | "day"
-  | "week"
-  | "sevenDays"
-  | "calendarMonth"
-  | "thirtyDays";
+  "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays";
 
 export type ShareUserPolicy = {
   parallelLimit?: number;
@@ -339,7 +402,9 @@ export type ShareAppAccess = {
   marketAccessMode: "selected" | "all";
 };
 
-export type ShareAccessByApp = Partial<Record<"claude" | "codex" | "gemini", ShareAppAccess>>;
+export type ShareAccessByApp = Partial<
+  Record<"claude" | "codex" | "gemini", ShareAppAccess>
+>;
 
 export type ShareAppSettings = {
   forSale?: "Yes" | "No" | "Free";
@@ -350,7 +415,9 @@ export type ShareAppSettings = {
   expiresAt?: string;
 };
 
-export type ShareAppSettingsByApp = Partial<Record<"claude" | "codex" | "gemini", ShareAppSettings>>;
+export type ShareAppSettingsByApp = Partial<
+  Record<"claude" | "codex" | "gemini", ShareAppSettings>
+>;
 
 export type ShareSettingsPatch = {
   ownerEmail?: string;
@@ -485,17 +552,14 @@ export type ProviderUsageResponse = UsageTokenTotals & {
   installations: ProviderInstallationUsage[];
 };
 
-export type UserProfileResponse = {
-  email?: string;
-  username?: string | null;
+export type UsageCardSettingsResponse = {
+  userId: string;
+  email: string;
   publicStatsEnabled: boolean;
-  createdAt?: string;
-  updatedAt?: string;
 };
 
-export type UpdateUserProfileRequest = {
-  username?: string | null;
-  publicStatsEnabled?: boolean;
+export type UpdateUsageCardSettingsRequest = {
+  publicStatsEnabled: boolean;
 };
 
 export type ShareMarketLink = {
@@ -664,7 +728,8 @@ export type ShareRequestLog = {
   clientServiceTier?: string;
   effectiveServiceTier?: string;
   serviceTierDecision?: string;
-  usageState?: "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
+  usageState?:
+    "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
   streamStatus?: string;
   usageRevision?: number;
   statusCode: number;
@@ -794,7 +859,8 @@ export type MarketRequestLog = {
   requestedModel: string;
   actualModel: string;
   actualModelSource?: string;
-  usageState?: "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
+  usageState?:
+    "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
   streamStatus?: string;
   usageRevision?: number;
   status: string;
@@ -836,7 +902,8 @@ export type RecentRequestEvent = {
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
   totalTokens?: number;
-  usageState?: "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
+  usageState?:
+    "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
   streamStatus?: string;
   usageRevision?: number;
   isHealthCheck?: boolean;
@@ -890,6 +957,12 @@ export type ShareModelHealthSummary = {
   gemini?: ModelHealthSummary[];
 };
 
+export type ShareProviderModelPolicyScope = "global" | "per_app";
+export type ShareProviderModelPolicySource =
+  "bundle_global" | "app_independent" | "profile_fixed";
+export type ShareProviderModelPolicy =
+  { mode: "passthrough" } | { mode: "single"; upstreamModel: string };
+
 export type ShareUpstreamProvider = {
   providerName?: string;
   kind?: string;
@@ -923,12 +996,17 @@ export type ShareUpstreamProvider = {
     slot?: string;
     actualModel?: string;
   }>;
+  modelPolicyScope?: ShareProviderModelPolicyScope;
+  modelPolicySource?: ShareProviderModelPolicySource;
+  modelPolicy?: ShareProviderModelPolicy;
 };
 
 export type ShareAppProvider = {
   id: string;
   name: string;
   app: "claude" | "codex" | "gemini" | string;
+  bundleId?: string;
+  supportedApps?: string[];
   kind?: string;
   providerType?: string;
   isCurrent?: boolean;
@@ -939,6 +1017,9 @@ export type ShareAppProvider = {
   apiUrl?: string;
   quota?: ShareUpstreamProvider["quota"];
   models?: ShareUpstreamProvider["models"];
+  modelPolicyScope?: ShareProviderModelPolicyScope;
+  modelPolicySource?: ShareProviderModelPolicySource;
+  modelPolicy?: ShareProviderModelPolicy;
 };
 
 export type ShareAppProviders = {
@@ -977,7 +1058,18 @@ export type SettingsField = {
   key: string;
   label: string;
   group: string;
-  fieldType: "text" | "select" | "int" | "decimal" | "bool" | "path" | "url" | "email" | "email_list" | "ip_list" | "secret";
+  fieldType:
+    | "text"
+    | "select"
+    | "int"
+    | "decimal"
+    | "bool"
+    | "path"
+    | "url"
+    | "email"
+    | "email_list"
+    | "ip_list"
+    | "secret";
   required: boolean;
   restartRequired: boolean;
   default?: string | null;
@@ -1128,7 +1220,8 @@ export type AlertChannelState = {
   channel: string;
   enabled: boolean;
   configured: boolean;
-  status: "disabled" | "misconfigured" | "ready" | "healthy" | "degraded" | string;
+  status:
+    "disabled" | "misconfigured" | "ready" | "healthy" | "degraded" | string;
   lastAttemptAt?: number | null;
   lastSuccessAt?: number | null;
   lastError?: string | null;
@@ -1210,7 +1303,14 @@ export type ClockSourceResult = {
 
 export type ClockHealthStatus = {
   enabled: boolean;
-  status: "healthy" | "warning" | "critical" | "degraded" | "unknown" | "disabled" | string;
+  status:
+    | "healthy"
+    | "warning"
+    | "critical"
+    | "degraded"
+    | "unknown"
+    | "disabled"
+    | string;
   direction: "ahead" | "behind" | "aligned" | "unknown" | string;
   confidence: "quorum" | "single_source" | "unavailable" | string;
   offsetMs?: number | null;
@@ -1610,7 +1710,8 @@ export type ProvisionSshKey = {
   authorizedKeysLine: string;
 };
 
-export type ProvisioningJobStatus = "pending" | "running" | "succeeded" | "failed";
+export type ProvisioningJobStatus =
+  "pending" | "running" | "succeeded" | "failed";
 
 export type ProvisioningJob = {
   id: string;
@@ -2014,7 +2115,13 @@ export type ClientMarketRental = {
   providerId: string;
   hostOwnerEmail: string;
   clientOwnerEmail: string;
-  status: "active" | "billing_suspended" | "releasing" | "release_failed" | "released" | string;
+  status:
+    | "active"
+    | "billing_suspended"
+    | "releasing"
+    | "release_failed"
+    | "released"
+    | string;
   dailyRateMinor?: number;
   currency?: "USD";
   freeDurationDays?: number;
@@ -2085,7 +2192,7 @@ export type ShareMarketSeatInput = {
   tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
   currency?: "USD";
-  freeDurationDays?: number;
+  serviceDurationDays?: number;
 };
 
 export type ShareMarketSubscription = {
@@ -2103,7 +2210,7 @@ export type ShareMarketSubscription = {
   status: string;
   dailyRateMinor?: number;
   currency?: "USD";
-  freeDurationDays?: number;
+  serviceDurationDays?: number;
   offerRevision: number;
   activatedAt?: string;
   expiresAt?: string;
@@ -2183,6 +2290,9 @@ export type ShareMarketOwnedShare = {
   shareId: string;
   shareName: string;
   appType: string;
+  subdomain: string;
+  ownerEmail: string;
+  supportedApps: string[];
   shareStatus: string;
   alreadyListed: boolean;
   supportedUserTokenPeriods: ShareTokenPeriod[];

@@ -2,7 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::namespace::PROTOCOL_EPOCH;
 
@@ -12,11 +12,15 @@ pub const INTERNAL_INGRESS_ERROR_HEADER: &str = "x-cc-switch-internal-ingress-er
 pub const INTERNAL_INGRESS_AGE_MS_HEADER: &str = "x-cc-switch-internal-ingress-age-ms";
 pub const INTERNAL_INGRESS_SERVER_TIME_MS_HEADER: &str =
     "x-cc-switch-internal-ingress-server-time-ms";
-const SIGNING_DOMAIN: &str = "cc-switch-router-ingress-v1";
+pub const SIGNATURE_VERSION: u8 = 2;
+const SIGNING_DOMAIN: &str = "cc-switch-router-ingress-v2";
+const SHA256_HEX_LENGTH: usize = 64;
+const MAX_PATH_AND_QUERY_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IngressContext {
+    pub signature_version: u8,
     pub protocol_epoch: String,
     pub router_id: String,
     pub route_id: String,
@@ -32,6 +36,9 @@ pub struct IngressContext {
     pub user_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_country: Option<String>,
+    pub method: String,
+    pub path_and_query: String,
+    pub body_sha256: String,
     pub issued_at_ms: i64,
 }
 
@@ -45,8 +52,9 @@ pub fn sign(
     mut context: IngressContext,
     control_secret: &str,
 ) -> Result<SignedIngressContext, &'static str> {
-    validate(&context, control_secret)?;
+    context.signature_version = SIGNATURE_VERSION;
     context.protocol_epoch = PROTOCOL_EPOCH.to_string();
+    validate(&context, control_secret)?;
     let encoded_context = URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&context).map_err(|_| "serialize ingress context failed")?);
     let mut mac = Hmac::<Sha256>::new_from_slice(control_secret.as_bytes())
@@ -67,7 +75,8 @@ fn validate(context: &IngressContext, control_secret: &str) -> Result<(), &'stat
     if control_secret.len() < 32 {
         return Err("ingress control secret is too short");
     }
-    if context.router_id.trim().is_empty()
+    if context.signature_version != SIGNATURE_VERSION
+        || context.router_id.trim().is_empty()
         || context.route_id.trim().is_empty()
         || context.installation_id.trim().is_empty()
         || context.target_lane_id.trim().is_empty()
@@ -76,6 +85,17 @@ fn validate(context: &IngressContext, control_secret: &str) -> Result<(), &'stat
         || context.issued_at_ms <= 0
     {
         return Err("ingress context contains an empty required field");
+    }
+    if normalize_method(&context.method).as_deref() != Some(context.method.as_str())
+        || normalize_path_and_query(&context.path_and_query).as_deref()
+            != Some(context.path_and_query.as_str())
+        || context.body_sha256.len() != SHA256_HEX_LENGTH
+        || !context
+            .body_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("ingress request binding is invalid");
     }
     if context.user_email.as_deref().is_some_and(|value| {
         value != value.trim()
@@ -95,12 +115,34 @@ fn validate(context: &IngressContext, control_secret: &str) -> Result<(), &'stat
     Ok(())
 }
 
+pub fn body_sha256_hex(body: &[u8]) -> String {
+    hex::encode(Sha256::digest(body))
+}
+
+pub fn normalize_method(method: &str) -> Option<String> {
+    let method = method.trim();
+    (!method.is_empty()
+        && method.len() <= 16
+        && method.bytes().all(|byte| byte.is_ascii_uppercase()))
+    .then(|| method.to_string())
+}
+
+pub fn normalize_path_and_query(path_and_query: &str) -> Option<String> {
+    let target = path_and_query.trim();
+    (target.starts_with('/')
+        && target.len() <= MAX_PATH_AND_QUERY_BYTES
+        && !target.contains('#')
+        && !target.bytes().any(|byte| byte.is_ascii_control()))
+    .then(|| target.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn context() -> IngressContext {
         IngressContext {
+            signature_version: SIGNATURE_VERSION,
             protocol_epoch: PROTOCOL_EPOCH.into(),
             router_id: "router-jp".into(),
             route_id: "share:share-1".into(),
@@ -112,6 +154,9 @@ mod tests {
             user_email: Some("owner@example.com".into()),
             user_role: None,
             user_country: Some("JP".into()),
+            method: "POST".into(),
+            path_and_query: "/v1/messages?beta=true".into(),
+            body_sha256: body_sha256_hex(br#"{"model":"claude-sonnet-4-6"}"#),
             issued_at_ms: 1_750_000_000_000,
         }
     }
@@ -122,11 +167,37 @@ mod tests {
         let signed = sign(context(), secret).unwrap();
         assert_eq!(
             signed.signature,
-            "RvdTGpCCJwSxo7Kn8meZ0Vx3MaHf3YocqnzKyqJxTeU"
+            "J1a63NviixVTTd2fuMrF3P696OeA-JP_abaLzW7PVEg"
         );
-        let mut changed = context();
-        changed.target_lane_id.push_str("-changed");
-        assert_ne!(sign(changed, secret).unwrap().signature, signed.signature);
+        for changed in [
+            {
+                let mut changed = context();
+                changed.target_lane_id.push_str("-changed");
+                changed
+            },
+            {
+                let mut changed = context();
+                changed.request_id.push_str("-changed");
+                changed
+            },
+            {
+                let mut changed = context();
+                changed.method = "GET".into();
+                changed
+            },
+            {
+                let mut changed = context();
+                changed.path_and_query.push_str("&changed=true");
+                changed
+            },
+            {
+                let mut changed = context();
+                changed.body_sha256 = body_sha256_hex(b"changed");
+                changed
+            },
+        ] {
+            assert_ne!(sign(changed, secret).unwrap().signature, signed.signature);
+        }
     }
 
     #[test]

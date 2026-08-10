@@ -354,6 +354,7 @@ struct ContractRow {
     buyer_user_id: String,
     supplier_user_id: String,
     currency: String,
+    service_ends_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1785,6 +1786,7 @@ pub(crate) fn terminate_contract_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
+    accrue_contract_until_tx(tx, product_kind, product_ref, parse_time(now)?)?;
     let row = tx
         .query_row(
             "SELECT id, account_id FROM market_service_contracts
@@ -4068,10 +4070,11 @@ fn void_invoice_tx(
 }
 
 fn latest_health_observation_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     product_kind: &str,
     product_ref: &str,
     service_ref: &str,
+    observed_at: DateTime<Utc>,
 ) -> Result<Option<(i64, String, String)>, AppError> {
     let service_active = match product_kind {
         "share" => tx
@@ -4111,33 +4114,52 @@ fn latest_health_observation_tx(
     tx.query_row(
         &format!(
             "SELECT checked_at, status, reason FROM {table}
-             WHERE {key} = ?1 ORDER BY checked_at DESC LIMIT 1"
+             WHERE {key} = ?1 AND checked_at <= ?2
+             ORDER BY checked_at DESC LIMIT 1"
         ),
-        params![service_ref],
+        params![service_ref, observed_at.timestamp()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
     .map_err(map_db("read latest service health observation"))
 }
 
+fn contract_evaluation_end(
+    contract: &ContractRow,
+    requested_end: DateTime<Utc>,
+) -> Result<DateTime<Utc>, AppError> {
+    let service_ends_at = contract
+        .service_ends_at
+        .as_deref()
+        .map(parse_time)
+        .transpose()?;
+    Ok(service_ends_at
+        .map(|service_ends_at| requested_end.min(service_ends_at))
+        .unwrap_or(requested_end))
+}
+
 fn load_reconcile_contracts_tx(tx: &Transaction<'_>) -> Result<Vec<ContractRow>, AppError> {
     tx.prepare(
-        "SELECT id, account_id, product_kind, product_ref, service_ref,
-                daily_rate_minor, trial_seconds_remaining,
-                health_state, last_evaluated_at, buyer_user_id, supplier_user_id, currency
-         FROM market_service_contracts
-         WHERE status IN ('trial', 'active')
-           AND account_id IN (
-               SELECT contract.account_id
-               FROM market_service_contracts contract
-               JOIN market_credit_accounts account ON account.id = contract.account_id
-               WHERE contract.status IN ('trial', 'active')
+        "SELECT contract.id, contract.account_id, contract.product_kind,
+                contract.product_ref, contract.service_ref, contract.daily_rate_minor,
+                contract.trial_seconds_remaining, contract.health_state,
+                contract.last_evaluated_at, contract.buyer_user_id,
+                contract.supplier_user_id, contract.currency, subscription.expires_at
+         FROM market_service_contracts contract
+         LEFT JOIN share_market_subscriptions subscription
+           ON contract.product_kind = 'share' AND subscription.id = contract.product_ref
+         WHERE contract.status IN ('trial', 'active')
+           AND contract.account_id IN (
+               SELECT candidate.account_id
+               FROM market_service_contracts candidate
+               JOIN market_credit_accounts account ON account.id = candidate.account_id
+               WHERE candidate.status IN ('trial', 'active')
                  AND account.status IN ('active', 'near_credit_limit')
-               GROUP BY contract.account_id
-               ORDER BY MIN(contract.last_evaluated_at), contract.account_id
+               GROUP BY candidate.account_id
+               ORDER BY MIN(candidate.last_evaluated_at), candidate.account_id
                LIMIT ?1
            )
-         ORDER BY account_id, id",
+         ORDER BY contract.account_id, contract.id",
     )
     .and_then(|mut statement| {
         statement
@@ -4155,6 +4177,7 @@ fn load_reconcile_contracts_tx(tx: &Transaction<'_>) -> Result<Vec<ContractRow>,
                     buyer_user_id: row.get(9)?,
                     supplier_user_id: row.get(10)?,
                     currency: row.get(11)?,
+                    service_ends_at: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -4162,7 +4185,7 @@ fn load_reconcile_contracts_tx(tx: &Transaction<'_>) -> Result<Vec<ContractRow>,
     .map_err(map_db("load market contracts for billing reconciliation"))
 }
 
-fn load_account_row_tx(tx: &Transaction<'_>, account_id: &str) -> Result<AccountRow, AppError> {
+fn load_account_row_tx(tx: &Connection, account_id: &str) -> Result<AccountRow, AppError> {
     tx.query_row(
         "SELECT account.id, account.buyer_user_id, account.supplier_user_id,
                 account.currency, account.status, account.balance_units,
@@ -4199,17 +4222,20 @@ fn load_account_row_tx(tx: &Transaction<'_>, account_id: &str) -> Result<Account
 }
 
 fn build_accrual_candidate_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     contract: ContractRow,
-    now: DateTime<Utc>,
+    requested_end: DateTime<Utc>,
 ) -> Result<AccrualCandidate, AppError> {
     let last = parse_time(&contract.last_evaluated_at)?;
+    let capped_end = contract_evaluation_end(&contract, requested_end)?;
+    let now = capped_end.max(last);
     let gap = (now - last).num_seconds().max(0);
     let observation = latest_health_observation_tx(
         tx,
         &contract.product_kind,
         &contract.product_ref,
         &contract.service_ref,
+        now,
     )?;
     let (observed_state, observation_reason) = match observation {
         Some((checked_at, status, reason))
@@ -4262,7 +4288,7 @@ fn build_accrual_candidate_tx(
 }
 
 fn append_service_interval_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     candidate: &AccrualCandidate,
     now: &str,
 ) -> Result<(), AppError> {
@@ -4373,8 +4399,100 @@ fn append_service_interval_tx(
     Ok(())
 }
 
+fn accrue_contract_until_tx(
+    tx: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    until: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let contract = tx
+        .query_row(
+            "SELECT contract.id, contract.account_id, contract.product_kind,
+                    contract.product_ref, contract.service_ref, contract.daily_rate_minor,
+                    contract.trial_seconds_remaining, contract.health_state,
+                    contract.last_evaluated_at, contract.buyer_user_id,
+                    contract.supplier_user_id, contract.currency, subscription.expires_at
+             FROM market_service_contracts contract
+             LEFT JOIN share_market_subscriptions subscription
+               ON contract.product_kind = 'share' AND subscription.id = contract.product_ref
+             WHERE contract.product_kind = ?1 AND contract.product_ref = ?2
+               AND contract.status IN ('trial', 'active')",
+            params![product_kind, product_ref],
+            |row| {
+                Ok(ContractRow {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    product_kind: row.get(2)?,
+                    product_ref: row.get(3)?,
+                    service_ref: row.get(4)?,
+                    daily_rate_minor: row.get(5)?,
+                    trial_seconds_remaining: row.get(6)?,
+                    health_state: row.get(7)?,
+                    last_evaluated_at: row.get(8)?,
+                    buyer_user_id: row.get(9)?,
+                    supplier_user_id: row.get(10)?,
+                    currency: row.get(11)?,
+                    service_ends_at: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_db("read market contract for final accrual"))?;
+    let Some(contract) = contract else {
+        return Ok(());
+    };
+    let account = tx
+        .query_row(
+            "SELECT status, balance_units FROM market_credit_accounts WHERE id = ?1",
+            params![contract.account_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(map_db("read market account for final accrual"))?;
+    let Some((account_status, account_balance_units)) = account else {
+        return Ok(());
+    };
+    if !matches!(
+        account_status.as_str(),
+        ACCOUNT_ACTIVE | ACCOUNT_NEAR_CREDIT_LIMIT
+    ) {
+        return Ok(());
+    }
+    let candidate = build_accrual_candidate_tx(tx, contract, until)?;
+    append_service_interval_tx(tx, &candidate, &candidate.interval_ended_at)?;
+    let next_balance = account_balance_units
+        .checked_add(candidate.requested_units)
+        .ok_or_else(|| AppError::Internal("market account balance overflowed".into()))?;
+    tx.execute(
+        "UPDATE market_credit_accounts
+         SET balance_units = ?2, version = version + 1, updated_at = ?3
+         WHERE id = ?1",
+        params![
+            candidate.contract.account_id,
+            next_balance,
+            candidate.interval_ended_at
+        ],
+    )
+    .map_err(map_db("apply final market accrual balance"))?;
+    tx.execute(
+        "UPDATE market_service_contracts
+         SET status = CASE WHEN ?2 > 0 THEN 'trial' ELSE 'active' END,
+             trial_seconds_remaining = ?2, health_state = ?3,
+             last_evaluated_at = ?4, updated_at = ?4
+         WHERE id = ?1 AND status IN ('trial', 'active')",
+        params![
+            candidate.contract.id,
+            candidate.next_trial_seconds,
+            candidate.observed_state,
+            candidate.interval_ended_at,
+        ],
+    )
+    .map_err(map_db("advance market contract final accrual"))?;
+    Ok(())
+}
+
 fn insert_service_interval_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     candidate: &AccrualCandidate,
     now: &str,
 ) -> Result<String, AppError> {
@@ -5016,20 +5134,21 @@ impl AppStore {
                      SET status = ?2, trial_seconds_remaining = ?3,
                          health_state = ?4, last_evaluated_at = ?5,
                          desired_control_state = CASE
-                             WHEN ?6 = 1 THEN 'terminated'
+                             WHEN ?7 = 1 THEN 'terminated'
                              WHEN ?2 = 'billing_suspended' THEN 'suspended'
                              ELSE desired_control_state END,
-                         control_error = CASE WHEN ?6 = 1
+                         control_error = CASE WHEN ?7 = 1
                              THEN 'supplier_credit_revoked' ELSE control_error END,
                          suspended_at = CASE WHEN ?2 = 'billing_suspended'
-                             THEN COALESCE(suspended_at, ?5) ELSE suspended_at END,
-                         updated_at = ?5
+                             THEN COALESCE(suspended_at, ?6) ELSE suspended_at END,
+                         updated_at = ?6
                      WHERE id = ?1",
                     params![
                         candidate.contract.id,
                         next_status,
                         candidate.next_trial_seconds,
                         candidate.observed_state,
+                        candidate.interval_ended_at,
                         now_text,
                         i64::from(credit_revoked),
                     ],
@@ -5772,10 +5891,6 @@ mod tests {
         force_contract_out_of_trial(&store, &contract_id, started_at).await;
         let observed_at = started_at + Duration::seconds(1);
         record_client_health(&store, "client-final", observed_at, "healthy").await;
-        store
-            .market_billing_reconcile(observed_at)
-            .await
-            .expect("accrue final service balance");
         store
             .market_billing_terminate_contract(
                 "client_host",

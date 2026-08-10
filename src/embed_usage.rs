@@ -24,6 +24,7 @@ pub enum EmbedNumberFormat {
 pub struct EmbedRenderOptions {
     pub theme: String,
     pub period: String,
+    pub models: usize,
     pub show_breakdown: bool,
     pub show_models: bool,
     pub compact: bool,
@@ -33,8 +34,9 @@ pub struct EmbedRenderOptions {
 impl Default for EmbedRenderOptions {
     fn default() -> Self {
         Self {
-            theme: "dark".to_string(),
-            period: "7d".to_string(),
+            theme: "light".to_string(),
+            period: "24h".to_string(),
+            models: 8,
             show_breakdown: true,
             show_models: true,
             compact: false,
@@ -47,14 +49,16 @@ impl EmbedRenderOptions {
     pub fn from_query(
         period: Option<&str>,
         theme: Option<&str>,
+        models: Option<usize>,
         show_breakdown: Option<&str>,
         show_models: Option<&str>,
         compact: Option<&str>,
         format: Option<&str>,
     ) -> Self {
         Self {
-            theme: normalize_theme(theme.unwrap_or("dark")).to_string(),
-            period: normalize_period_label(period.unwrap_or("7d")).to_string(),
+            theme: normalize_theme(theme.unwrap_or("light")).to_string(),
+            period: normalize_period_label(period.unwrap_or("24h")).to_string(),
+            models: models.unwrap_or(8).clamp(1, 16),
             show_breakdown: parse_bool_flag(show_breakdown, true),
             show_models: parse_bool_flag(show_models, true),
             compact: parse_bool_flag(compact, false),
@@ -173,8 +177,9 @@ fn format_number(value: u64, format: EmbedNumberFormat) -> String {
 
 fn query_suffix(opts: &EmbedRenderOptions) -> String {
     format!(
-        "theme={}&amp;showBreakdown={}&amp;showModels={}&amp;compact={}&amp;format={}",
+        "theme={}&amp;models={}&amp;showBreakdown={}&amp;showModels={}&amp;compact={}&amp;format={}",
         opts.theme,
+        opts.models,
         if opts.show_breakdown { "1" } else { "0" },
         if opts.show_models { "1" } else { "0" },
         if opts.compact { "1" } else { "0" },
@@ -389,7 +394,7 @@ pub fn render_global_usage_svg(
 }
 
 pub fn render_user_usage_svg(
-    username: &str,
+    email: &str,
     data: &AccountUsageResponse,
     opts: &EmbedRenderOptions,
 ) -> String {
@@ -404,10 +409,16 @@ pub fn render_user_usage_svg(
     let p = palette(&opts.theme);
     let title_size = if opts.compact { 14 } else { 16 };
     let total_size = if opts.compact { 22 } else { 28 };
-    let handle = escape_xml(&format!("@{}", username.trim().trim_start_matches('@')));
+    let card_identity = format!("TokenSwitch · {}", email.trim());
+    let card_identity = escape_xml(&card_identity);
+    let title_fit = if card_identity.chars().count() > 46 {
+        r#" textLength="470" lengthAdjust="spacingAndGlyphs""#
+    } else {
+        ""
+    };
     let mut y = if opts.compact { 30.0 } else { 34.0 };
     let mut body = format!(
-        r#"<text x="24" y="{y:.1}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="{title_size}" font-weight="700" fill="{text}">TokenSwitch · {handle}</text>
+        r#"<text x="24" y="{y:.1}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="{title_size}" font-weight="700" fill="{text}"{title_fit}>{card_identity}</text>
 {period_links}"#,
         text = p.text,
         period_links = period_links(&opts),
@@ -507,6 +518,31 @@ mod tests {
     }
 
     #[test]
+    fn defaults_to_light_24h_card() {
+        let opts = EmbedRenderOptions::from_query(None, None, None, None, None, None, None);
+        assert_eq!(opts.theme, "light");
+        assert_eq!(opts.period, "24h");
+        assert_eq!(opts.models, 8);
+    }
+
+    #[test]
+    fn period_links_preserve_every_visual_option() {
+        let opts = EmbedRenderOptions {
+            theme: "light".into(),
+            period: "24h".into(),
+            models: 12,
+            show_breakdown: false,
+            show_models: true,
+            compact: true,
+            format: EmbedNumberFormat::Full,
+        };
+        let links = period_links(&opts);
+        assert!(links.contains("?period=7d&amp;theme=light&amp;models=12"));
+        assert!(links.contains("showBreakdown=0&amp;showModels=1"));
+        assert!(links.contains("compact=1&amp;format=full"));
+    }
+
+    #[test]
     fn render_hides_optional_blocks() {
         let data = AccountUsageResponse {
             period: "7d".into(),
@@ -531,9 +567,11 @@ mod tests {
         let mut opts = EmbedRenderOptions::default();
         opts.show_breakdown = false;
         opts.show_models = false;
-        let svg = render_user_usage_svg("alice", &data, &opts);
+        let svg = render_user_usage_svg("alice@example.com", &data, &opts);
         assert!(!svg.contains("in "));
         assert!(!svg.contains("claude"));
         assert!(svg.contains("1.2K tokens"));
+        assert!(svg.contains("TokenSwitch · alice@example.com"));
+        assert!(!svg.contains("@alice@example.com"));
     }
 }

@@ -417,7 +417,7 @@ CREATE TABLE share_market_seats (
             token_period_json TEXT NOT NULL,
             daily_rate_minor INTEGER,
             currency TEXT,
-            free_duration_days INTEGER,
+            service_duration_days INTEGER,
             offer_revision INTEGER NOT NULL DEFAULT 1,
             current_subscription_id TEXT,
             retired_subscription_id TEXT,
@@ -444,7 +444,7 @@ CREATE TABLE share_market_subscriptions (
             token_period_json TEXT NOT NULL,
             daily_rate_minor INTEGER,
             currency TEXT,
-            free_duration_days INTEGER,
+            service_duration_days INTEGER,
             offer_revision INTEGER NOT NULL,
             release_reason TEXT,
             activated_at TEXT,
@@ -1267,6 +1267,8 @@ CREATE TABLE users (
             id TEXT PRIMARY KEY,
             email_normalized TEXT NOT NULL UNIQUE,
             status TEXT NOT NULL DEFAULT 'active',
+            public_stats_enabled INTEGER NOT NULL DEFAULT 1
+                CHECK (public_stats_enabled IN (0, 1)),
             created_at TEXT NOT NULL,
             last_login_at TEXT NOT NULL
         );
@@ -1516,14 +1518,6 @@ CREATE TABLE router_map_display_settings (
 CREATE TABLE router_announcement_settings (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             settings_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-CREATE TABLE user_profiles (
-            user_id TEXT PRIMARY KEY,
-            username TEXT,
-            username_normalized TEXT UNIQUE,
-            public_stats_enabled INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
 CREATE INDEX idx_share_request_logs_user_email_created

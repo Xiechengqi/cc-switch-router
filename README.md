@@ -35,7 +35,7 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 - **HTTP 服务** — API 端点 + 基于 Host subdomain 的反向代理 + 内嵌前端,共用同一端口
 - **SSH 服务** — 基于 `russh` 的 reverse forwarding,一次性密码认证
-- **数据存储** — 业务库可使用本地 libSQL 或 Turso Cloud Embedded Replica；metrics 使用独立本地数据库；Server 进程日志只写 Router 自有 JSONL/压缩文件
+- **数据存储** — 业务库可使用本地 libSQL 或 Turso Cloud Embedded Replica；metrics 使用独立本地数据库；Server 结构化审计日志只写 Router 自有 JSONL/压缩文件，不进入业务库
 
 核心依赖:`axum`、`russh`、`libsql`、`tokio`、`reqwest`
 
@@ -64,8 +64,9 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/client-market/*` | 33 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
 | `/v1/admin/*` | 约 43 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
-| `/v1/installations/*` | 11 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
-| `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner / Router owner | 通过在线 Client tunnel 按需读取日志；匿名与非 owner 最多 10 行，Client owner 与 Router owner 最多 100 行 |
+| `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
+| `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
+| `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner / Router owner | 从 Router 文件日志读取兼容文本 tail；匿名最多 10 条最近 5 分钟事件，Client owner 与 Router owner 最多 100 条留存事件 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
@@ -75,9 +76,9 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
 | `/v1/account/*` | 2 | Session | `payment-profile`、`payment-assets/:id` |
-| `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:username` |
+| `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
-| `/v1/dashboard/*`、`/v1/me/*` | 10 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/profile`、`me/usage/consumer`、`me/usage/provider` |
+| `/v1/dashboard/*`、`/v1/me/*` | 10 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider` |
 | 其余单例 | 约 15 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`_market/proxy/*`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
 
 ## 二进制部署
@@ -134,6 +135,11 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔(秒) |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `86400` | 过期 lease 保留时长(秒) |
 | `CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS` | `30` | Share 请求记录和图片请求历史保留天数,范围 1-365;不影响累计 Token 用量 |
+| `CC_SWITCH_ROUTER_SERVER_LOG_INGEST_ENABLED` | `true` | 是否接收 Server 结构化审计日志；修改后需重启 |
+| `CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR` | `$CC_SWITCH_ROUTER_DATA_DIR/server-logs` | Server 日志 JSONL、gzip 段、cursor 与可重建 manifest 目录；修改后需重启 |
+| `CC_SWITCH_ROUTER_SERVER_LOG_RETENTION_DAYS` | `7` | Server 日志文件保留天数，范围 1-90；修改后需重启 |
+| `CC_SWITCH_ROUTER_SERVER_LOG_MAX_TOTAL_MIB` | `1024` | Server 日志文件总容量上限 MiB，至少保留逻辑上最新的已接收事件文件；修改后需重启 |
+| `CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED` | `true` | 是否允许匿名查看最近 5 分钟的脱敏公开投影；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未心跳时标记离线,并清理其 share、lease 与内存路由 |
 | `CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS` | `21600` | 离线 client 的 installation 记录保留时长,超时后删除;必须 >= `CLIENT_STALE_SECS` |
 | `CC_SWITCH_ROUTER_CLIENT_MARKET_RECOVERY_ENABLED` | `true` | Client Market Client 自动恢复总开关；关闭后 Router 不再 SSH 介入,不影响 Host 本机 systemd/OpenRC 守护 |
@@ -182,11 +188,13 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
-### Client 日志
+### Server 日志
 
-Server 本地日志开启、级别为 `info` 且“日志采集”开关开启时，会在 installation heartbeat 中报告允许 Router 按需读取日志。Router 不接收后台上传，也不持久化或缓存 Client 日志。
+Server 本地日志开启、级别为 `info` 且“日志采集”开关开启时，会记录请求 accepted/terminal、Provider 选择、重试/切换和 OAuth 刷新等脱敏结构化 INFO 审计事件，并使用 installation Ed25519 身份持续向 Router 批量上传。上传协议不包含请求/响应正文、凭据、邮箱或任意 tracing 文本；重复批次按 boot id + sequence 幂等处理，断线期间由 Server 本地 spool 有界保留。
 
-Client 页面仅对报告已开启日志采集的 Client 显示“日志”按钮。弹窗打开期间，Router 每 3 秒通过在线 Client Web tunnel 请求最新日志；匿名用户和非该 Client owner 的登录用户最多查看最近 10 行并额外隐藏邮箱、IP、URL 和超长值，已验证 Client owner 与 Router owner 最多查看最近 100 行。关闭弹窗即停止读取并清空浏览器中的日志内容。
+Router 将事件按 Client 和 boot stream 写入自有 JSONL 文件，轮转段使用 gzip；不同 stream 使用独立串行槽并可并发写入。正常 ACK 顺序为事件 append/fsync、持久化 stream cursor、更新内存索引后返回；轮转、压缩、retention 和容量清理由后台 maintenance 完成。`segments.json` 保存可重建的段 manifest 与全局 `ingestOrder` 范围，重启时会与实际文件核对并重建稳定分页顺序。日志正文、事件、cursor 和 manifest 均不进入业务数据库。默认保留 7 天且总容量上限 1024 MiB；容量超限时按文件的最大 `ingestOrder` 删除逻辑上最旧的段，mtime 仅用于顺序相同时的判定，并至少保留逻辑上最新的已接收事件文件。可在 Settings 的 Server logs 分组修改采集开关、目录、保留期和容量，其中目录、保留期、容量及采集总开关需要重启；公开可见性可热更新。
+
+全局“日志 / Log”页提供三层范围：匿名用户仅能查看事件发生时间位于最近 5 分钟内的公开投影；登录用户可查看其已验证自有 Client 的全部留存事件；Router owner 可查看全部 Client。近期公开 Client 的文件扫描使用 2 秒进程内缓存合并高频请求，事件查询仍逐次执行精确的 5 分钟窗口校验。分页 cursor 使用 HMAC 签名并绑定访问范围、可见 installation 集合和过滤条件。JSONL 导出对每个候选 segment 只扫描一次，并通过有界 channel 流式返回，不在内存累计完整导出；导出期间仅租约保护尚未读取的候选文件，不长期占用轮转/清理使用的全局文件锁，每个 segment 读入后立即释放对应租约并请求 maintenance。Client 列统一显示 Subdomain 并可打开详情侧栏；只有已登录的自有 Client 用户或 Router owner 可以导出 JSONL。兼容端点 `/v1/clients/:installation_id/logs` 从同一文件存储生成文本 tail；Router owner 还可从详情侧栏通过签名控制 RPC 向在线 Server 拉取最多 100 行脱敏实时诊断，该响应不写入 Router 文件或数据库。
 
 注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 Client installation 与新 auth device 分别执行业务库持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复同类身份仍受尝试速率保护,但不消耗新身份额度。只有新 Client installation 还受未绑定 installation 水位线约束。
 

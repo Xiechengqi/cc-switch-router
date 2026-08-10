@@ -74,6 +74,7 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   seatCount: "chat.detail.seatCount",
   seatPosition: "chat.detail.seatPosition",
   seatStatus: "chat.detail.seatStatus",
+  serviceDurationDays: "chat.detail.serviceDurationDays",
   subdomain: "chat.detail.subdomain",
   subscriptionStatus: "chat.detail.subscriptionStatus",
   supplierEmail: "chat.detail.supplierEmail",
@@ -135,7 +136,7 @@ const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
   listing_relisted: [],
   listing_closed: [],
   listing_deleted: [],
-  seat_added: ["seatPosition", "dailyRateMinor", "currency"],
+  seat_added: ["seatPosition", "dailyRateMinor", "currency", "serviceDurationDays"],
   seat_updated: [
     "seatPosition",
     "dailyRateMinor",
@@ -143,12 +144,23 @@ const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
     "tokenLimit",
     "tokenPeriod",
     "parallelLimit",
+    "serviceDurationDays",
   ],
   seat_deleted: ["seatPosition"],
-  seat_rented: ["seatPosition", "renterEmail", "dailyRateMinor", "currency", "trialHours"],
+  seat_rented: [
+    "seatPosition",
+    "renterEmail",
+    "dailyRateMinor",
+    "currency",
+    "trialHours",
+    "serviceDurationDays",
+    "expiresAt",
+  ],
   seat_retired: ["seatPosition"],
-  entitlement_activated: ["seatPosition", "renterEmail"],
+  entitlement_activated: ["seatPosition", "renterEmail", "serviceDurationDays", "expiresAt"],
   entitlement_failed: ["seatPosition", "renterEmail", "error", "failureCode"],
+  service_term_expiring: ["seatPosition", "renterEmail", "expiresAt", "serviceDurationDays"],
+  service_term_expired: ["seatPosition", "renterEmail", "expiresAt", "serviceDurationDays"],
   renter_release_requested: ["seatPosition", "renterEmail"],
   owner_revoke_requested: ["seatPosition", "renterEmail"],
   entitlement_revoke_requested: ["seatPosition", "renterEmail"],
@@ -546,6 +558,13 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
       return t("chat.event.entitlementActivated", { seat, renter });
     case "entitlement_failed":
       return t("chat.event.entitlementFailed", { seat, renter });
+    case "service_term_expiring":
+      return t("chat.event.serviceTermExpiring", {
+        seat,
+        time: payloadTime(payload, "expiresAt", locale),
+      });
+    case "service_term_expired":
+      return t("chat.event.serviceTermExpired", { seat });
     case "payment_due":
       return t("chat.event.paymentDue", {
         amount: payloadAmount(payload, locale),

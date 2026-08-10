@@ -38,6 +38,9 @@ const SHARE_USER_COUNTRY_HEADER: &str = "X-CC-Switch-User-Country";
 const SHARE_USER_COUNTRY_ISO3_HEADER: &str = "X-CC-Switch-User-Country-Iso3";
 const SHARE_DATA_SOURCE_HEADER: &str = "X-CC-Switch-Data-Source";
 const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
+const DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES: usize = 48 * 1024 * 1024;
 const ROUTE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const ROUTE_RECONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const ROUTE_RECONNECT_MAX_WAITERS: usize = 128;
@@ -1236,6 +1239,21 @@ impl ProxyRegistry {
             .cloned()
     }
 
+    pub(crate) async fn active_client_route_for_installation(
+        &self,
+        installation_id: &str,
+    ) -> Option<RouteEntry> {
+        self.routes
+            .read()
+            .await
+            .values()
+            .filter_map(|slot| slot.active.as_ref())
+            .find(|route| {
+                route.is_client_web() && route.installation_id.as_deref() == Some(installation_id)
+            })
+            .cloned()
+    }
+
     async fn route_for_share_request(
         &self,
         share_id: &str,
@@ -1754,6 +1772,13 @@ pub async fn market_proxy_handler(
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
+    let body = match axum::body::to_bytes(body, proxy_request_body_limit(&path_and_query)).await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(error = %error, path = %path_and_query, "market proxy request body rejected");
+            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
+        }
+    };
     if route.is_share() || route.is_client_web() {
         let installation_id = route.installation_id().unwrap_or_default();
         let control_secret = match state
@@ -1780,13 +1805,20 @@ pub async fn market_proxy_handler(
                 );
             }
         };
-        let request_id = live_request_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let route_id = route
             .share_id()
             .map(|share_id| format!("share:{share_id}"))
             .unwrap_or_else(|| format!("client:{installation_id}"));
+        let signed_path_and_query = match outbound_request_path_and_query(&builder) {
+            Ok(path_and_query) => path_and_query,
+            Err(error) => {
+                warn!(%error, "proxy ingress outbound request binding failed");
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-context-signing-failed",
+                );
+            }
+        };
         let signed = match crate::ingress_context::sign(
             crate::ingress_context::IngressContext {
                 protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
@@ -1800,10 +1832,16 @@ pub async fn market_proxy_handler(
                 target_lane_id: installation_id.to_string(),
                 public_host: format!("{}.{}", route.subdomain, state.config.tunnel_domain),
                 share_id: route.share_id.clone(),
-                request_id,
+                request_id: live_request_id
+                    .clone()
+                    .expect("market Share requests always have a request id"),
                 user_email: Some(market_email.clone()),
                 user_role: None,
                 user_country: client_metadata.country_code.clone(),
+                method: method.as_str().to_string(),
+                path_and_query: signed_path_and_query,
+                body_sha256: crate::ingress_context::body_sha256_hex(&body),
+                signature_version: crate::ingress_context::SIGNATURE_VERSION,
                 issued_at_ms: chrono::Utc::now().timestamp_millis(),
             },
             &control_secret,
@@ -1833,11 +1871,7 @@ pub async fn market_proxy_handler(
         request_id: id.clone(),
     });
 
-    let upstream = match builder
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
-        .send()
-        .await
-    {
+    let upstream = match builder.body(reqwest::Body::from(body)).send().await {
         Ok(response) => response,
         Err(err) => {
             state.metrics.record_proxy_upstream_error(false);
@@ -1952,7 +1986,7 @@ pub async fn gateway_proxy_handler(
     let user_asn = trusted_asn_header(&parts.headers, peer);
     let user_agent = header_str(&parts.headers, "user-agent");
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, proxy_request_body_limit(&path)).await {
         Ok(bytes) => bytes,
         Err(err) => {
             warn!(
@@ -1966,7 +2000,7 @@ pub async fn gateway_proxy_handler(
                 error = %err,
                 "gateway proxy request body read failed"
             );
-            return simple_response(StatusCode::BAD_REQUEST, "failed-to-read-body");
+            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
         }
     };
     let body_hash = crate::api::sha256_hex(&body_bytes);
@@ -2148,9 +2182,11 @@ pub async fn gateway_proxy_handler(
         builder,
         &route,
         format!("{}.{}", route.subdomain, state.config.tunnel_domain),
-        live_request_id.clone(),
+        &live_request_id,
         None,
         client_metadata.country_code.clone(),
+        &method,
+        &body_bytes,
     )
     .await
     {
@@ -2666,7 +2702,7 @@ pub async fn proxy_handler(
         && method == axum::http::Method::POST
         && is_image_generation_submit_path(&path)
     {
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        let body_bytes = match axum::body::to_bytes(body, proxy_request_body_limit(&path)).await {
             Ok(body) => body,
             Err(err) => {
                 warn!(
@@ -2682,8 +2718,8 @@ pub async fn proxy_handler(
                     "image generation request body read failed"
                 );
                 return json_error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("failed-to-read-body: {err}"),
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request-body-too-large",
                 );
             }
         };
@@ -2826,7 +2862,7 @@ pub async fn proxy_handler(
         None
     };
 
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
+    let body = match axum::body::to_bytes(body, proxy_request_body_limit(&path)).await {
         Ok(body) => body,
         Err(err) => {
             warn!(
@@ -2842,10 +2878,7 @@ pub async fn proxy_handler(
                 error = %err,
                 "proxy request body read failed"
             );
-            return simple_response(
-                StatusCode::BAD_REQUEST,
-                &format!("failed-to-read-body: {err}"),
-            );
+            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
         }
     };
 
@@ -2949,13 +2982,20 @@ pub async fn proxy_handler(
                 );
             }
         };
-        let request_id = live_request_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let route_id = route
             .share_id()
             .map(|share_id| format!("share:{share_id}"))
             .unwrap_or_else(|| format!("client:{installation_id}"));
+        let signed_path_and_query = match outbound_request_path_and_query(&builder) {
+            Ok(path_and_query) => path_and_query,
+            Err(error) => {
+                warn!(%error, "proxy ingress outbound request binding failed");
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-context-signing-failed",
+                );
+            }
+        };
         let signed = match crate::ingress_context::sign(
             crate::ingress_context::IngressContext {
                 protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
@@ -2974,7 +3014,9 @@ pub async fn proxy_handler(
                     .trim_end_matches('.')
                     .to_ascii_lowercase(),
                 share_id: route.share_id.clone(),
-                request_id,
+                request_id: live_request_id
+                    .clone()
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
                 user_email: api_user_email
                     .clone()
                     .or_else(|| client_web_session.as_ref().map(|(email, _)| email.clone())),
@@ -2982,6 +3024,10 @@ pub async fn proxy_handler(
                     .as_ref()
                     .map(|(_, is_admin)| if *is_admin { "admin" } else { "owner" }.to_string()),
                 user_country: client_metadata.country_code.clone(),
+                method: method.as_str().to_string(),
+                path_and_query: signed_path_and_query,
+                body_sha256: crate::ingress_context::body_sha256_hex(&body),
+                signature_version: crate::ingress_context::SIGNATURE_VERSION,
                 issued_at_ms: chrono::Utc::now().timestamp_millis(),
             },
             &control_secret,
@@ -3198,6 +3244,20 @@ fn is_image_generation_submit_path(path: &str) -> bool {
     )
 }
 
+fn proxy_request_body_limit(path_and_query: &str) -> usize {
+    match path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path)
+        .trim_start_matches('/')
+    {
+        "v1/images/generations" | "images/generations" | "v1/images/edits" | "images/edits" => {
+            CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
+        }
+        "v1/videos/generations" | "videos/generations" => MEDIA_REQUEST_BODY_LIMIT_BYTES,
+        _ => DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES,
+    }
+}
+
 fn image_generation_request_wants_stream(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -3379,9 +3439,11 @@ async fn handle_image_generation_stream_submit(
         builder,
         route,
         format!("{}.{}", route.subdomain, state.config.tunnel_domain),
-        request_id.clone(),
+        &request_id,
         api_user_email.clone(),
         Some(user_country.clone()),
+        &axum::http::Method::POST,
+        &upstream_body,
     )
     .await
     {
@@ -4363,14 +4425,32 @@ fn reconnecting_response() -> Response {
     response
 }
 
+fn outbound_request_path_and_query(builder: &reqwest::RequestBuilder) -> Result<String, String> {
+    let request = builder
+        .try_clone()
+        .ok_or_else(|| "outbound request cannot be cloned before signing".to_string())?
+        .build()
+        .map_err(|error| format!("build outbound request before signing: {error}"))?;
+    let url = request.url();
+    let mut path_and_query = url.path().to_string();
+    if let Some(query) = url.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    crate::ingress_context::normalize_path_and_query(&path_and_query)
+        .ok_or_else(|| "outbound request path and query are invalid".to_string())
+}
+
 async fn with_signed_ingress_context(
     state: &ServerState,
     builder: reqwest::RequestBuilder,
     route: &RouteEntry,
     public_host: String,
-    request_id: String,
+    request_id: &str,
     user_email: Option<String>,
     user_country: Option<String>,
+    method: &axum::http::Method,
+    body: &[u8],
 ) -> Result<reqwest::RequestBuilder, Response> {
     let installation_id = route.installation_id().unwrap_or_default();
     let control_secret = match state
@@ -4401,8 +4481,16 @@ async fn with_signed_ingress_context(
         .share_id()
         .map(|share_id| format!("share:{share_id}"))
         .unwrap_or_else(|| format!("client:{installation_id}"));
+    let path_and_query = outbound_request_path_and_query(&builder).map_err(|error| {
+        warn!(%error, "proxy ingress outbound request binding failed");
+        simple_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ingress-context-signing-failed",
+        )
+    })?;
     let signed = crate::ingress_context::sign(
         crate::ingress_context::IngressContext {
+            signature_version: crate::ingress_context::SIGNATURE_VERSION,
             protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
             router_id: state
                 .config
@@ -4414,10 +4502,13 @@ async fn with_signed_ingress_context(
             target_lane_id: installation_id.to_string(),
             public_host,
             share_id: route.share_id.clone(),
-            request_id,
+            request_id: request_id.to_string(),
             user_email,
             user_role: None,
             user_country,
+            method: method.as_str().to_string(),
+            path_and_query,
+            body_sha256: crate::ingress_context::body_sha256_hex(body),
             issued_at_ms: chrono::Utc::now().timestamp_millis(),
         },
         &control_secret,
@@ -5088,6 +5179,70 @@ mod tests {
         let _ = std::fs::remove_file(&config.database.path);
     }
 
+    #[tokio::test]
+    async fn signed_ingress_context_reuses_router_request_id() {
+        let config = proxy_test_config("signed-ingress-request-id");
+        let proxy = Arc::new(ProxyRegistry::default());
+        let state = proxy_test_state(&config, proxy.clone());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[13_u8; 32]);
+        let registered = state
+            .store
+            .register_installation(
+                signed_registration_request(&signing_key, "nonce-signed-ingress-request-id"),
+                crate::models::ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .unwrap();
+        proxy
+            .set_route_with_kind(
+                "share-a".into(),
+                "127.0.0.1:1".into(),
+                RouteKind::Share,
+                Some(registered.installation_id),
+                None,
+                Some("share-a".into()),
+                Some("Share A".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let route = proxy.route_by_share_id("share-a").await.unwrap();
+        let request_id = "req_router_admission_123";
+        let request = with_signed_ingress_context(
+            &state,
+            reqwest::Client::new().post("http://127.0.0.1:1/v1/messages"),
+            &route,
+            "share-a.router.test".into(),
+            request_id,
+            Some("owner@example.com".into()),
+            Some("JP".into()),
+            &axum::http::Method::POST,
+            br#"{"model":"claude-sonnet-4-6"}"#,
+        )
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+        let encoded = request
+            .headers()
+            .get(crate::ingress_context::INGRESS_CONTEXT_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        let context: crate::ingress_context::IngressContext =
+            serde_json::from_slice(&decoded).unwrap();
+
+        assert_eq!(context.request_id, request_id);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
     fn proxy_test_state(config: &Config, proxy: Arc<ProxyRegistry>) -> ServerState {
         let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
         let dynamic = Arc::new(RwLock::new(
@@ -5107,6 +5262,12 @@ mod tests {
                 lon: None,
             },
             store: AppStore::new(config).unwrap(),
+            server_logs: Arc::new(crate::server_logs::ServerLogStore::disabled_for_tests(
+                std::env::temp_dir().join(format!(
+                    "cc-switch-router-proxy-server-logs-{}",
+                    Uuid::new_v4()
+                )),
+            )),
             client_logs: Arc::new(crate::client_logs::ClientLogAccessLimiter::default()),
             proxy,
             proxy_http: reqwest::Client::new(),
@@ -5483,6 +5644,49 @@ mod tests {
             br#"{"stream":false,"prompt":"draw"}"#
         ));
         assert!(!image_generation_request_wants_stream(b"not json"));
+    }
+
+    #[test]
+    fn ingress_binding_uses_the_canonical_reqwest_outbound_target() {
+        let builder = reqwest::Client::new()
+            .post("http://127.0.0.1/prefix/../v1/messages?beta=true&model=claude%2Fsonnet");
+        assert_eq!(
+            outbound_request_path_and_query(&builder).unwrap(),
+            "/v1/messages?beta=true&model=claude%2Fsonnet"
+        );
+
+        let empty_query = reqwest::Client::new().get("http://127.0.0.1/v1/models?");
+        assert_eq!(
+            outbound_request_path_and_query(&empty_query).unwrap(),
+            "/v1/models?"
+        );
+    }
+
+    #[test]
+    fn proxy_request_body_limits_match_server_ingress_envelopes() {
+        for path in [
+            "/v1/images/generations",
+            "/images/generations?stream=true",
+            "/v1/images/edits",
+            "/images/edits?mask=true",
+        ] {
+            assert_eq!(
+                proxy_request_body_limit(path),
+                CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+                "{path}"
+            );
+        }
+        for path in ["/v1/videos/generations", "/videos/generations?async=true"] {
+            assert_eq!(
+                proxy_request_body_limit(path),
+                MEDIA_REQUEST_BODY_LIMIT_BYTES,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            proxy_request_body_limit("/v1/messages?beta=true"),
+            DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES
+        );
     }
 
     #[tokio::test]

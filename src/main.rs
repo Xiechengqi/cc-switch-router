@@ -36,6 +36,7 @@ mod recent_traffic;
 mod registration_admission;
 mod scheduling_signals;
 mod schema;
+mod server_logs;
 mod server_state;
 mod share_market;
 mod ssh;
@@ -183,6 +184,8 @@ async fn main() -> Result<()> {
         .build()
         .context("build proxy http client failed")?;
     let metrics = MetricsRegistry::new(config.metrics.clone());
+    let server_logs = Arc::new(server_logs::ServerLogStore::from_env(&config.data_dir)?);
+    server_logs.spawn_maintenance();
     let clock_health = crate::clock_health::ClockHealthService::new(config.clock_health.clone())?;
     let dynamic = Arc::new(RwLock::new(DynamicSettings::from_config(&config)));
     let alerting = crate::alerting::AlertingService::new(
@@ -194,6 +197,7 @@ async fn main() -> Result<()> {
         config: config.clone(),
         server_geo: server_geo.clone(),
         store: AppStore::new(&config)?,
+        server_logs,
         client_logs: Arc::new(crate::client_logs::ClientLogAccessLimiter::default()),
         proxy: Arc::new(ProxyRegistry::default()),
         proxy_http,

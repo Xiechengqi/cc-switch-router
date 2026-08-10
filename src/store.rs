@@ -919,6 +919,20 @@ pub struct AppStore {
     market_usd_cny_rate_micros: Arc<AtomicI64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ServerLogClientRecord {
+    pub installation_id: String,
+    pub owner_email: Option<String>,
+    pub platform: String,
+    pub app_version: String,
+    pub country_code: Option<String>,
+    pub region: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub subdomain: Option<String>,
+    pub tunnel_enabled: Option<bool>,
+}
+
 fn map_database_error(context: &str, error: crate::db::Error) -> AppError {
     if error.is_unavailable() {
         AppError::ServiceUnavailable(format!("{context}: {error}"))
@@ -1086,13 +1100,6 @@ pub struct ShareRouteTarget {
 pub struct ClientTunnelRouteTarget {
     pub installation_id: String,
     pub subdomain: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ClientLogTarget {
-    pub subdomain: String,
-    pub control_secret: String,
-    pub log_collection_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1353,6 +1360,168 @@ impl AppStore {
         })
     }
 
+    pub(crate) async fn authenticate_installation_audit_batch(
+        &self,
+        input: &crate::server_logs::InstallationAuditBatchRequest,
+    ) -> Result<(), AppError> {
+        if input.protocol_epoch != PROTOCOL_EPOCH {
+            return Err(AppError::BadRequest(
+                "unsupported server audit protocol epoch".into(),
+            ));
+        }
+        let now = Utc::now();
+        let skew = now.timestamp_millis().abs_diff(input.timestamp_ms);
+        if skew > SIGNED_REQUEST_MAX_SKEW_MS as u64 {
+            return Err(AppError::Unauthorized("stale server audit batch".into()));
+        }
+        validate_request_nonce(&input.nonce)?;
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_payload(
+            &installation.public_key,
+            &input.installation_id,
+            crate::server_logs::INSTALLATION_AUDIT_BATCH_ACTION,
+            &input.payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        consume_authenticated_installation_nonce(
+            &conn,
+            &input.installation_id,
+            crate::server_logs::INSTALLATION_AUDIT_BATCH_ACTION,
+            &input.nonce,
+            now,
+        )
+    }
+
+    pub(crate) async fn list_verified_installation_ids_for_owner(
+        &self,
+        owner_email: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let owner_email = owner_email.trim().to_ascii_lowercase();
+        if owner_email.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM installations
+                 WHERE lifecycle = 'active'
+                   AND client_activated_at IS NOT NULL
+                   AND owner_verified_at IS NOT NULL
+                   AND owner_email IS NOT NULL
+                   AND LOWER(TRIM(owner_email)) = ?1
+                 ORDER BY created_at DESC, id ASC",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare verified Client owner installations failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![owner_email], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query verified Client owner installations failed: {error}"
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!(
+                "read verified Client owner installation failed: {error}"
+            ))
+        })
+    }
+
+    pub(crate) async fn list_server_log_client_records(
+        &self,
+        installation_ids: &HashSet<String>,
+    ) -> Result<Vec<ServerLogClientRecord>, AppError> {
+        if installation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut installation_ids = installation_ids.iter().cloned().collect::<Vec<_>>();
+        installation_ids.sort_unstable();
+        let placeholders = repeat_vars(installation_ids.len());
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT i.id,
+                        COALESCE(NULLIF(TRIM(t.owner_email), ''), i.owner_email),
+                        i.platform, i.app_version, i.country_code, i.region,
+                        i.created_at, i.last_seen_at,
+                        NULLIF(TRIM(t.subdomain), ''), t.enabled
+                   FROM installations i
+              LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
+                  WHERE i.id IN ({placeholders})
+               ORDER BY i.created_at DESC, i.id ASC"
+            ))
+            .map_err(|error| {
+                AppError::Internal(format!("prepare server log client query failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params_from_iter(installation_ids), |row| {
+                Ok(ServerLogClientRecord {
+                    installation_id: row.get(0)?,
+                    owner_email: row.get(1)?,
+                    platform: row.get(2)?,
+                    app_version: row.get(3)?,
+                    country_code: row.get(4)?,
+                    region: row.get(5)?,
+                    created_at: parse_dt_sql(&row.get::<_, String>(6)?)?,
+                    last_seen_at: parse_dt_sql(&row.get::<_, String>(7)?)?,
+                    subdomain: row.get(8)?,
+                    tunnel_enabled: row.get::<_, Option<i64>>(9)?.map(|value| value != 0),
+                })
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query server log clients failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read server log client row failed: {error}"))
+        })
+    }
+
+    pub(crate) async fn list_client_tunnel_subdomains_for_installations(
+        &self,
+        installation_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, String>, AppError> {
+        if installation_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut installation_ids = installation_ids.iter().collect::<Vec<_>>();
+        installation_ids.sort_unstable();
+        let placeholders = repeat_vars(installation_ids.len());
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT installation_id, subdomain
+                   FROM installation_client_tunnels
+                  WHERE installation_id IN ({placeholders})
+                    AND TRIM(subdomain) != ''"
+            ))
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare server log client subdomain query failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params_from_iter(installation_ids), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query server log client subdomains failed: {error}"
+                ))
+            })?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(|error| {
+            AppError::Internal(format!(
+                "read server log client subdomain row failed: {error}"
+            ))
+        })
+    }
+
     pub async fn is_verified_installation_owner(
         &self,
         installation_id: &str,
@@ -1380,29 +1549,25 @@ impl AppStore {
         .map_err(|error| AppError::Internal(format!("query verified Client owner failed: {error}")))
     }
 
-    pub(crate) async fn client_log_target(
+    pub(crate) async fn client_log_installation_exists(
         &self,
         installation_id: &str,
-    ) -> Result<Option<ClientLogTarget>, AppError> {
+    ) -> Result<bool, AppError> {
         let conn = self.conn.lock().await;
         conn.query_row(
-            "SELECT t.subdomain, i.control_secret_b64, i.log_collection_enabled
-               FROM installations i
-               JOIN installation_client_tunnels t ON t.installation_id = i.id
-              WHERE i.id = ?1
-                AND i.lifecycle = 'active'
-                AND i.client_activated_at IS NOT NULL",
+            "SELECT EXISTS(
+                 SELECT 1 FROM installations
+                  WHERE id = ?1
+                    AND lifecycle = 'active'
+                    AND client_activated_at IS NOT NULL
+             )",
             params![installation_id],
-            |row| {
-                Ok(ClientLogTarget {
-                    subdomain: row.get(0)?,
-                    control_secret: row.get(1)?,
-                    log_collection_enabled: row.get::<_, i64>(2)? != 0,
-                })
-            },
+            |row| row.get::<_, i64>(0),
         )
-        .optional()
-        .map_err(|error| AppError::Internal(format!("query Client log target failed: {error}")))
+        .map(|exists| exists != 0)
+        .map_err(|error| {
+            AppError::Internal(format!("query Client log installation failed: {error}"))
+        })
     }
 
     pub async fn list_all_installation_ids(&self) -> Result<Vec<String>, AppError> {
@@ -29477,7 +29642,11 @@ mod tests {
 
     #[test]
     fn upstream_provider_field_order_matches_server_signer() {
-        use crate::models::{ShareUpstreamModel, ShareUpstreamProvider, ShareUpstreamQuota};
+        use crate::models::{
+            ShareProviderModelPolicy, ShareProviderModelPolicyScope,
+            ShareProviderModelPolicySource, ShareUpstreamModel, ShareUpstreamProvider,
+            ShareUpstreamQuota,
+        };
         let value = ShareUpstreamProvider {
             kind: "codex_oauth".into(),
             app: "codex".into(),
@@ -29506,6 +29675,11 @@ mod tests {
                 slot: "model".into(),
                 actual_model: "gpt".into(),
             }],
+            model_policy_scope: Some(ShareProviderModelPolicyScope::Global),
+            model_policy_source: Some(ShareProviderModelPolicySource::BundleGlobal),
+            model_policy: Some(ShareProviderModelPolicy::Single {
+                upstream_model: "gpt".into(),
+            }),
             health: None,
             available: None,
         };
@@ -30424,6 +30598,56 @@ mod tests {
             "/d9Ky3UEESHcGKMe34fhXc3muioSt9q1M+BtHZQyEKamXA3WGRd/KHsStpyvrWHTlFRVZUS1F0PluI9ZHRo1Ag==",
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_audit_batch_rejects_nonce_replay() {
+        let store = AppStore::new_in_memory_for_tests().expect("create metadata store");
+        let installation_id = "inst-audit-batch";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let payload = crate::server_logs::InstallationAuditBatchPayload {
+            protocol_version: 1,
+            boot_id: "audit-boot".into(),
+            server_version: "1.2.3".into(),
+            commit_id: "abcdef0".into(),
+            events: vec![crate::server_logs::InstallationAuditEvent {
+                schema_version: 1,
+                sequence: 1,
+                timestamp_ms: Utc::now().timestamp_millis(),
+                boot_id: "audit-boot".into(),
+                level: "info".into(),
+                event: "inference.request.accepted".into(),
+                ..Default::default()
+            }],
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            crate::server_logs::INSTALLATION_AUDIT_BATCH_ACTION,
+            &payload,
+            timestamp_ms,
+            &nonce,
+        );
+        let request = crate::server_logs::InstallationAuditBatchRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            installation_id: installation_id.into(),
+            timestamp_ms,
+            nonce,
+            signature,
+            payload,
+        };
+
+        store
+            .authenticate_installation_audit_batch(&request)
+            .await
+            .expect("authenticate first audit batch");
+        let replay = store
+            .authenticate_installation_audit_batch(&request)
+            .await
+            .expect_err("replayed audit batch nonce must be rejected");
+        assert!(replay.to_string().contains("nonce already used"));
     }
 
     #[tokio::test]
@@ -40663,6 +40887,8 @@ mod tests {
                         id: "provider-1".into(),
                         name: "OpenAI Official".into(),
                         app: "codex".into(),
+                        bundle_id: Some("bundle-1".into()),
+                        supported_apps: vec!["claude".into(), "codex".into()],
                         kind: Some("official_oauth".into()),
                         provider_type: Some("codex_oauth".into()),
                         is_current: true,
@@ -40673,6 +40899,15 @@ mod tests {
                         api_url: None,
                         quota: None,
                         models: Vec::new(),
+                        model_policy_scope: Some(
+                            crate::models::ShareProviderModelPolicyScope::Global,
+                        ),
+                        model_policy_source: Some(
+                            crate::models::ShareProviderModelPolicySource::BundleGlobal,
+                        ),
+                        model_policy: Some(crate::models::ShareProviderModelPolicy::Single {
+                            upstream_model: "gpt-5.6".into(),
+                        }),
                         ..Default::default()
                     }],
                     ..ShareAppProviders::default()
@@ -40697,6 +40932,11 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query app providers");
+        let (_, persisted) = list_shares(&conn)
+            .expect("list shares")
+            .into_iter()
+            .find(|(_, share)| share.share_id == "share-1")
+            .expect("persisted share");
         drop(conn);
 
         assert_eq!(token_limit, -1);
@@ -40705,6 +40945,29 @@ mod tests {
         assert_eq!(share_status, "active");
         assert!(app_providers_json.contains("provider-1"));
         assert!(app_providers_json.contains("account@example.com"));
+        assert!(app_providers_json.contains("bundle_global"));
+        assert!(app_providers_json.contains("gpt-5.6"));
+        let provider = persisted
+            .app_providers
+            .codex
+            .first()
+            .expect("persisted app provider");
+        assert_eq!(provider.bundle_id.as_deref(), Some("bundle-1"));
+        assert_eq!(provider.supported_apps, ["claude", "codex"]);
+        assert_eq!(
+            provider.model_policy_scope,
+            Some(crate::models::ShareProviderModelPolicyScope::Global)
+        );
+        assert_eq!(
+            provider.model_policy_source,
+            Some(crate::models::ShareProviderModelPolicySource::BundleGlobal)
+        );
+        assert_eq!(
+            provider.model_policy,
+            Some(crate::models::ShareProviderModelPolicy::Single {
+                upstream_model: "gpt-5.6".into()
+            })
+        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }

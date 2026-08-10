@@ -103,17 +103,20 @@ function sortSubscriptions(left: ShareMarketSubscription, right: ShareMarketSubs
 function offerLabel(
   subscription: ShareMarketSubscription,
   locale: string,
-  freeLabel: string,
-  permanentLabel: string,
-  dayLabel: string,
+  t: ReturnType<typeof useLocaleText>["t"],
 ) {
-  if (subscription.dailyRateMinor == null) {
-    return subscription.freeDurationDays == null
-      ? `${freeLabel} · ${permanentLabel}`
-      : `${freeLabel} · ${subscription.freeDurationDays} ${dayLabel}`;
-  }
-  const amount = formatUsdMoney(subscription.dailyRateMinor, locale);
-  return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
+  const serviceTerm = subscription.serviceDurationDays == null
+    ? t("shareMarket.serviceDuration.permanent")
+    : t(
+        subscription.serviceDurationDays === 1
+          ? "shareMarket.serviceDuration.dayValue"
+          : "shareMarket.serviceDuration.daysValue",
+        { count: subscription.serviceDurationDays },
+      );
+  const price = subscription.dailyRateMinor == null
+    ? t("shareMarket.free")
+    : `${formatUsdMoney(subscription.dailyRateMinor, locale)} / ${t("marketBilling.day")}`;
+  return `${price} · ${serviceTerm}`;
 }
 
 function formatDate(value: string | undefined, locale: string) {
@@ -128,19 +131,17 @@ function shareOpenUrl(subdomain?: string | null) {
   return subdomainTunnelUrl(subdomain);
 }
 
-function freePeriodTiming(
+function servicePeriodTiming(
   subscription: ShareMarketSubscription,
   locale: string,
   t: ReturnType<typeof useLocaleText>["t"],
 ) {
-  if (subscription.dailyRateMinor != null) return null;
-  if (!subscription.activatedAt) return t("shareMarket.freeDuration.pendingActivation");
-  const activated = formatDate(subscription.activatedAt, locale);
+  const started = formatDate(subscription.createdAt, locale);
   if (!subscription.expiresAt) {
-    return `${t("shareMarket.freeDuration.activated")}: ${activated} · ${t("shareMarket.permanent")}`;
+    return `${t("shareMarket.serviceDuration.started")}: ${started} · ${t("shareMarket.serviceDuration.permanent")}`;
   }
   const expires = formatDate(subscription.expiresAt, locale);
-  return `${t("shareMarket.freeDuration.activated")}: ${activated} · ${t("shareMarket.freeDuration.expires")}: ${expires}`;
+  return `${t("shareMarket.serviceDuration.started")}: ${started} · ${t("shareMarket.serviceDuration.expires")}: ${expires}`;
 }
 
 function SubscriptionMonitorCard({
@@ -157,7 +158,7 @@ function SubscriptionMonitorCard({
     perspective === "provider"
       ? shareMarketHref({ tab: "mine", shareId: subscription.shareId })
       : shareMarketHref({ tab: "rentals", shareId: subscription.shareId });
-  const freeTiming = freePeriodTiming(subscription, locale, t);
+  const serviceTiming = servicePeriodTiming(subscription, locale, t);
 
   return (
     <section
@@ -194,15 +195,9 @@ function SubscriptionMonitorCard({
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.share.offer")}</dt>
           <dd className="font-medium">
-            {offerLabel(
-              subscription,
-              locale,
-              t("shareMarket.free"),
-              t("shareMarket.permanent"),
-              t("marketBilling.day"),
-            )}
+            {offerLabel(subscription, locale, t)}
           </dd>
-          {freeTiming ? <dd className="text-xs text-muted-foreground">{freeTiming}</dd> : null}
+          <dd className="text-xs text-muted-foreground">{serviceTiming}</dd>
         </div>
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.share.updated")}</dt>

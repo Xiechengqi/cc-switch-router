@@ -122,7 +122,6 @@ pub struct ClientLogTailReply {
     #[serde(default)]
     pub ok: bool,
     pub lines: usize,
-    #[serde(default)]
     pub truncated: bool,
     pub content: String,
 }
@@ -344,67 +343,6 @@ async fn post_control<T: serde::de::DeserializeOwned>(
         .map_err(|e| CtlError::Malformed(e.to_string()))
 }
 
-pub async fn fetch_client_log_tail(
-    http: &reqwest::Client,
-    backend: &str,
-    installation_id: &str,
-    control_secret: &str,
-    lines: usize,
-) -> Result<ClientLogTailReply, CtlError> {
-    let path = format!("{CLIENT_LOG_TAIL_PATH}?lines={lines}");
-    let response = authorize_control_request(
-        http.get(format!("http://{backend}{path}")),
-        "GET",
-        &path,
-        installation_id,
-        control_secret,
-        &[],
-    )
-    .timeout(CTL_TIMEOUT)
-    .send()
-    .await
-    .map_err(|error| {
-        if error.is_timeout() {
-            CtlError::Timeout
-        } else {
-            CtlError::Unreachable(error.to_string())
-        }
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(CtlError::Rejected {
-            status: status.as_u16(),
-            body: "Client log request rejected".into(),
-            code: None,
-            retryable: Some(false),
-        });
-    }
-
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            if error.is_timeout() {
-                CtlError::Timeout
-            } else {
-                CtlError::Unreachable(error.to_string())
-            }
-        })?;
-        if body.len().saturating_add(chunk.len()) > CLIENT_LOG_RESPONSE_MAX_BYTES {
-            return Err(CtlError::Malformed(
-                "Client log response exceeds size limit".into(),
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let reply: ClientLogTailReply =
-        serde_json::from_slice(&body).map_err(|error| CtlError::Malformed(error.to_string()))?;
-    if !reply.ok {
-        return Err(CtlError::Malformed("Client replied ok=false".into()));
-    }
-    Ok(reply)
-}
-
 /// Synchronously ask the installation behind `backend` (a `host:port` tunnel
 /// target) to apply `patch` to `share_id`, returning the descriptor the client
 /// actually wrote. `backend` comes from `RouteEntry::route_target()`.
@@ -537,6 +475,72 @@ pub async fn abort_client_subdomain_adoption(
         ));
     }
     Ok(reply.aborted)
+}
+
+pub async fn fetch_client_log_tail(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    lines: usize,
+) -> Result<ClientLogTailReply, CtlError> {
+    let path = format!("{CLIENT_LOG_TAIL_PATH}?lines={}", lines.clamp(1, 100));
+    let client = reqwest::Client::builder()
+        .timeout(CTL_TIMEOUT)
+        .build()
+        .map_err(|error| CtlError::Unreachable(format!("build http client failed: {error}")))?;
+    let request = authorize_control_request(
+        client.get(format!("http://{backend}{path}")),
+        "GET",
+        &path,
+        installation_id,
+        control_secret,
+        &[],
+    );
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            CtlError::Timeout
+        } else {
+            CtlError::Unreachable(error.to_string())
+        }
+    })?;
+    let status = response.status();
+    let body = read_bounded_client_log_body(response).await?;
+    if !status.is_success() {
+        let structured = serde_json::from_slice::<ControlErrorReply>(&body).ok();
+        return Err(CtlError::Rejected {
+            status: status.as_u16(),
+            body: String::from_utf8_lossy(&body).chars().take(500).collect(),
+            code: structured.as_ref().and_then(|reply| reply.code.clone()),
+            retryable: structured.and_then(|reply| reply.retryable),
+        });
+    }
+    let reply = serde_json::from_slice::<ClientLogTailReply>(&body)
+        .map_err(|error| CtlError::Malformed(error.to_string()))?;
+    if !reply.ok {
+        return Err(CtlError::Malformed("client replied ok=false".into()));
+    }
+    Ok(reply)
+}
+
+async fn read_bounded_client_log_body(response: reqwest::Response) -> Result<Vec<u8>, CtlError> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            if error.is_timeout() {
+                CtlError::Timeout
+            } else {
+                CtlError::Unreachable(error.to_string())
+            }
+        })?;
+        if body.len().saturating_add(chunk.len()) > CLIENT_LOG_RESPONSE_MAX_BYTES {
+            return Err(CtlError::Malformed(format!(
+                "Client log response exceeds {CLIENT_LOG_RESPONSE_MAX_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]

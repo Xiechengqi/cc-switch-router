@@ -28,6 +28,8 @@ pub struct ServerState {
     pub config: Config,
     pub server_geo: ServerGeo,
     pub store: AppStore,
+    /// Router-owned, file-backed audit events uploaded by Server installations.
+    pub server_logs: Arc<crate::server_logs::ServerLogStore>,
     /// Bounds on-demand Client log reads without retaining log content.
     pub client_logs: Arc<ClientLogAccessLimiter>,
     pub proxy: Arc<ProxyRegistry>,

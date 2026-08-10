@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::models::{
     AccountUsageResponse, GlobalUsageResponse, ProviderInstallationUsage, ProviderShareUsage,
-    ProviderUsageResponse, UpdateUserProfileRequest, UsageCallerRow, UsageDailyBucket,
-    UsageModelRow, UsageShareRow, UserProfilePublic, UserProfileResponse,
+    ProviderUsageResponse, UpdateUsageCardSettingsRequest, UsageCallerRow,
+    UsageCardSettingsResponse, UsageDailyBucket, UsageModelRow, UsageShareRow,
 };
 use crate::store::AppStore;
 
@@ -144,7 +144,7 @@ fn account_usage_date_keys(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> Ve
     keys
 }
 
-fn normalize_profile_email(value: &str) -> Result<String, AppError> {
+fn normalize_usage_email(value: &str) -> Result<String, AppError> {
     let email = value.trim().to_ascii_lowercase();
     let Some((local, domain)) = email.split_once('@') else {
         return Err(AppError::BadRequest("invalid email".into()));
@@ -156,27 +156,6 @@ fn normalize_profile_email(value: &str) -> Result<String, AppError> {
         return Err(AppError::BadRequest("invalid email".into()));
     }
     Ok(email)
-}
-
-fn validate_username(value: &str) -> Result<(String, String), AppError> {
-    let display = value.trim();
-    if display.is_empty() {
-        return Err(AppError::BadRequest("username is required".into()));
-    }
-    if !(3..=32).contains(&display.len()) {
-        return Err(AppError::BadRequest(
-            "username must be 3-32 characters".into(),
-        ));
-    }
-    if !display
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
-        return Err(AppError::BadRequest(
-            "username may only contain letters, digits, hyphen, and underscore".into(),
-        ));
-    }
-    Ok((display.to_string(), display.to_ascii_lowercase()))
 }
 
 fn market_input_tokens_expr(alias: &str) -> String {
@@ -248,7 +227,7 @@ fn ensure_user_id(conn: &Connection, email: &str) -> Result<String, AppError> {
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|e| AppError::Internal(format!("query user for profile failed: {e}")))?
+        .map_err(|e| AppError::Internal(format!("query usage card user failed: {e}")))?
     {
         return Ok(id);
     }
@@ -258,41 +237,19 @@ fn ensure_user_id(conn: &Connection, email: &str) -> Result<String, AppError> {
          VALUES (?1, ?2, 'active', ?3, ?4)",
         params![id, email, now, now],
     )
-    .map_err(|e| AppError::Internal(format!("insert user for profile failed: {e}")))?;
+    .map_err(|e| AppError::Internal(format!("insert usage card user failed: {e}")))?;
     Ok(id)
 }
 
-fn load_profile_row(
-    conn: &Connection,
+fn usage_card_settings_response(
     user_id: &str,
-) -> Result<Option<(Option<String>, bool, String)>, AppError> {
-    conn.query_row(
-        "SELECT username, public_stats_enabled, updated_at
-         FROM user_profiles WHERE user_id = ?1",
-        params![user_id],
-        |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, i64>(1)? != 0,
-                row.get::<_, String>(2)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(|e| AppError::Internal(format!("query user profile failed: {e}")))
-}
-
-fn profile_response(
     email: &str,
-    username: Option<String>,
     public_stats_enabled: bool,
-    updated_at: Option<String>,
-) -> UserProfileResponse {
-    UserProfileResponse {
+) -> UsageCardSettingsResponse {
+    UsageCardSettingsResponse {
+        user_id: user_id.to_string(),
         email: email.to_string(),
-        username: username.filter(|value| !value.trim().is_empty()),
         public_stats_enabled,
-        updated_at,
     }
 }
 
@@ -637,131 +594,44 @@ fn installation_label(platform: &str, app_version: &str, subdomain: Option<&str>
 }
 
 impl AppStore {
-    pub async fn get_user_profile(&self, email: &str) -> Result<UserProfileResponse, AppError> {
-        let email = normalize_profile_email(email)?;
-        let conn = self.conn.lock().await;
-        let user_id = ensure_user_id(&conn, &email)?;
-        match load_profile_row(&conn, &user_id)? {
-            Some((username, public_stats_enabled, updated_at)) => Ok(profile_response(
-                &email,
-                username,
-                public_stats_enabled,
-                Some(updated_at),
-            )),
-            None => Ok(profile_response(&email, None, false, None)),
-        }
-    }
-
-    pub async fn update_user_profile(
+    pub async fn get_usage_card_settings(
         &self,
         email: &str,
-        patch: UpdateUserProfileRequest,
-    ) -> Result<UserProfileResponse, AppError> {
-        let email = normalize_profile_email(email)?;
-        if patch.username.is_none() && patch.public_stats_enabled.is_none() {
-            return Err(AppError::BadRequest("no profile fields to update".into()));
-        }
+    ) -> Result<UsageCardSettingsResponse, AppError> {
+        let email = normalize_usage_email(email)?;
         let conn = self.conn.lock().await;
         let user_id = ensure_user_id(&conn, &email)?;
-        let now = Utc::now().to_rfc3339();
-        let existing = load_profile_row(&conn, &user_id)?;
-        let (mut username, mut username_normalized, mut public_stats_enabled) = match &existing {
-            Some((username, enabled, _)) => (
-                username.clone(),
-                username.as_ref().map(|value| value.to_ascii_lowercase()),
-                *enabled,
-            ),
-            None => (None, None, false),
-        };
-
-        if let Some(raw) = patch.username {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                username = None;
-                username_normalized = None;
-            } else {
-                let (display, normalized) = validate_username(trimmed)?;
-                if let Some(owner) = conn
-                    .query_row(
-                        "SELECT user_id FROM user_profiles
-                         WHERE username_normalized = ?1 AND user_id != ?2",
-                        params![normalized, user_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(|e| {
-                        AppError::Internal(format!("check username uniqueness failed: {e}"))
-                    })?
-                {
-                    let _ = owner;
-                    return Err(AppError::Conflict("username is already taken".into()));
-                }
-                username = Some(display);
-                username_normalized = Some(normalized);
-            }
-        }
-
-        if let Some(enabled) = patch.public_stats_enabled {
-            if enabled
-                && username
-                    .as_ref()
-                    .map(|v| v.trim().is_empty())
-                    .unwrap_or(true)
-            {
-                return Err(AppError::BadRequest(
-                    "username is required to enable public stats".into(),
-                ));
-            }
-            public_stats_enabled = enabled;
-        }
-
-        let created_at = existing
-            .as_ref()
-            .map(|(_, _, updated_at)| updated_at.clone())
-            .unwrap_or_else(|| now.clone());
-        // Prefer original created_at when present.
-        let created_at = conn
+        let public_stats_enabled = conn
             .query_row(
-                "SELECT created_at FROM user_profiles WHERE user_id = ?1",
+                "SELECT public_stats_enabled FROM users WHERE id = ?1",
                 params![user_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok(row.get::<_, i64>(0)? != 0),
             )
-            .optional()
-            .map_err(|e| AppError::Internal(format!("query profile created_at failed: {e}")))?
-            .unwrap_or(created_at);
-
-        conn.execute(
-            "INSERT INTO user_profiles (
-                user_id, username, username_normalized, public_stats_enabled, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                username_normalized = excluded.username_normalized,
-                public_stats_enabled = excluded.public_stats_enabled,
-                updated_at = excluded.updated_at",
-            params![
-                user_id,
-                username,
-                username_normalized,
-                i64::from(public_stats_enabled),
-                created_at,
-                now,
-            ],
-        )
-        .map_err(|e| {
-            let message = e.to_string();
-            if message.contains("UNIQUE") || message.contains("unique") {
-                AppError::Conflict("username is already taken".into())
-            } else {
-                AppError::Internal(format!("upsert user profile failed: {e}"))
-            }
-        })?;
-
-        Ok(profile_response(
+            .map_err(|e| AppError::Internal(format!("query usage card settings failed: {e}")))?;
+        Ok(usage_card_settings_response(
+            &user_id,
             &email,
-            username,
             public_stats_enabled,
-            Some(now),
+        ))
+    }
+
+    pub async fn update_usage_card_settings(
+        &self,
+        email: &str,
+        patch: UpdateUsageCardSettingsRequest,
+    ) -> Result<UsageCardSettingsResponse, AppError> {
+        let email = normalize_usage_email(email)?;
+        let conn = self.conn.lock().await;
+        let user_id = ensure_user_id(&conn, &email)?;
+        conn.execute(
+            "UPDATE users SET public_stats_enabled = ?1 WHERE id = ?2",
+            params![i64::from(patch.public_stats_enabled), user_id],
+        )
+        .map_err(|e| AppError::Internal(format!("update usage card settings failed: {e}")))?;
+        Ok(usage_card_settings_response(
+            &user_id,
+            &email,
+            patch.public_stats_enabled,
         ))
     }
 
@@ -770,7 +640,7 @@ impl AppStore {
         email: &str,
         period: &str,
     ) -> Result<AccountUsageResponse, AppError> {
-        let email = normalize_profile_email(email)?;
+        let email = normalize_usage_email(email)?;
         let window = normalize_account_usage_period(period)?;
         let conn = self.conn.lock().await;
         let events = query_consumer_events(&conn, Some(&email), &window)?;
@@ -782,7 +652,7 @@ impl AppStore {
         email: &str,
         period: &str,
     ) -> Result<ProviderUsageResponse, AppError> {
-        let email = normalize_profile_email(email)?;
+        let email = normalize_usage_email(email)?;
         let window = normalize_account_usage_period(period)?;
         let start_ts = window.start_at.timestamp();
         let start_rfc3339 = window.start_at.to_rfc3339();
@@ -1118,52 +988,35 @@ impl AppStore {
         })
     }
 
-    pub async fn usage_consumer_by_username(
+    pub async fn usage_consumer_by_user_id(
         &self,
-        username: &str,
+        user_id: &str,
         period: &str,
-    ) -> Result<Option<(UserProfilePublic, AccountUsageResponse)>, AppError> {
-        let normalized = username.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
+    ) -> Result<Option<(String, AccountUsageResponse)>, AppError> {
+        let Ok(user_id) = Uuid::parse_str(user_id.trim()) else {
             return Ok(None);
-        }
+        };
         let window = normalize_account_usage_period(period)?;
         let conn = self.conn.lock().await;
-        let Some((display_username, email, public_stats_enabled)) = conn
+        let Some((email, public_stats_enabled)) = conn
             .query_row(
-                "SELECT p.username, u.email_normalized, p.public_stats_enabled
-                 FROM user_profiles p
-                 INNER JOIN users u ON u.id = p.user_id
-                 WHERE p.username_normalized = ?1",
-                params![normalized],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                    ))
-                },
+                "SELECT email_normalized, public_stats_enabled
+                 FROM users
+                 WHERE id = ?1 AND status = 'active'",
+                params![user_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
             )
             .optional()
-            .map_err(|e| AppError::Internal(format!("query public usage profile failed: {e}")))?
+            .map_err(|e| AppError::Internal(format!("query public usage card failed: {e}")))?
         else {
             return Ok(None);
         };
         if !public_stats_enabled {
             return Ok(None);
         }
-        let username = display_username
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| username.trim().to_string());
         let events = query_consumer_events(&conn, Some(&email), &window)?;
         let usage = build_account_usage(&window, events, false);
-        Ok(Some((
-            UserProfilePublic {
-                username,
-                public_stats_enabled: true,
-            },
-            usage,
-        )))
+        Ok(Some((email, usage)))
     }
 }
 
@@ -1190,15 +1043,52 @@ mod tests {
         assert!(normalize_account_usage_period("year").is_err());
     }
 
-    #[test]
-    fn validate_username_rules() {
-        assert!(validate_username("ab").is_err());
-        assert!(validate_username("a".repeat(33).as_str()).is_err());
-        assert!(validate_username("bad name").is_err());
-        assert!(validate_username("bad@name").is_err());
-        let (display, normalized) = validate_username("Foo_Bar-1").unwrap();
-        assert_eq!(display, "Foo_Bar-1");
-        assert_eq!(normalized, "foo_bar-1");
+    #[tokio::test]
+    async fn usage_card_is_public_by_default_and_can_be_disabled() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let settings = store
+            .get_usage_card_settings("Owner@Example.com")
+            .await
+            .expect("default usage card settings");
+
+        assert_eq!(settings.email, "owner@example.com");
+        assert!(settings.public_stats_enabled);
+        assert_eq!(
+            Uuid::parse_str(&settings.user_id).unwrap().to_string(),
+            settings.user_id
+        );
+
+        let (public_email, _) = store
+            .usage_consumer_by_user_id(&settings.user_id, "24h")
+            .await
+            .expect("public usage lookup")
+            .expect("usage card should be public by default");
+        assert_eq!(public_email, settings.email);
+        assert!(
+            store
+                .usage_consumer_by_user_id("not-a-uuid", "24h")
+                .await
+                .expect("invalid public usage lookup")
+                .is_none()
+        );
+
+        let updated = store
+            .update_usage_card_settings(
+                &settings.email,
+                UpdateUsageCardSettingsRequest {
+                    public_stats_enabled: false,
+                },
+            )
+            .await
+            .expect("disable public usage card");
+        assert!(!updated.public_stats_enabled);
+        assert!(
+            store
+                .usage_consumer_by_user_id(&settings.user_id, "24h")
+                .await
+                .expect("private usage lookup")
+                .is_none()
+        );
     }
 
     #[test]

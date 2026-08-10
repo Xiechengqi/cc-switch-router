@@ -36,6 +36,10 @@
 }
 
 :root {
+  --font-inter: "Segoe UI", "Helvetica Neue", Arial;
+  --font-noto-sans-sc: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei";
+  --font-jetbrains: "SFMono-Regular", Menlo, Monaco, Consolas;
+  --font-source-code-pro: "SFMono-Regular", Menlo, Monaco, Consolas;
   --router-background: 250 250 250;
   --router-foreground: 15 23 42;
   --router-card: 255 255 255;

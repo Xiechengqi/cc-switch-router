@@ -1495,29 +1495,16 @@ pub struct GlobalUsageResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UserProfilePublic {
-    pub username: String,
-    pub public_stats_enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserProfileResponse {
+pub struct UsageCardSettingsResponse {
+    pub user_id: String,
     pub email: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
     pub public_stats_enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateUserProfileRequest {
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub public_stats_enabled: Option<bool>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateUsageCardSettingsRequest {
+    pub public_stats_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2005,6 +1992,32 @@ pub struct ShareUpstreamModel {
     pub actual_model: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareProviderModelPolicyScope {
+    Global,
+    PerApp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareProviderModelPolicySource {
+    BundleGlobal,
+    AppIndependent,
+    ProfileFixed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ShareProviderModelPolicy {
+    Passthrough,
+    Single { upstream_model: String },
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareProviderHealth {
@@ -2054,6 +2067,12 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_scope: Option<ShareProviderModelPolicyScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_source: Option<ShareProviderModelPolicySource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<ShareProviderModelPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
@@ -2076,6 +2095,9 @@ impl Default for ShareUpstreamProvider {
             quota: None,
             api_url: None,
             models: Vec::new(),
+            model_policy_scope: None,
+            model_policy_source: None,
+            model_policy: None,
             health: None,
             available: None,
         }
@@ -2088,6 +2110,10 @@ pub struct ShareAppProvider {
     pub id: String,
     pub name: String,
     pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_apps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2119,6 +2145,12 @@ pub struct ShareAppProvider {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_scope: Option<ShareProviderModelPolicyScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_source: Option<ShareProviderModelPolicySource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<ShareProviderModelPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
@@ -2130,6 +2162,8 @@ impl Default for ShareAppProvider {
             id: String::new(),
             name: String::new(),
             app: String::new(),
+            bundle_id: None,
+            supported_apps: Vec::new(),
             kind: None,
             provider_type: None,
             is_current: false,
@@ -2145,6 +2179,9 @@ impl Default for ShareAppProvider {
             quota: None,
             api_url: None,
             models: Vec::new(),
+            model_policy_scope: None,
+            model_policy_source: None,
+            model_policy: None,
             health: None,
             available: None,
         }

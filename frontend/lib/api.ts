@@ -21,8 +21,8 @@ import type {
   AccountUsagePeriod,
   AccountUsageResponse,
   ProviderUsageResponse,
-  UserProfileResponse,
-  UpdateUserProfileRequest,
+  UsageCardSettingsResponse,
+  UpdateUsageCardSettingsRequest,
   VersionResponse,
   MetricsSnapshot,
   HostMetricsInfo,
@@ -85,6 +85,10 @@ import type {
   ClientSubdomainTakeoverRequest,
   ClientSubdomainTakeoverResponse,
   ClientLogsResponse,
+  ServerLogEventsResponse,
+  ServerLogMeta,
+  LiveClientLogTail,
+  ServerLogScope,
 } from "@/lib/types";
 
 
@@ -130,6 +134,58 @@ export async function getClientLogs(installationId: string, signal?: AbortSignal
       cache: "no-store",
       signal,
     }),
+  );
+}
+
+export type ServerLogQuery = {
+  scope: ServerLogScope;
+  installationId?: string;
+  clientAlias?: string;
+  search?: string;
+  cursor?: string;
+  limit?: number;
+};
+
+function serverLogQueryString(query: ServerLogQuery) {
+  const params = new URLSearchParams({ scope: query.scope });
+  if (query.installationId) params.set("installationId", query.installationId);
+  if (query.clientAlias) params.set("clientAlias", query.clientAlias);
+  if (query.search) params.set("search", query.search);
+  if (query.cursor) params.set("cursor", query.cursor);
+  if (query.limit) params.set("limit", String(query.limit));
+  return params.toString();
+}
+
+export async function getServerLogMeta() {
+  return parseJson<ServerLogMeta>(
+    await authFetch("/v1/server-logs/meta", { cache: "no-store" }),
+  );
+}
+
+export async function getServerLogs(query: ServerLogQuery) {
+  return parseJson<ServerLogEventsResponse>(
+    await authFetch(`/v1/server-logs/events?${serverLogQueryString(query)}`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function exportServerLogs(query: Omit<ServerLogQuery, "cursor" | "limit">) {
+  const response = await authFetch(`/v1/server-logs/export?${serverLogQueryString(query)}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    await parseJson(response);
+  }
+  return response.blob();
+}
+
+export async function getLiveClientLogTail(installationId: string) {
+  return parseJson<LiveClientLogTail>(
+    await authFetch(
+      `/v1/server-logs/clients/${encodeURIComponent(installationId)}/live-tail`,
+      { cache: "no-store" },
+    ),
   );
 }
 
@@ -253,13 +309,15 @@ export async function getMyUsageProvider(period: AccountUsagePeriod | string) {
   );
 }
 
-export async function getMyProfile() {
-  return parseJson<UserProfileResponse>(await authFetch("/v1/me/profile", { cache: "no-store" }));
+export async function getMyUsageCardSettings() {
+  return parseJson<UsageCardSettingsResponse>(
+    await authFetch("/v1/me/usage-card", { cache: "no-store" }),
+  );
 }
 
-export async function updateMyProfile(patch: UpdateUserProfileRequest) {
-  return parseJson<UserProfileResponse>(
-    await authFetch("/v1/me/profile", {
+export async function updateMyUsageCardSettings(patch: UpdateUsageCardSettingsRequest) {
+  return parseJson<UsageCardSettingsResponse>(
+    await authFetch("/v1/me/usage-card", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),

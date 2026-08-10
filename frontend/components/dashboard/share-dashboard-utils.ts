@@ -3,16 +3,31 @@
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { AppLocale, MessageKey } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ModelHealthSummary, ShareAppProvider, ShareAppRuntimes, ShareRequestLog, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type {
+  DashboardClient,
+  DashboardMarket,
+  HealthCheckEntry,
+  MarketRequestLog,
+  ModelHealthSummary,
+  ShareAppProvider,
+  ShareAppRuntimes,
+  ShareRequestLog,
+  ShareUpstreamProvider,
+  ShareView,
+} from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
 
-export function modelHealthCheckedAt(entry: Pick<ModelHealthSummary, "checkedAt" | "lastCheckedAt">) {
+export function modelHealthCheckedAt(
+  entry: Pick<ModelHealthSummary, "checkedAt" | "lastCheckedAt">,
+) {
   return Number(entry.checkedAt ?? entry.lastCheckedAt ?? 0);
 }
 
 let rowPointerDown: { x: number; y: number } | null = null;
 
-export function onRowPointerDown(event: React.MouseEvent<HTMLElement> | React.PointerEvent<HTMLElement>) {
+export function onRowPointerDown(
+  event: React.MouseEvent<HTMLElement> | React.PointerEvent<HTMLElement>,
+) {
   rowPointerDown = { x: event.clientX, y: event.clientY };
 }
 
@@ -95,7 +110,11 @@ export function expiryTitle(value?: string) {
   return isUnlimitedExpiry(value) ? "∞" : formatDateTime(value);
 }
 
-export function formatDurationShort(value?: string, locale: AppLocale = "en", mode: "elapsed" | "remaining" = "elapsed") {
+export function formatDurationShort(
+  value?: string,
+  locale: AppLocale = "en",
+  mode: "elapsed" | "remaining" = "elapsed",
+) {
   if (!value) return "--";
   const ts = parseShareTimestamp(value);
   if (!Number.isFinite(ts)) return "--";
@@ -110,20 +129,26 @@ export function formatDurationShort(value?: string, locale: AppLocale = "en", mo
     ["分钟", "m", 60 * 1000],
     ["秒", "s", 1000],
   ];
-  const [zhUnit, enUnit, ms] = units.find(([, , unitMs]) => abs >= unitMs) || units[units.length - 1];
+  const [zhUnit, enUnit, ms] =
+    units.find(([, , unitMs]) => abs >= unitMs) || units[units.length - 1];
   const valueCount = Math.max(0, Math.floor(abs / ms));
   return isZh ? `${valueCount}${zhUnit}` : `${valueCount}${enUnit}`;
 }
 
 export function shareExpiryProgress(share: ShareView, locale: AppLocale) {
   const age = formatDurationShort(share.createdAt, locale, "elapsed");
-  const expiry = isUnlimitedExpiry(share.expiresAt) ? "∞" : formatDurationShort(share.expiresAt, locale, "remaining");
+  const expiry = isUnlimitedExpiry(share.expiresAt)
+    ? "∞"
+    : formatDurationShort(share.expiresAt, locale, "remaining");
   return `${age}/${expiry}`;
 }
 
 export function averageRecentLatencyMs(logs?: ShareRequestLog[], limit = 10) {
   const samples = [...(logs || [])]
-    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+    .sort(
+      (left, right) =>
+        Number(right.createdAt || 0) - Number(left.createdAt || 0),
+    )
     .slice(0, limit)
     .map((log) => Number(log.latencyMs || 0))
     .filter((latency) => Number.isFinite(latency) && latency > 0);
@@ -132,13 +157,21 @@ export function averageRecentLatencyMs(logs?: ShareRequestLog[], limit = 10) {
 }
 
 /** Recent-window total throughput (tok/s): Σ(input+output) / Σ(latency), truncated. */
-export function recentThroughputTokensPerSec(logs?: ShareRequestLog[], limit = 10) {
+export function recentThroughputTokensPerSec(
+  logs?: ShareRequestLog[],
+  limit = 10,
+) {
   const samples = [...(logs || [])]
-    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+    .sort(
+      (left, right) =>
+        Number(right.createdAt || 0) - Number(left.createdAt || 0),
+    )
     .slice(0, limit)
     .filter((log) => {
       const latency = Number(log.latencyMs || 0);
-      return hasObservedShareUsage(log) && Number.isFinite(latency) && latency > 0;
+      return (
+        hasObservedShareUsage(log) && Number.isFinite(latency) && latency > 0
+      );
     });
   if (!samples.length) return null;
   let tokenSum = 0;
@@ -153,12 +186,18 @@ export function recentThroughputTokensPerSec(logs?: ShareRequestLog[], limit = 1
 }
 
 export function formatThroughputTokensPerSec(tokensPerSec: number | null) {
-  if (tokensPerSec == null || !Number.isFinite(tokensPerSec) || tokensPerSec <= 0) return "-";
+  if (
+    tokensPerSec == null ||
+    !Number.isFinite(tokensPerSec) ||
+    tokensPerSec <= 0
+  )
+    return "-";
   return `${tokensPerSec} tok/s`;
 }
 
 export function formatLatencySeconds(latencyMs: number | null) {
-  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0)
+    return "-";
   const seconds = latencyMs / 1000;
   return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)}s`;
 }
@@ -190,20 +229,29 @@ export function parallelOccupancyByUser(
 }
 
 export function parallelOccupancyTitle(
-  share: Pick<ShareView, "activeRequests" | "activeRequestsByApp" | "activeRequestsByUser">,
+  share: Pick<
+    ShareView,
+    "activeRequests" | "activeRequestsByApp" | "activeRequestsByUser"
+  >,
   app: CoreShareApp | null | undefined,
   t: (key: MessageKey, values?: Record<string, string | number>) => string,
 ) {
   const byUser = parallelOccupancyByUser(share, app);
   const entries = Object.entries(byUser)
     .filter(([, count]) => count > 0)
-    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
-  const active = app ? share.activeRequestsByApp?.[app] ?? 0 : share.activeRequests ?? 0;
+    .sort(
+      (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+    );
+  const active = app
+    ? (share.activeRequestsByApp?.[app] ?? 0)
+    : (share.activeRequests ?? 0);
   if (!entries.length) {
     if (active > 0) return t("dashboard.parallelOccupancyUnknown");
     return t("dashboard.parallelOccupancyEmpty");
   }
-  const lines = entries.map(([email, count]) => `${email}: ${count}`).join("\n");
+  const lines = entries
+    .map(([email, count]) => `${email}: ${count}`)
+    .join("\n");
   const accounted = entries.reduce((sum, [, count]) => sum + count, 0);
   const remainder = active - accounted;
   if (remainder > 0) {
@@ -221,7 +269,8 @@ export function formatImageLogTimestamp(value?: number | null) {
 }
 
 export function formatImageLogSpendSeconds(latencyMs?: number | null) {
-  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0)
+    return "-";
   const seconds = latencyMs / 1000;
   return `${seconds < 10 ? seconds.toFixed(2) : seconds < 100 ? seconds.toFixed(1) : Math.round(seconds)}s`;
 }
@@ -242,7 +291,9 @@ export function shareApiUrlKey(share?: ShareView) {
   return share?.subdomain || share?.shareName || "";
 }
 
-export function shareDisplayTitle(share?: Pick<ShareView, "subdomain" | "shareId">) {
+export function shareDisplayTitle(
+  share?: Pick<ShareView, "subdomain" | "shareId">,
+) {
   return share?.subdomain || share?.shareId || "-";
 }
 
@@ -253,7 +304,9 @@ export function tunnelDomainHost(referenceTunnelUrl?: string | null) {
       const { hostname, port } = new URL(normalized);
       const dot = hostname.indexOf(".");
       if (dot > 0) {
-        return port ? `${hostname.slice(dot + 1)}:${port}` : hostname.slice(dot + 1);
+        return port
+          ? `${hostname.slice(dot + 1)}:${port}`
+          : hostname.slice(dot + 1);
       }
     } catch {
       // fall through to window host
@@ -265,7 +318,10 @@ export function tunnelDomainHost(referenceTunnelUrl?: string | null) {
   return "";
 }
 
-export function subdomainTunnelUrl(subdomain?: string | null, referenceTunnelUrl?: string | null) {
+export function subdomainTunnelUrl(
+  subdomain?: string | null,
+  referenceTunnelUrl?: string | null,
+) {
   const sub = String(subdomain || "").trim();
   if (!sub) return "";
   const host = tunnelDomainHost(referenceTunnelUrl);
@@ -273,16 +329,23 @@ export function subdomainTunnelUrl(subdomain?: string | null, referenceTunnelUrl
   return clientTunnelDisplayUrl(`${sub}.${host}`);
 }
 
-export function shareApiParts(share?: ShareView, referenceTunnelUrl?: string | null) {
+export function shareApiParts(
+  share?: ShareView,
+  referenceTunnelUrl?: string | null,
+) {
   if (!share) return { apiUrl: "-" };
-  const apiUrl = subdomainTunnelUrl(share.subdomain, referenceTunnelUrl) || share.subdomain || "-";
+  const apiUrl =
+    subdomainTunnelUrl(share.subdomain, referenceTunnelUrl) ||
+    share.subdomain ||
+    "-";
   return { apiUrl };
 }
 
 export function clientTunnelDisplayUrl(value?: string | null) {
   const trimmed = String(value || "").trim();
   if (!trimmed) return "";
-  if (/^http:\/\//i.test(trimmed)) return `https://${trimmed.slice("http://".length)}`;
+  if (/^http:\/\//i.test(trimmed))
+    return `https://${trimmed.slice("http://".length)}`;
   if (/^https:\/\//i.test(trimmed)) return trimmed;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed;
   return `https://${trimmed}`;
@@ -300,9 +363,10 @@ export function formatUsdExactTrimmed(value?: string | number) {
   if (!Number.isFinite(amount)) return "";
   if (amount === 0) return "$0";
   const unsigned = raw.replace(/^\+/, "");
-  const normalized = unsigned.includes("e") || unsigned.includes("E")
-    ? amount.toFixed(12)
-    : unsigned;
+  const normalized =
+    unsigned.includes("e") || unsigned.includes("E")
+      ? amount.toFixed(12)
+      : unsigned;
   return `$${normalized.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")}`;
 }
 
@@ -317,12 +381,21 @@ export function hasObservedShareUsage(
   return !log?.usageState || log.usageState === "observed";
 }
 
-export function usageBucketTotalTokens(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+export function usageBucketTotalTokens(
+  log?: Partial<ShareRequestLog | MarketRequestLog>,
+) {
   if (!hasObservedShareUsage(log)) return 0;
-  return tokenCount(log?.inputTokens) + tokenCount(log?.outputTokens) + tokenCount(log?.cacheReadTokens) + tokenCount(log?.cacheCreationTokens);
+  return (
+    tokenCount(log?.inputTokens) +
+    tokenCount(log?.outputTokens) +
+    tokenCount(log?.cacheReadTokens) +
+    tokenCount(log?.cacheCreationTokens)
+  );
 }
 
-export function cacheHitRate(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+export function cacheHitRate(
+  log?: Partial<ShareRequestLog | MarketRequestLog>,
+) {
   if (!hasObservedShareUsage(log)) return 0;
   const input = tokenCount(log?.inputTokens);
   const cacheRead = tokenCount(log?.cacheReadTokens);
@@ -335,25 +408,38 @@ export function formatPercent(value: number) {
   return `${percent.toFixed(percent >= 10 ? 0 : 1).replace(/\.0$/, "")}%`;
 }
 
-export function formatOfficialPriceMultiplier(value: string | number | null | undefined, label: string, t: TFn) {
+export function formatOfficialPriceMultiplier(
+  value: string | number | null | undefined,
+  label: string,
+  t: TFn,
+) {
   if (typeof value === "string" && value.trim().toLowerCase() === "mixed") {
     return `${t("dashboard.mixed")} x ${label}`;
   }
   const percent = Number(value);
   if (!Number.isFinite(percent) || percent <= 0) return `- x ${label}`;
   const multiplier = percent / 100;
-  const text = multiplier >= 1
-    ? multiplier.toFixed(2)
-    : multiplier.toFixed(3);
+  const text = multiplier >= 1 ? multiplier.toFixed(2) : multiplier.toFixed(3);
   return `${text.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")} x ${label}`;
 }
 
-export function requestModelRoute(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+export function requestModelRoute(
+  log?: Partial<ShareRequestLog | MarketRequestLog>,
+) {
   const record = (log || {}) as Partial<ShareRequestLog & MarketRequestLog>;
   const agent = record.requestAgent || "";
   const requested = record.requestedModel || record.requestModel || "";
   const actual = record.actualModel || record.model || "";
-  return [agent, requested && actual && requested !== actual ? `${requested} -> ${actual}` : actual || requested].filter(Boolean).join(" · ") || "-";
+  return (
+    [
+      agent,
+      requested && actual && requested !== actual
+        ? `${requested} -> ${actual}`
+        : actual || requested,
+    ]
+      .filter(Boolean)
+      .join(" · ") || "-"
+  );
 }
 
 export function formatShareStatus(value?: string) {
@@ -386,7 +472,9 @@ export function sortClients(clients: DashboardClient[]) {
     return (
       (Date.parse(left.installation.createdAt) || 0) -
         (Date.parse(right.installation.createdAt) || 0) ||
-      left.installation.id.localeCompare(right.installation.id, undefined, { sensitivity: "base" })
+      left.installation.id.localeCompare(right.installation.id, undefined, {
+        sensitivity: "base",
+      })
     );
   });
 }
@@ -396,11 +484,15 @@ export function sortMarkets(markets: DashboardMarket[]) {
   return [...markets].sort(
     (a, b) =>
       (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) ||
-      (a.publicBaseUrl || a.email || a.id).localeCompare(b.publicBaseUrl || b.email || b.id),
+      (a.publicBaseUrl || a.email || a.id).localeCompare(
+        b.publicBaseUrl || b.email || b.id,
+      ),
   );
 }
 
-export function marketLabel(market: Pick<DashboardMarket, "publicBaseUrl" | "email" | "subdomain">) {
+export function marketLabel(
+  market: Pick<DashboardMarket, "publicBaseUrl" | "email" | "subdomain">,
+) {
   return market.publicBaseUrl || market.email || market.subdomain;
 }
 
@@ -417,7 +509,12 @@ export function HealthDots({ entries = [] }: { entries?: HealthCheckEntry[] }) {
     return React.createElement(
       "span",
       { className: "inline-flex gap-1" },
-      Array.from({ length: 10 }).map((_, index) => React.createElement("i", { key: index, className: "h-2 w-2 rounded-full bg-slate-300" })),
+      Array.from({ length: 10 }).map((_, index) =>
+        React.createElement("i", {
+          key: index,
+          className: "h-2 w-2 rounded-full bg-slate-300",
+        }),
+      ),
     );
   }
   return React.createElement(
@@ -426,25 +523,35 @@ export function HealthDots({ entries = [] }: { entries?: HealthCheckEntry[] }) {
     dots.map((entry, index) =>
       React.createElement("i", {
         key: `${entry.checkedAt}-${index}`,
-        className: entry.isHealthy ? "h-2 w-2 rounded-full bg-emerald-500" : "h-2 w-2 rounded-full bg-red-500",
+        className: entry.isHealthy
+          ? "h-2 w-2 rounded-full bg-emerald-500"
+          : "h-2 w-2 rounded-full bg-red-500",
         title: formatDateTime(entry.checkedAt * 1000),
       }),
     ),
   );
 }
 
-export function upstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) {
+export function upstreamPercent(
+  apps?: ShareAppRuntimes,
+  key?: keyof ShareAppRuntimes,
+) {
   const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
   return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : "-";
 }
 
-export function configuredUpstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) {
+export function configuredUpstreamPercent(
+  apps?: ShareAppRuntimes,
+  key?: keyof ShareAppRuntimes,
+) {
   const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
   return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : null;
 }
 
 export function isOfficialMarker(value?: string) {
-  const normalized = String(value || "").trim().toLowerCase();
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
   return normalized === "official" || normalized === "offical";
 }
 
@@ -472,11 +579,15 @@ const MODEL_MAPPING_METADATA = new Set([
 ]);
 
 function normalizedProviderType(runtime?: ShareUpstreamProvider) {
-  return String(runtime?.providerType || runtime?.kind || "").trim().toLowerCase();
+  return String(runtime?.providerType || runtime?.kind || "")
+    .trim()
+    .toLowerCase();
 }
 
 function normalizedProviderName(runtime?: ShareUpstreamProvider) {
-  return String(runtime?.providerName || "").trim().toLowerCase();
+  return String(runtime?.providerName || "")
+    .trim()
+    .toLowerCase();
 }
 
 function resolvedApiKeyProviderType(runtime?: ShareUpstreamProvider) {
@@ -484,10 +595,13 @@ function resolvedApiKeyProviderType(runtime?: ShareUpstreamProvider) {
   if (API_KEY_PROVIDER_TYPES.has(providerType)) return providerType;
   const providerName = normalizedProviderName(runtime);
   if (providerName.includes("nvidia")) return "nvidia";
-  if (providerName.includes("deepseek") && providerName.includes("api")) return "deepseek_api";
+  if (providerName.includes("deepseek") && providerName.includes("api"))
+    return "deepseek_api";
   if (providerName.includes("openrouter")) return "openrouter";
   if (providerName.includes("ollama")) return "ollama_cloud";
-  const apiUrl = String(runtime?.apiUrl || "").trim().toLowerCase();
+  const apiUrl = String(runtime?.apiUrl || "")
+    .trim()
+    .toLowerCase();
   if (apiUrl.includes("integrate.api.nvidia.com")) return "nvidia";
   if (apiUrl.includes("api.deepseek.com")) return "deepseek_api";
   if (apiUrl.includes("openrouter.ai")) return "openrouter";
@@ -517,7 +631,11 @@ export function runtimeLooksOAuth(runtime?: ShareUpstreamProvider) {
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
-  return text.includes("oauth") || text.includes("ollama_cloud") || Boolean(oauthRuntimeKeyFromProvider(runtime));
+  return (
+    text.includes("oauth") ||
+    text.includes("ollama_cloud") ||
+    Boolean(oauthRuntimeKeyFromProvider(runtime))
+  );
 }
 
 export function isOllamaCloudRuntime(runtime?: ShareUpstreamProvider) {
@@ -530,7 +648,11 @@ export function isOllamaCloudRuntime(runtime?: ShareUpstreamProvider) {
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
-  return text.includes("ollama_cloud") || text.includes("ollama cloud") || text.includes("ollama");
+  return (
+    text.includes("ollama_cloud") ||
+    text.includes("ollama cloud") ||
+    text.includes("ollama")
+  );
 }
 
 export function isOfficialRuntime(runtime?: ShareUpstreamProvider) {
@@ -538,11 +660,23 @@ export function isOfficialRuntime(runtime?: ShareUpstreamProvider) {
   const kind = String(runtime.kind || "").toLowerCase();
   const apiUrl = runtimeApiUrl(runtime);
   const models = Array.isArray(runtime.models) ? runtime.models : [];
-  const modelsMarkedOfficial = models.length > 0 && models.every((item) => isOfficialMarker(item.actualModel));
-  return (kind === "official_oauth" || isOfficialMarker(kind) || isOfficialMarker(apiUrl) || modelsMarkedOfficial) && !hasConcreteApiUrl(runtime);
+  const modelsMarkedOfficial =
+    models.length > 0 &&
+    models.every((item) => isOfficialMarker(item.actualModel));
+  return (
+    (kind === "official_oauth" ||
+      isOfficialMarker(kind) ||
+      isOfficialMarker(apiUrl) ||
+      modelsMarkedOfficial) &&
+    !hasConcreteApiUrl(runtime)
+  );
 }
 
 export function runtimeModelSummary(runtime?: ShareUpstreamProvider) {
+  if (runtime?.modelPolicy?.mode === "single") {
+    return `model:${runtime.modelPolicy.upstreamModel}`;
+  }
+  if (runtime?.modelPolicy?.mode === "passthrough") return "passthrough";
   const models = Array.isArray(runtime?.models) ? runtime.models : [];
   return models
     .map((item) => `${item.slot || "model"}:${item.actualModel || ""}`)
@@ -551,52 +685,99 @@ export function runtimeModelSummary(runtime?: ShareUpstreamProvider) {
 }
 
 export function modelHealthKey(value?: string) {
-  return String(value || "").trim().toLowerCase();
+  return String(value || "")
+    .trim()
+    .toLowerCase();
 }
 
 export function runtimeModelKeys(runtime?: ShareUpstreamProvider) {
   const models = Array.isArray(runtime?.models) ? runtime.models : [];
-  return new Set(models.map((item) => modelHealthKey(item.actualModel)).filter(Boolean));
+  return new Set(
+    models.map((item) => modelHealthKey(item.actualModel)).filter(Boolean),
+  );
 }
 
-export function relevantModelHealthEntries(share: ShareView, key: "claude" | "codex" | "gemini") {
+export function relevantModelHealthEntries(
+  share: ShareView,
+  key: "claude" | "codex" | "gemini",
+) {
   const entries = share.modelHealth?.[key] || [];
   const currentModels = runtimeModelKeys(share.appRuntimes?.[key]);
   if (currentModels.size === 0) return entries;
-  return entries.filter((entry) => isAppLevelQuotaBlockedModelHealth(entry, key) || currentModels.has(modelHealthKey(entry.requestedModel)) || currentModels.has(modelHealthKey(entry.actualModel)));
+  return entries.filter(
+    (entry) =>
+      isAppLevelQuotaBlockedModelHealth(entry, key) ||
+      currentModels.has(modelHealthKey(entry.requestedModel)) ||
+      currentModels.has(modelHealthKey(entry.actualModel)),
+  );
 }
 
 export function modelHealthFailureReason(entries: ModelHealthSummary[]) {
   const failed = entries
-    .filter((entry) => entry.status === "failed" || (entry.recentResults || []).includes("failed"))
-    .sort((left, right) => modelHealthCheckedAt(right) - modelHealthCheckedAt(left))[0];
+    .filter(
+      (entry) =>
+        entry.status === "failed" ||
+        (entry.recentResults || []).includes("failed"),
+    )
+    .sort(
+      (left, right) => modelHealthCheckedAt(right) - modelHealthCheckedAt(left),
+    )[0];
   const code = Number(failed?.statusCode || 0);
   const message = String(failed?.errorMessage || "").toLowerCase();
-  if (code === 429 || message.includes("429") || message.includes("rate limit") || message.includes("rate limited") || message.includes("usage limit")) return "Rate Limited";
-  if (code === 401 || message.includes("auth rejected (401)") || message.includes("token_invalidated") || message.includes("token invalidated") || message.includes("invalidated")) return "Banned";
-  if (code === 403 || message.includes("403") || message.includes("forbidden")) return "Forbidden";
-  if (code === 402 || message.includes("insufficient") || message.includes("quota")) return "No Credits";
-  if (message.includes("timeout") || message.includes("timed out")) return "Timeout";
-  if (message.includes("oauth") || message.includes("refresh token")) return "Auth Failed";
+  if (
+    code === 429 ||
+    message.includes("429") ||
+    message.includes("rate limit") ||
+    message.includes("rate limited") ||
+    message.includes("usage limit")
+  )
+    return "Rate Limited";
+  if (
+    code === 401 ||
+    message.includes("auth rejected (401)") ||
+    message.includes("token_invalidated") ||
+    message.includes("token invalidated") ||
+    message.includes("invalidated")
+  )
+    return "Banned";
+  if (code === 403 || message.includes("403") || message.includes("forbidden"))
+    return "Forbidden";
+  if (
+    code === 402 ||
+    message.includes("insufficient") ||
+    message.includes("quota")
+  )
+    return "No Credits";
+  if (message.includes("timeout") || message.includes("timed out"))
+    return "Timeout";
+  if (message.includes("oauth") || message.includes("refresh token"))
+    return "Auth Failed";
   if (code >= 500 || message.includes("server error")) return "Provider Error";
   return "Failed";
 }
 
 export function isQuotaBlockedModelHealth(entry: ModelHealthSummary) {
   const message = String(entry.errorMessage || "").toLowerCase();
-  return entry.status === "quota_blocked"
-    || message.includes("quota exhausted")
-    || message.includes("quota_exhausted")
-    || message.includes("usage limit")
-    || message.includes("usage_limit")
-    || message.includes("weekly limit")
-    || message.includes("monthly limit");
+  return (
+    entry.status === "quota_blocked" ||
+    message.includes("quota exhausted") ||
+    message.includes("quota_exhausted") ||
+    message.includes("usage limit") ||
+    message.includes("usage_limit") ||
+    message.includes("weekly limit") ||
+    message.includes("monthly limit")
+  );
 }
 
-export function isAppLevelQuotaBlockedModelHealth(entry: ModelHealthSummary, key: "claude" | "codex" | "gemini") {
-  return modelHealthKey(entry.requestedModel) === key
-    && modelHealthKey(entry.actualModel) === key
-    && isQuotaBlockedModelHealth(entry);
+export function isAppLevelQuotaBlockedModelHealth(
+  entry: ModelHealthSummary,
+  key: "claude" | "codex" | "gemini",
+) {
+  return (
+    modelHealthKey(entry.requestedModel) === key &&
+    modelHealthKey(entry.actualModel) === key &&
+    isQuotaBlockedModelHealth(entry)
+  );
 }
 
 export function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
@@ -606,11 +787,19 @@ export function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
 }
 
 export function isCursorApiKeyRuntime(runtime?: ShareUpstreamProvider) {
-  return String(runtime?.providerType || "").trim().toLowerCase() === "cursor_apikey";
+  return (
+    String(runtime?.providerType || "")
+      .trim()
+      .toLowerCase() === "cursor_apikey"
+  );
 }
 
 export function isApiProviderRuntime(runtime?: ShareUpstreamProvider) {
-  if (!runtime || isCursorApiKeyRuntime(runtime) || runtimeLooksOAuth(runtime)) {
+  if (
+    !runtime ||
+    isCursorApiKeyRuntime(runtime) ||
+    runtimeLooksOAuth(runtime)
+  ) {
     return false;
   }
   if (resolvedApiKeyProviderType(runtime)) {
@@ -650,26 +839,44 @@ export function formatExpireDistance(expiresAt?: string) {
 }
 
 export function quotaTierLabel(label?: string, locale: AppLocale = "en") {
-  const normalized = String(label || "").trim().toLowerCase();
-  if (normalized === "cursor credits" || normalized === "cursor included usage") return "Usage";
-  if (normalized === "premium") return locale.startsWith("zh") ? "高级请求" : "Premium request";
+  const normalized = String(label || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "cursor credits" || normalized === "cursor included usage")
+    return "Usage";
+  if (normalized === "premium")
+    return locale.startsWith("zh") ? "高级请求" : "Premium request";
   return label || "";
 }
 
-export function normalizeCompactTierLabel(label?: string, locale: AppLocale = "en") {
-  const normalized = String(label || "").trim().toLowerCase();
+export function normalizeCompactTierLabel(
+  label?: string,
+  locale: AppLocale = "en",
+) {
+  const normalized = String(label || "")
+    .trim()
+    .toLowerCase();
   if (normalized === "1w" || normalized === "weekly_limit") return "7d";
   if (normalized === "five_hour") return "5h";
   if (normalized === "seven_day") return "7d";
   if (normalized === "30_day" || normalized === "monthly") return "30d";
-  if (normalized === "seven_day_opus" || normalized === "seven_day_omelette") return "7d Opus";
+  if (normalized === "seven_day_opus" || normalized === "seven_day_omelette")
+    return "7d Opus";
   if (normalized === "seven_day_sonnet") return "7d Sonnet";
   const mapped = quotaTierLabel(label, locale);
   return mapped || String(label || "").trim();
 }
 
 export function formatCompactQuotaTier(
-  tier: { label?: string; name?: string; utilization?: number; resetsAt?: string; used?: number; limit?: number; unit?: string },
+  tier: {
+    label?: string;
+    name?: string;
+    utilization?: number;
+    resetsAt?: string;
+    used?: number;
+    limit?: number;
+    unit?: string;
+  },
   locale: AppLocale = "en",
 ) {
   const label = normalizeCompactTierLabel(tier.label || tier.name, locale);
@@ -685,7 +892,10 @@ export function formatCompactQuotaTier(
 export function quotaPlanLabel(runtime: ShareUpstreamProvider, plan?: string) {
   const normalized = String(plan || "").trim();
   if (!normalized) return "";
-  if (isOllamaCloudRuntime(runtime) && !normalized.toLowerCase().includes("ollama")) {
+  if (
+    isOllamaCloudRuntime(runtime) &&
+    !normalized.toLowerCase().includes("ollama")
+  ) {
     return `ollama ${normalized}`;
   }
   return normalized;
@@ -713,8 +923,14 @@ export function formatQuotaUsageAmount(
 
 type OAuthRuntimeKey = "kiro" | "cursor" | "antigravity" | "copilot";
 
-export function oauthRuntimeKeyFromProvider(value?: Partial<ShareUpstreamProvider & ShareAppProvider>): OAuthRuntimeKey | undefined {
-  if (String(value?.providerType || "").trim().toLowerCase() === "cursor_apikey") {
+export function oauthRuntimeKeyFromProvider(
+  value?: Partial<ShareUpstreamProvider & ShareAppProvider>,
+): OAuthRuntimeKey | undefined {
+  if (
+    String(value?.providerType || "")
+      .trim()
+      .toLowerCase() === "cursor_apikey"
+  ) {
     return undefined;
   }
   const text = [
@@ -730,7 +946,8 @@ export function oauthRuntimeKeyFromProvider(value?: Partial<ShareUpstreamProvide
   if (text.includes("kiro")) return "kiro";
   if (text.includes("cursor")) return "cursor";
   if (text.includes("antigravity")) return "antigravity";
-  if (text.includes("copilot") || text.includes("github_copilot")) return "copilot";
+  if (text.includes("copilot") || text.includes("github_copilot"))
+    return "copilot";
   return undefined;
 }
 
@@ -748,10 +965,16 @@ export function mergeStandaloneOAuthRuntime(
     accountEmail: runtime.accountEmail || standalone.accountEmail,
     quota: runtime.quota || standalone.quota,
     models: runtime.models?.length ? runtime.models : standalone.models,
+    modelPolicyScope: runtime.modelPolicyScope || standalone.modelPolicyScope,
+    modelPolicySource:
+      runtime.modelPolicySource || standalone.modelPolicySource,
+    modelPolicy: runtime.modelPolicy || standalone.modelPolicy,
   };
 }
 
-export function shareAppProviderRuntime(provider: ShareAppProvider): ShareUpstreamProvider {
+export function shareAppProviderRuntime(
+  provider: ShareAppProvider,
+): ShareUpstreamProvider {
   return {
     providerName: provider.name,
     kind: provider.kind,
@@ -762,11 +985,20 @@ export function shareAppProviderRuntime(provider: ShareAppProvider): ShareUpstre
     apiUrl: provider.apiUrl,
     quota: provider.quota,
     models: provider.models,
+    modelPolicyScope: provider.modelPolicyScope,
+    modelPolicySource: provider.modelPolicySource,
+    modelPolicy: provider.modelPolicy,
   };
 }
 
-export function boundProviderIdForApp(share: ShareView | undefined, app: CoreShareApp) {
-  return share?.bindings?.[app] || (share?.appType === app ? share.providerId : undefined);
+export function boundProviderIdForApp(
+  share: ShareView | undefined,
+  app: CoreShareApp,
+) {
+  return (
+    share?.bindings?.[app] ||
+    (share?.appType === app ? share.providerId : undefined)
+  );
 }
 
 export function resolveShareAppRuntime(share: ShareView, app: CoreShareApp) {
@@ -778,7 +1010,11 @@ export function resolveShareAppRuntime(share: ShareView, app: CoreShareApp) {
     providers.find((item) => item.isCurrent) ||
     providers[0];
   if (provider) {
-    return mergeStandaloneOAuthRuntime(shareAppProviderRuntime(provider), runtimes, provider);
+    return mergeStandaloneOAuthRuntime(
+      shareAppProviderRuntime(provider),
+      runtimes,
+      provider,
+    );
   }
   const slotRuntime = runtimes?.[app];
   if (slotRuntime) {
@@ -793,17 +1029,24 @@ export function utilizationPercentForDisplay(value: number) {
   return Math.round(value);
 }
 
-export function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
-  if (!runtime || (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime))) return "";
+export function quotaSummary(
+  runtime?: ShareUpstreamProvider,
+  locale: AppLocale = "en",
+) {
+  if (!runtime || (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime)))
+    return "";
   const quota = runtime.quota;
   const status = String(quota?.status || "").toLowerCase();
-  if (!quota || (status && !["ok", "success", "valid"].includes(status))) return "";
+  if (!quota || (status && !["ok", "success", "valid"].includes(status)))
+    return "";
   let tiers = (quota.tiers || [])
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
     .filter((tier) => tier.label);
   if (runtime.app === "claude") {
     const preferredLabels = new Set(["5h", "1w", "7d"]);
-    const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
+    const preferredTiers = tiers.filter((tier) =>
+      preferredLabels.has(String(tier.label).toLowerCase()),
+    );
     if (preferredTiers.length) tiers = preferredTiers;
   }
   const tierText = tiers
@@ -811,7 +1054,11 @@ export function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale 
     .filter(Boolean)
     .join(" · ");
   const expireText = providerSubscriptionExpiry(runtime, locale);
-  return [quotaPlanLabel(runtime, quota.plan || quota.credentialMessage), expireText, tierText]
+  return [
+    quotaPlanLabel(runtime, quota.plan || quota.credentialMessage),
+    expireText,
+    tierText,
+  ]
     .filter(Boolean)
     .join(" · ");
 }
@@ -831,8 +1078,16 @@ export function providerSubscriptionExpiry(
   return `expire in ${remaining}`;
 }
 
-export function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
-  return quotaSummary(runtime, locale) || runtime?.providerName || runtime?.kind || "-";
+export function providerAccountLevel(
+  runtime?: ShareUpstreamProvider,
+  locale: AppLocale = "en",
+) {
+  return (
+    quotaSummary(runtime, locale) ||
+    runtime?.providerName ||
+    runtime?.kind ||
+    "-"
+  );
 }
 
 export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
@@ -872,13 +1127,18 @@ function preferredQuotaTiers(runtime?: ShareUpstreamProvider) {
     .filter((tier) => tier.label);
   if (runtime?.app === "claude") {
     const preferredLabels = new Set(["5h", "1w", "7d"]);
-    const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
+    const preferredTiers = tiers.filter((tier) =>
+      preferredLabels.has(String(tier.label).toLowerCase()),
+    );
     if (preferredTiers.length) tiers = preferredTiers;
   }
   return tiers;
 }
 
-export function providerQuotaStatusLine(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+export function providerQuotaStatusLine(
+  runtime?: ShareUpstreamProvider,
+  locale: AppLocale = "en",
+) {
   if (!runtime) return "-";
   if (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime)) {
     return runtime.providerName || runtime.kind || "-";
@@ -905,16 +1165,22 @@ export function providerAccountTierLabel(runtime?: ShareUpstreamProvider) {
   if (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime)) {
     return runtime.providerName || runtime.kind || "-";
   }
-  const plan = String(runtime.quota?.plan || runtime.quota?.credentialMessage || "").trim();
+  const plan = String(
+    runtime.quota?.plan || runtime.quota?.credentialMessage || "",
+  ).trim();
   if (plan) {
-    return isOllamaCloudRuntime(runtime) && !plan.toLowerCase().includes("ollama")
+    return isOllamaCloudRuntime(runtime) &&
+      !plan.toLowerCase().includes("ollama")
       ? `ollama ${plan}`
       : plan;
   }
   return runtime.providerName || runtime.kind || "-";
 }
 
-export function providerQuotaExpiry(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+export function providerQuotaExpiry(
+  runtime?: ShareUpstreamProvider,
+  locale: AppLocale = "en",
+) {
   if (!runtime?.quota) return "-";
   const tiers = preferredQuotaTiers(runtime);
   const resets = tiers
@@ -922,31 +1188,51 @@ export function providerQuotaExpiry(runtime?: ShareUpstreamProvider, locale: App
     .filter(Boolean)
     .sort()[0];
   if (resets) {
-    return countdownStr(resets) || formatDurationShort(resets, locale, "remaining") || "-";
+    return (
+      countdownStr(resets) ||
+      formatDurationShort(resets, locale, "remaining") ||
+      "-"
+    );
   }
   const subscriptionEnd = runtime.quota.subscriptionPeriodEnd;
   if (!subscriptionEnd) return "-";
   if (isUnlimitedExpiry(subscriptionEnd)) return "∞";
-  const remaining = countdownStr(subscriptionEnd) || formatDurationShort(subscriptionEnd, locale, "remaining");
+  const remaining =
+    countdownStr(subscriptionEnd) ||
+    formatDurationShort(subscriptionEnd, locale, "remaining");
   return remaining === "--" ? "-" : remaining;
 }
 
-export function providerUsageData(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+export function providerUsageData(
+  runtime?: ShareUpstreamProvider,
+  locale: AppLocale = "en",
+) {
   const line = providerQuotaStatusLine(runtime, locale);
   return line === "-" ? "-" : line;
 }
 
 export function providerActualModelNames(runtime?: ShareUpstreamProvider) {
+  if (runtime?.modelPolicy?.mode === "single") {
+    return runtime.modelPolicy.upstreamModel;
+  }
+  if (runtime?.modelPolicy?.mode === "passthrough") return "passthrough";
   const models = Array.isArray(runtime?.models) ? runtime.models : [];
   const names = models
     .map((item) => String(item.actualModel || "").trim())
-    .filter((name) => name && !isOfficialMarker(name) && !MODEL_MAPPING_METADATA.has(name.toLowerCase()));
+    .filter(
+      (name) =>
+        name &&
+        !isOfficialMarker(name) &&
+        !MODEL_MAPPING_METADATA.has(name.toLowerCase()),
+    );
   const deduped = [...new Set(names)];
   if (deduped.length === 1) {
     return deduped[0];
   }
   if (deduped.length > 1) {
-    const withoutMetadata = deduped.filter((name) => !MODEL_MAPPING_METADATA.has(name.toLowerCase()));
+    const withoutMetadata = deduped.filter(
+      (name) => !MODEL_MAPPING_METADATA.has(name.toLowerCase()),
+    );
     if (withoutMetadata.length === 1) {
       return withoutMetadata[0];
     }
@@ -955,7 +1241,10 @@ export function providerActualModelNames(runtime?: ShareUpstreamProvider) {
   return "-";
 }
 
-export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {
+export function modelHealthTone(
+  share: ShareView,
+  key: "claude" | "codex" | "gemini",
+) {
   const entries = relevantModelHealthEntries(share, key);
   if (entries.some((entry) => isAppLevelQuotaBlockedModelHealth(entry, key))) {
     return {
@@ -963,7 +1252,9 @@ export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gem
       label: modelHealthFailureReason(entries),
     };
   }
-  const results = entries.flatMap((entry) => (entry.recentResults || []).slice(0, 3));
+  const results = entries.flatMap((entry) =>
+    (entry.recentResults || []).slice(0, 3),
+  );
   if (!results.length) {
     return {
       className: "border-emerald-200 bg-emerald-50 text-emerald-700",
@@ -971,10 +1262,14 @@ export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gem
     };
   }
   const failures = results.filter((result) => result === "failed").length;
-  const allModelsFailed = entries.length > 0 && entries.every((entry) => {
-    const recent = (entry.recentResults || []).slice(0, 3);
-    return recent.length >= 3 && recent.every((result) => result === "failed");
-  });
+  const allModelsFailed =
+    entries.length > 0 &&
+    entries.every((entry) => {
+      const recent = (entry.recentResults || []).slice(0, 3);
+      return (
+        recent.length >= 3 && recent.every((result) => result === "failed")
+      );
+    });
   if (allModelsFailed) {
     return {
       className: "border-red-200 bg-red-50 text-red-700",
@@ -993,13 +1288,18 @@ export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gem
   };
 }
 
-export function modelHealthTitle(share: ShareView, key: "claude" | "codex" | "gemini") {
+export function modelHealthTitle(
+  share: ShareView,
+  key: "claude" | "codex" | "gemini",
+) {
   const entries = relevantModelHealthEntries(share, key);
   if (!entries.length) return "No failures recorded yet";
   return entries
     .map((entry) => {
       const recent = (entry.recentResults || []).join(" / ") || entry.status;
-      const checked = modelHealthCheckedAt(entry) ? formatDateTime(modelHealthCheckedAt(entry) * 1000) : "-";
+      const checked = modelHealthCheckedAt(entry)
+        ? formatDateTime(modelHealthCheckedAt(entry) * 1000)
+        : "-";
       const model = entry.requestedModel || entry.actualModel || "-";
       return `${model}: ${recent} · ${checked}${entry.errorMessage ? ` · ${entry.errorMessage}` : ""}`;
     })
@@ -1012,10 +1312,18 @@ export function shareAppSettings(share: ShareView, app: CoreShareApp) {
   const access = share.accessByApp?.[app];
   return {
     forSale: share.appSettings?.[app]?.forSale ?? share.forSale,
-    marketAccessMode: share.appSettings?.[app]?.marketAccessMode ?? access?.marketAccessMode ?? share.marketAccessMode,
-    sharedWithEmails: share.appSettings?.[app]?.sharedWithEmails ?? access?.sharedWithEmails ?? share.sharedWithEmails ?? [],
+    marketAccessMode:
+      share.appSettings?.[app]?.marketAccessMode ??
+      access?.marketAccessMode ??
+      share.marketAccessMode,
+    sharedWithEmails:
+      share.appSettings?.[app]?.sharedWithEmails ??
+      access?.sharedWithEmails ??
+      share.sharedWithEmails ??
+      [],
     tokenLimit: share.appSettings?.[app]?.tokenLimit ?? share.tokenLimit,
-    parallelLimit: share.appSettings?.[app]?.parallelLimit ?? share.parallelLimit,
+    parallelLimit:
+      share.appSettings?.[app]?.parallelLimit ?? share.parallelLimit,
     expiresAt: share.appSettings?.[app]?.expiresAt || share.expiresAt,
   };
 }
@@ -1023,16 +1331,19 @@ export function shareAppSettings(share: ShareView, app: CoreShareApp) {
 export function shareAppExists(share: ShareView, app: CoreShareApp) {
   return Boolean(
     share.bindings?.[app] ||
-      share.support?.[app] ||
-      share.appSettings?.[app] ||
-      share.accessByApp?.[app] ||
-      share.appRuntimes?.[app] ||
-      share.modelHealth?.[app]?.length ||
-      share.appType === app,
+    share.support?.[app] ||
+    share.appSettings?.[app] ||
+    share.accessByApp?.[app] ||
+    share.appRuntimes?.[app] ||
+    share.modelHealth?.[app]?.length ||
+    share.appType === app,
   );
 }
 
-export function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
+export function requestBelongsToApp(
+  request: ShareRequestLog,
+  app: CoreShareApp,
+) {
   const appType = (request.appType || "").trim().toLowerCase();
   if (appType) return appType === app;
   const agent = (request.requestAgent || "").trim().toLowerCase();
@@ -1045,12 +1356,16 @@ export function formatMinutesShort(minutes?: number, locale: AppLocale = "en") {
   if (value >= 1440) {
     const days = Math.floor(value / 1440);
     const hours = Math.floor((value % 1440) / 60);
-    return isZh ? `${days}天${hours ? `${hours}小时` : ""}` : `${days}d${hours ? `${hours}h` : ""}`;
+    return isZh
+      ? `${days}天${hours ? `${hours}小时` : ""}`
+      : `${days}d${hours ? `${hours}h` : ""}`;
   }
   if (value >= 60) {
     const hours = Math.floor(value / 60);
     const mins = value % 60;
-    return isZh ? `${hours}小时${mins ? `${mins}分钟` : ""}` : `${hours}h${mins ? `${mins}m` : ""}`;
+    return isZh
+      ? `${hours}小时${mins ? `${mins}分钟` : ""}`
+      : `${hours}h${mins ? `${mins}m` : ""}`;
   }
   return isZh ? `${value}分钟` : `${value}m`;
 }
@@ -1071,18 +1386,27 @@ export function formatAgeDaysOrHours(value?: string, locale: AppLocale = "en") {
   return isZh ? `${hours}小时` : `${hours}h`;
 }
 
-export function clientRunningDurationMs(client: DashboardClient, now = Date.now()) {
+export function clientRunningDurationMs(
+  client: DashboardClient,
+  now = Date.now(),
+) {
   const ts = Date.parse(client.installation.createdAt);
   if (!Number.isFinite(ts)) return 0;
   return Math.max(0, now - ts);
 }
 
-export function clientRunningDurationLabel(client: DashboardClient, locale: AppLocale = "en") {
+export function clientRunningDurationLabel(
+  client: DashboardClient,
+  locale: AppLocale = "en",
+) {
   return formatAgeDaysOrHours(client.installation.createdAt, locale);
 }
 
 export function clientTotalTokensUsed(shares: ShareView[]) {
-  return shares.reduce((sum, share) => sum + (Number(share.tokensUsed) || 0), 0);
+  return shares.reduce(
+    (sum, share) => sum + (Number(share.tokensUsed) || 0),
+    0,
+  );
 }
 
 export function clientTotalTokensLabel(shares: ShareView[]) {

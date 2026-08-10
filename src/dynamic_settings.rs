@@ -17,6 +17,7 @@ pub struct DynamicSettings {
     pub alerting: AlertingSettings,
     pub market_usd_cny_rate_micros: i64,
     pub footer_telegram_url: String,
+    pub server_log_public_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ impl DynamicSettings {
             alerting: config.metrics.alerting.clone(),
             market_usd_cny_rate_micros: config.market_usd_cny_rate_micros,
             footer_telegram_url: config.footer_telegram_url.clone(),
+            server_log_public_enabled: crate::server_logs::public_enabled_from_env(),
         }
     }
 

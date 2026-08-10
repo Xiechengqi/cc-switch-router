@@ -1,6 +1,9 @@
 "use client";
 
-import { settingsMessagesEn, settingsMessagesZh } from "@/lib/settings-messages";
+import {
+  settingsMessagesEn,
+  settingsMessagesZh,
+} from "@/lib/settings-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -45,9 +48,11 @@ export const messages = {
     "common.restartRequired": "restart",
     "common.unset": "unset",
     "nav.clientsTitle": "Total number of clients registered on this router.",
-    "nav.countriesTitle": "Distinct countries currently routing traffic through this router.",
+    "nav.countriesTitle":
+      "Distinct countries currently routing traffic through this router.",
     "nav.activeSharesTitle": "Clients whose share status is currently active.",
-    "nav.inFlightTitle": "Total HTTP requests currently in-flight across every share.",
+    "nav.inFlightTitle":
+      "Total HTTP requests currently in-flight across every share.",
     "nav.clients": "clients",
     "nav.countries": "countries",
     "nav.activeShares": "active shares",
@@ -61,6 +66,7 @@ export const messages = {
     "nav.marketsTab": "Token Market",
     "nav.shareMarketTab": "Share Market",
     "nav.clientMarketTab": "Client Market",
+    "nav.logsTab": "Log",
     "nav.accountTab": "Account",
     "nav.dashboardSections": "Dashboard sections",
     "nav.logout": "Logout",
@@ -77,6 +83,42 @@ export const messages = {
     "clientLogs.publicAccess": "Public view",
     "clientLogs.lineCount": "{count} / {limit} lines",
     "clientLogs.updatedAt": "Updated {time}",
+    "serverLogs.scope.public": "Public",
+    "serverLogs.scope.mine": "My Clients",
+    "serverLogs.scope.all": "All Clients",
+    "serverLogs.scopeAria": "Log visibility",
+    "serverLogs.allClients": "All Clients",
+    "serverLogs.lastFiveMinutes": "Last 5 minutes",
+    "serverLogs.retentionDays": "{days}-day retention",
+    "serverLogs.export": "Export logs",
+    "serverLogs.search": "Search events and fields",
+    "serverLogs.client": "Client",
+    "serverLogs.publicDisabled":
+      "Public logs are disabled. Sign in to view logs available to your account.",
+    "serverLogs.time": "Time",
+    "serverLogs.event": "Event",
+    "serverLogs.details": "Details",
+    "serverLogs.viewDetails": "View details",
+    "serverLogs.empty": "No log events in this scope.",
+    "serverLogs.loadNewer": "Newer",
+    "serverLogs.loadOlder": "Load older",
+    "serverLogs.page": "Page {page}",
+    "serverLogs.clientDetails": "Client details",
+    "serverLogs.subdomain": "Subdomain",
+    "serverLogs.platform": "Platform",
+    "serverLogs.appVersion": "App version",
+    "serverLogs.owner": "Owner",
+    "serverLogs.country": "Country / region",
+    "serverLogs.tunnel": "Tunnel",
+    "serverLogs.createdAt": "Created",
+    "serverLogs.lastSeenAt": "Last seen",
+    "serverLogs.installationId": "Installation ID",
+    "serverLogs.liveDiagnostics": "Live diagnostics",
+    "serverLogs.liveDiagnosticsHint":
+      "Reads up to 100 redacted lines directly from the online Server. Router does not retain this response.",
+    "serverLogs.fetchLiveDiagnostics": "Fetch",
+    "serverLogs.liveDiagnosticsMeta": "{lines} lines · fetched {time}",
+    "serverLogs.truncated": "truncated",
     "shareMarket.title": "Share Market",
     "shareMarket.addShare": "Add Share",
     "shareMarket.tab.all": "All seats",
@@ -90,7 +132,8 @@ export const messages = {
     "shareMarket.offline": "Offline",
     "shareMarket.unavailable": "Unavailable",
     "shareMarket.closed": "Closed",
-    "shareMarket.closedHint": "Available seats are disabled. Active rentals continue. After all rentals end, use Add Share to list this Share again. You can still add seats here to reopen the listing.",
+    "shareMarket.closedHint":
+      "Available seats are disabled. Active rentals continue. After all rentals end, use Add Share to list this Share again. You can still add seats here to reopen the listing.",
     "shareMarket.openShare": "Open Share",
     "shareMarket.groupChat": "Group chat",
     "shareMarket.openGroupChat": "Open the corresponding Client chat",
@@ -102,8 +145,10 @@ export const messages = {
     "shareMarket.search": "Search seats, Share, provider, owner, or renter",
     "shareMarket.searchAria": "Search Share Market",
     "shareMarket.deleteListing": "Delete listing",
-    "shareMarket.confirm.deleteListingTitle": "Delete this closed Share listing?",
-    "shareMarket.confirm.deleteListingDescription": "Permanently remove the closed listing for {share}. Only listings with no rental history can be deleted.",
+    "shareMarket.confirm.deleteListingTitle":
+      "Delete this closed Share listing?",
+    "shareMarket.confirm.deleteListingDescription":
+      "Permanently remove the closed listing for {share}. Only listings with no rental history can be deleted.",
     "shareMarket.filterClear": "Clear filters",
     "shareMarket.filterOnline": "Filter by online status",
     "shareMarket.filterShare": "Filter by Share",
@@ -126,13 +171,20 @@ export const messages = {
     "shareMarket.manage": "Manage",
     "shareMarket.expandDetails": "Share details",
     "shareMarket.collapseDetails": "Hide details",
-    "shareMarket.rentOfflineHint": "This Share is offline. Access will apply after the Server reconnects.",
+    "shareMarket.rentOfflineHint":
+      "This Share is offline. Access will apply after the Server reconnects.",
     "shareMarket.rentConfirm.title": "Confirm Share rental",
     "shareMarket.rentConfirm.confirm": "Confirm rental",
-    "shareMarket.rentConfirm.postpaid": "The first {hours} hours of healthy service are free and do not create charges. After that, usage accrues on this Owner account at the daily rate. When this Owner's credit threshold is reached, one payable invoice may combine multiple Share and Client Host services.",
-    "shareMarket.rentConfirm.freeFixed": "The {days}-day free period starts only after access is activated. No credit charge is created.",
-    "shareMarket.rentConfirm.freePermanent": "This is a permanent free offer. No credit charge is created.",
-    "shareMarket.rentConfirm.offline": "This Share is currently offline and cannot be rented. Try again after the Owner restores service.",
+    "shareMarket.rentConfirm.postpaid":
+      "The first {hours} hours of healthy service are free and do not create charges. After that, usage accrues on this Owner account at the daily rate. When this Owner's credit threshold is reached, one payable invoice may combine multiple Share and Client Host services.",
+    "shareMarket.rentConfirm.freeBilling":
+      "This seat is free and does not create credit charges.",
+    "shareMarket.rentConfirm.serviceFixed":
+      "The {days}-day service term starts when this rental is confirmed, without waiting for access activation. Router automatically reclaims access when the term ends.",
+    "shareMarket.rentConfirm.servicePermanent":
+      "This service has no fixed end date and continues until either party returns or reclaims the seat.",
+    "shareMarket.rentConfirm.offline":
+      "This Share is currently offline and cannot be rented. Try again after the Owner restores service.",
     "shareMarket.status": "Status",
     "shareMarket.seat": "Seat {position}",
     "shareMarket.free": "Free",
@@ -173,37 +225,49 @@ export const messages = {
     "shareMarket.subscription.grantFailed": "Grant failed",
     "shareMarket.subscription.released": "Reclaimed · read-only",
     "shareMarket.confirm.releaseTitle": "Return this seat?",
-    "shareMarket.confirm.releaseDescription": "Access to {share} will be removed after the Server confirms the change.",
+    "shareMarket.confirm.releaseDescription":
+      "Access to {share} will be removed after the Server confirms the change.",
     "shareMarket.confirm.revokeTitle": "Reclaim this seat?",
-    "shareMarket.confirm.revokeDescription": "Access for {email} will be removed. The renter will not be blocked.",
+    "shareMarket.confirm.revokeDescription":
+      "Access for {email} will be removed. The renter will not be blocked.",
     "shareMarket.confirm.denyTitle": "Reclaim and deny future access?",
-    "shareMarket.confirm.denyDescription": "Access for {email} will be removed and this account will be denied future Share rentals until you change its access rule.",
+    "shareMarket.confirm.denyDescription":
+      "Access for {email} will be removed and this account will be denied future Share rentals until you change its access rule.",
     "shareMarket.confirm.closeTitle": "Close this listing?",
-    "shareMarket.confirm.closeDescription": "Available seats on {share} will be disabled. Active rentals continue until returned or reclaimed.",
+    "shareMarket.confirm.closeDescription":
+      "Available seats on {share} will be disabled. Active rentals continue until returned or reclaimed.",
     "shareMarket.confirm.deleteTitle": "Delete this seat?",
-    "shareMarket.confirm.deleteDescription": "Seat {position} will be permanently removed from this listing.",
+    "shareMarket.confirm.deleteDescription":
+      "Seat {position} will be permanently removed from this listing.",
     "shareMarket.error.positiveInteger": "{field} must be a positive integer.",
-    "shareMarket.error.price": "Price must be greater than zero with no more than two decimal places.",
+    "shareMarket.error.price":
+      "Price must be greater than zero with no more than two decimal places.",
     "shareMarket.error.currency": "Currency must be USD.",
-    "shareMarket.error.freeDuration": "Free duration must be 1 to 365 days, or permanent.",
+    "shareMarket.error.serviceDuration":
+      "Service term must be 1 to 365 days, or have no fixed end date.",
     "shareMarket.priceChange.action": "Change price",
     "shareMarket.priceChange.title": "Propose a new daily price",
     "shareMarket.priceChange.current": "Current price: {amount} / day",
     "shareMarket.priceChange.newDailyPrice": "New daily price",
-    "shareMarket.priceChange.consentNotice": "The current price remains in effect until the renter accepts. After acceptance, the next billing reconciliation closes usage at the old price before applying the new price; prior usage is never repriced.",
+    "shareMarket.priceChange.consentNotice":
+      "The current price remains in effect until the renter accepts. After acceptance, the next billing reconciliation closes usage at the old price before applying the new price; prior usage is never repriced.",
     "shareMarket.priceChange.propose": "Send proposal",
-    "shareMarket.priceChange.samePrice": "Enter a price different from the current daily price.",
+    "shareMarket.priceChange.samePrice":
+      "Enter a price different from the current daily price.",
     "shareMarket.priceChange.summary": "{previous} → {proposed} / day",
     "shareMarket.priceChange.status.pending": "Awaiting renter",
-    "shareMarket.priceChange.status.accepted": "Accepted · awaiting billing boundary",
+    "shareMarket.priceChange.status.accepted":
+      "Accepted · awaiting billing boundary",
     "shareMarket.priceChange.acceptTitle": "Accept this new daily price?",
-    "shareMarket.priceChange.acceptDescription": "The daily price changes from {previous} to {proposed} at the next billing boundary. Usage already accrued keeps the old price.",
+    "shareMarket.priceChange.acceptDescription":
+      "The daily price changes from {previous} to {proposed} at the next billing boundary. Usage already accrued keeps the old price.",
     "shareMarket.priceChange.accept": "Accept price",
     "shareMarket.priceChange.reject": "Reject",
     "shareMarket.priceChange.cancel": "Cancel proposal",
     "shareMarket.dialog.title": "Add Share to market",
     "shareMarket.dialog.selectShare": "Share",
-    "shareMarket.dialog.noShares": "You have no active, unlisted Share available. Closed listings with active rentals must finish before Add Share can list them again.",
+    "shareMarket.dialog.noShares":
+      "You have no active, unlisted Share available. Closed listings with active rentals must finish before Add Share can list them again.",
     "shareMarket.dialog.seats": "Seats",
     "shareMarket.dialog.addSeat": "Add another seat",
     "shareMarket.dialog.create": "Publish listing",
@@ -212,16 +276,18 @@ export const messages = {
     "shareMarket.dialog.amount": "Daily price",
     "shareMarket.dialog.currency": "Currency",
     "shareMarket.dialog.unlimited": "Unlimited",
-    "shareMarket.freeDuration.fixed": "Fixed duration",
-    "shareMarket.freeDuration.permanent": "Permanent",
-    "shareMarket.freeDuration.days": "Free access duration (days)",
-    "shareMarket.freeDuration.pendingActivation": "Free duration starts after access is activated",
-    "shareMarket.freeDuration.activated": "Activated",
-    "shareMarket.freeDuration.expires": "Expires",
-    "shareMarket.freeDuration.expired": "Expired · reclaiming",
-    "shareMarket.freeDuration.remainingHours": "{count}h remaining",
-    "shareMarket.freeDuration.remainingDays": "{count}d remaining",
-    "shareMarket.period.lifetime": "Lifetime",
+    "shareMarket.serviceDuration.label": "Service term",
+    "shareMarket.serviceDuration.fixed": "Fixed term",
+    "shareMarket.serviceDuration.permanent": "No fixed end date",
+    "shareMarket.serviceDuration.days": "Service term (days)",
+    "shareMarket.serviceDuration.dayValue": "{count} day",
+    "shareMarket.serviceDuration.daysValue": "{count} days",
+    "shareMarket.serviceDuration.started": "Term starts",
+    "shareMarket.serviceDuration.expires": "Term ends",
+    "shareMarket.serviceDuration.expired": "Term ended",
+    "shareMarket.serviceDuration.remainingHours": "{count}h remaining",
+    "shareMarket.serviceDuration.remainingDays": "{count}d remaining",
+    "shareMarket.period.lifetime": "Cumulative (no reset)",
     "shareMarket.period.day": "Daily",
     "shareMarket.period.week": "Calendar week",
     "shareMarket.period.sevenDays": "Every 7 days",
@@ -232,27 +298,40 @@ export const messages = {
     "marketApproval.creditTitle": "Owner credit required",
     "marketApproval.billingTitle": "Settle the supplier account first",
     "marketApproval.unavailableTitle": "Market service unavailable",
-    "marketApproval.shareDescription": "Only users on {owner}'s allowlist can rent this Share seat. Ask the owner to add your login email, {buyer}, before renting.",
-    "marketApproval.clientHostDescription": "Only users on {owner}'s allowlist can create a Client on this Host. Ask the owner to add your login email, {buyer}, before creating it.",
-    "marketApproval.creditDescription": "You are approved to use this service, but {owner} has not granted your account {currency} postpaid credit. Contact the owner before trying again.",
-    "marketApproval.restrictedDescription": "Your account cannot start another postpaid market service until its overdue Router bills are resolved.",
-    "marketApproval.settlementDescription": "Your account with {owner} must be settled before another market service can be started.",
-    "marketApproval.limitDescription": "Your account has reached {owner}'s {currency} credit limit. Settle the account before starting another service.",
-    "marketApproval.closedDescription": "{owner} permanently closed this postpaid relationship. Existing balances remain payable, and future paid rentals cannot be restored.",
-    "marketApproval.unavailableDescription": "This market service is not currently available to your account.",
-    "marketApproval.shareContactHint": "Contact the owner in this Share's corresponding Client chat.",
-    "marketApproval.clientHostContactHint": "Contact the owner by email. Other contact methods configured by the owner are shown here as well.",
+    "marketApproval.shareDescription":
+      "Only users on {owner}'s allowlist can rent this Share seat. Ask the owner to add your login email, {buyer}, before renting.",
+    "marketApproval.clientHostDescription":
+      "Only users on {owner}'s allowlist can create a Client on this Host. Ask the owner to add your login email, {buyer}, before creating it.",
+    "marketApproval.creditDescription":
+      "You are approved to use this service, but {owner} has not granted your account {currency} postpaid credit. Contact the owner before trying again.",
+    "marketApproval.restrictedDescription":
+      "Your account cannot start another postpaid market service until its overdue Router bills are resolved.",
+    "marketApproval.settlementDescription":
+      "Your account with {owner} must be settled before another market service can be started.",
+    "marketApproval.limitDescription":
+      "Your account has reached {owner}'s {currency} credit limit. Settle the account before starting another service.",
+    "marketApproval.closedDescription":
+      "{owner} permanently closed this postpaid relationship. Existing balances remain payable, and future paid rentals cannot be restored.",
+    "marketApproval.unavailableDescription":
+      "This market service is not currently available to your account.",
+    "marketApproval.shareContactHint":
+      "Contact the owner in this Share's corresponding Client chat.",
+    "marketApproval.clientHostContactHint":
+      "Contact the owner by email. Other contact methods configured by the owner are shown here as well.",
     "marketApproval.openChat": "Open chat",
     "marketApproval.emailOwner": "Email owner",
     "marketApproval.apply": "Request allowlist access",
     "marketApproval.requested": "Access requested",
-    "marketApproval.requestedHint": "Your access request has been submitted. The owner can approve it in Market access.",
+    "marketApproval.requestedHint":
+      "Your access request has been submitted. The owner can approve it in Market access.",
     "marketApproval.cancelRequest": "Cancel request",
     "marketApproval.clientHostEmailSubject": "Client Host allowlist request",
     "account.title": "Account",
-    "account.pageHint": "Manage payment details for Hosts you provide, and Clients you rent from the market.",
+    "account.pageHint":
+      "Manage payment details for Hosts you provide, and Clients you rent from the market.",
     "account.loading": "Loading account settings...",
-    "account.signInRequired": "Sign in to configure Host Provider payment details.",
+    "account.signInRequired":
+      "Sign in to configure Host Provider payment details.",
     "account.nav.sections": "Account sections",
     "account.nav.group.security": "Access & security",
     "account.nav.group.usage": "Usage",
@@ -265,9 +344,11 @@ export const messages = {
     "account.nav.marketAccess": "Market access",
     "account.nav.payments": "Payment details",
     "account.nav.share": "Share Market",
-    "account.nav.shareHint": "Read-only monitor for Share Market rentals (separate from top-nav Share Market)",
+    "account.nav.shareHint":
+      "Read-only monitor for Share Market rentals (separate from top-nav Share Market)",
     "account.nav.client": "Client Market",
-    "account.nav.clientHint": "Read-only monitor for Market rentals (separate from top-nav Clients)",
+    "account.nav.clientHint":
+      "Read-only monitor for Market rentals (separate from top-nav Clients)",
     "account.nav.rentals": "Client rentals",
     "account.usage.period.24h": "24h",
     "account.usage.period.7d": "7d",
@@ -286,25 +367,30 @@ export const messages = {
     "account.usage.loading": "Loading usage…",
     "account.usage.signInRequired": "Sign in to view your usage.",
     "account.providerUsage.title": "Provider usage",
-    "account.providerUsage.hint": "Token usage across Clients and Shares you own.",
+    "account.providerUsage.hint":
+      "Token usage across Clients and Shares you own.",
     "account.providerUsage.installations": "Installations",
     "account.providerUsage.shares": "Shares",
     "account.providerUsage.caller": "Caller",
-    "account.providerUsage.noInstallations": "No provider usage in this period.",
+    "account.providerUsage.noInstallations":
+      "No provider usage in this period.",
     "account.consumerUsage.title": "Consumer usage",
-    "account.consumerUsage.hint": "Token usage from your API token and account email.",
+    "account.consumerUsage.hint":
+      "Token usage from your API token and account email.",
     "account.consumerUsage.trend": "Daily trend",
-    "account.consumerUsage.profile": "Public profile",
-    "account.consumerUsage.profileHint": "Opt in to embed a usage card on GitHub or personal sites.",
-    "account.consumerUsage.username": "Username",
-    "account.consumerUsage.usernamePlaceholder": "your-handle",
+    "account.consumerUsage.card": "Usage card",
+    "account.consumerUsage.cardHint":
+      "The card uses your account email. Turning off public stats makes its public URL private.",
+    "account.consumerUsage.cardIdentity": "Card identity",
     "account.consumerUsage.publicToggle": "Make consumer stats public",
-    "account.consumerUsage.embed": "GitHub embed card",
-    "account.consumerUsage.embedHint": "Customize the card, preview live, then copy Markdown or HTML into a README.",
-    "account.consumerUsage.embedPrivate": "Enable public stats and set a username to get an embed snippet.",
+    "account.consumerUsage.embed": "Embed card",
+    "account.consumerUsage.embedHint":
+      "Customize the card, preview it live, then copy Markdown, HTML, or its URL.",
+    "account.consumerUsage.embedPrivate":
+      "Enable public usage stats to generate embed snippets.",
     "account.consumerUsage.preview": "Live preview",
-    "account.consumerUsage.saveProfile": "Save profile",
-    "account.consumerUsage.profileSaved": "Profile saved",
+    "account.consumerUsage.previewUnavailable":
+      "Usage card preview is unavailable.",
     "account.consumerUsage.copyEmbed": "Copy",
     "account.consumerUsage.copied": "Copied",
     "account.consumerUsage.embedPeriod": "Period",
@@ -322,7 +408,8 @@ export const messages = {
     "account.consumerUsage.format.compact": "Compact",
     "account.consumerUsage.format.full": "Full",
     "account.apiKeys.title": "API Token",
-    "account.apiKeys.hint": "Use it to call the Router API, or put it in Share requests as Authorization: Bearer …",
+    "account.apiKeys.hint":
+      "Use it to call the Router API, or put it in Share requests as Authorization: Bearer …",
     "account.apiKeys.created": "Created",
     "account.apiKeys.lastUsed": "Last used",
     "account.apiKeys.copy": "Copy",
@@ -332,13 +419,17 @@ export const messages = {
     "account.apiKeys.hideToken": "Hide API token",
     "account.apiKeys.resetToGenerate": "Reset to generate a new API token",
     "account.apiKeys.resetConfirmTitle": "Reset API token?",
-    "account.apiKeys.resetConfirmDescription": "The current token will stop working immediately. Every script and integration using it must be updated with the new token.",
+    "account.apiKeys.resetConfirmDescription":
+      "The current token will stop working immediately. Every script and integration using it must be updated with the new token.",
     "account.apiKeys.resetConfirmAction": "Reset token",
     "account.apiKeys.exampleTitle": "Share API example",
-    "account.apiKeys.exampleHint": "Replace <share-subdomain> with your Share subdomain. Reveal the token above to fill it into the sample, or copy with the real token when available.",
+    "account.apiKeys.exampleHint":
+      "Replace <share-subdomain> with your Share subdomain. Reveal the token above to fill it into the sample, or copy with the real token when available.",
     "account.apiKeys.signInRequired": "Sign in to manage your API token.",
-    "account.clientHint": "Monitor Market rentals as renter or Host Provider. Combined postpaid balances and invoices are managed in Market billing.",
-    "account.shareHint": "Monitor Share Market seat rentals as User or Provider. Rent and reclaim in Share Market; manage combined postpaid balances and invoices in Market billing.",
+    "account.clientHint":
+      "Monitor Market rentals as renter or Host Provider. Combined postpaid balances and invoices are managed in Market billing.",
+    "account.shareHint":
+      "Monitor Share Market seat rentals as User or Provider. Rent and reclaim in Share Market; manage combined postpaid balances and invoices in Market billing.",
     "account.client.tab.user": "User",
     "account.client.tab.provider": "Provider",
     "account.client.userEmpty": "No rentals as a Client user right now.",
@@ -361,7 +452,8 @@ export const messages = {
     "account.share.tab.user": "User",
     "account.share.tab.provider": "Provider",
     "account.share.userEmpty": "No Share seats rented right now.",
-    "account.share.providerEmpty": "No Share listings or rentals as a provider right now.",
+    "account.share.providerEmpty":
+      "No Share listings or rentals as a provider right now.",
     "account.share.provider": "Owner: {owner}",
     "account.share.renter": "Renter: {email}",
     "account.share.offer": "Offer",
@@ -376,14 +468,19 @@ export const messages = {
     "account.share.seatsAvailable": "Available seats",
     "account.share.seatsOccupied": "Occupied seats",
     "account.share.seatsAttention": "Needs attention",
-    "account.share.closedListingHint": "Listing is closed. Active rentals continue until returned or reclaimed.",
+    "account.share.closedListingHint":
+      "Listing is closed. Active rentals continue until returned or reclaimed.",
     "account.share.status.unknown": "Unknown",
-    "account.rentalsHint": "Monitor or release Clients rented from Host Providers. Combined balances are managed in Market billing.",
+    "account.rentalsHint":
+      "Monitor or release Clients rented from Host Providers. Combined balances are managed in Market billing.",
     "account.paymentDetails": "Payment details",
-    "account.visibilityHint": "Market listings expose only payment method types and contact handles. Full payment details are frozen into invoices and shown only to the invoiced buyer.",
-    "market.currencyNotice": "The USD/CNY exchange rate is 1:{rate}. USD payment channels are recommended.",
+    "account.visibilityHint":
+      "Market listings expose only payment method types and contact handles. Full payment details are frozen into invoices and shown only to the invoiced buyer.",
+    "market.currencyNotice":
+      "The USD/CNY exchange rate is 1:{rate}. USD payment channels are recommended.",
     "account.contact.title": "Contact info",
-    "account.contact.hint": "Shown in the Market and on invoices so renters can reach you.",
+    "account.contact.hint":
+      "Shown in the Market and on invoices so renters can reach you.",
     "account.contact.add": "Add",
     "account.contact.channel": "Channel",
     "account.contact.handle": "Handle / ID",
@@ -414,18 +511,22 @@ export const messages = {
     "account.plainText": "plain text",
     "account.unblock": "Unblock",
     "clientMarket.title": "Client Market",
-    "clientMarket.subtitle": "Register SSH hosts and view provisioned router market clients.",
+    "clientMarket.subtitle":
+      "Register SSH hosts and view provisioned router market clients.",
     "clientMarket.sshKeyTitle": "Router provision SSH key",
-    "clientMarket.sshKeyHint": "The dedicated Ed25519 key is generated automatically and can be moved in Settings → Persistence.",
+    "clientMarket.sshKeyHint":
+      "The dedicated Ed25519 key is generated automatically and can be moved in Settings → Persistence.",
     "clientMarket.publicKey": "Public key",
     "clientMarket.authorizedKeysLine": "authorized_keys line",
     "clientMarket.addSshKeyTitle": "Add Router SSH public key to the host",
-    "clientMarket.addSshKeyHint": "Run this command on the host (as the SSH login user) before continuing.",
+    "clientMarket.addSshKeyHint":
+      "Run this command on the host (as the SSH login user) before continuing.",
     "clientMarket.authorizedKeysCommand": "Command",
     "clientMarket.tabPassword": "Install key with password",
     "clientMarket.tabManual": "Add key manually",
     "clientMarket.rootPassword": "Root password",
-    "clientMarket.rootPasswordHint": "Used once to install the Router SSH public key. The password is not stored.",
+    "clientMarket.rootPasswordHint":
+      "Used once to install the Router SSH public key. The password is not stored.",
     "clientMarket.rootPasswordRequired": "Enter the root password.",
     "clientMarket.next": "Next",
     "clientMarket.back": "Back",
@@ -460,7 +561,8 @@ export const messages = {
     "clientMarket.ipClass.business": "Business",
     "clientMarket.registerSuccess": "Host added successfully",
     "settings.provisionSshKeyTitle": "Client Market provisioning key",
-    "settings.provisionSshKeyDesc": "Public material for the dedicated outbound SSH key. Add the authorized_keys line to root on each Host before registration.",
+    "settings.provisionSshKeyDesc":
+      "Public material for the dedicated outbound SSH key. Add the authorized_keys line to root on each Host before registration.",
     "clientMarket.copy": "Copy",
     "clientMarket.copied": "Copied",
     "clientMarket.addHost": "Add host",
@@ -474,20 +576,28 @@ export const messages = {
     "clientMarket.currency": "Currency",
     "clientMarket.free": "Free",
     "clientMarket.paid": "Paid",
-    "clientMarket.offerHint": "Paid Hosts use this fixed daily rate and unified postpaid billing.",
-    "clientMarket.offerInvalid": "Enter a valid daily price with at most two decimal places.",
-    "clientMarket.offerRange": "Paid Hosts require a daily price from 0.01 to 1,000,000.00.",
+    "clientMarket.offerHint":
+      "Paid Hosts use this fixed daily rate and unified postpaid billing.",
+    "clientMarket.offerInvalid":
+      "Enter a valid daily price with at most two decimal places.",
+    "clientMarket.offerRange":
+      "Paid Hosts require a daily price from 0.01 to 1,000,000.00.",
     "clientMarket.offerUpdated": "Host offer updated",
     "clientMarket.editOffer": "Edit Host offer",
     "clientMarket.editOfferAction": "Edit offer",
-    "clientMarket.editOfferHint": "The daily rate is frozen when a Client starts renting this Host. Existing rentals keep their contracted rate.",
-    "clientMarket.makeFreeHint": "Switch to Free, then choose a fixed duration or permanent access.",
+    "clientMarket.editOfferHint":
+      "The daily rate is frozen when a Client starts renting this Host. Existing rentals keep their contracted rate.",
+    "clientMarket.makeFreeHint":
+      "Switch to Free, then choose a fixed duration or permanent access.",
     "clientMarket.freeDuration.fixed": "Fixed duration",
     "clientMarket.freeDuration.permanent": "Permanent",
     "clientMarket.freeDuration.days": "Free access duration (days)",
-    "clientMarket.freeDuration.hint": "The duration starts only after the Client is provisioned successfully. Use permanent only for buyers you trust indefinitely.",
-    "clientMarket.freeDurationInvalid": "Free duration must be an integer from 1 to 365 days.",
-    "clientMarket.freeDuration.pendingActivation": "Free duration starts after provisioning completes",
+    "clientMarket.freeDuration.hint":
+      "The duration starts only after the Client is provisioned successfully. Use permanent only for buyers you trust indefinitely.",
+    "clientMarket.freeDurationInvalid":
+      "Free duration must be an integer from 1 to 365 days.",
+    "clientMarket.freeDuration.pendingActivation":
+      "Free duration starts after provisioning completes",
     "clientMarket.freeDuration.activated": "Activated",
     "clientMarket.freeDuration.expires": "Expires",
     "clientMarket.freeDuration.expired": "Expired · reclaiming",
@@ -498,22 +608,31 @@ export const messages = {
     "clientMarket.hostAdded": "Host registered",
     "clientMarket.deleteHost": "Remove",
     "clientMarket.deleteHostConfirmTitle": "Remove this host?",
-    "clientMarket.deleteHostConfirmDesc": "Remove {host} from the Client Market pool. The host can be registered again later.",
+    "clientMarket.deleteHostConfirmDesc":
+      "Remove {host} from the Client Market pool. The host can be registered again later.",
     "clientMarket.retireUnreachable": "Permanently remove lost host",
-    "clientMarket.retireUnreachableConfirmTitle": "Permanently remove this lost host?",
-    "clientMarket.retireUnreachableConfirmDesc": "Router cannot reach {host}. This removes its disabled Client route, Router installation, and Host listing without claiming the remote files were erased. The Host will never return to the idle pool automatically; if recovered, it must be registered and verified again.",
-    "clientMarket.retireUnreachableSucceeded": "Lost Host permanently removed from Client Market",
+    "clientMarket.retireUnreachableConfirmTitle":
+      "Permanently remove this lost host?",
+    "clientMarket.retireUnreachableConfirmDesc":
+      "Router cannot reach {host}. This removes its disabled Client route, Router installation, and Host listing without claiming the remote files were erased. The Host will never return to the idle pool automatically; if recovered, it must be registered and verified again.",
+    "clientMarket.retireUnreachableSucceeded":
+      "Lost Host permanently removed from Client Market",
     "clientMarket.cleanup": "Cleanup client",
     "clientMarket.cleanupConfirmTitle": "Cleanup this client?",
-    "clientMarket.cleanupConfirmDesc": "Stop and remove the Client on {host}, purge its Router installation data, and return the Host to the idle pool. This cannot be undone.",
-    "clientMarket.denyOnCleanupCheckbox": "Also deny this user ({email}) future access to your Hosts",
+    "clientMarket.cleanupConfirmDesc":
+      "Stop and remove the Client on {host}, purge its Router installation data, and return the Host to the idle pool. This cannot be undone.",
+    "clientMarket.denyOnCleanupCheckbox":
+      "Also deny this user ({email}) future access to your Hosts",
     "clientMarket.retryCleanup": "Retry cleanup",
     "clientMarket.retryCleanupConfirmTitle": "Retry cleanup?",
-    "clientMarket.retryCleanupConfirmDesc": "Retry stopping and removing the Client on {host}, then purge Router data and return the Host to idle.",
+    "clientMarket.retryCleanupConfirmDesc":
+      "Retry stopping and removing the Client on {host}, then purge Router data and return the Host to idle.",
     "clientMarket.cleanupStarted": "Cleanup job started",
-    "clientMarket.cleanupSucceeded": "Cleanup completed. Host returned to the idle pool.",
+    "clientMarket.cleanupSucceeded":
+      "Cleanup completed. Host returned to the idle pool.",
     "clientMarket.cleanupFailed": "Cleanup failed",
-    "clientMarket.cleanupTimedOut": "Cleanup is still running or timed out. Refresh the host list and retry if needed.",
+    "clientMarket.cleanupTimedOut":
+      "Cleanup is still running or timed out. Refresh the host list and retry if needed.",
     "clientMarket.cleanupProgressTitle": "Cleaning up {host}",
     "clientMarket.cleanupPhase.starting": "Starting…",
     "clientMarket.cleanupPhase.remote": "Cleaning remote host",
@@ -521,37 +640,55 @@ export const messages = {
     "clientMarket.cleanupPhase.wipe": "Removing install files",
     "clientMarket.cleanupPhase.purge": "Purging Router data",
     "clientMarket.cleanupPhase.complete": "Complete",
-    "clientMarket.cleanupFailedGuidance": "Retry cleanup, or use Reverify after the host is clean.",
-    "clientMarket.cleanupFailedGuidance.purge": "Remote wipe likely succeeded. Retry cleanup or Reverify to finish Router-side recovery.",
-    "clientMarket.cleanupFailedGuidance.remote": "Remote stop/wipe failed — the host may still be running cc-switch-server. Retry cleanup, or clean the host manually then Reverify.",
-    "clientMarket.cleanupFailedGuidance.unreachable": "Router cannot reach the Host. Retry after connectivity returns, or the Provider can permanently remove the lost Host. The renter may end the failed rental separately.",
-    "clientMarket.cleanupFailedGuidance.safety": "Blocked by fingerprint or installation binding checks. Inspect the host before retrying.",
-    "clientMarket.offerRequiresPayment": "Set up payment details on the Account page before publishing a paid Host offer.",
-    "clientMarket.offerRequiresBilling": "Paid Host offers require payment details and a USD payment grace policy.",
+    "clientMarket.cleanupFailedGuidance":
+      "Retry cleanup, or use Reverify after the host is clean.",
+    "clientMarket.cleanupFailedGuidance.purge":
+      "Remote wipe likely succeeded. Retry cleanup or Reverify to finish Router-side recovery.",
+    "clientMarket.cleanupFailedGuidance.remote":
+      "Remote stop/wipe failed — the host may still be running cc-switch-server. Retry cleanup, or clean the host manually then Reverify.",
+    "clientMarket.cleanupFailedGuidance.unreachable":
+      "Router cannot reach the Host. Retry after connectivity returns, or the Provider can permanently remove the lost Host. The renter may end the failed rental separately.",
+    "clientMarket.cleanupFailedGuidance.safety":
+      "Blocked by fingerprint or installation binding checks. Inspect the host before retrying.",
+    "clientMarket.offerRequiresPayment":
+      "Set up payment details on the Account page before publishing a paid Host offer.",
+    "clientMarket.offerRequiresBilling":
+      "Paid Host offers require payment details and a USD payment grace policy.",
     "clientMarket.goToBilling": "Configure market billing",
     "clientMarket.goToAccountPayment": "Go to Account → Payment details",
-    "clientMarket.hostErrorGuidance.provisioningFailed": "Client setup failed and the host was not restored. Retry cleanup, or clean the host then Reverify.",
-    "clientMarket.hostErrorGuidance.rollbackFailed": "Setup rollback did not finish. Retry cleanup or Reverify after the host is clean.",
-    "clientMarket.hostErrorGuidance.abnormalProcess": "Host is reachable but already running cc-switch-server. Stop it, then cleanup or Reverify.",
-    "clientMarket.hostErrorGuidance.generic": "Needs attention. Retry cleanup, Reverify after manual cleanup, or permanently remove a Host that cannot be recovered.",
+    "clientMarket.hostErrorGuidance.provisioningFailed":
+      "Client setup failed and the host was not restored. Retry cleanup, or clean the host then Reverify.",
+    "clientMarket.hostErrorGuidance.rollbackFailed":
+      "Setup rollback did not finish. Retry cleanup or Reverify after the host is clean.",
+    "clientMarket.hostErrorGuidance.abnormalProcess":
+      "Host is reachable but already running cc-switch-server. Stop it, then cleanup or Reverify.",
+    "clientMarket.hostErrorGuidance.generic":
+      "Needs attention. Retry cleanup, Reverify after manual cleanup, or permanently remove a Host that cannot be recovered.",
     "clientMarket.rentedBy": "Renter: {email}",
-    "clientMarket.release.releasing": "Releasing Client and returning the Host to its Provider...",
-    "clientMarket.release.failedHint": "Release failed - retry cleanup, or end the failed rental while the Provider handles the quarantined Host.",
+    "clientMarket.release.releasing":
+      "Releasing Client and returning the Host to its Provider...",
+    "clientMarket.release.failedHint":
+      "Release failed - retry cleanup, or end the failed rental while the Provider handles the quarantined Host.",
     "clientMarket.release.manageInMarket": "Manage in Market",
     "clientMarket.release.retry": "Retry release",
     "clientMarket.release.confirmTitle": "Release this Client now?",
-    "clientMarket.release.confirmDescription": "The Client tunnel will be disabled immediately. Router will erase the remote installation and return the Host to its Provider. Any data on the Client may be lost.",
+    "clientMarket.release.confirmDescription":
+      "The Client tunnel will be disabled immediately. Router will erase the remote installation and return the Host to its Provider. Any data on the Client may be lost.",
     "clientMarket.release.progressTitle": "Releasing Client",
     "clientMarket.release.starting": "Starting release...",
-    "clientMarket.release.succeeded": "Release completed. The Host has been returned to its Provider.",
+    "clientMarket.release.succeeded":
+      "Release completed. The Host has been returned to its Provider.",
     "clientMarket.release.failedToast": "Release failed",
     "clientMarket.release.action": "Release Client",
     "clientMarket.release.finalizeAction": "End failed rental",
     "clientMarket.release.finalizeConfirmTitle": "End this failed rental?",
-    "clientMarket.release.finalizeConfirmDescription": "This only ends your rental and removes the creation lock. The Client tunnel stays disabled, and the unreachable Host remains quarantined for its Provider to handle. Router will not claim that the remote installation was erased.",
-    "clientMarket.release.finalizeSucceeded": "Rental ended. The unreachable Host remains quarantined for its Provider.",
+    "clientMarket.release.finalizeConfirmDescription":
+      "This only ends your rental and removes the creation lock. The Client tunnel stays disabled, and the unreachable Host remains quarantined for its Provider to handle. Router will not claim that the remote installation was erased.",
+    "clientMarket.release.finalizeSucceeded":
+      "Rental ended. The unreachable Host remains quarantined for its Provider.",
     "clientMarket.reverifyHost": "Reverify",
-    "clientMarket.hostReverified": "Host verified and returned to the idle pool",
+    "clientMarket.hostReverified":
+      "Host verified and returned to the idle pool",
     "clientMarket.sshHostKey.action": "SSH fingerprint",
     "clientMarket.sshHostKey.title": "Verify SSH identity · {host}",
     "clientMarket.sshHostKey.scanning": "Reading the current SSH host key…",
@@ -560,17 +697,27 @@ export const messages = {
     "clientMarket.sshHostKey.observed": "Observed fingerprint",
     "clientMarket.sshHostKey.algorithm": "Host key type",
     "clientMarket.sshHostKey.notPinned": "Not pinned",
-    "clientMarket.sshHostKey.matches": "The observed fingerprint matches the trusted Host identity. Strict verification remains enabled.",
-    "clientMarket.sshHostKey.changedWarning": "The SSH identity has changed. Continue only after confirming that this Host was reinstalled or its SSH host keys were intentionally rotated.",
-    "clientMarket.sshHostKey.firstPinWarning": "This Host has no trusted fingerprint. Confirm its identity before allowing Web Terminal access.",
-    "clientMarket.sshHostKey.consoleInstruction": "Open the hosting provider's console, run the command below on the Host, and enter the fingerprint it reports. Do not verify it through this SSH connection.",
-    "clientMarket.sshHostKey.confirmedFingerprint": "Fingerprint from Host console",
-    "clientMarket.sshHostKey.fingerprintMismatch": "The entered fingerprint does not match the key currently observed by Router.",
-    "clientMarket.sshHostKey.verifiedFromConsole": "I verified this exact fingerprint through the hosting provider's console.",
+    "clientMarket.sshHostKey.matches":
+      "The observed fingerprint matches the trusted Host identity. Strict verification remains enabled.",
+    "clientMarket.sshHostKey.changedWarning":
+      "The SSH identity has changed. Continue only after confirming that this Host was reinstalled or its SSH host keys were intentionally rotated.",
+    "clientMarket.sshHostKey.firstPinWarning":
+      "This Host has no trusted fingerprint. Confirm its identity before allowing Web Terminal access.",
+    "clientMarket.sshHostKey.consoleInstruction":
+      "Open the hosting provider's console, run the command below on the Host, and enter the fingerprint it reports. Do not verify it through this SSH connection.",
+    "clientMarket.sshHostKey.confirmedFingerprint":
+      "Fingerprint from Host console",
+    "clientMarket.sshHostKey.fingerprintMismatch":
+      "The entered fingerprint does not match the key currently observed by Router.",
+    "clientMarket.sshHostKey.verifiedFromConsole":
+      "I verified this exact fingerprint through the hosting provider's console.",
     "clientMarket.sshHostKey.confirm": "Trust this fingerprint",
-    "clientMarket.sshHostKey.updated": "SSH fingerprint updated. Strict host verification remains enabled.",
-    "clientMarket.sshHostKey.changedDuringConfirmation": "The Host key changed again during confirmation. Verify the newly observed fingerprint before continuing.",
-    "clientMarket.sshHostKey.reviewRequired": "SSH host identity confirmation is required before reconnecting.",
+    "clientMarket.sshHostKey.updated":
+      "SSH fingerprint updated. Strict host verification remains enabled.",
+    "clientMarket.sshHostKey.changedDuringConfirmation":
+      "The Host key changed again during confirmation. Verify the newly observed fingerprint before continuing.",
+    "clientMarket.sshHostKey.reviewRequired":
+      "SSH host identity confirmation is required before reconnecting.",
     "clientMarket.sshHostKey.review": "Review fingerprint",
     "clientMarket.invalidPort": "Port must be an integer from 1 to 65535.",
     "clientMarket.noteTooLong": "Note cannot exceed 500 characters.",
@@ -599,29 +746,43 @@ export const messages = {
     "clientMarket.recovery.pauseSucceeded": "Router recovery paused",
     "clientMarket.recovery.resumeSucceeded": "Router recovery resumed",
     "clientMarket.recovery.retrySucceeded": "Recovery retry queued",
-    "clientMarket.recovery.blocked.missingBinary": "cc-switch-server binary is missing",
-    "clientMarket.recovery.blocked.missingConfig": "cc-switch-server configuration is missing",
-    "clientMarket.recovery.blocked.hostKey": "SSH Host identity requires review",
-    "clientMarket.recovery.blocked.authentication": "Router SSH authentication was rejected",
+    "clientMarket.recovery.blocked.missingBinary":
+      "cc-switch-server binary is missing",
+    "clientMarket.recovery.blocked.missingConfig":
+      "cc-switch-server configuration is missing",
+    "clientMarket.recovery.blocked.hostKey":
+      "SSH Host identity requires review",
+    "clientMarket.recovery.blocked.authentication":
+      "Router SSH authentication was rejected",
     "clientMarket.recovery.blocked.other": "Provider action is required",
     "clientMarket.statusHint.all": "Show hosts in every status.",
     "clientMarket.statusHint.idle": "Available for online Client provisioning.",
-    "clientMarket.statusHint.reserved": "Temporarily held by a user reviewing an allocation quote.",
-    "clientMarket.statusHint.allocated": "Already running a Client for an owner.",
-    "clientMarket.statusHint.locked": "Claimed by an active create job; installing or waiting for tunnel.",
-    "clientMarket.statusHint.draining": "Client cleanup in progress; not allocatable yet. If stuck, retry cleanup.",
-    "clientMarket.statusHint.disabled": "Manually taken out of the pool (rarely set by current UI).",
-    "clientMarket.statusHint.unreachable": "SSH/network or cleanup failed; retry, reverify, or permanently remove a lost Host.",
-    "clientMarket.statusHint.abnormal": "Reachable but unexpected (e.g. cc-switch-server already running).",
+    "clientMarket.statusHint.reserved":
+      "Temporarily held by a user reviewing an allocation quote.",
+    "clientMarket.statusHint.allocated":
+      "Already running a Client for an owner.",
+    "clientMarket.statusHint.locked":
+      "Claimed by an active create job; installing or waiting for tunnel.",
+    "clientMarket.statusHint.draining":
+      "Client cleanup in progress; not allocatable yet. If stuck, retry cleanup.",
+    "clientMarket.statusHint.disabled":
+      "Manually taken out of the pool (rarely set by current UI).",
+    "clientMarket.statusHint.unreachable":
+      "SSH/network or cleanup failed; retry, reverify, or permanently remove a lost Host.",
+    "clientMarket.statusHint.abnormal":
+      "Reachable but unexpected (e.g. cc-switch-server already running).",
     "clientMarket.statusGroup.all": "All",
     "clientMarket.statusGroup.idle": "Idle",
     "clientMarket.statusGroup.in_use": "In use",
     "clientMarket.statusGroup.needs_attention": "Needs attention",
     "clientMarket.statusGroup.mine": "Mine",
-    "clientMarket.statusGroupHint.all": "Every host matching the other filters.",
+    "clientMarket.statusGroupHint.all":
+      "Every host matching the other filters.",
     "clientMarket.statusGroupHint.idle": "Available for provisioning.",
-    "clientMarket.statusGroupHint.in_use": "Allocated or provisioning (locked).",
-    "clientMarket.statusGroupHint.needs_attention": "Draining, unreachable, abnormal, or disabled — needs action.",
+    "clientMarket.statusGroupHint.in_use":
+      "Allocated or provisioning (locked).",
+    "clientMarket.statusGroupHint.needs_attention":
+      "Draining, unreachable, abnormal, or disabled — needs action.",
     "clientMarket.statusGroupHint.mine": "Hosts you provide or currently rent.",
     "clientMarket.filter": "Filter",
     "clientMarket.filterActive": "Filter · {count}",
@@ -638,7 +799,8 @@ export const messages = {
     "clientMarket.sortAsc": "Sorted ascending",
     "clientMarket.sortDesc": "Sorted descending",
     "clientMarket.sortNone": "Sort cleared",
-    "clientMarket.hostAlreadyRunning": "This host is already running cc-switch-server. Stop the process before adding it.",
+    "clientMarket.hostAlreadyRunning":
+      "This host is already running cc-switch-server. Stop the process before adding it.",
     "clientMarket.noHosts": "No hosts registered yet.",
     "clientMarket.paginationSummary": "{start}–{end} of {total}",
     "clientMarket.paginationPage": "{page} / {pages}",
@@ -663,13 +825,16 @@ export const messages = {
     "clientMarket.loginToAddHost": "Sign in to register a host.",
     "clientMarket.exportedHosts": "Exported {count} Hosts",
     "clientMarket.importSizeLimit": "Host import text must not exceed 1 MB.",
-    "clientMarket.importVersionRequired": "Each line must be ip:port with optional |note|dailyPriceMinor|currency|freeDurationDays|fingerprint.",
+    "clientMarket.importVersionRequired":
+      "Each line must be ip:port with optional |note|dailyPriceMinor|currency|freeDurationDays|fingerprint.",
     "clientMarket.importMyHosts": "Import my Hosts",
     "clientMarket.exportMyHosts": "Export my Hosts",
     "clientMarket.importDialogTitle": "Import Hosts",
     "clientMarket.exportDialogTitle": "Export Hosts",
-    "clientMarket.transferFormatHint": "One host per line: ip:port|note|dailyPriceMinor|currency|freeDurationDays|fingerprint. Free duration is 1-365 days; leave it blank for permanent access. Paid Hosts must leave free duration blank. Only ip:port is required; lines starting with # are ignored.",
-    "clientMarket.importPlaceholder": "203.0.113.9:22\n203.0.113.10:22|trial host|||7",
+    "clientMarket.transferFormatHint":
+      "One host per line: ip:port|note|dailyPriceMinor|currency|freeDurationDays|fingerprint. Free duration is 1-365 days; leave it blank for permanent access. Paid Hosts must leave free duration blank. Only ip:port is required; lines starting with # are ignored.",
+    "clientMarket.importPlaceholder":
+      "203.0.113.9:22\n203.0.113.10:22|trial host|||7",
     "clientMarket.importSubmit": "Import",
     "clientMarket.exportCopy": "Copy",
     "clientMarket.exportCopied": "Copied to clipboard",
@@ -684,11 +849,13 @@ export const messages = {
     "clientMarket.batchEnterSelection": "Select",
     "clientMarket.batchDoneSelection": "Done",
     "clientMarket.batchEligible": "{run} of {selected} eligible",
-    "clientMarket.batchActionAria": "{action}: {run} of {selected} selected hosts eligible",
+    "clientMarket.batchActionAria":
+      "{action}: {run} of {selected} selected hosts eligible",
     "clientMarket.hostsTableCaption": "Registered hosts",
     "clientMarket.scopeShowAll": "View all supply",
     "clientMarket.scopeShowMine": "Show only my hosts",
-    "clientMarket.scopeMineEmpty": "You are not hosting or renting any hosts yet.",
+    "clientMarket.scopeMineEmpty":
+      "You are not hosting or renting any hosts yet.",
     "clientMarket.scopeMineEmptyAction": "Browse all supply",
     "clientMarket.rentals.empty": "You are not renting any hosts right now.",
     "clientMarket.rentals.provider": "Provider: {owner}",
@@ -697,11 +864,14 @@ export const messages = {
     "clientMarket.tabMyHosts": "My hosts",
     "clientMarket.tabMyRentals": "Client rentals",
     "clientMarket.batchConfirmCleanupTitle": "Cleanup selected clients?",
-    "clientMarket.batchConfirmCleanupDesc": "Cleanup will run on {run} host(s). {skip} host(s) will be skipped (no client or not eligible).",
+    "clientMarket.batchConfirmCleanupDesc":
+      "Cleanup will run on {run} host(s). {skip} host(s) will be skipped (no client or not eligible).",
     "clientMarket.batchConfirmReverifyTitle": "Reverify selected hosts?",
-    "clientMarket.batchConfirmReverifyDesc": "Reverify will run on {run} host(s). {skip} host(s) will be skipped.",
+    "clientMarket.batchConfirmReverifyDesc":
+      "Reverify will run on {run} host(s). {skip} host(s) will be skipped.",
     "clientMarket.batchConfirmDeleteTitle": "Remove selected hosts?",
-    "clientMarket.batchConfirmDeleteDesc": "Remove {run} host(s) from the pool. {skip} host(s) will be skipped (still have a client or not removable).",
+    "clientMarket.batchConfirmDeleteDesc":
+      "Remove {run} host(s) from the pool. {skip} host(s) will be skipped (still have a client or not removable).",
     "clientMarket.batchProgressTitle": "Batch {action}",
     "clientMarket.batchProgressCleanup": "cleanup",
     "clientMarket.batchProgressReverify": "reverify",
@@ -711,17 +881,23 @@ export const messages = {
     "clientMarket.batchStatus.succeeded": "Succeeded",
     "clientMarket.batchStatus.failed": "Failed",
     "clientMarket.batchStatus.skipped": "Skipped",
-    "clientMarket.batchSummary": "Done: {succeeded} succeeded · {skipped} skipped · {failed} failed",
-    "clientMarket.batchExportEmpty": "None of the selected hosts can be exported (only your own hosts).",
+    "clientMarket.batchSummary":
+      "Done: {succeeded} succeeded · {skipped} skipped · {failed} failed",
+    "clientMarket.batchExportEmpty":
+      "None of the selected hosts can be exported (only your own hosts).",
     "clientMarket.batchExportSelected": "Export selected",
-    "clientMarket.batchNothingEligible": "No selected hosts are eligible for this action.",
+    "clientMarket.batchNothingEligible":
+      "No selected hosts are eligible for this action.",
     "clientMarket.providerActivity": "Host Provider activity",
     "clientMarket.providerObservations": "Router Provider observations",
-    "clientMarket.providerObservationNotice": "Router-observed history only; not a security certification or proof of payment.",
-    "clientMarket.observedHosts": "verified {total} · idle {idle} · allocated {allocated}",
+    "clientMarket.providerObservationNotice":
+      "Router-observed history only; not a security certification or proof of payment.",
+    "clientMarket.observedHosts":
+      "verified {total} · idle {idle} · allocated {allocated}",
     "clientMarket.observedAllocationRate": "allocation {rate}",
     "clientMarket.observedFreeSupply": "free {total} ({allocated} allocated)",
-    "clientMarket.observedPaidSupply": "paid offer {total} ({allocated} allocated)",
+    "clientMarket.observedPaidSupply":
+      "paid offer {total} ({allocated} allocated)",
     "clientMarket.observedExternalOwners": "external owners {count}",
     "clientMarket.observedLongRentals": ">3d {over3} · >30d {over30}",
     "clientMarket.observedUptime": "30d online {rate}",
@@ -740,23 +916,29 @@ export const messages = {
     "clientMarket.webTerminal": "Web Terminal",
     "clientMarket.terminalTitle": "Web Terminal · {host}",
     "clientMarket.terminalConnecting": "Connecting…",
-    "clientMarket.terminalConnectionFailed": "Failed to open web terminal session.",
+    "clientMarket.terminalConnectionFailed":
+      "Failed to open web terminal session.",
     "clientMarket.terminalDisconnected": "Disconnected",
     "clientMarket.terminalMountFailed": "Terminal UI failed to mount.",
     "clientMarket.terminal.resize": "Resize window",
     "clientMarket.terminal.dockLabel": "Web terminals",
-    "clientMarket.terminal.maxWindows": "At most {count} terminals can be open. Close one first.",
+    "clientMarket.terminal.maxWindows":
+      "At most {count} terminals can be open. Close one first.",
     "clientMarket.terminal.switchNamed": "Switch to {name}",
     "clientMarket.terminal.activeNamed": "Active: {name}",
     "clientMarket.terminal.closeNamed": "Close {name}",
     "clientMarket.terminal.suspended": "Resume",
-    "clientMarket.terminal.resumeHint": "Click to reconnect with a new one-time ticket",
+    "clientMarket.terminal.resumeHint":
+      "Click to reconnect with a new one-time ticket",
     "clientMarket.terminal.resumeNamed": "Resume {name}",
     "clientMarket.terminal.cleanAll": "Clean all",
-    "clientMarket.terminal.autoMinimized": "Open terminals were minimized and disconnected while leaving Clients / Client Market.",
+    "clientMarket.terminal.autoMinimized":
+      "Open terminals were minimized and disconnected while leaving Clients / Client Market.",
     "clientMarket.terminalAccess.title": "Provider terminal access",
-    "clientMarket.terminalAccess.description": "The Provider cannot open a root shell on this rented Host without your time-limited approval.",
-    "clientMarket.terminalAccess.activeUntil": "Root terminal access is authorized until {time}.",
+    "clientMarket.terminalAccess.description":
+      "The Provider cannot open a root shell on this rented Host without your time-limited approval.",
+    "clientMarket.terminalAccess.activeUntil":
+      "Root terminal access is authorized until {time}.",
     "clientMarket.terminalAccess.duration": "Authorization duration",
     "clientMarket.terminalAccess.duration30m": "30 minutes",
     "clientMarket.terminalAccess.duration1h": "1 hour",
@@ -765,11 +947,15 @@ export const messages = {
     "clientMarket.terminalAccess.authorize": "Authorize",
     "clientMarket.terminalAccess.extend": "Extend",
     "clientMarket.terminalAccess.revoke": "Revoke",
-    "clientMarket.terminalAccess.authorizeTitle": "Authorize Provider root access?",
-    "clientMarket.terminalAccess.authorizeConfirm": "For {duration}, the Provider can open an unrestricted root shell on this Host. Only approve a maintenance window you agreed on privately.",
+    "clientMarket.terminalAccess.authorizeTitle":
+      "Authorize Provider root access?",
+    "clientMarket.terminalAccess.authorizeConfirm":
+      "For {duration}, the Provider can open an unrestricted root shell on this Host. Only approve a maintenance window you agreed on privately.",
     "clientMarket.terminalAccess.revokeTitle": "Revoke Provider root access?",
-    "clientMarket.terminalAccess.revokeConfirm": "The active Provider terminal will be disconnected within a few seconds. You can authorize another maintenance window later.",
-    "clientMarket.terminalAccess.granted": "Provider terminal access authorized.",
+    "clientMarket.terminalAccess.revokeConfirm":
+      "The active Provider terminal will be disconnected within a few seconds. You can authorize another maintenance window later.",
+    "clientMarket.terminalAccess.granted":
+      "Provider terminal access authorized.",
     "clientMarket.terminalAccess.revoked": "Provider terminal access revoked.",
     "createClient.newClient": "New",
     "createClient.title": "New client",
@@ -778,22 +964,31 @@ export const messages = {
     "createClient.hostProvider": "Host Provider",
     "createClient.official": "Official",
     "createClient.routerOwner": "Router owner",
-    "createClient.freeOnlyHint": "Free Hosts only — may be unstable or reclaimed anytime. For stability, pick a paid Host in Client Market.",
-    "createClient.officialUnavailable": "The official Provider has no idle free Host capacity right now. Open Host Provider and include another owner only if you trust it.",
-    "createClient.officialNotConfigured": "No official Provider is configured on this Router yet. Open Host Provider and choose an owner only if you trust it.",
-    "createClient.officialNoCapacityButton": "Official Provider has no free capacity",
+    "createClient.freeOnlyHint":
+      "Free Hosts only — may be unstable or reclaimed anytime. For stability, pick a paid Host in Client Market.",
+    "createClient.officialUnavailable":
+      "The official Provider has no idle free Host capacity right now. Open Host Provider and include another owner only if you trust it.",
+    "createClient.officialNotConfigured":
+      "No official Provider is configured on this Router yet. Open Host Provider and choose an owner only if you trust it.",
+    "createClient.officialNoCapacityButton":
+      "Official Provider has no free capacity",
     "createClient.reservedHosts": "Reserved Hosts",
-    "createClient.reviewQuote": "Review the actual Provider and offer before installation.",
+    "createClient.reviewQuote":
+      "Review the actual Provider and offer before installation.",
     "createClient.resultSummary": "{successes} succeeded · {failures} failed",
-    "createClient.partialRollback": "Successful Clients remain allocated. Failed items were rolled back independently.",
+    "createClient.partialRollback":
+      "Successful Clients remain allocated. Failed items were rolled back independently.",
     "createClient.selectHosts": "Select Hosts",
     "createClient.confirmCreate": "Confirm & create",
     "createClient.quoteTerms.postpaidTitle": "Postpaid service",
-    "createClient.quoteTerms.postpaid": "{count} paid Host(s) from {suppliers} supplier account(s) include {hours} hours of free healthy-service time. Charges then accrue by actual healthy service time and settle only when each supplier's credit threshold is reached; each supplier invoice may combine multiple Share and Client Host services.",
-    "createClient.quoteTerms.free": "{count} free Host(s) create no credit charge. Any fixed free period starts after the Host is activated.",
+    "createClient.quoteTerms.postpaid":
+      "{count} paid Host(s) from {suppliers} supplier account(s) include {hours} hours of free healthy-service time. Charges then accrue by actual healthy service time and settle only when each supplier's credit threshold is reached; each supplier invoice may combine multiple Share and Client Host services.",
+    "createClient.quoteTerms.free":
+      "{count} free Host(s) create no credit charge. Any fixed free period starts after the Host is activated.",
     "createClient.tabManual": "Manual install",
     "createClient.tabOnline": "Online install",
-    "createClient.manualDescription": "Run this command on the target Linux host. Replace the owner email and web login password before executing.",
+    "createClient.manualDescription":
+      "Run this command on the target Linux host. Replace the owner email and web login password before executing.",
     "createClient.manualCommandLabel": "Install command",
     "createClient.manualPasswordPlaceholder": "web-login-password",
     "createClient.hostOwners": "Host owners",
@@ -816,17 +1011,21 @@ export const messages = {
     "createClient.randomSubdomain": "Random",
     "createClient.subdomainRandom": "Randomly generated",
     "createClient.subdomainRequired": "Enter a subdomain.",
-    "createClient.subdomainInvalid": "Use 6-30 lowercase letters, digits, or single hyphens, starting with a letter.",
-    "createClient.subdomainDuplicate": "Each Client needs a different subdomain.",
+    "createClient.subdomainInvalid":
+      "Use 6-30 lowercase letters, digits, or single hyphens, starting with a letter.",
+    "createClient.subdomainDuplicate":
+      "Each Client needs a different subdomain.",
     "createClient.subdomainChecking": "Checking availability...",
     "createClient.subdomainAvailable": "Subdomain is available",
-    "createClient.subdomainCheckFailed": "Could not check subdomain availability. Try again.",
+    "createClient.subdomainCheckFailed":
+      "Could not check subdomain availability. Try again.",
     "createClient.password": "Web login password",
     "createClient.passwordHint": "At least 8 characters.",
     "createClient.create": "Create",
     "createClient.login": "Login",
     "createClient.provisioning": "Provisioning…",
-    "createClient.statusRetrying": "Provisioning continues; reconnecting to job status…",
+    "createClient.statusRetrying":
+      "Provisioning continues; reconnecting to job status…",
     "createClient.log": "Job log",
     "createClient.logWaiting": "Waiting for installer output…",
     "createClient.successTitle": "Client created",
@@ -836,8 +1035,10 @@ export const messages = {
     "createClient.successClientOwner": "Client owner",
     "createClient.successRegion": "Region",
     "createClient.failed": "Provisioning failed",
-    "createClient.quoteExpired": "The Host reservation expired. Select Hosts again.",
-    "createClient.quoteExpiredDraftsKept": "The Host reservation expired. Your subdomains and passwords were kept — select Hosts again to reuse them.",
+    "createClient.quoteExpired":
+      "The Host reservation expired. Select Hosts again.",
+    "createClient.quoteExpiredDraftsKept":
+      "The Host reservation expired. Your subdomains and passwords were kept — select Hosts again to reuse them.",
     "createClient.quoteCountdown": "{seconds}s left",
     "billing.payment.alipay": "Alipay",
     "billing.payment.wechat": "WeChat Pay",
@@ -854,24 +1055,33 @@ export const messages = {
     "marketAccess.pricing.paid": "Paid",
     "marketAccess.mode.whitelist": "Trusted buyers only",
     "marketAccess.mode.blacklist": "Default open",
-    "marketAccess.mode.trustedHint": "New buyers must be explicitly approved before they can use this scope.",
-    "marketAccess.mode.openHint": "New buyers can use this scope unless you explicitly deny them.",
+    "marketAccess.mode.trustedHint":
+      "New buyers must be explicitly approved before they can use this scope.",
+    "marketAccess.mode.openHint":
+      "New buyers can use this scope unless you explicitly deny them.",
     "marketAccess.policySaved": "Access policy saved.",
     "marketAccess.blacklistBannerTitle": "Public paid-credit risk",
-    "marketAccess.blacklistBanner": "At least one paid scope is default-open, or public credit remains enabled. Unknown buyers can use this credit only while a paid scope is default-open; review or disable the public limit below.",
+    "marketAccess.blacklistBanner":
+      "At least one paid scope is default-open, or public credit remains enabled. Unknown buyers can use this credit only while a paid scope is default-open; review or disable the public limit below.",
     "marketAccess.blacklistConfirmTitle": "Enable blacklist mode?",
-    "marketAccess.blacklistConfirmDescription": "This scope will allow users without a private trust relationship unless you explicitly deny them. Paid rentals also require public credit to be enabled.",
-    "marketAccess.blacklistConfirmCheckbox": "I understand that unknown users may consume my services before I can deny them.",
+    "marketAccess.blacklistConfirmDescription":
+      "This scope will allow users without a private trust relationship unless you explicitly deny them. Paid rentals also require public credit to be enabled.",
+    "marketAccess.blacklistConfirmCheckbox":
+      "I understand that unknown users may consume my services before I can deny them.",
     "marketAccess.enableBlacklist": "Enable blacklist mode",
     "marketAccess.publicCreditTitle": "Public credit for blacklist mode",
-    "marketAccess.publicCreditHint": "Optional limited credit for paid rentals by users without a private credit grant. Unlimited public credit is never allowed.",
+    "marketAccess.publicCreditHint":
+      "Optional limited credit for paid rentals by users without a private credit grant. Unlimited public credit is never allowed.",
     "marketAccess.publicConfirm": "I accept this public credit exposure",
-    "marketAccess.publicConfirmRequired": "Confirm the public credit exposure before saving.",
+    "marketAccess.publicConfirmRequired":
+      "Confirm the public credit exposure before saving.",
     "marketAccess.publicSaved": "{currency} public credit saved.",
     "marketAccess.addTitle": "Add a trusted buyer",
     "marketAccess.addCreditTitle": "Initial account-level USD credit",
-    "marketAccess.addCreditHint": "Required for paid access. This credit is shared by all paid Share seats and Client Hosts this buyer rents from you.",
-    "marketAccess.addCreditRequired": "Set an initial USD credit limit or explicitly allow unlimited credit for paid access.",
+    "marketAccess.addCreditHint":
+      "Required for paid access. This credit is shared by all paid Share seats and Client Hosts this buyer rents from you.",
+    "marketAccess.addCreditRequired":
+      "Set an initial USD credit limit or explicitly allow unlimited credit for paid access.",
     "marketAccess.buyersTitle": "Trusted buyers",
     "marketAccess.searchBuyers": "Search buyers by email or user ID",
     "marketAccess.table.buyer": "Buyer",
@@ -893,29 +1103,36 @@ export const messages = {
     "marketAccess.status.requested": "Access requested",
     "marketAccess.approve": "Approve",
     "marketAccess.reject": "Reject",
-    "marketAccess.requestSaveDraftFirst": "Save or reset this buyer's unsaved changes before resolving the request.",
+    "marketAccess.requestSaveDraftFirst":
+      "Save or reset this buyer's unsaved changes before resolving the request.",
     "marketAccess.requestApproved": "Approved {email}'s access request.",
     "marketAccess.requestRejected": "Rejected {email}'s access request.",
     "marketAccess.requestCount": "{count} pending",
     "marketAccess.creditSummary": "Credit: {value}",
     "marketAccess.exposureSummary": "Exposure: {amount} · {count} services",
     "marketAccess.relationshipStatus": "Buyer relationship",
-    "marketAccess.relationshipStatusHint": "Disabling this relationship blocks new rentals and terminates active paid services after saving.",
-    "marketAccess.leaveConfirm": "You have unsaved market access changes. Leave this page and discard them?",
+    "marketAccess.relationshipStatusHint":
+      "Disabling this relationship blocks new rentals and terminates active paid services after saving.",
+    "marketAccess.leaveConfirm":
+      "You have unsaved market access changes. Leave this page and discard them?",
     "marketAccess.approveTitle": "Approve market access",
     "marketAccess.rejectTitle": "Reject market access",
     "marketAccess.approvalCreditTitle": "Account-level USD credit",
-    "marketAccess.approvalCreditHint": "This limit is shared by all paid Share seats and Client Hosts this buyer rents from you. The suggested amount covers about seven days of this requested service.",
+    "marketAccess.approvalCreditHint":
+      "This limit is shared by all paid Share seats and Client Hosts this buyer rents from you. The suggested amount covers about seven days of this requested service.",
     "marketAccess.currentExposure": "Current accrued exposure",
     "marketAccess.activeServicesLabel": "Active paid services",
-    "marketAccess.approveFreeHint": "This approval only grants the requested free product scope. It does not create a credit line.",
+    "marketAccess.approveFreeHint":
+      "This approval only grants the requested free product scope. It does not create a credit line.",
     "marketAccess.rejectionReason": "Reason shown in the audit record",
     "marketAccess.rejectionReasonRequired": "Enter a rejection reason.",
-    "marketAccess.rejectionCooldown": "After rejection, this buyer must wait 24 hours before applying for the same supplier scope again.",
+    "marketAccess.rejectionCooldown":
+      "After rejection, this buyer must wait 24 hours before applying for the same supplier scope again.",
     "marketAccess.approveConfirm": "Approve and grant credit",
     "marketAccess.rejectConfirm": "Reject request",
     "marketAccess.revokeConfirmTitle": "Review relationship revocation",
-    "marketAccess.revokeConfirmDescription": "Saving will block these buyers from new rentals and terminate their active paid services. Existing balances and invoices remain payable.",
+    "marketAccess.revokeConfirmDescription":
+      "Saving will block these buyers from new rentals and terminate their active paid services. Existing balances and invoices remain payable.",
     "marketAccess.revokeImpact": "{amount} exposure · {count} active services",
     "marketAccess.revokeNoExposure": "No current exposure",
     "marketAccess.revokeConfirm": "Revoke and save all changes",
@@ -929,12 +1146,16 @@ export const messages = {
     "marketAccess.credit.limited": "Limited",
     "marketAccess.credit.unlimited": "Unlimited",
     "marketAccess.limitMajor": "Limit (USD)",
-    "marketAccess.invalidLimit": "Enter a positive credit limit with at most two decimal places.",
-    "marketAccess.unlimitedConfirm": "I accept unlimited exposure to this buyer",
-    "marketAccess.unlimitedConfirmRequired": "Confirm the unlimited credit exposure before saving.",
+    "marketAccess.invalidLimit":
+      "Enter a positive credit limit with at most two decimal places.",
+    "marketAccess.unlimitedConfirm":
+      "I accept unlimited exposure to this buyer",
+    "marketAccess.unlimitedConfirmRequired":
+      "Confirm the unlimited credit exposure before saving.",
     "marketAccess.creditSaved": "{currency} credit grant saved.",
     "marketReadiness.title": "Market readiness",
-    "marketReadiness.subtitle": "Review the supplier setup and operational tasks that affect Share and Client Host transactions.",
+    "marketReadiness.subtitle":
+      "Review the supplier setup and operational tasks that affect Share and Client Host transactions.",
     "marketReadiness.ready": "Ready",
     "marketReadiness.needsSetup": "Needs setup",
     "marketReadiness.pending": "{count} pending",
@@ -943,23 +1164,28 @@ export const messages = {
     "marketReadiness.summary.billingActions": "Billing actions",
     "marketReadiness.summary.overdue": "Overdue invoices",
     "marketReadiness.payment.title": "Payment and contact details",
-    "marketReadiness.payment.detail": "{methods} payment method(s) and {contacts} contact route(s) are visible to buyers when payment or approval is needed.",
+    "marketReadiness.payment.detail":
+      "{methods} payment method(s) and {contacts} contact route(s) are visible to buyers when payment or approval is needed.",
     "marketReadiness.payment.action": "Manage payment details",
     "marketReadiness.access.title": "Buyer access and credit",
-    "marketReadiness.access.detail": "{buyers} active trusted buyer relationship(s), with free and paid scopes managed independently.",
+    "marketReadiness.access.detail":
+      "{buyers} active trusted buyer relationship(s), with free and paid scopes managed independently.",
     "marketReadiness.access.action": "Manage access",
     "marketReadiness.billing.title": "Market billing tasks",
-    "marketReadiness.billing.detail": "{payables} invoice(s) to pay, {reviews} payment(s) to review, and {overdue} overdue invoice(s).",
+    "marketReadiness.billing.detail":
+      "{payables} invoice(s) to pay, {reviews} payment(s) to review, and {overdue} overdue invoice(s).",
     "marketReadiness.billing.action": "Open billing",
     "marketReadiness.policies.title": "Current access policies",
-    "marketReadiness.policies.hint": "Free and paid access are independent for each product. Default-open paid access carries supplier credit risk.",
+    "marketReadiness.policies.hint":
+      "Free and paid access are independent for each product. Default-open paid access carries supplier credit risk.",
     "marketReadiness.policies.product": "Product",
     "marketReadiness.policies.pricing": "Pricing",
     "marketReadiness.policies.mode": "Access mode",
     "marketReadiness.policies.revision": "Revision",
     "marketBilling.title": "Market billing",
     "marketBilling.open": "Open billing",
-    "marketBilling.subtitle": "Share and Client Host usage is postpaid by supplier account. Only healthy service time is billed, after a {hours}-hour healthy-time trial.",
+    "marketBilling.subtitle":
+      "Share and Client Host usage is postpaid by supplier account. Only healthy service time is billed, after a {hours}-hour healthy-time trial.",
     "marketBilling.supplier": "Supplier",
     "marketBilling.buyer": "Buyer",
     "marketBilling.day": "day",
@@ -991,13 +1217,16 @@ export const messages = {
     "marketBilling.service.active": "Billable",
     "marketBilling.service.suspended": "Suspended",
     "marketBilling.service.terminated": "Terminated",
-    "marketBilling.service.trialRemaining": "Healthy-time trial remaining: {hours}h {minutes}m",
-    "marketBilling.healthOnly": "offline and unknown time do not consume trial or accrue charges",
+    "marketBilling.service.trialRemaining":
+      "Healthy-time trial remaining: {hours}h {minutes}m",
+    "marketBilling.healthOnly":
+      "offline and unknown time do not consume trial or accrue charges",
     "marketBilling.invoice.number": "Combined invoice #{sequence}",
     "marketBilling.invoice.total": "Invoice total",
     "marketBilling.invoice.deadline": "Payment confirmation deadline: {date}",
     "marketBilling.invoice.exchangeRate": "Invoice rate 1:{rate}",
-    "marketBilling.declaration.summary": "Payment declared {date}; reference: {reference}",
+    "marketBilling.declaration.summary":
+      "Payment declared {date}; reference: {reference}",
     "marketBilling.dispute.summary": "Dispute under review: {reason}",
     "marketBilling.dispute.openedAt": "Opened",
     "marketBilling.dispute.respondBy": "Supplier response due",
@@ -1020,10 +1249,12 @@ export const messages = {
     "marketBilling.summary.overdue": "Overdue invoices",
     "marketBilling.summary.disputes": "Open disputes",
     "marketBilling.todo.title": "Needs your attention",
-    "marketBilling.todo.hint": "Payment, receipt review, and settlement actions are ordered here before account monitoring.",
+    "marketBilling.todo.hint":
+      "Payment, receipt review, and settlement actions are ordered here before account monitoring.",
     "marketBilling.todo.empty": "No billing action needs your attention.",
     "marketBilling.history.title": "Invoice history",
-    "marketBilling.history.hint": "Settled and voided invoices are grouped by supplier account. Open an account to load its history.",
+    "marketBilling.history.hint":
+      "Settled and voided invoices are grouped by supplier account. Open an account to load its history.",
     "marketBilling.history.loading": "Loading invoice history...",
     "marketBilling.history.empty": "No settled invoices yet.",
     "marketBilling.history.loadMore": "Load more",
@@ -1035,37 +1266,47 @@ export const messages = {
     "marketBilling.action.requestSettlement": "Request settlement",
     "marketBilling.action.closeAccount": "Permanently close credit account",
     "marketBilling.action.completed": "Billing action completed.",
-    "marketBilling.closing.title": "This credit relationship is permanently closed",
-    "marketBilling.closing.description": "All attached services are terminated and will not resume after settlement. The final bill remains payable, and future paid rentals with this supplier are disabled.",
+    "marketBilling.closing.title":
+      "This credit relationship is permanently closed",
+    "marketBilling.closing.description":
+      "All attached services are terminated and will not resume after settlement. The final bill remains payable, and future paid rentals with this supplier are disabled.",
     "marketBilling.restricted.title": "Market credit is restricted",
-    "marketBilling.restricted.description": "An overdue invoice blocks new paid Share and Client Host rentals until the supplier confirms receipt or Router voids the invoice.",
+    "marketBilling.restricted.description":
+      "An overdue invoice blocks new paid Share and Client Host rentals until the supplier confirms receipt or Router voids the invoice.",
     "marketBilling.restricted.openInvoice": "Open invoice #{sequence}",
     "marketBilling.restricted.open": "Open restricted invoice",
     "marketBilling.profile.title": "Supplier payment policy",
-    "marketBilling.profile.hint": "Set how long buyers have to pay an issued invoice. Access and credit limits are granted separately for each buyer in Market access.",
+    "marketBilling.profile.hint":
+      "Set how long buyers have to pay an issued invoice. Access and credit limits are granted separately for each buyer in Market access.",
     "marketBilling.profile.grace": "Payment grace (hours)",
     "marketBilling.profile.notSet": "Not configured",
-    "marketBilling.profile.invalidGrace": "Grace period must be an integer from 1 to 720 hours.",
+    "marketBilling.profile.invalidGrace":
+      "Grace period must be an integer from 1 to 720 hours.",
     "marketBilling.profile.saved": "{currency} payment policy saved.",
     "marketBilling.payables.title": "Accounts payable",
-    "marketBilling.payables.hint": "Each supplier has one USD balance shared across all rented Share seats and Client Hosts.",
+    "marketBilling.payables.hint":
+      "Each supplier has one USD balance shared across all rented Share seats and Client Hosts.",
     "marketBilling.payables.empty": "No supplier credit accounts yet.",
     "marketBilling.receivables.title": "Accounts receivable",
-    "marketBilling.receivables.hint": "Review buyer exposure, combined invoices, and payment declarations before confirming receipt.",
+    "marketBilling.receivables.hint":
+      "Review buyer exposure, combined invoices, and payment declarations before confirming receipt.",
     "marketBilling.receivables.empty": "No buyer credit accounts yet.",
     "marketBilling.declare.method": "Payment method",
     "marketBilling.declare.methodOther": "Other / arranged offline",
     "marketBilling.declare.reference": "Transfer reference",
     "marketBilling.declare.evidence": "Evidence URL",
     "marketBilling.declare.openEvidence": "Open payment evidence",
-    "marketBilling.declare.notice": "This records a payment claim only. The supplier independently verifies receipt before Router clears the balance and restores suspended services.",
+    "marketBilling.declare.notice":
+      "This records a payment claim only. The supplier independently verifies receipt before Router clears the balance and restores suspended services.",
     "marketBilling.providerPaymentDetails": "Provider payment details",
-    "marketBilling.paymentSnapshot": "Payment instructions frozen with this invoice from the supplier profile updated {date}.",
+    "marketBilling.paymentSnapshot":
+      "Payment instructions frozen with this invoice from the supplier profile updated {date}.",
     "marketBilling.note": "Note",
     "marketBilling.reason": "Reason",
     "marketBilling.reasonRequired": "A reason is required.",
     "marketBilling.admin.title": "Billing disputes",
-    "marketBilling.admin.hint": "Resolve open disputes from invoice evidence. Voiding an invoice clears its balance and restores eligible services.",
+    "marketBilling.admin.hint":
+      "Resolve open disputes from invoice evidence. Voiding an invoice clears its balance and restores eligible services.",
     "marketBilling.admin.empty": "No open billing disputes.",
     "marketBilling.admin.uphold": "Uphold invoice",
     "marketBilling.admin.voidDispute": "Void after review",
@@ -1073,7 +1314,8 @@ export const messages = {
     "marketBilling.admin.note": "Resolution note",
     "marketBilling.dialog.settle": "Create a combined invoice",
     "marketBilling.dialog.request-settlement": "Request buyer settlement",
-    "marketBilling.dialog.close": "Permanently close this supplier relationship",
+    "marketBilling.dialog.close":
+      "Permanently close this supplier relationship",
     "marketBilling.dialog.declare": "Declare invoice payment",
     "marketBilling.dialog.confirm": "Confirm payment receipt",
     "marketBilling.dialog.reject": "Reject payment declaration",
@@ -1081,11 +1323,16 @@ export const messages = {
     "marketBilling.dialog.admin-uphold": "Uphold disputed invoice",
     "marketBilling.dialog.admin-void": "Void disputed invoice",
     "marketBilling.dialog.admin-invoice-void": "Force void invoice",
-    "marketBilling.dialog.settle.description": "The current accrued balance becomes payable now and all services on this supplier account pause until the supplier confirms receipt.",
-    "marketBilling.dialog.request-settlement.description": "The current accrued balance becomes one combined invoice. Services on this account pause until you confirm payment receipt.",
-    "marketBilling.dialog.close.description": "This permanently terminates all services and disables future paid rentals between this buyer and supplier. Any accrued balance remains payable through one final combined invoice.",
-    "marketBilling.dialog.confirm.description": "Confirm only after independently verifying the transfer. Router clears the combined balance and restores eligible services immediately.",
-    "createClient.selectionRequired": "Select at least one host owner and region.",
+    "marketBilling.dialog.settle.description":
+      "The current accrued balance becomes payable now and all services on this supplier account pause until the supplier confirms receipt.",
+    "marketBilling.dialog.request-settlement.description":
+      "The current accrued balance becomes one combined invoice. Services on this account pause until you confirm payment receipt.",
+    "marketBilling.dialog.close.description":
+      "This permanently terminates all services and disables future paid rentals between this buyer and supplier. Any accrued balance remains payable through one final combined invoice.",
+    "marketBilling.dialog.confirm.description":
+      "Confirm only after independently verifying the transfer. Router clears the combined balance and restores eligible services immediately.",
+    "createClient.selectionRequired":
+      "Select at least one host owner and region.",
     "createClient.noCapacity": "No idle host matches the current selection.",
     "createClient.subdomainTaken": "Subdomain is not available",
     "createClient.close": "Close",
@@ -1103,10 +1350,13 @@ export const messages = {
     "auth.useDifferentEmail": "Use a different email",
     "settings.title": "Settings",
     "settings.adminRequired": "Admin access required",
-    "settings.adminRequiredDesc": "Sign in as a configured router administrator to edit runtime settings.",
+    "settings.adminRequiredDesc":
+      "Sign in as a configured router administrator to edit runtime settings.",
     "settings.saveRestart": "Save and restart",
-    "settings.saved": "Saved. updated={updated} unchanged={unchanged} restartRequired={restartRequired}",
-    "settings.restartScheduled": "Restart scheduled. Waiting for service to return...",
+    "settings.saved":
+      "Saved. updated={updated} unchanged={unchanged} restartRequired={restartRequired}",
+    "settings.restartScheduled":
+      "Restart scheduled. Waiting for service to return...",
     "settings.groups": "Groups",
     "settings.unsavedChanges": "{count} unsaved changes",
     "settings.groupsAria": "Settings groups",
@@ -1115,36 +1365,47 @@ export const messages = {
     "settings.notificationDeliveries": "Notification deliveries",
     "settings.map": "Map",
     "settings.mapTitle": "Map display",
-    "settings.mapDescription": "Control dashboard map overlays and viewport framing. Settings are stored on the router and shared by all visitors.",
-    "settings.mapShowFlowsDescription": "Draw light request-flow lines between router and active clients.",
-    "settings.mapShowHeatDescription": "Shade countries by client installation density.",
+    "settings.mapDescription":
+      "Control dashboard map overlays and viewport framing. Settings are stored on the router and shared by all visitors.",
+    "settings.mapShowFlowsDescription":
+      "Draw light request-flow lines between router and active clients.",
+    "settings.mapShowHeatDescription":
+      "Shade countries by client installation density.",
     "settings.mapViewportTitle": "Viewport framing",
-    "settings.mapViewportDescription": "Set the map content Y at the top of the 420px dashboard card. The bottom edge is start + 420.",
+    "settings.mapViewportDescription":
+      "Set the map content Y at the top of the 420px dashboard card. The bottom edge is start + 420.",
     "settings.mapVisibleStartPx": "Visible start (px)",
-    "settings.mapVisibleStartPxDescription": "Map content Y at the top edge of the viewport.",
+    "settings.mapVisibleStartPxDescription":
+      "Map content Y at the top edge of the viewport.",
     "settings.mapViewportReset": "Reset defaults",
     "settings.mapSaved": "Map display settings saved.",
     "settings.announcement": "Announcement",
     "settings.announcementTitle": "Announcement",
-    "settings.announcementDescription": "Configure the announcement modal shown after page refresh. Content is stored on the router and shared by all visitors.",
+    "settings.announcementDescription":
+      "Configure the announcement modal shown after page refresh. Content is stored on the router and shared by all visitors.",
     "settings.announcementEnabled": "Enable announcement",
-    "settings.announcementEnabledDescription": "When enabled, visitors see the announcement after refresh unless they dismiss it.",
+    "settings.announcementEnabledDescription":
+      "When enabled, visitors see the announcement after refresh unless they dismiss it.",
     "settings.announcementContentZh": "Chinese content (HTML)",
     "settings.announcementContentEn": "English content (HTML)",
-    "settings.announcementHtmlPlaceholder": "<p>Supports basic HTML tags such as links, lists, and emphasis.</p>",
+    "settings.announcementHtmlPlaceholder":
+      "<p>Supports basic HTML tags such as links, lists, and emphasis.</p>",
     "settings.announcementPreview": "Preview",
     "settings.announcementSaved": "Announcement settings saved.",
     "announcement.dismissToday": "Dismiss for today",
     "announcement.dismissPermanent": "Dismiss permanently",
-    "settings.restartFieldDesc": "Fields marked restart required are persisted immediately but need a process restart to take full effect.",
+    "settings.restartFieldDesc":
+      "Fields marked restart required are persisted immediately but need a process restart to take full effect.",
     "settings.loading": "Loading settings...",
     "settings.currentlySet": "currently set",
     "settings.secretPlaceholder": "Leave blank to keep; type - to clear",
     "settings.alertChannels.title": "Channel health",
-    "settings.alertChannels.description": "Status reflects real delivery or test attempts, not only saved credentials.",
+    "settings.alertChannels.description":
+      "Status reflects real delivery or test attempts, not only saved credentials.",
     "settings.alertChannels.lastSuccess": "Last successful delivery: {time}",
     "settings.alertChannels.neverSucceeded": "No successful delivery recorded.",
-    "settings.alertChannels.configureFirst": "Configure the channel credentials before testing.",
+    "settings.alertChannels.configureFirst":
+      "Configure the channel credentials before testing.",
     "settings.alertChannels.sendTest": "Send test",
     "settings.alertChannels.testSent": "{channel} test message sent.",
     "settings.alertChannels.status.disabled": "Disabled",
@@ -1153,10 +1414,12 @@ export const messages = {
     "settings.alertChannels.status.healthy": "Healthy",
     "settings.alertChannels.status.degraded": "Degraded",
     "metrics.title": "Metrics",
-    "metrics.subtitle": "Host, Router, Client, LLM, and persistent incident telemetry.",
+    "metrics.subtitle":
+      "Host, Router, Client, LLM, and persistent incident telemetry.",
     "metrics.clear": "Clear metrics DB",
     "metrics.clearTitle": "Clear metrics history?",
-    "metrics.clearDesc": "This only deletes metrics history from the separate metrics database. Business data, shares, markets, settings, and logs are not affected.",
+    "metrics.clearDesc":
+      "This only deletes metrics history from the separate metrics database. Business data, shares, markets, settings, and logs are not affected.",
     "metrics.cleared": "Metrics history cleared.",
     "metrics.lastSample": "Last sample",
     "metrics.autoRefresh": "Auto refresh",
@@ -1197,7 +1460,8 @@ export const messages = {
     "metrics.clients.unknown": "Unknown",
     "metrics.clients.trend": "Client Presence Trend",
     "metrics.clients.inventory": "Client inventory",
-    "metrics.clients.inventoryDesc": "Current state comes from the same authenticated presence state machine that opens and resolves Client incidents.",
+    "metrics.clients.inventoryDesc":
+      "Current state comes from the same authenticated presence state machine that opens and resolves Client incidents.",
     "metrics.clients.client": "Client",
     "metrics.clients.status": "Status",
     "metrics.clients.platform": "Platform",
@@ -1212,17 +1476,22 @@ export const messages = {
     "metrics.alerts.active": "Active incidents",
     "metrics.alerts.activeDesc": "Firing, acknowledged, or silenced",
     "metrics.alerts.critical": "Critical incidents",
-    "metrics.alerts.criticalDesc": "Active incidents requiring immediate attention",
+    "metrics.alerts.criticalDesc":
+      "Active incidents requiring immediate attention",
     "metrics.alerts.failedDeliveries": "Failed deliveries",
-    "metrics.alerts.failedDeliveriesDesc": "Retryable, dead-letter, or disabled-channel deliveries",
+    "metrics.alerts.failedDeliveriesDesc":
+      "Retryable, dead-letter, or disabled-channel deliveries",
     "metrics.alerts.resolved": "Resolved history",
     "metrics.alerts.historyDesc": "All retained resolved incidents",
     "metrics.alerts.channels": "Notification channels",
-    "metrics.alerts.channelsDesc": "Health is based on the latest real delivery or test attempt.",
+    "metrics.alerts.channelsDesc":
+      "Health is based on the latest real delivery or test attempt.",
     "metrics.alerts.neverDelivered": "No successful delivery recorded",
     "metrics.alerts.incidents": "Active incidents",
-    "metrics.alerts.incidentsDesc": "Acknowledgement stops reminders until escalation; silence expires automatically; resume sends a new notification.",
-    "metrics.alerts.notePlaceholder": "Operator note (optional, applied to the next action)",
+    "metrics.alerts.incidentsDesc":
+      "Acknowledgement stops reminders until escalation; silence expires automatically; resume sends a new notification.",
+    "metrics.alerts.notePlaceholder":
+      "Operator note (optional, applied to the next action)",
     "metrics.alerts.silenceDuration": "Silence duration",
     "metrics.alerts.silence1h": "Silence 1 hour",
     "metrics.alerts.silence6h": "Silence 6 hours",
@@ -1236,7 +1505,8 @@ export const messages = {
     "metrics.alerts.occurrences": "{count} observations",
     "metrics.alerts.silencedUntil": "Silenced until {time}",
     "metrics.alerts.deliveries": "Delivery outbox",
-    "metrics.alerts.deliveriesDesc": "Payloads are frozen per incident transition. Failed or suppressed deliveries can be queued again unless a newer transition superseded them.",
+    "metrics.alerts.deliveriesDesc":
+      "Payloads are frozen per incident transition. Failed or suppressed deliveries can be queued again unless a newer transition superseded them.",
     "metrics.alerts.channel": "Channel",
     "metrics.alerts.deliveryStatus": "Status",
     "metrics.alerts.attempts": "Attempts",
@@ -1315,14 +1585,18 @@ export const messages = {
     "metrics.chart.stale": "Sampling may have stopped",
     "metrics.chart.noTraffic": "No traffic in window",
     "metrics.chart.noDataTitle": "No data yet",
-    "metrics.chart.noDataDetail": "No samples fall inside this time range. Pick a wider range or wait for the next sample.",
+    "metrics.chart.noDataDetail":
+      "No samples fall inside this time range. Pick a wider range or wait for the next sample.",
     "metrics.chart.samplingDetail": "Waiting for the first samples to arrive.",
     "metrics.chart.disabledTitle": "Collection is off",
-    "metrics.chart.disabledDetail": "Set CC_SWITCH_ROUTER_METRICS_ENABLED=true to start collecting metrics.",
+    "metrics.chart.disabledDetail":
+      "Set CC_SWITCH_ROUTER_METRICS_ENABLED=true to start collecting metrics.",
     "metrics.chart.staleTitle": "Samples look stale",
-    "metrics.chart.staleDetail": "The last persisted sample is older than expected — the collector may have stopped.",
+    "metrics.chart.staleDetail":
+      "The last persisted sample is older than expected — the collector may have stopped.",
     "metrics.chart.noTrafficTitle": "No traffic",
-    "metrics.chart.noTrafficDetail": "The collector is healthy but no requests were recorded in this window.",
+    "metrics.chart.noTrafficDetail":
+      "The collector is healthy but no requests were recorded in this window.",
     "metrics.chart.deltaHint": "Δ per bucket",
     "metrics.panel.routerProcess": "Router Process",
     "metrics.panel.diskUsage": "Disk Usage",
@@ -1331,7 +1605,8 @@ export const messages = {
     "metrics.panel.counters": "Route Lifecycle Counters",
     "metrics.panel.topConsumers": "Top Consumers",
     "metrics.panel.substitution": "Model Substitution",
-    "metrics.panel.substitutionDesc": "Requests served by a model other than the one requested (the router's effective failover).",
+    "metrics.panel.substitutionDesc":
+      "Requests served by a model other than the one requested (the router's effective failover).",
     "metrics.kpi.failover": "Failover Success",
     "metrics.detail.substitutionRate": "Substituted {value}",
     "metrics.sub.total": "Requests",
@@ -1353,7 +1628,8 @@ export const messages = {
     "metrics.hostinfo.kernel": "Kernel",
     "metrics.hostinfo.cpu": "CPU",
     "metrics.hostinfo.tcp": "TCP",
-    "metrics.hostinfo.tcpValue": "{established} established / {timeWait} time_wait",
+    "metrics.hostinfo.tcpValue":
+      "{established} established / {timeWait} time_wait",
     "metrics.hostinfo.load": "Load (1·5·15m)",
     "metrics.hostinfo.swap": "Swap",
     "metrics.hostinfo.noSwap": "Not configured",
@@ -1374,7 +1650,8 @@ export const messages = {
     "metrics.header.p95": "P95",
     "metrics.table.noData": "No data",
     "logs.title": "Router Logs",
-    "logs.description": "Live tail of the latest 100 lines from /var/log/cc-switch-router.log.",
+    "logs.description":
+      "Live tail of the latest 100 lines from /var/log/cc-switch-router.log.",
     "logs.download": "Download log",
     "logs.pause": "Pause",
     "logs.resume": "Resume",
@@ -1396,9 +1673,11 @@ export const messages = {
     "logs.filteredCount": "{visible} / {total} lines",
     "logs.noMatchingLines": "No log lines match the current level filter.",
     "notifications.title": "Client notification deliveries",
-    "notifications.description": "Latest registration and offline email deliveries. Recipient addresses are masked and message bodies are not exposed.",
+    "notifications.description":
+      "Latest registration and offline email deliveries. Recipient addresses are masked and message bodies are not exposed.",
     "notifications.chatTitle": "Chat email deliveries",
-    "notifications.chatDescription": "One-minute Client chat digests, retries, and dead-letter deliveries.",
+    "notifications.chatDescription":
+      "One-minute Client chat digests, retries, and dead-letter deliveries.",
     "notifications.client": "Client",
     "notifications.messages": "Messages",
     "notifications.requeue": "Retry dead-letter delivery",
@@ -1422,9 +1701,12 @@ export const messages = {
     "notifications.status.retry": "retry scheduled",
     "notifications.status.sent": "sent",
     "notifications.status.deadLetter": "dead letter",
-    "notifications.status.cancelledOwnerChanged": "cancelled after Owner change",
-    "notifications.status.cancelledMessageDeleted": "cancelled after message deletion",
-    "notifications.status.cancelledRoomArchived": "cancelled after room archive",
+    "notifications.status.cancelledOwnerChanged":
+      "cancelled after Owner change",
+    "notifications.status.cancelledMessageDeleted":
+      "cancelled after message deletion",
+    "notifications.status.cancelledRoomArchived":
+      "cancelled after room archive",
     "notifications.status.blocked": "configuration blocked",
     "notifications.status.suppressedRateLimit": "suppressed by hourly cap",
     "notifications.status.suppressedStorm": "included in incident window",
@@ -1444,10 +1726,14 @@ export const messages = {
     "version.binaryPath": "Binary path",
     "version.adminOnly": "admin only",
     "version.confirmRestart": "Restart cc-switch-router now?",
-    "version.confirmUpgrade": "Download latest binary, replace current binary, and restart?",
-    "version.confirmRollback": "Rollback to the previous cc-switch-router binary and restart?",
-    "version.confirmRollbackAgain": "Confirm rollback? The current binary will become the new backup.",
-    "version.restartScheduledHealth": "Restart scheduled. Waiting for service health...",
+    "version.confirmUpgrade":
+      "Download latest binary, replace current binary, and restart?",
+    "version.confirmRollback":
+      "Rollback to the previous cc-switch-router binary and restart?",
+    "version.confirmRollbackAgain":
+      "Confirm rollback? The current binary will become the new backup.",
+    "version.restartScheduledHealth":
+      "Restart scheduled. Waiting for service health...",
     "version.rollbackUnavailable": "No rollback backup found.",
     "version.streamDisconnected": "upgrade stream disconnected",
     "version.upgradeLog": "Upgrade Log",
@@ -1466,7 +1752,8 @@ export const messages = {
     "chat.noMessages": "No messages yet",
     "chat.empty": "No recent chats",
     "chat.overLimit": "Messages can contain at most {count} characters.",
-    "chat.confirmDelete": "Delete this message? Pending email delivery will be cancelled.",
+    "chat.confirmDelete":
+      "Delete this message? Pending email delivery will be cancelled.",
     "chat.loadOlder": "Load earlier messages",
     "chat.loginToSend": "Log in to send a message",
     "chat.archivedReadOnly": "This archived chat is read-only.",
@@ -1475,7 +1762,8 @@ export const messages = {
     "chat.subtitle": "Message clients from the router",
     "chat.tabRecent": "Recent",
     "chat.tabAll": "All clients",
-    "chat.emptyHint": "Open a client card and tap Chat to start a conversation.",
+    "chat.emptyHint":
+      "Open a client card and tap Chat to start a conversation.",
     "chat.emptyAction": "Browse clients",
     "chat.loginHint": "Log in to join the conversation and send messages.",
     "chat.viewClient": "View client",
@@ -1493,7 +1781,8 @@ export const messages = {
     "chat.systemMessage": "System message",
     "chat.showDetails": "Details",
     "chat.hideDetails": "Hide",
-    "chat.marketPublicNotice": "Market details submitted here are posted to this Client's public chat. Do not include API keys, OAuth/session tokens, cookies, passwords, secrets, or private keys.",
+    "chat.marketPublicNotice":
+      "Market details submitted here are posted to this Client's public chat. Do not include API keys, OAuth/session tokens, cookies, passwords, secrets, or private keys.",
     "chat.event.listingCreated": "Share listed with {count} seat(s).",
     "chat.event.listingRelisted": "Share listing reopened.",
     "chat.event.listingClosed": "Share listing closed.",
@@ -1503,40 +1792,73 @@ export const messages = {
     "chat.event.seatDeleted": "Seat {seat} deleted.",
     "chat.event.seatRented": "{renter} rented seat {seat}.",
     "chat.event.seatRetired": "Seat {seat} retired and became read-only.",
-    "chat.event.entitlementActivated": "Access activated for {renter} on seat {seat}.",
-    "chat.event.entitlementFailed": "Access activation failed for {renter} on seat {seat}.",
+    "chat.event.entitlementActivated":
+      "Access activated for {renter} on seat {seat}.",
+    "chat.event.entitlementFailed":
+      "Access activation failed for {renter} on seat {seat}.",
+    "chat.event.serviceTermExpiring":
+      "The service term for seat {seat} ends at {time}.",
+    "chat.event.serviceTermExpired":
+      "The service term for seat {seat} ended and access is being reclaimed.",
     "chat.event.paymentDue": "Payment of {amount} is due by {time}.",
     "chat.event.paymentDeclared": "The renter declared a payment of {amount}.",
-    "chat.event.billingPaymentConfirmed": "The supplier confirmed the combined payment of {amount}.",
-    "chat.event.billingPaymentRejected": "The supplier rejected the payment declaration for {amount}: {reason}",
-    "chat.event.billingPaymentOverdue": "The combined payment of {amount} became overdue after {time}.",
-    "chat.event.billingInvoiceDisputed": "The combined bill for {amount} was disputed: {reason}",
-    "chat.event.billingDisputeResolvedVoid": "The billing dispute was resolved and the combined bill for {amount} was voided.",
-    "chat.event.billingDisputeResolvedUpheld": "The billing dispute was resolved and the combined bill for {amount} was upheld.",
-    "chat.event.billingInvoiceVoided": "The combined bill for {amount} was voided: {reason}",
-    "chat.event.billingCreditLimitWarning": "The combined postpaid balance reached {utilization} of the granted credit limit.",
-    "chat.event.billingAccountClosing": "The supplier permanently closed this credit relationship. Services will not resume, and any final combined bill remains payable.",
-    "chat.event.clientOffline": "Client {client} is confirmed offline. Last trusted heartbeat: {time}.",
-    "chat.event.clientProvisioned": "Client {client} was provisioned and rented successfully.",
-    "chat.event.freePeriodExpiring": "Free period for Client {client} expires at {time}.",
-    "chat.event.freePeriodExpired": "Free period for Client {client} has ended.",
+    "chat.event.billingPaymentConfirmed":
+      "The supplier confirmed the combined payment of {amount}.",
+    "chat.event.billingPaymentRejected":
+      "The supplier rejected the payment declaration for {amount}: {reason}",
+    "chat.event.billingPaymentOverdue":
+      "The combined payment of {amount} became overdue after {time}.",
+    "chat.event.billingInvoiceDisputed":
+      "The combined bill for {amount} was disputed: {reason}",
+    "chat.event.billingDisputeResolvedVoid":
+      "The billing dispute was resolved and the combined bill for {amount} was voided.",
+    "chat.event.billingDisputeResolvedUpheld":
+      "The billing dispute was resolved and the combined bill for {amount} was upheld.",
+    "chat.event.billingInvoiceVoided":
+      "The combined bill for {amount} was voided: {reason}",
+    "chat.event.billingCreditLimitWarning":
+      "The combined postpaid balance reached {utilization} of the granted credit limit.",
+    "chat.event.billingAccountClosing":
+      "The supplier permanently closed this credit relationship. Services will not resume, and any final combined bill remains payable.",
+    "chat.event.clientOffline":
+      "Client {client} is confirmed offline. Last trusted heartbeat: {time}.",
+    "chat.event.clientProvisioned":
+      "Client {client} was provisioned and rented successfully.",
+    "chat.event.freePeriodExpiring":
+      "Free period for Client {client} expires at {time}.",
+    "chat.event.freePeriodExpired":
+      "Free period for Client {client} has ended.",
     "chat.event.cleanupStarted": "Client {client} cleanup started: {reason}",
-    "chat.event.cleanupFinished": "Client {client} was returned and cleanup completed.",
+    "chat.event.cleanupFinished":
+      "Client {client} was returned and cleanup completed.",
     "chat.event.cleanupFailed": "Client {client} cleanup failed: {error}",
-    "chat.event.releaseFinalized": "Client {client} rental ended after cleanup failed; the Host remains quarantined.",
-    "chat.event.clientRecoverySucceeded": "Router restarted Client {client} and its tunnel recovered.",
-    "chat.event.clientRecoveryFailed": "Router could not recover Client {client}: {error}",
-    "chat.event.clientRecoveryBlocked": "Automatic recovery for Client {client} is blocked and requires Provider action.",
-    "chat.event.renterReleaseRequested": "{renter} requested to return seat {seat}.",
-    "chat.event.ownerRevokeRequested": "The owner requested to reclaim seat {seat} from {renter}.",
+    "chat.event.releaseFinalized":
+      "Client {client} rental ended after cleanup failed; the Host remains quarantined.",
+    "chat.event.clientRecoverySucceeded":
+      "Router restarted Client {client} and its tunnel recovered.",
+    "chat.event.clientRecoveryFailed":
+      "Router could not recover Client {client}: {error}",
+    "chat.event.clientRecoveryBlocked":
+      "Automatic recovery for Client {client} is blocked and requires Provider action.",
+    "chat.event.renterReleaseRequested":
+      "{renter} requested to return seat {seat}.",
+    "chat.event.ownerRevokeRequested":
+      "The owner requested to reclaim seat {seat} from {renter}.",
     "chat.event.subscriptionReleased": "Seat {seat} was released by {renter}.",
-    "chat.event.revokeFailed": "Failed to revoke access for {renter} on seat {seat}.",
-    "chat.event.billingSuspensionRequested": "Billing suspension was requested for {renter} on seat {seat}.",
-    "chat.event.billingSuspended": "Service was suspended for {renter} on seat {seat} due to billing status.",
-    "chat.event.billingSuspensionFailed": "Failed to suspend service for {renter} on seat {seat}.",
-    "chat.event.billingResumeRequested": "Billing recovery was requested for {renter} on seat {seat}.",
-    "chat.event.billingResumed": "Service resumed for {renter} on seat {seat} after billing recovery.",
-    "chat.event.billingResumeFailed": "Failed to resume service for {renter} on seat {seat}.",
+    "chat.event.revokeFailed":
+      "Failed to revoke access for {renter} on seat {seat}.",
+    "chat.event.billingSuspensionRequested":
+      "Billing suspension was requested for {renter} on seat {seat}.",
+    "chat.event.billingSuspended":
+      "Service was suspended for {renter} on seat {seat} due to billing status.",
+    "chat.event.billingSuspensionFailed":
+      "Failed to suspend service for {renter} on seat {seat}.",
+    "chat.event.billingResumeRequested":
+      "Billing recovery was requested for {renter} on seat {seat}.",
+    "chat.event.billingResumed":
+      "Service resumed for {renter} on seat {seat} after billing recovery.",
+    "chat.event.billingResumeFailed":
+      "Failed to resume service for {renter} on seat {seat}.",
     "chat.event.shareEnabled": "Share service enabled.",
     "chat.event.shareDisabled": "Share service disabled.",
     "chat.event.shareExpirationChanged": "Share expiration changed to {time}.",
@@ -1624,6 +1946,7 @@ export const messages = {
     "chat.detail.seatId": "Seat ID",
     "chat.detail.seatPosition": "Seat",
     "chat.detail.seatStatus": "Seat status",
+    "chat.detail.serviceDurationDays": "Service term (days)",
     "chat.detail.serviceLabel": "Service",
     "chat.detail.serviceRef": "Service reference",
     "chat.detail.services": "Services",
@@ -1645,6 +1968,7 @@ export const messages = {
     "chat.detail.trialHours": "Trial hours",
     "chat.detail.utilization": "Credit utilization",
     "dashboard.clients": "CLIENTS",
+    "dashboard.mine": "Mine",
     "dashboard.all": "All",
     "dashboard.overview": "Network overview",
     "dashboard.kpiIssues": "{count} issues",
@@ -1653,7 +1977,8 @@ export const messages = {
     "dashboard.kpiOnline": "{count} online",
     "dashboard.needsAttention": "Needs attention",
     "dashboard.allSystemsHealthy": "All systems healthy",
-    "dashboard.noOperationalIssues": "No Client or Market currently needs attention.",
+    "dashboard.noOperationalIssues":
+      "No Client or Market currently needs attention.",
     "dashboard.showAll": "Show all",
     "dashboard.uptime24h": "24h uptime",
     "dashboard.provider": "Provider",
@@ -1668,9 +1993,11 @@ export const messages = {
     "dashboard.installClient": "Install client",
     "dashboard.installMarket": "Install market",
     "dashboard.installClientTitle": "Install cc-switch-server",
-    "dashboard.installClientDescription": "Run the following command on the target Linux host. Replace the owner email and web login password placeholders before executing:",
+    "dashboard.installClientDescription":
+      "Run the following command on the target Linux host. Replace the owner email and web login password placeholders before executing:",
     "dashboard.installMarketTitle": "Install cc-switch-market",
-    "dashboard.installMarketDescription": "Open the releases page or copy the link below:",
+    "dashboard.installMarketDescription":
+      "Open the releases page or copy the link below:",
     "dashboard.installClientCommandLabel": "Install command",
     "dashboard.installClientCommandOwnerPlaceholder": "user-email",
     "dashboard.installMarketCommandLabel": "Releases URL",
@@ -1694,17 +2021,23 @@ export const messages = {
     "dashboard.subdomainTakeover.action": "Switch subdomain",
     "dashboard.subdomainTakeover.title": "Switch Client subdomain",
     "dashboard.subdomainTakeover.target": "Online target Client",
-    "dashboard.subdomainTakeover.source": "Source Client whose subdomain will be adopted",
+    "dashboard.subdomainTakeover.source":
+      "Source Client whose subdomain will be adopted",
     "dashboard.subdomainTakeover.retired": "Retire target subdomain",
     "dashboard.subdomainTakeover.adopted": "Adopt source subdomain",
-    "dashboard.subdomainTakeover.warningSource": "The source Client will be permanently fenced and taken offline.",
-    "dashboard.subdomainTakeover.warningData": "No source Shares, users, settings, logs, or other data will move to the target Client.",
-    "dashboard.subdomainTakeover.warningShares": "The target Client keeps its Shares and their IDs; each Share URL automatically adopts the new Client subdomain suffix.",
-    "dashboard.subdomainTakeover.confirmPrompt": "Type {subdomain} to confirm that this source Client will be permanently fenced.",
+    "dashboard.subdomainTakeover.warningSource":
+      "The source Client will be permanently fenced and taken offline.",
+    "dashboard.subdomainTakeover.warningData":
+      "No source Shares, users, settings, logs, or other data will move to the target Client.",
+    "dashboard.subdomainTakeover.warningShares":
+      "The target Client keeps its Shares and their IDs; each Share URL automatically adopts the new Client subdomain suffix.",
+    "dashboard.subdomainTakeover.confirmPrompt":
+      "Type {subdomain} to confirm that this source Client will be permanently fenced.",
     "dashboard.subdomainTakeover.confirmInput": "Confirmation subdomain",
     "dashboard.subdomainTakeover.running": "Switching...",
     "dashboard.subdomainTakeover.confirm": "Switch permanently",
-    "dashboard.subdomainTakeover.success": "Client subdomain switched to {subdomain}",
+    "dashboard.subdomainTakeover.success":
+      "Client subdomain switched to {subdomain}",
     "dashboard.clientUpgrade": "Upgrade",
     "dashboard.clientUpgrading": "Upgrading",
     "dashboard.clientUpgradeSucceeded": "{target} upgraded successfully",
@@ -1713,7 +2046,8 @@ export const messages = {
     "dashboard.clientUpgradeFailedButton": "Upgrade failed",
     "dashboard.clientUpgradeTimedOutButton": "Upgrade timed out",
     "dashboard.clientUpgradeConfirmTitle": "Confirm client upgrade",
-    "dashboard.clientUpgradeConfirm": "Force re-pull the latest cc-switch-server release for {target}. Version equality is not checked, and the service may restart after upgrade.",
+    "dashboard.clientUpgradeConfirm":
+      "Force re-pull the latest cc-switch-server release for {target}. Version equality is not checked, and the service may restart after upgrade.",
     "dashboard.clientUpgradeStarted": "Upgrade started (task {taskId}).",
     "dashboard.clientConsole.close": "Close console",
     "dashboard.clientConsole.minimize": "Minimize to dock",
@@ -1721,39 +2055,49 @@ export const messages = {
     "dashboard.clientConsole.restore": "Restore window",
     "dashboard.clientConsole.resize": "Resize window",
     "dashboard.clientConsole.dockLabel": "Client consoles",
-    "dashboard.clientConsole.maxWindows": "At most {count} consoles can be open. Close one first.",
+    "dashboard.clientConsole.maxWindows":
+      "At most {count} consoles can be open. Close one first.",
     "dashboard.clientConsole.restoreNamed": "Restore {name}",
     "dashboard.clientConsole.switchNamed": "Switch to {name}",
     "dashboard.clientConsole.activeNamed": "Active: {name}",
     "dashboard.clientConsole.closeNamed": "Close {name}",
     "dashboard.clientConsole.suspended": "Resume",
-    "dashboard.clientConsole.resumeHint": "Click to reload console after leaving Clients or refreshing",
+    "dashboard.clientConsole.resumeHint":
+      "Click to reload console after leaving Clients or refreshing",
     "dashboard.clientConsole.resumeNamed": "Resume {name}",
     "dashboard.clientConsole.refresh": "Refresh console",
     "dashboard.clientConsole.cleanAll": "Clean all",
-    "dashboard.clientConsole.autoMinimized": "Open consoles were minimized while viewing Markets.",
-    "dashboard.clientConsole.autoSuspended": "Open consoles were suspended while leaving Clients. Click Resume in the dock to restore.",
+    "dashboard.clientConsole.autoMinimized":
+      "Open consoles were minimized while viewing Markets.",
+    "dashboard.clientConsole.autoSuspended":
+      "Open consoles were suspended while leaving Clients. Click Resume in the dock to restore.",
     "dashboard.connectDialog.title": "Connection info",
     "dashboard.connectDialog.baseUrl": "Base URL",
     "dashboard.connectDialog.apiKey": "API Key",
     "dashboard.connectDialog.loginRequired": "Sign in to view the API Key",
     "dashboard.connectDialog.loginAction": "Sign in",
-    "dashboard.connectDialog.forbidden": "No permission — only the share owner or invited emails can view the API Key",
+    "dashboard.connectDialog.forbidden":
+      "No permission — only the share owner or invited emails can view the API Key",
     "dashboard.connectDialog.requestAccess": "Request access",
     "dashboard.connectDialog.copy": "Copy",
     "dashboard.connectDialog.copyOk": "Copied",
-    "dashboard.connectDialog.maskedHint": "Showing the prefix only. To reveal the full token, reset it from the API Token panel in the top bar.",
-    "dashboard.connectDialog.appShared": "Same Base URL serves Claude / Codex / Gemini for this share.",
+    "dashboard.connectDialog.maskedHint":
+      "Showing the prefix only. To reveal the full token, reset it from the API Token panel in the top bar.",
+    "dashboard.connectDialog.appShared":
+      "Same Base URL serves Claude / Codex / Gemini for this share.",
     "dashboard.connectDialog.appSharedSingle": "This share serves {app} only.",
     "dashboard.connectDialog.close": "Close",
     "dashboard.connectDialog.test.section": "Test connection",
     "dashboard.connectDialog.test.button": "Test",
     "dashboard.connectDialog.test.running": "Testing…",
-    "dashboard.connectDialog.test.refreshUsage": "Refresh usage from cc-switch-server",
+    "dashboard.connectDialog.test.refreshUsage":
+      "Refresh usage from cc-switch-server",
     "dashboard.connectDialog.test.refreshUsageShort": "Usage",
     "dashboard.connectDialog.test.refreshUsageDone": "usage refreshed",
-    "dashboard.connectDialog.test.refreshUsageOk": "Usage refresh triggered: {target}",
-    "dashboard.connectDialog.test.refreshUsageError": "Usage refresh failed: {message}",
+    "dashboard.connectDialog.test.refreshUsageOk":
+      "Usage refresh triggered: {target}",
+    "dashboard.connectDialog.test.refreshUsageError":
+      "Usage refresh failed: {message}",
     "dashboard.connectDialog.test.schedulingRecovered": "Scheduling recovered",
     "dashboard.connectDialog.test.notBound": "App not bound to this share",
     "dashboard.connectDialog.test.needAuth": "Sign in to test",
@@ -1761,16 +2105,19 @@ export const messages = {
     "dashboard.connectDialog.test.textApiCall": "Text generation API call",
     "dashboard.connectDialog.test.chatApiCall": "Chat Completions API call",
     "dashboard.connectDialog.test.imageApiCall": "Image generation API call",
-    "dashboard.connectDialog.test.toolsApiCall": "Tool-calling API call (Cursor)",
+    "dashboard.connectDialog.test.toolsApiCall":
+      "Tool-calling API call (Cursor)",
     "dashboard.connectDialog.test.curlLabel": "curl",
     "dashboard.connectDialog.test.durationMs": "{ms} ms",
     "dashboard.connectDialog.test.status": "Status",
     "dashboard.connectDialog.test.headers": "Response headers",
     "dashboard.connectDialog.test.body": "Response body",
-    "dashboard.connectDialog.test.bodyTruncated": "(truncated — run curl for full body)",
+    "dashboard.connectDialog.test.bodyTruncated":
+      "(truncated — run curl for full body)",
     "dashboard.connectDialog.test.networkError": "Network error: {message}",
     "dashboard.noShare": "No share",
     "dashboard.noClients": "No clients yet",
+    "dashboard.noMyClients": "No Clients you own or access through ShareTo yet",
     "dashboard.noClient": "No client",
     "dashboard.unlinkedClients": "UNLINKED",
     "dashboard.scrollSharesLeft": "Scroll shares left",
@@ -1788,7 +2135,8 @@ export const messages = {
     "dashboard.expires": "Expires",
     "dashboard.parallel": "Parallel",
     "dashboard.parallelOccupancyEmpty": "No active concurrency usage",
-    "dashboard.parallelOccupancyUnknown": "Concurrency is in use, but user attribution is unavailable",
+    "dashboard.parallelOccupancyUnknown":
+      "Concurrency is in use, but user attribution is unavailable",
     "dashboard.parallelOccupancyUnattributed": "Unattributed: {count}",
     "dashboard.response": "Latency",
     "dashboard.online24h": "Online 24h",
@@ -1831,6 +2179,11 @@ export const messages = {
     "dashboard.usageHigh": "Usage above 90%",
     "dashboard.parallelFull": "Parallel capacity full",
     "dashboard.providerUnavailable": "Provider details unavailable",
+    "dashboard.modelPolicyFixed": "Fixed · {model}",
+    "dashboard.modelPolicyPassthrough": "Pass through request model",
+    "dashboard.modelScopeGlobal": "Global",
+    "dashboard.modelScopePerApp": "Per App",
+    "dashboard.modelSourceProfileFixed": "Profile fixed",
     "dashboard.notListed": "Not listed",
     "dashboard.marketsCount": "{count} markets",
     "dashboard.moreActions": "More actions",
@@ -1852,10 +2205,14 @@ export const messages = {
     "dashboard.reason.routeReconnecting": "Route is reconnecting",
     "dashboard.reason.healthCheckFailed": "Latest health check failed",
     "dashboard.reason.noOnlineShares": "No linked Shares are online",
-    "dashboard.reason.partialShareOutage": "{current} of {total} enabled Shares are online",
-    "dashboard.reason.parallelFull": "Parallel capacity reached {current}/{total}",
-    "dashboard.reason.parallelWarning": "Parallel capacity is high ({current}/{total})",
-    "dashboard.reason.usageWarning": "Usage is approaching its limit ({current}/{total})",
+    "dashboard.reason.partialShareOutage":
+      "{current} of {total} enabled Shares are online",
+    "dashboard.reason.parallelFull":
+      "Parallel capacity reached {current}/{total}",
+    "dashboard.reason.parallelWarning":
+      "Parallel capacity is high ({current}/{total})",
+    "dashboard.reason.usageWarning":
+      "Usage is approaching its limit ({current}/{total})",
     "dashboard.reason.expired": "Configuration has expired",
     "dashboard.reason.expiresSoon": "Configuration expires soon",
     "dashboard.reason.providerUnavailable": "Provider is unavailable",
@@ -1866,19 +2223,31 @@ export const messages = {
     "dashboard.reason.maintenance": "Maintenance mode is enabled",
     "dashboard.reason.disabled": "Disabled intentionally",
     "dashboard.impact.none": "No operational impact detected.",
-    "dashboard.impact.routeOffline": "New requests cannot use this route until it recovers.",
-    "dashboard.impact.routeReconnecting": "The Router is preserving this route while its Client reconnects.",
-    "dashboard.impact.marketOffline": "Requests may use another available Market or remain unscheduled.",
-    "dashboard.impact.capacityFull": "New requests may wait or be routed to another available path.",
-    "dashboard.impact.providerUnavailable": "Requests for the affected provider or models may fail or use another route.",
-    "dashboard.impact.disabled": "The entity is intentionally excluded from new routing.",
-    "dashboard.impact.degraded": "The route remains usable, but performance or availability may be reduced.",
-    "dashboard.uptimeObservation": "{healthy}% healthy across {observed} observed minutes ({coverage}% coverage of the last 24h)",
-    "dashboard.operationSubmitted": "Configuration submitted; waiting for runtime confirmation.",
+    "dashboard.impact.routeOffline":
+      "New requests cannot use this route until it recovers.",
+    "dashboard.impact.routeReconnecting":
+      "The Router is preserving this route while its Client reconnects.",
+    "dashboard.impact.marketOffline":
+      "Requests may use another available Market or remain unscheduled.",
+    "dashboard.impact.capacityFull":
+      "New requests may wait or be routed to another available path.",
+    "dashboard.impact.providerUnavailable":
+      "Requests for the affected provider or models may fail or use another route.",
+    "dashboard.impact.disabled":
+      "The entity is intentionally excluded from new routing.",
+    "dashboard.impact.degraded":
+      "The route remains usable, but performance or availability may be reduced.",
+    "dashboard.uptimeObservation":
+      "{healthy}% healthy across {observed} observed minutes ({coverage}% coverage of the last 24h)",
+    "dashboard.operationSubmitted":
+      "Configuration submitted; waiting for runtime confirmation.",
     "dashboard.operationObserved": "The updated runtime state is now visible.",
-    "dashboard.operationRouteVerified": "Routing recovered and the updated state is active.",
-    "dashboard.operationRejected": "The client rejected the configuration change.",
-    "dashboard.operationUnverified": "Configuration was submitted, but runtime confirmation has not been observed yet.",
+    "dashboard.operationRouteVerified":
+      "Routing recovered and the updated state is active.",
+    "dashboard.operationRejected":
+      "The client rejected the configuration change.",
+    "dashboard.operationUnverified":
+      "Configuration was submitted, but runtime confirmation has not been observed yet.",
     "dashboard.activity": "Activity",
     "dashboard.active": "active",
     "dashboard.actions": "Actions",
@@ -1895,7 +2264,8 @@ export const messages = {
     "dashboard.noOnlineShares": "No online shares",
     "dashboard.seen": "Seen",
     "dashboard.shares": "Shares",
-    "dashboard.sharesAvailableDetail": "Service-ready: {available}/{total}. Routes online: {routeOnline}/{total}.",
+    "dashboard.sharesAvailableDetail":
+      "Service-ready: {available}/{total}. Routes online: {routeOnline}/{total}.",
     "dashboard.appType": "App",
     "dashboard.installation": "Installation",
     "dashboard.shareCount": "# Shares",
@@ -1903,7 +2273,8 @@ export const messages = {
     "dashboard.details": "Details",
     "dashboard.linkedShares": "Linked Shares",
     "dashboard.sharePriority": "SHARES Priority",
-    "dashboard.sharePriorityHint": "Public default token-market scheduling view. Specific requests may still change order by model, API key scope, sticky routing, cooldowns, and market runtime state.",
+    "dashboard.sharePriorityHint":
+      "Public default token-market scheduling view. Specific requests may still change order by model, API key scope, sticky routing, cooldowns, and market runtime state.",
     "dashboard.sharePriorityLoading": "Loading share priority...",
     "dashboard.sharePriorityUnavailable": "No shares for this app",
     "dashboard.sharePriorityLoadFailed": "Failed to load share priority",
@@ -1911,7 +2282,8 @@ export const messages = {
     "dashboard.sharePriorityScore": "Score",
     "dashboard.sharePrioritySignals": "Signals",
     "dashboard.sharePrioritySessions": "Sessions",
-    "dashboard.sharePrioritySignalsTitle": "stability {stability} · quota {quota} · headroom {headroom} · owner {owner}",
+    "dashboard.sharePrioritySignalsTitle":
+      "stability {stability} · quota {quota} · headroom {headroom} · owner {owner}",
     "dashboard.sharePrioritySchedulable": "Schedulable",
     "dashboard.sharePriorityDegraded": "Degraded",
     "dashboard.sharePriorityUnsupported": "Not supported",
@@ -1953,9 +2325,11 @@ export const messages = {
     "dashboard.noMarketRequests": "No market requests yet",
     "dashboard.success": "Success",
     "dashboard.failed": "Failed",
-    "dashboard.publicFreeShare": "Free share. Any signed-in router user can call it with their own Router API Token; it is not settled through a market.",
+    "dashboard.publicFreeShare":
+      "Free share. Any signed-in router user can call it with their own Router API Token; it is not settled through a market.",
     "dashboard.notForSale": "This share is not marked for sale.",
-    "dashboard.authorizedAllMarkets": "Authorized for all registered markets, including future markets.",
+    "dashboard.authorizedAllMarkets":
+      "Authorized for all registered markets, including future markets.",
     "dashboard.unknownMarket": "Unknown market",
     "dashboard.offlineSince": "Offline since",
     "dashboard.free": "Free",
@@ -1966,7 +2340,8 @@ export const messages = {
     "dashboard.shareStatus.expired": "Expired",
     "dashboard.allMarkets": "All markets",
     "dashboard.tokenMarket": "Token Market",
-    "dashboard.tokenMarketTooltip": "Token market bills by token usage and handles request traffic through the market.",
+    "dashboard.tokenMarketTooltip":
+      "Token market bills by token usage and handles request traffic through the market.",
     "dashboard.addMarket": "Add a market...",
     "dashboard.on": "on",
     "dashboard.off": "off",
@@ -1984,14 +2359,16 @@ export const messages = {
     "dashboard.shareMarketRevokePending": "Share Market access revoking",
     "dashboard.applyFailed": "Apply failed",
     "dashboard.applyFailedFallback": "The previous apply failed",
-    "dashboard.shareEditQueued": "Saved. The client is offline, so the change is queued and will take effect once it reconnects.",
+    "dashboard.shareEditQueued":
+      "Saved. The client is offline, so the change is queued and will take effect once it reconnects.",
     "dashboard.shareViewSettings": "View share settings",
     "dashboard.openShareDrawer": "Open share details",
     "dashboard.shareEditSettings": "Edit share settings",
     "dashboard.shareEdit.section.overview": "Overview",
     "dashboard.shareEdit.section.market": "Market & sale",
     "dashboard.shareEdit.section.access": "Sharing & limits",
-    "dashboard.shareEditNoAppType": "No app binding is configured for this share.",
+    "dashboard.shareEditNoAppType":
+      "No app binding is configured for this share.",
     "dashboard.field.description": "Description",
     "dashboard.field.ownerEmail": "Owner email",
     "dashboard.field.subdomain": "Subdomain",
@@ -2004,8 +2381,10 @@ export const messages = {
     "dashboard.field.expiresAt": "Expires at",
     "dashboard.field.modelPricing": "Model pricing (% of official)",
     "dashboard.userLimit.title": "User limits",
-    "dashboard.userLimit.hint": "The total Share limits always apply. Each user is also constrained by their own policy.",
-    "dashboard.userLimit.parallelScopeHint": "A user's parallel limit is shared across Claude, Codex, and Gemini requests within this Share.",
+    "dashboard.userLimit.hint":
+      "The total Share limits always apply. Each user is also constrained by their own policy.",
+    "dashboard.userLimit.parallelScopeHint":
+      "A user's parallel limit is shared across Claude, Codex, and Gemini requests within this Share.",
     "dashboard.userLimit.add": "Add user",
     "dashboard.userLimit.edit": "Edit user limits",
     "dashboard.userLimit.period": "Token period",
@@ -2016,10 +2395,12 @@ export const messages = {
     "dashboard.userLimit.periodMonth": "Calendar month",
     "dashboard.userLimit.periodThirtyDays": "Every 30 days",
     "dashboard.userLimit.anchor": "Period start (UTC)",
-    "dashboard.userLimit.anchorHint": "Resets at fixed intervals from this UTC time. It cannot be in the future.",
+    "dashboard.userLimit.anchorHint":
+      "Resets at fixed intervals from this UTC time. It cannot be in the future.",
     "dashboard.userLimit.invalidEmail": "Enter a valid email address.",
     "dashboard.userLimit.duplicateEmail": "This user already exists.",
-    "dashboard.userLimit.invalidPolicy": "Limits must be positive integers and expiration must be valid.",
+    "dashboard.userLimit.invalidPolicy":
+      "Limits must be positive integers and expiration must be valid.",
     "dashboard.userLimit.empty": "No user limit configuration.",
     "dashboard.userLimit.permanent": "Permanent",
     "dashboard.userLimit.parallel": "Parallel",
@@ -2034,28 +2415,36 @@ export const messages = {
     "dashboard.field.maintenanceMessage": "Maintenance message",
     "dashboard.hint.maxChars": "Maximum 200 characters.",
     "dashboard.hint.forSaleOnly": "Only applies when ForSale = Yes",
-    "dashboard.hint.selectedMarkets": "Click x to remove; empty = no market is authorized",
-    "dashboard.hint.sharedWith": "Separate multiple emails with new lines or commas. These emails can view this share after signing in to the dashboard.",
-    "dashboard.hint.sharedWithReadOnly": "Read-only view; only the owner can edit the shared-with list.",
+    "dashboard.hint.selectedMarkets":
+      "Click x to remove; empty = no market is authorized",
+    "dashboard.hint.sharedWith":
+      "Separate multiple emails with new lines or commas. These emails can view this share after signing in to the dashboard.",
+    "dashboard.hint.sharedWithReadOnly":
+      "Read-only view; only the owner can edit the shared-with list.",
     "dashboard.hint.minValue": "Minimum {value}",
-    "dashboard.hint.modelPricing": "Share default; provider % overrides; blank uses market default; 1-100.",
+    "dashboard.hint.modelPricing":
+      "Share default; provider % overrides; blank uses market default; 1-100.",
     "dashboard.noAuthorizedMarkets": "No market is authorized by default",
-    "dashboard.allMarketsSelected": "All markets is selected. Every online market can access this share.",
+    "dashboard.allMarketsSelected":
+      "All markets is selected. Every online market can access this share.",
     "dashboard.switchToSelected": "Switch to selected",
     "dashboard.setAsOwner": "Set as owner",
     "dashboard.permanent": "Permanent (never expires)",
     "dashboard.noCurrentNode": "No current node",
     "dashboard.confirmFreeTitle": "Switch to Free?",
-    "dashboard.confirmFreeDesc": "Free shares can be called by any signed-in router user with their own Router API Token and no longer generate revenue. Confirm the switch.",
+    "dashboard.confirmFreeDesc":
+      "Free shares can be called by any signed-in router user with their own Router API Token and no longer generate revenue. Confirm the switch.",
     "dashboard.confirmFree": "Confirm switch",
     "dashboard.transferOwnerTitle": "Transfer owner?",
-    "dashboard.transferOwnerDesc": "Promote {target} to owner and demote the current owner {owner} to shareto.",
+    "dashboard.transferOwnerDesc":
+      "Promote {target} to owner and demote the current owner {owner} to shareto.",
     "dashboard.transferOwnerConfirm": "Confirm transfer",
     "dashboard.fieldInvalid": "Check this field",
     "dashboard.maintenance": "Maintenance",
     "dashboard.maintenanceMode": "Maintenance mode",
     "dashboard.saveMaintenanceMode": "Save maintenance mode",
-    "dashboard.maintenancePlaceholder": "Market is under maintenance and is expected to recover later.",
+    "dashboard.maintenancePlaceholder":
+      "Market is under maintenance and is expected to recover later.",
     "dashboard.blockList": "Block list",
     "dashboard.noBlockedStates": "No cooldowns or blocks",
     "dashboard.blockedStatesCount": "{count} active",
@@ -2113,7 +2502,8 @@ export const messages = {
     "map.waiting": "Waiting for the network",
     "map.empty": "No server geo · No active clients",
     "map.active": "{count} active",
-    "map.countrySummary": "{clients} clients · {shares} shares · {inflight} in-flight",
+    "map.countrySummary":
+      "{clients} clients · {shares} shares · {inflight} in-flight",
     "map.countryClients": "{count} clients",
     "map.countryShares": "{count} shares",
     "map.countryInflight": "{count} in-flight",
@@ -2180,6 +2570,7 @@ export const messages = {
     "nav.marketsTab": "Token 市场",
     "nav.shareMarketTab": "Share 市场",
     "nav.clientMarketTab": "Client 市场",
+    "nav.logsTab": "日志",
     "nav.accountTab": "账户",
     "nav.dashboardSections": "控制台分区",
     "nav.logout": "退出登录",
@@ -2196,6 +2587,42 @@ export const messages = {
     "clientLogs.publicAccess": "公开视图",
     "clientLogs.lineCount": "{count} / {limit} 行",
     "clientLogs.updatedAt": "更新于 {time}",
+    "serverLogs.scope.public": "公开",
+    "serverLogs.scope.mine": "我的 Client",
+    "serverLogs.scope.all": "全部 Client",
+    "serverLogs.scopeAria": "日志可见范围",
+    "serverLogs.allClients": "全部 Client",
+    "serverLogs.lastFiveMinutes": "最近 5 分钟",
+    "serverLogs.retentionDays": "保留 {days} 天",
+    "serverLogs.export": "导出日志",
+    "serverLogs.search": "搜索事件和字段",
+    "serverLogs.client": "Client",
+    "serverLogs.publicDisabled":
+      "公开日志已关闭，登录后可查看账户有权访问的日志。",
+    "serverLogs.time": "时间",
+    "serverLogs.event": "事件",
+    "serverLogs.details": "详情",
+    "serverLogs.viewDetails": "查看详情",
+    "serverLogs.empty": "当前范围暂无日志事件。",
+    "serverLogs.loadNewer": "更新日志",
+    "serverLogs.loadOlder": "加载更早日志",
+    "serverLogs.page": "第 {page} 页",
+    "serverLogs.clientDetails": "Client 详情",
+    "serverLogs.subdomain": "Subdomain",
+    "serverLogs.platform": "平台",
+    "serverLogs.appVersion": "应用版本",
+    "serverLogs.owner": "所有者",
+    "serverLogs.country": "国家 / 地区",
+    "serverLogs.tunnel": "隧道",
+    "serverLogs.createdAt": "创建时间",
+    "serverLogs.lastSeenAt": "最后在线",
+    "serverLogs.installationId": "Installation ID",
+    "serverLogs.liveDiagnostics": "实时诊断日志",
+    "serverLogs.liveDiagnosticsHint":
+      "直接从在线 Server 读取最多 100 行脱敏日志，Router 不会保存本次响应。",
+    "serverLogs.fetchLiveDiagnostics": "读取",
+    "serverLogs.liveDiagnosticsMeta": "{lines} 行 · 读取于 {time}",
+    "serverLogs.truncated": "已截断",
     "shareMarket.title": "Share 市场",
     "shareMarket.addShare": "添加 Share",
     "shareMarket.tab.all": "全部拼车位",
@@ -2209,7 +2636,8 @@ export const messages = {
     "shareMarket.offline": "离线",
     "shareMarket.unavailable": "不可用",
     "shareMarket.closed": "已停止挂售",
-    "shareMarket.closedHint": "空闲拼车位已停用，进行中的租约不受影响。全部租约结束后可用「添加 Share」重新挂售；也可在此添加拼车位以重新打开挂售。",
+    "shareMarket.closedHint":
+      "空闲拼车位已停用，进行中的租约不受影响。全部租约结束后可用「添加 Share」重新挂售；也可在此添加拼车位以重新打开挂售。",
     "shareMarket.openShare": "打开 Share",
     "shareMarket.groupChat": "群聊",
     "shareMarket.openGroupChat": "打开对应 Client 聊天室",
@@ -2222,7 +2650,8 @@ export const messages = {
     "shareMarket.searchAria": "搜索 Share 市场",
     "shareMarket.deleteListing": "删除挂售",
     "shareMarket.confirm.deleteListingTitle": "删除这个已停售的 Share？",
-    "shareMarket.confirm.deleteListingDescription": "将永久移除 {share} 的停售记录。只有从未产生租用记录的挂售可以删除。",
+    "shareMarket.confirm.deleteListingDescription":
+      "将永久移除 {share} 的停售记录。只有从未产生租用记录的挂售可以删除。",
     "shareMarket.filterClear": "清除筛选",
     "shareMarket.filterOnline": "筛选在线状态",
     "shareMarket.filterShare": "筛选 Share",
@@ -2245,13 +2674,19 @@ export const messages = {
     "shareMarket.manage": "管理",
     "shareMarket.expandDetails": "Share 详情",
     "shareMarket.collapseDetails": "收起详情",
-    "shareMarket.rentOfflineHint": "该 Share 当前离线，权限将在 Server 重新上线后生效。",
+    "shareMarket.rentOfflineHint":
+      "该 Share 当前离线，权限将在 Server 重新上线后生效。",
     "shareMarket.rentConfirm.title": "确认租用 Share 拼车位",
     "shareMarket.rentConfirm.confirm": "确认租用",
-    "shareMarket.rentConfirm.postpaid": "前 {hours} 小时健康服务时间免费且不产生费用；之后按实际健康服务时间和日费累计到该 Owner 的赊账账户。用满该 Owner 授予的信用额度后生成应付账单，一张账单可能合并多个 Share 和 Client Host 服务。",
-    "shareMarket.rentConfirm.freeFixed": "免费期限为 {days} 天，从访问权限实际生效后开始计算，不产生赊账费用。",
-    "shareMarket.rentConfirm.freePermanent": "这是永久免费服务，不产生赊账费用。",
-    "shareMarket.rentConfirm.offline": "该 Share 当前离线，暂时无法租用。请等待 Owner 恢复服务后重试。",
+    "shareMarket.rentConfirm.postpaid":
+      "前 {hours} 小时健康服务时间免费且不产生费用；之后按实际健康服务时间和日费累计到该 Owner 的赊账账户。用满该 Owner 授予的信用额度后生成应付账单，一张账单可能合并多个 Share 和 Client Host 服务。",
+    "shareMarket.rentConfirm.freeBilling": "该拼车位免费，不会产生赊账费用。",
+    "shareMarket.rentConfirm.serviceFixed":
+      "服务期限为 {days} 天，从确认租用时开始计算，不等待访问权限生效；期限结束后 Router 会自动回收权限。",
+    "shareMarket.rentConfirm.servicePermanent":
+      "该服务没有固定到期时间，直至任一方归还或回收拼车位。",
+    "shareMarket.rentConfirm.offline":
+      "该 Share 当前离线，暂时无法租用。请等待 Owner 恢复服务后重试。",
     "shareMarket.status": "状态",
     "shareMarket.seat": "拼车位 {position}",
     "shareMarket.free": "免费",
@@ -2292,37 +2727,46 @@ export const messages = {
     "shareMarket.subscription.grantFailed": "授权失败",
     "shareMarket.subscription.released": "已回收 · 只读",
     "shareMarket.confirm.releaseTitle": "归还这个拼车位？",
-    "shareMarket.confirm.releaseDescription": "Server 确认变更后，你对 {share} 的访问权限将被移除。",
+    "shareMarket.confirm.releaseDescription":
+      "Server 确认变更后，你对 {share} 的访问权限将被移除。",
     "shareMarket.confirm.revokeTitle": "强制回收这个拼车位？",
-    "shareMarket.confirm.revokeDescription": "将移除 {email} 的访问权限，但不会拉黑该用户。",
+    "shareMarket.confirm.revokeDescription":
+      "将移除 {email} 的访问权限，但不会拉黑该用户。",
     "shareMarket.confirm.denyTitle": "回收并拒绝后续访问？",
-    "shareMarket.confirm.denyDescription": "将移除 {email} 的访问权限；修改其准入规则前，该账号不能再租用你的 Share。",
+    "shareMarket.confirm.denyDescription":
+      "将移除 {email} 的访问权限；修改其准入规则前，该账号不能再租用你的 Share。",
     "shareMarket.confirm.closeTitle": "停止挂售这个 Share？",
-    "shareMarket.confirm.closeDescription": "{share} 的空闲拼车位会被停用，已有租用不受影响，直至用户归还或被回收。",
+    "shareMarket.confirm.closeDescription":
+      "{share} 的空闲拼车位会被停用，已有租用不受影响，直至用户归还或被回收。",
     "shareMarket.confirm.deleteTitle": "删除这个拼车位？",
-    "shareMarket.confirm.deleteDescription": "拼车位 {position} 将从该挂售中永久删除。",
+    "shareMarket.confirm.deleteDescription":
+      "拼车位 {position} 将从该挂售中永久删除。",
     "shareMarket.error.positiveInteger": "{field} 必须是正整数。",
     "shareMarket.error.price": "价格必须大于 0，且最多保留两位小数。",
     "shareMarket.error.currency": "币种仅支持 USD。",
-    "shareMarket.error.freeDuration": "免费使用期限必须为 1 至 365 天，或选择永久。",
+    "shareMarket.error.serviceDuration":
+      "服务期限必须为 1 至 365 天，或选择无固定期限。",
     "shareMarket.priceChange.action": "调整价格",
     "shareMarket.priceChange.title": "提议新的每日价格",
     "shareMarket.priceChange.current": "当前价格：{amount} / 天",
     "shareMarket.priceChange.newDailyPrice": "新的每日价格",
-    "shareMarket.priceChange.consentNotice": "租用方接受前继续使用当前价格。接受后，下一次计费对账会先按旧价格结算到该时间点，再启用新价格；已经产生的费用不会被追溯调价。",
+    "shareMarket.priceChange.consentNotice":
+      "租用方接受前继续使用当前价格。接受后，下一次计费对账会先按旧价格结算到该时间点，再启用新价格；已经产生的费用不会被追溯调价。",
     "shareMarket.priceChange.propose": "发送调价提议",
     "shareMarket.priceChange.samePrice": "请输入与当前每日价格不同的价格。",
     "shareMarket.priceChange.summary": "{previous} → {proposed} / 天",
     "shareMarket.priceChange.status.pending": "等待租用方确认",
     "shareMarket.priceChange.status.accepted": "已接受 · 等待计费边界生效",
     "shareMarket.priceChange.acceptTitle": "接受新的每日价格？",
-    "shareMarket.priceChange.acceptDescription": "每日价格将在下一次计费边界由 {previous} 调整为 {proposed}；此前已产生的费用仍按旧价格计算。",
+    "shareMarket.priceChange.acceptDescription":
+      "每日价格将在下一次计费边界由 {previous} 调整为 {proposed}；此前已产生的费用仍按旧价格计算。",
     "shareMarket.priceChange.accept": "接受新价格",
     "shareMarket.priceChange.reject": "拒绝",
     "shareMarket.priceChange.cancel": "取消提议",
     "shareMarket.dialog.title": "添加 Share 到市场",
     "shareMarket.dialog.selectShare": "选择 Share",
-    "shareMarket.dialog.noShares": "暂无可挂售的活跃 Share。若已停止挂售但仍有进行中的租约，需等租约结束后才能通过「添加 Share」重新挂售。",
+    "shareMarket.dialog.noShares":
+      "暂无可挂售的活跃 Share。若已停止挂售但仍有进行中的租约，需等租约结束后才能通过「添加 Share」重新挂售。",
     "shareMarket.dialog.seats": "拼车位",
     "shareMarket.dialog.addSeat": "再添加一个拼车位",
     "shareMarket.dialog.create": "发布挂售",
@@ -2331,16 +2775,18 @@ export const messages = {
     "shareMarket.dialog.amount": "每日价格",
     "shareMarket.dialog.currency": "币种",
     "shareMarket.dialog.unlimited": "不限",
-    "shareMarket.freeDuration.fixed": "固定期限",
-    "shareMarket.freeDuration.permanent": "永久",
-    "shareMarket.freeDuration.days": "免费使用期限（天）",
-    "shareMarket.freeDuration.pendingActivation": "免费期限将在访问权限生效后开始计算",
-    "shareMarket.freeDuration.activated": "生效时间",
-    "shareMarket.freeDuration.expires": "到期时间",
-    "shareMarket.freeDuration.expired": "已到期 · 正在回收",
-    "shareMarket.freeDuration.remainingHours": "剩余 {count} 小时",
-    "shareMarket.freeDuration.remainingDays": "剩余 {count} 天",
-    "shareMarket.period.lifetime": "累计",
+    "shareMarket.serviceDuration.label": "服务期限",
+    "shareMarket.serviceDuration.fixed": "固定期限",
+    "shareMarket.serviceDuration.permanent": "无固定期限",
+    "shareMarket.serviceDuration.days": "服务期限（天）",
+    "shareMarket.serviceDuration.dayValue": "{count} 天",
+    "shareMarket.serviceDuration.daysValue": "{count} 天",
+    "shareMarket.serviceDuration.started": "期限开始",
+    "shareMarket.serviceDuration.expires": "期限结束",
+    "shareMarket.serviceDuration.expired": "期限已结束",
+    "shareMarket.serviceDuration.remainingHours": "剩余 {count} 小时",
+    "shareMarket.serviceDuration.remainingDays": "剩余 {count} 天",
+    "shareMarket.period.lifetime": "累计（不重置）",
     "shareMarket.period.day": "每天",
     "shareMarket.period.week": "自然周",
     "shareMarket.period.sevenDays": "每 7 天",
@@ -2351,25 +2797,36 @@ export const messages = {
     "marketApproval.creditTitle": "需要 Owner 授信",
     "marketApproval.billingTitle": "请先完成清账",
     "marketApproval.unavailableTitle": "暂时无法使用市场服务",
-    "marketApproval.shareDescription": "只有被 {owner} 加入白名单的用户才能租用此 Share 拼车位。请先联系 Owner，将你的登录邮箱 {buyer} 加入白名单。",
-    "marketApproval.clientHostDescription": "只有被 {owner} 加入白名单的用户才能在此 Host 上新建 Client。请先联系 Owner，将你的登录邮箱 {buyer} 加入白名单。",
-    "marketApproval.creditDescription": "你已经获得该服务的准入权限，但 {owner} 尚未向你的账户授予 {currency} 后付费信用额度，请联系 Owner 处理。",
-    "marketApproval.restrictedDescription": "你的账户存在尚未解决的 Router 逾期账单，完成处理前不能开始新的后付费市场服务。",
-    "marketApproval.settlementDescription": "你与 {owner} 的赊账账户需要先完成清账，之后才能开始新的市场服务。",
-    "marketApproval.limitDescription": "你已达到 {owner} 授予的 {currency} 信用额度，请先清账再开始新的服务。",
-    "marketApproval.closedDescription": "{owner} 已永久关闭与你的后付费关系；已有余额仍需结清，后续付费租用无法恢复。",
+    "marketApproval.shareDescription":
+      "只有被 {owner} 加入白名单的用户才能租用此 Share 拼车位。请先联系 Owner，将你的登录邮箱 {buyer} 加入白名单。",
+    "marketApproval.clientHostDescription":
+      "只有被 {owner} 加入白名单的用户才能在此 Host 上新建 Client。请先联系 Owner，将你的登录邮箱 {buyer} 加入白名单。",
+    "marketApproval.creditDescription":
+      "你已经获得该服务的准入权限，但 {owner} 尚未向你的账户授予 {currency} 后付费信用额度，请联系 Owner 处理。",
+    "marketApproval.restrictedDescription":
+      "你的账户存在尚未解决的 Router 逾期账单，完成处理前不能开始新的后付费市场服务。",
+    "marketApproval.settlementDescription":
+      "你与 {owner} 的赊账账户需要先完成清账，之后才能开始新的市场服务。",
+    "marketApproval.limitDescription":
+      "你已达到 {owner} 授予的 {currency} 信用额度，请先清账再开始新的服务。",
+    "marketApproval.closedDescription":
+      "{owner} 已永久关闭与你的后付费关系；已有余额仍需结清，后续付费租用无法恢复。",
     "marketApproval.unavailableDescription": "你的账户当前无法使用该市场服务。",
-    "marketApproval.shareContactHint": "请前往此 Share 对应的 Client 聊天室联系 Owner。",
-    "marketApproval.clientHostContactHint": "请通过邮件联系 Owner；Owner 配置的其他联系方式也会在此展示。",
+    "marketApproval.shareContactHint":
+      "请前往此 Share 对应的 Client 聊天室联系 Owner。",
+    "marketApproval.clientHostContactHint":
+      "请通过邮件联系 Owner；Owner 配置的其他联系方式也会在此展示。",
     "marketApproval.openChat": "打开聊天室",
     "marketApproval.emailOwner": "发送邮件",
     "marketApproval.apply": "申请加入白名单",
     "marketApproval.requested": "已申请准入",
-    "marketApproval.requestedHint": "准入申请已提交，Owner 可在“市场准入”中处理。",
+    "marketApproval.requestedHint":
+      "准入申请已提交，Owner 可在“市场准入”中处理。",
     "marketApproval.cancelRequest": "取消申请",
     "marketApproval.clientHostEmailSubject": "申请加入 Client Host 白名单",
     "account.title": "账户",
-    "account.pageHint": "管理你作为供给方的收款信息，以及作为租用方的 Client 租约。",
+    "account.pageHint":
+      "管理你作为供给方的收款信息，以及作为租用方的 Client 租约。",
     "account.loading": "正在加载账户设置...",
     "account.signInRequired": "登录后可配置 Host Provider 收款信息。",
     "account.nav.sections": "账户分区",
@@ -2384,9 +2841,11 @@ export const messages = {
     "account.nav.marketAccess": "市场准入",
     "account.nav.payments": "收款信息",
     "account.nav.share": "Share 市场",
-    "account.nav.shareHint": "Share Market 租用只读监控（与顶栏 Share Market 操作页不同）",
+    "account.nav.shareHint":
+      "Share Market 租用只读监控（与顶栏 Share Market 操作页不同）",
     "account.nav.client": "Client 市场",
-    "account.nav.clientHint": "Market 租用只读监控（与顶栏 Clients 安装管理不同）",
+    "account.nav.clientHint":
+      "Market 租用只读监控（与顶栏 Clients 安装管理不同）",
     "account.nav.rentals": "Client 租用",
     "account.usage.period.24h": "24 小时",
     "account.usage.period.7d": "7 天",
@@ -2405,25 +2864,28 @@ export const messages = {
     "account.usage.loading": "正在加载用量…",
     "account.usage.signInRequired": "登录后可查看用量。",
     "account.providerUsage.title": "我提供的用量",
-    "account.providerUsage.hint": "你拥有的 Client / Share 被消耗的 Token 汇总。",
+    "account.providerUsage.hint":
+      "你拥有的 Client / Share 被消耗的 Token 汇总。",
     "account.providerUsage.installations": "安装实例",
     "account.providerUsage.shares": "Shares",
     "account.providerUsage.caller": "调用方",
     "account.providerUsage.noInstallations": "该周期暂无供给侧用量。",
     "account.consumerUsage.title": "我使用的用量",
-    "account.consumerUsage.hint": "你的 API Token 与账号邮箱发起的 Token 消耗。",
+    "account.consumerUsage.hint":
+      "你的 API Token 与账号邮箱发起的 Token 消耗。",
     "account.consumerUsage.trend": "每日趋势",
-    "account.consumerUsage.profile": "公开资料",
-    "account.consumerUsage.profileHint": "开启后可把用量卡片嵌入 GitHub 或个人站点。",
-    "account.consumerUsage.username": "用户名",
-    "account.consumerUsage.usernamePlaceholder": "your-handle",
-    "account.consumerUsage.publicToggle": "公开我的使用量统计",
-    "account.consumerUsage.embed": "GitHub 嵌入卡片",
-    "account.consumerUsage.embedHint": "自定义卡片参数并实时预览，再复制 Markdown / HTML 到 README。",
-    "account.consumerUsage.embedPrivate": "开启公开统计并设置用户名后，即可获得嵌入片段。",
+    "account.consumerUsage.card": "用量卡片",
+    "account.consumerUsage.cardHint":
+      "卡片直接显示当前账号邮箱；关闭公开统计后，公开链接将停止展示用量。",
+    "account.consumerUsage.cardIdentity": "卡片身份",
+    "account.consumerUsage.publicToggle": "公开用量统计",
+    "account.consumerUsage.embed": "嵌入卡片",
+    "account.consumerUsage.embedHint":
+      "自定义卡片参数并实时预览，再复制 Markdown、HTML 或卡片 URL。",
+    "account.consumerUsage.embedPrivate":
+      "开启公开用量统计后，即可获得嵌入片段。",
     "account.consumerUsage.preview": "实时预览",
-    "account.consumerUsage.saveProfile": "保存资料",
-    "account.consumerUsage.profileSaved": "资料已保存",
+    "account.consumerUsage.previewUnavailable": "无法显示用量卡片预览。",
     "account.consumerUsage.copyEmbed": "复制",
     "account.consumerUsage.copied": "已复制",
     "account.consumerUsage.embedPeriod": "周期",
@@ -2441,7 +2903,8 @@ export const messages = {
     "account.consumerUsage.format.compact": "紧凑",
     "account.consumerUsage.format.full": "完整",
     "account.apiKeys.title": "API Token",
-    "account.apiKeys.hint": "用来调用 Router API；调用 Share 时也可放在请求头：Authorization: Bearer …",
+    "account.apiKeys.hint":
+      "用来调用 Router API；调用 Share 时也可放在请求头：Authorization: Bearer …",
     "account.apiKeys.created": "创建时间",
     "account.apiKeys.lastUsed": "最近使用",
     "account.apiKeys.copy": "复制",
@@ -2451,13 +2914,17 @@ export const messages = {
     "account.apiKeys.hideToken": "隐藏 API token",
     "account.apiKeys.resetToGenerate": "重置以生成新的 API token",
     "account.apiKeys.resetConfirmTitle": "重置 API Token？",
-    "account.apiKeys.resetConfirmDescription": "当前 Token 会立即失效。所有使用它的脚本和外部系统都必须更新为新 Token。",
+    "account.apiKeys.resetConfirmDescription":
+      "当前 Token 会立即失效。所有使用它的脚本和外部系统都必须更新为新 Token。",
     "account.apiKeys.resetConfirmAction": "确认重置",
     "account.apiKeys.exampleTitle": "Share API 调用示例",
-    "account.apiKeys.exampleHint": "把 <share-subdomain> 换成你的 Share 子域名。上方点开眼睛可把 token 填进示例；复制时会优先使用真实 token。",
+    "account.apiKeys.exampleHint":
+      "把 <share-subdomain> 换成你的 Share 子域名。上方点开眼睛可把 token 填进示例；复制时会优先使用真实 token。",
     "account.apiKeys.signInRequired": "登录后可管理你的 API Token。",
-    "account.clientHint": "以租户或 Host 供给方视角监控 Market 租用；聚合后付费余额与账单统一在市场账务中管理。",
-    "account.shareHint": "以用户或供应商视角监控 Share Market 拼车位租用。租用和回收在 Share Market 操作；聚合后付费余额与账单统一在市场账务中管理。",
+    "account.clientHint":
+      "以租户或 Host 供给方视角监控 Market 租用；聚合后付费余额与账单统一在市场账务中管理。",
+    "account.shareHint":
+      "以用户或供应商视角监控 Share Market 拼车位租用。租用和回收在 Share Market 操作；聚合后付费余额与账单统一在市场账务中管理。",
     "account.client.tab.user": "用户",
     "account.client.tab.provider": "供应商",
     "account.client.userEmpty": "你当前没有作为租户的租用。",
@@ -2495,12 +2962,16 @@ export const messages = {
     "account.share.seatsAvailable": "空闲拼车位",
     "account.share.seatsOccupied": "已租拼车位",
     "account.share.seatsAttention": "需关注",
-    "account.share.closedListingHint": "已停止挂售。进行中的租约可继续，直至归还或回收。",
+    "account.share.closedListingHint":
+      "已停止挂售。进行中的租约可继续，直至归还或回收。",
     "account.share.status.unknown": "未知",
-    "account.rentalsHint": "监控或释放从 Host 供给方租用的 Client；聚合余额统一在市场账务中管理。",
+    "account.rentalsHint":
+      "监控或释放从 Host 供给方租用的 Client；聚合余额统一在市场账务中管理。",
     "account.paymentDetails": "收款信息",
-    "account.visibilityHint": "Market 商品只展示收款方式种类和联系账号；完整收款资料会冻结到聚合账单，且仅向该账单买方展示。",
-    "market.currencyNotice": "美元人民币汇率采用 1:{rate}，推荐使用美元渠道付款",
+    "account.visibilityHint":
+      "Market 商品只展示收款方式种类和联系账号；完整收款资料会冻结到聚合账单，且仅向该账单买方展示。",
+    "market.currencyNotice":
+      "美元人民币汇率采用 1:{rate}，推荐使用美元渠道付款",
     "account.contact.title": "联系信息",
     "account.contact.hint": "会在 Market 与聚合账单中展示，方便租户联系你。",
     "account.contact.add": "添加",
@@ -2533,18 +3004,22 @@ export const messages = {
     "account.plainText": "纯文本",
     "account.unblock": "解除屏蔽",
     "clientMarket.title": "Client 市场",
-    "clientMarket.subtitle": "注册 SSH 主机并查看已分配的 router market client。",
+    "clientMarket.subtitle":
+      "注册 SSH 主机并查看已分配的 router market client。",
     "clientMarket.sshKeyTitle": "Router 开通 SSH 公钥",
-    "clientMarket.sshKeyHint": "专用 Ed25519 密钥会自动生成，可在 Settings → Persistence 修改路径。",
+    "clientMarket.sshKeyHint":
+      "专用 Ed25519 密钥会自动生成，可在 Settings → Persistence 修改路径。",
     "clientMarket.publicKey": "公钥",
     "clientMarket.authorizedKeysLine": "authorized_keys 行",
     "clientMarket.addSshKeyTitle": "添加 Router SSH 公钥到主机",
-    "clientMarket.addSshKeyHint": "请先在目标主机上（以 SSH 登录用户）执行以下命令，再继续注册。",
+    "clientMarket.addSshKeyHint":
+      "请先在目标主机上（以 SSH 登录用户）执行以下命令，再继续注册。",
     "clientMarket.authorizedKeysCommand": "命令",
     "clientMarket.tabPassword": "密码安装密钥",
     "clientMarket.tabManual": "手动添加密钥",
     "clientMarket.rootPassword": "Root 密码",
-    "clientMarket.rootPasswordHint": "仅用于一次性写入 Router SSH 公钥，不会保存密码。",
+    "clientMarket.rootPasswordHint":
+      "仅用于一次性写入 Router SSH 公钥，不会保存密码。",
     "clientMarket.rootPasswordRequired": "请填写 root 密码。",
     "clientMarket.next": "下一步",
     "clientMarket.back": "上一步",
@@ -2579,7 +3054,8 @@ export const messages = {
     "clientMarket.ipClass.business": "商业网络",
     "clientMarket.registerSuccess": "主机添加成功",
     "settings.provisionSshKeyTitle": "Client Market 装配密钥",
-    "settings.provisionSshKeyDesc": "专用出站 SSH 密钥的公开信息。登记 Host 前，将 authorized_keys 行添加到该 Host 的 root 账户。",
+    "settings.provisionSshKeyDesc":
+      "专用出站 SSH 密钥的公开信息。登记 Host 前，将 authorized_keys 行添加到该 Host 的 root 账户。",
     "clientMarket.copy": "复制",
     "clientMarket.copied": "已复制",
     "clientMarket.addHost": "添加主机",
@@ -2595,18 +3071,23 @@ export const messages = {
     "clientMarket.paid": "付费",
     "clientMarket.offerHint": "付费 Host 使用固定每日费率和统一后付费账务。",
     "clientMarket.offerInvalid": "请输入最多两位小数的有效每日费用。",
-    "clientMarket.offerRange": "收费 Host 的每日费用范围为 0.01 至 1,000,000.00。",
+    "clientMarket.offerRange":
+      "收费 Host 的每日费用范围为 0.01 至 1,000,000.00。",
     "clientMarket.offerUpdated": "Host 报价已更新",
     "clientMarket.editOffer": "修改 Host 报价",
     "clientMarket.editOfferAction": "修改报价",
-    "clientMarket.editOfferHint": "Client 开始租用时会冻结每日费率；已有租用继续按合同费率计费。",
+    "clientMarket.editOfferHint":
+      "Client 开始租用时会冻结每日费率；已有租用继续按合同费率计费。",
     "clientMarket.makeFreeHint": "切换为免费后，可选择固定期限或永久使用。",
     "clientMarket.freeDuration.fixed": "固定期限",
     "clientMarket.freeDuration.permanent": "永久",
     "clientMarket.freeDuration.days": "免费使用期限（天）",
-    "clientMarket.freeDuration.hint": "期限仅在 Client 成功开通后开始计算；只应对长期信任的买家提供永久免费。",
-    "clientMarket.freeDurationInvalid": "免费使用期限必须是 1 至 365 的整数天。",
-    "clientMarket.freeDuration.pendingActivation": "免费期限将在开通成功后开始计算",
+    "clientMarket.freeDuration.hint":
+      "期限仅在 Client 成功开通后开始计算；只应对长期信任的买家提供永久免费。",
+    "clientMarket.freeDurationInvalid":
+      "免费使用期限必须是 1 至 365 的整数天。",
+    "clientMarket.freeDuration.pendingActivation":
+      "免费期限将在开通成功后开始计算",
     "clientMarket.freeDuration.activated": "生效时间",
     "clientMarket.freeDuration.expires": "到期时间",
     "clientMarket.freeDuration.expired": "已到期 · 正在回收",
@@ -2617,22 +3098,29 @@ export const messages = {
     "clientMarket.hostAdded": "主机已注册",
     "clientMarket.deleteHost": "移除",
     "clientMarket.deleteHostConfirmTitle": "移除这台主机？",
-    "clientMarket.deleteHostConfirmDesc": "将 {host} 从 Client Market 供给池移除，之后仍可重新登记。",
+    "clientMarket.deleteHostConfirmDesc":
+      "将 {host} 从 Client Market 供给池移除，之后仍可重新登记。",
     "clientMarket.retireUnreachable": "永久移除失联 Host",
     "clientMarket.retireUnreachableConfirmTitle": "永久移除这台失联 Host？",
-    "clientMarket.retireUnreachableConfirmDesc": "Router 已无法连接 {host}。此操作会移除已禁用的 Client 路由、Router installation 和 Host 挂售记录，但不会声称远端文件已被清除；Host 不会自动回到空闲池，恢复后必须重新登记并验证。",
-    "clientMarket.retireUnreachableSucceeded": "失联 Host 已从 Client Market 永久移除",
+    "clientMarket.retireUnreachableConfirmDesc":
+      "Router 已无法连接 {host}。此操作会移除已禁用的 Client 路由、Router installation 和 Host 挂售记录，但不会声称远端文件已被清除；Host 不会自动回到空闲池，恢复后必须重新登记并验证。",
+    "clientMarket.retireUnreachableSucceeded":
+      "失联 Host 已从 Client Market 永久移除",
     "clientMarket.cleanup": "清理 client",
     "clientMarket.cleanupConfirmTitle": "清理这个 Client？",
-    "clientMarket.cleanupConfirmDesc": "停止并移除 {host} 上的 Client，清除 Router 中的 installation 数据，再将 Host 放回空闲池。此操作无法撤销。",
-    "clientMarket.denyOnCleanupCheckbox": "同时拒绝该用户（{email}）后续租用你的 Host",
+    "clientMarket.cleanupConfirmDesc":
+      "停止并移除 {host} 上的 Client，清除 Router 中的 installation 数据，再将 Host 放回空闲池。此操作无法撤销。",
+    "clientMarket.denyOnCleanupCheckbox":
+      "同时拒绝该用户（{email}）后续租用你的 Host",
     "clientMarket.retryCleanup": "重试清理",
     "clientMarket.retryCleanupConfirmTitle": "重试清理？",
-    "clientMarket.retryCleanupConfirmDesc": "再次尝试停止并移除 {host} 上的 Client，清除 Router 数据后将 Host 放回空闲池。",
+    "clientMarket.retryCleanupConfirmDesc":
+      "再次尝试停止并移除 {host} 上的 Client，清除 Router 数据后将 Host 放回空闲池。",
     "clientMarket.cleanupStarted": "清理任务已开始",
     "clientMarket.cleanupSucceeded": "清理完成，主机已回到空闲池。",
     "clientMarket.cleanupFailed": "清理失败",
-    "clientMarket.cleanupTimedOut": "清理仍在进行或已超时。请刷新主机列表，必要时重试。",
+    "clientMarket.cleanupTimedOut":
+      "清理仍在进行或已超时。请刷新主机列表，必要时重试。",
     "clientMarket.cleanupProgressTitle": "正在清理 {host}",
     "clientMarket.cleanupPhase.starting": "开始中…",
     "clientMarket.cleanupPhase.remote": "清理远程主机",
@@ -2640,26 +3128,40 @@ export const messages = {
     "clientMarket.cleanupPhase.wipe": "删除安装文件",
     "clientMarket.cleanupPhase.purge": "清理 Router 数据",
     "clientMarket.cleanupPhase.complete": "完成",
-    "clientMarket.cleanupFailedGuidance": "可重试清理；若主机已干净，也可使用重新验证。",
-    "clientMarket.cleanupFailedGuidance.purge": "远程清理多半已成功。请重试清理，或用重新验证完成 Router 侧收尾。",
-    "clientMarket.cleanupFailedGuidance.remote": "远程停止/删除失败——主机上可能仍有 cc-switch-server 在运行。可重试清理，或手动清理后重新验证。",
-    "clientMarket.cleanupFailedGuidance.unreachable": "Router 无法连接 Host。可在网络恢复后重试；若 Host 永久失联，Provider 可将其永久移除，租户也可单独结束失败租用。",
-    "clientMarket.cleanupFailedGuidance.safety": "被指纹或不一致绑定拦截。请先检查主机再重试。",
-    "clientMarket.offerRequiresPayment": "设置付费报价前，请先到账户页配置收款信息。",
-    "clientMarket.offerRequiresBilling": "发布付费 Host 前，必须配置收款信息以及 USD 付款宽限。",
+    "clientMarket.cleanupFailedGuidance":
+      "可重试清理；若主机已干净，也可使用重新验证。",
+    "clientMarket.cleanupFailedGuidance.purge":
+      "远程清理多半已成功。请重试清理，或用重新验证完成 Router 侧收尾。",
+    "clientMarket.cleanupFailedGuidance.remote":
+      "远程停止/删除失败——主机上可能仍有 cc-switch-server 在运行。可重试清理，或手动清理后重新验证。",
+    "clientMarket.cleanupFailedGuidance.unreachable":
+      "Router 无法连接 Host。可在网络恢复后重试；若 Host 永久失联，Provider 可将其永久移除，租户也可单独结束失败租用。",
+    "clientMarket.cleanupFailedGuidance.safety":
+      "被指纹或不一致绑定拦截。请先检查主机再重试。",
+    "clientMarket.offerRequiresPayment":
+      "设置付费报价前，请先到账户页配置收款信息。",
+    "clientMarket.offerRequiresBilling":
+      "发布付费 Host 前，必须配置收款信息以及 USD 付款宽限。",
     "clientMarket.goToBilling": "配置市场账务",
     "clientMarket.goToAccountPayment": "前往账户 → 收款信息",
-    "clientMarket.hostErrorGuidance.provisioningFailed": "Client 开通失败且主机未恢复。请重试清理，或手动清理后重新验证。",
-    "clientMarket.hostErrorGuidance.rollbackFailed": "开通回滚未完成。请重试清理，或确认主机干净后重新验证。",
-    "clientMarket.hostErrorGuidance.abnormalProcess": "主机可达但已在运行 cc-switch-server。请先停止进程，再清理或重新验证。",
-    "clientMarket.hostErrorGuidance.generic": "需要处理。可重试清理、手动清理后重新验证；若 Host 无法恢复，也可永久移除。",
+    "clientMarket.hostErrorGuidance.provisioningFailed":
+      "Client 开通失败且主机未恢复。请重试清理，或手动清理后重新验证。",
+    "clientMarket.hostErrorGuidance.rollbackFailed":
+      "开通回滚未完成。请重试清理，或确认主机干净后重新验证。",
+    "clientMarket.hostErrorGuidance.abnormalProcess":
+      "主机可达但已在运行 cc-switch-server。请先停止进程，再清理或重新验证。",
+    "clientMarket.hostErrorGuidance.generic":
+      "需要处理。可重试清理、手动清理后重新验证；若 Host 无法恢复，也可永久移除。",
     "clientMarket.rentedBy": "租户：{email}",
-    "clientMarket.release.releasing": "正在释放 Client，并将 Host 归还给 Provider...",
-    "clientMarket.release.failedHint": "释放失败；可重试清理，或先结束失败租用，由 Provider 继续处理隔离中的 Host。",
+    "clientMarket.release.releasing":
+      "正在释放 Client，并将 Host 归还给 Provider...",
+    "clientMarket.release.failedHint":
+      "释放失败；可重试清理，或先结束失败租用，由 Provider 继续处理隔离中的 Host。",
     "clientMarket.release.manageInMarket": "在 Market 管理",
     "clientMarket.release.retry": "重试释放",
     "clientMarket.release.confirmTitle": "立即释放此 Client？",
-    "clientMarket.release.confirmDescription": "Client 隧道会立即禁用，Router 将清除远程安装并把 Host 归还给 Provider。Client 上的数据可能永久丢失。",
+    "clientMarket.release.confirmDescription":
+      "Client 隧道会立即禁用，Router 将清除远程安装并把 Host 归还给 Provider。Client 上的数据可能永久丢失。",
     "clientMarket.release.progressTitle": "正在释放 Client",
     "clientMarket.release.starting": "正在发起释放...",
     "clientMarket.release.succeeded": "释放完成，主机已交还供给方。",
@@ -2667,8 +3169,10 @@ export const messages = {
     "clientMarket.release.action": "释放 Client",
     "clientMarket.release.finalizeAction": "结束失败租用",
     "clientMarket.release.finalizeConfirmTitle": "结束这笔失败租用？",
-    "clientMarket.release.finalizeConfirmDescription": "此操作只结束你的租用并解除创建锁。Client 隧道会保持禁用，失联 Host 仍被隔离并由 Provider 处理；Router 不会声称远端安装已被清除。",
-    "clientMarket.release.finalizeSucceeded": "租用已结束，失联 Host 仍保持隔离并由 Provider 处理。",
+    "clientMarket.release.finalizeConfirmDescription":
+      "此操作只结束你的租用并解除创建锁。Client 隧道会保持禁用，失联 Host 仍被隔离并由 Provider 处理；Router 不会声称远端安装已被清除。",
+    "clientMarket.release.finalizeSucceeded":
+      "租用已结束，失联 Host 仍保持隔离并由 Provider 处理。",
     "clientMarket.reverifyHost": "重新验证",
     "clientMarket.hostReverified": "主机验证成功并已回到空闲池",
     "clientMarket.sshHostKey.action": "SSH 指纹",
@@ -2679,17 +3183,26 @@ export const messages = {
     "clientMarket.sshHostKey.observed": "当前观测指纹",
     "clientMarket.sshHostKey.algorithm": "Host Key 类型",
     "clientMarket.sshHostKey.notPinned": "尚未固定",
-    "clientMarket.sshHostKey.matches": "当前观测指纹与已信任的主机身份一致，严格校验保持启用。",
-    "clientMarket.sshHostKey.changedWarning": "SSH 主机身份已经变化。仅当你确认该主机已重装系统或主动轮换过 SSH Host Key 时才可继续。",
-    "clientMarket.sshHostKey.firstPinWarning": "该主机尚无可信指纹，必须先确认其身份才能使用 Web Terminal。",
-    "clientMarket.sshHostKey.consoleInstruction": "请打开云服务商提供的主机控制台，在主机内执行下方命令并输入其返回的指纹。不要通过当前 SSH 连接进行核对。",
+    "clientMarket.sshHostKey.matches":
+      "当前观测指纹与已信任的主机身份一致，严格校验保持启用。",
+    "clientMarket.sshHostKey.changedWarning":
+      "SSH 主机身份已经变化。仅当你确认该主机已重装系统或主动轮换过 SSH Host Key 时才可继续。",
+    "clientMarket.sshHostKey.firstPinWarning":
+      "该主机尚无可信指纹，必须先确认其身份才能使用 Web Terminal。",
+    "clientMarket.sshHostKey.consoleInstruction":
+      "请打开云服务商提供的主机控制台，在主机内执行下方命令并输入其返回的指纹。不要通过当前 SSH 连接进行核对。",
     "clientMarket.sshHostKey.confirmedFingerprint": "主机控制台中的指纹",
-    "clientMarket.sshHostKey.fingerprintMismatch": "输入的指纹与 Router 当前观测到的 Host Key 不一致。",
-    "clientMarket.sshHostKey.verifiedFromConsole": "我已通过云服务商的主机控制台核对这个完整指纹。",
+    "clientMarket.sshHostKey.fingerprintMismatch":
+      "输入的指纹与 Router 当前观测到的 Host Key 不一致。",
+    "clientMarket.sshHostKey.verifiedFromConsole":
+      "我已通过云服务商的主机控制台核对这个完整指纹。",
     "clientMarket.sshHostKey.confirm": "信任此指纹",
-    "clientMarket.sshHostKey.updated": "SSH 指纹已更新，严格主机身份校验保持启用。",
-    "clientMarket.sshHostKey.changedDuringConfirmation": "确认期间 Host Key 再次发生变化，请重新核对最新观测指纹。",
-    "clientMarket.sshHostKey.reviewRequired": "重新连接前必须确认 SSH 主机身份。",
+    "clientMarket.sshHostKey.updated":
+      "SSH 指纹已更新，严格主机身份校验保持启用。",
+    "clientMarket.sshHostKey.changedDuringConfirmation":
+      "确认期间 Host Key 再次发生变化，请重新核对最新观测指纹。",
+    "clientMarket.sshHostKey.reviewRequired":
+      "重新连接前必须确认 SSH 主机身份。",
     "clientMarket.sshHostKey.review": "核对指纹",
     "clientMarket.invalidPort": "端口必须是 1 到 65535 之间的整数。",
     "clientMarket.noteTooLong": "备注不能超过 500 个字符。",
@@ -2718,20 +3231,28 @@ export const messages = {
     "clientMarket.recovery.pauseSucceeded": "Router 自动恢复已暂停",
     "clientMarket.recovery.resumeSucceeded": "Router 自动恢复已恢复",
     "clientMarket.recovery.retrySucceeded": "已安排立即重试",
-    "clientMarket.recovery.blocked.missingBinary": "cc-switch-server 二进制文件缺失",
-    "clientMarket.recovery.blocked.missingConfig": "cc-switch-server 配置文件缺失",
+    "clientMarket.recovery.blocked.missingBinary":
+      "cc-switch-server 二进制文件缺失",
+    "clientMarket.recovery.blocked.missingConfig":
+      "cc-switch-server 配置文件缺失",
     "clientMarket.recovery.blocked.hostKey": "需要核对 SSH 主机身份",
-    "clientMarket.recovery.blocked.authentication": "Router 的 SSH 身份验证被拒绝",
+    "clientMarket.recovery.blocked.authentication":
+      "Router 的 SSH 身份验证被拒绝",
     "clientMarket.recovery.blocked.other": "需要 Provider 人工处理",
     "clientMarket.statusHint.all": "显示全部状态的主机。",
     "clientMarket.statusHint.idle": "可被在线开通 Client 选用。",
     "clientMarket.statusHint.reserved": "用户正在确认分配报价，暂时预留。",
-    "clientMarket.statusHint.allocated": "已挂载 Client，正在为某位所有者服务。",
+    "clientMarket.statusHint.allocated":
+      "已挂载 Client，正在为某位所有者服务。",
     "clientMarket.statusHint.locked": "已被开通任务认领，正在安装或等待隧道。",
-    "clientMarket.statusHint.draining": "正在清理 Client，暂不可再分配。若卡住可重试清理。",
-    "clientMarket.statusHint.disabled": "已移出分配池（当前界面很少主动设置）。",
-    "clientMarket.statusHint.unreachable": "SSH/网络或清理失败；可重试、重新验证，或永久移除失联 Host。",
-    "clientMarket.statusHint.abnormal": "能连上但不正常（例如已在运行 cc-switch-server）。",
+    "clientMarket.statusHint.draining":
+      "正在清理 Client，暂不可再分配。若卡住可重试清理。",
+    "clientMarket.statusHint.disabled":
+      "已移出分配池（当前界面很少主动设置）。",
+    "clientMarket.statusHint.unreachable":
+      "SSH/网络或清理失败；可重试、重新验证，或永久移除失联 Host。",
+    "clientMarket.statusHint.abnormal":
+      "能连上但不正常（例如已在运行 cc-switch-server）。",
     "clientMarket.statusGroup.all": "全部",
     "clientMarket.statusGroup.idle": "空闲",
     "clientMarket.statusGroup.in_use": "使用中",
@@ -2740,7 +3261,8 @@ export const messages = {
     "clientMarket.statusGroupHint.all": "匹配其他筛选条件的全部主机。",
     "clientMarket.statusGroupHint.idle": "可开通。",
     "clientMarket.statusGroupHint.in_use": "已分配或开通中（locked）。",
-    "clientMarket.statusGroupHint.needs_attention": "排空中、不可达、异常或已禁用，需要处理。",
+    "clientMarket.statusGroupHint.needs_attention":
+      "排空中、不可达、异常或已禁用，需要处理。",
     "clientMarket.statusGroupHint.mine": "你托管或正在租用的主机。",
     "clientMarket.filter": "筛选",
     "clientMarket.filterActive": "筛选 · {count}",
@@ -2757,7 +3279,8 @@ export const messages = {
     "clientMarket.sortAsc": "升序",
     "clientMarket.sortDesc": "降序",
     "clientMarket.sortNone": "已取消排序",
-    "clientMarket.hostAlreadyRunning": "该主机已在运行 cc-switch-server，请先停止进程后再添加。",
+    "clientMarket.hostAlreadyRunning":
+      "该主机已在运行 cc-switch-server，请先停止进程后再添加。",
     "clientMarket.noHosts": "暂无已注册主机。",
     "clientMarket.paginationSummary": "第 {start}–{end} 条，共 {total} 条",
     "clientMarket.paginationPage": "{page} / {pages}",
@@ -2782,13 +3305,16 @@ export const messages = {
     "clientMarket.loginToAddHost": "登录后可注册主机。",
     "clientMarket.exportedHosts": "已导出 {count} 台 Host",
     "clientMarket.importSizeLimit": "Host 导入文本不能超过 1 MB。",
-    "clientMarket.importVersionRequired": "每行格式为 ip:port，可选 |备注|每日价格（最小货币单位）|币种|免费期限天数|指纹。",
+    "clientMarket.importVersionRequired":
+      "每行格式为 ip:port，可选 |备注|每日价格（最小货币单位）|币种|免费期限天数|指纹。",
     "clientMarket.importMyHosts": "导入我的 Host",
     "clientMarket.exportMyHosts": "导出我的 Host",
     "clientMarket.importDialogTitle": "导入 Host",
     "clientMarket.exportDialogTitle": "导出 Host",
-    "clientMarket.transferFormatHint": "每行一台：ip:port|备注|每日价格（最小货币单位）|币种|免费期限天数|指纹。免费期限为 1-365 天，留空表示永久；付费 Host 必须留空。仅 ip:port 必填；以 # 开头的行为注释。",
-    "clientMarket.importPlaceholder": "203.0.113.9:22\n203.0.113.10:22|体验主机|||7",
+    "clientMarket.transferFormatHint":
+      "每行一台：ip:port|备注|每日价格（最小货币单位）|币种|免费期限天数|指纹。免费期限为 1-365 天，留空表示永久；付费 Host 必须留空。仅 ip:port 必填；以 # 开头的行为注释。",
+    "clientMarket.importPlaceholder":
+      "203.0.113.9:22\n203.0.113.10:22|体验主机|||7",
     "clientMarket.importSubmit": "导入",
     "clientMarket.exportCopy": "复制",
     "clientMarket.exportCopied": "已复制到剪贴板",
@@ -2803,7 +3329,8 @@ export const messages = {
     "clientMarket.batchEnterSelection": "选择",
     "clientMarket.batchDoneSelection": "完成",
     "clientMarket.batchEligible": "将执行 {run} / 已选 {selected}",
-    "clientMarket.batchActionAria": "{action}:已选 {selected} 台中 {run} 台可执行",
+    "clientMarket.batchActionAria":
+      "{action}:已选 {selected} 台中 {run} 台可执行",
     "clientMarket.hostsTableCaption": "已登记主机",
     "clientMarket.scopeShowAll": "查看全部供给",
     "clientMarket.scopeShowMine": "只看我的主机",
@@ -2816,11 +3343,14 @@ export const messages = {
     "clientMarket.tabMyHosts": "我的主机",
     "clientMarket.tabMyRentals": "Client 租用",
     "clientMarket.batchConfirmCleanupTitle": "批量清理选中的 Client？",
-    "clientMarket.batchConfirmCleanupDesc": "将对 {run} 台主机执行清理；另有 {skip} 台将被跳过（无 Client 或不符合条件）。",
+    "clientMarket.batchConfirmCleanupDesc":
+      "将对 {run} 台主机执行清理；另有 {skip} 台将被跳过（无 Client 或不符合条件）。",
     "clientMarket.batchConfirmReverifyTitle": "批量重新验证选中主机？",
-    "clientMarket.batchConfirmReverifyDesc": "将对 {run} 台主机执行重新验证；另有 {skip} 台将被跳过。",
+    "clientMarket.batchConfirmReverifyDesc":
+      "将对 {run} 台主机执行重新验证；另有 {skip} 台将被跳过。",
     "clientMarket.batchConfirmDeleteTitle": "批量移除选中主机？",
-    "clientMarket.batchConfirmDeleteDesc": "将从供给池移除 {run} 台主机；另有 {skip} 台将被跳过（仍有 Client 或不可移除）。",
+    "clientMarket.batchConfirmDeleteDesc":
+      "将从供给池移除 {run} 台主机；另有 {skip} 台将被跳过（仍有 Client 或不可移除）。",
     "clientMarket.batchProgressTitle": "批量{action}",
     "clientMarket.batchProgressCleanup": "清理",
     "clientMarket.batchProgressReverify": "重新验证",
@@ -2830,14 +3360,18 @@ export const messages = {
     "clientMarket.batchStatus.succeeded": "成功",
     "clientMarket.batchStatus.failed": "失败",
     "clientMarket.batchStatus.skipped": "已跳过",
-    "clientMarket.batchSummary": "完成：成功 {succeeded} · 跳过 {skipped} · 失败 {failed}",
-    "clientMarket.batchExportEmpty": "选中的主机均不可导出（仅可导出自己的主机）。",
+    "clientMarket.batchSummary":
+      "完成：成功 {succeeded} · 跳过 {skipped} · 失败 {failed}",
+    "clientMarket.batchExportEmpty":
+      "选中的主机均不可导出（仅可导出自己的主机）。",
     "clientMarket.batchExportSelected": "导出选中",
     "clientMarket.batchNothingEligible": "没有符合条件的选中主机。",
     "clientMarket.providerActivity": "Host Provider 活跃情况",
     "clientMarket.providerObservations": "Router Provider 观察",
-    "clientMarket.providerObservationNotice": "仅为 Router 可观察历史，不是安全认证或到账证明。",
-    "clientMarket.observedHosts": "已验证 {total} · 空闲 {idle} · 已分配 {allocated}",
+    "clientMarket.providerObservationNotice":
+      "仅为 Router 可观察历史，不是安全认证或到账证明。",
+    "clientMarket.observedHosts":
+      "已验证 {total} · 空闲 {idle} · 已分配 {allocated}",
     "clientMarket.observedAllocationRate": "分配率 {rate}",
     "clientMarket.observedFreeSupply": "免费 {total}（已分配 {allocated}）",
     "clientMarket.observedPaidSupply": "收费 {total}（已分配 {allocated}）",
@@ -2864,7 +3398,8 @@ export const messages = {
     "clientMarket.terminalMountFailed": "终端界面挂载失败。",
     "clientMarket.terminal.resize": "调整窗口大小",
     "clientMarket.terminal.dockLabel": "Web 终端",
-    "clientMarket.terminal.maxWindows": "最多同时打开 {count} 个终端，请先关闭一个。",
+    "clientMarket.terminal.maxWindows":
+      "最多同时打开 {count} 个终端，请先关闭一个。",
     "clientMarket.terminal.switchNamed": "切换到 {name}",
     "clientMarket.terminal.activeNamed": "当前：{name}",
     "clientMarket.terminal.closeNamed": "关闭 {name}",
@@ -2872,9 +3407,11 @@ export const messages = {
     "clientMarket.terminal.resumeHint": "点击后使用新的一次性票据重新连接",
     "clientMarket.terminal.resumeNamed": "恢复 {name}",
     "clientMarket.terminal.cleanAll": "全部清理",
-    "clientMarket.terminal.autoMinimized": "离开 Clients / Client 市场时，已自动最小化并断开打开的终端。",
+    "clientMarket.terminal.autoMinimized":
+      "离开 Clients / Client 市场时，已自动最小化并断开打开的终端。",
     "clientMarket.terminalAccess.title": "供应商终端权限",
-    "clientMarket.terminalAccess.description": "未经你的限时授权，供应商不能在这台已租用 Host 上打开 root 终端。",
+    "clientMarket.terminalAccess.description":
+      "未经你的限时授权，供应商不能在这台已租用 Host 上打开 root 终端。",
     "clientMarket.terminalAccess.activeUntil": "root 终端权限有效至 {time}。",
     "clientMarket.terminalAccess.duration": "授权时长",
     "clientMarket.terminalAccess.duration30m": "30 分钟",
@@ -2885,9 +3422,11 @@ export const messages = {
     "clientMarket.terminalAccess.extend": "延长",
     "clientMarket.terminalAccess.revoke": "撤销",
     "clientMarket.terminalAccess.authorizeTitle": "授权供应商 root 权限？",
-    "clientMarket.terminalAccess.authorizeConfirm": "在 {duration} 内，供应商可以在该 Host 上打开不受限制的 root 终端。请仅为双方私下约定的维护窗口授权。",
+    "clientMarket.terminalAccess.authorizeConfirm":
+      "在 {duration} 内，供应商可以在该 Host 上打开不受限制的 root 终端。请仅为双方私下约定的维护窗口授权。",
     "clientMarket.terminalAccess.revokeTitle": "撤销供应商 root 权限？",
-    "clientMarket.terminalAccess.revokeConfirm": "当前供应商终端会在数秒内断开。后续需要维护时可再次授权。",
+    "clientMarket.terminalAccess.revokeConfirm":
+      "当前供应商终端会在数秒内断开。后续需要维护时可再次授权。",
     "clientMarket.terminalAccess.granted": "已授权供应商终端权限。",
     "clientMarket.terminalAccess.revoked": "已撤销供应商终端权限。",
     "createClient.newClient": "新建",
@@ -2897,22 +3436,29 @@ export const messages = {
     "createClient.hostProvider": "供应商",
     "createClient.official": "官方",
     "createClient.routerOwner": "Router owner",
-    "createClient.freeOnlyHint": "仅能从免费主机创建，可能不稳定或随时被收回；要稳定请到 Client市场选付费 Host。",
-    "createClient.officialUnavailable": "官方 Provider 当前没有空闲免费 Host。只有在你明确信任其他 Provider 时，再打开 Host Provider 勾选。",
-    "createClient.officialNotConfigured": "此 Router 尚未配置官方 Provider。只有在你明确信任时，再打开 Host Provider 勾选其他所有者。",
+    "createClient.freeOnlyHint":
+      "仅能从免费主机创建，可能不稳定或随时被收回；要稳定请到 Client市场选付费 Host。",
+    "createClient.officialUnavailable":
+      "官方 Provider 当前没有空闲免费 Host。只有在你明确信任其他 Provider 时，再打开 Host Provider 勾选。",
+    "createClient.officialNotConfigured":
+      "此 Router 尚未配置官方 Provider。只有在你明确信任时，再打开 Host Provider 勾选其他所有者。",
     "createClient.officialNoCapacityButton": "官方 Provider 暂无免费容量",
     "createClient.reservedHosts": "已预留的 Host",
     "createClient.reviewQuote": "安装前请确认实际 Provider 和报价。",
     "createClient.resultSummary": "成功 {successes} · 失败 {failures}",
-    "createClient.partialRollback": "成功的 Client 会保留分配；失败项已分别回滚。",
+    "createClient.partialRollback":
+      "成功的 Client 会保留分配；失败项已分别回滚。",
     "createClient.selectHosts": "选择 Host",
     "createClient.confirmCreate": "确认并创建",
     "createClient.quoteTerms.postpaidTitle": "后付费服务",
-    "createClient.quoteTerms.postpaid": "本次包含来自 {suppliers} 个供应商账户的 {count} 台付费 Host；每台都有 {hours} 小时免费健康服务时间，之后按实际健康服务时间累计费用。用满各供应商授予的信用额度后分别生成账单，一张账单可能合并多个 Share 和 Client Host 服务。",
-    "createClient.quoteTerms.free": "本次包含 {count} 台免费 Host，不产生赊账费用；如有固定免费期限，将从 Host 实际激活后开始计算。",
+    "createClient.quoteTerms.postpaid":
+      "本次包含来自 {suppliers} 个供应商账户的 {count} 台付费 Host；每台都有 {hours} 小时免费健康服务时间，之后按实际健康服务时间累计费用。用满各供应商授予的信用额度后分别生成账单，一张账单可能合并多个 Share 和 Client Host 服务。",
+    "createClient.quoteTerms.free":
+      "本次包含 {count} 台免费 Host，不产生赊账费用；如有固定免费期限，将从 Host 实际激活后开始计算。",
     "createClient.tabManual": "手动安装",
     "createClient.tabOnline": "在线安装",
-    "createClient.manualDescription": "在目标 Linux 主机上执行以下命令，请将用户邮箱与 Web 登录密码替换为实际值：",
+    "createClient.manualDescription":
+      "在目标 Linux 主机上执行以下命令，请将用户邮箱与 Web 登录密码替换为实际值：",
     "createClient.manualCommandLabel": "安装命令",
     "createClient.manualPasswordPlaceholder": "web登陆密码",
     "createClient.hostOwners": "主机所有者",
@@ -2935,7 +3481,8 @@ export const messages = {
     "createClient.randomSubdomain": "随机生成",
     "createClient.subdomainRandom": "随机生成",
     "createClient.subdomainRequired": "请填写子域名。",
-    "createClient.subdomainInvalid": "请使用 6-30 位小写字母、数字或单个连字符，并以字母开头。",
+    "createClient.subdomainInvalid":
+      "请使用 6-30 位小写字母、数字或单个连字符，并以字母开头。",
     "createClient.subdomainDuplicate": "每个 Client 必须使用不同的子域名。",
     "createClient.subdomainChecking": "正在检查可用性...",
     "createClient.subdomainAvailable": "子域名可用",
@@ -2956,7 +3503,8 @@ export const messages = {
     "createClient.successRegion": "地区",
     "createClient.failed": "开通失败",
     "createClient.quoteExpired": "主机预留已过期，请重新选择主机。",
-    "createClient.quoteExpiredDraftsKept": "主机预留已过期。已为你保留填写的子域名与密码，重新选择主机后可继续使用。",
+    "createClient.quoteExpiredDraftsKept":
+      "主机预留已过期。已为你保留填写的子域名与密码，重新选择主机后可继续使用。",
     "createClient.quoteCountdown": "剩余 {seconds} 秒",
     "billing.payment.alipay": "支付宝",
     "billing.payment.wechat": "微信支付",
@@ -2973,24 +3521,32 @@ export const messages = {
     "marketAccess.pricing.paid": "付费",
     "marketAccess.mode.whitelist": "仅可信买家",
     "marketAccess.mode.blacklist": "默认开放",
-    "marketAccess.mode.trustedHint": "新买家必须获得明确准入后才能使用此作用域。",
-    "marketAccess.mode.openHint": "新买家默认可以使用此作用域，除非你明确拒绝。",
+    "marketAccess.mode.trustedHint":
+      "新买家必须获得明确准入后才能使用此作用域。",
+    "marketAccess.mode.openHint":
+      "新买家默认可以使用此作用域，除非你明确拒绝。",
     "marketAccess.policySaved": "准入策略已保存。",
     "marketAccess.blacklistBannerTitle": "公共付费授信风险",
-    "marketAccess.blacklistBanner": "至少一个付费作用域处于默认开放状态，或公共额度仍然启用。只有在付费作用域默认开放时，未知买家才能使用该额度；请在下方检查或关闭公共额度。",
+    "marketAccess.blacklistBanner":
+      "至少一个付费作用域处于默认开放状态，或公共额度仍然启用。只有在付费作用域默认开放时，未知买家才能使用该额度；请在下方检查或关闭公共额度。",
     "marketAccess.blacklistConfirmTitle": "启用黑名单模式？",
-    "marketAccess.blacklistConfirmDescription": "该作用域将默认允许尚未与你私下建立信任关系、且未被明确拒绝的用户使用；付费租用还需要启用公共额度。",
-    "marketAccess.blacklistConfirmCheckbox": "我了解未知用户可能在我拒绝其访问前使用服务。",
+    "marketAccess.blacklistConfirmDescription":
+      "该作用域将默认允许尚未与你私下建立信任关系、且未被明确拒绝的用户使用；付费租用还需要启用公共额度。",
+    "marketAccess.blacklistConfirmCheckbox":
+      "我了解未知用户可能在我拒绝其访问前使用服务。",
     "marketAccess.enableBlacklist": "启用黑名单模式",
     "marketAccess.publicCreditTitle": "黑名单模式公共额度",
-    "marketAccess.publicCreditHint": "可为没有私有授信的用户提供有限公共额度；公共额度永远不能设为无限。",
+    "marketAccess.publicCreditHint":
+      "可为没有私有授信的用户提供有限公共额度；公共额度永远不能设为无限。",
     "marketAccess.publicConfirm": "我接受该公共额度风险",
     "marketAccess.publicConfirmRequired": "保存前请确认接受公共额度风险。",
     "marketAccess.publicSaved": "{currency} 公共额度已保存。",
     "marketAccess.addTitle": "添加可信买家",
     "marketAccess.addCreditTitle": "初始账户级美元信用额度",
-    "marketAccess.addCreditHint": "开通付费准入时必须设置；该额度由此买家向你租用的所有付费 Share 和 Client Host 共用。",
-    "marketAccess.addCreditRequired": "开通付费准入时，请设置初始美元信用额度，或明确授予无限额度。",
+    "marketAccess.addCreditHint":
+      "开通付费准入时必须设置；该额度由此买家向你租用的所有付费 Share 和 Client Host 共用。",
+    "marketAccess.addCreditRequired":
+      "开通付费准入时，请设置初始美元信用额度，或明确授予无限额度。",
     "marketAccess.buyersTitle": "可信买家",
     "marketAccess.searchBuyers": "按邮箱或用户 ID 搜索买家",
     "marketAccess.table.buyer": "买家",
@@ -3012,29 +3568,36 @@ export const messages = {
     "marketAccess.status.requested": "申请准入",
     "marketAccess.approve": "准入",
     "marketAccess.reject": "拒绝",
-    "marketAccess.requestSaveDraftFirst": "请先保存或重置该买家的未保存变更，再处理准入申请。",
+    "marketAccess.requestSaveDraftFirst":
+      "请先保存或重置该买家的未保存变更，再处理准入申请。",
     "marketAccess.requestApproved": "已准入 {email} 的申请。",
     "marketAccess.requestRejected": "已拒绝 {email} 的准入申请。",
     "marketAccess.requestCount": "{count} 个待处理",
     "marketAccess.creditSummary": "授信：{value}",
     "marketAccess.exposureSummary": "敞口：{amount} · {count} 个服务",
     "marketAccess.relationshipStatus": "买家关系",
-    "marketAccess.relationshipStatusHint": "停用关系后将阻止新租用，并在保存后终止现有付费服务。",
-    "marketAccess.leaveConfirm": "市场准入还有未保存的修改，离开后将丢弃，确认继续吗？",
+    "marketAccess.relationshipStatusHint":
+      "停用关系后将阻止新租用，并在保存后终止现有付费服务。",
+    "marketAccess.leaveConfirm":
+      "市场准入还有未保存的修改，离开后将丢弃，确认继续吗？",
     "marketAccess.approveTitle": "批准市场准入",
     "marketAccess.rejectTitle": "拒绝市场准入",
     "marketAccess.approvalCreditTitle": "账户级美元信用额度",
-    "marketAccess.approvalCreditHint": "该额度由此买家向你租用的所有付费 Share 和 Client Host 共用；建议值约覆盖当前申请服务七天费用。",
+    "marketAccess.approvalCreditHint":
+      "该额度由此买家向你租用的所有付费 Share 和 Client Host 共用；建议值约覆盖当前申请服务七天费用。",
     "marketAccess.currentExposure": "当前累计敞口",
     "marketAccess.activeServicesLabel": "活跃付费服务",
-    "marketAccess.approveFreeHint": "本次只批准所申请的免费产品作用域，不会创建信用额度。",
+    "marketAccess.approveFreeHint":
+      "本次只批准所申请的免费产品作用域，不会创建信用额度。",
     "marketAccess.rejectionReason": "写入审计记录的拒绝原因",
     "marketAccess.rejectionReasonRequired": "请输入拒绝原因。",
-    "marketAccess.rejectionCooldown": "拒绝后，该买家需要等待 24 小时才能再次申请同一供应商作用域。",
+    "marketAccess.rejectionCooldown":
+      "拒绝后，该买家需要等待 24 小时才能再次申请同一供应商作用域。",
     "marketAccess.approveConfirm": "批准并授信",
     "marketAccess.rejectConfirm": "拒绝申请",
     "marketAccess.revokeConfirmTitle": "确认撤销买家关系",
-    "marketAccess.revokeConfirmDescription": "保存后将阻止这些买家新增租用，并终止其现有付费服务；已经产生的余额和账单仍需结清。",
+    "marketAccess.revokeConfirmDescription":
+      "保存后将阻止这些买家新增租用，并终止其现有付费服务；已经产生的余额和账单仍需结清。",
     "marketAccess.revokeImpact": "敞口 {amount} · {count} 个活跃服务",
     "marketAccess.revokeNoExposure": "当前无敞口",
     "marketAccess.revokeConfirm": "撤销并保存全部修改",
@@ -3053,7 +3616,8 @@ export const messages = {
     "marketAccess.unlimitedConfirmRequired": "保存前请确认接受无限额度风险。",
     "marketAccess.creditSaved": "{currency} 授信已保存。",
     "marketReadiness.title": "市场准备",
-    "marketReadiness.subtitle": "集中检查会影响 Share 与 Client Host 交易的供应商配置和运营待办。",
+    "marketReadiness.subtitle":
+      "集中检查会影响 Share 与 Client Host 交易的供应商配置和运营待办。",
     "marketReadiness.ready": "已就绪",
     "marketReadiness.needsSetup": "需要配置",
     "marketReadiness.pending": "{count} 项待处理",
@@ -3062,23 +3626,28 @@ export const messages = {
     "marketReadiness.summary.billingActions": "账务待办",
     "marketReadiness.summary.overdue": "逾期账单",
     "marketReadiness.payment.title": "收款与联系方式",
-    "marketReadiness.payment.detail": "已配置 {methods} 种收款方式和 {contacts} 个联系渠道，会在付款或申请准入时向买家展示。",
+    "marketReadiness.payment.detail":
+      "已配置 {methods} 种收款方式和 {contacts} 个联系渠道，会在付款或申请准入时向买家展示。",
     "marketReadiness.payment.action": "管理收款信息",
     "marketReadiness.access.title": "买家准入与授信",
-    "marketReadiness.access.detail": "当前有 {buyers} 个有效可信买家关系，免费和付费作用域分别管理。",
+    "marketReadiness.access.detail":
+      "当前有 {buyers} 个有效可信买家关系，免费和付费作用域分别管理。",
     "marketReadiness.access.action": "管理市场准入",
     "marketReadiness.billing.title": "市场账务待办",
-    "marketReadiness.billing.detail": "待支付 {payables} 笔、待确认到账 {reviews} 笔、逾期 {overdue} 笔。",
+    "marketReadiness.billing.detail":
+      "待支付 {payables} 笔、待确认到账 {reviews} 笔、逾期 {overdue} 笔。",
     "marketReadiness.billing.action": "打开市场账务",
     "marketReadiness.policies.title": "当前准入策略",
-    "marketReadiness.policies.hint": "每种产品的免费与付费准入互相独立；付费默认开放会增加供应商的赊账风险。",
+    "marketReadiness.policies.hint":
+      "每种产品的免费与付费准入互相独立；付费默认开放会增加供应商的赊账风险。",
     "marketReadiness.policies.product": "产品",
     "marketReadiness.policies.pricing": "价格类型",
     "marketReadiness.policies.mode": "准入模式",
     "marketReadiness.policies.revision": "版本",
     "marketBilling.title": "市场账务",
     "marketBilling.open": "查看账务",
-    "marketBilling.subtitle": "Share 与 Client Host 按供应商账户统一后付费；仅健康服务时间计费，并先享受 {hours} 小时健康时长试用。",
+    "marketBilling.subtitle":
+      "Share 与 Client Host 按供应商账户统一后付费；仅健康服务时间计费，并先享受 {hours} 小时健康时长试用。",
     "marketBilling.supplier": "供应商",
     "marketBilling.buyer": "用户",
     "marketBilling.day": "天",
@@ -3110,13 +3679,15 @@ export const messages = {
     "marketBilling.service.active": "计费中",
     "marketBilling.service.suspended": "已暂停",
     "marketBilling.service.terminated": "已终止",
-    "marketBilling.service.trialRemaining": "剩余健康时长试用：{hours} 小时 {minutes} 分钟",
+    "marketBilling.service.trialRemaining":
+      "剩余健康时长试用：{hours} 小时 {minutes} 分钟",
     "marketBilling.healthOnly": "离线及未知状态不消耗试用，也不产生费用",
     "marketBilling.invoice.number": "聚合账单 #{sequence}",
     "marketBilling.invoice.total": "账单总额",
     "marketBilling.invoice.deadline": "付款确认截止：{date}",
     "marketBilling.invoice.exchangeRate": "账单汇率 1:{rate}",
-    "marketBilling.declaration.summary": "已于 {date} 声明付款；转账参考：{reference}",
+    "marketBilling.declaration.summary":
+      "已于 {date} 声明付款；转账参考：{reference}",
     "marketBilling.dispute.summary": "争议处理中：{reason}",
     "marketBilling.dispute.openedAt": "发起时间",
     "marketBilling.dispute.respondBy": "供应商响应截止",
@@ -3139,10 +3710,12 @@ export const messages = {
     "marketBilling.summary.overdue": "逾期账单",
     "marketBilling.summary.disputes": "处理中争议",
     "marketBilling.todo.title": "需要你处理",
-    "marketBilling.todo.hint": "付款、到账确认和清账操作集中在这里，账户监控放在其他视图。",
+    "marketBilling.todo.hint":
+      "付款、到账确认和清账操作集中在这里，账户监控放在其他视图。",
     "marketBilling.todo.empty": "当前没有需要你处理的账务事项。",
     "marketBilling.history.title": "账单历史",
-    "marketBilling.history.hint": "已结清和已作废账单按供应商账户归档，展开账户时再加载其历史。",
+    "marketBilling.history.hint":
+      "已结清和已作废账单按供应商账户归档，展开账户时再加载其历史。",
     "marketBilling.history.loading": "正在加载账单历史...",
     "marketBilling.history.empty": "尚无已结账单。",
     "marketBilling.history.loadMore": "加载更多",
@@ -3155,36 +3728,45 @@ export const messages = {
     "marketBilling.action.closeAccount": "永久关闭赊账关系",
     "marketBilling.action.completed": "账务操作已完成。",
     "marketBilling.closing.title": "该赊账关系已永久关闭",
-    "marketBilling.closing.description": "关联服务均已终止，清账后也不会恢复；最终账单仍需支付，且后续无法再向该供应商租用付费产品。",
+    "marketBilling.closing.description":
+      "关联服务均已终止，清账后也不会恢复；最终账单仍需支付，且后续无法再向该供应商租用付费产品。",
     "marketBilling.restricted.title": "市场赊账已受限",
-    "marketBilling.restricted.description": "存在逾期账单，暂时无法新增付费 Share 或 Client Host；供应商确认到账或 Router 裁决作废账单后才会恢复。",
+    "marketBilling.restricted.description":
+      "存在逾期账单，暂时无法新增付费 Share 或 Client Host；供应商确认到账或 Router 裁决作废账单后才会恢复。",
     "marketBilling.restricted.openInvoice": "打开账单 #{sequence}",
     "marketBilling.restricted.open": "打开受限账单",
     "marketBilling.profile.title": "供应商付款策略",
-    "marketBilling.profile.hint": "设置账单生成后允许买家付款的时间。准入和信用额度需在“市场准入”中按买家单独授予。",
+    "marketBilling.profile.hint":
+      "设置账单生成后允许买家付款的时间。准入和信用额度需在“市场准入”中按买家单独授予。",
     "marketBilling.profile.grace": "付款宽限（小时）",
     "marketBilling.profile.notSet": "未配置",
-    "marketBilling.profile.invalidGrace": "付款宽限必须是 1 至 720 的整数小时。",
+    "marketBilling.profile.invalidGrace":
+      "付款宽限必须是 1 至 720 的整数小时。",
     "marketBilling.profile.saved": "{currency} 付款策略已保存。",
     "marketBilling.payables.title": "我的应付",
-    "marketBilling.payables.hint": "同一供应商下，所有 Share 与 Client Host 共用一个美元赊账余额。",
+    "marketBilling.payables.hint":
+      "同一供应商下，所有 Share 与 Client Host 共用一个美元赊账余额。",
     "marketBilling.payables.empty": "尚无供应商赊账账户。",
     "marketBilling.receivables.title": "我的应收",
-    "marketBilling.receivables.hint": "查看用户风险敞口、聚合账单和付款声明，核实到账后再确认。",
+    "marketBilling.receivables.hint":
+      "查看用户风险敞口、聚合账单和付款声明，核实到账后再确认。",
     "marketBilling.receivables.empty": "尚无用户赊账账户。",
     "marketBilling.declare.method": "付款方式",
     "marketBilling.declare.methodOther": "其他 / 已线下协商",
     "marketBilling.declare.reference": "转账参考号",
     "marketBilling.declare.evidence": "凭证链接",
     "marketBilling.declare.openEvidence": "打开付款凭证",
-    "marketBilling.declare.notice": "这里只记录付款声明。供应商需独立核实到账，确认后 Router 才会清零聚合余额并恢复已暂停服务。",
+    "marketBilling.declare.notice":
+      "这里只记录付款声明。供应商需独立核实到账，确认后 Router 才会清零聚合余额并恢复已暂停服务。",
     "marketBilling.providerPaymentDetails": "Provider 收款信息",
-    "marketBilling.paymentSnapshot": "本账单使用供应商于 {date} 更新的收款资料快照，出账后不会随资料修改而变化。",
+    "marketBilling.paymentSnapshot":
+      "本账单使用供应商于 {date} 更新的收款资料快照，出账后不会随资料修改而变化。",
     "marketBilling.note": "备注",
     "marketBilling.reason": "原因",
     "marketBilling.reasonRequired": "必须填写原因。",
     "marketBilling.admin.title": "账单争议",
-    "marketBilling.admin.hint": "根据账单证据处理争议。作废账单会清除其余额，并恢复符合条件的服务。",
+    "marketBilling.admin.hint":
+      "根据账单证据处理争议。作废账单会清除其余额，并恢复符合条件的服务。",
     "marketBilling.admin.empty": "当前没有待处理争议。",
     "marketBilling.admin.uphold": "维持账单",
     "marketBilling.admin.voidDispute": "裁决作废",
@@ -3200,10 +3782,14 @@ export const messages = {
     "marketBilling.dialog.admin-uphold": "维持争议账单",
     "marketBilling.dialog.admin-void": "作废争议账单",
     "marketBilling.dialog.admin-invoice-void": "强制作废账单",
-    "marketBilling.dialog.settle.description": "当前累计余额会立即生成应付账单；该供应商账户下的全部服务暂停，直到供应商确认到账。",
-    "marketBilling.dialog.request-settlement.description": "当前累计余额会生成一张聚合账单；你确认到账前，该账户下的服务都会暂停。",
-    "marketBilling.dialog.close.description": "此操作会永久终止该用户与供应商之间的全部服务，并禁止后续付费租用；已累计余额仍会通过最后一张聚合账单清偿。",
-    "marketBilling.dialog.confirm.description": "请在独立核实转账后确认。Router 会清零聚合余额，并立即恢复符合条件的服务。",
+    "marketBilling.dialog.settle.description":
+      "当前累计余额会立即生成应付账单；该供应商账户下的全部服务暂停，直到供应商确认到账。",
+    "marketBilling.dialog.request-settlement.description":
+      "当前累计余额会生成一张聚合账单；你确认到账前，该账户下的服务都会暂停。",
+    "marketBilling.dialog.close.description":
+      "此操作会永久终止该用户与供应商之间的全部服务，并禁止后续付费租用；已累计余额仍会通过最后一张聚合账单清偿。",
+    "marketBilling.dialog.confirm.description":
+      "请在独立核实转账后确认。Router 会清零聚合余额，并立即恢复符合条件的服务。",
     "createClient.selectionRequired": "请至少选择一个主机所有者和地区。",
     "createClient.noCapacity": "当前选择没有匹配的空闲主机。",
     "createClient.subdomainTaken": "子域名不可用",
@@ -3222,9 +3808,11 @@ export const messages = {
     "auth.useDifferentEmail": "使用其他邮箱",
     "settings.title": "设置",
     "settings.adminRequired": "需要管理员权限",
-    "settings.adminRequiredDesc": "请使用已配置的 router 管理员账号登录后编辑运行时设置。",
+    "settings.adminRequiredDesc":
+      "请使用已配置的 router 管理员账号登录后编辑运行时设置。",
     "settings.saveRestart": "保存并重启",
-    "settings.saved": "已保存。更新={updated} 未变化={unchanged} 需重启={restartRequired}",
+    "settings.saved":
+      "已保存。更新={updated} 未变化={unchanged} 需重启={restartRequired}",
     "settings.restartScheduled": "已安排重启，正在等待服务恢复...",
     "settings.groups": "分组",
     "settings.unsavedChanges": "{count} 项未保存修改",
@@ -3234,33 +3822,41 @@ export const messages = {
     "settings.notificationDeliveries": "通知记录",
     "settings.map": "地图",
     "settings.mapTitle": "地图显示",
-    "settings.mapDescription": "控制 Dashboard 地图叠加层与视口范围。设置保存在 router 上，所有访客共用。",
-    "settings.mapShowFlowsDescription": "在 router 与活跃 client 之间绘制浅色请求流连线。",
+    "settings.mapDescription":
+      "控制 Dashboard 地图叠加层与视口范围。设置保存在 router 上，所有访客共用。",
+    "settings.mapShowFlowsDescription":
+      "在 router 与活跃 client 之间绘制浅色请求流连线。",
     "settings.mapShowHeatDescription": "按 client 安装密度为国家区域着色。",
     "settings.mapViewportTitle": "视口范围",
-    "settings.mapViewportDescription": "设置 Dashboard 420px 地图卡片顶边对应的地图 Y；底边为起点 + 420。",
+    "settings.mapViewportDescription":
+      "设置 Dashboard 420px 地图卡片顶边对应的地图 Y；底边为起点 + 420。",
     "settings.mapVisibleStartPx": "可见起点 (px)",
     "settings.mapVisibleStartPxDescription": "视口顶边对应的地图内容 Y 坐标。",
     "settings.mapViewportReset": "恢复默认",
     "settings.mapSaved": "地图显示设置已保存。",
     "settings.announcement": "公告",
     "settings.announcementTitle": "公告",
-    "settings.announcementDescription": "配置页面刷新后向所有访客展示的公告弹窗。内容保存在 router 上，所有访客共用。",
+    "settings.announcementDescription":
+      "配置页面刷新后向所有访客展示的公告弹窗。内容保存在 router 上，所有访客共用。",
     "settings.announcementEnabled": "启用公告",
-    "settings.announcementEnabledDescription": "启用后，访客刷新页面时会看到公告，除非选择关闭。",
+    "settings.announcementEnabledDescription":
+      "启用后，访客刷新页面时会看到公告，除非选择关闭。",
     "settings.announcementContentZh": "中文内容（HTML）",
     "settings.announcementContentEn": "英文内容（HTML）",
-    "settings.announcementHtmlPlaceholder": "<p>支持链接、列表、强调等基础 HTML 标签。</p>",
+    "settings.announcementHtmlPlaceholder":
+      "<p>支持链接、列表、强调等基础 HTML 标签。</p>",
     "settings.announcementPreview": "预览",
     "settings.announcementSaved": "公告设置已保存。",
     "announcement.dismissToday": "今日关闭",
     "announcement.dismissPermanent": "永久关闭",
-    "settings.restartFieldDesc": "标记为需重启的字段会立即持久化，但需要进程重启后才会完全生效。",
+    "settings.restartFieldDesc":
+      "标记为需重启的字段会立即持久化，但需要进程重启后才会完全生效。",
     "settings.loading": "正在加载设置...",
     "settings.currentlySet": "当前已设置",
     "settings.secretPlaceholder": "留空保持不变；输入 - 清除",
     "settings.alertChannels.title": "渠道健康状态",
-    "settings.alertChannels.description": "状态基于真实投递或测试结果，而不只判断是否保存了凭据。",
+    "settings.alertChannels.description":
+      "状态基于真实投递或测试结果，而不只判断是否保存了凭据。",
     "settings.alertChannels.lastSuccess": "最近成功投递：{time}",
     "settings.alertChannels.neverSucceeded": "尚无成功投递记录。",
     "settings.alertChannels.configureFirst": "请先完整配置渠道凭据。",
@@ -3275,7 +3871,8 @@ export const messages = {
     "metrics.subtitle": "主机、Router、Client、LLM 与持久化事故监控。",
     "metrics.clear": "清空 metrics DB",
     "metrics.clearTitle": "清空 metrics 历史？",
-    "metrics.clearDesc": "这里只会删除独立 metrics 数据库中的历史监控数据，不影响业务数据、shares、markets、settings 和日志。",
+    "metrics.clearDesc":
+      "这里只会删除独立 metrics 数据库中的历史监控数据，不影响业务数据、shares、markets、settings 和日志。",
     "metrics.cleared": "Metrics 历史已清空。",
     "metrics.lastSample": "最后采样",
     "metrics.autoRefresh": "自动刷新",
@@ -3316,7 +3913,8 @@ export const messages = {
     "metrics.clients.unknown": "未知",
     "metrics.clients.trend": "Client 在线状态趋势",
     "metrics.clients.inventory": "Client 清单",
-    "metrics.clients.inventoryDesc": "当前状态来自同一个可信 presence 状态机，它同时负责创建和恢复 Client 事故。",
+    "metrics.clients.inventoryDesc":
+      "当前状态来自同一个可信 presence 状态机，它同时负责创建和恢复 Client 事故。",
     "metrics.clients.client": "Client",
     "metrics.clients.status": "状态",
     "metrics.clients.platform": "平台",
@@ -3340,7 +3938,8 @@ export const messages = {
     "metrics.alerts.channelsDesc": "健康状态基于最近一次真实投递或测试。",
     "metrics.alerts.neverDelivered": "尚无成功投递记录",
     "metrics.alerts.incidents": "活跃事故",
-    "metrics.alerts.incidentsDesc": "确认会停止普通提醒直到事故升级；静默到期后自动恢复；手动恢复会发送新通知。",
+    "metrics.alerts.incidentsDesc":
+      "确认会停止普通提醒直到事故升级；静默到期后自动恢复；手动恢复会发送新通知。",
     "metrics.alerts.notePlaceholder": "运维备注（可选，应用于下一次操作）",
     "metrics.alerts.silenceDuration": "静默时长",
     "metrics.alerts.silence1h": "静默 1 小时",
@@ -3355,7 +3954,8 @@ export const messages = {
     "metrics.alerts.occurrences": "观察到 {count} 次",
     "metrics.alerts.silencedUntil": "静默至 {time}",
     "metrics.alerts.deliveries": "投递队列",
-    "metrics.alerts.deliveriesDesc": "每次事故流转的消息内容会被冻结；修复配置后可重新排队失败或被禁用渠道抑制的投递，但已被更新流转取代的投递不可重试。",
+    "metrics.alerts.deliveriesDesc":
+      "每次事故流转的消息内容会被冻结；修复配置后可重新排队失败或被禁用渠道抑制的投递，但已被更新流转取代的投递不可重试。",
     "metrics.alerts.channel": "渠道",
     "metrics.alerts.deliveryStatus": "状态",
     "metrics.alerts.attempts": "尝试次数",
@@ -3434,14 +4034,18 @@ export const messages = {
     "metrics.chart.stale": "采集可能已停止",
     "metrics.chart.noTraffic": "时间窗内无流量",
     "metrics.chart.noDataTitle": "暂无数据",
-    "metrics.chart.noDataDetail": "该时间范围内没有采样点。请扩大范围或等待下一次采样。",
+    "metrics.chart.noDataDetail":
+      "该时间范围内没有采样点。请扩大范围或等待下一次采样。",
     "metrics.chart.samplingDetail": "正在等待首批采样数据。",
     "metrics.chart.disabledTitle": "采集已关闭",
-    "metrics.chart.disabledDetail": "设置 CC_SWITCH_ROUTER_METRICS_ENABLED=true 以开启监控采集。",
+    "metrics.chart.disabledDetail":
+      "设置 CC_SWITCH_ROUTER_METRICS_ENABLED=true 以开启监控采集。",
     "metrics.chart.staleTitle": "采样数据已陈旧",
-    "metrics.chart.staleDetail": "最近一次持久化采样早于预期，采集器可能已停止。",
+    "metrics.chart.staleDetail":
+      "最近一次持久化采样早于预期，采集器可能已停止。",
     "metrics.chart.noTrafficTitle": "无流量",
-    "metrics.chart.noTrafficDetail": "采集器运行正常，但该时间窗内没有任何请求记录。",
+    "metrics.chart.noTrafficDetail":
+      "采集器运行正常，但该时间窗内没有任何请求记录。",
     "metrics.chart.deltaHint": "每桶增量 Δ",
     "metrics.panel.routerProcess": "Router 进程",
     "metrics.panel.diskUsage": "磁盘使用",
@@ -3450,7 +4054,8 @@ export const messages = {
     "metrics.panel.counters": "路由生命周期计数",
     "metrics.panel.topConsumers": "用量排行",
     "metrics.panel.substitution": "模型替换",
-    "metrics.panel.substitutionDesc": "实际服务模型与请求模型不一致的请求（即路由器的有效降级/转移）。",
+    "metrics.panel.substitutionDesc":
+      "实际服务模型与请求模型不一致的请求（即路由器的有效降级/转移）。",
     "metrics.kpi.failover": "转移成功率",
     "metrics.detail.substitutionRate": "替换占比 {value}",
     "metrics.sub.total": "请求数",
@@ -3493,7 +4098,8 @@ export const messages = {
     "metrics.header.p95": "P95",
     "metrics.table.noData": "暂无数据",
     "logs.title": "Router 日志",
-    "logs.description": "实时查看 /var/log/cc-switch-router.log 的最新最后 100 行。",
+    "logs.description":
+      "实时查看 /var/log/cc-switch-router.log 的最新最后 100 行。",
     "logs.download": "下载日志",
     "logs.pause": "暂停",
     "logs.resume": "继续",
@@ -3515,9 +4121,11 @@ export const messages = {
     "logs.filteredCount": "{visible} / {total} 行",
     "logs.noMatchingLines": "当前筛选条件下没有匹配的日志。",
     "notifications.title": "Client 通知记录",
-    "notifications.description": "最近的注册与离线邮件投递。收件人已脱敏，不展示邮件正文。",
+    "notifications.description":
+      "最近的注册与离线邮件投递。收件人已脱敏，不展示邮件正文。",
     "notifications.chatTitle": "聊天室邮件投递",
-    "notifications.chatDescription": "按一分钟聚合的 Client 聊天邮件、重试和停止重试记录。",
+    "notifications.chatDescription":
+      "按一分钟聚合的 Client 聊天邮件、重试和停止重试记录。",
     "notifications.client": "Client",
     "notifications.messages": "消息数",
     "notifications.requeue": "重新投递",
@@ -3612,7 +4220,8 @@ export const messages = {
     "chat.systemMessage": "系统消息",
     "chat.showDetails": "详情",
     "chat.hideDetails": "收起",
-    "chat.marketPublicNotice": "此处提交的 Market 详情会发布到该 Client 的公开聊天室。请勿填写 API Key、OAuth/会话 Token、Cookie、密码、Secret 或私钥。",
+    "chat.marketPublicNotice":
+      "此处提交的 Market 详情会发布到该 Client 的公开聊天室。请勿填写 API Key、OAuth/会话 Token、Cookie、密码、Secret 或私钥。",
     "chat.event.listingCreated": "Share 已挂售，共 {count} 个拼车位。",
     "chat.event.listingRelisted": "Share 已重新挂售。",
     "chat.event.listingClosed": "Share 已停止挂售。",
@@ -3622,40 +4231,66 @@ export const messages = {
     "chat.event.seatDeleted": "拼车位 {seat} 已删除。",
     "chat.event.seatRented": "{renter} 租用了拼车位 {seat}。",
     "chat.event.seatRetired": "拼车位 {seat} 已回收并转为只读。",
-    "chat.event.entitlementActivated": "{renter} 的拼车位 {seat} 使用权限已生效。",
+    "chat.event.entitlementActivated":
+      "{renter} 的拼车位 {seat} 使用权限已生效。",
     "chat.event.entitlementFailed": "{renter} 的拼车位 {seat} 授权失败。",
+    "chat.event.serviceTermExpiring":
+      "拼车位 {seat} 的服务期限将于 {time} 结束。",
+    "chat.event.serviceTermExpired":
+      "拼车位 {seat} 的服务期限已结束，正在回收访问权限。",
     "chat.event.paymentDue": "应付 {amount}，付款截止时间为 {time}。",
     "chat.event.paymentDeclared": "租户已声明支付 {amount}。",
-    "chat.event.billingPaymentConfirmed": "供应商已确认收到 {amount} 的合并账单付款。",
-    "chat.event.billingPaymentRejected": "供应商拒绝了 {amount} 的付款声明：{reason}",
-    "chat.event.billingPaymentOverdue": "{amount} 的合并账单已于 {time} 后逾期。",
-    "chat.event.billingInvoiceDisputed": "{amount} 的合并账单已发起争议：{reason}",
-    "chat.event.billingDisputeResolvedVoid": "账单争议已处理，{amount} 的合并账单已作废。",
-    "chat.event.billingDisputeResolvedUpheld": "账单争议已处理，{amount} 的合并账单维持有效。",
+    "chat.event.billingPaymentConfirmed":
+      "供应商已确认收到 {amount} 的合并账单付款。",
+    "chat.event.billingPaymentRejected":
+      "供应商拒绝了 {amount} 的付款声明：{reason}",
+    "chat.event.billingPaymentOverdue":
+      "{amount} 的合并账单已于 {time} 后逾期。",
+    "chat.event.billingInvoiceDisputed":
+      "{amount} 的合并账单已发起争议：{reason}",
+    "chat.event.billingDisputeResolvedVoid":
+      "账单争议已处理，{amount} 的合并账单已作废。",
+    "chat.event.billingDisputeResolvedUpheld":
+      "账单争议已处理，{amount} 的合并账单维持有效。",
     "chat.event.billingInvoiceVoided": "{amount} 的合并账单已作废：{reason}",
-    "chat.event.billingCreditLimitWarning": "合并后付费余额已达到授予信用额度的 {utilization}。",
-    "chat.event.billingAccountClosing": "供应商已永久关闭该赊账关系。服务不会恢复，尚未结清的最终聚合账单仍需支付。",
-    "chat.event.clientOffline": "Client {client} 已确认离线，最后一次可信心跳：{time}。",
+    "chat.event.billingCreditLimitWarning":
+      "合并后付费余额已达到授予信用额度的 {utilization}。",
+    "chat.event.billingAccountClosing":
+      "供应商已永久关闭该赊账关系。服务不会恢复，尚未结清的最终聚合账单仍需支付。",
+    "chat.event.clientOffline":
+      "Client {client} 已确认离线，最后一次可信心跳：{time}。",
     "chat.event.clientProvisioned": "Client {client} 已完成装配并租用成功。",
-    "chat.event.freePeriodExpiring": "Client {client} 的免费期限将于 {time} 到期。",
+    "chat.event.freePeriodExpiring":
+      "Client {client} 的免费期限将于 {time} 到期。",
     "chat.event.freePeriodExpired": "Client {client} 的免费期限已结束。",
     "chat.event.cleanupStarted": "Client {client} 已开始清理：{reason}",
     "chat.event.cleanupFinished": "Client {client} 已归还并完成清理。",
     "chat.event.cleanupFailed": "Client {client} 清理失败：{error}",
-    "chat.event.releaseFinalized": "Client {client} 清理失败后已结束租用，Host 仍保持隔离。",
-    "chat.event.clientRecoverySucceeded": "Router 已拉起 Client {client}，Tunnel 已恢复。",
-    "chat.event.clientRecoveryFailed": "Router 未能恢复 Client {client}：{error}",
-    "chat.event.clientRecoveryBlocked": "Client {client} 的自动恢复已阻断，需要 Provider 处理。",
+    "chat.event.releaseFinalized":
+      "Client {client} 清理失败后已结束租用，Host 仍保持隔离。",
+    "chat.event.clientRecoverySucceeded":
+      "Router 已拉起 Client {client}，Tunnel 已恢复。",
+    "chat.event.clientRecoveryFailed":
+      "Router 未能恢复 Client {client}：{error}",
+    "chat.event.clientRecoveryBlocked":
+      "Client {client} 的自动恢复已阻断，需要 Provider 处理。",
     "chat.event.renterReleaseRequested": "{renter} 已申请归还拼车位 {seat}。",
-    "chat.event.ownerRevokeRequested": "车主已申请回收 {renter} 的拼车位 {seat}。",
+    "chat.event.ownerRevokeRequested":
+      "车主已申请回收 {renter} 的拼车位 {seat}。",
     "chat.event.subscriptionReleased": "{renter} 的拼车位 {seat} 已回收。",
     "chat.event.revokeFailed": "回收 {renter} 的拼车位 {seat} 权限失败。",
-    "chat.event.billingSuspensionRequested": "已申请因账单状态暂停 {renter} 的拼车位 {seat}。",
-    "chat.event.billingSuspended": "{renter} 的拼车位 {seat} 已因账单状态暂停服务。",
-    "chat.event.billingSuspensionFailed": "因账单状态暂停 {renter} 的拼车位 {seat} 失败。",
-    "chat.event.billingResumeRequested": "已申请恢复 {renter} 的拼车位 {seat} 服务。",
-    "chat.event.billingResumed": "{renter} 的拼车位 {seat} 已在账单恢复后恢复服务。",
-    "chat.event.billingResumeFailed": "恢复 {renter} 的拼车位 {seat} 服务失败。",
+    "chat.event.billingSuspensionRequested":
+      "已申请因账单状态暂停 {renter} 的拼车位 {seat}。",
+    "chat.event.billingSuspended":
+      "{renter} 的拼车位 {seat} 已因账单状态暂停服务。",
+    "chat.event.billingSuspensionFailed":
+      "因账单状态暂停 {renter} 的拼车位 {seat} 失败。",
+    "chat.event.billingResumeRequested":
+      "已申请恢复 {renter} 的拼车位 {seat} 服务。",
+    "chat.event.billingResumed":
+      "{renter} 的拼车位 {seat} 已在账单恢复后恢复服务。",
+    "chat.event.billingResumeFailed":
+      "恢复 {renter} 的拼车位 {seat} 服务失败。",
     "chat.event.shareEnabled": "Share 服务已启用。",
     "chat.event.shareDisabled": "Share 服务已停用。",
     "chat.event.shareExpirationChanged": "Share 到期时间已调整为 {time}。",
@@ -3743,6 +4378,7 @@ export const messages = {
     "chat.detail.seatId": "拼车位 ID",
     "chat.detail.seatPosition": "拼车位",
     "chat.detail.seatStatus": "拼车位状态",
+    "chat.detail.serviceDurationDays": "服务期限（天）",
     "chat.detail.serviceLabel": "服务",
     "chat.detail.serviceRef": "服务引用",
     "chat.detail.services": "服务列表",
@@ -3764,6 +4400,7 @@ export const messages = {
     "chat.detail.trialHours": "试用小时",
     "chat.detail.utilization": "信用额度使用率",
     "dashboard.clients": "CLIENTS",
+    "dashboard.mine": "我的",
     "dashboard.all": "全部",
     "dashboard.overview": "网络概览",
     "dashboard.kpiIssues": "{count} 个问题",
@@ -3787,9 +4424,11 @@ export const messages = {
     "dashboard.installClient": "安装 Client",
     "dashboard.installMarket": "安装 Market",
     "dashboard.installClientTitle": "安装 cc-switch-server",
-    "dashboard.installClientDescription": "在目标 Linux 主机上执行以下命令，请将命令中的用户邮箱与 Web 登录密码替换为实际值：",
+    "dashboard.installClientDescription":
+      "在目标 Linux 主机上执行以下命令，请将命令中的用户邮箱与 Web 登录密码替换为实际值：",
     "dashboard.installMarketTitle": "安装 cc-switch-market",
-    "dashboard.installMarketDescription": "打开 releases 页面，或复制下方链接：",
+    "dashboard.installMarketDescription":
+      "打开 releases 页面，或复制下方链接：",
     "dashboard.installClientCommandLabel": "安装命令",
     "dashboard.installClientCommandOwnerPlaceholder": "用户邮箱",
     "dashboard.installMarketCommandLabel": "Releases 链接",
@@ -3816,14 +4455,19 @@ export const messages = {
     "dashboard.subdomainTakeover.source": "提供待接管 subdomain 的来源 Client",
     "dashboard.subdomainTakeover.retired": "退役目标原 subdomain",
     "dashboard.subdomainTakeover.adopted": "接管来源 subdomain",
-    "dashboard.subdomainTakeover.warningSource": "来源 Client 将被永久隔离并下线。",
-    "dashboard.subdomainTakeover.warningData": "来源 Client 的 Share、用户、设置、日志及其他数据都不会迁移到目标 Client。",
-    "dashboard.subdomainTakeover.warningShares": "目标 Client 保留现有 Share 及其 ID；每个 Share URL 会自动改用新的 Client subdomain 后缀。",
-    "dashboard.subdomainTakeover.confirmPrompt": "输入 {subdomain}，确认来源 Client 将被永久隔离。",
+    "dashboard.subdomainTakeover.warningSource":
+      "来源 Client 将被永久隔离并下线。",
+    "dashboard.subdomainTakeover.warningData":
+      "来源 Client 的 Share、用户、设置、日志及其他数据都不会迁移到目标 Client。",
+    "dashboard.subdomainTakeover.warningShares":
+      "目标 Client 保留现有 Share 及其 ID；每个 Share URL 会自动改用新的 Client subdomain 后缀。",
+    "dashboard.subdomainTakeover.confirmPrompt":
+      "输入 {subdomain}，确认来源 Client 将被永久隔离。",
     "dashboard.subdomainTakeover.confirmInput": "确认 subdomain",
     "dashboard.subdomainTakeover.running": "切换中...",
     "dashboard.subdomainTakeover.confirm": "永久切换",
-    "dashboard.subdomainTakeover.success": "Client subdomain 已切换为 {subdomain}",
+    "dashboard.subdomainTakeover.success":
+      "Client subdomain 已切换为 {subdomain}",
     "dashboard.clientUpgrade": "升级",
     "dashboard.clientUpgrading": "升级中",
     "dashboard.clientUpgradeSucceeded": "{target} 升级成功",
@@ -3832,7 +4476,8 @@ export const messages = {
     "dashboard.clientUpgradeFailedButton": "升级失败",
     "dashboard.clientUpgradeTimedOutButton": "升级超时",
     "dashboard.clientUpgradeConfirmTitle": "确认客户端升级",
-    "dashboard.clientUpgradeConfirm": "将强制为 {target} 重新拉取最新 cc-switch-server 版本，不检查是否已是最新，升级完成后可能自动重启服务。",
+    "dashboard.clientUpgradeConfirm":
+      "将强制为 {target} 重新拉取最新 cc-switch-server 版本，不检查是否已是最新，升级完成后可能自动重启服务。",
     "dashboard.clientUpgradeStarted": "升级已开始（任务 {taskId}）。",
     "dashboard.clientConsole.close": "关闭控制台",
     "dashboard.clientConsole.minimize": "最小化到任务栏",
@@ -3840,29 +4485,36 @@ export const messages = {
     "dashboard.clientConsole.restore": "还原窗口",
     "dashboard.clientConsole.resize": "调整窗口大小",
     "dashboard.clientConsole.dockLabel": "客户端控制台",
-    "dashboard.clientConsole.maxWindows": "最多同时打开 {count} 个控制台，请先关闭一个。",
+    "dashboard.clientConsole.maxWindows":
+      "最多同时打开 {count} 个控制台，请先关闭一个。",
     "dashboard.clientConsole.restoreNamed": "还原 {name}",
     "dashboard.clientConsole.switchNamed": "切换到 {name}",
     "dashboard.clientConsole.activeNamed": "当前：{name}",
     "dashboard.clientConsole.closeNamed": "关闭 {name}",
     "dashboard.clientConsole.suspended": "待恢复",
-    "dashboard.clientConsole.resumeHint": "离开 Client 页或刷新后，点击以重新加载控制台",
+    "dashboard.clientConsole.resumeHint":
+      "离开 Client 页或刷新后，点击以重新加载控制台",
     "dashboard.clientConsole.resumeNamed": "恢复 {name}",
     "dashboard.clientConsole.refresh": "刷新控制台",
     "dashboard.clientConsole.cleanAll": "全部清理",
-    "dashboard.clientConsole.autoMinimized": "查看 Markets 时已自动最小化打开的控制台。",
-    "dashboard.clientConsole.autoSuspended": "已离开 Client 页，打开的控制台已挂起为待恢复；点击任务栏可恢复。",
+    "dashboard.clientConsole.autoMinimized":
+      "查看 Markets 时已自动最小化打开的控制台。",
+    "dashboard.clientConsole.autoSuspended":
+      "已离开 Client 页，打开的控制台已挂起为待恢复；点击任务栏可恢复。",
     "dashboard.connectDialog.title": "连接信息",
     "dashboard.connectDialog.baseUrl": "Base URL",
     "dashboard.connectDialog.apiKey": "API Key",
     "dashboard.connectDialog.loginRequired": "登录后查看 API Key",
     "dashboard.connectDialog.loginAction": "登录",
-    "dashboard.connectDialog.forbidden": "没有权限 —— 仅 share owner 或被授权邮箱可查看 API Key",
+    "dashboard.connectDialog.forbidden":
+      "没有权限 —— 仅 share owner 或被授权邮箱可查看 API Key",
     "dashboard.connectDialog.requestAccess": "申请加入",
     "dashboard.connectDialog.copy": "复制",
     "dashboard.connectDialog.copyOk": "已复制",
-    "dashboard.connectDialog.maskedHint": "仅显示前缀。需要完整 Token 请在顶部 API Token 面板里重置。",
-    "dashboard.connectDialog.appShared": "Claude / Codex / Gemini 共用同一个 Base URL。",
+    "dashboard.connectDialog.maskedHint":
+      "仅显示前缀。需要完整 Token 请在顶部 API Token 面板里重置。",
+    "dashboard.connectDialog.appShared":
+      "Claude / Codex / Gemini 共用同一个 Base URL。",
     "dashboard.connectDialog.appSharedSingle": "此 share 仅服务 {app}。",
     "dashboard.connectDialog.close": "关闭",
     "dashboard.connectDialog.test.section": "测试连接",
@@ -3886,10 +4538,12 @@ export const messages = {
     "dashboard.connectDialog.test.status": "状态",
     "dashboard.connectDialog.test.headers": "响应头",
     "dashboard.connectDialog.test.body": "响应体",
-    "dashboard.connectDialog.test.bodyTruncated": "（已截断，完整内容请 curl 自跑）",
+    "dashboard.connectDialog.test.bodyTruncated":
+      "（已截断，完整内容请 curl 自跑）",
     "dashboard.connectDialog.test.networkError": "网络错误：{message}",
     "dashboard.noShare": "无 share",
     "dashboard.noClients": "暂无 clients",
+    "dashboard.noMyClients": "暂无你拥有或通过 ShareTo 使用的 Client",
     "dashboard.noClient": "无 client",
     "dashboard.unlinkedClients": "未关联",
     "dashboard.scrollSharesLeft": "向左滚动 shares",
@@ -3950,6 +4604,11 @@ export const messages = {
     "dashboard.usageHigh": "用量已超过 90%",
     "dashboard.parallelFull": "并发容量已满",
     "dashboard.providerUnavailable": "暂无 Provider 信息",
+    "dashboard.modelPolicyFixed": "固定 · {model}",
+    "dashboard.modelPolicyPassthrough": "请求模型透传",
+    "dashboard.modelScopeGlobal": "全局",
+    "dashboard.modelScopePerApp": "按 App 独立",
+    "dashboard.modelSourceProfileFixed": "Profile 固定",
     "dashboard.notListed": "未上架",
     "dashboard.marketsCount": "{count} 个 Markets",
     "dashboard.moreActions": "更多操作",
@@ -3971,7 +4630,8 @@ export const messages = {
     "dashboard.reason.routeReconnecting": "路由正在重连",
     "dashboard.reason.healthCheckFailed": "最近一次健康检查失败",
     "dashboard.reason.noOnlineShares": "没有在线的关联 Share",
-    "dashboard.reason.partialShareOutage": "{total} 个启用 Share 中有 {current} 个在线",
+    "dashboard.reason.partialShareOutage":
+      "{total} 个启用 Share 中有 {current} 个在线",
     "dashboard.reason.parallelFull": "并发容量已达到 {current}/{total}",
     "dashboard.reason.parallelWarning": "并发容量较高（{current}/{total}）",
     "dashboard.reason.usageWarning": "用量接近上限（{current}/{total}）",
@@ -3986,13 +4646,17 @@ export const messages = {
     "dashboard.reason.disabled": "已主动停用",
     "dashboard.impact.none": "当前未检测到运行影响。",
     "dashboard.impact.routeOffline": "恢复前，新请求无法使用这条路由。",
-    "dashboard.impact.routeReconnecting": "Router 会保留该路由，等待 Client 重新建立连接。",
-    "dashboard.impact.marketOffline": "请求可能转向其他可用 Market，或暂时无法调度。",
+    "dashboard.impact.routeReconnecting":
+      "Router 会保留该路由，等待 Client 重新建立连接。",
+    "dashboard.impact.marketOffline":
+      "请求可能转向其他可用 Market，或暂时无法调度。",
     "dashboard.impact.capacityFull": "新请求可能等待，或转向其他可用路径。",
-    "dashboard.impact.providerUnavailable": "受影响 Provider 或模型的请求可能失败或改走其他路径。",
+    "dashboard.impact.providerUnavailable":
+      "受影响 Provider 或模型的请求可能失败或改走其他路径。",
     "dashboard.impact.disabled": "该实体已被主动排除在新请求路由之外。",
     "dashboard.impact.degraded": "路由仍可使用，但性能或可用性可能下降。",
-    "dashboard.uptimeObservation": "已观测 {observed} 分钟，健康率 {healthy}%（过去 24 小时覆盖率 {coverage}%）",
+    "dashboard.uptimeObservation":
+      "已观测 {observed} 分钟，健康率 {healthy}%（过去 24 小时覆盖率 {coverage}%）",
     "dashboard.operationSubmitted": "配置已提交，正在等待运行状态确认。",
     "dashboard.operationObserved": "已观察到更新后的运行状态。",
     "dashboard.operationRouteVerified": "路由已经恢复，更新后的状态已生效。",
@@ -4014,7 +4678,8 @@ export const messages = {
     "dashboard.noOnlineShares": "无在线 shares",
     "dashboard.seen": "在线",
     "dashboard.shares": "Shares",
-    "dashboard.sharesAvailableDetail": "服务可用：{available}/{total}；路由在线：{routeOnline}/{total}。",
+    "dashboard.sharesAvailableDetail":
+      "服务可用：{available}/{total}；路由在线：{routeOnline}/{total}。",
     "dashboard.appType": "App",
     "dashboard.installation": "Installation",
     "dashboard.shareCount": "分享数",
@@ -4022,7 +4687,8 @@ export const messages = {
     "dashboard.details": "详情",
     "dashboard.linkedShares": "关联 Shares",
     "dashboard.sharePriority": "SHARES 优先级",
-    "dashboard.sharePriorityHint": "公开的 Token market 默认调度视图。具体请求仍可能受模型、API key scope、sticky 路由、冷却和 market 运行状态影响而改变顺序。",
+    "dashboard.sharePriorityHint":
+      "公开的 Token market 默认调度视图。具体请求仍可能受模型、API key scope、sticky 路由、冷却和 market 运行状态影响而改变顺序。",
     "dashboard.sharePriorityLoading": "正在加载 share 优先级...",
     "dashboard.sharePriorityUnavailable": "当前 App 无 shares",
     "dashboard.sharePriorityLoadFailed": "加载 share 优先级失败",
@@ -4030,7 +4696,8 @@ export const messages = {
     "dashboard.sharePriorityScore": "分数",
     "dashboard.sharePrioritySignals": "信号",
     "dashboard.sharePrioritySessions": "会话",
-    "dashboard.sharePrioritySignalsTitle": "稳定 {stability} · 配额 {quota} · 余量 {headroom} · owner {owner}",
+    "dashboard.sharePrioritySignalsTitle":
+      "稳定 {stability} · 配额 {quota} · 余量 {headroom} · owner {owner}",
     "dashboard.sharePrioritySchedulable": "可调度",
     "dashboard.sharePriorityDegraded": "降级",
     "dashboard.sharePriorityUnsupported": "不支持",
@@ -4072,9 +4739,11 @@ export const messages = {
     "dashboard.noMarketRequests": "暂无 market 请求",
     "dashboard.success": "成功",
     "dashboard.failed": "失败",
-    "dashboard.publicFreeShare": "Free share。任何已登录 router 用户都可用自己的 Router API Token 调用；不通过 market 结算。",
+    "dashboard.publicFreeShare":
+      "Free share。任何已登录 router 用户都可用自己的 Router API Token 调用；不通过 market 结算。",
     "dashboard.notForSale": "此 share 未标记为出售。",
-    "dashboard.authorizedAllMarkets": "已授权所有已注册 markets，包括未来新增 markets。",
+    "dashboard.authorizedAllMarkets":
+      "已授权所有已注册 markets，包括未来新增 markets。",
     "dashboard.unknownMarket": "未知 market",
     "dashboard.offlineSince": "离线时间",
     "dashboard.free": "Free",
@@ -4085,7 +4754,8 @@ export const messages = {
     "dashboard.shareStatus.expired": "过期",
     "dashboard.allMarkets": "全部 markets",
     "dashboard.tokenMarket": "Token Market",
-    "dashboard.tokenMarketTooltip": "Token Market 按 token 用量计费，请求流量经过 market。",
+    "dashboard.tokenMarketTooltip":
+      "Token Market 按 token 用量计费，请求流量经过 market。",
     "dashboard.addMarket": "添加 market...",
     "dashboard.on": "开启",
     "dashboard.off": "关闭",
@@ -4103,7 +4773,8 @@ export const messages = {
     "dashboard.shareMarketRevokePending": "Share Market 权限回收中",
     "dashboard.applyFailed": "应用失败",
     "dashboard.applyFailedFallback": "上一轮应用失败",
-    "dashboard.shareEditQueued": "已保存。客户端当前离线，修改已入队，将在其重新连接后生效。",
+    "dashboard.shareEditQueued":
+      "已保存。客户端当前离线，修改已入队，将在其重新连接后生效。",
     "dashboard.shareViewSettings": "查看 share 设置",
     "dashboard.openShareDrawer": "打开 share 详情",
     "dashboard.shareEditSettings": "编辑 share 设置",
@@ -4123,8 +4794,10 @@ export const messages = {
     "dashboard.field.expiresAt": "过期时间",
     "dashboard.field.modelPricing": "模型定价（官方价格百分比）",
     "dashboard.userLimit.title": "用户限制",
-    "dashboard.userLimit.hint": "Share 总限制始终生效；每个用户还受自己的策略约束。",
-    "dashboard.userLimit.parallelScopeHint": "同一 Share 内，用户并发限制由 Claude、Codex 和 Gemini 请求共同占用。",
+    "dashboard.userLimit.hint":
+      "Share 总限制始终生效；每个用户还受自己的策略约束。",
+    "dashboard.userLimit.parallelScopeHint":
+      "同一 Share 内，用户并发限制由 Claude、Codex 和 Gemini 请求共同占用。",
     "dashboard.userLimit.add": "添加用户",
     "dashboard.userLimit.edit": "编辑用户限制",
     "dashboard.userLimit.period": "Token 周期",
@@ -4135,10 +4808,12 @@ export const messages = {
     "dashboard.userLimit.periodMonth": "自然月",
     "dashboard.userLimit.periodThirtyDays": "每 30 天",
     "dashboard.userLimit.anchor": "周期开始时间（UTC）",
-    "dashboard.userLimit.anchorHint": "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",
+    "dashboard.userLimit.anchorHint":
+      "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",
     "dashboard.userLimit.invalidEmail": "请输入有效邮箱。",
     "dashboard.userLimit.duplicateEmail": "该用户已存在。",
-    "dashboard.userLimit.invalidPolicy": "限制必须为正整数，且到期时间必须有效。",
+    "dashboard.userLimit.invalidPolicy":
+      "限制必须为正整数，且到期时间必须有效。",
     "dashboard.userLimit.empty": "暂无用户限制配置。",
     "dashboard.userLimit.permanent": "永久",
     "dashboard.userLimit.parallel": "并发",
@@ -4154,21 +4829,27 @@ export const messages = {
     "dashboard.hint.maxChars": "最多 200 字。",
     "dashboard.hint.forSaleOnly": "仅 ForSale = Yes 时生效",
     "dashboard.hint.selectedMarkets": "点 x 移除；空 = 不授权任何 market",
-    "dashboard.hint.sharedWith": "多个邮箱用换行/逗号分隔。这些邮箱登录 dashboard 后可查看此 share。",
-    "dashboard.hint.sharedWithReadOnly": "只读查看；仅 Owner 可修改「共享给」列表。",
+    "dashboard.hint.sharedWith":
+      "多个邮箱用换行/逗号分隔。这些邮箱登录 dashboard 后可查看此 share。",
+    "dashboard.hint.sharedWithReadOnly":
+      "只读查看；仅 Owner 可修改「共享给」列表。",
     "dashboard.hint.minValue": "最小 {value}",
-    "dashboard.hint.modelPricing": "Share 默认；供应商百分比优先；留空用 market 默认；1-100。",
+    "dashboard.hint.modelPricing":
+      "Share 默认；供应商百分比优先；留空用 market 默认；1-100。",
     "dashboard.noAuthorizedMarkets": "默认不授权任何 market",
-    "dashboard.allMarketsSelected": "已选择 All markets，所有在线 market 都可访问此 share。",
+    "dashboard.allMarketsSelected":
+      "已选择 All markets，所有在线 market 都可访问此 share。",
     "dashboard.switchToSelected": "切回 selected",
     "dashboard.setAsOwner": "设为 Owner",
     "dashboard.permanent": "永久（不过期）",
     "dashboard.noCurrentNode": "无当前节点",
     "dashboard.confirmFreeTitle": "确认切换为 Free",
-    "dashboard.confirmFreeDesc": "Free share 允许任何已登录 router 用户用自己的 Router API Token 调用，且不再产生收益。请确认切换。",
+    "dashboard.confirmFreeDesc":
+      "Free share 允许任何已登录 router 用户用自己的 Router API Token 调用，且不再产生收益。请确认切换。",
     "dashboard.confirmFree": "确认切换",
     "dashboard.transferOwnerTitle": "转移 Owner?",
-    "dashboard.transferOwnerDesc": "将 {target} 升级为 owner，并把当前 owner {owner} 降级为 shareto。",
+    "dashboard.transferOwnerDesc":
+      "将 {target} 升级为 owner，并把当前 owner {owner} 降级为 shareto。",
     "dashboard.transferOwnerConfirm": "确认转移",
     "dashboard.fieldInvalid": "请检查该字段",
     "dashboard.maintenance": "维护中",
@@ -4232,7 +4913,8 @@ export const messages = {
     "map.waiting": "等待网络数据",
     "map.empty": "无 server 地理信息 · 无活跃 clients",
     "map.active": "{count} 活跃",
-    "map.countrySummary": "{clients} 个 client · {shares} 个 share · {inflight} 个进行中",
+    "map.countrySummary":
+      "{clients} 个 client · {shares} 个 share · {inflight} 个进行中",
     "map.countryClients": "{count} 个 client",
     "map.countryShares": "{count} 个 share",
     "map.countryInflight": "{count} 个进行中",
@@ -4249,7 +4931,9 @@ export const messages = {
   },
 } as const;
 
-export function normalizeLocale(value: string | null | undefined): AppLocale | null {
+export function normalizeLocale(
+  value: string | null | undefined,
+): AppLocale | null {
   if (!value) return null;
   if (value === "zh-CN" || value.toLowerCase().startsWith("zh")) return "zh-CN";
   if (value === "en" || value.toLowerCase().startsWith("en")) return "en";
@@ -4258,8 +4942,12 @@ export function normalizeLocale(value: string | null | undefined): AppLocale | n
 
 export function detectBrowserLocale(): AppLocale {
   if (typeof navigator === "undefined") return "en";
-  const languages = navigator.languages?.length ? navigator.languages : [navigator.language];
-  return languages.some((language) => normalizeLocale(language) === "zh-CN") ? "zh-CN" : "en";
+  const languages = navigator.languages?.length
+    ? navigator.languages
+    : [navigator.language];
+  return languages.some((language) => normalizeLocale(language) === "zh-CN")
+    ? "zh-CN"
+    : "en";
 }
 
 export function readStoredLocale(): AppLocale | null {
@@ -4272,7 +4960,12 @@ export function writeStoredLocale(locale: AppLocale) {
   localStorage.setItem(LOCALE_STORAGE_KEY, locale);
 }
 
-export function interpolate(template: string, values?: Record<string, string | number>) {
+export function interpolate(
+  template: string,
+  values?: Record<string, string | number>,
+) {
   if (!values) return template;
-  return template.replace(/\{(\w+)\}/g, (match, key) => String(values[key] ?? match));
+  return template.replace(/\{(\w+)\}/g, (match, key) =>
+    String(values[key] ?? match),
+  );
 }

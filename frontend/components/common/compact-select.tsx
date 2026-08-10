@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 type CompactSelectOption = {
   value: string;
   label: string;
+  description?: string;
 };
 
 const EMPTY_KEY = "__router_empty_select_value__";
@@ -39,15 +40,42 @@ export function CompactSelect({
         if (next) onChange(next === EMPTY_KEY ? "" : next);
       }}
     >
-      <Select.Trigger className={cn("min-h-9 rounded-lg border bg-white px-3 text-xs shadow-sm", triggerClassName)}>
-        <Select.Value className="min-w-0 truncate pr-2 text-xs font-medium text-foreground">{selected?.label || value}</Select.Value>
+      <Select.Trigger
+        className={cn(
+          "min-h-9 rounded-lg border bg-white px-3 text-xs shadow-sm",
+          selected?.description && "py-2",
+          triggerClassName,
+        )}
+      >
+        <Select.Value className="min-w-0 flex-1 pr-2 text-left text-xs text-foreground">
+          <span className="grid min-w-0 gap-0.5">
+            <span className="truncate font-medium">{selected?.label || value}</span>
+            {selected?.description ? (
+              <span className="truncate text-[11px] font-normal text-muted-foreground">
+                {selected.description}
+              </span>
+            ) : null}
+          </span>
+        </Select.Value>
         <Select.Indicator className="text-muted-foreground" />
       </Select.Trigger>
       <Select.Popover className="min-w-[var(--trigger-width)] bg-white text-foreground">
         <ListBox aria-label={ariaLabel}>
           {options.map((option) => (
-            <ListBox.Item key={option.value || EMPTY_KEY} id={option.value || EMPTY_KEY} textValue={option.label}>
-              {option.label}
+            <ListBox.Item
+              key={option.value || EMPTY_KEY}
+              id={option.value || EMPTY_KEY}
+              textValue={[option.label, option.description].filter(Boolean).join(" ")}
+              className={option.description ? "py-2" : undefined}
+            >
+              <span className="grid min-w-0 gap-0.5">
+                <span className="truncate text-xs font-medium">{option.label}</span>
+                {option.description ? (
+                  <span className="truncate text-[11px] text-muted-foreground">
+                    {option.description}
+                  </span>
+                ) : null}
+              </span>
             </ListBox.Item>
           ))}
         </ListBox>

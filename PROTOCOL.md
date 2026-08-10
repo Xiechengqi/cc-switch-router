@@ -124,6 +124,7 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 - `capacityPoolId` 是非空匿名标识。同一 Router 下复用相同物理账号或 API key 的不同 Share URL 使用同一值,用于容量与故障域去重；该值在凭据源不变期间稳定，账号绑定或 API key 改变时必须重新派生并同步。
 - `bindings` 必须包含 1 到 3 个不同 app 的 `{ app: providerId }` 绑定,app 仅允许 `claude`、`codex`、`gemini`;顶层 `appType` / `providerId` 必须对应其中一个绑定。
 - `support`、`appRuntimes`、`appProviders`、`appSettings` 和分 app 价格只可声明已绑定 app。多 app Share 的远程 ACL、限额、到期时间、描述、子域名和价格百分比必须一致。
+- `upstreamProvider`、`appRuntimes` 和 `appProviders` 中的 Provider 投影携带有效 `modelPolicy`，并用 `modelPolicyScope=global|per_app` 与 `modelPolicySource=bundle_global|app_independent|profile_fixed` 明确控制来源。`global` 只统一 Bundle 中可配置的 Surface；Profile 固定策略可不同且必须标记为 `profile_fixed`。这些字段属于静态 descriptor 指纹，单独切换 scope 也必须提升投影并同步 Router。
 - 调用 app 只由 URL 协议路径判定,客户端提供的 app header 不参与授权。未绑定 app 的直连、Market 和 Gateway 请求均被拒绝。
 
 已连接的 Server 使用签名续期 API 在**原 SSH 连接上**续期,不按 lease TTL 周期重建连接。
@@ -223,7 +224,7 @@ Server 要求:
 | `GET` | `/v1/share-market/listings` | 公开 catalog(含统一准入与授信计算后的 `canRent`) |
 | `POST` | `/v1/share-market/listings` | 添加 Share 挂牌(1–20 座位) |
 | `DELETE` | `/v1/share-market/listings/:id` | 停止挂售 |
-| `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选(`alreadyListed`) |
+| `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选(`alreadyListed`、`subdomain`、`ownerEmail`、`supportedApps`) |
 | `POST` | `/v1/share-market/listings/:id/seats` | 添加拼车位(可 reopen closed listing) |
 | `PATCH`/`DELETE` | `/v1/share-market/seats/:id` | 编辑/删除空闲座位 |
 | `POST` | `/v1/share-market/seats/:id/rent` | 租用 |
@@ -232,7 +233,7 @@ Server 要求:
 
 `alreadyListed` 为 true 当且仅当:当前 owner 对该 Share 有 `active` listing,或该 Share 上仍有非终态订阅。停止挂售且租约全部结束后可再次 `POST /listings`。
 
-免费拼车位可通过 `freeDurationDays` 设置 `1..=365` 天固定期限；省略或传 `null` 表示永久。付费拼车位不得携带该字段。报价参数在租用时冻结到订阅，但期限只从 managed grant 被 Server 实际应用、订阅进入 `active_free` 时开始计算。Router 在到期前 24 小时写入一次临期事件；到期后自动进入现有 revoke 流程，回收失败时保持失败状态并继续重试，不会把座位提前恢复为可租。
+免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription，固定期限从租用事务提交成功时计算，并以同一绝对 `expiresAt` 写入 managed grant policy，授权延迟和账单暂停均不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
 
 ### 7.2 Share / Client Market 统一准入与授信
 
@@ -279,7 +280,7 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 
 `limitMinor` 使用 USD 最小单位（美分）且范围为 `1..=100000000`；路径币种仅接受 `USD`。私有无限额度和任何公共额度都必须显式确认风险，公共额度始终只能是有限额度。
 
-免费 Client Host 使用与免费 Share 相同的期限契约：Host 创建、编辑与导入接口接受 `freeDurationDays=1..365` 或 `null`（永久），付费 Host 拒绝该字段。Allocation Quote 冻结期限和 `offerRevision`；倒计时从 Client provisioning 成功、订阅写入 `activatedAt` 时开始。到期前 24 小时只产生一次临期事件，到期后 Router 以 `free_period_expired` 调用现有安全 cleanup。清理失败时租约保持 `release_failed` 且 Host 继续隔离，不会错误回到 `idle`。
+Client Host 继续使用独立的免费期限契约：Host 创建、编辑与导入接口接受 `freeDurationDays=1..365` 或 `null`（永久），付费 Host 拒绝该字段。Allocation Quote 冻结期限和 `offerRevision`；倒计时从 Client provisioning 成功、订阅写入 `activatedAt` 时开始。到期前 24 小时只产生一次临期事件，到期后 Router 以 `free_period_expired` 调用现有安全 cleanup。清理失败时租约保持 `release_failed` 且 Host 继续隔离，不会错误回到 `idle`。
 
 ### 7.3 Share / Client Market 统一后付费
 

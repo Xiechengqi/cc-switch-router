@@ -4,7 +4,10 @@ import { Card } from "@heroui/react";
 import { Eye, Link2, Pencil } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
+import {
+  operationalReasonLabel,
+  shareOperationalSummary,
+} from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import {
   averageRecentLatencyMs,
@@ -28,9 +31,17 @@ import {
   type CoreShareApp,
 } from "@/components/dashboard/data-tables";
 import type { ShareRequestLog, ShareView } from "@/lib/types";
-import { compactTokens, formatDateTime, preferredScrollBehavior } from "@/lib/utils";
+import {
+  compactTokens,
+  formatDateTime,
+  preferredScrollBehavior,
+} from "@/lib/utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { resolveShareCoreApp, shareAccessApps } from "@/lib/share-app";
+import {
+  resolveShareCoreApp,
+  shareAccessApps,
+  SHARE_APP_LABELS,
+} from "@/lib/share-app";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
@@ -86,48 +97,134 @@ export const ShareCard = React.memo(function ShareCard({
   const apps = shareAccessApps(share);
   const app = resolveShareCoreApp(share);
   const settings = app ? shareAppSettings(share, app) : null;
-  const appRequests = apps.length === 1 && app
-    ? (share.recentRequests || []).filter((request) => requestBelongsToApp(request, app))
-    : share.recentRequests || [];
+  const appRequests =
+    apps.length === 1 && app
+      ? (share.recentRequests || []).filter((request) =>
+          requestBelongsToApp(request, app),
+        )
+      : share.recentRequests || [];
   const tokensUsed = share.tokensUsed || 0;
   const tokenLimit = settings?.tokenLimit ?? share.tokenLimit;
   const parallelLimit = settings?.parallelLimit ?? share.parallelLimit;
-  const activeRequests = apps.length === 1 && app
-    ? share.activeRequestsByApp?.[app] ?? 0
-    : share.activeRequests || 0;
+  const activeRequests =
+    apps.length === 1 && app
+      ? (share.activeRequestsByApp?.[app] ?? 0)
+      : share.activeRequests || 0;
   const averageLatency = averageRecentLatencyMs(appRequests);
   const throughputTokensPerSec = recentThroughputTokensPerSec(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
+  const modelPolicyEntries = apps.flatMap((entryApp) => {
+    const entryRuntime = resolveShareAppRuntime(share, entryApp);
+    if (!entryRuntime) return [];
+    const policy = entryRuntime.modelPolicy;
+    const text =
+      policy?.mode === "single"
+        ? t("dashboard.modelPolicyFixed", { model: policy.upstreamModel })
+        : policy?.mode === "passthrough"
+          ? t("dashboard.modelPolicyPassthrough")
+          : providerActualModelNames(entryRuntime);
+    const signature =
+      policy?.mode === "single"
+        ? `single:${policy.upstreamModel}`
+        : policy?.mode || `legacy:${text}`;
+    return [{ app: entryApp, runtime: entryRuntime, text, signature }];
+  });
+  const modelPolicyScope = modelPolicyEntries.find(
+    (entry) => entry.runtime.modelPolicyScope,
+  )?.runtime.modelPolicyScope;
+  const bundleGlobalModels = modelPolicyEntries.filter(
+    (entry) => entry.runtime.modelPolicySource === "bundle_global",
+  );
+  const globalModelsConsistent =
+    new Set(bundleGlobalModels.map((entry) => entry.signature)).size <= 1;
+  const modelPolicySummary =
+    modelPolicyScope === "global" &&
+    bundleGlobalModels.length &&
+    globalModelsConsistent
+      ? [
+          `${t("dashboard.modelScopeGlobal")}: ${bundleGlobalModels[0]?.text}`,
+          ...modelPolicyEntries
+            .filter(
+              (entry) => entry.runtime.modelPolicySource === "profile_fixed",
+            )
+            .map(
+              (entry) =>
+                `${SHARE_APP_LABELS[entry.app]} (${t("dashboard.modelSourceProfileFixed")}): ${entry.text}`,
+            ),
+        ].join(" · ")
+      : modelPolicyEntries
+          .map((entry) => `${SHARE_APP_LABELS[entry.app]}: ${entry.text}`)
+          .join(" · ");
   const providerEnabled = app ? !!share.support?.[app] : !!runtime;
-  const quotaStatusLine = providerEnabled && runtime ? providerQuotaStatusLine(runtime, locale) : "-";
-  const accountLine = providerEnabled && runtime
-    ? providerStatusIdentity(runtime)
-    : share.providerId || t("dashboard.providerUnavailable");
-  const actualModels = providerEnabled && runtime ? providerActualModelNames(runtime) : "-";
-  const isApiProvider = providerEnabled && runtime ? isApiProviderRuntime(runtime) : false;
-  const apiEndpoint = providerEnabled && runtime ? providerApiEndpoint(runtime) : "-";
-  const healthTone = app ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
+  const quotaStatusLine =
+    providerEnabled && runtime ? providerQuotaStatusLine(runtime, locale) : "-";
+  const accountLine =
+    providerEnabled && runtime
+      ? providerStatusIdentity(runtime)
+      : share.providerId || t("dashboard.providerUnavailable");
+  const actualModels =
+    modelPolicySummary ||
+    (providerEnabled && runtime ? providerActualModelNames(runtime) : "-");
+  const isApiProvider =
+    providerEnabled && runtime ? isApiProviderRuntime(runtime) : false;
+  const apiEndpoint =
+    providerEnabled && runtime ? providerApiEndpoint(runtime) : "-";
+  const healthTone = app
+    ? modelHealthTone(share, app)
+    : { className: "bg-slate-50 text-muted-foreground", label: "" };
   const summary = shareOperationalSummary(share);
-  const issue = summary.primaryReason ? operationalReasonLabel(summary.primaryReason, t) : null;
+  const issue = summary.primaryReason
+    ? operationalReasonLabel(summary.primaryReason, t)
+    : null;
   const title = shareDisplayTitle(share);
   const subdomain = share.subdomain || "";
   const hasSubdomain = Boolean(subdomain.trim());
   const description = share.description?.trim() || "";
-  const usagePercent = !isUnlimited(tokenLimit) && Number(tokenLimit) > 0 ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100)) : null;
+  const usagePercent =
+    !isUnlimited(tokenLimit) && Number(tokenLimit) > 0
+      ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100))
+      : null;
   const onlineRate = share.onlineRate24h || 0;
   const observedMinutes = share.observedMinutes24h || 0;
   const observationCoverage = share.observationCoverage24h || 0;
-  const onlineTitle = t("dashboard.uptimeObservation", { healthy: onlineRate.toFixed(1), observed: observedMinutes, coverage: observationCoverage.toFixed(1) });
+  const onlineTitle = t("dashboard.uptimeObservation", {
+    healthy: onlineRate.toFixed(1),
+    observed: observedMinutes,
+    coverage: observationCoverage.toFixed(1),
+  });
   const expiryLabel = shareExpiryProgress(share, locale);
   const expiryHint = `${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`;
-  const parallelTitle = parallelOccupancyTitle(share, apps.length === 1 ? app : null, t);
+  const parallelTitle = parallelOccupancyTitle(
+    share,
+    apps.length === 1 ? app : null,
+    t,
+  );
   const editPending = share.canManage && share.activeEdit?.status === "pending";
-  const editRejected = share.canManage && share.activeEdit?.status === "rejected";
+  const editRejected =
+    share.canManage && share.activeEdit?.status === "rejected";
   const focused = focus.isFocused("share", share.shareId);
   const related = focus.isRelated("share", share.shareId);
   const dimmed = Boolean(focus.target) && !related;
-  const stateTone = summary.state === "offline" ? "border-rose-200" : summary.state === "reconnecting" ? "border-sky-300" : summary.state === "degraded" ? "border-amber-300" : summary.state === "disabled" ? "border-slate-300 opacity-70" : "border-slate-200";
-  const statusDot = summary.state === "offline" ? "bg-rose-500" : summary.state === "reconnecting" ? "bg-sky-500" : summary.state === "degraded" ? "bg-amber-400" : summary.state === "disabled" ? "bg-slate-400" : "bg-emerald-500";
+  const stateTone =
+    summary.state === "offline"
+      ? "border-rose-200"
+      : summary.state === "reconnecting"
+        ? "border-sky-300"
+        : summary.state === "degraded"
+          ? "border-amber-300"
+          : summary.state === "disabled"
+            ? "border-slate-300 opacity-70"
+            : "border-slate-200";
+  const statusDot =
+    summary.state === "offline"
+      ? "bg-rose-500"
+      : summary.state === "reconnecting"
+        ? "bg-sky-500"
+        : summary.state === "degraded"
+          ? "bg-amber-400"
+          : summary.state === "disabled"
+            ? "bg-slate-400"
+            : "bg-emerald-500";
   const connectDisabled = summary.state === "disabled";
   const editLabel = editPending
     ? shareEditPendingLabel(share.activeEdit!, t)
@@ -140,14 +237,27 @@ export const ShareCard = React.memo(function ShareCard({
     "inline-flex h-6 max-w-[160px] items-center gap-1 rounded-md border border-slate-200 bg-white px-2 text-[10px] font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
 
   const openShareDrawer = React.useCallback(() => {
-    focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" });
+    focus.setFocus({
+      kind: "share",
+      id: share.shareId,
+      source: "client-board",
+    });
     onOpen(share);
   }, [focus, onOpen, share]);
 
   React.useEffect(() => {
     if (!focused || focus.target?.source === "client-board") return;
-    cardRef.current?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "nearest", inline: "center" });
-    if (focus.target?.kind === "request") void recordDashboardUxEvent({ eventType: "share_located_from_request", source: "activity", targetType: "share" });
+    cardRef.current?.scrollIntoView({
+      behavior: preferredScrollBehavior(),
+      block: "nearest",
+      inline: "center",
+    });
+    if (focus.target?.kind === "request")
+      void recordDashboardUxEvent({
+        eventType: "share_located_from_request",
+        source: "activity",
+        targetType: "share",
+      });
   }, [focus.target?.source, focused]);
 
   return (
@@ -168,54 +278,127 @@ export const ShareCard = React.memo(function ShareCard({
         <div className="grid min-w-0 gap-1">
           <div className="flex min-w-0 items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-1.5">
-              <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot}`} title={issue || summary.state} />
-              <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
-              {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${statusDot}`}
+                title={issue || summary.state}
+              />
+              <strong
+                className="min-w-0 truncate text-sm font-semibold text-foreground"
+                title={title}
+              >
+                {title}
+              </strong>
+              {hasSubdomain ? (
+                <SubdomainCopyButton subdomain={subdomain} />
+              ) : null}
               {apps.length > 0 ? (
                 <span className="inline-flex shrink-0 items-center gap-1">
                   {apps.map((supportedApp) => (
-                    <ShareAppLogo key={supportedApp} app={supportedApp} size={14} />
+                    <ShareAppLogo
+                      key={supportedApp}
+                      app={supportedApp}
+                      size={14}
+                    />
                   ))}
+                </span>
+              ) : null}
+              {modelPolicyScope ? (
+                <span className="shrink-0 text-[9px] font-semibold text-muted-foreground">
+                  {modelPolicyScope === "global"
+                    ? t("dashboard.modelScopeGlobal")
+                    : t("dashboard.modelScopePerApp")}
                 </span>
               ) : null}
             </div>
             <div className="flex shrink-0 items-center gap-1">
-              <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.disabled") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
-                <Link2 className="h-3 w-3" />{t("dashboard.connect")}
+              <button
+                type="button"
+                data-no-row-drawer
+                disabled={connectDisabled}
+                title={
+                  connectDisabled ? issue || t("common.disabled") : undefined
+                }
+                className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (!connectDisabled) onConnect(share);
+                }}
+              >
+                <Link2 className="h-3 w-3" />
+                {t("dashboard.connect")}
               </button>
               <button
                 type="button"
                 data-no-row-drawer
                 disabled={editPending}
-                title={editRejected ? share.activeEdit?.errorMessage || t("dashboard.applyFailedFallback") : undefined}
+                title={
+                  editRejected
+                    ? share.activeEdit?.errorMessage ||
+                      t("dashboard.applyFailedFallback")
+                    : undefined
+                }
                 className={secondaryActionClass}
                 onClick={(event) => {
                   event.stopPropagation();
                   if (!editPending) onEdit(share);
                 }}
               >
-                {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                {share.canManage ? (
+                  <Pencil className="h-3 w-3" />
+                ) : (
+                  <Eye className="h-3 w-3" />
+                )}
                 <span className="truncate">{editLabel}</span>
               </button>
             </div>
           </div>
           {description ? (
-            <span className="block truncate text-[10px] text-muted-foreground" title={description}>{description}</span>
+            <span
+              className="block truncate text-[10px] text-muted-foreground"
+              title={description}
+            >
+              {description}
+            </span>
           ) : null}
         </div>
 
-        <div className={`grid min-w-0 gap-1 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`} title={app ? modelHealthTitle(share, app) : undefined}>
+        <div
+          className={`grid min-w-0 gap-1 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`}
+          title={app ? modelHealthTitle(share, app) : undefined}
+        >
           {isApiProvider ? (
             <>
-              <span className="min-w-0 truncate font-mono text-[10px] font-semibold leading-4" title={`${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`}>{apiEndpoint}</span>
+              <span
+                className="min-w-0 truncate font-mono text-[10px] font-semibold leading-4"
+                title={`${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`}
+              >
+                {apiEndpoint}
+              </span>
               <span className="min-w-0 truncate opacity-80">-</span>
-              <span className="min-w-0 truncate opacity-80" title={actualModels}>{actualModels}</span>
+              <span
+                className="min-w-0 truncate opacity-80"
+                title={actualModels}
+              >
+                {actualModels}
+              </span>
             </>
           ) : (
             <>
-              <span className="min-w-0 truncate font-semibold leading-4" title={quotaStatusLine}>{quotaStatusLine}</span>
-              <span className="min-w-0 truncate opacity-80" title={accountLine}>{accountLine}</span>
-              <span className="min-w-0 truncate opacity-80" title={actualModels}>{actualModels}</span>
+              <span
+                className="min-w-0 truncate font-semibold leading-4"
+                title={quotaStatusLine}
+              >
+                {quotaStatusLine}
+              </span>
+              <span className="min-w-0 truncate opacity-80" title={accountLine}>
+                {accountLine}
+              </span>
+              <span
+                className="min-w-0 truncate opacity-80"
+                title={actualModels}
+              >
+                {actualModels}
+              </span>
             </>
           )}
         </div>
@@ -223,28 +406,60 @@ export const ShareCard = React.memo(function ShareCard({
         <div className="grid gap-2 text-[11px]">
           <div className="grid grid-cols-2 gap-2">
             <div className="min-w-0">
-              <span className="block text-muted-foreground">{t("dashboard.usage")}</span>
-              <strong className="tabular-nums">{compactTokens(tokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong>
-              {usagePercent != null ? <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100"><div className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`} style={{ width: `${usagePercent}%` }} /></div> : null}
+              <span className="block text-muted-foreground">
+                {t("dashboard.usage")}
+              </span>
+              <strong className="tabular-nums">
+                {compactTokens(tokensUsed)} /{" "}
+                {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}
+              </strong>
+              {usagePercent != null ? (
+                <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100">
+                  <div
+                    className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`}
+                    style={{ width: `${usagePercent}%` }}
+                  />
+                </div>
+              ) : null}
             </div>
             <div className="min-w-0" title={parallelTitle}>
-              <span className="block text-muted-foreground">{t("dashboard.parallel")}</span>
-              <strong className="cursor-help tabular-nums">{activeRequests}<span className="text-muted-foreground">/{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}</span></strong>
+              <span className="block text-muted-foreground">
+                {t("dashboard.parallel")}
+              </span>
+              <strong className="cursor-help tabular-nums">
+                {activeRequests}
+                <span className="text-muted-foreground">
+                  /{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}
+                </span>
+              </strong>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2">
             <div className="min-w-0">
-              <span className="block text-muted-foreground">{t("dashboard.expires")}</span>
-              <strong className="tabular-nums" title={expiryHint}>{expiryLabel}</strong>
+              <span className="block text-muted-foreground">
+                {t("dashboard.expires")}
+              </span>
+              <strong className="tabular-nums" title={expiryHint}>
+                {expiryLabel}
+              </strong>
             </div>
             <div className="min-w-0">
-              <span className="block text-muted-foreground">{t("dashboard.uptime24h")}</span>
-              <strong className={`tabular-nums ${onlineRate < 90 ? "text-amber-700" : "text-emerald-700"}`} title={onlineTitle}>{onlineRate.toFixed(1)}%</strong>
+              <span className="block text-muted-foreground">
+                {t("dashboard.uptime24h")}
+              </span>
+              <strong
+                className={`tabular-nums ${onlineRate < 90 ? "text-amber-700" : "text-emerald-700"}`}
+                title={onlineTitle}
+              >
+                {onlineRate.toFixed(1)}%
+              </strong>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2">
             <div className="min-w-0">
-              <span className="block text-muted-foreground">{t("dashboard.response")}</span>
+              <span className="block text-muted-foreground">
+                {t("dashboard.response")}
+              </span>
               <strong
                 className={`block truncate tabular-nums font-medium ${latencyResponseToneClass(averageLatency)}`}
                 title={formatLatencySeconds(averageLatency)}
@@ -253,7 +468,9 @@ export const ShareCard = React.memo(function ShareCard({
               </strong>
             </div>
             <div className="min-w-0">
-              <span className="block text-muted-foreground">{t("dashboard.totalThroughput")}</span>
+              <span className="block text-muted-foreground">
+                {t("dashboard.totalThroughput")}
+              </span>
               <strong className="block truncate tabular-nums font-medium text-foreground">
                 {formatThroughputTokensPerSec(throughputTokensPerSec)}
               </strong>

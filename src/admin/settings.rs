@@ -33,6 +33,7 @@ pub enum DynamicGroup {
     Alerting,
     ClientNotifications,
     MarketBilling,
+    ServerLogs,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +333,66 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         default: Some("30"),
         description: "Share and image request history is kept for this many days (1-365).",
         placeholder: Some("30"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_INGEST_ENABLED",
+        label: "Server log collection",
+        group: "Server logs",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: true,
+        default: Some("true"),
+        description: "Accept signed structured audit batches from registered Server installations.",
+        placeholder: None,
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED",
+        label: "Public Server logs",
+        group: "Server logs",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("true"),
+        description: "Allow anonymous visitors to view the public projection of events that occurred in the last five minutes.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::ServerLogs),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR",
+        label: "Server log directory",
+        group: "Server logs",
+        field_type: FieldType::Path,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Router-owned file directory for per-Client audit events and upload cursors; event bodies are never stored in the business database.",
+        placeholder: Some("/var/lib/cc-switch-router/server-logs"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_RETENTION_DAYS",
+        label: "Server log retention (days)",
+        group: "Server logs",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("7"),
+        description: "Keep uploaded Server audit files for this many days (1-90).",
+        placeholder: Some("7"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_MAX_TOTAL_MIB",
+        label: "Server log capacity (MiB)",
+        group: "Server logs",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("1024"),
+        description: "Maximum aggregate size of uploaded Server audit files before oldest segments are removed (16-1048576 MiB).",
+        placeholder: Some("1024"),
         dynamic_group: None,
     },
     SettingsField {
@@ -1929,6 +1990,9 @@ pub fn apply_updates_to_dynamic(
                 current.market_usd_cny_rate_micros = value
                     .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(value).ok())
                     .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS);
+            }
+            "CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED" => {
+                current.server_log_public_enabled = value.map(parse_bool_truthy).unwrap_or(true);
             }
             // Restart-required fields (paths, addresses, TTLs, Resend API
             // key, auth limits, verification URLs, email From/Reply-To):
