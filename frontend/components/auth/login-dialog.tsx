@@ -159,6 +159,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                   </div>
                 ) : (
                   <Input
+                    className="mt-3"
                     value={email}
                     onChange={(event) => setEmail(event.target.value)}
                     placeholder="email@example.com"
