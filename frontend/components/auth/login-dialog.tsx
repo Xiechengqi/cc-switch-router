@@ -94,11 +94,11 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             <Modal.Header>
               <div>
                 <Modal.Heading className="!text-slate-900">{isCodeStep ? t("auth.verifyTitle") : t("auth.title")}</Modal.Heading>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  {isCodeStep
-                    ? t("auth.verifySubtitle", { destination: maskedDestination || fallbackMask(email) })
-                    : t("auth.subtitle")}
-                </p>
+                {isCodeStep ? (
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {t("auth.verifySubtitle", { destination: maskedDestination || fallbackMask(email) })}
+                  </p>
+                ) : null}
               </div>
             </Modal.Header>
             <Form
@@ -158,20 +158,18 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                     </button>
                   </div>
                 ) : (
-                  <label className="grid gap-2 text-sm">
-                    <span className="mono-label text-muted-foreground">{t("auth.email")}</span>
-                    <Input
-                      value={email}
-                      onChange={(event) => setEmail(event.target.value)}
-                      placeholder="email@example.com"
-                      type="email"
-                      name="email"
-                      autoComplete="email"
-                      autoCapitalize="none"
-                      spellCheck={false}
-                      autoFocus
-                    />
-                  </label>
+                  <Input
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="email@example.com"
+                    aria-label={t("auth.email")}
+                    type="email"
+                    name="email"
+                    autoComplete="email"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    autoFocus
+                  />
                 )}
                 {error ? <Alert status="danger" className="!text-slate-900" role="alert">{error}</Alert> : null}
               </Modal.Body>
