@@ -119,7 +119,7 @@ export const ShareCard = React.memo(function ShareCard({
     const policy = entryRuntime.modelPolicy;
     const text =
       policy?.mode === "single"
-        ? t("dashboard.modelPolicyFixed", { model: policy.upstreamModel })
+        ? policy.upstreamModel
         : policy?.mode === "passthrough"
           ? t("dashboard.modelPolicyPassthrough")
           : providerActualModelNames(entryRuntime);
@@ -149,7 +149,7 @@ export const ShareCard = React.memo(function ShareCard({
             )
             .map(
               (entry) =>
-                `${SHARE_APP_LABELS[entry.app]} (${t("dashboard.modelSourceProfileFixed")}): ${entry.text}`,
+                `${SHARE_APP_LABELS[entry.app]}: ${entry.text}`,
             ),
         ].join(" · ")
       : modelPolicyEntries
@@ -302,11 +302,9 @@ export const ShareCard = React.memo(function ShareCard({
                   ))}
                 </span>
               ) : null}
-              {modelPolicyScope ? (
+              {modelPolicyScope === "global" ? (
                 <span className="shrink-0 text-[9px] font-semibold text-muted-foreground">
-                  {modelPolicyScope === "global"
-                    ? t("dashboard.modelScopeGlobal")
-                    : t("dashboard.modelScopePerApp")}
+                  {t("dashboard.modelScopeGlobal")}
                 </span>
               ) : null}
             </div>

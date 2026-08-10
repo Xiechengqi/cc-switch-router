@@ -3,6 +3,7 @@
 import { Eye, ExternalLink, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -783,12 +784,6 @@ const PROVIDER_APPS: Array<{ key: CoreShareApp; label: string }> = [
   { key: "gemini", label: "Gemini" },
 ];
 
-const PROVIDER_APP_TAG_CLASS: Record<CoreShareApp, string> = {
-  claude: "border-amber-200 bg-amber-50 text-amber-800",
-  codex: "border-emerald-200 bg-emerald-50 text-emerald-800",
-  gemini: "border-sky-200 bg-sky-50 text-sky-800",
-};
-
 type GroupedProvider = {
   key: string;
   providers: Partial<Record<CoreShareApp, ShareAppProvider>>;
@@ -863,15 +858,12 @@ export function ProviderCard({
   appRuntimes,
   t,
   locale,
-  showCurrentBadge,
   supportedApps,
 }: {
   providers: Partial<Record<CoreShareApp, ShareAppProvider>>;
   appRuntimes: ShareAppRuntimes | undefined;
   t: TFn;
   locale: AppLocale;
-  /** false 时不显示 "current" 角标。client 侧边栏跨多 share 看时无意义。 */
-  showCurrentBadge: boolean;
   supportedApps?: CoreShareApp[];
 }) {
   const entries = PROVIDER_APPS.flatMap(({ key: app }) => {
@@ -908,9 +900,7 @@ export function ProviderCard({
   };
   const policyText = (value: ShareUpstreamProvider | undefined) => {
     if (value?.modelPolicy?.mode === "single") {
-      return t("dashboard.modelPolicyFixed", {
-        model: value.modelPolicy.upstreamModel,
-      });
+      return value.modelPolicy.upstreamModel;
     }
     if (value?.modelPolicy?.mode === "passthrough") {
       return t("dashboard.modelPolicyPassthrough");
@@ -934,7 +924,6 @@ export function ProviderCard({
             key: "global",
             label: t("dashboard.modelScopeGlobal"),
             text: policyText(bundleGlobalEntries[0]?.runtime),
-            fixed: false,
           },
           ...entries
             .filter(
@@ -944,14 +933,12 @@ export function ProviderCard({
               key: entry.app,
               label: SHARE_APP_LABELS[entry.app],
               text: policyText(entry.runtime),
-              fixed: true,
             })),
         ]
       : entries.map((entry) => ({
           key: entry.app,
           label: SHARE_APP_LABELS[entry.app],
           text: policyText(entry.runtime),
-          fixed: entry.runtime?.modelPolicySource === "profile_fixed",
         }));
   return (
     <div className="rounded-lg border bg-background p-3">
@@ -964,43 +951,14 @@ export function ProviderCard({
             {provider.id}
           </div>
         </div>
-        <div className="flex shrink-0 flex-wrap justify-end gap-1">
-          {showCurrentBadge &&
-          entries.some((entry) => entry.provider.isCurrent) ? (
-            <Chip color="success" size="sm" variant="soft">
-              {t("dashboard.current")}
-            </Chip>
-          ) : null}
-          {showCurrentBadge &&
-          entries.some((entry) => entry.provider.isCurrent) ? (
-            <Chip
-              color={
-                entries.every((entry) => entry.provider.enabled)
-                  ? "success"
-                  : "default"
-              }
-              size="sm"
-              variant="soft"
-            >
-              {entries.every((entry) => entry.provider.enabled)
-                ? t("dashboard.on")
-                : t("dashboard.off")}
-            </Chip>
-          ) : null}
-        </div>
+        {apps.length ? (
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+            {apps.map((app) => (
+              <ShareAppLogo key={app} app={app} size={14} />
+            ))}
+          </div>
+        ) : null}
       </div>
-      {apps.length ? (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {apps.map((app) => (
-            <span
-              key={app}
-              className={`inline-flex min-h-6 items-center rounded border px-2 text-[11px] font-semibold ${PROVIDER_APP_TAG_CLASS[app]}`}
-            >
-              {SHARE_APP_LABELS[app]}
-            </span>
-          ))}
-        </div>
-      ) : null}
       <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
         {meta ? <div className="break-words">{meta}</div> : null}
         {endpoint ? <div className="break-words">{endpoint}</div> : null}
@@ -1016,11 +974,6 @@ export function ProviderCard({
             <span className="shrink-0 font-semibold text-foreground">
               {line.label}
             </span>
-            {line.fixed ? (
-              <span className="shrink-0 rounded border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                {t("dashboard.modelSourceProfileFixed")}
-              </span>
-            ) : null}
             <span
               className="min-w-0 truncate text-muted-foreground"
               title={line.text}
@@ -1069,7 +1022,6 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
                 appRuntimes={runtimes}
                 t={t}
                 locale={locale}
-                showCurrentBadge
                 supportedApps={item.supportedApps}
               />
             );
@@ -1909,7 +1861,6 @@ export function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
                 appRuntimes={runtimes}
                 t={t}
                 locale={locale}
-                showCurrentBadge={false}
                 supportedApps={item.supportedApps}
               />
             );
