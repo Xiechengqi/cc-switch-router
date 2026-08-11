@@ -11,10 +11,11 @@ use serde::Serialize;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::ServerState;
+use crate::ctl_client::{ClientLogTailReply, CtlError};
 use crate::error::AppError;
 
-const PUBLIC_LOG_LINE_LIMIT: usize = 10;
-const FULL_LOG_LINE_LIMIT: usize = 100;
+const LOG_LINE_LIMIT: usize = 100;
+const LOG_LINE_MAX_BYTES: usize = 16 * 1024;
 const GLOBAL_CONCURRENCY_LIMIT: usize = 16;
 const PER_CLIENT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const RATE_ENTRY_TTL: Duration = Duration::from_secs(5 * 60);
@@ -36,13 +37,13 @@ impl Default for ClientLogAccessLimiter {
     }
 }
 
-pub(crate) struct ClientLogAccessPermit {
+struct ClientLogAccessPermit {
     _global: OwnedSemaphorePermit,
     _client: OwnedSemaphorePermit,
 }
 
 impl ClientLogAccessLimiter {
-    pub(crate) async fn try_acquire(
+    async fn try_acquire(
         self: &Arc<Self>,
         installation_id: &str,
     ) -> Result<ClientLogAccessPermit, AppError> {
@@ -99,7 +100,6 @@ struct ClientLogsResponse {
     lines: usize,
     limit: usize,
     truncated: bool,
-    full_log_access: bool,
     fetched_at: String,
 }
 
@@ -137,51 +137,86 @@ async fn client_logs_inner(
             "invalid Client installation id".into(),
         ));
     }
-    let exists = state
+    let session = crate::api::resolve_router_session(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
+    let is_admin = state.dynamic.read().await.is_admin(&session.email);
+    let is_client_owner = state
         .store
-        .client_log_installation_exists(installation_id)
+        .is_verified_installation_owner(installation_id, &session.email)
         .await?;
-    if !exists {
-        return Err(AppError::NotFound("Client not found".into()));
-    }
-    let session = crate::api::resolve_router_session(state, headers).await?;
-    let is_router_owner = session.as_ref().is_some_and(|session| {
-        state
-            .config
-            .official_provider_email()
-            .is_some_and(|owner| owner.eq_ignore_ascii_case(session.email.trim()))
-    });
-    let is_client_owner = if let Some(session) = session.as_ref() {
-        state
-            .store
-            .is_verified_installation_owner(installation_id, &session.email)
-            .await?
-    } else {
-        false
-    };
-    let full_log_access = is_router_owner || is_client_owner;
-    if !full_log_access && !state.dynamic.read().await.server_log_public_enabled {
+    if !can_read_process_logs(is_admin, is_client_owner) {
         return Err(AppError::Forbidden(
-            "public server logs are disabled".into(),
+            "Client owner or Router administrator access is required for process logs".into(),
         ));
     }
-    let limit = if full_log_access {
-        FULL_LOG_LINE_LIMIT
-    } else {
-        PUBLIC_LOG_LINE_LIMIT
-    };
+    if !state
+        .store
+        .client_log_installation_exists(installation_id)
+        .await?
+    {
+        return Err(AppError::NotFound("Client not found".into()));
+    }
     let _permit = state.client_logs.try_acquire(installation_id).await?;
-    let tail = state
-        .server_logs
-        .client_text_tail(installation_id, !full_log_access, limit)
-        .await?;
+    let route = state
+        .proxy
+        .active_client_route_for_installation(installation_id)
+        .await
+        .ok_or_else(|| AppError::ServiceUnavailable("Client is offline or reconnecting".into()))?;
+    let control_secret = state
+        .store
+        .installation_control_secret(installation_id)
+        .await?
+        .ok_or_else(|| AppError::ServiceUnavailable("Client control is unavailable".into()))?;
+    let reply = crate::ctl_client::fetch_client_log_tail(
+        route.route_target(),
+        installation_id,
+        &control_secret,
+        LOG_LINE_LIMIT,
+    )
+    .await
+    .map_err(map_control_error)?;
+    client_logs_response(installation_id, reply)
+}
+
+fn can_read_process_logs(is_admin: bool, is_client_owner: bool) -> bool {
+    is_admin || is_client_owner
+}
+
+fn map_control_error(error: CtlError) -> AppError {
+    match error {
+        CtlError::Rejected { status: 403, .. } => AppError::Conflict(
+            "Client log collection is disabled; enable INFO log collection on the Server".into(),
+        ),
+        error if error.is_transport() => {
+            AppError::ServiceUnavailable("Client process logs are temporarily unavailable".into())
+        }
+        error => AppError::Internal(format!("read Client process logs failed: {error}")),
+    }
+}
+
+fn client_logs_response(
+    installation_id: &str,
+    reply: ClientLogTailReply,
+) -> Result<ClientLogsResponse, AppError> {
+    let content_lines = reply.content.lines().count();
+    if reply.lines != content_lines
+        || reply.lines > LOG_LINE_LIMIT
+        || reply
+            .content
+            .lines()
+            .any(|line| line.len() > LOG_LINE_MAX_BYTES)
+    {
+        return Err(AppError::Internal(
+            "Client returned an invalid process log response".into(),
+        ));
+    }
     Ok(ClientLogsResponse {
         installation_id: installation_id.to_string(),
-        content: tail.content,
-        lines: tail.lines,
-        limit,
-        truncated: tail.truncated,
-        full_log_access,
+        content: reply.content,
+        lines: reply.lines,
+        limit: LOG_LINE_LIMIT,
+        truncated: reply.truncated,
         fetched_at: chrono::Utc::now().to_rfc3339(),
     })
 }
@@ -189,6 +224,69 @@ async fn client_logs_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_preserves_server_process_log_content() {
+        let content = concat!(
+            "2026-08-10T10:36:57.612Z  INFO cc_switch_server::state: server process log started ",
+            "process_id=42 provider=\"openai official\"\n",
+            "2026-08-10T10:36:58.612Z  WARN cc_switch_server::clients::router: retry  ",
+            "attempt=2"
+        );
+        let response = client_logs_response(
+            "installation-a",
+            ClientLogTailReply {
+                ok: true,
+                lines: 2,
+                truncated: false,
+                content: content.to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.content, content);
+        assert_eq!(response.lines, 2);
+        assert_eq!(response.limit, LOG_LINE_LIMIT);
+    }
+
+    #[test]
+    fn process_logs_are_never_public() {
+        assert!(can_read_process_logs(true, false));
+        assert!(can_read_process_logs(false, true));
+        assert!(!can_read_process_logs(false, false));
+    }
+
+    #[test]
+    fn response_rejects_inconsistent_line_metadata_without_reformatting() {
+        let result = client_logs_response(
+            "installation-a",
+            ClientLogTailReply {
+                ok: true,
+                lines: 1,
+                truncated: false,
+                content: "first\nsecond".into(),
+            },
+        );
+
+        assert!(matches!(result, Err(AppError::Internal(_))));
+    }
+
+    #[test]
+    fn control_error_mapping_distinguishes_disabled_and_transport_failures() {
+        assert!(matches!(
+            map_control_error(CtlError::Rejected {
+                status: 403,
+                body: "disabled".into(),
+                code: None,
+                retryable: Some(false),
+            }),
+            AppError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_control_error(CtlError::Timeout),
+            AppError::ServiceUnavailable(_)
+        ));
+    }
 
     #[tokio::test]
     async fn limiter_rejects_immediate_repeat_for_one_client() {

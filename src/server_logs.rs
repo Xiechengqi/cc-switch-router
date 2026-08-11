@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -1089,48 +1089,6 @@ impl ServerLogStore {
             server_time_ms,
         })
     }
-
-    pub(crate) async fn client_text_tail(
-        self: &Arc<Self>,
-        installation_id: &str,
-        public_only: bool,
-        limit: usize,
-    ) -> Result<ServerLogTextTail, AppError> {
-        let installation_id = installation_id.trim().to_string();
-        let query = ServerLogQuery {
-            installation_id: Some(installation_id.clone()),
-            client_alias: None,
-            limit: Some(limit),
-            ..ServerLogQuery::default()
-        };
-        let access = QueryAccess {
-            public_only,
-            all_installations: false,
-            installation_ids: (!public_only)
-                .then(|| HashSet::from([installation_id]))
-                .unwrap_or_default(),
-        };
-        let response = self.query(access, query).await?;
-        let truncated = response.next_cursor.is_some();
-        let mut events = response.events;
-        events.reverse();
-        let content = events
-            .iter()
-            .map(format_text_event)
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(ServerLogTextTail {
-            content,
-            lines: events.len(),
-            truncated,
-        })
-    }
-}
-
-pub(crate) struct ServerLogTextTail {
-    pub content: String,
-    pub lines: usize,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1264,16 +1222,6 @@ struct ServerLogMetaResponse {
     public_window_seconds: u32,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LiveClientLogTailResponse {
-    installation_id: String,
-    content: String,
-    lines: usize,
-    truncated: bool,
-    fetched_at: String,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CursorPayload {
@@ -1307,10 +1255,6 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/server-logs/meta", get(server_log_meta))
         .route("/v1/server-logs/events", get(server_log_events))
         .route("/v1/server-logs/export", get(server_log_export))
-        .route(
-            "/v1/server-logs/clients/:installation_id/live-tail",
-            get(live_client_log_tail),
-        )
 }
 
 async fn ingest_installation_audit_events(
@@ -1483,68 +1427,6 @@ async fn server_log_events(
     let mut response = state.server_logs.query(access, query).await?;
     enrich_client_subdomains(&state.store, &mut response).await?;
     Ok(no_store_json(response))
-}
-
-async fn live_client_log_tail(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(installation_id): AxumPath<String>,
-) -> Result<Response, AppError> {
-    let installation_id = installation_id.trim();
-    if installation_id.is_empty() || installation_id.len() > 128 {
-        return Err(AppError::BadRequest(
-            "invalid Client installation id".into(),
-        ));
-    }
-    let session = crate::api::resolve_router_session(&state, &headers)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
-    if !session_is_router_owner(&state, &session.email) {
-        return Err(AppError::Forbidden(
-            "Router owner access is required for live diagnostics".into(),
-        ));
-    }
-    if !state
-        .store
-        .client_log_installation_exists(installation_id)
-        .await?
-    {
-        return Err(AppError::NotFound("Client not found".into()));
-    }
-    let _permit = state.client_logs.try_acquire(installation_id).await?;
-    let route = state
-        .proxy
-        .active_client_route_for_installation(installation_id)
-        .await
-        .ok_or_else(|| AppError::ServiceUnavailable("Client is offline or reconnecting".into()))?;
-    let control_secret = state
-        .store
-        .installation_control_secret(installation_id)
-        .await?
-        .ok_or_else(|| AppError::ServiceUnavailable("Client control is unavailable".into()))?;
-    let reply = crate::ctl_client::fetch_client_log_tail(
-        route.route_target(),
-        installation_id,
-        &control_secret,
-        100,
-    )
-    .await
-    .map_err(|error| match error {
-        crate::ctl_client::CtlError::Rejected { status: 403, .. } => AppError::Conflict(
-            "Client log collection is disabled; enable INFO log collection on the Server".into(),
-        ),
-        error if error.is_transport() => {
-            AppError::ServiceUnavailable("Client live diagnostics are unavailable".into())
-        }
-        error => AppError::Internal(format!("read Client live diagnostics failed: {error}")),
-    })?;
-    Ok(no_store_json(LiveClientLogTailResponse {
-        installation_id: installation_id.to_string(),
-        content: reply.content,
-        lines: reply.lines,
-        truncated: reply.truncated,
-        fetched_at: Utc::now().to_rfc3339(),
-    }))
 }
 
 fn no_store_json<T: Serialize>(value: T) -> Response {
@@ -3136,29 +3018,6 @@ fn public_message(input: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn format_text_event(event: &ServerLogEventView) -> String {
-    let timestamp = Utc
-        .timestamp_millis_opt(event.occurred_at_ms)
-        .single()
-        .unwrap_or_else(Utc::now)
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let mut parts = vec![
-        timestamp,
-        event.level.to_ascii_uppercase(),
-        event.message.clone(),
-    ];
-    if let Some(fields) = event.fields.as_ref() {
-        for (key, value) in fields {
-            parts.push(format!("{key}={}", compact_json_value(value)));
-        }
-    }
-    parts.join(" ")
-}
-
-fn compact_json_value(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {

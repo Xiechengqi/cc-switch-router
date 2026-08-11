@@ -5,7 +5,7 @@ import { LoaderCircle, RefreshCw, RefreshCwOff, TriangleAlert } from "lucide-rea
 import * as React from "react";
 
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getClientLogs } from "@/lib/api";
+import { ApiError, getClientLogs } from "@/lib/api";
 import type { ClientLogsResponse, DashboardClient } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 
@@ -92,7 +92,16 @@ export function ClientLogsDialog({
         POLL_INTERVAL_MS * 2 ** Math.max(0, failureCountRef.current - 1),
         MAX_ERROR_BACKOFF_MS,
       );
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (reason instanceof ApiError) {
+        if (reason.status === 401) setError(t("clientLogs.error.loginRequired"));
+        else if (reason.status === 403) setError(t("clientLogs.error.forbidden"));
+        else if (reason.status === 409) setError(t("clientLogs.error.disabled"));
+        else if (reason.status === 429) setError(t("clientLogs.error.busy"));
+        else if (reason.status === 503) setError(t("clientLogs.error.offline"));
+        else setError(reason.message);
+      } else {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
       if (generation === generationRef.current) {
         inFlightRef.current = false;
@@ -101,7 +110,7 @@ export function ClientLogsDialog({
         schedule(nextDelay);
       }
     }
-  }, [clearTimer, installationId, open, response, schedule]);
+  }, [clearTimer, installationId, open, response, schedule, t]);
 
   fetchRef.current = () => void fetchLogs();
 
@@ -174,7 +183,6 @@ export function ClientLogsDialog({
               <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
                 {response ? (
                   <>
-                    <span>{response.fullLogAccess ? t("clientLogs.fullAccess") : t("clientLogs.publicAccess")}</span>
                     <span>{t("clientLogs.lineCount", { count: response.lines, limit: response.limit })}</span>
                     <span>{t("clientLogs.updatedAt", { time: formatDateTime(response.fetchedAt) })}</span>
                   </>

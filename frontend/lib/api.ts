@@ -87,7 +87,6 @@ import type {
   ClientLogsResponse,
   ServerLogEventsResponse,
   ServerLogMeta,
-  LiveClientLogTail,
   ServerLogScope,
 } from "@/lib/types";
 
@@ -178,15 +177,6 @@ export async function exportServerLogs(query: Omit<ServerLogQuery, "cursor" | "l
     await parseJson(response);
   }
   return response.blob();
-}
-
-export async function getLiveClientLogTail(installationId: string) {
-  return parseJson<LiveClientLogTail>(
-    await authFetch(
-      `/v1/server-logs/clients/${encodeURIComponent(installationId)}/live-tail`,
-      { cache: "no-store" },
-    ),
-  );
 }
 
 export async function takeOverClientSubdomain(input: ClientSubdomainTakeoverRequest) {

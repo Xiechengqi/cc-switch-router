@@ -232,7 +232,6 @@ export type ClientLogsResponse = {
   lines: number;
   limit: number;
   truncated: boolean;
-  fullLogAccess: boolean;
   fetchedAt: string;
 };
 
@@ -287,14 +286,6 @@ export type ServerLogEventsResponse = {
   nextCursor?: string;
   publicWindowSeconds?: number;
   serverTimeMs: number;
-};
-
-export type LiveClientLogTail = {
-  installationId: string;
-  content: string;
-  lines: number;
-  truncated: boolean;
-  fetchedAt: string;
 };
 
 export type ClientSubdomainTakeoverRequest = {

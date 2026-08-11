@@ -348,7 +348,7 @@ function ClientCard({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   onOpenTakeover?: () => void;
-  onOpenLogs: () => void;
+  onOpenLogs?: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
@@ -453,7 +453,7 @@ function ClientCard({
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
               {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
-              {client.logCollectionEnabled ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
+              {client.logCollectionEnabled && onOpenLogs ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
               <ClientChatButton client={client} />
             </div>
           </div>
@@ -607,6 +607,15 @@ export function ClientBoard({
     );
   }, [hasViewerIdentity, sessionEmail, shareById, sortedClients]);
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
+  const canViewClientLogs = React.useCallback(
+    (client: DashboardClient) =>
+      Boolean(
+        client.logCollectionEnabled &&
+        authed &&
+        (session?.isAdmin || normalizeEmail(client.installation.ownerEmail) === sessionEmail),
+      ),
+    [authed, session?.isAdmin, sessionEmail],
+  );
   const takeoverSourcesFor = React.useCallback(
     (target: DashboardClient) => {
       if (!sessionEmail || target.clientTunnel?.routeState !== "active" || !target.clientTunnel.enabled) return [];
@@ -793,7 +802,8 @@ export function ClientBoard({
 
   const selectedClient = selectedClientId ? clientById.get(selectedClientId) || null : null;
   const takeoverTarget = takeoverTargetId ? clientById.get(takeoverTargetId) || null : null;
-  const logClient = logClientId ? clientById.get(logClientId) || null : null;
+  const logClientCandidate = logClientId ? clientById.get(logClientId) || null : null;
+  const logClient = logClientCandidate && canViewClientLogs(logClientCandidate) ? logClientCandidate : null;
   const takeoverSources = React.useMemo(
     () => (takeoverTarget ? takeoverSourcesFor(takeoverTarget) : []),
     [takeoverSourcesFor, takeoverTarget],
@@ -805,7 +815,7 @@ export function ClientBoard({
   const selectedApi = shareApiParts(selectedShare ?? undefined);
 
   React.useEffect(() => {
-    if (logClientId && !logClient?.logCollectionEnabled) setLogClientId("");
+    if (logClientId && !logClient) setLogClientId("");
   }, [logClient, logClientId]);
 
   React.useEffect(() => {
@@ -945,7 +955,7 @@ export function ClientBoard({
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={() => setLogClientId(client.installation.id)} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
