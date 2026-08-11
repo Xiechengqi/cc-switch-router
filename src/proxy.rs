@@ -437,6 +437,23 @@ impl Drop for KeyedConcurrencyPermit {
 struct RecentTrafficGuard {
     traffic: RecentTraffic,
     request_id: String,
+    started: Instant,
+    status_code: Option<u16>,
+}
+
+impl RecentTrafficGuard {
+    fn new(traffic: RecentTraffic, request_id: String) -> Self {
+        Self {
+            traffic,
+            request_id,
+            started: Instant::now(),
+            status_code: None,
+        }
+    }
+
+    fn set_status(&mut self, status: StatusCode) {
+        self.status_code = Some(status.as_u16());
+    }
 }
 
 impl Drop for RecentTrafficGuard {
@@ -446,8 +463,12 @@ impl Drop for RecentTrafficGuard {
         if request_id.is_empty() {
             return;
         }
+        let status_code = self.status_code;
+        let latency_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         tokio::spawn(async move {
-            traffic.complete(&request_id).await;
+            traffic
+                .complete_with_result(&request_id, status_code, Some(latency_ms))
+                .await;
         });
     }
 }
@@ -1757,17 +1778,6 @@ pub async fn market_proxy_handler(
     // reflects requests that actually traversed the market proxy.
     let market_permit = state.proxy.acquire_market_permit(&market_email).await;
 
-    state
-        .recent_traffic
-        .record_with_id(
-            admission_request_id.clone(),
-            share_id.clone(),
-            route.share_name.clone(),
-            Some(route.subdomain.clone()),
-            client_metadata.country_code.clone(),
-            Some(market_email.clone()),
-        )
-        .await;
     let live_request_id = Some(admission_request_id);
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
@@ -1866,14 +1876,29 @@ pub async fn market_proxy_handler(
             );
     }
     builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
-    let recent_traffic_guard = live_request_id.as_ref().map(|id| RecentTrafficGuard {
-        traffic: state.recent_traffic.clone(),
-        request_id: id.clone(),
-    });
+    state
+        .recent_traffic
+        .record_with_id(
+            live_request_id
+                .clone()
+                .expect("market Share requests always have a request id"),
+            share_id.clone(),
+            route.share_name.clone(),
+            Some(route.subdomain.clone()),
+            client_metadata.country_code.clone(),
+            Some(market_email.clone()),
+        )
+        .await;
+    let mut recent_traffic_guard = live_request_id
+        .as_ref()
+        .map(|id| RecentTrafficGuard::new(state.recent_traffic.clone(), id.clone()));
 
     let upstream = match builder.body(reqwest::Body::from(body)).send().await {
         Ok(response) => response,
         Err(err) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
+            }
             state.metrics.record_proxy_upstream_error(false);
             warn!(
                 method = %method,
@@ -1896,6 +1921,9 @@ pub async fn market_proxy_handler(
     };
 
     let status = upstream.status();
+    if let Some(guard) = recent_traffic_guard.as_mut() {
+        guard.set_status(status);
+    }
     let response_headers = upstream.headers().clone();
     if let Some(response) =
         ingress_rejection_response(&state, status, &response_headers, &route, &path_and_query)
@@ -2164,17 +2192,6 @@ pub async fn gateway_proxy_handler(
     builder = builder.header(SHARE_DATA_SOURCE_HEADER, "gateway");
     builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
 
-    state
-        .recent_traffic
-        .record_with_id(
-            admission_request_id.clone(),
-            share_id.clone(),
-            route.share_name.clone(),
-            Some(route.subdomain.clone()),
-            client_metadata.country_code.clone(),
-            None,
-        )
-        .await;
     let live_request_id = admission_request_id;
     builder = builder.header("X-CC-Switch-Request-Id", live_request_id.as_str());
     builder = match with_signed_ingress_context(
@@ -2193,14 +2210,24 @@ pub async fn gateway_proxy_handler(
         Ok(builder) => builder,
         Err(response) => return response,
     };
-    let recent_traffic_guard = RecentTrafficGuard {
-        traffic: state.recent_traffic.clone(),
-        request_id: live_request_id.clone(),
-    };
+    state
+        .recent_traffic
+        .record_with_id(
+            live_request_id.clone(),
+            share_id.clone(),
+            route.share_name.clone(),
+            Some(route.subdomain.clone()),
+            client_metadata.country_code.clone(),
+            None,
+        )
+        .await;
+    let mut recent_traffic_guard =
+        RecentTrafficGuard::new(state.recent_traffic.clone(), live_request_id.clone());
 
     let upstream = match builder.body(reqwest::Body::from(body_bytes)).send().await {
         Ok(response) => response,
         Err(err) => {
+            recent_traffic_guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
             state.metrics.record_proxy_upstream_error(false);
             warn!(
                 method = %method,
@@ -2223,6 +2250,7 @@ pub async fn gateway_proxy_handler(
     };
 
     let status = upstream.status();
+    recent_traffic_guard.set_status(status);
     let response_headers = upstream.headers().clone();
     if let Some(response) =
         ingress_rejection_response(&state, status, &response_headers, &route, &path_and_query)
@@ -2475,21 +2503,6 @@ pub async fn proxy_handler(
     let is_direct_share_web_request = route.is_share() && is_allowed_direct_share_web_path(&path);
     let skips_share_edge_auth =
         share_route_skips_edge_auth(is_internal_share_router_path, is_direct_share_web_request);
-    if route.is_client_web() && is_share_router_probe {
-        debug!(
-            method = %method,
-            host = %host,
-            path = %path_and_query,
-            backend = %backend,
-            status = %StatusCode::NO_CONTENT.as_u16(),
-            client_ip = %user_ip,
-            client_country = %user_country,
-            client_asn = %user_asn,
-            user_agent = %user_agent,
-            "proxy client web health probe completed"
-        );
-        return empty_response(StatusCode::NO_CONTENT);
-    }
     if route.is_share() && !is_allowed_direct_share_proxy_path(&path) {
         debug!(
             method = %method,
@@ -2505,7 +2518,7 @@ pub async fn proxy_handler(
     }
     let mut client_web_session: Option<(String, bool)> = None;
     if route.is_client_web() {
-        if !is_allowed_client_web_path(&path) {
+        if !is_internal_share_router_path && !is_allowed_client_web_path(&path) {
             debug!(
                 method = %method,
                 host = %host,
@@ -2927,29 +2940,14 @@ pub async fn proxy_handler(
         None
     };
 
-    // Record the request for the dashboard's demand/ticker stream and propagate the
-    // generated identity downstream so share clients can write the same request id back
-    // in their request logs.
+    // Generate the downstream identity before signing. Recording happens only after all
+    // local request preparation succeeds, so early local failures cannot leak inflight rows.
     let live_request_id = if !skips_share_edge_auth && !is_share_router_probe {
-        if let Some(share_id) = route.share_id.as_deref() {
-            let request_id = admission_request_id
+        route.share_id.as_ref().map(|_| {
+            admission_request_id
                 .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-            state
-                .recent_traffic
-                .record_with_id(
-                    request_id.clone(),
-                    share_id.to_string(),
-                    route.share_name.clone(),
-                    Some(route.subdomain.clone()),
-                    client_metadata.country_code.clone(),
-                    api_user_email.clone(),
-                )
-                .await;
-            Some(request_id)
-        } else {
-            None
-        }
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
+        })
     } else {
         None
     };
@@ -3055,16 +3053,32 @@ pub async fn proxy_handler(
     // lives at function scope it covers the early-return-on-upstream-error
     // path; once the body stream is constructed we move it into the streaming
     // closure so completion fires when the upstream stream actually ends.
-    let recent_traffic_guard = live_request_id.as_ref().map(|id| RecentTrafficGuard {
-        traffic: state.recent_traffic.clone(),
-        request_id: id.clone(),
-    });
+    if let (Some(request_id), Some(share_id)) = (live_request_id.as_ref(), route.share_id.as_ref())
+    {
+        state
+            .recent_traffic
+            .record_with_id(
+                request_id.clone(),
+                share_id.clone(),
+                route.share_name.clone(),
+                Some(route.subdomain.clone()),
+                client_metadata.country_code.clone(),
+                api_user_email.clone(),
+            )
+            .await;
+    }
+    let mut recent_traffic_guard = live_request_id
+        .as_ref()
+        .map(|id| RecentTrafficGuard::new(state.recent_traffic.clone(), id.clone()));
     let share_proxy_started = Instant::now();
     let share_request_app = infer_share_request_app(&path);
 
     let upstream = match builder.body(body).send().await {
         Ok(response) => response,
         Err(err) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
+            }
             if is_share_router_probe && state.proxy.has_pending_route(&route.subdomain).await {
                 debug!(
                     method = %method,
@@ -3086,6 +3100,7 @@ pub async fn proxy_handler(
                     .proxy
                     .record_health_probe_failure(route.subdomain.clone())
                     .await;
+                retire_failed_client_web_probe(&state, &route).await;
             }
             state
                 .metrics
@@ -3135,6 +3150,9 @@ pub async fn proxy_handler(
         .as_ref()
         .map(Response::status)
         .unwrap_or(upstream_status);
+    if let Some(guard) = recent_traffic_guard.as_mut() {
+        guard.set_status(status);
+    }
     state.metrics.record_proxy_status(status);
     let share_llm_metrics_guard = share_llm_proxy_metrics_guard(
         &state,
@@ -3149,10 +3167,18 @@ pub async fn proxy_handler(
         share_request_app,
     );
     if is_health_check_request {
-        state
-            .proxy
-            .clear_health_probe_failure(&route.subdomain)
-            .await;
+        if status.is_success() {
+            state
+                .proxy
+                .clear_health_probe_failure(&route.subdomain)
+                .await;
+        } else {
+            state
+                .proxy
+                .record_health_probe_failure(route.subdomain.clone())
+                .await;
+            retire_failed_client_web_probe(&state, &route).await;
+        }
     }
     if let Some(response) = ingress_rejection {
         return response;
@@ -3235,6 +3261,28 @@ pub async fn proxy_handler(
         );
     }
     response
+}
+
+async fn retire_failed_client_web_probe(state: &ServerState, route: &RouteEntry) {
+    if !route.is_client_web() {
+        return;
+    }
+    let Some(connection_id) = route.connection_id() else {
+        return;
+    };
+    if state
+        .proxy
+        .remove_route_target_if_generation(&route.subdomain, connection_id, route.generation)
+        .await
+    {
+        warn!(
+            subdomain = %route.subdomain,
+            installation_id = route.installation_id().unwrap_or("-"),
+            connection_id,
+            generation = route.generation,
+            "retired client web route after backend health probe failed"
+        );
+    }
 }
 
 fn is_image_generation_submit_path(path: &str) -> bool {
@@ -3422,17 +3470,6 @@ async fn handle_image_generation_stream_submit(
     builder = with_share_user_country_headers(builder, Some(user_country.as_str()));
 
     let metrics_permit = state.metrics.proxy_request_started();
-    state
-        .recent_traffic
-        .record_with_id(
-            admission_request_id.clone(),
-            share_id.to_string(),
-            route.share_name.clone(),
-            Some(route.subdomain.clone()),
-            Some(user_country.clone()),
-            api_user_email.clone(),
-        )
-        .await;
     let request_id = admission_request_id;
     builder = match with_signed_ingress_context(
         state,
@@ -3450,15 +3487,29 @@ async fn handle_image_generation_stream_submit(
         Ok(builder) => builder,
         Err(response) => return response,
     };
-    let recent_traffic_guard = Some(RecentTrafficGuard {
-        traffic: state.recent_traffic.clone(),
-        request_id: request_id.clone(),
-    });
+    state
+        .recent_traffic
+        .record_with_id(
+            request_id.clone(),
+            share_id.to_string(),
+            route.share_name.clone(),
+            Some(route.subdomain.clone()),
+            Some(user_country.clone()),
+            api_user_email.clone(),
+        )
+        .await;
+    let mut recent_traffic_guard = Some(RecentTrafficGuard::new(
+        state.recent_traffic.clone(),
+        request_id.clone(),
+    ));
 
     let request_started = Instant::now();
     let upstream = match builder.body(upstream_body).send().await {
         Ok(response) => response,
         Err(err) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
+            }
             state.metrics.record_proxy_upstream_error(false);
             warn!(
                 share_id = %share_id,
@@ -3494,6 +3545,9 @@ async fn handle_image_generation_stream_submit(
         }
     };
     let status = upstream.status();
+    if let Some(guard) = recent_traffic_guard.as_mut() {
+        guard.set_status(status);
+    }
     let response_headers = upstream.headers().clone();
     if let Some(response) = ingress_rejection_response(
         state,
@@ -6317,6 +6371,46 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
                 .state,
             RouteAvailability::Reconnecting
         );
+    }
+
+    #[tokio::test]
+    async fn failed_client_web_probe_retires_matching_route_generation() {
+        let registry = ProxyRegistry::default();
+        registry
+            .set_route_with_kind(
+                "client-probe".into(),
+                "127.0.0.1:3000".into(),
+                RouteKind::ClientWeb,
+                Some("inst-client-probe".into()),
+                Some("connection-client-probe".into()),
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let route = registry
+            .backend_for_host("client-probe.example.com", "example.com")
+            .await
+            .expect("client web route should start active");
+        assert!(route.is_client_web());
+
+        assert!(
+            registry
+                .remove_route_target_if_generation(
+                    route.subdomain(),
+                    route.connection_id().unwrap(),
+                    route.generation(),
+                )
+                .await
+        );
+        assert!(matches!(
+            registry
+                .route_for_host_request("client-probe.example.com", "example.com")
+                .await,
+            RouteLookup::Reconnecting
+        ));
     }
 
     #[tokio::test]

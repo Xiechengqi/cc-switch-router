@@ -8,7 +8,7 @@ use russh::keys::key::KeyPair;
 use russh::keys::{encode_pkcs8_pem, load_secret_key};
 use russh::server::Msg;
 use russh::server::{Auth, Session};
-use russh::{Channel, ChannelId, server};
+use russh::{Channel, ChannelId, Disconnect, server};
 use tokio::io;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -112,6 +112,8 @@ struct ForwardHandle {
     generation: u64,
     closed: bool,
 }
+
+const FORWARD_CHANNEL_FAILURE_LIMIT: u32 = 3;
 
 impl ForwardHandle {
     fn new(
@@ -439,13 +441,23 @@ async fn serve_forward_listener(
     generation: u64,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut consecutive_channel_failures = 0_u32;
     loop {
         let accepted = tokio::select! {
             biased;
 
             changed = shutdown_rx.changed() => {
                 match changed {
-                    Ok(()) if *shutdown_rx.borrow() => return Ok(()),
+                    Ok(()) if *shutdown_rx.borrow() => {
+                        let _ = handle
+                            .disconnect(
+                                Disconnect::ByApplication,
+                                "router forward retired".into(),
+                                "en".into(),
+                            )
+                            .await;
+                        return Ok(());
+                    }
                     Ok(()) => continue,
                     Err(_) => return Ok(()),
                 }
@@ -458,6 +470,13 @@ async fn serve_forward_listener(
                 metrics.forward_accept_error(&err.to_string());
                 proxy
                     .remove_route_target_if_generation(&subdomain, &connection_id, generation)
+                    .await;
+                let _ = handle
+                    .disconnect(
+                        Disconnect::ByApplication,
+                        "router forward listener failed".into(),
+                        "en".into(),
+                    )
                     .await;
                 return Err(err.into());
             }
@@ -477,13 +496,30 @@ async fn serve_forward_listener(
         {
             Ok(channel) => channel,
             Err(err) => {
+                consecutive_channel_failures = consecutive_channel_failures.saturating_add(1);
                 warn!(
-                    "failed to open one forwarded tcp channel: {} subdomain={} connection_id={} generation={}; listener remains registered",
-                    err, subdomain, connection_id, generation
+                    "failed to open forwarded tcp channel: {} subdomain={} connection_id={} generation={} consecutive_failures={}",
+                    err, subdomain, connection_id, generation, consecutive_channel_failures
                 );
+                if consecutive_channel_failures >= FORWARD_CHANNEL_FAILURE_LIMIT {
+                    proxy
+                        .remove_route_target_if_generation(&subdomain, &connection_id, generation)
+                        .await;
+                    let _ = handle
+                        .disconnect(
+                            Disconnect::ByApplication,
+                            "router forward backend unavailable".into(),
+                            "en".into(),
+                        )
+                        .await;
+                    anyhow::bail!(
+                        "forwarded tcp backend failed {consecutive_channel_failures} consecutive channel opens"
+                    );
+                }
                 continue;
             }
         };
+        consecutive_channel_failures = 0;
 
         tokio::spawn(async move {
             let mut ssh_stream = channel.into_stream();

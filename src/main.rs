@@ -288,6 +288,9 @@ async fn main() -> Result<()> {
     let runtime_proxy = state.proxy.clone();
     let runtime_config = config.clone();
     let runtime_traffic = state.recent_traffic.clone();
+    let request_log_recovery_store = state.store.clone();
+    let request_log_recovery_proxy = state.proxy.clone();
+    let request_log_recovery_config = config.clone();
     let resend_usage_cache = state.resend_usage_cache.clone();
     let resend_usage_api_key = config.resend_api_key.clone();
     let metrics_config = config.clone();
@@ -473,6 +476,39 @@ async fn main() -> Result<()> {
                 .await
                 {
                     tracing::warn!("share runtime refresh failed: {err}");
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
+    let request_log_recovery_task = spawn_background_task(
+        "Share request log recovery",
+        background_shutdown_rx.clone(),
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match request_log_recovery_store
+                    .recover_share_request_logs_cycle(
+                        &request_log_recovery_config,
+                        &request_log_recovery_proxy,
+                    )
+                    .await
+                {
+                    Ok(summary) if summary.recovered > 0 => info!(
+                        shares = summary.shares_checked,
+                        pages = summary.pages,
+                        recovered = summary.recovered,
+                        failed = summary.failed,
+                        "Share request log recovery synchronized entries"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "Share request log recovery cycle failed"
+                    ),
                 }
             }
             #[allow(unreachable_code)]
@@ -679,6 +715,7 @@ async fn main() -> Result<()> {
         ("IP blacklist logger", ip_blacklist_log_task),
         ("route health probe", probe_task),
         ("Share runtime refresh", runtime_task),
+        ("Share request log recovery", request_log_recovery_task),
         ("Resend usage refresh", resend_usage_task),
         ("metrics collector", metrics_task),
         ("clock health", clock_health_task),

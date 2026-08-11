@@ -9,6 +9,7 @@ import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-e
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getShareImageGenerationRequestLogs,
+  getShareRequestLogs,
   getShareUsageByEmail,
   getShareUserLimitStatus,
 } from "@/lib/api";
@@ -1030,7 +1031,7 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
       )}
       {share ? <ShareEmailUsagePanel share={share} app={shareApp} /> : null}
       {share ? (
-        <ShareProviderRequestsPanel share={share} app={shareApp} />
+        <ShareProviderRequestsPanel share={share} />
       ) : null}
     </div>
   );
@@ -1875,20 +1876,71 @@ type RequestLogTab = "text" | "image";
 
 export function ShareProviderRequestsPanel({
   share,
-  app,
 }: {
   share: ShareView;
-  app: keyof ShareAppProviders;
 }) {
   const { t } = useLocaleText();
   const [selectedKey, setSelectedKey] = React.useState<RequestLogTab>("text");
-  const textLogs = React.useMemo(
-    () =>
-      (share.recentRequests || []).filter(
-        (log) => (log.appType || "").toLowerCase() === app,
-      ),
-    [share.recentRequests, app],
+  const apps = React.useMemo(() => shareAccessApps(share), [share]);
+  const [appFilter, setAppFilter] = React.useState<"all" | CoreShareApp>("all");
+  const [textLogs, setTextLogs] = React.useState<ShareRequestLog[]>(share.recentRequests || []);
+  const [nextCursor, setNextCursor] = React.useState<string | undefined>();
+  const [hasMore, setHasMore] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const requestSequence = React.useRef(0);
+  const loadedTextLogQueryRef = React.useRef("");
+  const textLogQueryKey = `${share.shareId}:${appFilter}`;
+  const recentRequestVersion = React.useMemo(
+    () => (share.recentRequests || [])
+      .map((log) => `${log.requestId}:${log.usageRevision || 0}`)
+      .join("|"),
+    [share.recentRequests],
   );
+
+  const loadTextLogs = React.useCallback(async (cursor: string | undefined, reset: boolean) => {
+    const sequence = ++requestSequence.current;
+    setLoading(true);
+    setError("");
+    try {
+      const page = await getShareRequestLogs(share.shareId, {
+        app: appFilter === "all" ? undefined : appFilter,
+        cursor,
+        limit: 50,
+      });
+      if (sequence !== requestSequence.current) return;
+      setTextLogs((current) => {
+        if (reset) return page.logs || [];
+        const merged = new Map(current.map((log) => [log.requestId, log]));
+        (page.logs || []).forEach((log) => merged.set(log.requestId, log));
+        return Array.from(merged.values());
+      });
+      setNextCursor(page.nextCursor);
+      setHasMore(page.hasMore);
+    } catch (err) {
+      if (sequence === requestSequence.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (sequence === requestSequence.current) setLoading(false);
+    }
+  }, [appFilter, share.shareId]);
+
+  React.useEffect(() => {
+    if (selectedKey !== "text") return;
+    if (loadedTextLogQueryRef.current !== textLogQueryKey) {
+      loadedTextLogQueryRef.current = textLogQueryKey;
+      setTextLogs([]);
+      setNextCursor(undefined);
+      setHasMore(false);
+    }
+    void loadTextLogs(undefined, true);
+  }, [loadTextLogs, recentRequestVersion, selectedKey, textLogQueryKey]);
+
+  React.useEffect(() => {
+    setAppFilter("all");
+  }, [share.shareId]);
+
   return (
     <div className="grid gap-3">
       <div className="mono-label text-muted-foreground">
@@ -1918,8 +1970,42 @@ export function ShareProviderRequestsPanel({
         </Tabs.List>
       </Tabs>
       {selectedKey === "text" ? (
-        <ShareRequestLogs logs={textLogs} />
-      ) : app === "codex" ? (
+        <div className="grid gap-3">
+          {apps.length > 1 ? (
+            <Tabs
+              selectedKey={appFilter}
+              onSelectionChange={(key: React.Key) =>
+                setAppFilter(String(key) as "all" | CoreShareApp)
+              }
+              variant="secondary"
+              className="text-foreground"
+            >
+              <Tabs.List className="flex w-full flex-wrap gap-1 text-foreground">
+                <Tabs.Tab id="all" className="rounded-md px-2 py-1 text-xs">
+                  {t("dashboard.all")}
+                </Tabs.Tab>
+                {apps.map((app) => (
+                  <Tabs.Tab key={app} id={app} className="rounded-md px-2 py-1 text-xs">
+                    {SHARE_APP_LABELS[app]}
+                  </Tabs.Tab>
+                ))}
+              </Tabs.List>
+            </Tabs>
+          ) : null}
+          <ShareRequestLogs logs={textLogs} />
+          {error ? <EmptyBlock>{error}</EmptyBlock> : null}
+          {hasMore ? (
+            <Button
+              size="sm"
+              variant="outline"
+              isDisabled={loading}
+              onPress={() => void loadTextLogs(nextCursor, false)}
+            >
+              {loading ? t("dashboard.usageEmail.loading") : t("dashboard.loadMore")}
+            </Button>
+          ) : null}
+        </div>
+      ) : apps.includes("codex") ? (
         <ShareImageRequestLogs shareId={share.shareId} />
       ) : (
         <EmptyBlock>{t("dashboard.noImageJobs")}</EmptyBlock>

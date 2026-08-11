@@ -2007,9 +2007,16 @@ export const messages = {
     "dashboard.clientUpgrading": "Upgrading",
     "dashboard.clientUpgradeSucceeded": "{target} upgraded successfully",
     "dashboard.clientUpgradeFailed": "{target} upgrade failed",
-    "dashboard.clientUpgradeTimedOut": "{target} upgrade timed out",
-    "dashboard.clientUpgradeFailedButton": "Upgrade failed",
-    "dashboard.clientUpgradeTimedOutButton": "Upgrade timed out",
+    "dashboard.clientUpgradeFailedButton": "Retry upgrade",
+    "dashboard.clientUpgradeRecovering": "Checking upgrade status",
+    "dashboard.clientUpgradeStatusUnavailable": "Upgrade status is unavailable; retrying",
+    "dashboard.clientUpgradeStatusUnavailableButton": "Status unavailable",
+    "dashboard.clientUpgradeStartUncertain":
+      "The upgrade request result is uncertain. Router is checking whether the Client accepted it.",
+    "dashboard.clientUpgradeStartUnconfirmed":
+      "Router could not confirm that the Client accepted the upgrade request. You can retry.",
+    "dashboard.clientUpgradeTaskMissing":
+      "Router no longer has the accepted upgrade task. You can retry the upgrade.",
     "dashboard.clientUpgradeConfirmTitle": "Confirm client upgrade",
     "dashboard.clientUpgradeConfirm":
       "Force re-pull the latest cc-switch-server release for {target}. Version equality is not checked, and the service may restart after upgrade.",
@@ -2256,6 +2263,7 @@ export const messages = {
     "dashboard.sharePriorityBlocked": "Blocked",
     "dashboard.sharePriorityUnavailableState": "Unavailable",
     "dashboard.requestLogs": "Request logs",
+    "dashboard.loadMore": "Load more",
     "dashboard.textRequests": "Text",
     "dashboard.imageJobs": "Images",
     "dashboard.imageResultUrl": "Image URL",
@@ -4399,9 +4407,16 @@ export const messages = {
     "dashboard.clientUpgrading": "升级中",
     "dashboard.clientUpgradeSucceeded": "{target} 升级成功",
     "dashboard.clientUpgradeFailed": "{target} 升级失败",
-    "dashboard.clientUpgradeTimedOut": "{target} 升级超时",
-    "dashboard.clientUpgradeFailedButton": "升级失败",
-    "dashboard.clientUpgradeTimedOutButton": "升级超时",
+    "dashboard.clientUpgradeFailedButton": "重试升级",
+    "dashboard.clientUpgradeRecovering": "正在确认升级状态",
+    "dashboard.clientUpgradeStatusUnavailable": "升级状态暂不可达，正在重试",
+    "dashboard.clientUpgradeStatusUnavailableButton": "状态暂不可达",
+    "dashboard.clientUpgradeStartUncertain":
+      "升级请求结果暂不确定，Router 正在确认 Client 是否已接受任务。",
+    "dashboard.clientUpgradeStartUnconfirmed":
+      "Router 无法确认 Client 已接受升级请求，可以重新发起升级。",
+    "dashboard.clientUpgradeTaskMissing":
+      "Router 已无法找到此前接受的升级任务，可以重新发起升级。",
     "dashboard.clientUpgradeConfirmTitle": "确认客户端升级",
     "dashboard.clientUpgradeConfirm":
       "将强制为 {target} 重新拉取最新 cc-switch-server 版本，不检查是否已是最新，升级完成后可能自动重启服务。",
@@ -4632,6 +4647,7 @@ export const messages = {
     "dashboard.sharePriorityBlocked": "已拉黑",
     "dashboard.sharePriorityUnavailableState": "不可用",
     "dashboard.requestLogs": "请求日志",
+    "dashboard.loadMore": "加载更多",
     "dashboard.textRequests": "文字",
     "dashboard.imageJobs": "图片",
     "dashboard.imageResultUrl": "图片 URL",

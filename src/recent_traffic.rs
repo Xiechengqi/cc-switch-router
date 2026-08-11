@@ -24,7 +24,7 @@ use crate::geo::iso2_to_iso3;
 /// Sliding window for country count aggregation.
 const COUNTRY_WINDOW_SECS: i64 = 5 * 60;
 /// Freshness window for dashboard ticker request events.
-const TICKER_WINDOW_SECS: i64 = 8;
+const TICKER_WINDOW_SECS: i64 = 60;
 /// Maximum number of events held in the ring buffer.
 const MAX_EVENTS: usize = 64;
 /// Hard cap on retained event records — protects memory under sustained spikes.
@@ -285,8 +285,30 @@ impl RecentTraffic {
     /// event stays in the ring (so it can still appear in the ticker briefly
     /// during its `leaving` animation) until the freshness window evicts it.
     pub async fn complete(&self, request_id: &str) {
+        self.complete_with_result(request_id, None, None).await;
+    }
+
+    pub async fn complete_with_result(
+        &self,
+        request_id: &str,
+        status_code: Option<u16>,
+        latency_ms: Option<u64>,
+    ) {
         let mut state = self.inner.write().await;
         state.inflight_request_ids.remove(request_id);
+        if let Some(event) = state
+            .events
+            .iter_mut()
+            .rev()
+            .find(|event| event.request_id == request_id)
+        {
+            if status_code.is_some() {
+                event.status_code = status_code;
+            }
+            if latency_ms.is_some() {
+                event.latency_ms = latency_ms;
+            }
+        }
     }
 
     /// Build the dashboard payload. Walks the ring once to compute country counts and
@@ -439,6 +461,26 @@ mod tests {
                 .any(|e| e.request_id == request_id),
             "completed + stale event must be evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_records_status_and_total_latency() {
+        let traffic = RecentTraffic::new();
+        let request_id = record(&traffic, "share-x", Some("US")).await;
+
+        traffic
+            .complete_with_result(&request_id, Some(201), Some(432))
+            .await;
+
+        let snapshot = traffic.snapshot().await;
+        let event = snapshot
+            .recent_events
+            .iter()
+            .find(|event| event.request_id == request_id)
+            .unwrap();
+        assert!(!event.is_inflight);
+        assert_eq!(event.status_code, Some(201));
+        assert_eq!(event.latency_ms, Some(432));
     }
 
     #[tokio::test]

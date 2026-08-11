@@ -48,8 +48,9 @@ use crate::models::{
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
     HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
     InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
-    InstallationSetupCompletedResponse, IssueLeaseRequest, IssueLeaseResponse, MapDisplaySettings,
-    MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
+    InstallationSetupCompletedResponse, InstallationUpgradeTaskReportRequest,
+    InstallationUpgradeTaskReportResponse, IssueLeaseRequest, IssueLeaseResponse,
+    MapDisplaySettings, MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketNotificationEmailLogView,
     MarketNotificationEmailRequest, MarketNotificationEmailResponse,
@@ -66,12 +67,13 @@ use crate::models::{
     ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
     ShareDescriptorBatchSyncResponse, ShareEditAckRequest, ShareEditAvailableEvent,
     ShareEditEventSignaturePayload, ShareHeartbeatRequest, SharePendingEditsRequest,
-    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRuntimeRefreshRequest, ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
-    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
-    UpdateUsageCardSettingsRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
-    UpgradeInstallationStatusResponse, UsageCardSettingsResponse, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogBatchSyncResponse,
+    ShareRequestLogEntry, ShareRuntimeRefreshRequest, ShareSettingsPatch,
+    ShareSettingsUpdateRequest, ShareSyncRequest, SubdomainAvailabilityResponse,
+    TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse, UpdateUsageCardSettingsRequest,
+    UpgradeInstallationRequest, UpgradeInstallationResponse, UpgradeInstallationStatusResponse,
+    UsageCardSettingsResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -122,12 +124,24 @@ const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
 const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 100;
 const ROUTER_ACCESS_COOKIE: &str = "cc_switch_router_access";
 const INSTALLATION_CONTROL_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES: usize = 512 * 1024;
+const INSTALLATION_UPGRADE_TASK_BODY_LIMIT_BYTES: usize =
+    INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES + 32 * 1024;
 
 fn installation_control_body_limited<S>(route: MethodRouter<S>) -> MethodRouter<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     route.layer(DefaultBodyLimit::max(INSTALLATION_CONTROL_BODY_LIMIT_BYTES))
+}
+
+fn installation_upgrade_task_body_limited<S>(route: MethodRouter<S>) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    route.layer(DefaultBodyLimit::max(
+        INSTALLATION_UPGRADE_TASK_BODY_LIMIT_BYTES,
+    ))
 }
 
 mod ui_assets {
@@ -190,7 +204,7 @@ struct ShareUserLimitStatusQuery {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InstallationUpgradeStatusQuery {
-    task_id: String,
+    task_id: Option<String>,
 }
 
 pub fn router(state: ServerState) -> Router {
@@ -303,6 +317,10 @@ pub fn router(state: ServerState) -> Router {
             post(report_installation_status),
         )
         .route(
+            "/v1/installations/upgrade-task-report",
+            installation_upgrade_task_body_limited(post(report_installation_upgrade_task)),
+        )
+        .route(
             "/v1/installations/:installation_id/upgrade",
             post(upgrade_installation),
         )
@@ -402,6 +420,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/refresh-usage",
             post(refresh_share_usage),
+        )
+        .route(
+            "/v1/shares/:share_id/request-logs",
+            get(list_share_request_logs),
         )
         .route(
             "/v1/shares/:share_id/image-request-logs",
@@ -1191,6 +1213,15 @@ async fn report_installation_status(
     Ok(Json(state.store.report_installation_status(input).await?))
 }
 
+async fn report_installation_upgrade_task(
+    State(state): State<ServerState>,
+    Json(input): Json<InstallationUpgradeTaskReportRequest>,
+) -> Result<Json<InstallationUpgradeTaskReportResponse>, AppError> {
+    Ok(Json(
+        state.store.report_installation_upgrade_task(input).await?,
+    ))
+}
+
 async fn installation_heartbeat(
     State(state): State<ServerState>,
     Json(input): Json<InstallationHeartbeatRequest>,
@@ -1254,6 +1285,7 @@ async fn upgrade_installation(
         )
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(body)
+        .timeout(Duration::from_secs(30))
         .send()
         .await
         .map_err(|error| AppError::Internal(format!("client upgrade request failed: {error}")))?;
@@ -1274,6 +1306,15 @@ async fn upgrade_installation(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Internal("client upgrade response missing taskId".into()))?
         .to_string();
+    state
+        .store
+        .record_installation_upgrade_started(
+            &installation_id,
+            &task_id,
+            &session_email,
+            input.restart_after,
+        )
+        .await?;
     Ok(Json(UpgradeInstallationResponse { ok: true, task_id }))
 }
 
@@ -1284,59 +1325,15 @@ async fn upgrade_installation_status(
     Query(query): Query<InstallationUpgradeStatusQuery>,
 ) -> Result<Json<UpgradeInstallationStatusResponse>, AppError> {
     let session_email = require_session_email(&state, &headers).await?;
-    let task_id = query.task_id.trim();
-    if task_id.is_empty() {
-        return Err(AppError::BadRequest("taskId is required".into()));
-    }
-    let tunnel_url = state
+    let status = state
         .store
-        .prepare_installation_upgrade_status(&state.config, &installation_id, &session_email)
+        .installation_upgrade_status_for_owner(
+            &installation_id,
+            query.task_id.as_deref(),
+            &session_email,
+        )
         .await?;
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("taskId", task_id)
-        .finish();
-    let path_and_query = format!("/web-api/admin/upgrade/status?{query}");
-    let target = client_upgrade_target(
-        &state,
-        &tunnel_url,
-        &installation_id,
-        &session_email,
-        "GET",
-        &path_and_query,
-        &[],
-    )
-    .await?;
-    let response = state
-        .proxy_http
-        .get(format!("{}{}", target.backend_base, path_and_query))
-        .header(
-            crate::ingress_context::INGRESS_CONTEXT_HEADER,
-            target.ingress.encoded_context,
-        )
-        .header(
-            crate::ingress_context::INGRESS_SIGNATURE_HEADER,
-            target.ingress.signature,
-        )
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::Internal(format!("client upgrade status request failed: {error}"))
-        })?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "client upgrade status failed: {status}: {body}"
-        )));
-    }
-    let status = response
-        .json::<UpgradeInstallationStatusResponse>()
-        .await
-        .map_err(|error| {
-            AppError::Internal(format!("parse client upgrade status failed: {error}"))
-        })?;
-    Ok(Json(validate_installation_upgrade_status(status, task_id)?))
+    Ok(Json(status))
 }
 
 struct ClientUpgradeTarget {
@@ -1420,24 +1417,6 @@ async fn client_upgrade_target(
         backend_base: format!("http://{}", route.route_target()),
         ingress,
     })
-}
-
-fn validate_installation_upgrade_status(
-    status: UpgradeInstallationStatusResponse,
-    expected_task_id: &str,
-) -> Result<UpgradeInstallationStatusResponse, AppError> {
-    if status.task_id != expected_task_id {
-        return Err(AppError::Internal(
-            "client upgrade status taskId does not match".into(),
-        ));
-    }
-    if !matches!(status.status.as_str(), "running" | "success" | "failed") {
-        return Err(AppError::Internal(format!(
-            "client upgrade status is invalid: {}",
-            status.status
-        )));
-    }
-    Ok(status)
 }
 
 async fn bind_installation_owner_email(
@@ -1711,7 +1690,13 @@ async fn dashboard(
 ) -> Result<Json<DashboardResponse>, AppError> {
     let viewer_email = extract_dashboard_session_email(&state, &headers).await?;
     let mut runtime_config = state.config.clone();
-    runtime_config.client_notifications = state.dynamic.read().await.client_notifications.clone();
+    let viewer_is_admin = {
+        let dynamic = state.dynamic.read().await;
+        runtime_config.client_notifications = dynamic.client_notifications.clone();
+        viewer_email
+            .as_deref()
+            .is_some_and(|email| dynamic.is_admin(email))
+    };
     let mut response = state
         .store
         .dashboard_snapshot(
@@ -1731,6 +1716,7 @@ async fn dashboard(
         confirmed_request_events(&snapshot, &response, &global_ticker_logs);
     response.user_country_counts = confirmed_country_counts;
     response.recent_request_events = confirmed_events;
+    apply_dashboard_request_log_visibility(&mut response, viewer_email.as_deref(), viewer_is_admin);
     Ok(Json(response))
 }
 
@@ -1963,25 +1949,7 @@ fn confirmed_request_events(
             events_by_id.insert(event.request_id.clone(), event);
         }
     }
-    let request_log_ids = response
-        .ticker_shares
-        .iter()
-        .flat_map(|share| share.recent_requests.iter())
-        .map(|log| log.request_id.as_str())
-        .chain(
-            response
-                .market_request_logs
-                .iter()
-                .map(|log| log.request_id.as_str()),
-        )
-        .collect::<HashSet<_>>();
-    let confirmed_live_events = snapshot
-        .events
-        .iter()
-        .filter(|event| request_log_ids.contains(event.request_id.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    for event in &confirmed_live_events {
+    for event in &snapshot.recent_events {
         match events_by_id.get_mut(&event.request_id) {
             Some(existing) => {
                 merge_ticker_event_country(existing, event);
@@ -1991,6 +1959,12 @@ fn confirmed_request_events(
                 }
                 if event.share_name.is_some() {
                     existing.share_name = event.share_name.clone();
+                }
+                if event.status_code.is_some() {
+                    existing.status_code = event.status_code;
+                }
+                if event.latency_ms.is_some() {
+                    existing.latency_ms = event.latency_ms;
                 }
             }
             None => {
@@ -2011,13 +1985,117 @@ fn confirmed_request_events(
     if events.len() > DASHBOARD_REQUEST_TICKER_LIMIT {
         events.drain(0..events.len() - DASHBOARD_REQUEST_TICKER_LIMIT);
     }
-    let mut country_counts = HashMap::new();
-    for event in &confirmed_live_events {
-        if let Some(iso3) = event.user_country_iso3.as_deref() {
-            *country_counts.entry(iso3.to_string()).or_insert(0) += 1;
+    (events, snapshot.country_counts.clone())
+}
+
+fn apply_dashboard_request_log_visibility(
+    response: &mut DashboardResponse,
+    viewer_email: Option<&str>,
+    viewer_is_admin: bool,
+) {
+    let share_log_access = response
+        .shares
+        .iter()
+        .map(|share| {
+            let can_view_all = viewer_is_admin || share.can_manage;
+            (share.share_id.clone(), can_view_all)
+        })
+        .collect::<HashMap<_, _>>();
+    for share in &mut response.shares {
+        let can_view_all = share_log_access
+            .get(&share.share_id)
+            .copied()
+            .unwrap_or(viewer_is_admin);
+        retain_visible_share_request_logs(&mut share.recent_requests, viewer_email, can_view_all);
+    }
+
+    for share in &mut response.ticker_shares {
+        let can_view_all = share_log_access
+            .get(&share.share_id)
+            .copied()
+            .unwrap_or(viewer_is_admin);
+        if !can_view_all {
+            for log in &mut share.recent_requests {
+                redact_foreign_share_request_identity(log, viewer_email);
+            }
         }
     }
-    (events, country_counts)
+
+    let managed_market_emails = response
+        .markets
+        .iter()
+        .filter(|market| viewer_is_admin || market.can_manage)
+        .map(|market| market.email.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for market in &mut response.markets {
+        let can_view_all =
+            viewer_is_admin || managed_market_emails.contains(&market.email.to_ascii_lowercase());
+        if !can_view_all {
+            market
+                .recent_requests
+                .retain(|log| emails_match(log.user_email.as_deref(), viewer_email));
+        }
+    }
+
+    let managed_market_request_ids = response
+        .market_request_logs
+        .iter()
+        .filter(|log| {
+            viewer_is_admin
+                || managed_market_emails.contains(&log.market_email.to_ascii_lowercase())
+        })
+        .map(|log| log.request_id.clone())
+        .collect::<HashSet<_>>();
+    for log in &mut response.market_request_logs {
+        let can_view_all = viewer_is_admin
+            || managed_market_emails.contains(&log.market_email.to_ascii_lowercase());
+        if !can_view_all {
+            if !emails_match(log.user_email.as_deref(), viewer_email) {
+                log.user_email = None;
+            }
+            log.api_key_prefix = None;
+        }
+    }
+
+    for event in &mut response.recent_request_events {
+        let can_view_all = viewer_is_admin
+            || share_log_access
+                .get(&event.share_id)
+                .copied()
+                .unwrap_or(false)
+            || managed_market_request_ids.contains(&event.request_id);
+        if !can_view_all && !emails_match(event.user_email.as_deref(), viewer_email) {
+            event.user_email = None;
+        }
+    }
+}
+
+fn retain_visible_share_request_logs(
+    logs: &mut Vec<ShareRequestLogEntry>,
+    viewer_email: Option<&str>,
+    can_view_all: bool,
+) {
+    if can_view_all {
+        return;
+    }
+    logs.retain(|log| emails_match(log.user_email.as_deref(), viewer_email));
+}
+
+fn redact_foreign_share_request_identity(
+    log: &mut ShareRequestLogEntry,
+    viewer_email: Option<&str>,
+) {
+    log.session_id = None;
+    if !emails_match(log.user_email.as_deref(), viewer_email) {
+        log.user_email = None;
+    }
+}
+
+fn emails_match(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
 }
 
 fn merge_persisted_ticker_event(target: &mut RecentRequestEvent, mut source: RecentRequestEvent) {
@@ -2964,6 +3042,55 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn upgrade_task_body_limit_accepts_diagnostics_and_rejects_oversize() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/installations/upgrade-task-report",
+                installation_upgrade_task_body_limited(post(counted_json_handler)),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let bounded = format!(
+            "{{\"logs\":\"{}\"}}",
+            "x".repeat(INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES)
+        );
+
+        let accepted = client
+            .post(format!(
+                "http://{address}/v1/installations/upgrade-task-report"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(bounded)
+            .send()
+            .await
+            .unwrap();
+        let oversized = format!(
+            "{{\"logs\":\"{}\"}}",
+            "x".repeat(INSTALLATION_UPGRADE_TASK_BODY_LIMIT_BYTES)
+        );
+        let rejected = client
+            .post(format!(
+                "http://{address}/v1/installations/upgrade-task-report"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(oversized)
+            .send()
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn dashboard_session_policy_accepts_valid_session() {
         let viewer_email = require_dashboard_session_email(Some("owner@example.com".into()))
@@ -2995,95 +3122,6 @@ mod tests {
             .expect_err("present but invalid dashboard credentials must be rejected");
 
         assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn client_upgrade_status_accepts_supported_terminal_and_running_states() {
-        for status in ["running", "success", "failed"] {
-            let response = UpgradeInstallationStatusResponse {
-                task_id: "task-1".into(),
-                status: status.into(),
-                restart_pending: status == "success",
-                target_commit_id: Some("aabbccddeeff".into()),
-                logs: Vec::new(),
-            };
-
-            let validated = validate_installation_upgrade_status(response, "task-1")
-                .expect("supported upgrade status");
-
-            assert_eq!(validated.status, status);
-            assert_eq!(validated.target_commit_id.as_deref(), Some("aabbccddeeff"));
-        }
-    }
-
-    #[test]
-    fn client_upgrade_status_preserves_client_diagnostics() {
-        let response = UpgradeInstallationStatusResponse {
-            task_id: "task-1".into(),
-            status: "failed".into(),
-            restart_pending: false,
-            target_commit_id: Some("aabbccddeeff".into()),
-            logs: vec![crate::models::InstallationUpgradeLogEntry {
-                task_id: "task-1".into(),
-                step: 1,
-                total_steps: 7,
-                level: "error".into(),
-                message: "checksum request HTTP 403 Forbidden".into(),
-                progress: None,
-                at: "2026-07-20T10:14:17Z".into(),
-            }],
-        };
-
-        let validated = validate_installation_upgrade_status(response, "task-1")
-            .expect("client diagnostics should be preserved");
-        let payload = serde_json::to_value(validated).unwrap();
-
-        assert_eq!(payload["targetCommitId"], "aabbccddeeff");
-        assert_eq!(payload["restartPending"], false);
-        assert_eq!(
-            payload["logs"][0]["message"],
-            "checksum request HTTP 403 Forbidden"
-        );
-    }
-
-    #[test]
-    fn client_upgrade_status_defaults_diagnostics_from_older_clients() {
-        let response: UpgradeInstallationStatusResponse =
-            serde_json::from_value(serde_json::json!({ "taskId": "task-1", "status": "running" }))
-                .unwrap();
-
-        assert!(!response.restart_pending);
-        assert!(response.target_commit_id.is_none());
-        assert!(response.logs.is_empty());
-    }
-
-    #[test]
-    fn client_upgrade_status_rejects_mismatched_task_or_unknown_state() {
-        let mismatched = validate_installation_upgrade_status(
-            UpgradeInstallationStatusResponse {
-                task_id: "task-other".into(),
-                status: "running".into(),
-                restart_pending: false,
-                target_commit_id: None,
-                logs: Vec::new(),
-            },
-            "task-1",
-        )
-        .expect_err("mismatched task must fail");
-        assert!(mismatched.to_string().contains("taskId does not match"));
-
-        let unknown = validate_installation_upgrade_status(
-            UpgradeInstallationStatusResponse {
-                task_id: "task-1".into(),
-                status: "timed_out".into(),
-                restart_pending: false,
-                target_commit_id: None,
-                logs: Vec::new(),
-            },
-            "task-1",
-        )
-        .expect_err("unknown status must fail");
-        assert!(unknown.to_string().contains("status is invalid"));
     }
 
     #[test]
@@ -3483,9 +3521,9 @@ mod tests {
             ..Default::default()
         };
         let snapshot = RecentTrafficSnapshot {
-            country_counts: HashMap::new(),
-            events: vec![event],
-            recent_events: Vec::new(),
+            country_counts: HashMap::from([("USA".to_string(), 1)]),
+            events: vec![event.clone()],
+            recent_events: vec![event],
         };
         let response = DashboardResponse {
             generated_at: Utc::now(),
@@ -3657,9 +3695,9 @@ mod tests {
             ..Default::default()
         };
         let snapshot = RecentTrafficSnapshot {
-            country_counts: HashMap::new(),
-            events: vec![live],
-            recent_events: Vec::new(),
+            country_counts: HashMap::from([("USA".to_string(), 1)]),
+            events: vec![live.clone()],
+            recent_events: vec![live],
         };
         let response = DashboardResponse {
             generated_at: Utc::now(),
@@ -3752,6 +3790,7 @@ mod tests {
 
     fn share_log(request_id: &str, created_at: i64) -> crate::models::ShareRequestLogEntry {
         crate::models::ShareRequestLogEntry {
+            export_sequence: 0,
             request_id: request_id.into(),
             share_id: "share-1".into(),
             share_name: "Share".into(),
@@ -3922,6 +3961,107 @@ mod tests {
             recent_request_events: Vec::new(),
             market_request_logs,
         }
+    }
+
+    #[test]
+    fn dashboard_request_log_visibility_redacts_foreign_identity_without_dropping_telemetry() {
+        let mut own_share_log = share_log("req-own", 2);
+        own_share_log.user_email = Some("viewer@example.com".into());
+        own_share_log.session_id = Some("own-session".into());
+        let mut foreign_share_log = share_log("req-foreign", 1);
+        foreign_share_log.user_email = Some("foreign@example.com".into());
+        foreign_share_log.session_id = Some("foreign-session".into());
+
+        let mut own_market_log = market_log("req-market-own", "codex");
+        own_market_log.user_email = Some("VIEWER@example.com".into());
+        own_market_log.api_key_prefix = Some("own-prefix".into());
+        let mut foreign_market_log = market_log("req-market-foreign", "codex");
+        foreign_market_log.user_email = Some("foreign@example.com".into());
+        foreign_market_log.api_key_prefix = Some("foreign-prefix".into());
+
+        let mut response = dashboard_response(
+            vec![ticker_share(vec![
+                own_share_log.clone(),
+                foreign_share_log.clone(),
+            ])],
+            vec![own_market_log, foreign_market_log],
+        );
+        response.recent_request_events = vec![
+            RecentRequestEvent {
+                request_id: "req-own".into(),
+                share_id: "share-1".into(),
+                user_email: Some("viewer@example.com".into()),
+                ..Default::default()
+            },
+            RecentRequestEvent {
+                request_id: "req-foreign".into(),
+                share_id: "share-1".into(),
+                user_email: Some("foreign@example.com".into()),
+                ..Default::default()
+            },
+        ];
+
+        apply_dashboard_request_log_visibility(&mut response, Some("viewer@example.com"), false);
+
+        let ticker_logs = &response.ticker_shares[0].recent_requests;
+        assert_eq!(ticker_logs.len(), 2);
+        assert_eq!(
+            ticker_logs[0].user_email.as_deref(),
+            Some("viewer@example.com")
+        );
+        assert!(ticker_logs[0].session_id.is_none());
+        assert!(ticker_logs[1].user_email.is_none());
+        assert!(ticker_logs[1].session_id.is_none());
+        assert_eq!(
+            response.market_request_logs[0].user_email.as_deref(),
+            Some("VIEWER@example.com")
+        );
+        assert!(response.market_request_logs[0].api_key_prefix.is_none());
+        assert!(response.market_request_logs[1].user_email.is_none());
+        assert!(response.market_request_logs[1].api_key_prefix.is_none());
+        assert_eq!(
+            response.recent_request_events[0].user_email.as_deref(),
+            Some("viewer@example.com")
+        );
+        assert!(response.recent_request_events[1].user_email.is_none());
+
+        let mut detail_logs = vec![own_share_log, foreign_share_log];
+        retain_visible_share_request_logs(&mut detail_logs, Some("viewer@example.com"), false);
+        assert_eq!(detail_logs.len(), 1);
+        assert_eq!(detail_logs[0].request_id, "req-own");
+    }
+
+    #[test]
+    fn dashboard_request_log_visibility_preserves_admin_identity() {
+        let mut log = share_log("req-admin", 1);
+        log.user_email = Some("buyer@example.com".into());
+        log.session_id = Some("buyer-session".into());
+        let mut response = dashboard_response(vec![ticker_share(vec![log])], Vec::new());
+        response.recent_request_events = vec![RecentRequestEvent {
+            request_id: "req-admin".into(),
+            share_id: "share-1".into(),
+            user_email: Some("buyer@example.com".into()),
+            ..Default::default()
+        }];
+
+        apply_dashboard_request_log_visibility(&mut response, None, true);
+
+        assert_eq!(
+            response.ticker_shares[0].recent_requests[0]
+                .user_email
+                .as_deref(),
+            Some("buyer@example.com")
+        );
+        assert_eq!(
+            response.ticker_shares[0].recent_requests[0]
+                .session_id
+                .as_deref(),
+            Some("buyer-session")
+        );
+        assert_eq!(
+            response.recent_request_events[0].user_email.as_deref(),
+            Some("buyer@example.com")
+        );
     }
 
     #[test]
@@ -4475,11 +4615,11 @@ async fn batch_sync_share_request_logs(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<ShareRequestLogBatchSyncRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ShareRequestLogBatchSyncResponse>, AppError> {
     let snapshot = state.recent_traffic.snapshot().await;
     let live_context_map = live_request_context_by_request_id(&snapshot);
     let metric_logs = input.logs.clone();
-    state
+    let acks = state
         .store
         .batch_sync_share_request_logs(
             input,
@@ -4489,7 +4629,7 @@ async fn batch_sync_share_request_logs(
         )
         .await?;
     state.metrics.record_share_request_logs(&metric_logs);
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(ShareRequestLogBatchSyncResponse { ok: true, acks }))
 }
 
 async fn refresh_share_runtime(
@@ -6237,6 +6377,26 @@ struct ImageGenerationRequestLogsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRequestLogsQuery {
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRequestLogsResponse {
+    logs: Vec<ShareRequestLogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct ImageGenerationResultQuery {
     token: Option<String>,
 }
@@ -6488,6 +6648,37 @@ async fn list_share_image_generation_request_logs(
         .await?;
     apply_image_generation_log_visibility(&mut logs, &view);
     Ok(Json(ImageGenerationRequestLogsResponse { logs }))
+}
+
+async fn list_share_request_logs(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Query(query): Query<ShareRequestLogsQuery>,
+) -> Result<Json<ShareRequestLogsResponse>, AppError> {
+    let current_user_email = require_user_email(&state, &headers, "share:read").await?;
+    let share = state
+        .store
+        .get_share_for_test(&share_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+    let can_view_all = state.dynamic.read().await.is_admin(&current_user_email)
+        || share.owner_email.eq_ignore_ascii_case(&current_user_email);
+    let page = state
+        .store
+        .list_share_request_logs_page(
+            &share_id,
+            query.app.as_deref(),
+            (!can_view_all).then_some(current_user_email.as_str()),
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(50),
+        )
+        .await?;
+    Ok(Json(ShareRequestLogsResponse {
+        logs: page.logs,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+    }))
 }
 
 async fn list_share_image_generation_jobs_compat(

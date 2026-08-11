@@ -88,6 +88,7 @@ import type {
   ServerLogEventsResponse,
   ServerLogMeta,
   ServerLogScope,
+  ShareRequestLogsPage,
 } from "@/lib/types";
 
 
@@ -123,8 +124,10 @@ export async function parseJson<T>(response: Response): Promise<T> {
   return data as T;
 }
 
-export async function getDashboard() {
-  return parseJson<DashboardResponse>(await authFetch("/v1/dashboard", { cache: "no-store" }));
+export async function getDashboard(signal?: AbortSignal) {
+  return parseJson<DashboardResponse>(
+    await authFetch("/v1/dashboard", { cache: "no-store", signal }),
+  );
 }
 
 export async function getClientLogs(installationId: string, signal?: AbortSignal) {
@@ -472,12 +475,14 @@ export type ClientInstallationUpgradeStatus = {
 
 export async function getClientInstallationUpgradeStatus(
   installationId: string,
-  taskId: string,
+  taskId?: string,
   signal?: AbortSignal,
 ) {
-  const params = new URLSearchParams({ taskId });
+  const params = new URLSearchParams();
+  if (taskId) params.set("taskId", taskId);
+  const query = params.toString();
   return parseJson<ClientInstallationUpgradeStatus>(
-    await authFetch(`/v1/installations/${installationId}/upgrade/status?${params}`, {
+    await authFetch(`/v1/installations/${installationId}/upgrade/status${query ? `?${query}` : ""}`, {
       cache: "no-store",
       signal,
     }),
@@ -757,6 +762,21 @@ export async function getShareImageGenerationRequestLogs(
     }),
   );
   return data.logs || [];
+}
+
+export async function getShareRequestLogs(
+  shareId: string,
+  options: { app?: "claude" | "codex" | "gemini"; cursor?: string; limit?: number } = {},
+): Promise<ShareRequestLogsPage> {
+  const params = new URLSearchParams();
+  if (options.app) params.set("app", options.app);
+  if (options.cursor) params.set("cursor", options.cursor);
+  params.set("limit", String(options.limit || 50));
+  return parseJson<ShareRequestLogsPage>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/request-logs?${params}`, {
+      cache: "no-store",
+    }),
+  );
 }
 
 export async function getProvisionSshKey() {

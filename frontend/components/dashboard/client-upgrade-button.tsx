@@ -5,9 +5,9 @@ import { CircleX, Clock3, Loader2, Rocket } from "lucide-react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { clientOwnerEmail, clientTunnelDisplayUrl } from "@/components/dashboard/data-tables";
-import { clientOperationalSummary } from "@/components/dashboard/operational-status";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  ApiError,
   type ClientInstallationUpgradeLog,
   getClientInstallationUpgradeStatus,
   upgradeClientInstallation,
@@ -15,34 +15,55 @@ import {
 import { readAuthState } from "@/lib/auth";
 import type { DashboardClient } from "@/lib/types";
 
-type ClientUpgradePhase = "idle" | "starting" | "running" | "failed" | "timeout";
+type ClientUpgradePhase = "idle" | "starting" | "recovering" | "running" | "failed";
+type ClientUpgradeRecoveryReason = "discovery" | "start";
 
 type ClientUpgradeState = {
   phase: ClientUpgradePhase;
   startedAt: number;
   taskId?: string;
   errorMessage?: string;
+  recoveryReason?: ClientUpgradeRecoveryReason;
+  statusUnavailable?: boolean;
 };
 
-const CLIENT_UPGRADE_START_TIMEOUT_MS = 30_000;
+const CLIENT_UPGRADE_START_TIMEOUT_MS = 35_000;
+const CLIENT_UPGRADE_START_RECOVERY_TIMEOUT_MS = 60_000;
 const CLIENT_UPGRADE_STATUS_REQUEST_TIMEOUT_MS = 10_000;
-const CLIENT_UPGRADE_TOTAL_TIMEOUT_MS = 6 * 60_000;
 const CLIENT_UPGRADE_POLL_INTERVAL_MS = 2_000;
 const CLIENT_UPGRADE_STATE_EVENT = "cc-switch-router-client-upgrade-state";
 const IDLE_CLIENT_UPGRADE_STATE: ClientUpgradeState = { phase: "idle", startedAt: 0 };
 
 function storageKey(installationId: string) {
-  return `cc_switch_router_client_upgrade_v1:${installationId}`;
+  return `cc_switch_router_client_upgrade_v2:${installationId}`;
+}
+
+function isClientUpgradeActive(state: ClientUpgradeState) {
+  return ["starting", "recovering", "running"].includes(state.phase);
 }
 
 function isStoredClientUpgradeState(value: unknown): value is ClientUpgradeState {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<ClientUpgradeState>;
-  if (!["starting", "running", "failed", "timeout"].includes(candidate.phase || "")) return false;
-  if (typeof candidate.startedAt !== "number" || !Number.isFinite(candidate.startedAt) || candidate.startedAt <= 0) return false;
+  if (!["idle", "starting", "recovering", "running", "failed"].includes(candidate.phase || "")) {
+    return false;
+  }
+  if (candidate.phase === "idle") return candidate.startedAt === 0;
+  if (typeof candidate.startedAt !== "number" || !Number.isFinite(candidate.startedAt) || candidate.startedAt <= 0) {
+    return false;
+  }
   if (candidate.taskId != null && typeof candidate.taskId !== "string") return false;
   if (candidate.errorMessage != null && typeof candidate.errorMessage !== "string") return false;
-  return candidate.phase !== "running" || !!candidate.taskId?.trim();
+  if (candidate.statusUnavailable != null && typeof candidate.statusUnavailable !== "boolean") return false;
+  if (candidate.phase === "running" && !candidate.taskId?.trim()) return false;
+  if (
+    candidate.phase === "recovering"
+    && candidate.recoveryReason !== "discovery"
+    && candidate.recoveryReason !== "start"
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function upgradeFailureMessage(logs: ClientInstallationUpgradeLog[]) {
@@ -62,6 +83,14 @@ function readStoredState(installationId: string) {
   try {
     const parsed = JSON.parse(window.sessionStorage.getItem(storageKey(installationId)) || "null") as unknown;
     if (!isStoredClientUpgradeState(parsed)) return IDLE_CLIENT_UPGRADE_STATE;
+    if (parsed.phase === "starting") {
+      return {
+        ...parsed,
+        phase: "recovering" as const,
+        recoveryReason: "start" as const,
+        statusUnavailable: true,
+      };
+    }
     return parsed;
   } catch {
     return IDLE_CLIENT_UPGRADE_STATE;
@@ -83,25 +112,15 @@ function writeStoredState(installationId: string, state: ClientUpgradeState) {
   }));
 }
 
-function UpgradeStateIcon({ phase }: { phase: ClientUpgradePhase }) {
-  if (phase === "starting" || phase === "running") {
+function UpgradeStateIcon({ state }: { state: ClientUpgradeState }) {
+  if (state.statusUnavailable || state.phase === "recovering") {
+    return <Clock3 className="h-3 w-3 shrink-0" />;
+  }
+  if (state.phase === "starting" || state.phase === "running") {
     return <Loader2 className="h-3 w-3 shrink-0 animate-spin" />;
   }
-  if (phase === "failed") return <CircleX className="h-3 w-3 shrink-0" />;
-  if (phase === "timeout") return <Clock3 className="h-3 w-3 shrink-0" />;
+  if (state.phase === "failed") return <CircleX className="h-3 w-3 shrink-0" />;
   return <Rocket className="h-3 w-3 shrink-0" />;
-}
-
-function isClientUpgradeRecoverable(client: DashboardClient) {
-  const upgrade = client.installation.upgrade;
-  if (upgrade?.delegateUpgradeToRouterOwner === false) return false;
-  if (upgrade?.upgradeCapable === false) return false;
-
-  const tunnel = client.clientTunnel;
-  if (!tunnel?.tunnelUrl?.trim() || !tunnel.enabled || !tunnel.online) return false;
-
-  const state = clientOperationalSummary(client).state;
-  return state !== "offline" && state !== "disabled";
 }
 
 export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
@@ -110,15 +129,28 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
   const [stateReady, setStateReady] = React.useState(false);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const startGuardRef = React.useRef(false);
-  const lastRecoverableRef = React.useRef<boolean | null>(null);
   const installationId = client.installation.id;
   const upgradeTarget = client.clientTunnel?.subdomain || installationId.slice(0, 8);
+  const sessionEmail = readAuthState().email?.trim().toLowerCase();
+  const ownerEmail = clientOwnerEmail(client)?.trim().toLowerCase();
+  const clientTunnel = client.clientTunnel;
+  const tunnelUrl = clientTunnelDisplayUrl(clientTunnel?.tunnelUrl);
+  const delegateEnabled = client.installation.upgrade?.delegateUpgradeToRouterOwner !== false;
+  const upgradeCapable = client.installation.upgrade?.upgradeCapable;
+  const canInspect = !!sessionEmail && !!ownerEmail && sessionEmail === ownerEmail;
+  const canUpgrade = canInspect
+    && !!tunnelUrl
+    && clientTunnel?.enabled === true
+    && clientTunnel.online
+    && delegateEnabled
+    && upgradeCapable !== false;
 
   const patchState = React.useCallback((
     updater: ClientUpgradeState | ((prev: ClientUpgradeState) => ClientUpgradeState),
   ) => {
     setState((prev) => {
       const next = typeof updater === "function" ? updater(prev) : updater;
+      if (next === prev) return prev;
       writeStoredState(installationId, next);
       return next;
     });
@@ -129,88 +161,83 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     patchState(IDLE_CLIENT_UPGRADE_STATE);
   }, [patchState]);
 
+  const markUpgradeFailed = React.useCallback((errorMessage?: string) => {
+    startGuardRef.current = false;
+    patchState((prev) => ({
+      phase: "failed",
+      startedAt: prev.startedAt || Date.now(),
+      taskId: prev.taskId,
+      errorMessage,
+    }));
+    toast.danger(t("dashboard.clientUpgradeFailed", { target: upgradeTarget }), errorMessage ? {
+      description: errorMessage,
+    } : undefined);
+  }, [patchState, t, upgradeTarget]);
+
   React.useEffect(() => {
+    setStateReady(false);
+    if (!canInspect) {
+      setState(IDLE_CLIENT_UPGRADE_STATE);
+      startGuardRef.current = false;
+      setStateReady(true);
+      return;
+    }
     const stored = readStoredState(installationId);
-    setState(stored);
-    startGuardRef.current = stored.phase !== "idle";
-    lastRecoverableRef.current = null;
+    const initial = stored.phase === "idle"
+      ? {
+          phase: "recovering" as const,
+          startedAt: Date.now(),
+          recoveryReason: "discovery" as const,
+        }
+      : stored;
+    setState(initial);
+    startGuardRef.current = isClientUpgradeActive(initial);
     setStateReady(true);
-  }, [installationId]);
+  }, [canInspect, installationId]);
 
   React.useEffect(() => {
     const syncState = (event: Event) => {
       const detail = (event as CustomEvent<{ installationId?: unknown; state?: unknown }>).detail;
-      if (detail?.installationId === installationId && isStoredClientUpgradeState(detail.state)) {
+      if (
+        canInspect
+        && detail?.installationId === installationId
+        && isStoredClientUpgradeState(detail.state)
+      ) {
         setState(detail.state);
-        startGuardRef.current = detail.state.phase !== "idle";
+        startGuardRef.current = isClientUpgradeActive(detail.state);
       }
     };
     window.addEventListener(CLIENT_UPGRADE_STATE_EVENT, syncState);
     return () => window.removeEventListener(CLIENT_UPGRADE_STATE_EVENT, syncState);
-  }, [installationId]);
+  }, [canInspect, installationId]);
 
-  const upgrading = state.phase === "starting" || state.phase === "running";
-  const locked = state.phase !== "idle";
-
-  React.useEffect(() => {
-    if (!stateReady) return;
-
-    const recoverable = isClientUpgradeRecoverable(client);
-    const previous = lastRecoverableRef.current;
-    lastRecoverableRef.current = recoverable;
-
-    if (state.phase !== "failed" && state.phase !== "timeout") return;
-    if (!recoverable) return;
-    if (previous !== null && previous) return;
-
-    resetUpgradeState();
-  }, [
-    client,
-    resetUpgradeState,
-    state.phase,
-    stateReady,
-  ]);
+  const upgrading = isClientUpgradeActive(state);
+  const locked = upgrading;
 
   React.useEffect(() => {
-    if (state.phase !== "starting") return;
-    const startedAt = state.startedAt;
-    const remaining = CLIENT_UPGRADE_START_TIMEOUT_MS - (Date.now() - startedAt);
-    const markTimeout = () => {
-      patchState((prev) => (prev.phase === "starting" ? { ...prev, phase: "timeout" } : prev));
-      toast.warning(t("dashboard.clientUpgradeTimedOut", { target: upgradeTarget }));
-    };
-    if (remaining <= 0) {
-      markTimeout();
-      return;
-    }
-    const timer = window.setTimeout(markTimeout, remaining);
-    return () => window.clearTimeout(timer);
-  }, [patchState, state.phase, state.startedAt, t, upgradeTarget]);
+    const isRunning = state.phase === "running" && !!state.taskId;
+    const isRecovering = state.phase === "recovering";
+    if (!isRunning && !isRecovering) return;
 
-  React.useEffect(() => {
-    if (state.phase !== "running" || !state.taskId) return;
-    const taskId = state.taskId;
+    const taskId = isRunning ? state.taskId : undefined;
+    const recoveryReason = state.recoveryReason;
     const startedAt = state.startedAt;
     let cancelled = false;
     let finished = false;
     let pollTimer: number | undefined;
     let requestController: AbortController | undefined;
 
-    const finish = (phase: "success" | "failed" | "timeout", errorMessage?: string) => {
+    const finishSuccess = () => {
       if (cancelled || finished) return;
       finished = true;
-      if (phase === "success") {
-        toast.success(t("dashboard.clientUpgradeSucceeded", { target: upgradeTarget }));
-        resetUpgradeState();
-        return;
+      toast.success(t("dashboard.clientUpgradeSucceeded", { target: upgradeTarget }));
+      resetUpgradeState();
+    };
+
+    const retry = () => {
+      if (!cancelled && !finished) {
+        pollTimer = window.setTimeout(() => void poll(), CLIENT_UPGRADE_POLL_INTERVAL_MS);
       }
-      patchState((prev) => ({ ...prev, phase, errorMessage }));
-      if (phase === "failed") {
-        toast.danger(t("dashboard.clientUpgradeFailed", { target: upgradeTarget }), errorMessage ? {
-          description: errorMessage,
-        } : undefined);
-      }
-      if (phase === "timeout") toast.warning(t("dashboard.clientUpgradeTimedOut", { target: upgradeTarget }));
     };
 
     const poll = async () => {
@@ -226,23 +253,65 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
           requestController.signal,
         );
         if (cancelled) return;
-        if (result.status === "success" || result.status === "failed") {
-          finish(result.status, result.status === "failed" ? upgradeFailureMessage(result.logs) : undefined);
+        if (result.status === "success") {
+          if (recoveryReason === "discovery") {
+            finished = true;
+            resetUpgradeState();
+          } else {
+            finishSuccess();
+          }
           return;
         }
-      } catch {
+        if (result.status === "failed") {
+          if (recoveryReason === "discovery") {
+            finished = true;
+            resetUpgradeState();
+          } else {
+            finished = true;
+            markUpgradeFailed(upgradeFailureMessage(result.logs));
+          }
+          return;
+        }
+        patchState((prev) => ({
+          phase: "running",
+          startedAt: prev.startedAt,
+          taskId: result.taskId,
+        }));
+        if (isRecovering && recoveryReason === "start") {
+          toast.success(t("dashboard.clientUpgradeStarted", { taskId: result.taskId }));
+        }
+      } catch (error) {
         if (cancelled) return;
+        const notFound = error instanceof ApiError && error.status === 404;
+        if (notFound && recoveryReason === "discovery") {
+          finished = true;
+          resetUpgradeState();
+          return;
+        }
+        if (
+          notFound
+          && recoveryReason === "start"
+          && Date.now() - startedAt >= CLIENT_UPGRADE_START_RECOVERY_TIMEOUT_MS
+        ) {
+          finished = true;
+          markUpgradeFailed(t("dashboard.clientUpgradeStartUnconfirmed"));
+          return;
+        }
+        if (notFound && isRunning) {
+          finished = true;
+          markUpgradeFailed(t("dashboard.clientUpgradeTaskMissing"));
+          return;
+        }
+        const details = error instanceof Error ? error.message : String(error);
+        patchState((prev) => ({
+          ...prev,
+          statusUnavailable: true,
+          errorMessage: `${t("dashboard.clientUpgradeStatusUnavailable")}: ${details}`,
+        }));
       } finally {
         window.clearTimeout(requestTimeout);
       }
-
-      if (Date.now() - startedAt >= CLIENT_UPGRADE_TOTAL_TIMEOUT_MS) {
-        finish("timeout");
-        return;
-      }
-      if (!cancelled && !finished) {
-        pollTimer = window.setTimeout(() => void poll(), CLIENT_UPGRADE_POLL_INTERVAL_MS);
-      }
+      retry();
     };
 
     void poll();
@@ -251,35 +320,45 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
       requestController?.abort();
       if (pollTimer != null) window.clearTimeout(pollTimer);
     };
-  }, [installationId, patchState, resetUpgradeState, state.phase, state.startedAt, state.taskId, t, upgradeTarget]);
+  }, [
+    installationId,
+    markUpgradeFailed,
+    patchState,
+    resetUpgradeState,
+    state.phase,
+    state.recoveryReason,
+    state.startedAt,
+    state.taskId,
+    t,
+    upgradeTarget,
+  ]);
 
-  const sessionEmail = readAuthState().email?.trim().toLowerCase();
-  const ownerEmail = clientOwnerEmail(client)?.trim().toLowerCase();
-  const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  const delegateEnabled = client.installation.upgrade?.delegateUpgradeToRouterOwner !== false;
-  const upgradeCapable = client.installation.upgrade?.upgradeCapable;
-  const canUpgrade =
-    !!sessionEmail &&
-    !!ownerEmail &&
-    sessionEmail === ownerEmail &&
-    !!tunnelUrl &&
-    delegateEnabled &&
-    upgradeCapable !== false;
-
-  if (!canUpgrade && !locked) return null;
+  if (!canUpgrade && state.phase === "idle") return null;
 
   let buttonLabel = t("dashboard.clientUpgrade");
-  if (upgrading) buttonLabel = t("dashboard.clientUpgrading");
+  if (state.phase === "starting" || state.phase === "running") {
+    buttonLabel = t("dashboard.clientUpgrading");
+  }
+  if (state.phase === "recovering") buttonLabel = t("dashboard.clientUpgradeRecovering");
   if (state.phase === "failed") buttonLabel = t("dashboard.clientUpgradeFailedButton");
-  if (state.phase === "timeout") buttonLabel = t("dashboard.clientUpgradeTimedOutButton");
+  if (state.statusUnavailable) buttonLabel = t("dashboard.clientUpgradeStatusUnavailableButton");
+
   let buttonAriaLabel = buttonLabel;
-  if (state.phase === "failed") buttonAriaLabel = t("dashboard.clientUpgradeFailed", { target: upgradeTarget });
-  if (state.phase === "timeout") buttonAriaLabel = t("dashboard.clientUpgradeTimedOut", { target: upgradeTarget });
+  if (state.phase === "failed") {
+    buttonAriaLabel = t("dashboard.clientUpgradeFailed", { target: upgradeTarget });
+  }
+  if (state.statusUnavailable) {
+    buttonAriaLabel = t("dashboard.clientUpgradeStatusUnavailable");
+  }
 
   let buttonTone = "border-violet-200 bg-violet-50 text-violet-700";
   if (state.phase === "idle") buttonTone += " hover:border-violet-300 hover:bg-violet-100";
-  if (state.phase === "failed") buttonTone = "border-rose-200 bg-rose-50 text-rose-700";
-  if (state.phase === "timeout") buttonTone = "border-amber-200 bg-amber-50 text-amber-700";
+  if (state.phase === "failed") {
+    buttonTone = "border-rose-200 bg-rose-50 text-rose-700 hover:border-rose-300 hover:bg-rose-100";
+  }
+  if (state.statusUnavailable || state.phase === "recovering") {
+    buttonTone = "border-amber-200 bg-amber-50 text-amber-700";
+  }
   if (locked) buttonTone += " pointer-events-none";
 
   async function runUpgrade(startedAt: number) {
@@ -290,13 +369,21 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
       patchState({ phase: "running", startedAt, taskId: result.taskId });
       toast.success(t("dashboard.clientUpgradeStarted", { taskId: result.taskId }));
     } catch (error) {
-      if (controller.signal.aborted) {
-        patchState({ phase: "timeout", startedAt });
-        toast.warning(t("dashboard.clientUpgradeTimedOut", { target: upgradeTarget }));
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const resultIsUncertain = controller.signal.aborted
+        || !(error instanceof ApiError)
+        || error.status >= 500;
+      if (resultIsUncertain) {
+        patchState({
+          phase: "recovering",
+          startedAt,
+          recoveryReason: "start",
+          statusUnavailable: true,
+          errorMessage,
+        });
+        toast.warning(t("dashboard.clientUpgradeStartUncertain"));
       } else {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        patchState({ phase: "failed", startedAt, errorMessage });
-        toast.danger(errorMessage);
+        markUpgradeFailed(errorMessage);
       }
     } finally {
       window.clearTimeout(requestTimeout);
@@ -304,7 +391,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
   }
 
   function beginUpgrade() {
-    if (startGuardRef.current || locked) return;
+    if (startGuardRef.current || locked || !canUpgrade) return;
     startGuardRef.current = true;
     const startedAt = Date.now();
     patchState({ phase: "starting", startedAt });
@@ -312,7 +399,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     void runUpgrade(startedAt);
   }
 
-  const buttonDisabled = !stateReady || locked || confirmOpen;
+  const buttonDisabled = !stateReady || locked || confirmOpen || !canUpgrade;
 
   return (
     <>
@@ -330,7 +417,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
         }}
         className={`inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-65 ${buttonTone}`}
       >
-        <UpgradeStateIcon phase={state.phase} />
+        <UpgradeStateIcon state={state} />
         <span>{buttonLabel}</span>
       </button>
       <ConfirmAlertDialog

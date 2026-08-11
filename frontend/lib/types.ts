@@ -702,6 +702,7 @@ export type MarketsResponse = {
 };
 
 export type ShareRequestLog = {
+  exportSequence?: number;
   requestId: string;
   shareId?: string;
   shareName?: string;
@@ -736,6 +737,12 @@ export type ShareRequestLog = {
   userCountry?: string;
   userCountryIso3?: string;
   createdAt: number;
+};
+
+export type ShareRequestLogsPage = {
+  logs: ShareRequestLog[];
+  nextCursor?: string;
+  hasMore: boolean;
 };
 
 export type ImageGenerationRequestLog = {

@@ -15,6 +15,7 @@ use crate::db::{
 use base64::Engine;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use futures_util::{StreamExt, stream};
 use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
 use resend_rs::types::CreateEmailBaseOptions;
@@ -25,6 +26,9 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
+const INSTALLATION_UPGRADE_TASK_REPORT_ACTION: &str = "installation_upgrade_task_report_v1";
+const INSTALLATION_UPGRADE_TASK_MAX_LOGS: usize = 512;
+const INSTALLATION_UPGRADE_TASK_MAX_JSON_BYTES: usize = 512 * 1024;
 
 use crate::ServerGeo;
 use crate::alerting::models::OperatorAlertSignal;
@@ -46,33 +50,36 @@ use crate::models::{
     ImageGenerationRequestLogEntry, Installation, InstallationHeartbeatRequest,
     InstallationHeartbeatResponse, InstallationSetupCompletedPayload,
     InstallationSetupCompletedRequest, InstallationSetupCompletedResponse,
-    InstallationSetupCompletedStatus, InstallationUpgradeView, InstallationView, IssueLeaseRequest,
-    IssueLeaseResponse, LatLonPoint, MapDisplaySettings, MapDisplaySettingsUpdate,
-    MapViewportSettings, MarketAppAvailability, MarketAppAvailabilityEntry,
-    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkView,
-    MarketLinkedShareView, MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
-    MarketRegistryRecord, MarketRequestLogBatchSyncRequest, MarketRequestLogEntry,
-    MarketShareAppView, MarketShareRuntimeStateInput, MarketShareRuntimeStateView, MarketShareView,
-    ModelHealthSummary, OperationalReason, OperationalSummary, PublicMapClientPoint,
-    PublicMapPointsResponse, PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest,
+    InstallationSetupCompletedStatus, InstallationUpgradeTaskReportPayload,
+    InstallationUpgradeTaskReportRequest, InstallationUpgradeTaskReportResponse,
+    InstallationUpgradeView, InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint,
+    MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
+    MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
+    MarketDisabledSharesUpdateResponse, MarketLinkView, MarketLinkedShareView,
+    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse, MarketRegistryRecord,
+    MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareAppView,
+    MarketShareRuntimeStateInput, MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary,
+    OperationalReason, OperationalSummary, PublicMapClientPoint, PublicMapPointsResponse,
+    PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest,
     RegisterAuthDeviceRequest, RegisterAuthDeviceResponse, RegisterGatewayRequest,
     RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
     RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest,
     RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess, ShareAppAvailability,
     ShareAppProviders, ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest,
     ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareDescriptorSyncAck, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
-    SharePendingEditsResponse, SharePruneRequest, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareDescriptorSyncAck, ShareEditAckEnvelope, ShareEditAckRequest, ShareEditView,
+    ShareHeartbeatRequest, ShareModelHealthCheckEntry, ShareModelHealthSummary,
+    SharePendingEditsPayload, SharePendingEditsRequest, SharePendingEditsResponse,
+    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRequestLogSyncAck, ShareRuntimeRefreshPayload,
     ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
     ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest, ShareTokenPeriod,
     ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
     ShareUsageEmailRow, ShareUserGrant, ShareUserLimitStatusResponse, ShareUserLimitStatusRow,
     ShareUserPolicy, ShareView, SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease,
-    TunnelStateRequest, TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    TunnelStateRequest, TunnelStateResponse, UpgradeInstallationStatusResponse,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -100,8 +107,9 @@ pub(crate) mod client_chat;
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
 const SHARE_MODEL_HEALTH_CHECK_LIMIT: usize = 10;
-const SHARE_REQUEST_LOG_RECOVERY_STALE_SECS: i64 = 10 * 60;
-const SHARE_REQUEST_LOG_RECOVERY_COOLDOWN_SECS: i64 = 5 * 60;
+const SHARE_REQUEST_LOG_RECOVERY_PAGE_LIMIT: usize = 100;
+const SHARE_REQUEST_LOG_RECOVERY_MAX_PAGES: usize = 10;
+const SHARE_REQUEST_LOG_RECOVERY_CONCURRENCY: usize = 4;
 const ROUTE_REGISTRATION_PENDING_GRACE_SECS: u64 = 30;
 const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
 const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
@@ -912,11 +920,32 @@ pub struct AppStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
     database_health: DatabaseHealthHandle,
     database_sync: DatabaseSyncHandle,
-    share_log_recovery_attempts: Arc<Mutex<HashMap<String, i64>>>,
     auth_email_send_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
     ip_hash_salt: Arc<String>,
     geo_lookup_base_url: Arc<String>,
     market_usd_cny_rate_micros: Arc<AtomicI64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareRequestLogRecoverySummary {
+    pub shares_checked: usize,
+    pub pages: usize,
+    pub recovered: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShareRequestLogPage {
+    pub logs: Vec<ShareRequestLogEntry>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRequestLogCursor {
+    created_at: i64,
+    request_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1352,7 +1381,6 @@ impl AppStore {
             conn: Arc::new(Mutex::new(conn)),
             database_health,
             database_sync,
-            share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
@@ -1609,7 +1637,6 @@ impl AppStore {
             conn: Arc::new(Mutex::new(conn)),
             database_health,
             database_sync,
-            share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
@@ -2776,6 +2803,105 @@ impl AppStore {
             AppError::Internal(format!("commit installation status failed: {error}"))
         })?;
         Ok(crate::models::ReportInstallationStatusResponse { ok: true })
+    }
+
+    pub async fn report_installation_upgrade_task(
+        &self,
+        input: InstallationUpgradeTaskReportRequest,
+    ) -> Result<InstallationUpgradeTaskReportResponse, AppError> {
+        if input.protocol_epoch != PROTOCOL_EPOCH {
+            return Err(AppError::BadRequest(format!(
+                "unsupported protocolEpoch; expected {PROTOCOL_EPOCH}"
+            )));
+        }
+        validate_installation_upgrade_task_report(&input.payload)?;
+        let logs_json = serde_json::to_string(&input.payload.logs).map_err(|error| {
+            AppError::Internal(format!(
+                "serialize installation upgrade task logs failed: {error}"
+            ))
+        })?;
+        let now = Utc::now().to_rfc3339();
+        let client_reported_at_ms = input.timestamp_ms;
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin installation upgrade task report failed: {error}"
+                ))
+            })?;
+        let installation = get_installation(&tx, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &tx,
+            &installation.public_key,
+            &input.installation_id,
+            INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+            &input.payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        tx.execute(
+            "INSERT INTO installation_upgrade_tasks (
+                installation_id, task_id, requested_by_email, status, restart_pending,
+                target_commit_id, logs_json, restart_after, client_reported_at_ms,
+                reported_at, created_at, updated_at
+             ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9)
+             ON CONFLICT(installation_id, task_id) DO UPDATE SET
+                status = CASE
+                    WHEN installation_upgrade_tasks.status IN ('success', 'failed')
+                         AND excluded.status = 'running'
+                    THEN installation_upgrade_tasks.status
+                    ELSE excluded.status
+                END,
+                restart_pending = CASE
+                    WHEN installation_upgrade_tasks.status IN ('success', 'failed')
+                         AND excluded.status = 'running'
+                    THEN installation_upgrade_tasks.restart_pending
+                    ELSE excluded.restart_pending
+                END,
+                target_commit_id = CASE
+                    WHEN installation_upgrade_tasks.status IN ('success', 'failed')
+                         AND excluded.status = 'running'
+                    THEN installation_upgrade_tasks.target_commit_id
+                    ELSE excluded.target_commit_id
+                END,
+                logs_json = CASE
+                    WHEN installation_upgrade_tasks.status IN ('success', 'failed')
+                         AND excluded.status = 'running'
+                    THEN installation_upgrade_tasks.logs_json
+                    ELSE excluded.logs_json
+                END,
+                restart_after = excluded.restart_after,
+                client_reported_at_ms = excluded.client_reported_at_ms,
+                reported_at = excluded.reported_at,
+                updated_at = excluded.updated_at
+             WHERE installation_upgrade_tasks.client_reported_at_ms IS NULL
+                OR excluded.client_reported_at_ms >= installation_upgrade_tasks.client_reported_at_ms",
+            params![
+                input.installation_id,
+                input.payload.task_id.trim(),
+                input.payload.status,
+                i64::from(input.payload.restart_pending),
+                input.payload.target_commit_id,
+                logs_json,
+                i64::from(input.payload.restart_after),
+                client_reported_at_ms,
+                now,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "persist installation upgrade task report failed: {error}"
+            ))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit installation upgrade task report failed: {error}"
+            ))
+        })?;
+        Ok(InstallationUpgradeTaskReportResponse { ok: true })
     }
 
     pub async fn record_installation_heartbeat(
@@ -4819,21 +4945,128 @@ impl AppStore {
         Ok((tunnel_url, installation.id))
     }
 
-    pub async fn prepare_installation_upgrade_status(
+    pub async fn record_installation_upgrade_started(
         &self,
-        config: &Config,
         installation_id: &str,
-        session_email: &str,
-    ) -> Result<String, AppError> {
+        task_id: &str,
+        requested_by_email: &str,
+        restart_after: bool,
+    ) -> Result<(), AppError> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() || task_id.len() > 128 {
+            return Err(AppError::BadRequest(
+                "client upgrade taskId must be 1-128 characters".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        let (_, tunnel_url) = Self::installation_upgrade_context(
-            &conn,
-            config,
-            installation_id,
-            session_email,
-            "only installation owner can inspect upgrade status",
-        )?;
-        Ok(tunnel_url)
+        let installation = get_installation(&conn, installation_id)?
+            .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
+        let owner_email = verified_installation_owner_email(&installation)
+            .map_err(|_| AppError::Forbidden("installation owner is not verified".into()))?;
+        if owner_email != requested_by_email.trim().to_ascii_lowercase() {
+            return Err(AppError::Forbidden(
+                "only installation owner can trigger upgrade".into(),
+            ));
+        }
+        conn.execute(
+            "INSERT INTO installation_upgrade_tasks (
+                installation_id, task_id, requested_by_email, status, restart_pending,
+                target_commit_id, logs_json, restart_after, client_reported_at_ms,
+                reported_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'running', 0, NULL, '[]', ?4, NULL, NULL, ?5, ?5)
+             ON CONFLICT(installation_id, task_id) DO UPDATE SET
+                requested_by_email = excluded.requested_by_email,
+                restart_after = excluded.restart_after",
+            params![
+                installation_id,
+                task_id,
+                owner_email,
+                i64::from(restart_after),
+                now,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("record installation upgrade task failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn installation_upgrade_status_for_owner(
+        &self,
+        installation_id: &str,
+        task_id: Option<&str>,
+        session_email: &str,
+    ) -> Result<UpgradeInstallationStatusResponse, AppError> {
+        let task_id = task_id.map(str::trim).filter(|value| !value.is_empty());
+        if task_id.is_some_and(|value| value.len() > 128) {
+            return Err(AppError::BadRequest(
+                "client upgrade taskId must not exceed 128 characters".into(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, installation_id)?
+            .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
+        let owner_email = verified_installation_owner_email(&installation)
+            .map_err(|_| AppError::Forbidden("installation owner is not verified".into()))?;
+        if owner_email != session_email.trim().to_ascii_lowercase() {
+            return Err(AppError::Forbidden(
+                "only installation owner can inspect upgrade status".into(),
+            ));
+        }
+        let row = if let Some(task_id) = task_id {
+            conn.query_row(
+                "SELECT task_id, status, restart_pending, target_commit_id, logs_json
+                 FROM installation_upgrade_tasks
+                 WHERE installation_id = ?1 AND task_id = ?2",
+                params![installation_id, task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+        } else {
+            conn.query_row(
+                "SELECT task_id, status, restart_pending, target_commit_id, logs_json
+                 FROM installation_upgrade_tasks
+                 WHERE installation_id = ?1 AND status = 'running'
+                 ORDER BY created_at DESC, task_id DESC
+                 LIMIT 1",
+                params![installation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+        }
+        .map_err(|error| {
+            AppError::Internal(format!("read installation upgrade task failed: {error}"))
+        })?
+        .ok_or_else(|| AppError::NotFound("client upgrade task not found".into()))?;
+        let logs = serde_json::from_str(&row.4).map_err(|error| {
+            AppError::Internal(format!(
+                "decode installation upgrade task logs failed: {error}"
+            ))
+        })?;
+        Ok(UpgradeInstallationStatusResponse {
+            task_id: row.0,
+            status: row.1,
+            restart_pending: row.2 != 0,
+            target_commit_id: row.3,
+            logs,
+        })
     }
 
     fn installation_upgrade_context(
@@ -6223,6 +6456,95 @@ impl AppStore {
                 AppError::Internal(format!("query image request logs list failed: {e}"))
             })?;
         collect_rows(rows)
+    }
+
+    pub async fn list_share_request_logs_page(
+        &self,
+        share_id: &str,
+        app_type: Option<&str>,
+        user_email: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ShareRequestLogPage, AppError> {
+        let app_type = app_type
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        if app_type
+            .as_deref()
+            .is_some_and(|app| !matches!(app, "claude" | "codex" | "gemini"))
+        {
+            return Err(AppError::BadRequest(
+                "unsupported Share request log app".into(),
+            ));
+        }
+        let user_email = user_email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let cursor = cursor.map(decode_share_request_log_cursor).transpose()?;
+        let cursor_created_at = cursor.as_ref().map(|cursor| cursor.created_at);
+        let cursor_request_id = cursor.as_ref().map(|cursor| cursor.request_id.as_str());
+        let page_limit = limit.clamp(1, 100);
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
+                        request_model, request_agent, requested_model, actual_model, actual_model_source,
+                        requested_reasoning_effort, effective_reasoning_effort, client_service_tier,
+                        effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
+                        status_code, latency_ms, first_token_ms, input_tokens,
+                        output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
+                        session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
+                 FROM share_request_logs
+                 WHERE share_id = ?1
+                   AND COALESCE(is_health_check, 0) = 0
+                   AND (?2 IS NULL OR lower(app_type) = ?2)
+                   AND (?3 IS NULL OR lower(COALESCE(user_email, '')) = ?3)
+                   AND (
+                       ?4 IS NULL
+                       OR created_at < ?4
+                       OR (created_at = ?4 AND request_id < ?5)
+                   )
+                 ORDER BY created_at DESC, request_id DESC
+                 LIMIT ?6",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare Share request log page failed: {error}"))
+            })?;
+        let rows = stmt
+            .query_map(
+                params![
+                    share_id,
+                    app_type,
+                    user_email,
+                    cursor_created_at,
+                    cursor_request_id,
+                    page_limit.saturating_add(1) as i64,
+                ],
+                map_share_request_log_row,
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("query Share request log page failed: {error}"))
+            })?;
+        let mut logs = collect_rows(rows)?;
+        let has_more = logs.len() > page_limit;
+        logs.truncate(page_limit);
+        let next_cursor = has_more
+            .then(|| logs.last())
+            .flatten()
+            .map(|log| {
+                encode_share_request_log_cursor(&ShareRequestLogCursor {
+                    created_at: log.created_at,
+                    request_id: log.request_id.clone(),
+                })
+            })
+            .transpose()?;
+        Ok(ShareRequestLogPage {
+            logs,
+            next_cursor,
+            has_more,
+        })
     }
 
     pub async fn get_image_generation_result_for_access(
@@ -8754,12 +9076,15 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
+        let payload = SharePendingEditsPayload {
+            share_ids: input.share_ids.clone(),
+        };
         verify_signed_share_request(
             &conn,
             &installation.public_key,
             &input.installation_id,
             "share_pending_edits",
-            &input.share_ids,
+            &payload,
             input.timestamp_ms,
             &input.nonce,
             &input.signature,
@@ -8783,12 +9108,15 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
+        let payload = ShareEditAckEnvelope {
+            ack: input.ack.clone(),
+        };
         verify_signed_share_request(
             &conn,
             &installation.public_key,
             &input.installation_id,
             "share_edit_ack",
-            &input.ack,
+            &payload,
             input.timestamp_ms,
             &input.nonce,
             &input.signature,
@@ -8924,7 +9252,7 @@ impl AppStore {
             String,
             (Option<String>, Option<String>, Option<String>),
         >,
-    ) -> Result<(), AppError> {
+    ) -> Result<Vec<ShareRequestLogSyncAck>, AppError> {
         if input.logs.len() > 500 {
             return Err(AppError::BadRequest("too many Share request logs".into()));
         }
@@ -8991,6 +9319,7 @@ impl AppStore {
                 "only share installation can sync request logs".into(),
             ));
         }
+        let mut acks = Vec::with_capacity(input.logs.len());
         for mut log in input.logs {
             if !owned_share_ids.contains(log.share_id.trim()) {
                 return Err(AppError::Unauthorized(
@@ -9010,12 +9339,16 @@ impl AppStore {
                     log.user_email = Some(user_email.clone());
                 }
             }
+            acks.push(ShareRequestLogSyncAck {
+                request_id: log.request_id.clone(),
+                usage_revision: log.usage_revision,
+            });
             upsert_share_request_log_tx(&tx, &input.installation_id, log)?;
         }
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit request log batch sync failed: {e}"))
         })?;
-        Ok(())
+        Ok(acks)
     }
 
     pub async fn prepare_share_runtime_refresh(
@@ -9180,9 +9513,7 @@ impl AppStore {
                 acc
             },
         );
-        let mut logs_by_share = self
-            .recover_missing_share_request_logs(config, &active_subdomains, &shares, logs_by_share)
-            .await?;
+        let mut logs_by_share = logs_by_share;
         merge_market_request_logs_into_share_logs(
             &mut logs_by_share,
             &market_logs,
@@ -9715,126 +10046,184 @@ impl AppStore {
         read_announcement_settings(&conn)
     }
 
-    async fn recover_missing_share_request_logs(
+    pub async fn recover_share_request_logs_cycle(
         &self,
         config: &Config,
-        active_subdomains: &HashSet<String>,
-        shares: &[(String, ShareDescriptor)],
-        mut logs_by_share: HashMap<String, Vec<ShareRequestLogEntry>>,
-    ) -> Result<HashMap<String, Vec<ShareRequestLogEntry>>, AppError> {
-        let now_ts = Utc::now().timestamp();
-        let missing_shares = shares
-            .iter()
-            .filter(|(_, share)| {
-                active_subdomains.contains(&share.subdomain)
-                    && share_logs_need_recovery(
-                        logs_by_share.get(&share.share_id).map(Vec::as_slice),
-                        now_ts,
-                    )
-            })
-            .map(|(installation_id, share)| {
-                (
-                    installation_id.clone(),
-                    share.share_id.clone(),
-                    share.subdomain.clone(),
-                )
-            })
+        proxy: &ProxyRegistry,
+    ) -> Result<ShareRequestLogRecoverySummary, AppError> {
+        let active_subdomains = proxy
+            .active_subdomains()
+            .await
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let targets = self
+            .list_share_route_targets()
+            .await?
+            .into_iter()
+            .filter(|target| active_subdomains.contains(&target.subdomain))
             .collect::<Vec<_>>();
-        let missing_shares = {
-            let mut attempted = self.share_log_recovery_attempts.lock().await;
-            missing_shares
-                .into_iter()
-                .filter(|(_, share_id, _)| {
-                    if attempted
-                        .get(share_id)
-                        .map(|last_attempt| {
-                            now_ts - *last_attempt < SHARE_REQUEST_LOG_RECOVERY_COOLDOWN_SECS
-                        })
-                        .unwrap_or(false)
-                    {
-                        return false;
-                    }
-                    attempted.insert(share_id.clone(), now_ts);
-                    true
-                })
-                .collect::<Vec<_>>()
-        };
-
-        if missing_shares.is_empty() {
-            return Ok(logs_by_share);
-        }
-
         let client = reqwest::Client::builder()
             .user_agent("cc-switch-router/0.1 share-log-recovery")
             .timeout(StdDuration::from_secs(5))
             .build()
-            .map_err(|e| {
-                AppError::Internal(format!("build share log recovery client failed: {e}"))
+            .map_err(|error| {
+                AppError::Internal(format!("build share log recovery client failed: {error}"))
             })?;
+        let results = stream::iter(targets.into_iter().map(|target| {
+            let store = self.clone();
+            let config = config.clone();
+            let client = client.clone();
+            async move {
+                let result = store
+                    .recover_share_request_logs_for_target(&config, &client, &target)
+                    .await;
+                (target, result)
+            }
+        }))
+        .buffer_unordered(SHARE_REQUEST_LOG_RECOVERY_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
-        for (installation_id, share_id, subdomain) in missing_shares {
-            let response = match fetch_share_request_logs_from_route(
+        let mut summary = ShareRequestLogRecoverySummary {
+            shares_checked: results.len(),
+            ..ShareRequestLogRecoverySummary::default()
+        };
+        for (target, result) in results {
+            match result {
+                Ok((pages, recovered)) => {
+                    summary.pages += pages;
+                    summary.recovered += recovered;
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    tracing::debug!(
+                        share_id = %target.share_id,
+                        subdomain = %target.subdomain,
+                        error = %error,
+                        "share request log background recovery deferred"
+                    );
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    async fn recover_share_request_logs_for_target(
+        &self,
+        config: &Config,
+        client: &reqwest::Client,
+        target: &ShareRouteTarget,
+    ) -> Result<(usize, usize), AppError> {
+        let mut cursor = self
+            .share_request_log_recovery_cursor(&target.share_id)
+            .await?;
+        let mut pages = 0;
+        let mut recovered = 0;
+        while pages < SHARE_REQUEST_LOG_RECOVERY_MAX_PAGES {
+            let response = fetch_share_request_logs_from_route(
                 self,
                 config,
-                &client,
-                &subdomain,
-                &share_id,
-                &installation_id,
+                client,
+                &target.subdomain,
+                &target.share_id,
+                &target.installation_id,
+                cursor,
+                SHARE_REQUEST_LOG_RECOVERY_PAGE_LIMIT,
             )
-            .await
+            .await?;
+            if response.share_id.as_deref() != Some(target.share_id.as_str()) {
+                return Err(AppError::Internal(
+                    "share request log recovery returned a mismatched share id".into(),
+                ));
+            }
+            if response.logs.iter().any(|log| {
+                log.share_id != target.share_id
+                    || log.export_sequence <= cursor
+                    || log.export_sequence > response.next_sequence
+            }) {
+                return Err(AppError::Internal(
+                    "share request log recovery returned an invalid export sequence".into(),
+                ));
+            }
+            if response.next_sequence < cursor
+                || (response.has_more && response.next_sequence == cursor)
             {
-                Ok(response) => response,
-                Err(err) => {
-                    tracing::debug!(
-                        share_id = %share_id,
-                        subdomain = %subdomain,
-                        "share request log recovery skipped: {err}"
-                    );
-                    continue;
-                }
-            };
-
-            if response.logs.is_empty() {
-                continue;
+                return Err(AppError::Internal(
+                    "share request log recovery cursor did not advance".into(),
+                ));
             }
-
-            if let Some(response_share_id) = response.share_id.as_deref() {
-                if response_share_id != share_id {
-                    tracing::debug!(
-                        share_id = %share_id,
-                        response_share_id = %response_share_id,
-                        subdomain = %subdomain,
-                        "share request log recovery returned mismatched share id"
-                    );
-                }
+            self.persist_share_request_log_recovery_page(
+                &target.installation_id,
+                &target.share_id,
+                response.next_sequence,
+                &response.logs,
+            )
+            .await?;
+            pages += 1;
+            recovered += response.logs.len();
+            cursor = response.next_sequence;
+            if !response.has_more {
+                break;
             }
-
-            {
-                let mut recovered_logs = response.logs;
-                recovered_logs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                recovered_logs.truncate(SHARE_REQUEST_LOG_RECOVERY_LIMIT);
-                let conn = self.conn.lock().await;
-                let tx = conn.unchecked_transaction().map_err(|e| {
-                    AppError::Internal(format!("begin share request log recovery tx failed: {e}"))
-                })?;
-                for log in &recovered_logs {
-                    upsert_share_request_log_tx(&tx, &installation_id, log.clone())?;
-                }
-                tx.commit().map_err(|e| {
-                    AppError::Internal(format!("commit share request log recovery tx failed: {e}"))
-                })?;
-                logs_by_share.insert(share_id.clone(), recovered_logs);
-            }
-
-            tracing::info!(
-                share_id = %share_id,
-                subdomain = %subdomain,
-                recovered = logs_by_share.get(&share_id).map(|logs| logs.len()).unwrap_or(0),
-                "recovered share request logs from active route"
-            );
         }
+        Ok((pages, recovered))
+    }
 
-        Ok(logs_by_share)
+    async fn share_request_log_recovery_cursor(&self, share_id: &str) -> Result<u64, AppError> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT export_sequence FROM share_request_log_recovery_cursors WHERE share_id = ?1",
+            params![share_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or_default().max(0) as u64)
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read share request log recovery cursor failed: {error}"
+            ))
+        })
+    }
+
+    async fn persist_share_request_log_recovery_page(
+        &self,
+        installation_id: &str,
+        share_id: &str,
+        next_sequence: u64,
+        logs: &[ShareRequestLogEntry],
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction().map_err(|error| {
+            AppError::Internal(format!(
+                "begin share request log recovery tx failed: {error}"
+            ))
+        })?;
+        for log in logs {
+            upsert_share_request_log_tx(&tx, installation_id, log.clone())?;
+        }
+        tx.execute(
+            "INSERT INTO share_request_log_recovery_cursors (
+                 share_id, installation_id, export_sequence, updated_at
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(share_id) DO UPDATE SET
+                 installation_id = excluded.installation_id,
+                 export_sequence = max(share_request_log_recovery_cursors.export_sequence, excluded.export_sequence),
+                 updated_at = excluded.updated_at",
+            params![
+                share_id,
+                installation_id,
+                next_sequence.min(i64::MAX as u64) as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("advance share request log recovery cursor failed: {error}"))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit share request log recovery tx failed: {error}"
+            ))
+        })
     }
 
     pub async fn cleanup_expired_data(
@@ -11996,14 +12385,6 @@ impl AppStore {
     }
 }
 
-fn share_logs_need_recovery(logs: Option<&[ShareRequestLogEntry]>, now_ts: i64) -> bool {
-    let Some(logs) = logs else {
-        return true;
-    };
-    let newest_created_at = logs.iter().map(|log| log.created_at).max().unwrap_or(0);
-    newest_created_at <= now_ts - SHARE_REQUEST_LOG_RECOVERY_STALE_SECS
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminAuditEntry {
@@ -12022,9 +12403,13 @@ async fn fetch_share_request_logs_from_route(
     subdomain: &str,
     share_id: &str,
     installation_id: &str,
+    after_sequence: u64,
+    limit: usize,
 ) -> Result<ShareRequestLogFetchResponse, AppError> {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("shareId", share_id)
+        .append_pair("afterSequence", &after_sequence.to_string())
+        .append_pair("limit", &limit.to_string())
         .finish();
     let path = format!("/_share-router/request-logs?{query}");
     let url = format!("{}{path}", config.tunnel_url(subdomain));
@@ -15541,6 +15926,69 @@ fn installation_upgrade_view(installation: &Installation) -> Option<Installation
     })
 }
 
+fn validate_installation_upgrade_task_report(
+    payload: &InstallationUpgradeTaskReportPayload,
+) -> Result<(), AppError> {
+    let task_id = payload.task_id.trim();
+    if task_id.is_empty() || task_id.len() > 128 {
+        return Err(AppError::BadRequest(
+            "installation upgrade taskId must be 1-128 characters".into(),
+        ));
+    }
+    if !matches!(payload.status.as_str(), "running" | "success" | "failed") {
+        return Err(AppError::BadRequest(
+            "installation upgrade status is invalid".into(),
+        ));
+    }
+    if payload
+        .target_commit_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+    {
+        return Err(AppError::BadRequest(
+            "installation upgrade target commit is invalid".into(),
+        ));
+    }
+    if payload.updated_at.trim().is_empty()
+        || payload.updated_at.len() > 128
+        || DateTime::parse_from_rfc3339(payload.updated_at.trim()).is_err()
+    {
+        return Err(AppError::BadRequest(
+            "installation upgrade updatedAt must be an RFC3339 timestamp".into(),
+        ));
+    }
+    if payload.logs.len() > INSTALLATION_UPGRADE_TASK_MAX_LOGS {
+        return Err(AppError::BadRequest(
+            "installation upgrade task has too many log entries".into(),
+        ));
+    }
+    for log in &payload.logs {
+        if log.task_id != task_id
+            || log.message.len() > 4_096
+            || log.at.len() > 128
+            || !matches!(
+                log.level.as_str(),
+                "info" | "progress" | "success" | "warn" | "error"
+            )
+        {
+            return Err(AppError::BadRequest(
+                "installation upgrade task contains an invalid log entry".into(),
+            ));
+        }
+    }
+    let encoded = serde_json::to_vec(payload).map_err(|error| {
+        AppError::Internal(format!(
+            "encode installation upgrade task report failed: {error}"
+        ))
+    })?;
+    if encoded.len() > INSTALLATION_UPGRADE_TASK_MAX_JSON_BYTES {
+        return Err(AppError::BadRequest(
+            "installation upgrade task report is too large".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn find_installation_id_by_public_key(
     conn: &Connection,
     public_key: &str,
@@ -16316,6 +16764,7 @@ mod token_period_window_tests {
         init_schema(&conn).unwrap();
         let log = |request_id: &str, email: &str, created_at: i64, quota_tokens: u32| {
             ShareRequestLogEntry {
+                export_sequence: 0,
                 request_id: request_id.to_string(),
                 share_id: "share-anchored".into(),
                 share_name: "Anchored".into(),
@@ -17712,6 +18161,23 @@ fn record_runtime_model_health_snapshot_conn(
             .map_err(|e| AppError::Internal(format!("update model health results failed: {e}")))?;
         }
     }
+    for app_type in &bound_app_types {
+        if current_models_by_app.contains_key(app_type) {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM share_model_health_state
+             WHERE share_id = ?1
+               AND app_type = ?2
+               AND last_checked_at <= ?3",
+            params![snapshot.share_id, app_type, snapshot.queried_at],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "delete model health state omitted from runtime snapshot failed: {e}"
+            ))
+        })?;
+    }
     for (app_type, current_models) in current_models_by_app {
         if current_models.is_empty() {
             continue;
@@ -19106,7 +19572,7 @@ fn list_global_recent_share_request_logs(
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
              FROM share_request_logs
              WHERE COALESCE(is_health_check, 0) = 0
-             ORDER BY created_at DESC
+             ORDER BY created_at DESC, request_id DESC
              LIMIT ?1",
         )
         .map_err(|e| AppError::Internal(format!("prepare global share request logs failed: {e}")))?;
@@ -19137,11 +19603,15 @@ fn list_recent_share_request_logs(
                         status_code, latency_ms, first_token_ms, input_tokens,
                         output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                         session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
-                        ROW_NUMBER() OVER (PARTITION BY share_id ORDER BY created_at DESC) AS row_num
+                        ROW_NUMBER() OVER (
+                            PARTITION BY share_id
+                            ORDER BY created_at DESC, request_id DESC
+                        ) AS row_num
                  FROM share_request_logs
+                 WHERE COALESCE(is_health_check, 0) = 0
              )
              WHERE row_num <= ?1
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC, request_id DESC",
         )
         .map_err(|e| AppError::Internal(format!("prepare recent share request logs failed: {e}")))?;
     let rows = stmt
@@ -19153,6 +19623,7 @@ fn list_recent_share_request_logs(
 
 fn map_share_request_log_row(row: &crate::db::Row<'_>) -> crate::db::Result<ShareRequestLogEntry> {
     Ok(ShareRequestLogEntry {
+        export_sequence: 0,
         request_id: row.get(0)?,
         share_id: row.get(1)?,
         share_name: row.get(2)?,
@@ -19191,6 +19662,27 @@ fn map_share_request_log_row(row: &crate::db::Row<'_>) -> crate::db::Result<Shar
         is_health_check: row.get::<_, i64>(33)? != 0,
         created_at: row.get(34)?,
     })
+}
+
+fn encode_share_request_log_cursor(cursor: &ShareRequestLogCursor) -> Result<String, AppError> {
+    let encoded = serde_json::to_vec(cursor).map_err(|error| {
+        AppError::Internal(format!("encode Share request log cursor failed: {error}"))
+    })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded))
+}
+
+fn decode_share_request_log_cursor(value: &str) -> Result<ShareRequestLogCursor, AppError> {
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .map_err(|_| AppError::BadRequest("invalid Share request log cursor".into()))?;
+    let cursor = serde_json::from_slice::<ShareRequestLogCursor>(&decoded)
+        .map_err(|_| AppError::BadRequest("invalid Share request log cursor".into()))?;
+    if cursor.request_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "invalid Share request log cursor".into(),
+        ));
+    }
+    Ok(cursor)
 }
 
 fn sql_prefix(alias: &str) -> String {
@@ -19423,6 +19915,7 @@ fn market_log_to_share_request_log(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| log.actual_model.clone());
     ShareRequestLogEntry {
+        export_sequence: 0,
         request_id: log.request_id.clone(),
         share_id: share_id.to_string(),
         share_name: share_names
@@ -24165,7 +24658,7 @@ fn share_app_settings_visible_to_market(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::models::{ShareEditAckPayload, ShareSyncOperation};
+    use crate::models::{InstallationUpgradeLogEntry, ShareEditAckPayload, ShareSyncOperation};
     use crate::proxy::ProxyRegistry;
     use axum::Router;
     use axum::extract::State;
@@ -24176,6 +24669,95 @@ mod tests {
     use rand::rngs::OsRng;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    const GOLDEN_PRIVATE_KEY_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const GOLDEN_PUBLIC_KEY_B64: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
+    const GOLDEN_INSTALLATION_ID: &str = "inst-signature-golden";
+    const GOLDEN_TIMESTAMP_MS: i64 = 1_786_412_345_678;
+    const GOLDEN_NONCE: &str = "golden-nonce-01";
+    const GOLDEN_PENDING_EDITS_SIGNATURE: &str =
+        "NJzUP/o+ARIo2U+KibgynZffeQq/241v5THPz27RkaKJ0s54z7Bf6ExQ4dg4iObhu3Gpvvn1aU5Xks5VF9oNDw==";
+    const GOLDEN_EDIT_ACK_SIGNATURE: &str =
+        "Hkrch4qOQ8Of/C3JLjkqY/Y4Eo/NFJ9OaK+LoXqYBeVlLprRXpJa2OMUYFzVeabhhSeXFxeK+DIEXAQ2/dpeCw==";
+
+    #[test]
+    fn share_control_signature_golden_fixtures_match_server_contract() {
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(GOLDEN_PRIVATE_KEY_B64)
+            .unwrap();
+        let secret: [u8; 32] = secret.try_into().unwrap();
+        let signing_key = SigningKey::from_bytes(&secret);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .encode(signing_key.verifying_key().as_bytes()),
+            GOLDEN_PUBLIC_KEY_B64
+        );
+
+        let pending = SharePendingEditsPayload {
+            share_ids: vec!["share-alpha".to_string(), "share-beta".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_string(&pending).unwrap(),
+            r#"{"shareIds":["share-alpha","share-beta"]}"#
+        );
+        assert_eq!(
+            sign_test_payload(
+                &signing_key,
+                GOLDEN_INSTALLATION_ID,
+                "share_pending_edits",
+                &pending,
+                GOLDEN_TIMESTAMP_MS,
+                GOLDEN_NONCE,
+            ),
+            GOLDEN_PENDING_EDITS_SIGNATURE
+        );
+        verify_signed_payload(
+            GOLDEN_PUBLIC_KEY_B64,
+            GOLDEN_INSTALLATION_ID,
+            "share_pending_edits",
+            &pending,
+            GOLDEN_TIMESTAMP_MS,
+            GOLDEN_NONCE,
+            GOLDEN_PENDING_EDITS_SIGNATURE,
+        )
+        .unwrap();
+
+        let edit_ack = ShareEditAckEnvelope {
+            ack: ShareEditAckPayload {
+                edit_id: "edit-42".to_string(),
+                revision: 7,
+                status: "applied".to_string(),
+                error_message: None,
+                error_code: None,
+                retryable: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&edit_ack).unwrap(),
+            r#"{"ack":{"editId":"edit-42","revision":7,"status":"applied"}}"#
+        );
+        assert_eq!(
+            sign_test_payload(
+                &signing_key,
+                GOLDEN_INSTALLATION_ID,
+                "share_edit_ack",
+                &edit_ack,
+                GOLDEN_TIMESTAMP_MS,
+                GOLDEN_NONCE,
+            ),
+            GOLDEN_EDIT_ACK_SIGNATURE
+        );
+        verify_signed_payload(
+            GOLDEN_PUBLIC_KEY_B64,
+            GOLDEN_INSTALLATION_ID,
+            "share_edit_ack",
+            &edit_ack,
+            GOLDEN_TIMESTAMP_MS,
+            GOLDEN_NONCE,
+            GOLDEN_EDIT_ACK_SIGNATURE,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn dashboard_ip_prefers_self_report_and_falls_back_to_router_observation() {
@@ -26926,6 +27508,7 @@ mod tests {
         created_at: i64,
     ) -> ShareRequestLogEntry {
         ShareRequestLogEntry {
+            export_sequence: 0,
             request_id: request_id.into(),
             share_id: share_id.into(),
             share_name: "Share".into(),
@@ -27008,6 +27591,179 @@ mod tests {
             stored[0].effective_service_tier.as_deref(),
             Some("priority")
         );
+    }
+
+    #[tokio::test]
+    async fn share_request_log_page_filters_before_stable_cursor_pagination() {
+        let (store, config) = setup_store("share-request-log-page-cursor").await;
+        let created_at = Utc::now().timestamp();
+        let mut newest = test_share_request_log_entry("req-page-4", "share-page", created_at);
+        newest.app_type = "codex".into();
+        newest.user_email = Some("buyer@example.com".into());
+        let mut health = test_share_request_log_entry("req-page-3", "share-page", created_at);
+        health.app_type = "codex".into();
+        health.user_email = Some("buyer@example.com".into());
+        health.is_health_check = true;
+        let mut middle = test_share_request_log_entry("req-page-2", "share-page", created_at);
+        middle.app_type = "claude".into();
+        middle.user_email = Some("other@example.com".into());
+        let mut oldest = test_share_request_log_entry("req-page-1", "share-page", created_at);
+        oldest.app_type = "codex".into();
+        oldest.user_email = Some("buyer@example.com".into());
+        let other = test_share_request_log_entry("req-page-9", "share-other", created_at + 1);
+        {
+            let conn = store.conn.lock().await;
+            for log in [newest, health, middle, oldest, other] {
+                upsert_share_request_log_tx(&conn, "inst-page", log).unwrap();
+            }
+        }
+
+        let first = store
+            .list_share_request_logs_page("share-page", None, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .logs
+                .iter()
+                .map(|log| log.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-page-4", "req-page-2"]
+        );
+        assert!(first.has_more);
+        let second = store
+            .list_share_request_logs_page("share-page", None, None, first.next_cursor.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .logs
+                .iter()
+                .map(|log| log.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-page-1"]
+        );
+        assert!(!second.has_more);
+
+        let codex_first = store
+            .list_share_request_logs_page("share-page", Some("CoDeX"), None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(codex_first.logs[0].request_id, "req-page-4");
+        assert!(codex_first.has_more);
+        let codex_second = store
+            .list_share_request_logs_page(
+                "share-page",
+                Some("codex"),
+                None,
+                codex_first.next_cursor.as_deref(),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(codex_second.logs[0].request_id, "req-page-1");
+        assert!(!codex_second.has_more);
+
+        let buyer_first = store
+            .list_share_request_logs_page("share-page", None, Some("BUYER@example.com"), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(buyer_first.logs[0].request_id, "req-page-4");
+        assert!(buyer_first.has_more);
+        let buyer_second = store
+            .list_share_request_logs_page(
+                "share-page",
+                None,
+                Some("buyer@example.com"),
+                buyer_first.next_cursor.as_deref(),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(buyer_second.logs[0].request_id, "req-page-1");
+        assert!(!buyer_second.has_more);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_request_log_recovery_page_commits_logs_and_monotonic_cursor_atomically() {
+        let (store, config) = setup_store("share-request-log-recovery-page").await;
+        insert_installation(&store, "inst-recovery").await;
+        insert_share(
+            &store,
+            "inst-recovery",
+            "share-recovery",
+            "recovery-sub",
+            "active",
+        )
+        .await;
+        let mut first = test_share_request_log_entry(
+            "req-recovery-5",
+            "share-recovery",
+            Utc::now().timestamp(),
+        );
+        first.export_sequence = 5;
+        store
+            .persist_share_request_log_recovery_page("inst-recovery", "share-recovery", 5, &[first])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .share_request_log_recovery_cursor("share-recovery")
+                .await
+                .unwrap(),
+            5
+        );
+
+        let mut stale = test_share_request_log_entry(
+            "req-recovery-3",
+            "share-recovery",
+            Utc::now().timestamp(),
+        );
+        stale.export_sequence = 3;
+        store
+            .persist_share_request_log_recovery_page("inst-recovery", "share-recovery", 3, &[stale])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .share_request_log_recovery_cursor("share-recovery")
+                .await
+                .unwrap(),
+            5
+        );
+
+        let mut orphan = test_share_request_log_entry(
+            "req-recovery-orphan",
+            "share-missing",
+            Utc::now().timestamp(),
+        );
+        orphan.export_sequence = 6;
+        assert!(
+            store
+                .persist_share_request_log_recovery_page(
+                    "inst-recovery",
+                    "share-missing",
+                    6,
+                    &[orphan],
+                )
+                .await
+                .is_err()
+        );
+        let orphan_count: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM share_request_logs WHERE request_id = 'req-recovery-orphan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_count, 0);
+
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]
@@ -27774,27 +28530,6 @@ mod tests {
         let _ = std::fs::remove_file(&config.database.path);
     }
 
-    #[test]
-    fn share_logs_need_recovery_for_empty_or_stale_logs() {
-        let now_ts = Utc::now().timestamp();
-        assert!(share_logs_need_recovery(None, now_ts));
-        assert!(share_logs_need_recovery(Some(&[]), now_ts));
-
-        let stale = vec![test_share_request_log_entry(
-            "req-stale",
-            "share-1",
-            now_ts - SHARE_REQUEST_LOG_RECOVERY_STALE_SECS - 1,
-        )];
-        assert!(share_logs_need_recovery(Some(&stale), now_ts));
-
-        let fresh = vec![test_share_request_log_entry(
-            "req-fresh",
-            "share-1",
-            now_ts - 60,
-        )];
-        assert!(!share_logs_need_recovery(Some(&fresh), now_ts));
-    }
-
     #[tokio::test]
     async fn list_market_shares_all_access_allows_future_market_email() {
         let (store, config) = setup_store("market-share-all-access").await;
@@ -28048,6 +28783,72 @@ mod tests {
         );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    fn signed_upgrade_task_report_request(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        payload: InstallationUpgradeTaskReportPayload,
+        nonce: &str,
+    ) -> InstallationUpgradeTaskReportRequest {
+        signed_upgrade_task_report_request_at(
+            signing_key,
+            installation_id,
+            payload,
+            nonce,
+            Utc::now().timestamp_millis(),
+        )
+    }
+
+    fn signed_upgrade_task_report_request_at(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        payload: InstallationUpgradeTaskReportPayload,
+        nonce: &str,
+        timestamp_ms: i64,
+    ) -> InstallationUpgradeTaskReportRequest {
+        let signature = sign_test_payload(
+            signing_key,
+            installation_id,
+            INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+            &payload,
+            timestamp_ms,
+            nonce,
+        );
+        InstallationUpgradeTaskReportRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            installation_id: installation_id.into(),
+            timestamp_ms,
+            nonce: nonce.into(),
+            signature,
+            payload,
+        }
+    }
+
+    fn upgrade_task_report_payload(
+        task_id: &str,
+        status: &str,
+        level: &str,
+        message: &str,
+    ) -> InstallationUpgradeTaskReportPayload {
+        let updated_at = Utc::now().to_rfc3339();
+        InstallationUpgradeTaskReportPayload {
+            task_id: task_id.into(),
+            status: status.into(),
+            restart_pending: status == "success",
+            target_commit_id: Some("aabbccddeeff".into()),
+            logs: vec![InstallationUpgradeLogEntry {
+                task_id: task_id.into(),
+                step: 7,
+                total_steps: 7,
+                level: level.into(),
+                message: message.into(),
+                progress: (status == "success").then_some(100),
+                at: updated_at.clone(),
+            }],
+            restart_after: true,
+            updated_at,
+        }
     }
 
     fn sign_tunnel_test_payload<T: Serialize>(
@@ -29841,7 +30642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrade_status_lookup_survives_capability_or_delegation_changes() {
+    async fn upgrade_status_uses_router_persistence_and_enforces_owner() {
         let (store, config) = setup_store("upgrade-status-route").await;
         insert_installation(&store, "inst-upgrade-status").await;
         insert_client_tunnel(
@@ -29851,6 +30652,15 @@ mod tests {
             "upgrade-status-sub",
         )
         .await;
+        store
+            .record_installation_upgrade_started(
+                "inst-upgrade-status",
+                "task-running",
+                "owner@example.com",
+                true,
+            )
+            .await
+            .expect("record accepted upgrade before the client tunnel disappears");
         let conn = store.conn.lock().await;
         conn.execute(
             "UPDATE installations
@@ -29861,15 +30671,22 @@ mod tests {
         .expect("disable future upgrades");
         drop(conn);
 
-        let status_url = store
-            .prepare_installation_upgrade_status(
-                &config,
+        let status = store
+            .installation_upgrade_status_for_owner(
                 "inst-upgrade-status",
+                Some("task-running"),
                 "owner@example.com",
             )
             .await
-            .expect("owner should still be able to inspect an existing task");
-        assert_eq!(status_url, "http://upgrade-status-sub.127.0.0.1:8787");
+            .expect("owner should read persisted status without a client tunnel");
+        assert_eq!(status.task_id, "task-running");
+        assert_eq!(status.status, "running");
+
+        let latest_running = store
+            .installation_upgrade_status_for_owner("inst-upgrade-status", None, "owner@example.com")
+            .await
+            .expect("latest persisted task should be discoverable after refresh");
+        assert_eq!(latest_running.task_id, "task-running");
 
         let start_error = store
             .prepare_installation_upgrade(&config, "inst-upgrade-status", "owner@example.com")
@@ -29878,14 +30695,168 @@ mod tests {
         assert!(start_error.to_string().contains("delegation is disabled"));
 
         let owner_error = store
-            .prepare_installation_upgrade_status(
-                &config,
+            .installation_upgrade_status_for_owner(
                 "inst-upgrade-status",
+                Some("task-running"),
                 "other@example.com",
             )
             .await
             .expect_err("other users cannot inspect upgrade state");
         assert!(owner_error.to_string().contains("only installation owner"));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn signed_upgrade_reports_update_tasks_without_terminal_regression() {
+        let (store, config) = setup_store("signed-upgrade-task-report").await;
+        let installation_id = "inst-upgrade-report";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        store
+            .record_installation_upgrade_started(
+                installation_id,
+                "task-failed",
+                "owner@example.com",
+                true,
+            )
+            .await
+            .expect("record failed task start");
+
+        let failed_payload = upgrade_task_report_payload(
+            "task-failed",
+            "failed",
+            "error",
+            "replacement process failed health checks",
+        );
+        store
+            .report_installation_upgrade_task(signed_upgrade_task_report_request(
+                &signing_key,
+                installation_id,
+                failed_payload,
+                "upgrade-report-failed",
+            ))
+            .await
+            .expect("accept signed failed report");
+
+        let delayed_running = upgrade_task_report_payload(
+            "task-failed",
+            "running",
+            "progress",
+            "delayed running report",
+        );
+        store
+            .report_installation_upgrade_task(signed_upgrade_task_report_request(
+                &signing_key,
+                installation_id,
+                delayed_running,
+                "upgrade-report-delayed-running",
+            ))
+            .await
+            .expect("accept delayed report without regressing terminal state");
+
+        let failed = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-failed"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read failed task from router database");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.logs.len(), 1);
+        assert_eq!(
+            failed.logs[0].message,
+            "replacement process failed health checks"
+        );
+
+        store
+            .record_installation_upgrade_started(
+                installation_id,
+                "task-success",
+                "owner@example.com",
+                true,
+            )
+            .await
+            .expect("record second task start");
+        let success_payload = upgrade_task_report_payload(
+            "task-success",
+            "success",
+            "success",
+            "replacement process passed health and version checks",
+        );
+        let success_reported_at_ms = Utc::now().timestamp_millis() + 1_000;
+        store
+            .report_installation_upgrade_task(signed_upgrade_task_report_request_at(
+                &signing_key,
+                installation_id,
+                success_payload.clone(),
+                "upgrade-report-success",
+                success_reported_at_ms,
+            ))
+            .await
+            .expect("accept signed success report");
+
+        let stale_failed =
+            upgrade_task_report_payload("task-success", "failed", "error", "stale failure report");
+        store
+            .report_installation_upgrade_task(signed_upgrade_task_report_request_at(
+                &signing_key,
+                installation_id,
+                stale_failed,
+                "upgrade-report-stale-failed",
+                success_reported_at_ms - 1,
+            ))
+            .await
+            .expect("accept but ignore stale signed report");
+
+        let delayed_old_task = upgrade_task_report_payload(
+            "task-failed",
+            "running",
+            "progress",
+            "old task reported after the newer task",
+        );
+        store
+            .report_installation_upgrade_task(signed_upgrade_task_report_request(
+                &signing_key,
+                installation_id,
+                delayed_old_task,
+                "upgrade-report-old-task-late",
+            ))
+            .await
+            .expect("accept late report for older task");
+
+        let replay = store
+            .report_installation_upgrade_task(signed_upgrade_task_report_request_at(
+                &signing_key,
+                installation_id,
+                success_payload,
+                "upgrade-report-success",
+                success_reported_at_ms,
+            ))
+            .await
+            .expect_err("signed report nonce must not be replayable");
+        assert!(replay.to_string().contains("nonce"));
+
+        let latest = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-success"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read successful task by id");
+        assert_eq!(latest.task_id, "task-success");
+        assert_eq!(latest.status, "success");
+        assert!(latest.restart_pending);
+        assert_eq!(
+            latest.logs[0].message,
+            "replacement process passed health and version checks"
+        );
+        let no_running_task = store
+            .installation_upgrade_status_for_owner(installation_id, None, "owner@example.com")
+            .await
+            .expect_err("terminal tasks must not be restored as active upgrades");
+        assert!(no_running_task.to_string().contains("not found"));
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -37153,7 +38124,9 @@ mod tests {
             &signing_key,
             installation_id,
             "share_pending_edits",
-            &requested_share_ids,
+            &SharePendingEditsPayload {
+                share_ids: requested_share_ids.clone(),
+            },
             timestamp_ms,
             &nonce,
         );
@@ -37865,6 +38838,7 @@ mod tests {
                 &conn,
                 "inst-clean",
                 ShareRequestLogEntry {
+                    export_sequence: 0,
                     request_id: "req-old-share-log".into(),
                     share_id: "share-old".into(),
                     share_name: "Old Share".into(),
@@ -38057,6 +39031,7 @@ mod tests {
         insert_share(&store, "inst-logs", "share-log-1", "log-sub", "active").await;
 
         let logs = vec![ShareRequestLogEntry {
+            export_sequence: 1,
             request_id: "req-1".into(),
             share_id: "share-log-1".into(),
             share_name: "Log Share".into(),
@@ -39181,7 +40156,7 @@ mod tests {
             &signing_key,
             "inst-1",
             "share_edit_ack",
-            &ack,
+            &ShareEditAckEnvelope { ack: ack.clone() },
             timestamp_ms,
             &nonce,
         );
@@ -39626,7 +40601,9 @@ mod tests {
             &signing_key,
             installation_id,
             "share_pending_edits",
-            &requested_share_ids,
+            &SharePendingEditsPayload {
+                share_ids: requested_share_ids.clone(),
+            },
             timestamp_ms,
             &nonce,
         );
@@ -40692,6 +41669,87 @@ mod tests {
 
         assert_eq!(stale_count, 0);
         assert_eq!(current_count, 1);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_clears_current_health_for_omitted_bound_apps() {
+        let (store, config) = setup_store("runtime-clears-omitted-bound-app-health").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        set_share_bindings(&store, "share-1", &["claude", "codex"]).await;
+        let now = Utc::now().timestamp();
+
+        let mut claude_check = test_health_check("share-1", "claude-haiku", "success", now - 60);
+        claude_check.app_type = "claude".into();
+        store
+            .record_share_model_health_check(claude_check)
+            .await
+            .expect("seed Claude health");
+        store
+            .record_share_model_health_check(test_health_check(
+                "share-1",
+                "gpt-5.5",
+                "success",
+                now - 60,
+            ))
+            .await
+            .expect("seed Codex health");
+
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now,
+                support: ShareSupport {
+                    claude: true,
+                    codex: true,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes {
+                    codex: Some(test_upstream_provider("gpt-5.5")),
+                    ..ShareAppRuntimes::default()
+                },
+                app_providers: ShareAppProviders::default(),
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: None,
+                model_health: ShareModelHealthSummary {
+                    codex: vec![test_model_summary("gpt-5.5", &["success"])],
+                    ..ShareModelHealthSummary::default()
+                },
+            })
+            .await
+            .expect("record authoritative runtime snapshot");
+
+        let conn = store.conn.lock().await;
+        let claude_state: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_state WHERE share_id = 'share-1' AND app_type = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count Claude state");
+        let codex_state: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_state WHERE share_id = 'share-1' AND app_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count Codex state");
+        let claude_history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_checks WHERE share_id = 'share-1' AND app_type = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count Claude history");
+        drop(conn);
+
+        assert_eq!(claude_state, 0);
+        assert_eq!(codex_state, 1);
+        assert_eq!(claude_history, 1);
 
         let _ = std::fs::remove_file(&config.database.path);
     }

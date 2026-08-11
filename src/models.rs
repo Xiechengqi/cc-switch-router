@@ -1105,6 +1105,12 @@ pub struct SharePendingEditsRequest {
     pub share_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharePendingEditsPayload {
+    pub share_ids: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SharePendingEditsResponse {
@@ -1132,6 +1138,12 @@ pub struct ShareEditAckRequest {
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: String,
+    pub ack: ShareEditAckPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareEditAckEnvelope {
     pub ack: ShareEditAckPayload,
 }
 
@@ -1166,6 +1178,8 @@ pub struct ShareRequestLogEntry {
     /// Downstream clients should prefer the proxied `X-CC-Switch-Request-Id` header as
     /// the request id when present so live dashboard events and synced request logs share
     /// one identity.
+    #[serde(default)]
+    pub export_sequence: u64,
     pub request_id: String,
     pub share_id: String,
     pub share_name: String,
@@ -1216,6 +1230,20 @@ pub struct ShareRequestLogEntry {
     pub created_at: i64,
     #[serde(default)]
     pub is_health_check: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRequestLogSyncAck {
+    pub request_id: String,
+    pub usage_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRequestLogBatchSyncResponse {
+    pub ok: bool,
+    pub acks: Vec<ShareRequestLogSyncAck>,
 }
 
 fn default_observed_usage_state() -> String {
@@ -1333,6 +1361,10 @@ pub struct ShareRequestLogFetchResponse {
     pub share_id: Option<String>,
     #[serde(default)]
     pub logs: Vec<ShareRequestLogEntry>,
+    #[serde(default)]
+    pub next_sequence: u64,
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2789,6 +2821,41 @@ pub struct UpgradeInstallationStatusResponse {
     pub target_commit_id: Option<String>,
     #[serde(default)]
     pub logs: Vec<InstallationUpgradeLogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationUpgradeTaskReportPayload {
+    pub task_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub restart_pending: bool,
+    #[serde(default)]
+    pub target_commit_id: Option<String>,
+    #[serde(default)]
+    pub logs: Vec<InstallationUpgradeLogEntry>,
+    #[serde(default)]
+    pub restart_after: bool,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationUpgradeTaskReportRequest {
+    pub protocol_epoch: String,
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    #[serde(flatten)]
+    pub payload: InstallationUpgradeTaskReportPayload,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationUpgradeTaskReportResponse {
+    pub ok: bool,
 }
 
 #[derive(Debug, Serialize)]

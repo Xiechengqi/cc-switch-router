@@ -40,6 +40,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         10,
         include_str!("../schema/0010_share_market_reconciliation_cursor.sql"),
     ),
+    (
+        11,
+        include_str!("../schema/0011_installation_upgrade_tasks.sql"),
+    ),
+    (
+        12,
+        include_str!("../schema/0012_share_request_log_recovery_cursors.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -228,7 +236,16 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 109);
+        assert_eq!(table_count, 111);
+        let recovery_cursor_table_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'share_request_log_recovery_cursors'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Share request log recovery cursor tables");
+        assert_eq!(recovery_cursor_table_count, 1);
         let legacy_profile_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -247,7 +264,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 10);
+        assert_eq!(versions.len(), 12);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -258,6 +275,8 @@ mod tests {
         assert_eq!(versions[7], (8, migration_checksum(MIGRATIONS[6].1)));
         assert_eq!(versions[8], (9, migration_checksum(MIGRATIONS[7].1)));
         assert_eq!(versions[9], (10, migration_checksum(MIGRATIONS[8].1)));
+        assert_eq!(versions[10], (11, migration_checksum(MIGRATIONS[9].1)));
+        assert_eq!(versions[11], (12, migration_checksum(MIGRATIONS[10].1)));
     }
 
     #[test]
