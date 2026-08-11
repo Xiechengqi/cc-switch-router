@@ -19,6 +19,14 @@ const DEFAULT_IP_INTEL_ENDPOINTS: &[&str] = &["http://3.0.3.0", "http://3.0.2.1"
 pub const DEFAULT_DB_SYNC_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_CLOCK_PROBE_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_CLOCK_PROBE_TIMEOUT_SECS: u64 = 4;
+pub const DEFAULT_SSH_INACTIVITY_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_SSH_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_SSH_KEEPALIVE_MAX: usize = 3;
+pub const DEFAULT_SSH_CHANNEL_OPEN_TIMEOUT_SECS: u64 = 15;
+pub const DEFAULT_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_SSH_MAX_FORWARD_CONNECTIONS: usize = 2_048;
+pub const DEFAULT_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL: usize = 256;
 pub const DEFAULT_CLOCK_SOURCES: &[&str] = &[
     "https://www.cloudflare.com/cdn-cgi/trace",
     "https://www.apple.com/library/test/success.html",
@@ -138,6 +146,103 @@ impl fmt::Debug for DatabaseConfig {
             )
             .field("sync_interval_secs", &self.sync_interval_secs)
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTransportConfig {
+    pub inactivity_timeout_secs: u64,
+    pub keepalive_interval_secs: u64,
+    pub keepalive_max: usize,
+    pub channel_open_timeout_secs: u64,
+    pub bridge_write_stall_timeout_secs: u64,
+    pub bridge_half_close_idle_timeout_secs: u64,
+    pub max_forward_connections: usize,
+    pub max_forward_connections_per_tunnel: usize,
+}
+
+impl Default for SshTransportConfig {
+    fn default() -> Self {
+        Self {
+            inactivity_timeout_secs: DEFAULT_SSH_INACTIVITY_TIMEOUT_SECS,
+            keepalive_interval_secs: DEFAULT_SSH_KEEPALIVE_INTERVAL_SECS,
+            keepalive_max: DEFAULT_SSH_KEEPALIVE_MAX,
+            channel_open_timeout_secs: DEFAULT_SSH_CHANNEL_OPEN_TIMEOUT_SECS,
+            bridge_write_stall_timeout_secs: DEFAULT_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS,
+            bridge_half_close_idle_timeout_secs: DEFAULT_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS,
+            max_forward_connections: DEFAULT_SSH_MAX_FORWARD_CONNECTIONS,
+            max_forward_connections_per_tunnel: DEFAULT_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL,
+        }
+    }
+}
+
+impl SshTransportConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS",
+            self.inactivity_timeout_secs,
+            30,
+            3_600,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS",
+            self.keepalive_interval_secs,
+            5,
+            300,
+        )?;
+        validate_usize_range(
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX",
+            self.keepalive_max,
+            1,
+            10,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS",
+            self.channel_open_timeout_secs,
+            1,
+            120,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS",
+            self.bridge_write_stall_timeout_secs,
+            30,
+            3_600,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS",
+            self.bridge_half_close_idle_timeout_secs,
+            30,
+            3_600,
+        )?;
+        validate_usize_range(
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS",
+            self.max_forward_connections,
+            1,
+            65_536,
+        )?;
+        validate_usize_range(
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
+            self.max_forward_connections_per_tunnel,
+            1,
+            4_096,
+        )?;
+        if self.max_forward_connections_per_tunnel > self.max_forward_connections {
+            return Err(
+                "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL must not exceed CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS"
+                    .into(),
+            );
+        }
+        let keepalive_failure_window = self
+            .keepalive_interval_secs
+            .checked_mul(self.keepalive_max as u64 + 1)
+            .ok_or_else(|| "SSH keepalive failure window overflowed".to_string())?;
+        if keepalive_failure_window > self.inactivity_timeout_secs {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS must be at least {} so all configured keepalive attempts can complete",
+                keepalive_failure_window
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -306,6 +411,7 @@ pub struct Config {
     pub ssh_addr: SocketAddr,
     pub tunnel_domain: String,
     pub ssh_public_addr: String,
+    pub ssh_transport: SshTransportConfig,
     pub use_localhost: bool,
     pub lease_ttl_secs: i64,
     pub data_dir: PathBuf,
@@ -414,6 +520,40 @@ impl Config {
                 .expect("invalid CC_SWITCH_ROUTER_SSH_ADDR"),
             tunnel_domain: tunnel_domain.clone(),
             ssh_public_addr: env_var("CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR").unwrap_or_default(),
+            ssh_transport: SshTransportConfig {
+                inactivity_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS",
+                    DEFAULT_SSH_INACTIVITY_TIMEOUT_SECS,
+                ),
+                keepalive_interval_secs: env_u64(
+                    "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS",
+                    DEFAULT_SSH_KEEPALIVE_INTERVAL_SECS,
+                ),
+                keepalive_max: env_usize(
+                    "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX",
+                    DEFAULT_SSH_KEEPALIVE_MAX,
+                ),
+                channel_open_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS",
+                    DEFAULT_SSH_CHANNEL_OPEN_TIMEOUT_SECS,
+                ),
+                bridge_write_stall_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS",
+                    DEFAULT_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS,
+                ),
+                bridge_half_close_idle_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS",
+                    DEFAULT_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS,
+                ),
+                max_forward_connections: env_usize(
+                    "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS",
+                    DEFAULT_SSH_MAX_FORWARD_CONNECTIONS,
+                ),
+                max_forward_connections_per_tunnel: env_usize(
+                    "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
+                    DEFAULT_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL,
+                ),
+            },
             use_localhost: env_var("CC_SWITCH_ROUTER_USE_LOCALHOST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -639,6 +779,26 @@ impl Config {
         self.clock_health.validate()
     }
 
+    pub fn validate_ssh_transport_config(&self) -> std::result::Result<(), String> {
+        for key in [
+            "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS",
+            "CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS",
+        ] {
+            validate_optional_env_u64(key)?;
+        }
+        for key in [
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX",
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS",
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
+        ] {
+            validate_optional_env_usize(key)?;
+        }
+        self.ssh_transport.validate()
+    }
+
     pub fn tunnel_url(&self, subdomain: &str) -> String {
         let scheme = if self.use_localhost { "http" } else { "https" };
         format!("{scheme}://{subdomain}.{}", self.tunnel_domain)
@@ -763,6 +923,14 @@ CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:80
 CC_SWITCH_ROUTER_SSH_ADDR=0.0.0.0:2222
 CC_SWITCH_ROUTER_TUNNEL_DOMAIN=
 CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR=
+CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS=300
+CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS=30
+CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX=3
+CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS=15
+CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS=300
+CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS=300
+CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS=2048
+CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL=256
 CC_SWITCH_ROUTER_OWNER_EMAIL=
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
@@ -876,6 +1044,68 @@ fn env_i64(key: &str, default: i64) -> i64 {
     env_var(key)
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    env_var(key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    env_var(key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn validate_optional_env_u64(key: &str) -> std::result::Result<(), String> {
+    let Some(value) = env_var(key) else {
+        return Ok(());
+    };
+    value
+        .parse::<u64>()
+        .map(|_| ())
+        .map_err(|_| format!("{key} must be a non-negative integer, got: {value}"))
+}
+
+fn validate_optional_env_usize(key: &str) -> std::result::Result<(), String> {
+    let Some(value) = env_var(key) else {
+        return Ok(());
+    };
+    value
+        .parse::<usize>()
+        .map(|_| ())
+        .map_err(|_| format!("{key} must be a non-negative integer, got: {value}"))
+}
+
+fn validate_u64_range(
+    key: &str,
+    value: u64,
+    minimum: u64,
+    maximum: u64,
+) -> std::result::Result<(), String> {
+    if (minimum..=maximum).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key} must be between {minimum} and {maximum}, got: {value}"
+        ))
+    }
+}
+
+fn validate_usize_range(
+    key: &str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+) -> std::result::Result<(), String> {
+    if (minimum..=maximum).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key} must be between {minimum} and {maximum}, got: {value}"
+        ))
+    }
 }
 
 fn parse_request_log_retention_days(value: Option<&str>) -> std::result::Result<u32, String> {
@@ -1009,6 +1239,7 @@ mod tests {
             ssh_addr: "127.0.0.1:2222".parse().expect("ssh addr"),
             tunnel_domain: "example.com".into(),
             ssh_public_addr: String::new(),
+            ssh_transport: SshTransportConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir: PathBuf::from("/tmp"),
@@ -1159,6 +1390,81 @@ mod tests {
         assert!(database.validate().is_ok());
         database.sync_interval_secs = 3_601;
         assert!(database.validate().is_err());
+    }
+
+    #[test]
+    fn ssh_transport_defaults_and_env_surface_are_valid() {
+        assert!(SshTransportConfig::default().validate().is_ok());
+        let contents = default_env_contents();
+        for expected in [
+            "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS=300",
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS=30",
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX=3",
+            "CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS=15",
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS=300",
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS=300",
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS=2048",
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL=256",
+        ] {
+            assert!(contents.contains(expected), "missing default: {expected}");
+        }
+    }
+
+    #[test]
+    fn ssh_transport_rejects_unsafe_ranges_and_relations() {
+        let config = SshTransportConfig {
+            inactivity_timeout_secs: 29,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            keepalive_interval_secs: 301,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            keepalive_max: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            channel_open_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            bridge_write_stall_timeout_secs: 29,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            bridge_half_close_idle_timeout_secs: 29,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            max_forward_connections: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            max_forward_connections_per_tunnel: DEFAULT_SSH_MAX_FORWARD_CONNECTIONS + 1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = SshTransportConfig {
+            inactivity_timeout_secs: 100,
+            ..Default::default()
+        };
+        assert!(config.validate().unwrap_err().contains("keepalive"));
     }
 
     #[test]

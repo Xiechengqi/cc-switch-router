@@ -107,6 +107,14 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_SSH_ADDR` | `0.0.0.0:2222` | SSH 监听地址 |
 | `CC_SWITCH_ROUTER_TUNNEL_DOMAIN` | `0.0.0.0:8787` | 公共 tunnel 域名 |
 | `CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR` | `{TUNNEL_DOMAIN}:{SSH_PORT}` | 下发给客户端的 SSH 地址(Cloudflare 代理时填源站 IP:端口) |
+| `CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS` | `300` | 入站 SSH 无流量超时，范围 30-3600 秒；必须覆盖完整 keepalive 失败窗口 |
+| `CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS` | `30` | 入站 SSH 无流量时的 keepalive 周期，范围 5-300 秒 |
+| `CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX` | `3` | 未响应 keepalive 上限，范围 1-10 |
+| `CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS` | `15` | 等待 client 确认 forwarded TCP 通道的超时，范围 1-120 秒 |
+| `CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS` | `300` | 有待写数据但无写入进展时关闭 bridge，范围 30-3600 秒；双向纯空闲不触发 |
+| `CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS` | `300` | 单向 EOF 后剩余方向无进展的超时，范围 30-3600 秒 |
+| `CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS` | `2048` | 全局等待通道建立与活动 bridge 的 forwarded TCP 连接总上限，范围 1-65536 |
+| `CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL` | `256` | 单 SSH 隧道等待通道建立与活动 bridge 的连接总上限，范围 1-4096 且不得超过全局上限 |
 | `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期(秒);已连接 client 使用签名续期 API 原连接续期,不按该周期重建 SSH |

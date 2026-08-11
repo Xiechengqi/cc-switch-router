@@ -2,6 +2,7 @@ pub mod collector;
 pub mod models;
 pub mod store;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -24,14 +25,39 @@ use self::models::{
 };
 use self::store::MetricsStore;
 
+#[derive(Debug, Default)]
+struct AlertRouterBaselineState {
+    committed: Option<RouterMetricsStatus>,
+    origin: Option<RouterMetricsStatus>,
+}
+
+impl AlertRouterBaselineState {
+    fn previous_for(&mut self, current: &RouterMetricsStatus) -> Option<RouterMetricsStatus> {
+        if let Some(committed) = &self.committed {
+            return Some(committed.clone());
+        }
+        if let Some(origin) = &self.origin {
+            return Some(origin.clone());
+        }
+        self.origin = Some(current.clone());
+        None
+    }
+
+    fn commit(&mut self, current: RouterMetricsStatus) {
+        self.committed = Some(current);
+        self.origin = None;
+    }
+}
+
 #[derive(Debug)]
 pub struct MetricsRegistry {
     enabled: bool,
     sample_interval_secs: u64,
     store: MetricsStore,
     sampler: Mutex<HostSampler>,
+    sample_cycle: Mutex<()>,
     last_host: Mutex<Option<HostMetricsStatus>>,
-    last_router: Mutex<Option<RouterMetricsStatus>>,
+    alert_router_baseline: Mutex<AlertRouterBaselineState>,
     proxy_inflight: AtomicU64,
     proxy_requests_total: AtomicU64,
     proxy_upstream_errors_total: AtomicU64,
@@ -46,6 +72,21 @@ pub struct MetricsRegistry {
     ssh_forward_bind_errors_total: AtomicU64,
     ssh_forward_accept_errors_total: AtomicU64,
     ssh_forward_emfile_errors_total: AtomicU64,
+    ssh_pending_channel_opens: AtomicU64,
+    ssh_channel_open_started_total: AtomicU64,
+    ssh_channel_open_succeeded_total: AtomicU64,
+    ssh_channel_open_explicit_failures_total: AtomicU64,
+    ssh_channel_open_timeout_total: AtomicU64,
+    ssh_channel_open_session_errors_total: AtomicU64,
+    ssh_channel_open_cancelled_total: AtomicU64,
+    ssh_active_bridges: AtomicU64,
+    ssh_bridge_created_total: AtomicU64,
+    ssh_bridge_completed_total: AtomicU64,
+    ssh_bridge_cancelled_total: AtomicU64,
+    ssh_bridge_write_stall_total: AtomicU64,
+    ssh_bridge_half_close_idle_total: AtomicU64,
+    ssh_bridge_io_errors_total: AtomicU64,
+    ssh_forward_capacity_rejected_total: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -56,8 +97,9 @@ impl MetricsRegistry {
             sample_interval_secs,
             store: MetricsStore::new(config.db_path, config.retention_days),
             sampler: Mutex::new(HostSampler::default()),
+            sample_cycle: Mutex::new(()),
             last_host: Mutex::new(None),
-            last_router: Mutex::new(None),
+            alert_router_baseline: Mutex::new(AlertRouterBaselineState::default()),
             proxy_inflight: AtomicU64::new(0),
             proxy_requests_total: AtomicU64::new(0),
             proxy_upstream_errors_total: AtomicU64::new(0),
@@ -72,6 +114,21 @@ impl MetricsRegistry {
             ssh_forward_bind_errors_total: AtomicU64::new(0),
             ssh_forward_accept_errors_total: AtomicU64::new(0),
             ssh_forward_emfile_errors_total: AtomicU64::new(0),
+            ssh_pending_channel_opens: AtomicU64::new(0),
+            ssh_channel_open_started_total: AtomicU64::new(0),
+            ssh_channel_open_succeeded_total: AtomicU64::new(0),
+            ssh_channel_open_explicit_failures_total: AtomicU64::new(0),
+            ssh_channel_open_timeout_total: AtomicU64::new(0),
+            ssh_channel_open_session_errors_total: AtomicU64::new(0),
+            ssh_channel_open_cancelled_total: AtomicU64::new(0),
+            ssh_active_bridges: AtomicU64::new(0),
+            ssh_bridge_created_total: AtomicU64::new(0),
+            ssh_bridge_completed_total: AtomicU64::new(0),
+            ssh_bridge_cancelled_total: AtomicU64::new(0),
+            ssh_bridge_write_stall_total: AtomicU64::new(0),
+            ssh_bridge_half_close_idle_total: AtomicU64::new(0),
+            ssh_bridge_io_errors_total: AtomicU64::new(0),
+            ssh_forward_capacity_rejected_total: AtomicU64::new(0),
         })
     }
 
@@ -103,9 +160,17 @@ impl MetricsRegistry {
         app_store: &AppStore,
         alerting: &AlertingService,
     ) -> Result<(), AppError> {
+        let _cycle = self.sample_cycle.lock().await;
         let host = self.current_host_status(config).await;
         let router = self.router_status(proxy).await;
-        let previous_router = self.last_router.lock().await.replace(router.clone());
+        if !self.enabled {
+            return Ok(());
+        }
+        let previous_router = self
+            .alert_router_baseline
+            .lock()
+            .await
+            .previous_for(&router);
         let (clients, client_metrics_error) =
             match app_store.client_metrics_snapshot(chrono::Utc::now()).await {
                 Ok(clients) => (clients, None),
@@ -117,27 +182,26 @@ impl MetricsRegistry {
                     Some(error.to_string()),
                 ),
             };
-        let llm = if self.enabled {
-            self.store.llm_snapshot(5 * 60).await.unwrap_or_default()
-        } else {
-            LlmMetricsSnapshot::default()
-        };
-        if self.enabled {
-            self.store
-                .insert_sample(host.clone(), router.clone(), clients.clone())
-                .await?;
-            let conditions = build_alert_conditions(
-                &host,
-                &router,
-                previous_router.as_ref(),
-                &llm,
-                client_metrics_error.as_deref(),
-            );
-            if let Err(error) = alerting.reconcile_metrics(conditions, host.timestamp).await {
-                debug!("reconcile persistent metric incidents failed: {error}");
-            }
+        let llm = self.store.llm_snapshot(5 * 60).await.unwrap_or_default();
+        let conditions = build_alert_conditions(
+            &host,
+            &router,
+            previous_router.as_ref(),
+            &llm,
+            client_metrics_error.as_deref(),
+        );
+        let (persistence, reconciliation) = run_sample_sinks(
+            || {
+                self.store
+                    .insert_sample(host.clone(), router.clone(), clients)
+            },
+            || alerting.reconcile_metrics(conditions, host.timestamp),
+        )
+        .await;
+        if reconciliation.is_ok() {
+            self.alert_router_baseline.lock().await.commit(router);
         }
-        Ok(())
+        combine_sample_results(persistence, reconciliation)
     }
 
     pub async fn record_clock_sample(&self, sample: ClockHealthStatus) -> Result<(), AppError> {
@@ -240,6 +304,37 @@ impl MetricsRegistry {
             ssh_forward_emfile_errors_total: self
                 .ssh_forward_emfile_errors_total
                 .load(Ordering::Relaxed),
+            ssh_pending_channel_opens: self.ssh_pending_channel_opens.load(Ordering::Relaxed),
+            ssh_channel_open_started_total: self
+                .ssh_channel_open_started_total
+                .load(Ordering::Relaxed),
+            ssh_channel_open_succeeded_total: self
+                .ssh_channel_open_succeeded_total
+                .load(Ordering::Relaxed),
+            ssh_channel_open_explicit_failures_total: self
+                .ssh_channel_open_explicit_failures_total
+                .load(Ordering::Relaxed),
+            ssh_channel_open_timeout_total: self
+                .ssh_channel_open_timeout_total
+                .load(Ordering::Relaxed),
+            ssh_channel_open_session_errors_total: self
+                .ssh_channel_open_session_errors_total
+                .load(Ordering::Relaxed),
+            ssh_channel_open_cancelled_total: self
+                .ssh_channel_open_cancelled_total
+                .load(Ordering::Relaxed),
+            ssh_active_bridges: self.ssh_active_bridges.load(Ordering::Relaxed),
+            ssh_bridge_created_total: self.ssh_bridge_created_total.load(Ordering::Relaxed),
+            ssh_bridge_completed_total: self.ssh_bridge_completed_total.load(Ordering::Relaxed),
+            ssh_bridge_cancelled_total: self.ssh_bridge_cancelled_total.load(Ordering::Relaxed),
+            ssh_bridge_write_stall_total: self.ssh_bridge_write_stall_total.load(Ordering::Relaxed),
+            ssh_bridge_half_close_idle_total: self
+                .ssh_bridge_half_close_idle_total
+                .load(Ordering::Relaxed),
+            ssh_bridge_io_errors_total: self.ssh_bridge_io_errors_total.load(Ordering::Relaxed),
+            ssh_forward_capacity_rejected_total: self
+                .ssh_forward_capacity_rejected_total
+                .load(Ordering::Relaxed),
             proxy_inflight: self.proxy_inflight.load(Ordering::Relaxed),
             proxy_requests_total: self.proxy_requests_total.load(Ordering::Relaxed),
             proxy_upstream_errors_total: self.proxy_upstream_errors_total.load(Ordering::Relaxed),
@@ -293,16 +388,13 @@ impl MetricsRegistry {
         }
     }
 
-    pub fn forward_listener_started(&self) {
+    pub fn forward_listener_started(self: &Arc<Self>) -> MetricsForwardListenerGuard {
         self.ssh_forward_listeners.fetch_add(1, Ordering::Relaxed);
         self.ssh_forward_listener_created_total
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn forward_listener_shutdown(&self) {
-        decrement(&self.ssh_forward_listeners);
-        self.ssh_forward_listener_shutdown_total
-            .fetch_add(1, Ordering::Relaxed);
+        MetricsForwardListenerGuard {
+            metrics: self.clone(),
+        }
     }
 
     pub fn forward_bind_error(&self, message: &str) {
@@ -321,6 +413,32 @@ impl MetricsRegistry {
             self.ssh_forward_emfile_errors_total
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn forward_channel_open_started(self: &Arc<Self>) -> MetricsChannelOpenGuard {
+        self.ssh_pending_channel_opens
+            .fetch_add(1, Ordering::Relaxed);
+        self.ssh_channel_open_started_total
+            .fetch_add(1, Ordering::Relaxed);
+        MetricsChannelOpenGuard {
+            metrics: self.clone(),
+            closed: false,
+        }
+    }
+
+    pub fn forward_bridge_started(self: &Arc<Self>) -> MetricsBridgeGuard {
+        self.ssh_active_bridges.fetch_add(1, Ordering::Relaxed);
+        self.ssh_bridge_created_total
+            .fetch_add(1, Ordering::Relaxed);
+        MetricsBridgeGuard {
+            metrics: self.clone(),
+            closed: false,
+        }
+    }
+
+    pub fn forward_capacity_rejected(&self) {
+        self.ssh_forward_capacity_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_llm_request(self: &Arc<Self>, metric: LlmRequestMetric) {
@@ -449,6 +567,118 @@ pub struct MetricsSessionGuard {
     closed: bool,
 }
 
+#[derive(Debug)]
+pub struct MetricsForwardListenerGuard {
+    metrics: Arc<MetricsRegistry>,
+}
+
+impl Drop for MetricsForwardListenerGuard {
+    fn drop(&mut self) {
+        decrement(&self.metrics.ssh_forward_listeners);
+        self.metrics
+            .ssh_forward_listener_shutdown_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardChannelOpenMetricOutcome {
+    Succeeded,
+    ExplicitFailure,
+    TimedOut,
+    SessionError,
+    Cancelled,
+}
+
+#[derive(Debug)]
+pub struct MetricsChannelOpenGuard {
+    metrics: Arc<MetricsRegistry>,
+    closed: bool,
+}
+
+impl MetricsChannelOpenGuard {
+    pub fn finish(mut self, outcome: ForwardChannelOpenMetricOutcome) {
+        self.close(outcome);
+    }
+
+    fn close(&mut self, outcome: ForwardChannelOpenMetricOutcome) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        decrement(&self.metrics.ssh_pending_channel_opens);
+        let counter = match outcome {
+            ForwardChannelOpenMetricOutcome::Succeeded => {
+                &self.metrics.ssh_channel_open_succeeded_total
+            }
+            ForwardChannelOpenMetricOutcome::ExplicitFailure => {
+                &self.metrics.ssh_channel_open_explicit_failures_total
+            }
+            ForwardChannelOpenMetricOutcome::TimedOut => {
+                &self.metrics.ssh_channel_open_timeout_total
+            }
+            ForwardChannelOpenMetricOutcome::SessionError => {
+                &self.metrics.ssh_channel_open_session_errors_total
+            }
+            ForwardChannelOpenMetricOutcome::Cancelled => {
+                &self.metrics.ssh_channel_open_cancelled_total
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for MetricsChannelOpenGuard {
+    fn drop(&mut self) {
+        self.close(ForwardChannelOpenMetricOutcome::Cancelled);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardBridgeMetricOutcome {
+    Completed,
+    Cancelled,
+    WriteStall,
+    HalfCloseIdle,
+    IoError,
+}
+
+#[derive(Debug)]
+pub struct MetricsBridgeGuard {
+    metrics: Arc<MetricsRegistry>,
+    closed: bool,
+}
+
+impl MetricsBridgeGuard {
+    pub fn finish(mut self, outcome: ForwardBridgeMetricOutcome) {
+        self.close(outcome);
+    }
+
+    fn close(&mut self, outcome: ForwardBridgeMetricOutcome) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        decrement(&self.metrics.ssh_active_bridges);
+        let counter = match outcome {
+            ForwardBridgeMetricOutcome::Completed => &self.metrics.ssh_bridge_completed_total,
+            ForwardBridgeMetricOutcome::Cancelled => &self.metrics.ssh_bridge_cancelled_total,
+            ForwardBridgeMetricOutcome::WriteStall => &self.metrics.ssh_bridge_write_stall_total,
+            ForwardBridgeMetricOutcome::HalfCloseIdle => {
+                &self.metrics.ssh_bridge_half_close_idle_total
+            }
+            ForwardBridgeMetricOutcome::IoError => &self.metrics.ssh_bridge_io_errors_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for MetricsBridgeGuard {
+    fn drop(&mut self) {
+        self.close(ForwardBridgeMetricOutcome::Cancelled);
+    }
+}
+
 impl Drop for MetricsSessionGuard {
     fn drop(&mut self) {
         if self.closed {
@@ -508,6 +738,34 @@ fn decrement(value: &AtomicU64) {
             Ok(_) => break,
             Err(next) => current = next,
         }
+    }
+}
+
+async fn run_sample_sinks<P, PF, R, RF>(
+    persist: P,
+    reconcile: R,
+) -> (Result<(), AppError>, Result<(), AppError>)
+where
+    P: FnOnce() -> PF,
+    PF: Future<Output = Result<(), AppError>>,
+    R: FnOnce() -> RF,
+    RF: Future<Output = Result<(), AppError>>,
+{
+    let persistence = persist().await;
+    let reconciliation = reconcile().await;
+    (persistence, reconciliation)
+}
+
+fn combine_sample_results(
+    persistence: Result<(), AppError>,
+    reconciliation: Result<(), AppError>,
+) -> Result<(), AppError> {
+    match (persistence, reconciliation) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(persistence), Err(reconciliation)) => Err(AppError::Internal(format!(
+            "metrics history persistence failed: {persistence}; alert reconciliation failed: {reconciliation}"
+        ))),
     }
 }
 
@@ -656,6 +914,69 @@ fn build_alert_conditions(
                 serde_json::json!({ "newErrors": emfile_errors }),
             );
         }
+        let bridge_write_stalls = router
+            .ssh_bridge_write_stall_total
+            .saturating_sub(previous.ssh_bridge_write_stall_total);
+        if bridge_write_stalls > 0 {
+            push(
+                "ssh_bridge_write_stall",
+                "warning",
+                "SSH bridge write progress stalled",
+                "Forwarded TCP bridges reached the configured write-stall timeout",
+                serde_json::json!({
+                    "newStalls": bridge_write_stalls,
+                    "total": router.ssh_bridge_write_stall_total,
+                }),
+            );
+        }
+        let channel_open_timeouts = router
+            .ssh_channel_open_timeout_total
+            .saturating_sub(previous.ssh_channel_open_timeout_total);
+        if channel_open_timeouts > 0 {
+            push(
+                "ssh_channel_open_timeout",
+                "warning",
+                "SSH forwarded channel open timed out",
+                "A Client did not confirm a forwarded TCP channel before the configured deadline",
+                serde_json::json!({
+                    "newTimeouts": channel_open_timeouts,
+                    "total": router.ssh_channel_open_timeout_total,
+                    "pendingChannelOpens": router.ssh_pending_channel_opens,
+                }),
+            );
+        }
+        let channel_session_errors = router
+            .ssh_channel_open_session_errors_total
+            .saturating_sub(previous.ssh_channel_open_session_errors_total);
+        if channel_session_errors > 0 {
+            push(
+                "ssh_channel_open_session_error",
+                "warning",
+                "SSH session failed while opening a channel",
+                "Forwarded TCP channel setup encountered a terminal SSH session error",
+                serde_json::json!({
+                    "newErrors": channel_session_errors,
+                    "total": router.ssh_channel_open_session_errors_total,
+                }),
+            );
+        }
+        let capacity_rejections = router
+            .ssh_forward_capacity_rejected_total
+            .saturating_sub(previous.ssh_forward_capacity_rejected_total);
+        if capacity_rejections > 0 {
+            push(
+                "ssh_forward_capacity",
+                "warning",
+                "SSH forwarding capacity exhausted",
+                "Forwarded TCP connections were rejected at the configured connection limit",
+                serde_json::json!({
+                    "newRejections": capacity_rejections,
+                    "total": router.ssh_forward_capacity_rejected_total,
+                    "pendingChannelOpens": router.ssh_pending_channel_opens,
+                    "activeBridges": router.ssh_active_bridges,
+                }),
+            );
+        }
     }
     if llm.rpm >= 1.0 && llm.error_rate >= 0.25 {
         push(
@@ -740,7 +1061,67 @@ fn error_kind_from_status(status: &str, status_code: Option<u16>) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::error_kind_from_status;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::config::{AlertingSettings, MetricsConfig};
+    use crate::error::AppError;
+
+    use super::{
+        AlertRouterBaselineState, ForwardBridgeMetricOutcome, ForwardChannelOpenMetricOutcome,
+        MetricsRegistry, RouterMetricsStatus, error_kind_from_status, run_sample_sinks,
+    };
+
+    #[test]
+    fn alert_baseline_retains_deltas_until_reconciliation_commits() {
+        let mut state = AlertRouterBaselineState::default();
+        let first = RouterMetricsStatus {
+            ssh_channel_open_timeout_total: 2,
+            ..Default::default()
+        };
+        assert!(state.previous_for(&first).is_none());
+
+        let recovered = RouterMetricsStatus {
+            ssh_channel_open_timeout_total: 7,
+            ..Default::default()
+        };
+        let previous = state
+            .previous_for(&recovered)
+            .expect("failed reconciliation should preserve the first observation");
+        assert_eq!(previous.ssh_channel_open_timeout_total, 2);
+        assert_eq!(
+            recovered
+                .ssh_channel_open_timeout_total
+                .saturating_sub(previous.ssh_channel_open_timeout_total),
+            5
+        );
+
+        state.commit(recovered.clone());
+        let next = RouterMetricsStatus {
+            ssh_channel_open_timeout_total: 9,
+            ..Default::default()
+        };
+        let previous = state.previous_for(&next).unwrap();
+        assert_eq!(previous.ssh_channel_open_timeout_total, 7);
+    }
+
+    #[tokio::test]
+    async fn alert_reconciliation_runs_when_metrics_history_persistence_fails() {
+        let reconciled = Arc::new(AtomicBool::new(false));
+        let reconcile_flag = reconciled.clone();
+        let (persistence, reconciliation) = run_sample_sinks(
+            || async { Err(AppError::Internal("injected metrics failure".into())) },
+            move || async move {
+                reconcile_flag.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(persistence.is_err());
+        assert!(reconciliation.is_ok());
+        assert!(reconciled.load(Ordering::Acquire));
+    }
 
     #[test]
     fn concurrency_metrics_require_a_stable_local_code() {
@@ -760,6 +1141,74 @@ mod tests {
         assert_eq!(
             error_kind_from_status("error", Some(409)).as_deref(),
             Some("upstream_error")
+        );
+    }
+
+    #[test]
+    fn ssh_lifecycle_guards_keep_active_and_terminal_counters_consistent() {
+        let metrics = MetricsRegistry::new(MetricsConfig {
+            enabled: false,
+            db_path: std::env::temp_dir().join("unused-router-metrics.db"),
+            retention_days: 7,
+            sample_interval_secs: 5,
+            alerting: AlertingSettings::default(),
+        });
+
+        let listener = metrics.forward_listener_started();
+        assert_eq!(metrics.ssh_forward_listeners.load(Ordering::Relaxed), 1);
+        drop(listener);
+        assert_eq!(metrics.ssh_forward_listeners.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .ssh_forward_listener_shutdown_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        metrics
+            .forward_bridge_started()
+            .finish(ForwardBridgeMetricOutcome::Completed);
+        assert_eq!(metrics.ssh_active_bridges.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.ssh_bridge_completed_total.load(Ordering::Relaxed),
+            1
+        );
+
+        let cancelled = metrics.forward_bridge_started();
+        assert_eq!(metrics.ssh_active_bridges.load(Ordering::Relaxed), 1);
+        drop(cancelled);
+        assert_eq!(metrics.ssh_active_bridges.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.ssh_bridge_cancelled_total.load(Ordering::Relaxed),
+            1
+        );
+
+        metrics
+            .forward_channel_open_started()
+            .finish(ForwardChannelOpenMetricOutcome::Succeeded);
+        let cancelled_open = metrics.forward_channel_open_started();
+        assert_eq!(metrics.ssh_pending_channel_opens.load(Ordering::Relaxed), 1);
+        drop(cancelled_open);
+        assert_eq!(metrics.ssh_pending_channel_opens.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .ssh_channel_open_succeeded_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .ssh_channel_open_cancelled_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        metrics.forward_capacity_rejected();
+        assert_eq!(
+            metrics
+                .ssh_forward_capacity_rejected_total
+                .load(Ordering::Relaxed),
+            1
         );
     }
 }

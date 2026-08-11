@@ -36,6 +36,7 @@ mod recent_traffic;
 mod registration_admission;
 mod scheduling_signals;
 mod schema;
+mod secure_file;
 mod server_logs;
 mod server_state;
 mod share_market;
@@ -81,7 +82,7 @@ pub use crate::server_state::{ResendUsageCache, ServerGeo, ServerState};
 
 const APP_NAME: &str = "cc-switch-router";
 const HTTP_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const SSH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SSH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tokio::main]
@@ -100,15 +101,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config = Config::from_env();
-    config
-        .validate_database_config()
-        .map_err(anyhow::Error::msg)?;
-    config
-        .validate_official_provider_config()
-        .map_err(anyhow::Error::msg)?;
-    config
-        .validate_clock_health_config()
-        .map_err(anyhow::Error::msg)?;
+    validate_runtime_config(&config)?;
     let _process_lock = crate::process_lock::ProcessLock::acquire(&config.data_dir)?;
     let server_geo = resolve_server_geo().await;
     info!(
@@ -117,6 +110,16 @@ async fn main() -> Result<()> {
         tunnel_domain = %config.tunnel_domain,
         router_owner_email = config.official_provider_email().unwrap_or("-"),
         ssh_public_addr = %config.effective_ssh_public_addr(),
+        ssh_inactivity_timeout_secs = config.ssh_transport.inactivity_timeout_secs,
+        ssh_keepalive_interval_secs = config.ssh_transport.keepalive_interval_secs,
+        ssh_keepalive_max = config.ssh_transport.keepalive_max,
+        ssh_channel_open_timeout_secs = config.ssh_transport.channel_open_timeout_secs,
+        ssh_bridge_write_stall_timeout_secs = config.ssh_transport.bridge_write_stall_timeout_secs,
+        ssh_bridge_half_close_idle_timeout_secs = config.ssh_transport.bridge_half_close_idle_timeout_secs,
+        ssh_max_forward_connections = config.ssh_transport.max_forward_connections,
+        ssh_max_forward_connections_per_tunnel = config
+            .ssh_transport
+            .max_forward_connections_per_tunnel,
         server_label = "server",
         server_lat = server_geo.lat,
         server_lon = server_geo.lon,
@@ -271,6 +274,7 @@ async fn main() -> Result<()> {
         proxy: state.proxy.clone(),
         host_key: ssh_host_key,
         metrics: state.metrics.clone(),
+        transport: config.ssh_transport.clone(),
     };
     let cleanup_store = state.store.clone();
     let cleanup_config = config.clone();
@@ -1263,12 +1267,14 @@ async fn try_handle_cli() -> Result<bool> {
             let env_path = ensure_default_env_file()?;
             load_env_file(&env_path)?;
             ensure_startup_config(&env_path, StartupConfigMode::SetupOnly)?;
+            validate_runtime_config(&Config::from_env())?;
             Ok(true)
         }
         "check-config" => {
             let env_path = ensure_default_env_file()?;
             load_env_file(&env_path)?;
             ensure_startup_config(&env_path, StartupConfigMode::CheckOnly)?;
+            validate_runtime_config(&Config::from_env())?;
             Ok(true)
         }
         "check-db" => {
@@ -1303,6 +1309,22 @@ async fn try_handle_cli() -> Result<bool> {
     }
 }
 
+fn validate_runtime_config(config: &Config) -> Result<()> {
+    config
+        .validate_database_config()
+        .map_err(anyhow::Error::msg)?;
+    config
+        .validate_official_provider_config()
+        .map_err(anyhow::Error::msg)?;
+    config
+        .validate_clock_health_config()
+        .map_err(anyhow::Error::msg)?;
+    config
+        .validate_ssh_transport_config()
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "\
@@ -1323,6 +1345,14 @@ Environment:
   CC_SWITCH_ROUTER_SSH_ADDR              SSH listen address, default 0.0.0.0:2222
   CC_SWITCH_ROUTER_TUNNEL_DOMAIN         Public tunnel domain, required
   CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR       SSH address sent to clients, required
+  CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS Inbound SSH inactivity timeout, default 300
+  CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS SSH keepalive interval, default 30
+  CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX     Unanswered keepalive limit, default 3
+  CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS Forward channel open timeout, default 15
+  CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS Bridge write-progress timeout, default 300
+  CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS Half-close idle timeout, default 300
+  CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS Global pending + active forward limit, default 2048
+  CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL Per-tunnel pending + active limit, default 256
   CC_SWITCH_ROUTER_RESEND_API_KEY        Resend API key for email login, required
   CC_SWITCH_ROUTER_RESEND_FROM           Sender email, default noreply@[TUNNEL_DOMAIN]
   CC_SWITCH_ROUTER_USE_LOCALHOST         Use http for localhost-style domains, default false

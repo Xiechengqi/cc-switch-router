@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use crate::config::{Config, MAX_REQUEST_LOG_RETENTION_DAYS, MIN_REQUEST_LOG_RETENTION_DAYS};
+use crate::config::{
+    Config, MAX_REQUEST_LOG_RETENTION_DAYS, MIN_REQUEST_LOG_RETENTION_DAYS, SshTransportConfig,
+};
 use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 
@@ -175,6 +177,103 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         default: Some("false"),
         description: "When true, generated tunnel URLs use http://. Set false for HTTPS in production.",
         placeholder: None,
+        dynamic_group: None,
+    },
+    // ── SSH transport lifecycle ──
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS",
+        label: "SSH inactivity timeout (seconds)",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("300"),
+        description: "Close an inbound SSH session that has received no traffic within this interval (30-3600 seconds).",
+        placeholder: Some("300"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS",
+        label: "SSH keepalive interval (seconds)",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("30"),
+        description: "Send a keepalive after this period without inbound SSH traffic (5-300 seconds).",
+        placeholder: Some("30"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX",
+        label: "Unanswered SSH keepalives",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("3"),
+        description: "Maximum unanswered keepalive probes before the SSH session is closed (1-10).",
+        placeholder: Some("3"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS",
+        label: "Forward channel open timeout (seconds)",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("15"),
+        description: "Maximum time to wait for a client to confirm a forwarded TCP channel (1-120 seconds).",
+        placeholder: Some("15"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS",
+        label: "Bridge write stall timeout (seconds)",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("300"),
+        description: "Close a bridge only when pending bytes make no write progress for this long (30-3600 seconds).",
+        placeholder: Some("300"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS",
+        label: "Bridge half-close idle timeout (seconds)",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("300"),
+        description: "After one direction reaches EOF, wait this long without remaining-direction progress (30-3600 seconds).",
+        placeholder: Some("300"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS",
+        label: "Global forward connection limit",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("2048"),
+        description: "Maximum forwarded TCP connections waiting for a channel or actively bridging across all SSH tunnels (1-65536).",
+        placeholder: Some("2048"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
+        label: "Per-tunnel forward connection limit",
+        group: "SSH transport",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("256"),
+        description: "Maximum forwarded TCP connections waiting for a channel or actively bridging on one SSH tunnel (1-4096 and no more than the global limit).",
+        placeholder: Some("256"),
         dynamic_group: None,
     },
     // ── Persistence ──
@@ -1403,6 +1502,7 @@ pub fn validate_and_diff(
     validate_client_notification_relations(&next, updates)?;
     validate_alerting_relations(&next, updates)?;
     validate_database_relations(&next, updates)?;
+    validate_ssh_transport_relations(&next, updates)?;
 
     Ok(ApplyOutcome {
         updated_keys: updated,
@@ -1664,6 +1764,135 @@ fn validate_database_relations(
         ));
     }
     Ok(())
+}
+
+fn validate_ssh_transport_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<(), AppError> {
+    const SSH_TRANSPORT_KEYS: &[&str] = &[
+        "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS",
+        "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX",
+        "CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS",
+        "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
+    ];
+    if !updates
+        .keys()
+        .any(|key| SSH_TRANSPORT_KEYS.contains(&key.as_str()))
+    {
+        return Ok(());
+    }
+
+    let defaults = SshTransportConfig::default();
+    let config = SshTransportConfig {
+        inactivity_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS",
+            defaults.inactivity_timeout_secs,
+        )?,
+        keepalive_interval_secs: resolved_ssh_u64(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS",
+            defaults.keepalive_interval_secs,
+        )?,
+        keepalive_max: resolved_ssh_usize(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX",
+            defaults.keepalive_max,
+        )?,
+        channel_open_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_CHANNEL_OPEN_TIMEOUT_SECS",
+            defaults.channel_open_timeout_secs,
+        )?,
+        bridge_write_stall_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS",
+            defaults.bridge_write_stall_timeout_secs,
+        )?,
+        bridge_half_close_idle_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS",
+            defaults.bridge_half_close_idle_timeout_secs,
+        )?,
+        max_forward_connections: resolved_ssh_usize(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS",
+            defaults.max_forward_connections,
+        )?,
+        max_forward_connections_per_tunnel: resolved_ssh_usize(
+            next,
+            updates,
+            "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
+            defaults.max_forward_connections_per_tunnel,
+        )?,
+    };
+    config.validate().map_err(AppError::BadRequest)
+}
+
+fn resolved_ssh_value(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    key: &str,
+) -> Option<String> {
+    let file_value = next.get(key).cloned();
+    if updates.contains_key(key) {
+        file_value
+    } else {
+        file_value.or_else(|| {
+            std::env::var(key)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+    }
+}
+
+fn resolved_ssh_u64(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    key: &str,
+    default: u64,
+) -> Result<u64, AppError> {
+    resolved_ssh_value(next, updates, key)
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                AppError::BadRequest(format!(
+                    "{key} must be a non-negative integer, got: {value}"
+                ))
+            })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn resolved_ssh_usize(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    key: &str,
+    default: usize,
+) -> Result<usize, AppError> {
+    resolved_ssh_value(next, updates, key)
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                AppError::BadRequest(format!(
+                    "{key} must be a non-negative integer, got: {value}"
+                ))
+            })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 fn validate_client_notification_integer(key: &str, value: i64) -> Result<(), AppError> {
@@ -2157,6 +2386,57 @@ mod tests {
     }
 
     #[test]
+    fn ssh_transport_settings_use_runtime_validation_contract() {
+        let existing = HashMap::new();
+        let valid = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS".into(),
+                Some("128".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL".into(),
+                Some("64".into()),
+            ),
+        ]);
+        let outcome = validate_and_diff(&existing, &valid).expect("valid SSH transport settings");
+        assert_eq!(outcome.restart_required_keys.len(), 2);
+
+        let invalid_capacity = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS".into(),
+                Some("32".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL".into(),
+                Some("64".into()),
+            ),
+        ]);
+        assert!(validate_and_diff(&existing, &invalid_capacity).is_err());
+
+        let invalid_keepalive = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS".into(),
+                Some("100".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS".into(),
+                Some("30".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_SSH_KEEPALIVE_MAX".into(),
+                Some("3".into()),
+            ),
+        ]);
+        assert!(validate_and_diff(&existing, &invalid_keepalive).is_err());
+
+        let out_of_range = BTreeMap::from([(
+            "CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS".into(),
+            Some("29".into()),
+        )]);
+        assert!(validate_and_diff(&existing, &out_of_range).is_err());
+    }
+
+    #[test]
     fn turso_mode_requires_url_and_secret_token() {
         let existing = HashMap::new();
         let mut updates =
@@ -2579,6 +2859,7 @@ mod tests {
             ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2222),
             tunnel_domain: "router.example.com".into(),
             ssh_public_addr: String::new(),
+            ssh_transport: crate::config::SshTransportConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir: std::env::temp_dir(),

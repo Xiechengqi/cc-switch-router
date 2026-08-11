@@ -30,6 +30,7 @@ use crate::ServerState;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::proxy::RouteAvailability;
+use crate::secure_file::atomic_replace_file_mode;
 use crate::store::AppStore;
 
 pub const PROVISION_SOURCE_ROUTER_MARKET: &str = "router_market";
@@ -3529,55 +3530,13 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn atomic_write_file_mode(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path has no parent directory: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create directory failed: {}", parent.display()))?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("rotation-state");
-    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
-    let result = (|| -> anyhow::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(mode)
-            .open(&temporary)
-            .with_context(|| format!("create temporary file failed: {}", temporary.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("write temporary file failed: {}", temporary.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync temporary file failed: {}", temporary.display()))?;
-        drop(file);
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode)).with_context(|| {
-            format!(
-                "set temporary file permissions failed: {}",
-                temporary.display()
-            )
-        })?;
-        fs::rename(&temporary, path)
-            .with_context(|| format!("replace file failed: {}", path.display()))?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("sync directory failed: {}", parent.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 fn write_provision_rotation_state(
     path: &Path,
     state: &ProvisionSshRotationState,
 ) -> anyhow::Result<()> {
     let mut serialized = serde_json::to_vec_pretty(state)?;
     serialized.push(b'\n');
-    atomic_write_file_mode(path, &serialized, 0o600)
+    atomic_replace_file_mode(path, &serialized, 0o600)
 }
 
 fn activate_provision_ssh_candidate(
@@ -3741,7 +3700,7 @@ pub async fn rotate_provision_ssh_key_offline(
     if rotation.stage == ProvisionSshRotationStage::Distributing
         && active_derived == rotation.new_public_key
     {
-        atomic_write_file_mode(
+        atomic_replace_file_mode(
             public_key_path,
             format!("{} cc-switch-router-provision\n", rotation.new_public_key).as_bytes(),
             0o644,
@@ -8991,6 +8950,7 @@ mod tests {
             ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tunnel_domain: "router.test".into(),
             ssh_public_addr: String::new(),
+            ssh_transport: crate::config::SshTransportConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir: root.clone(),

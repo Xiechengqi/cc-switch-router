@@ -68,11 +68,8 @@ impl MetricsStore {
     ) -> Result<(), AppError> {
         let store = self.clone();
         spawn_blocking(move || {
-            let conn = store.open()?;
-            insert_host_metrics(&conn, &host)?;
-            insert_router_metrics(&conn, host.timestamp, &router)?;
-            insert_client_metrics(&conn, &clients)?;
-            Ok(())
+            let mut conn = store.open()?;
+            insert_metrics_sample(&mut conn, &host, &router, &clients)
         })
         .await
         .map_err(|err| AppError::Internal(format!("metrics sample task failed: {err}")))?
@@ -445,6 +442,21 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
             ssh_forward_bind_errors_total INTEGER NOT NULL,
             ssh_forward_accept_errors_total INTEGER NOT NULL,
             ssh_forward_emfile_errors_total INTEGER NOT NULL,
+            ssh_pending_channel_opens INTEGER NOT NULL,
+            ssh_channel_open_started_total INTEGER NOT NULL,
+            ssh_channel_open_succeeded_total INTEGER NOT NULL,
+            ssh_channel_open_explicit_failures_total INTEGER NOT NULL,
+            ssh_channel_open_timeout_total INTEGER NOT NULL,
+            ssh_channel_open_session_errors_total INTEGER NOT NULL,
+            ssh_channel_open_cancelled_total INTEGER NOT NULL,
+            ssh_active_bridges INTEGER NOT NULL,
+            ssh_bridge_created_total INTEGER NOT NULL,
+            ssh_bridge_completed_total INTEGER NOT NULL,
+            ssh_bridge_cancelled_total INTEGER NOT NULL,
+            ssh_bridge_write_stall_total INTEGER NOT NULL,
+            ssh_bridge_half_close_idle_total INTEGER NOT NULL,
+            ssh_bridge_io_errors_total INTEGER NOT NULL,
+            ssh_forward_capacity_rejected_total INTEGER NOT NULL,
             proxy_inflight INTEGER NOT NULL,
             proxy_requests_total INTEGER NOT NULL,
             proxy_upstream_errors_total INTEGER NOT NULL,
@@ -518,33 +530,6 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
         ",
     )
     .map_err(|err| AppError::Internal(format!("init metrics db failed: {err}")))?;
-    migrate_metrics_db(conn)?;
-    Ok(())
-}
-
-/// Adds columns introduced after a DB was first created. SQLite does not have
-/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we inspect `pragma_table_info`
-/// and only ALTER when the column is missing — that way migrations are safe to
-/// re-run on every boot and won't error on fresh DBs.
-fn migrate_metrics_db(conn: &Connection) -> Result<(), AppError> {
-    let ensure_column = |table: &str, column: &str, decl: &str| -> Result<(), AppError> {
-        let exists: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
-                params![column],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if exists == 0 {
-            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
-                .map_err(|err| {
-                    AppError::Internal(format!("migrate {table}.{column} failed: {err}"))
-                })?;
-        }
-        Ok(())
-    };
-    ensure_column("host_metrics", "uptime_secs", "INTEGER")?;
-    ensure_column("host_metrics", "process_uptime_secs", "INTEGER")?;
     Ok(())
 }
 
@@ -602,9 +587,17 @@ fn insert_router_metrics(
             ssh_active_sessions, ssh_forward_listeners, ssh_forward_listener_created_total,
             ssh_forward_listener_shutdown_total, ssh_forward_bind_errors_total,
             ssh_forward_accept_errors_total, ssh_forward_emfile_errors_total,
+            ssh_pending_channel_opens, ssh_channel_open_started_total,
+            ssh_channel_open_succeeded_total, ssh_channel_open_explicit_failures_total,
+            ssh_channel_open_timeout_total, ssh_channel_open_session_errors_total,
+            ssh_channel_open_cancelled_total,
+            ssh_active_bridges, ssh_bridge_created_total, ssh_bridge_completed_total,
+            ssh_bridge_cancelled_total, ssh_bridge_write_stall_total,
+            ssh_bridge_half_close_idle_total, ssh_bridge_io_errors_total,
+            ssh_forward_capacity_rejected_total,
             proxy_inflight, proxy_requests_total, proxy_upstream_errors_total, proxy_5xx_total,
             health_probe_failures_total, health_probe_cached_failures_total, db_errors_total
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
         params![
             timestamp,
             router.active_routes as i64,
@@ -617,6 +610,21 @@ fn insert_router_metrics(
             router.ssh_forward_bind_errors_total as i64,
             router.ssh_forward_accept_errors_total as i64,
             router.ssh_forward_emfile_errors_total as i64,
+            router.ssh_pending_channel_opens as i64,
+            router.ssh_channel_open_started_total as i64,
+            router.ssh_channel_open_succeeded_total as i64,
+            router.ssh_channel_open_explicit_failures_total as i64,
+            router.ssh_channel_open_timeout_total as i64,
+            router.ssh_channel_open_session_errors_total as i64,
+            router.ssh_channel_open_cancelled_total as i64,
+            router.ssh_active_bridges as i64,
+            router.ssh_bridge_created_total as i64,
+            router.ssh_bridge_completed_total as i64,
+            router.ssh_bridge_cancelled_total as i64,
+            router.ssh_bridge_write_stall_total as i64,
+            router.ssh_bridge_half_close_idle_total as i64,
+            router.ssh_bridge_io_errors_total as i64,
+            router.ssh_forward_capacity_rejected_total as i64,
             router.proxy_inflight as i64,
             router.proxy_requests_total as i64,
             router.proxy_upstream_errors_total as i64,
@@ -627,6 +635,24 @@ fn insert_router_metrics(
         ],
     )
     .map_err(|err| AppError::Internal(format!("insert router metrics failed: {err}")))?;
+    Ok(())
+}
+
+fn insert_metrics_sample(
+    conn: &mut Connection,
+    host: &HostMetricsStatus,
+    router: &RouterMetricsStatus,
+    clients: &ClientMetricsSnapshot,
+) -> Result<(), AppError> {
+    let transaction = conn.transaction().map_err(|error| {
+        AppError::Internal(format!("begin metrics sample transaction failed: {error}"))
+    })?;
+    insert_host_metrics(&transaction, host)?;
+    insert_router_metrics(&transaction, host.timestamp, router)?;
+    insert_client_metrics(&transaction, clients)?;
+    transaction.commit().map_err(|error| {
+        AppError::Internal(format!("commit metrics sample transaction failed: {error}"))
+    })?;
     Ok(())
 }
 
@@ -1568,6 +1594,74 @@ mod tests {
         assert_eq!(series[0].online, 2);
         assert_eq!(series[0].recovering, 1);
         assert_eq!(series[0].offline, 1);
+    }
+
+    #[test]
+    fn router_metrics_persist_all_ssh_forwarding_counters() {
+        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        init_metrics_db(&conn).expect("init metrics db");
+        let router = RouterMetricsStatus {
+            ssh_pending_channel_opens: 11,
+            ssh_channel_open_started_total: 12,
+            ssh_channel_open_succeeded_total: 13,
+            ssh_channel_open_explicit_failures_total: 14,
+            ssh_channel_open_timeout_total: 15,
+            ssh_channel_open_session_errors_total: 16,
+            ssh_channel_open_cancelled_total: 17,
+            ssh_active_bridges: 18,
+            ssh_bridge_created_total: 19,
+            ssh_bridge_completed_total: 20,
+            ssh_bridge_cancelled_total: 21,
+            ssh_bridge_write_stall_total: 22,
+            ssh_bridge_half_close_idle_total: 23,
+            ssh_bridge_io_errors_total: 24,
+            ssh_forward_capacity_rejected_total: 25,
+            ..Default::default()
+        };
+        insert_router_metrics(&conn, 900, &router).expect("insert router metrics");
+
+        let stored: Vec<i64> = conn
+            .query_row(
+                "SELECT ssh_pending_channel_opens, ssh_channel_open_started_total,
+                        ssh_channel_open_succeeded_total,
+                        ssh_channel_open_explicit_failures_total,
+                        ssh_channel_open_timeout_total,
+                        ssh_channel_open_session_errors_total,
+                        ssh_channel_open_cancelled_total,
+                        ssh_active_bridges, ssh_bridge_created_total,
+                        ssh_bridge_completed_total, ssh_bridge_cancelled_total,
+                        ssh_bridge_write_stall_total, ssh_bridge_half_close_idle_total,
+                        ssh_bridge_io_errors_total, ssh_forward_capacity_rejected_total
+                   FROM router_metrics WHERE timestamp = 900",
+                [],
+                |row| (0..15).map(|index| row.get(index)).collect(),
+            )
+            .expect("read SSH forwarding metrics");
+        assert_eq!(stored, (11..=25).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn metrics_sample_transaction_rolls_back_partial_history() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        init_metrics_db(&conn).expect("init metrics db");
+        conn.execute("DROP TABLE router_metrics", [])
+            .expect("remove router metrics table");
+        let host = host_sample(900, 512);
+        let router = RouterMetricsStatus::default();
+        let clients = ClientMetricsSnapshot {
+            timestamp: 900,
+            ..Default::default()
+        };
+
+        assert!(insert_metrics_sample(&mut conn, &host, &router, &clients).is_err());
+        let host_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM host_metrics", [], |row| row.get(0))
+            .unwrap();
+        let client_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM client_metrics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(host_rows, 0);
+        assert_eq!(client_rows, 0);
     }
 
     #[test]

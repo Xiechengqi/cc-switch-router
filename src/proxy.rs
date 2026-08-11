@@ -5376,6 +5376,7 @@ mod tests {
             ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tunnel_domain: "router.test".into(),
             ssh_public_addr: String::new(),
+            ssh_transport: crate::config::SshTransportConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir,

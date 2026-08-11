@@ -25393,6 +25393,7 @@ mod tests {
             ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2222),
             tunnel_domain: "127.0.0.1:8787".into(),
             ssh_public_addr: String::new(),
+            ssh_transport: crate::config::SshTransportConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir,

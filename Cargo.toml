@@ -25,9 +25,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 libsql = { version = "=0.9.30", default-features = false, features = ["replication", "tls"] }
 portable-pty = "0.8"
 rand = "0.8"
+rand_0_10 = { package = "rand", version = "0.10" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 resend-rs = "0.15"
-russh = { version = "0.46", default-features = false, features = ["flate2"] }
+# 0.46 busy-polls ChannelTx when a peer's channel window reaches zero.
+russh = { version = "=0.62.6", default-features = false, features = ["flate2", "ring"] }
 rusqlite = { package = "libsql-rusqlite", version = "=0.9.30" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
