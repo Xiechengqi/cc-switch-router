@@ -272,10 +272,19 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
           }
           return;
         }
+        if (result.statusSync === "lost") {
+          finished = true;
+          markUpgradeFailed(t("dashboard.clientUpgradeStatusLost"));
+          return;
+        }
         patchState((prev) => ({
           phase: "running",
           startedAt: prev.startedAt,
           taskId: result.taskId,
+          statusUnavailable: result.statusSync !== "reported",
+          errorMessage: result.statusSync === "reported"
+            ? undefined
+            : t("dashboard.clientUpgradeStatusUnavailable"),
         }));
         if (isRecovering && recoveryReason === "start") {
           toast.success(t("dashboard.clientUpgradeStarted", { taskId: result.taskId }));

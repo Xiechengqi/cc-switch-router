@@ -220,7 +220,7 @@ export function ShareConnectionTestRow({
       });
       setResult(response);
       setResultOpen(true);
-      setTestState("done");
+      setTestState(response.success ? "done" : "error");
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
       setTestState("error");
@@ -263,7 +263,7 @@ export function ShareConnectionTestRow({
   else if (!canExecute) disabledReason = t("dashboard.connectDialog.test.needPermission");
 
   const statusColor = result?.response
-    ? result.response.statusCode < 300
+    ? result.success
       ? "text-emerald-700"
       : result.response.statusCode < 500
         ? "text-amber-700"

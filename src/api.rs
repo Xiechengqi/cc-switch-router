@@ -48,16 +48,16 @@ use crate::models::{
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
     HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
     InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
-    InstallationSetupCompletedResponse, InstallationUpgradeTaskReportRequest,
-    InstallationUpgradeTaskReportResponse, IssueLeaseRequest, IssueLeaseResponse,
-    MapDisplaySettings, MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
-    MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
-    MarketMaintenanceUpdateResponse, MarketNotificationEmailLogView,
-    MarketNotificationEmailRequest, MarketNotificationEmailResponse,
-    MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
-    MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
-    MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse,
-    PostClientChatMessageRequest, ProviderUsageResponse, PublicMapPointsResponse,
+    InstallationSetupCompletedResponse, InstallationUpgradeTaskReportPayload,
+    InstallationUpgradeTaskReportRequest, InstallationUpgradeTaskReportResponse, IssueLeaseRequest,
+    IssueLeaseResponse, MapDisplaySettings, MapDisplaySettingsUpdate,
+    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
+    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
+    MarketNotificationEmailLogView, MarketNotificationEmailRequest,
+    MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
+    MarketShareRuntimeStateReleaseRequest, MarketShareRuntimeStateReleaseResponse,
+    MarketShareRuntimeStateSyncRequest, MarketShareRuntimeStateSyncResponse, MarketShareView,
+    MarketsResponse, PostClientChatMessageRequest, ProviderUsageResponse, PublicMapPointsResponse,
     PublicNetworkStatsResponse, RefreshSessionRequest, RegisterAuthDeviceRequest,
     RegisterAuthDeviceResponse, RegisterGatewayRequest, RegisterGatewayResponse,
     RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
@@ -127,6 +127,8 @@ const INSTALLATION_CONTROL_BODY_LIMIT_BYTES: usize = 16 * 1024;
 const INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES: usize = 512 * 1024;
 const INSTALLATION_UPGRADE_TASK_BODY_LIMIT_BYTES: usize =
     INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES + 32 * 1024;
+const INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES: usize =
+    INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES;
 
 fn installation_control_body_limited<S>(route: MethodRouter<S>) -> MethodRouter<S>
 where
@@ -1318,7 +1320,7 @@ async fn upgrade_installation_status(
     Query(query): Query<InstallationUpgradeStatusQuery>,
 ) -> Result<Json<UpgradeInstallationStatusResponse>, AppError> {
     let session_email = require_session_email(&state, &headers).await?;
-    let status = state
+    let mut status = state
         .store
         .installation_upgrade_status_for_owner(
             &installation_id,
@@ -1326,7 +1328,130 @@ async fn upgrade_installation_status(
             &session_email,
         )
         .await?;
+    if status.status == "running" && status.status_sync != "reported" {
+        match reconcile_installation_upgrade_status_from_client(
+            &state,
+            &installation_id,
+            &session_email,
+            &status.task_id,
+        )
+        .await
+        {
+            Ok(()) => {
+                status = state
+                    .store
+                    .installation_upgrade_status_for_owner(
+                        &installation_id,
+                        Some(&status.task_id),
+                        &session_email,
+                    )
+                    .await?;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    installation_id,
+                    task_id = %status.task_id,
+                    error = %error,
+                    "client upgrade status reconciliation remains pending"
+                );
+                if status.status_sync != "lost" {
+                    status.status_sync = "unavailable".into();
+                }
+            }
+        }
+    }
     Ok(Json(status))
+}
+
+async fn reconcile_installation_upgrade_status_from_client(
+    state: &ServerState,
+    installation_id: &str,
+    session_email: &str,
+    task_id: &str,
+) -> Result<(), AppError> {
+    let tunnel_url = state
+        .store
+        .installation_upgrade_tunnel_for_owner(&state.config, installation_id, session_email)
+        .await?;
+    let path_and_query = format!(
+        "/web-api/admin/upgrade/status?taskId={}",
+        url::form_urlencoded::byte_serialize(task_id.as_bytes()).collect::<String>()
+    );
+    let target = client_upgrade_target(
+        state,
+        &tunnel_url,
+        installation_id,
+        session_email,
+        "GET",
+        &path_and_query,
+        &[],
+    )
+    .await?;
+    let response = state
+        .proxy_http
+        .get(format!("{}{}", target.backend_base, path_and_query))
+        .header(
+            crate::ingress_context::INGRESS_CONTEXT_HEADER,
+            target.ingress.encoded_context,
+        )
+        .header(
+            crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+            target.ingress.signature,
+        )
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("client upgrade status request failed: {error}"))
+        })?;
+    let status = response.status();
+    let body = read_bounded_upgrade_status_body(response).await?;
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&body)
+            .chars()
+            .take(2_000)
+            .collect::<String>();
+        return Err(AppError::ServiceUnavailable(format!(
+            "client upgrade status failed: {status}: {body}"
+        )));
+    }
+    let payload =
+        serde_json::from_slice::<InstallationUpgradeTaskReportPayload>(&body).map_err(|error| {
+            AppError::ServiceUnavailable(format!("parse client upgrade status failed: {error}"))
+        })?;
+    state
+        .store
+        .reconcile_installation_upgrade_status_from_client(installation_id, task_id, payload)
+        .await
+}
+
+async fn read_bounded_upgrade_status_body(
+    response: reqwest::Response,
+) -> Result<Vec<u8>, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES as u64)
+    {
+        return Err(AppError::ServiceUnavailable(format!(
+            "client upgrade status response exceeds {INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            AppError::ServiceUnavailable(format!(
+                "client upgrade status response read failed: {error}"
+            ))
+        })?;
+        if body.len().saturating_add(chunk.len()) > INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES {
+            return Err(AppError::ServiceUnavailable(format!(
+                "client upgrade status response exceeds {INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 struct ClientUpgradeTarget {
@@ -3048,6 +3173,39 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn upgrade_status_response_body_is_bounded() {
+        async fn oversized_upgrade_status() -> Body {
+            Body::from(vec![
+                b'x';
+                INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES + 1
+            ])
+        }
+
+        let app = Router::new().route("/status", get(oversized_upgrade_status));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upgrade status server");
+        let address = listener
+            .local_addr()
+            .expect("upgrade status server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve oversized upgrade status");
+        });
+
+        let response = reqwest::get(format!("http://{address}/status"))
+            .await
+            .expect("request oversized upgrade status");
+        let error = read_bounded_upgrade_status_body(response)
+            .await
+            .expect_err("oversized client status must be rejected");
+        server.abort();
+
+        assert!(error.to_string().contains("response exceeds"));
+    }
+
     #[test]
     fn dashboard_session_policy_accepts_valid_session() {
         let viewer_email = require_dashboard_session_email(Some("owner@example.com".into()))
@@ -4142,6 +4300,90 @@ mod tests {
         assert!(probe.body.contains("\"store\":false"));
         assert!(probe.body.contains("\"stream\":true"));
         assert!(!probe.body.contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn responses_probe_requires_completed_terminal_event_across_chunks() {
+        let mut tracker = ProbeSseTracker::new(ProbeResponseMode::ResponsesSse);
+        tracker.push(b"event: response.com");
+        tracker.push(b"pleted\ndata: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n");
+        let (terminal_event, error) = tracker.finish();
+
+        assert_eq!(terminal_event.as_deref(), Some("response.completed"));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn responses_probe_rejects_failure_terminal_event() {
+        let mut tracker = ProbeSseTracker::new(ProbeResponseMode::ResponsesSse);
+        tracker
+            .push(b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n");
+        let (terminal_event, error) = tracker.finish();
+
+        assert_eq!(terminal_event.as_deref(), Some("response.failed"));
+        assert!(error.unwrap().contains("response.failed"));
+    }
+
+    #[test]
+    fn responses_probe_rejects_done_without_semantic_terminal_event() {
+        let mut tracker = ProbeSseTracker::new(ProbeResponseMode::ResponsesSse);
+        tracker.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n");
+        tracker.push(b"data: [DONE]\n\n");
+        let (terminal_event, error) = tracker.finish();
+
+        assert!(terminal_event.is_none());
+        assert!(error.unwrap().contains("before required terminal event"));
+    }
+
+    #[test]
+    fn anthropic_and_image_probes_use_their_protocol_terminals() {
+        let mut anthropic = ProbeSseTracker::new(ProbeResponseMode::AnthropicSse);
+        anthropic.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(anthropic.finish().0.as_deref(), Some("message_stop"));
+
+        let mut image = ProbeSseTracker::new(ProbeResponseMode::ImageSse);
+        image.push(b"event: image_generation.com");
+        image.push(b"pleted\ndata: {\"type\":\"image_generation.completed\"}\n\n");
+        assert_eq!(
+            image.finish().0.as_deref(),
+            Some("image_generation.completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_body_drains_past_preview_before_accepting_terminal_event() {
+        async fn streaming_probe_response() -> Body {
+            let prefix = bytes::Bytes::from(vec![b'x'; TEST_BODY_CAP + 1_024]);
+            let terminal = bytes::Bytes::from_static(
+                b"\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+            );
+            Body::from_stream(futures_util::stream::iter([
+                Ok::<_, std::convert::Infallible>(prefix),
+                Ok(terminal),
+            ]))
+        }
+
+        let app = Router::new().route("/probe", get(streaming_probe_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe server");
+        let address = listener.local_addr().expect("probe server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve probe response");
+        });
+
+        let response = reqwest::get(format!("http://{address}/probe"))
+            .await
+            .expect("request probe response");
+        let body = read_probe_body(response, ProbeResponseMode::ResponsesSse).await;
+        server.abort();
+
+        assert_eq!(body.preview.len(), TEST_BODY_CAP);
+        assert!(body.total_bytes > body.preview.len());
+        assert_eq!(body.terminal_event.as_deref(), Some("response.completed"));
+        assert!(body.error.is_none());
     }
 
     #[test]
@@ -6305,11 +6547,13 @@ struct ShareConnectionTestRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareConnectionTestResponse {
+    success: bool,
     request: TestRequestEcho,
     response: Option<TestResponseEcho>,
     duration_ms: u64,
-    /// 网络层错误（DNS / 连接 / 超时）时填写
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduling_recovery: Option<crate::store::ShareSchedulingRecovery>,
 }
@@ -6422,11 +6666,22 @@ struct TestResponseEcho {
 }
 
 const TEST_BODY_CAP: usize = 64 * 1024;
+const TEST_JSON_PARSE_CAP: usize = 1024 * 1024;
+const TEST_SSE_LINE_SCAN_CAP: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeResponseMode {
+    Json,
+    AnthropicSse,
+    ResponsesSse,
+    ImageSse,
+}
 
 struct AppProbe {
     method: &'static str,
     path: &'static str,
     body: &'static str,
+    response_mode: ProbeResponseMode,
 }
 
 fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
@@ -6445,6 +6700,7 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
             // "Empty choices array"。claude-cli 真实流量恒为 stream:true，走 SSE
             // passthrough 不触发这条转换，所以也对齐这一行为。
             body: r#"{"model":"claude-opus-4-7","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"who are you"}]}"#,
+            response_mode: ProbeResponseMode::AnthropicSse,
         }),
         ("codex", "text") => Some(AppProbe {
             method: "POST",
@@ -6453,16 +6709,19 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
             // 对齐 cc-switch-server provider_test_body：stream + reasoning + include，
             // 不用 max_output_tokens（OAuth 端点会拒绝）。
             body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"who are you"}],"stream":true,"store":false,"reasoning":{"effort":"low"},"include":["reasoning.encrypted_content"],"instructions":"","tools":[],"parallel_tool_calls":false}"#,
+            response_mode: ProbeResponseMode::ResponsesSse,
         }),
         ("codex", "chat") => Some(AppProbe {
             method: "POST",
             path: "/v1/chat/completions",
             body: r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"who are you"}],"max_completion_tokens":16}"#,
+            response_mode: ProbeResponseMode::Json,
         }),
         ("codex", "image") => Some(AppProbe {
             method: "POST",
             path: "/v1/images/generations",
             body: r#"{"model":"gpt-5.5","prompt":"A small robot painting a sunrise","size":"1024x1024","response_format":"b64_json","output_format":"png","stream":true,"partial_images":0}"#,
+            response_mode: ProbeResponseMode::ImageSse,
         }),
         ("gemini", "text") => Some(AppProbe {
             method: "POST",
@@ -6470,6 +6729,7 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
             // 同 claude/codex 思路：避免极小 maxOutputTokens 触发上游 OAuth 网关的
             // 探针检测。Gemini 2.5 Flash 也是 reasoning model。
             body: r#"{"contents":[{"parts":[{"text":"who are you"}]}],"generationConfig":{"maxOutputTokens":16}}"#,
+            response_mode: ProbeResponseMode::Json,
         }),
         ("claude", "tools") => Some(AppProbe {
             method: "POST",
@@ -6478,8 +6738,227 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
             // probe should return tool_use or assistant text within the timeout,
             // not stall after message_start.
             body: r#"{"model":"claude-opus-4-7","max_tokens":256,"stream":true,"tools":[{"name":"Bash","description":"run bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],"messages":[{"role":"user","content":"run ls"}]}"#,
+            response_mode: ProbeResponseMode::AnthropicSse,
         }),
         _ => None,
+    }
+}
+
+struct ProbeBodyRead {
+    preview: Vec<u8>,
+    total_bytes: usize,
+    terminal_event: Option<String>,
+    error: Option<String>,
+}
+
+struct ProbeSseTracker {
+    mode: ProbeResponseMode,
+    line: Vec<u8>,
+    line_truncated: bool,
+    success_event: Option<String>,
+    failure_event: Option<String>,
+    saw_done: bool,
+}
+
+impl ProbeSseTracker {
+    fn new(mode: ProbeResponseMode) -> Self {
+        Self {
+            mode,
+            line: Vec::new(),
+            line_truncated: false,
+            success_event: None,
+            failure_event: None,
+            saw_done: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if *byte == b'\n' {
+                self.finish_line();
+            } else if self.line.len() < TEST_SSE_LINE_SCAN_CAP {
+                self.line.push(*byte);
+            } else {
+                self.line_truncated = true;
+            }
+        }
+    }
+
+    fn finish(mut self) -> (Option<String>, Option<String>) {
+        if !self.line.is_empty() || self.line_truncated {
+            self.finish_line();
+        }
+        if let Some(event) = self.failure_event {
+            return (
+                Some(event.clone()),
+                Some(format!("stream ended with failure event {event}")),
+            );
+        }
+        if let Some(event) = self.success_event {
+            return (Some(event), None);
+        }
+        let expected = match self.mode {
+            ProbeResponseMode::AnthropicSse => "message_stop",
+            ProbeResponseMode::ResponsesSse => "response.completed",
+            ProbeResponseMode::ImageSse => "image_generation.completed",
+            ProbeResponseMode::Json => "JSON response",
+        };
+        let message = if self.saw_done {
+            format!("stream emitted [DONE] before required terminal event {expected}")
+        } else {
+            format!("stream ended before required terminal event {expected}")
+        };
+        (None, Some(message))
+    }
+
+    fn finish_line(&mut self) {
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        let line = std::mem::take(&mut self.line);
+        let truncated = std::mem::replace(&mut self.line_truncated, false);
+        if let Some(event) = line.strip_prefix(b"event:") {
+            self.observe_event(String::from_utf8_lossy(event).trim());
+            return;
+        }
+        let Some(data) = line.strip_prefix(b"data:") else {
+            return;
+        };
+        let data = trim_ascii(data);
+        if data == b"[DONE]" {
+            self.saw_done = true;
+            return;
+        }
+        if let Some(event) = sse_json_event_type(data, truncated) {
+            self.observe_event(&event);
+        }
+    }
+
+    fn observe_event(&mut self, event: &str) {
+        let event = event.trim();
+        let success = match self.mode {
+            ProbeResponseMode::AnthropicSse => event == "message_stop",
+            ProbeResponseMode::ResponsesSse => event == "response.completed",
+            ProbeResponseMode::ImageSse => event == "image_generation.completed",
+            ProbeResponseMode::Json => false,
+        };
+        let failure = match self.mode {
+            ProbeResponseMode::AnthropicSse => event == "error",
+            ProbeResponseMode::ResponsesSse => matches!(
+                event,
+                "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.canceled"
+                    | "error"
+            ),
+            ProbeResponseMode::ImageSse => {
+                matches!(event, "image_generation.failed" | "error")
+            }
+            ProbeResponseMode::Json => false,
+        };
+        if failure && self.failure_event.is_none() {
+            self.failure_event = Some(event.to_string());
+        } else if success && self.success_event.is_none() {
+            self.success_event = Some(event.to_string());
+        }
+    }
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn sse_json_event_type(data: &[u8], truncated: bool) -> Option<String> {
+    if !truncated
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(data)
+        && let Some(event) = value.get("type").and_then(serde_json::Value::as_str)
+    {
+        return Some(event.to_string());
+    }
+    let prefix = &data[..data.len().min(512)];
+    let key = b"\"type\"";
+    let start = prefix.windows(key.len()).position(|window| window == key)? + key.len();
+    let mut remainder = trim_ascii(&prefix[start..]);
+    remainder = remainder.strip_prefix(b":")?;
+    remainder = trim_ascii(remainder);
+    remainder = remainder.strip_prefix(b"\"")?;
+    let end = remainder.iter().position(|byte| *byte == b'\"')?;
+    std::str::from_utf8(&remainder[..end])
+        .ok()
+        .map(str::to_string)
+}
+
+async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> ProbeBodyRead {
+    let mut stream = resp.bytes_stream();
+    let mut preview = Vec::new();
+    let mut total_bytes = 0_usize;
+    let mut json_body = Vec::new();
+    let mut json_too_large = false;
+    let mut sse_tracker = (mode != ProbeResponseMode::Json).then(|| ProbeSseTracker::new(mode));
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return ProbeBodyRead {
+                    preview,
+                    total_bytes,
+                    terminal_event: None,
+                    error: Some(format!("response body read failed: {error}")),
+                };
+            }
+        };
+        total_bytes = total_bytes.saturating_add(chunk.len());
+        if preview.len() < TEST_BODY_CAP {
+            let remaining = TEST_BODY_CAP - preview.len();
+            preview.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        if let Some(tracker) = sse_tracker.as_mut() {
+            tracker.push(&chunk);
+        } else if json_body.len().saturating_add(chunk.len()) <= TEST_JSON_PARSE_CAP {
+            json_body.extend_from_slice(&chunk);
+        } else {
+            json_too_large = true;
+        }
+    }
+
+    if let Some(tracker) = sse_tracker {
+        let (terminal_event, error) = tracker.finish();
+        return ProbeBodyRead {
+            preview,
+            total_bytes,
+            terminal_event,
+            error,
+        };
+    }
+    if json_too_large {
+        return ProbeBodyRead {
+            preview,
+            total_bytes,
+            terminal_event: None,
+            error: Some(format!(
+                "JSON response exceeds the {TEST_JSON_PARSE_CAP} byte validation limit"
+            )),
+        };
+    }
+    let parsed = serde_json::from_slice::<serde_json::Value>(&json_body);
+    let error = match parsed {
+        Ok(value) if !value.get("error").is_some_and(|error| !error.is_null()) => None,
+        Ok(_) => Some("JSON response contains an error object".to_string()),
+        Err(error) => Some(format!("response body is not valid JSON: {error}")),
+    };
+    ProbeBodyRead {
+        preview,
+        total_bytes,
+        terminal_event: error.is_none().then(|| "json.completed".to_string()),
+        error,
     }
 }
 
@@ -6877,18 +7356,19 @@ async fn test_share_connection(
     };
 
     let started = std::time::Instant::now();
-    let result = client
+    let mut request = client
         .post(&local_url)
         .header("Host", &public_host)
         .bearer_auth(&api_token)
         .header("Content-Type", "application/json")
-        .body(probe.body)
-        .send()
-        .await;
-    let duration_ms = started.elapsed().as_millis() as u64;
-
+        .body(probe.body);
+    if probe.response_mode != ProbeResponseMode::Json {
+        request = request.header("Accept", "text/event-stream");
+    }
+    let result = request.send().await;
     match result {
         Err(err) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
             tracing::info!(
                 tag = "test-connection",
                 share_id = %share_id,
@@ -6898,10 +7378,12 @@ async fn test_share_connection(
                 "test-connection network error"
             );
             Ok(Json(ShareConnectionTestResponse {
+                success: false,
                 request: request_echo,
                 response: None,
                 duration_ms,
                 error: Some(err.to_string()),
+                terminal_event: None,
                 scheduling_recovery: None,
             }))
         }
@@ -6913,20 +7395,11 @@ async fn test_share_connection(
                 .iter()
                 .map(|(k, v)| [k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
-            let body_bytes = if app == "codex" && matches!(probe_kind, "image" | "text") {
-                let mut stream = resp.bytes_stream();
-                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
-                    Ok(Some(Ok(bytes))) => bytes,
-                    Ok(Some(Err(err))) => bytes::Bytes::from(format!("stream read error: {err}")),
-                    Ok(None) => bytes::Bytes::new(),
-                    Err(_) => bytes::Bytes::from("stream did not produce a first event within 5s"),
-                }
-            } else {
-                resp.bytes().await.unwrap_or_default()
-            };
-            let body_truncated = body_bytes.len() > TEST_BODY_CAP;
-            let body_slice = &body_bytes[..body_bytes.len().min(TEST_BODY_CAP)];
-            let body_text = String::from_utf8_lossy(body_slice).into_owned();
+            let body = read_probe_body(resp, probe.response_mode).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let body_truncated = body.total_bytes > body.preview.len();
+            let body_text = String::from_utf8_lossy(&body.preview).into_owned();
+            let success = (200..300).contains(&status_code) && body.error.is_none();
 
             tracing::info!(
                 tag = "test-connection",
@@ -6934,9 +7407,12 @@ async fn test_share_connection(
                 app = %app,
                 status = status_code,
                 duration_ms,
+                success,
+                terminal_event = body.terminal_event.as_deref().unwrap_or("-"),
+                semantic_error = body.error.as_deref().unwrap_or("-"),
                 "test-connection completed"
             );
-            let scheduling_recovery = if status_code == 200 {
+            let scheduling_recovery = if success {
                 let recovery = state
                     .store
                     .recover_share_app_scheduling_after_successful_test(&share_id, &app)
@@ -6959,6 +7435,7 @@ async fn test_share_connection(
                 None
             };
             Ok(Json(ShareConnectionTestResponse {
+                success,
                 request: request_echo,
                 response: Some(TestResponseEcho {
                     status_code,
@@ -6968,7 +7445,8 @@ async fn test_share_connection(
                     body_truncated,
                 }),
                 duration_ms,
-                error: None,
+                error: body.error,
+                terminal_event: body.terminal_event,
                 scheduling_recovery,
             }))
         }

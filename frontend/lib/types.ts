@@ -1583,6 +1583,7 @@ export type ShareConnectionTestRequest = {
 };
 
 export type ShareConnectionTestResponse = {
+  success: boolean;
   request: {
     method: string;
     url: string;
@@ -1598,6 +1599,7 @@ export type ShareConnectionTestResponse = {
   } | null;
   durationMs: number;
   error: string | null;
+  terminalEvent?: string | null;
   schedulingRecovery?: {
     shareModelHealthDeleted: number;
     marketModelFailuresDeleted: number;

@@ -2819,6 +2819,8 @@ pub struct UpgradeInstallationStatusResponse {
     pub target_commit_id: Option<String>,
     #[serde(default)]
     pub logs: Vec<InstallationUpgradeLogEntry>,
+    pub status_sync: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2829,9 +2831,9 @@ pub struct InstallationUpgradeTaskReportPayload {
     #[serde(default)]
     pub restart_pending: bool,
     #[serde(default)]
-    pub target_commit_id: Option<String>,
-    #[serde(default)]
     pub logs: Vec<InstallationUpgradeLogEntry>,
+    #[serde(default)]
+    pub target_commit_id: Option<String>,
     #[serde(default)]
     pub restart_after: bool,
     #[serde(default)]

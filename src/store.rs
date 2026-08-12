@@ -19,6 +19,7 @@ use futures_util::{StreamExt, stream};
 use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
 use resend_rs::types::CreateEmailBaseOptions;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -29,6 +30,8 @@ const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
 const INSTALLATION_UPGRADE_TASK_REPORT_ACTION: &str = "installation_upgrade_task_report_v1";
 const INSTALLATION_UPGRADE_TASK_MAX_LOGS: usize = 512;
 const INSTALLATION_UPGRADE_TASK_MAX_JSON_BYTES: usize = 512 * 1024;
+const INSTALLATION_UPGRADE_STATUS_FRESH_SECS: i64 = 45;
+const INSTALLATION_UPGRADE_STATUS_LOST_SECS: i64 = 15 * 60;
 
 use crate::ServerGeo;
 use crate::alerting::models::OperatorAlertSignal;
@@ -2838,11 +2841,10 @@ impl AppStore {
             })?;
         let installation = get_installation(&tx, &input.installation_id)?
             .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-        verify_signed_share_request(
+        verify_signed_installation_upgrade_task_report(
             &tx,
             &installation.public_key,
             &input.installation_id,
-            INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
             &input.payload,
             input.timestamp_ms,
             &input.nonce,
@@ -5022,7 +5024,8 @@ impl AppStore {
         }
         let row = if let Some(task_id) = task_id {
             conn.query_row(
-                "SELECT task_id, status, restart_pending, target_commit_id, logs_json
+                "SELECT task_id, status, restart_pending, target_commit_id, logs_json,
+                        client_reported_at_ms, updated_at, created_at
                  FROM installation_upgrade_tasks
                  WHERE installation_id = ?1 AND task_id = ?2",
                 params![installation_id, task_id],
@@ -5033,13 +5036,17 @@ impl AppStore {
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
             .optional()
         } else {
             conn.query_row(
-                "SELECT task_id, status, restart_pending, target_commit_id, logs_json
+                "SELECT task_id, status, restart_pending, target_commit_id, logs_json,
+                        client_reported_at_ms, updated_at, created_at
                  FROM installation_upgrade_tasks
                  WHERE installation_id = ?1 AND status = 'running'
                  ORDER BY created_at DESC, task_id DESC
@@ -5052,6 +5059,9 @@ impl AppStore {
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -5066,13 +5076,147 @@ impl AppStore {
                 "decode installation upgrade task logs failed: {error}"
             ))
         })?;
+        let reference_at = DateTime::parse_from_rfc3339(&row.6)
+            .or_else(|_| DateTime::parse_from_rfc3339(&row.7))
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let age_secs = Utc::now()
+            .signed_duration_since(reference_at)
+            .num_seconds()
+            .max(0);
+        let status_sync = if row.1 != "running"
+            || (row.5.is_some() && age_secs <= INSTALLATION_UPGRADE_STATUS_FRESH_SECS)
+        {
+            "reported"
+        } else if age_secs >= INSTALLATION_UPGRADE_STATUS_LOST_SECS {
+            "lost"
+        } else {
+            "pending"
+        };
         Ok(UpgradeInstallationStatusResponse {
             task_id: row.0,
             status: row.1,
             restart_pending: row.2 != 0,
             target_commit_id: row.3,
             logs,
+            status_sync: status_sync.into(),
+            updated_at: row.6,
         })
+    }
+
+    pub async fn installation_upgrade_tunnel_for_owner(
+        &self,
+        config: &Config,
+        installation_id: &str,
+        session_email: &str,
+    ) -> Result<String, AppError> {
+        let conn = self.conn.lock().await;
+        let (_, tunnel_url) = Self::installation_upgrade_context(
+            &conn,
+            config,
+            installation_id,
+            session_email,
+            "only installation owner can inspect upgrade status",
+        )?;
+        Ok(tunnel_url)
+    }
+
+    pub async fn reconcile_installation_upgrade_status_from_client(
+        &self,
+        installation_id: &str,
+        expected_task_id: &str,
+        payload: InstallationUpgradeTaskReportPayload,
+    ) -> Result<(), AppError> {
+        validate_installation_upgrade_task_report(&payload)?;
+        let expected_task_id = expected_task_id.trim();
+        if expected_task_id.is_empty() || expected_task_id.len() > 128 {
+            return Err(AppError::BadRequest(
+                "client upgrade taskId must be 1-128 characters".into(),
+            ));
+        }
+        if payload.task_id.trim() != expected_task_id {
+            return Err(AppError::Conflict(
+                "client upgrade status task does not match Router task".into(),
+            ));
+        }
+        let logs_json = serde_json::to_string(&payload.logs).map_err(|error| {
+            AppError::Internal(format!(
+                "serialize reconciled installation upgrade logs failed: {error}"
+            ))
+        })?;
+        let client_reported_at_ms = DateTime::parse_from_rfc3339(payload.updated_at.trim())
+            .map_err(|_| {
+                AppError::BadRequest(
+                    "installation upgrade updatedAt must be an RFC3339 timestamp".into(),
+                )
+            })?
+            .timestamp_millis();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let stored_client_reported_at_ms = conn
+            .query_row(
+                "SELECT client_reported_at_ms
+                 FROM installation_upgrade_tasks
+                 WHERE installation_id = ?1 AND task_id = ?2",
+                params![installation_id, expected_task_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read installation upgrade task before reconciliation failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| AppError::NotFound("client upgrade task not found".into()))?;
+        if stored_client_reported_at_ms.is_some_and(|stored| client_reported_at_ms < stored) {
+            return Ok(());
+        }
+        let changed = conn
+            .execute(
+                "UPDATE installation_upgrade_tasks
+                 SET status = CASE
+                         WHEN status IN ('success', 'failed') AND ?3 = 'running' THEN status
+                         ELSE ?3
+                     END,
+                     restart_pending = CASE
+                         WHEN status IN ('success', 'failed') AND ?3 = 'running' THEN restart_pending
+                         ELSE ?4
+                     END,
+                     target_commit_id = CASE
+                         WHEN status IN ('success', 'failed') AND ?3 = 'running' THEN target_commit_id
+                         ELSE ?5
+                     END,
+                     logs_json = CASE
+                         WHEN status IN ('success', 'failed') AND ?3 = 'running' THEN logs_json
+                         ELSE ?6
+                     END,
+                     restart_after = ?7,
+                     client_reported_at_ms = ?8,
+                     reported_at = ?9,
+                     updated_at = ?9
+                 WHERE installation_id = ?1 AND task_id = ?2",
+                params![
+                    installation_id,
+                    expected_task_id,
+                    payload.status,
+                    i64::from(payload.restart_pending),
+                    payload.target_commit_id,
+                    logs_json,
+                    i64::from(payload.restart_after),
+                    client_reported_at_ms,
+                    now_text,
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("reconcile installation upgrade task failed: {error}"))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Internal(
+                "reconcile installation upgrade task changed an unexpected row count".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn installation_upgrade_context(
@@ -23284,6 +23428,28 @@ fn verify_signed_payload<T: Serialize>(
     nonce: &str,
     signature: &str,
 ) -> Result<(), AppError> {
+    let payload_json = serde_json::to_string(payload)
+        .map_err(|_| AppError::Unauthorized("invalid signed payload".into()))?;
+    verify_signed_payload_json(
+        public_key,
+        installation_id,
+        action,
+        &payload_json,
+        timestamp_ms,
+        nonce,
+        signature,
+    )
+}
+
+fn verify_signed_payload_json(
+    public_key: &str,
+    installation_id: &str,
+    action: &str,
+    payload_json: &str,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
     let key_bytes = base64::engine::general_purpose::STANDARD
         .decode(public_key)
         .map_err(|_| AppError::Unauthorized("invalid stored public key".into()))?;
@@ -23301,8 +23467,6 @@ fn verify_signed_payload<T: Serialize>(
         .map_err(|_| AppError::Unauthorized("invalid signature length".into()))?;
     let signature = Signature::from_bytes(&sig_array);
 
-    let payload_json = serde_json::to_string(payload)
-        .map_err(|_| AppError::Unauthorized("invalid signed payload".into()))?;
     let payload = format!(
         "{PROTOCOL_EPOCH}\n{}\n{}\n{}\n{}\n{}",
         installation_id, action, payload_json, timestamp_ms, nonce
@@ -23310,6 +23474,65 @@ fn verify_signed_payload<T: Serialize>(
     verifying_key
         .verify(payload.as_bytes(), &signature)
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
+}
+
+fn installation_upgrade_task_report_payload_json(
+    payload: &InstallationUpgradeTaskReportPayload,
+) -> Result<String, AppError> {
+    serde_json::to_string(&CanonicalInstallationUpgradeTaskReportPayload(payload))
+        .map_err(|_| AppError::Unauthorized("invalid signed upgrade payload".into()))
+}
+
+struct CanonicalInstallationUpgradeTaskReportPayload<'a>(&'a InstallationUpgradeTaskReportPayload);
+
+impl Serialize for CanonicalInstallationUpgradeTaskReportPayload<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let payload = self.0;
+        let mut state = serializer.serialize_struct("InstallationUpgradeTaskReportPayload", 7)?;
+        state.serialize_field("taskId", &payload.task_id)?;
+        state.serialize_field("status", &payload.status)?;
+        state.serialize_field("restartPending", &payload.restart_pending)?;
+        state.serialize_field("logs", &payload.logs)?;
+        state.serialize_field("targetCommitId", &payload.target_commit_id)?;
+        state.serialize_field("restartAfter", &payload.restart_after)?;
+        state.serialize_field("updatedAt", &payload.updated_at)?;
+        state.end()
+    }
+}
+
+fn verify_signed_installation_upgrade_task_report(
+    conn: &Connection,
+    public_key: &str,
+    installation_id: &str,
+    payload: &InstallationUpgradeTaskReportPayload,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    if signed_request_timestamp_is_stale(now, timestamp_ms) {
+        return Err(AppError::Unauthorized("stale signed request".into()));
+    }
+    let payload_json = installation_upgrade_task_report_payload_json(payload)?;
+    verify_signed_payload_json(
+        public_key,
+        installation_id,
+        INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+        &payload_json,
+        timestamp_ms,
+        nonce,
+        signature,
+    )?;
+    consume_authenticated_installation_nonce(
+        conn,
+        installation_id,
+        INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+        nonce,
+        now,
+    )
 }
 
 fn verify_tunnel_signed_payload<T: Serialize>(
@@ -24721,6 +24944,8 @@ mod tests {
         "NJzUP/o+ARIo2U+KibgynZffeQq/241v5THPz27RkaKJ0s54z7Bf6ExQ4dg4iObhu3Gpvvn1aU5Xks5VF9oNDw==";
     const GOLDEN_EDIT_ACK_SIGNATURE: &str =
         "Hkrch4qOQ8Of/C3JLjkqY/Y4Eo/NFJ9OaK+LoXqYBeVlLprRXpJa2OMUYFzVeabhhSeXFxeK+DIEXAQ2/dpeCw==";
+    const GOLDEN_UPGRADE_REPORT_SIGNATURE: &str =
+        "iRQAxdFnKRhGFSa0/bWVvp7q7kOZmY1t1tm2i5yjSQf29XUdtOpxRQF3zYTzxwt0kEoC6vsOLcYaxctqAWSwCA==";
 
     #[test]
     fn share_control_signature_golden_fixtures_match_server_contract() {
@@ -24797,6 +25022,42 @@ mod tests {
             GOLDEN_TIMESTAMP_MS,
             GOLDEN_NONCE,
             GOLDEN_EDIT_ACK_SIGNATURE,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upgrade_task_report_signature_golden_fixture_matches_server_contract() {
+        let payload = InstallationUpgradeTaskReportPayload {
+            task_id: "task-upgrade-golden".into(),
+            status: "success".into(),
+            restart_pending: false,
+            logs: vec![InstallationUpgradeLogEntry {
+                task_id: "task-upgrade-golden".into(),
+                step: 7,
+                total_steps: 7,
+                level: "success".into(),
+                message: "replacement process passed health checks".into(),
+                progress: Some(100),
+                at: "2026-08-11T10:00:00Z".into(),
+            }],
+            target_commit_id: Some("7b5e172c9cb4".into()),
+            restart_after: true,
+            updated_at: "2026-08-11T10:00:01Z".into(),
+        };
+        let payload_json = installation_upgrade_task_report_payload_json(&payload).unwrap();
+        assert_eq!(
+            payload_json,
+            r#"{"taskId":"task-upgrade-golden","status":"success","restartPending":false,"logs":[{"taskId":"task-upgrade-golden","step":7,"totalSteps":7,"level":"success","message":"replacement process passed health checks","progress":100,"at":"2026-08-11T10:00:00Z"}],"targetCommitId":"7b5e172c9cb4","restartAfter":true,"updatedAt":"2026-08-11T10:00:01Z"}"#
+        );
+        verify_signed_payload_json(
+            GOLDEN_PUBLIC_KEY_B64,
+            GOLDEN_INSTALLATION_ID,
+            INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+            &payload_json,
+            GOLDEN_TIMESTAMP_MS,
+            GOLDEN_NONCE,
+            GOLDEN_UPGRADE_REPORT_SIGNATURE,
         )
         .unwrap();
     }
@@ -30835,6 +31096,159 @@ mod tests {
             .await
             .expect_err("other users cannot inspect upgrade state");
         assert!(owner_error.to_string().contains("only installation owner"));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn upgrade_status_becomes_lost_after_confirmation_deadline() {
+        let (store, config) = setup_store("upgrade-status-lost").await;
+        let installation_id = "inst-upgrade-lost";
+        insert_installation(&store, installation_id).await;
+        store
+            .record_installation_upgrade_started(
+                installation_id,
+                "task-running",
+                "owner@example.com",
+                true,
+            )
+            .await
+            .expect("record running upgrade");
+
+        let pending = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-running"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read fresh running upgrade");
+        assert_eq!(pending.status_sync, "pending");
+
+        let stale_at = (Utc::now() - Duration::seconds(INSTALLATION_UPGRADE_STATUS_LOST_SECS + 1))
+            .to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE installation_upgrade_tasks
+             SET created_at = ?3, updated_at = ?3
+             WHERE installation_id = ?1 AND task_id = ?2",
+            params![installation_id, "task-running", stale_at],
+        )
+        .expect("age running upgrade beyond confirmation deadline");
+        drop(conn);
+
+        let lost = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-running"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read stale running upgrade");
+        assert_eq!(lost.status, "running");
+        assert_eq!(lost.status_sync, "lost");
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_status_reconciliation_requires_the_expected_task() {
+        let (store, config) = setup_store("upgrade-status-reconcile").await;
+        let installation_id = "inst-upgrade-reconcile";
+        insert_installation(&store, installation_id).await;
+        store
+            .record_installation_upgrade_started(
+                installation_id,
+                "task-current",
+                "owner@example.com",
+                true,
+            )
+            .await
+            .expect("record current upgrade");
+
+        let mismatch = store
+            .reconcile_installation_upgrade_status_from_client(
+                installation_id,
+                "task-current",
+                upgrade_task_report_payload(
+                    "task-other",
+                    "success",
+                    "success",
+                    "wrong task completed",
+                ),
+            )
+            .await
+            .expect_err("a different client task must not overwrite the current task");
+        assert!(mismatch.to_string().contains("does not match Router task"));
+
+        let still_running = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-current"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read current task after rejected reconciliation");
+        assert_eq!(still_running.status, "running");
+        assert_eq!(still_running.status_sync, "pending");
+
+        store
+            .reconcile_installation_upgrade_status_from_client(
+                installation_id,
+                "task-current",
+                upgrade_task_report_payload(
+                    "task-current",
+                    "success",
+                    "success",
+                    "client confirmed the replacement process",
+                ),
+            )
+            .await
+            .expect("reconcile matching client task");
+        let completed = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-current"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read reconciled task");
+        assert_eq!(completed.status, "success");
+        assert_eq!(completed.status_sync, "reported");
+        assert_eq!(
+            completed.logs[0].message,
+            "client confirmed the replacement process"
+        );
+
+        let mut stale_running = upgrade_task_report_payload(
+            "task-current",
+            "running",
+            "progress",
+            "stale running snapshot",
+        );
+        stale_running.updated_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+        stale_running.logs[0].at = stale_running.updated_at.clone();
+        store
+            .reconcile_installation_upgrade_status_from_client(
+                installation_id,
+                "task-current",
+                stale_running,
+            )
+            .await
+            .expect("ignore a stale client status snapshot");
+        let still_completed = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-current"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read task after stale reconciliation");
+        assert_eq!(still_completed.status, "success");
+        assert_eq!(
+            still_completed.logs[0].message,
+            "client confirmed the replacement process"
+        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }

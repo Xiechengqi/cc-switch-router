@@ -2043,6 +2043,8 @@ export const messages = {
       "Router could not confirm that the Client accepted the upgrade request. You can retry.",
     "dashboard.clientUpgradeTaskMissing":
       "Router no longer has the accepted upgrade task. You can retry the upgrade.",
+    "dashboard.clientUpgradeStatusLost":
+      "Router could not confirm the accepted upgrade task for 15 minutes. The task is unlocked and can be retried.",
     "dashboard.clientUpgradeConfirmTitle": "Confirm client upgrade",
     "dashboard.clientUpgradeConfirm":
       "Force re-pull the latest cc-switch-server release for {target}. Version equality is not checked, and the service may restart after upgrade.",
@@ -4469,6 +4471,8 @@ export const messages = {
       "Router 无法确认 Client 已接受升级请求，可以重新发起升级。",
     "dashboard.clientUpgradeTaskMissing":
       "Router 已无法找到此前接受的升级任务，可以重新发起升级。",
+    "dashboard.clientUpgradeStatusLost":
+      "Router 已连续 15 分钟无法确认此前接受的升级任务，任务锁定已解除，可以重新发起升级。",
     "dashboard.clientUpgradeConfirmTitle": "确认客户端升级",
     "dashboard.clientUpgradeConfirm":
       "将强制为 {target} 重新拉取最新 cc-switch-server 版本，不检查是否已是最新，升级完成后可能自动重启服务。",

@@ -466,6 +466,8 @@ export type ClientInstallationUpgradeStatus = {
   restartPending: boolean;
   targetCommitId: string | null;
   logs: ClientInstallationUpgradeLog[];
+  statusSync: "reported" | "pending" | "unavailable" | "lost";
+  updatedAt: string;
 };
 
 export async function getClientInstallationUpgradeStatus(
