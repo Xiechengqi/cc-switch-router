@@ -14,7 +14,8 @@ use crate::ServerState;
 use crate::ctl_client::{ClientLogTailReply, CtlError};
 use crate::error::AppError;
 
-const LOG_LINE_LIMIT: usize = 100;
+const OWNER_LOG_LINE_LIMIT: usize = 100;
+const PUBLIC_LOG_LINE_LIMIT: usize = 10;
 const LOG_LINE_MAX_BYTES: usize = 16 * 1024;
 const GLOBAL_CONCURRENCY_LIMIT: usize = 16;
 const PER_CLIENT_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -137,19 +138,17 @@ async fn client_logs_inner(
             "invalid Client installation id".into(),
         ));
     }
-    let session = crate::api::resolve_router_session(state, headers)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
-    let is_client_owner = state
-        .store
-        .is_verified_installation_owner(installation_id, &session.email)
-        .await?;
-    if !can_read_process_logs(is_admin, is_client_owner) {
-        return Err(AppError::Forbidden(
-            "Client owner or Router administrator access is required for process logs".into(),
-        ));
-    }
+    let session = crate::api::resolve_router_session(state, headers).await?;
+    let is_client_owner = match session.as_ref() {
+        Some(session) => {
+            state
+                .store
+                .is_verified_installation_owner(installation_id, &session.email)
+                .await?
+        }
+        None => false,
+    };
+    let line_limit = client_log_line_limit(is_client_owner);
     if !state
         .store
         .client_log_installation_exists(installation_id)
@@ -172,15 +171,19 @@ async fn client_logs_inner(
         route.route_target(),
         installation_id,
         &control_secret,
-        LOG_LINE_LIMIT,
+        line_limit,
     )
     .await
     .map_err(map_control_error)?;
-    client_logs_response(installation_id, reply)
+    client_logs_response(installation_id, line_limit, reply)
 }
 
-fn can_read_process_logs(is_admin: bool, is_client_owner: bool) -> bool {
-    is_admin || is_client_owner
+fn client_log_line_limit(is_client_owner: bool) -> usize {
+    if is_client_owner {
+        OWNER_LOG_LINE_LIMIT
+    } else {
+        PUBLIC_LOG_LINE_LIMIT
+    }
 }
 
 fn map_control_error(error: CtlError) -> AppError {
@@ -197,11 +200,12 @@ fn map_control_error(error: CtlError) -> AppError {
 
 fn client_logs_response(
     installation_id: &str,
+    line_limit: usize,
     reply: ClientLogTailReply,
 ) -> Result<ClientLogsResponse, AppError> {
     let content_lines = reply.content.lines().count();
     if reply.lines != content_lines
-        || reply.lines > LOG_LINE_LIMIT
+        || reply.lines > line_limit
         || reply
             .content
             .lines()
@@ -215,7 +219,7 @@ fn client_logs_response(
         installation_id: installation_id.to_string(),
         content: reply.content,
         lines: reply.lines,
-        limit: LOG_LINE_LIMIT,
+        limit: line_limit,
         truncated: reply.truncated,
         fetched_at: chrono::Utc::now().to_rfc3339(),
     })
@@ -235,6 +239,7 @@ mod tests {
         );
         let response = client_logs_response(
             "installation-a",
+            OWNER_LOG_LINE_LIMIT,
             ClientLogTailReply {
                 ok: true,
                 lines: 2,
@@ -246,20 +251,20 @@ mod tests {
 
         assert_eq!(response.content, content);
         assert_eq!(response.lines, 2);
-        assert_eq!(response.limit, LOG_LINE_LIMIT);
+        assert_eq!(response.limit, OWNER_LOG_LINE_LIMIT);
     }
 
     #[test]
-    fn process_logs_are_never_public() {
-        assert!(can_read_process_logs(true, false));
-        assert!(can_read_process_logs(false, true));
-        assert!(!can_read_process_logs(false, false));
+    fn process_log_limit_is_full_for_owner_and_ten_for_everyone_else() {
+        assert_eq!(client_log_line_limit(true), OWNER_LOG_LINE_LIMIT);
+        assert_eq!(client_log_line_limit(false), PUBLIC_LOG_LINE_LIMIT);
     }
 
     #[test]
     fn response_rejects_inconsistent_line_metadata_without_reformatting() {
         let result = client_logs_response(
             "installation-a",
+            PUBLIC_LOG_LINE_LIMIT,
             ClientLogTailReply {
                 ok: true,
                 lines: 1,

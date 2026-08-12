@@ -156,43 +156,73 @@ export function averageRecentLatencyMs(logs?: ShareRequestLog[], limit = 10) {
   return samples.reduce((sum, latency) => sum + latency, 0) / samples.length;
 }
 
-/** Recent-window total throughput (tok/s): Σ(input+output) / Σ(latency), truncated. */
-export function recentThroughputTokensPerSec(
+export type RecentSharePerformance = {
+  averageTtftMs: number | null;
+  averageTps: number | null;
+  ttftSampleCount: number;
+  tpsSampleCount: number;
+};
+
+function isCompletedStreamingRequest(log: ShareRequestLog) {
+  const statusCode = Number(log.statusCode || 0);
+  const latencyMs = Number(log.latencyMs || 0);
+  const firstTokenMs = Number(log.firstTokenMs || 0);
+  return (
+    !log.isHealthCheck &&
+    log.isStreaming === true &&
+    statusCode >= 200 &&
+    statusCode < 300 &&
+    String(log.streamStatus || "").trim().toLowerCase() === "completed" &&
+    Number.isFinite(latencyMs) &&
+    Number.isFinite(firstTokenMs) &&
+    firstTokenMs > 0 &&
+    firstTokenMs < latencyMs
+  );
+}
+
+export function recentSharePerformance(
   logs?: ShareRequestLog[],
   limit = 10,
-) {
-  const samples = [...(logs || [])]
+): RecentSharePerformance {
+  const recent = [...(logs || [])]
     .sort(
       (left, right) =>
         Number(right.createdAt || 0) - Number(left.createdAt || 0),
     )
-    .slice(0, limit)
-    .filter((log) => {
-      const latency = Number(log.latencyMs || 0);
-      return (
-        hasObservedShareUsage(log) && Number.isFinite(latency) && latency > 0
-      );
-    });
-  if (!samples.length) return null;
-  let tokenSum = 0;
-  let latencySumMs = 0;
-  for (const log of samples) {
-    tokenSum += tokenCount(log.inputTokens) + tokenCount(log.outputTokens);
-    latencySumMs += Number(log.latencyMs || 0);
+    .slice(0, limit);
+  const ttftSamples: number[] = [];
+  const tpsSamples: number[] = [];
+  for (const log of recent) {
+    if (!isCompletedStreamingRequest(log)) continue;
+    const firstTokenMs = Number(log.firstTokenMs);
+    ttftSamples.push(firstTokenMs);
+    if (log.usageState !== "observed") continue;
+    const outputTokens = tokenCount(log.outputTokens);
+    if (!(outputTokens > 0)) continue;
+    const generationMs = Number(log.latencyMs) - firstTokenMs;
+    const tps = outputTokens / (generationMs / 1000);
+    if (Number.isFinite(tps) && tps > 0) tpsSamples.push(tps);
   }
-  const timeSec = latencySumMs / 1000;
-  if (!(timeSec > 0) || !(tokenSum > 0)) return null;
-  return Math.trunc(tokenSum / timeSec);
+  const average = (samples: number[]) =>
+    samples.length
+      ? samples.reduce((sum, sample) => sum + sample, 0) / samples.length
+      : null;
+  return {
+    averageTtftMs: average(ttftSamples),
+    averageTps: average(tpsSamples),
+    ttftSampleCount: ttftSamples.length,
+    tpsSampleCount: tpsSamples.length,
+  };
 }
 
-export function formatThroughputTokensPerSec(tokensPerSec: number | null) {
-  if (
-    tokensPerSec == null ||
-    !Number.isFinite(tokensPerSec) ||
-    tokensPerSec <= 0
-  )
-    return "-";
-  return `${tokensPerSec} tok/s`;
+export function formatTtftTps(performance: RecentSharePerformance) {
+  const ttft = formatLatencySeconds(performance.averageTtftMs);
+  const tps = performance.averageTps;
+  const formattedTps =
+    tps != null && Number.isFinite(tps) && tps > 0
+      ? `${tps.toFixed(1)} tok/s`
+      : "-";
+  return `${ttft} / ${formattedTps}`;
 }
 
 export function formatLatencySeconds(latencyMs: number | null) {
@@ -672,11 +702,14 @@ export function isOfficialRuntime(runtime?: ShareUpstreamProvider) {
   );
 }
 
-export function runtimeModelSummary(runtime?: ShareUpstreamProvider) {
+export function runtimeModelSummary(
+  runtime?: ShareUpstreamProvider,
+  passthroughLabel = "passthrough",
+) {
   if (runtime?.modelPolicy?.mode === "single") {
-    return `model:${runtime.modelPolicy.upstreamModel}`;
+    return String(runtime.modelPolicy.upstreamModel || "").trim();
   }
-  if (runtime?.modelPolicy?.mode === "passthrough") return "passthrough";
+  if (runtime?.modelPolicy?.mode === "passthrough") return passthroughLabel;
   const models = Array.isArray(runtime?.models) ? runtime.models : [];
   return models
     .map((item) => `${item.slot || "model"}:${item.actualModel || ""}`)
@@ -1113,8 +1146,11 @@ export function providerStatusIdentity(runtime?: ShareUpstreamProvider) {
   return name || "-";
 }
 
-export function providerModelMap(runtime?: ShareUpstreamProvider) {
-  return runtimeModelSummary(runtime) || "-";
+export function providerModelMap(
+  runtime?: ShareUpstreamProvider,
+  passthroughLabel = "passthrough",
+) {
+  return runtimeModelSummary(runtime, passthroughLabel) || "-";
 }
 
 function preferredQuotaTiers(runtime?: ShareUpstreamProvider) {
@@ -1211,11 +1247,14 @@ export function providerUsageData(
   return line === "-" ? "-" : line;
 }
 
-export function providerActualModelNames(runtime?: ShareUpstreamProvider) {
+export function providerActualModelNames(
+  runtime?: ShareUpstreamProvider,
+  passthroughLabel = "passthrough",
+) {
   if (runtime?.modelPolicy?.mode === "single") {
-    return runtime.modelPolicy.upstreamModel;
+    return String(runtime.modelPolicy.upstreamModel || "").trim() || "-";
   }
-  if (runtime?.modelPolicy?.mode === "passthrough") return "passthrough";
+  if (runtime?.modelPolicy?.mode === "passthrough") return passthroughLabel;
   const models = Array.isArray(runtime?.models) ? runtime.models : [];
   const names = models
     .map((item) => String(item.actualModel || "").trim())

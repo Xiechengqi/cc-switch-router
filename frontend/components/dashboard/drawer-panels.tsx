@@ -19,7 +19,6 @@ import type {
   ImageGenerationRequestLog,
   MarketRequestLog,
   ShareAppProvider,
-  ShareAppProviders,
   ShareAppRuntimes,
   ShareModelHealthCheck,
   ShareRequestLog,
@@ -74,7 +73,6 @@ import {
   shareApiParts,
   shareAppExists,
   shareAppProviderRuntime,
-  shareAppSettings,
   shareExpiryProgress,
   tokenCount,
   usageBucketTotalTokens,
@@ -241,13 +239,16 @@ export function ShareAppSupportCard({
   label: string;
   locale: AppLocale;
 }) {
+  const { t } = useLocaleText();
   const enabled = !!share.support?.[app];
   const runtime = resolveShareAppRuntime(share, app);
   const tone = enabled
     ? modelHealthTone(share, app)
     : { className: "bg-slate-50 text-muted-foreground", label: "" };
   const accountEmail = enabled ? providerAccountIdentity(runtime) : "";
-  const modelSummary = enabled ? providerModelMap(runtime) : "";
+  const modelSummary = enabled
+    ? providerModelMap(runtime, t("dashboard.modelPolicyPassthrough"))
+    : "";
   return (
     <div
       data-no-row-drawer
@@ -900,13 +901,10 @@ export function ProviderCard({
     return `legacy:${providerModelMap(value)}`;
   };
   const policyText = (value: ShareUpstreamProvider | undefined) => {
-    if (value?.modelPolicy?.mode === "single") {
-      return value.modelPolicy.upstreamModel;
-    }
-    if (value?.modelPolicy?.mode === "passthrough") {
-      return t("dashboard.modelPolicyPassthrough");
-    }
-    return providerModelMap(value);
+    return providerModelMap(
+      value,
+      t("dashboard.modelPolicyPassthrough"),
+    );
   };
   const explicitScope = entries.find((entry) => entry.runtime?.modelPolicyScope)
     ?.runtime?.modelPolicyScope;
@@ -990,7 +988,6 @@ export function ProviderCard({
 
 export function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const { locale, t } = useLocaleText();
-  const shareApp = resolveShareCoreApp(share);
   const runtimes = share?.appRuntimes;
   const currentProviders = React.useMemo(() => {
     if (!share) return [];
@@ -1004,10 +1001,6 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
     });
     return groupProviders(entries);
   }, [share]);
-
-  if (!shareApp) {
-    return <EmptyBlock>{t("dashboard.noProviders")}</EmptyBlock>;
-  }
 
   return (
     <div className="grid gap-3">
@@ -1029,9 +1022,9 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
           })}
         </div>
       )}
-      {share ? <ShareEmailUsagePanel share={share} app={shareApp} /> : null}
+      {share ? <ShareEmailUsagePanel key={share.shareId} share={share} /> : null}
       {share ? (
-        <ShareProviderRequestsPanel share={share} />
+        <ShareProviderRequestsPanel key={share.shareId} share={share} />
       ) : null}
     </div>
   );
@@ -1046,38 +1039,11 @@ const SHARE_USAGE_VIEW_MODES: readonly ShareUsageViewMode[] = [
   "trend",
 ];
 
-function normalizeLimitEmail(value?: string | null) {
-  return (value || "").trim().toLowerCase();
-}
-
 function activeUserLimitGrants(
   share: ShareView,
-  app: keyof ShareAppProviders,
 ): ShareUserGrant[] {
-  const grants = Object.values(share.userGrants || {}).filter(
-    (grant) => grant.active !== false,
-  );
-  if (!grants.length) return [];
-
-  const owner = normalizeLimitEmail(share.ownerEmail);
-  const appKey = CORE_SHARE_APPS.some(([key]) => key === app)
-    ? (app as CoreShareApp)
-    : null;
-  const appEmails = new Set(
-    (appKey
-      ? shareAppSettings(share, appKey).sharedWithEmails
-      : share.sharedWithEmails || []
-    )
-      .map(normalizeLimitEmail)
-      .filter(Boolean),
-  );
-  if (owner) appEmails.add(owner);
-
-  return grants
-    .filter((grant) => {
-      const email = normalizeLimitEmail(grant.email);
-      return grant.role === "owner" || appEmails.has(email);
-    })
+  return Object.values(share.userGrants || {})
+    .filter((grant) => grant.active !== false)
     .sort((left, right) => {
       if (left.role === "owner") return -1;
       if (right.role === "owner") return 1;
@@ -1087,10 +1053,8 @@ function activeUserLimitGrants(
 
 export function ShareEmailUsagePanel({
   share,
-  app,
 }: {
   share: ShareView;
-  app: keyof ShareAppProviders;
 }) {
   const { t } = useLocaleText();
   const [period, setPeriod] = React.useState<ShareUsagePeriod>("24h");
@@ -1106,8 +1070,8 @@ export function ShareEmailUsagePanel({
   const showUsage = mode === "table" || mode === "trend";
   const showLimits = mode === "limits";
   const limitGrants = React.useMemo(
-    () => activeUserLimitGrants(share, app),
-    [share, app],
+    () => activeUserLimitGrants(share),
+    [share],
   );
 
   React.useEffect(() => {
@@ -1115,7 +1079,7 @@ export function ShareEmailUsagePanel({
     let cancelled = false;
     setLoading(true);
     setError("");
-    getShareUsageByEmail(share.shareId, app, period)
+    getShareUsageByEmail(share.shareId, period)
       .then((data) => {
         if (!cancelled) setUsage(data);
       })
@@ -1131,14 +1095,14 @@ export function ShareEmailUsagePanel({
     return () => {
       cancelled = true;
     };
-  }, [share.shareId, app, period, showUsage]);
+  }, [share.shareId, period, showUsage]);
 
   React.useEffect(() => {
     if (!showLimits) return;
     let cancelled = false;
     setLoading(true);
     setError("");
-    getShareUserLimitStatus(share.shareId, app)
+    getShareUserLimitStatus(share.shareId)
       .then((data) => {
         if (!cancelled) setLimitRows(data.rows || []);
       })
@@ -1154,7 +1118,7 @@ export function ShareEmailUsagePanel({
     return () => {
       cancelled = true;
     };
-  }, [share.shareId, app, showLimits]);
+  }, [share.shareId, showLimits]);
 
   const total = usage?.totalTokens ?? 0;
   const modeLabel = (item: ShareUsageViewMode) => {
@@ -1175,9 +1139,6 @@ export function ShareEmailUsagePanel({
             {mode === "limits"
               ? t("dashboard.userLimit.hint")
               : t("dashboard.emailTokenUsageSubtitle", {
-                  app:
-                    PROVIDER_APPS.find((item) => item.key === app)?.label ??
-                    app,
                   total: compactTokens(total),
                 })}
           </div>
@@ -1935,6 +1896,9 @@ export function ShareProviderRequestsPanel({
       setHasMore(false);
     }
     void loadTextLogs(undefined, true);
+    return () => {
+      requestSequence.current += 1;
+    };
   }, [loadTextLogs, recentRequestVersion, selectedKey, textLogQueryKey]);
 
   React.useEffect(() => {
@@ -2005,10 +1969,8 @@ export function ShareProviderRequestsPanel({
             </Button>
           ) : null}
         </div>
-      ) : apps.includes("codex") ? (
-        <ShareImageRequestLogs shareId={share.shareId} />
       ) : (
-        <EmptyBlock>{t("dashboard.noImageJobs")}</EmptyBlock>
+        <ShareImageRequestLogs shareId={share.shareId} />
       )}
     </div>
   );

@@ -14,7 +14,9 @@ import {
   Route,
   ServerCrash,
   Shuffle,
+  Timer,
   Trash2,
+  Zap,
 } from "lucide-react";
 import { Alert, Button, Card, Switch } from "@heroui/react";
 import * as React from "react";
@@ -54,7 +56,7 @@ import {
   StatusChip,
 } from "./metrics-cards";
 import { ClockOffsetChart, type ChartState, ResourceTrendChart } from "./metrics-charts";
-import { CountersTable, MetricEventsList, ModelSubstitutionPanel, TopConsumersTable } from "./metrics-tables";
+import { CountersTable, MetricEventsList, ModelSubstitutionPanel, SharePerformanceTable, TopConsumersTable } from "./metrics-tables";
 import { AlertsTab, ClientsTab } from "./metrics-client-alerts";
 
 type MetricsTab = "overview" | "host" | "router" | "clients" | "llm" | "alerts" | "events";
@@ -96,6 +98,7 @@ export function MetricsPage() {
   const [events, setEvents] = React.useState<MetricEvent[]>([]);
   const [top, setTop] = React.useState<LlmTopResponse | null>(null);
   const [failover, setFailover] = React.useState<LlmReliabilityResponse | null>(null);
+  const [sharePerformance, setSharePerformance] = React.useState<LlmTopResponse | null>(null);
   const [alerting, setAlerting] = React.useState<AlertingOverview | null>(null);
   const [busy, setBusy] = React.useState("");
   const [error, setError] = React.useState("");
@@ -116,13 +119,14 @@ export function MetricsPage() {
       const wantEvents = activeTab === "overview" || activeTab === "events";
       const wantTop = activeTab === "llm";
       const wantAlerting = activeTab === "alerts";
-      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop, nextFailover, nextAlerting] = await Promise.all([
+      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop, nextFailover, nextSharePerformance, nextAlerting] = await Promise.all([
         getMetricsSnapshot(),
         wantSeries ? getMetricsSeries(range) : Promise.resolve(null),
         wantInfo ? getMetricsHostInfo() : Promise.resolve(null),
         wantEvents ? getMetricEvents(100) : Promise.resolve(null),
         wantTop ? getLlmMetricsTop(range, "tokens") : Promise.resolve(null),
         wantTop ? getLlmMetricsFailover(range, 10) : Promise.resolve(null),
+        wantTop ? getLlmMetricsTop(range, "share-performance", 50) : Promise.resolve(null),
         wantAlerting ? getAlertingOverview(200) : Promise.resolve(null),
       ]);
       setSnapshot(nextSnapshot);
@@ -131,6 +135,7 @@ export function MetricsPage() {
       if (nextEvents) setEvents(nextEvents);
       if (nextTop) setTop(nextTop);
       if (nextFailover) setFailover(nextFailover);
+      if (nextSharePerformance) setSharePerformance(nextSharePerformance);
       if (nextAlerting) setAlerting(nextAlerting);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -270,7 +275,7 @@ export function MetricsPage() {
           {activeTab === "host" ? <HostTab snapshot={snapshot} series={series} hostInfo={hostInfo} state={chartState} /> : null}
           {activeTab === "router" ? <RouterTab snapshot={snapshot} series={series} state={chartState} /> : null}
           {activeTab === "clients" ? <ClientsTab clients={snapshot?.clients} series={series} state={chartState} /> : null}
-          {activeTab === "llm" ? <LlmTab snapshot={snapshot} series={series} top={top} failover={failover} state={chartState} /> : null}
+          {activeTab === "llm" ? <LlmTab snapshot={snapshot} series={series} top={top} failover={failover} sharePerformance={sharePerformance} state={chartState} /> : null}
           {activeTab === "alerts" ? <AlertsTab overview={alerting} onReload={() => load(true)} /> : null}
           {activeTab === "events" ? <EventsTab events={alertEvents} /> : null}
         </>
@@ -587,12 +592,14 @@ function LlmTab({
   series,
   top,
   failover,
+  sharePerformance,
   state,
 }: {
   snapshot: MetricsSnapshot | null;
   series: MetricsSeriesResponse | null;
   top: LlmTopResponse | null;
   failover: LlmReliabilityResponse | null;
+  sharePerformance: LlmTopResponse | null;
   state: ChartState;
 }) {
   const { t } = useLocaleText();
@@ -620,6 +627,24 @@ function LlmTab({
           })}
           icon={<Activity />}
           spark={llmPts.map((p) => p.tpm)}
+        />
+        <MetricKpiCard
+          label="TTFT"
+          value={llm?.averageTtftMs != null ? `${fixed(llm.averageTtftMs)} ms` : "-"}
+          detail={t("metrics.detail.validSamples", { count: formatNumber(llm?.ttftSampleCount) })}
+          icon={<Timer />}
+          spark={llmPts
+            .filter((point) => point.ttftSampleCount > 0 && point.averageTtftMs != null)
+            .map((point) => Number(point.averageTtftMs))}
+        />
+        <MetricKpiCard
+          label="TPS"
+          value={llm?.averageTps != null ? `${fixed(llm.averageTps)} tok/s` : "-"}
+          detail={t("metrics.detail.validSamples", { count: formatNumber(llm?.tpsSampleCount) })}
+          icon={<Zap />}
+          spark={llmPts
+            .filter((point) => point.tpsSampleCount > 0 && point.averageTps != null)
+            .map((point) => Number(point.averageTps))}
         />
         <MetricKpiCard
           label={t("metrics.kpi.cacheHit")}
@@ -671,6 +696,30 @@ function LlmTab({
           timestamps={series?.llm.map((p) => p.timestamp) || []}
         />
       </div>
+      <div className="grid gap-5 xl:grid-cols-2">
+        <ResourceTrendChart
+          title={t("metrics.chart.ttftTrend")}
+          maxMode="auto"
+          state={state}
+          unit="ms"
+          series={[
+            { label: t("metrics.series.average"), color: "#0F766E", values: llmPts.map((point) => point.ttftSampleCount > 0 ? point.averageTtftMs : null) },
+            { label: "P95", color: "#F59E0B", values: llmPts.map((point) => point.ttftSampleCount > 0 ? point.p95TtftMs : null) },
+          ]}
+          timestamps={llmPts.map((point) => point.timestamp)}
+        />
+        <ResourceTrendChart
+          title={t("metrics.chart.tpsTrend")}
+          maxMode="auto"
+          state={state}
+          unit="tok/s"
+          series={[
+            { label: t("metrics.series.average"), color: "#0052FF", values: llmPts.map((point) => point.tpsSampleCount > 0 ? point.averageTps : null) },
+          ]}
+          timestamps={llmPts.map((point) => point.timestamp)}
+        />
+      </div>
+      <SharePerformanceTable data={sharePerformance} />
       <div className="grid gap-5 xl:grid-cols-[1fr_1fr]">
         <ModelSubstitutionPanel data={failover} />
         <TopConsumersTable top={top} />

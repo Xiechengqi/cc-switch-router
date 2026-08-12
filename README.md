@@ -66,7 +66,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
-| `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner / Router owner | 从 Router 文件日志读取兼容文本 tail；匿名最多 10 条最近 5 分钟事件，Client owner 与 Router owner 最多 100 条留存事件 |
+| `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner | 从在线 Client 拉取脱敏进程日志；Client owner 最多 100 行，匿名、非 owner 用户和非 owner 管理员最多 10 行 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
@@ -202,7 +202,7 @@ Server 本地日志开启、级别为 `info` 且“日志采集”开关开启�
 
 Router 将事件按 Client 和 boot stream 写入自有 JSONL 文件，轮转段使用 gzip；不同 stream 使用独立串行槽并可并发写入。正常 ACK 顺序为事件 append/fsync、持久化 stream cursor、更新内存索引后返回；轮转、压缩、retention 和容量清理由后台 maintenance 完成。`segments.json` 保存可重建的段 manifest 与全局 `ingestOrder` 范围，重启时会与实际文件核对并重建稳定分页顺序。日志正文、事件、cursor 和 manifest 均不进入业务数据库。默认保留 7 天且总容量上限 1024 MiB；容量超限时按文件的最大 `ingestOrder` 删除逻辑上最旧的段，mtime 仅用于顺序相同时的判定，并至少保留逻辑上最新的已接收事件文件。可在 Settings 的 Server logs 分组修改采集开关、目录、保留期和容量，其中目录、保留期、容量及采集总开关需要重启；公开可见性可热更新。
 
-全局“日志 / Log”页提供三层范围：匿名用户仅能查看事件发生时间位于最近 5 分钟内的公开投影；登录用户可查看其已验证自有 Client 的全部留存事件；Router owner 可查看全部 Client。近期公开 Client 的文件扫描使用 2 秒进程内缓存合并高频请求，事件查询仍逐次执行精确的 5 分钟窗口校验。分页 cursor 使用 HMAC 签名并绑定访问范围、可见 installation 集合和过滤条件。JSONL 导出对每个候选 segment 只扫描一次，并通过有界 channel 流式返回，不在内存累计完整导出；导出期间仅租约保护尚未读取的候选文件，不长期占用轮转/清理使用的全局文件锁，每个 segment 读入后立即释放对应租约并请求 maintenance。Client 列统一显示 Subdomain 并可打开详情侧栏；只有已登录的自有 Client 用户或 Router owner 可以导出 JSONL。兼容端点 `/v1/clients/:installation_id/logs` 从同一文件存储生成文本 tail；Router owner 还可从详情侧栏通过签名控制 RPC 向在线 Server 拉取最多 100 行脱敏实时诊断，该响应不写入 Router 文件或数据库。
+全局“日志 / Log”页提供三层范围：匿名用户仅能查看事件发生时间位于最近 5 分钟内的公开投影；登录用户可查看其已验证自有 Client 的全部留存事件；Router owner 可查看全部 Client。近期公开 Client 的文件扫描使用 2 秒进程内缓存合并高频请求，事件查询仍逐次执行精确的 5 分钟窗口校验。分页 cursor 使用 HMAC 签名并绑定访问范围、可见 installation 集合和过滤条件。JSONL 导出对每个候选 segment 只扫描一次，并通过有界 channel 流式返回，不在内存累计完整导出；导出期间仅租约保护尚未读取的候选文件，不长期占用轮转/清理使用的全局文件锁，每个 segment 读入后立即释放对应租约并请求 maintenance。Client 列统一显示 Subdomain 并可打开详情侧栏；只有已登录的自有 Client 用户或 Router owner 可以导出 JSONL。兼容端点 `/v1/clients/:installation_id/logs` 通过签名控制 RPC 从在线 Client 拉取脱敏进程日志，不写入 Router 文件或数据库；已验证 Client owner 最多读取 100 行，其他访问者最多读取最近 10 行。
 
 注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 Client installation 与新 auth device 分别执行业务库持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复同类身份仍受尝试速率保护,但不消耗新身份额度。只有新 Client installation 还受未绑定 installation 水位线约束。
 
@@ -252,6 +252,12 @@ EOF
 ```
 
 Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离线 episode 去重,注册与离线邮件都只发送至对应 Client 当前已验证的 Owner 邮箱。关闭总开关时,Router 会推进在线状态 baseline 并抑制待发记录;以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度,registration lane 使用独立的 `3/10` 小时额度,两者互不占用。未完成的 outbox 会持续保留,已发送、dead-letter、取消和抑制记录保留 30 天供审计。
+
+### LLM 性能指标
+
+Share 卡片中的 `TTFT/TPS` 取该卡片最近 10 条请求记录，并分别计算有效样本的算术平均值。TTFT 只接受成功且完整结束、具有合法首 Token 时间的流式请求；TPS 还要求 Server 已观测到最终 usage，并按单次请求的 `output tokens / ((总延迟 - TTFT) / 1000)` 计算，不包含 input、cache 或 reasoning token。健康检查、中断请求、未结束流和无效时间数据不参与计算；TTFT 与 TPS 的有效样本彼此独立，因此两者样本数可能不同。
+
+Metrics 的 LLM 页使用当前选择的时间窗口聚合相同口径，并在趋势图中按时间桶展示；无有效样本的时间桶保持空值，不按 `0` 处理。Share 性能表按时间窗口汇总各 Share，而不是复用卡片的最近 10 条限制。请求状态按 `usage_revision` 合并，旧的 pending 状态不能覆盖较新的 completed/interrupted 终态；模型替代成功率也只统计 `success` 和 `error` 终态请求。
 
 ### 运维事故与即时通知
 

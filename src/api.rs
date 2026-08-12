@@ -173,7 +173,6 @@ struct ShareApiAuthQuery {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareUsageByEmailQuery {
-    app: Option<String>,
     period: Option<String>,
 }
 
@@ -193,12 +192,6 @@ struct EmbedUsageQuery {
     show_models: Option<String>,
     compact: Option<String>,
     format: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ShareUserLimitStatusQuery {
-    app: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2006,7 +1999,9 @@ fn apply_dashboard_request_log_visibility(
             .get(&share.share_id)
             .copied()
             .unwrap_or(viewer_is_admin);
-        retain_visible_share_request_logs(&mut share.recent_requests, viewer_email, can_view_all);
+        if !can_view_all {
+            remove_share_request_session_ids(&mut share.recent_requests);
+        }
     }
 
     for share in &mut response.ticker_shares {
@@ -2015,9 +2010,7 @@ fn apply_dashboard_request_log_visibility(
             .copied()
             .unwrap_or(viewer_is_admin);
         if !can_view_all {
-            for log in &mut share.recent_requests {
-                redact_foreign_share_request_identity(log, viewer_email);
-            }
+            remove_share_request_session_ids(&mut share.recent_requests);
         }
     }
 
@@ -2037,15 +2030,6 @@ fn apply_dashboard_request_log_visibility(
         }
     }
 
-    let managed_market_request_ids = response
-        .market_request_logs
-        .iter()
-        .filter(|log| {
-            viewer_is_admin
-                || managed_market_emails.contains(&log.market_email.to_ascii_lowercase())
-        })
-        .map(|log| log.request_id.clone())
-        .collect::<HashSet<_>>();
     for log in &mut response.market_request_logs {
         let can_view_all = viewer_is_admin
             || managed_market_emails.contains(&log.market_email.to_ascii_lowercase());
@@ -2056,38 +2040,11 @@ fn apply_dashboard_request_log_visibility(
             log.api_key_prefix = None;
         }
     }
-
-    for event in &mut response.recent_request_events {
-        let can_view_all = viewer_is_admin
-            || share_log_access
-                .get(&event.share_id)
-                .copied()
-                .unwrap_or(false)
-            || managed_market_request_ids.contains(&event.request_id);
-        if !can_view_all && !emails_match(event.user_email.as_deref(), viewer_email) {
-            event.user_email = None;
-        }
-    }
 }
 
-fn retain_visible_share_request_logs(
-    logs: &mut Vec<ShareRequestLogEntry>,
-    viewer_email: Option<&str>,
-    can_view_all: bool,
-) {
-    if can_view_all {
-        return;
-    }
-    logs.retain(|log| emails_match(log.user_email.as_deref(), viewer_email));
-}
-
-fn redact_foreign_share_request_identity(
-    log: &mut ShareRequestLogEntry,
-    viewer_email: Option<&str>,
-) {
-    log.session_id = None;
-    if !emails_match(log.user_email.as_deref(), viewer_email) {
-        log.user_email = None;
+fn remove_share_request_session_ids(logs: &mut [ShareRequestLogEntry]) {
+    for log in logs {
+        log.session_id = None;
     }
 }
 
@@ -3964,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_request_log_visibility_redacts_foreign_identity_without_dropping_telemetry() {
+    fn dashboard_request_log_visibility_keeps_public_share_identity_without_internal_sessions() {
         let mut own_share_log = share_log("req-own", 2);
         own_share_log.user_email = Some("viewer@example.com".into());
         own_share_log.session_id = Some("own-session".into());
@@ -4001,7 +3958,7 @@ mod tests {
             },
         ];
 
-        apply_dashboard_request_log_visibility(&mut response, Some("viewer@example.com"), false);
+        apply_dashboard_request_log_visibility(&mut response, None, false);
 
         let ticker_logs = &response.ticker_shares[0].recent_requests;
         assert_eq!(ticker_logs.len(), 2);
@@ -4010,12 +3967,12 @@ mod tests {
             Some("viewer@example.com")
         );
         assert!(ticker_logs[0].session_id.is_none());
-        assert!(ticker_logs[1].user_email.is_none());
-        assert!(ticker_logs[1].session_id.is_none());
         assert_eq!(
-            response.market_request_logs[0].user_email.as_deref(),
-            Some("VIEWER@example.com")
+            ticker_logs[1].user_email.as_deref(),
+            Some("foreign@example.com")
         );
+        assert!(ticker_logs[1].session_id.is_none());
+        assert!(response.market_request_logs[0].user_email.is_none());
         assert!(response.market_request_logs[0].api_key_prefix.is_none());
         assert!(response.market_request_logs[1].user_email.is_none());
         assert!(response.market_request_logs[1].api_key_prefix.is_none());
@@ -4023,12 +3980,20 @@ mod tests {
             response.recent_request_events[0].user_email.as_deref(),
             Some("viewer@example.com")
         );
-        assert!(response.recent_request_events[1].user_email.is_none());
+        assert_eq!(
+            response.recent_request_events[1].user_email.as_deref(),
+            Some("foreign@example.com")
+        );
 
         let mut detail_logs = vec![own_share_log, foreign_share_log];
-        retain_visible_share_request_logs(&mut detail_logs, Some("viewer@example.com"), false);
-        assert_eq!(detail_logs.len(), 1);
+        remove_share_request_session_ids(&mut detail_logs);
+        assert_eq!(detail_logs.len(), 2);
         assert_eq!(detail_logs[0].request_id, "req-own");
+        assert_eq!(
+            detail_logs[1].user_email.as_deref(),
+            Some("foreign@example.com")
+        );
+        assert!(detail_logs.iter().all(|log| log.session_id.is_none()));
     }
 
     #[test]
@@ -4396,11 +4361,7 @@ async fn share_usage_by_email(
     Ok(Json(
         state
             .store
-            .share_usage_by_email(
-                &share_id,
-                query.app.as_deref().unwrap_or("claude"),
-                query.period.as_deref().unwrap_or("24h"),
-            )
+            .share_usage_by_email(&share_id, query.period.as_deref().unwrap_or("24h"))
             .await?,
     ))
 }
@@ -4408,14 +4369,8 @@ async fn share_usage_by_email(
 async fn share_user_limit_status(
     State(state): State<ServerState>,
     Path(share_id): Path<String>,
-    Query(query): Query<ShareUserLimitStatusQuery>,
 ) -> Result<Json<crate::models::ShareUserLimitStatusResponse>, AppError> {
-    Ok(Json(
-        state
-            .store
-            .share_user_limit_status(&share_id, query.app.as_deref().unwrap_or("claude"))
-            .await?,
-    ))
+    Ok(Json(state.store.share_user_limit_status(&share_id).await?))
 }
 
 async fn update_share_settings_with_email(
@@ -4618,8 +4573,7 @@ async fn batch_sync_share_request_logs(
 ) -> Result<Json<ShareRequestLogBatchSyncResponse>, AppError> {
     let snapshot = state.recent_traffic.snapshot().await;
     let live_context_map = live_request_context_by_request_id(&snapshot);
-    let metric_logs = input.logs.clone();
-    let acks = state
+    let sync = state
         .store
         .batch_sync_share_request_logs(
             input,
@@ -4628,8 +4582,11 @@ async fn batch_sync_share_request_logs(
             live_context_map,
         )
         .await?;
-    state.metrics.record_share_request_logs(&metric_logs);
-    Ok(Json(ShareRequestLogBatchSyncResponse { ok: true, acks }))
+    state.metrics.record_share_request_logs(&sync.accepted_logs);
+    Ok(Json(ShareRequestLogBatchSyncResponse {
+        ok: true,
+        acks: sync.acks,
+    }))
 }
 
 async fn refresh_share_runtime(
@@ -6652,28 +6609,25 @@ async fn list_share_image_generation_request_logs(
 
 async fn list_share_request_logs(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Path(share_id): Path<String>,
     Query(query): Query<ShareRequestLogsQuery>,
 ) -> Result<Json<ShareRequestLogsResponse>, AppError> {
-    let current_user_email = require_user_email(&state, &headers, "share:read").await?;
-    let share = state
+    state
         .store
         .get_share_for_test(&share_id)
         .await?
         .ok_or_else(|| AppError::NotFound("share not found".into()))?;
-    let can_view_all = state.dynamic.read().await.is_admin(&current_user_email)
-        || share.owner_email.eq_ignore_ascii_case(&current_user_email);
-    let page = state
+    let mut page = state
         .store
         .list_share_request_logs_page(
             &share_id,
             query.app.as_deref(),
-            (!can_view_all).then_some(current_user_email.as_str()),
+            None,
             query.cursor.as_deref(),
             query.limit.unwrap_or(50),
         )
         .await?;
+    remove_share_request_session_ids(&mut page.logs);
     Ok(Json(ShareRequestLogsResponse {
         logs: page.logs,
         next_cursor: page.next_cursor,

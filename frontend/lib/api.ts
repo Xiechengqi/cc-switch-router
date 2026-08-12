@@ -255,10 +255,9 @@ export async function updateShareSettings(
 
 export async function getShareUsageByEmail(
   shareId: string,
-  app: "claude" | "codex" | "gemini",
   period: "24h" | "1w" | "30d",
 ) {
-  const params = new URLSearchParams({ app, period });
+  const params = new URLSearchParams({ period });
   return parseJson<ShareUsageByEmailResponse>(
     await fetch(`/v1/shares/${encodeURIComponent(shareId)}/usage-by-email?${params}`, {
       cache: "no-store",
@@ -266,13 +265,9 @@ export async function getShareUsageByEmail(
   );
 }
 
-export async function getShareUserLimitStatus(
-  shareId: string,
-  app: "claude" | "codex" | "gemini" | string,
-) {
-  const params = new URLSearchParams({ app });
+export async function getShareUserLimitStatus(shareId: string) {
   return parseJson<ShareUserLimitStatusResponse>(
-    await fetch(`/v1/shares/${encodeURIComponent(shareId)}/user-limit-status?${params}`, {
+    await fetch(`/v1/shares/${encodeURIComponent(shareId)}/user-limit-status`, {
       cache: "no-store",
     }),
   );
@@ -534,8 +529,9 @@ export async function getMetricsSeries(range: string, step?: string) {
   return parseJson<MetricsSeriesResponse>(await authFetch(`/v1/admin/metrics/series?${params}`, { cache: "no-store" }));
 }
 
-export async function getLlmMetricsTop(range = "1h", by = "tokens") {
+export async function getLlmMetricsTop(range = "1h", by = "tokens", limit?: number) {
   const params = new URLSearchParams({ range, by });
+  if (limit != null) params.set("limit", String(limit));
   return parseJson<LlmTopResponse>(await authFetch(`/v1/admin/metrics/llm/top?${params}`, { cache: "no-store" }));
 }
 

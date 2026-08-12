@@ -4,7 +4,7 @@ import { Card, ScrollShadow } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { LlmReliabilityResponse, LlmTopResponse, MetricEvent, MetricsSnapshot } from "@/lib/types";
-import { compactTokens, formatNumber, formatDateTime, percent } from "@/lib/utils";
+import { compactTokens, fixed, formatNumber, formatDateTime, percent } from "@/lib/utils";
 
 export function SimpleTable({ headers, rows }: { headers: string[]; rows: React.ReactNode[][] }) {
   const { t } = useLocaleText();
@@ -110,6 +110,46 @@ export function TopConsumersTable({ top }: { top: LlmTopResponse | null }) {
             formatNumber(item.errors),
             percent(item.errorRate * 100),
             item.p95LatencyMs ? `${item.p95LatencyMs}ms` : "-",
+          ])}
+        />
+      </Card.Content>
+    </Card>
+  );
+}
+
+export function SharePerformanceTable({ data }: { data: LlmTopResponse | null }) {
+  const { locale, t } = useLocaleText();
+  const rows = [...(data?.items || [])].sort((left, right) => {
+    const leftHasTtft = left.averageTtftMs != null && Number.isFinite(left.averageTtftMs);
+    const rightHasTtft = right.averageTtftMs != null && Number.isFinite(right.averageTtftMs);
+    if (leftHasTtft !== rightHasTtft) {
+      return rightHasTtft ? 1 : -1;
+    }
+    return Number(right.averageTtftMs || 0) - Number(left.averageTtftMs || 0);
+  });
+  return (
+    <Card className="rounded-xl">
+      <Card.Header>
+        <Card.Title>{t("metrics.panel.sharePerformance")}</Card.Title>
+        <Card.Description>{t("metrics.panel.sharePerformanceDesc")}</Card.Description>
+      </Card.Header>
+      <Card.Content>
+        <SimpleTable
+          headers={[
+            t("metrics.header.share"),
+            t("metrics.header.requests"),
+            "TTFT",
+            "TPS",
+            t("metrics.header.samples"),
+            t("metrics.header.lastRequest"),
+          ]}
+          rows={rows.map((item) => [
+            <span key="share" className="font-mono text-xs">{item.key}</span>,
+            formatNumber(item.requests),
+            item.averageTtftMs != null ? `${fixed(item.averageTtftMs)} ms` : "-",
+            item.averageTps != null ? `${fixed(item.averageTps)} tok/s` : "-",
+            `${formatNumber(item.ttftSampleCount)} / ${formatNumber(item.tpsSampleCount)}`,
+            item.lastRequestAt ? formatDateTime(item.lastRequestAt * 1000, locale) : "-",
           ])}
         />
       </Card.Content>

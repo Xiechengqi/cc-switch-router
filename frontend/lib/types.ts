@@ -791,7 +791,6 @@ export type ShareUsageEmailRow = {
 
 export type ShareUsageByEmailResponse = {
   shareId: string;
-  app: "claude" | "codex" | "gemini" | string;
   period: "24h" | "1w" | "30d" | string;
   bucketGranularity?: "hour" | "day" | string;
   days: number;
@@ -815,7 +814,6 @@ export type ShareUserLimitStatusRow = {
 
 export type ShareUserLimitStatusResponse = {
   shareId: string;
-  app: string;
   rows: ShareUserLimitStatusRow[];
 };
 
@@ -1395,6 +1393,10 @@ export type LlmMetricsSnapshot = {
   rateLimitPerMinute: number;
   p95LatencyMs?: number | null;
   p95TtftMs?: number | null;
+  averageTtftMs?: number | null;
+  averageTps?: number | null;
+  ttftSampleCount: number;
+  tpsSampleCount: number;
   activeModels: number;
   activeShares: number;
   failoverSuccessRate?: number | null;
@@ -1464,6 +1466,10 @@ export type LlmMetricsPoint = {
   concurrencyLimited: number;
   p95LatencyMs?: number | null;
   p95TtftMs?: number | null;
+  averageTtftMs?: number | null;
+  averageTps?: number | null;
+  ttftSampleCount: number;
+  tpsSampleCount: number;
 };
 
 export type MetricsSeriesResponse = {
@@ -1486,6 +1492,10 @@ export type LlmTopResponse = {
     errors: number;
     errorRate: number;
     p95LatencyMs?: number | null;
+    averageTtftMs?: number | null;
+    averageTps?: number | null;
+    ttftSampleCount: number;
+    tpsSampleCount: number;
     lastRequestAt?: number | null;
   }>;
 };

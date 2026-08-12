@@ -4,7 +4,7 @@ import { Card } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { compactNumber, fixed } from "@/lib/utils";
-import { type ChartSeries, polyline } from "./metrics-utils";
+import { type ChartSeries, polylineSegments } from "./metrics-utils";
 
 const WIDTH = 600;
 const HEIGHT = 192;
@@ -48,18 +48,24 @@ export function ResourceTrendChart({
   const rafRef = React.useRef<number | null>(null);
 
   const visibleSeries = series.filter((item) => !hidden.has(item.label));
+  const finiteValues = visibleSeries
+    .flatMap((item) => item.values)
+    .filter((value): value is number => Number.isFinite(value));
   const max =
     maxMode === "percent"
       ? 100
-      : Math.max(1, ...visibleSeries.flatMap((s) => s.values));
+      : Math.max(1, ...finiteValues);
   const hasBuckets = timestamps.length > 1;
-  const allZero = series.every((s) => s.values.every((v) => !Number.isFinite(v) || v === 0));
+  const hasFiniteValues = finiteValues.length > 0;
+  const allZero = hasFiniteValues && finiteValues.every((value) => value === 0);
   const resolvedState: ChartState =
     state === "ready"
       ? hasBuckets
-        ? allZero
-          ? "no-traffic"
-          : "ready"
+        ? !hasFiniteValues
+          ? "no-data"
+          : allZero
+            ? "no-traffic"
+            : "ready"
         : "no-data"
       : state;
 
@@ -68,7 +74,7 @@ export function ResourceTrendChart({
       visibleSeries.map((item) => ({
         label: item.label,
         color: item.color,
-        points: polyline(item.values, WIDTH, HEIGHT, max),
+        segments: polylineSegments(item.values, WIDTH, HEIGHT, max),
       })),
     [visibleSeries, max],
   );
@@ -189,9 +195,17 @@ export function ResourceTrendChart({
                       {t("metrics.chart.noTraffic")}
                     </text>
                   ) : null}
-                  {lines.map((item) => (
-                    <polyline key={item.label} fill="none" stroke={item.color} strokeWidth="1.8" points={item.points} />
-                  ))}
+                  {lines.flatMap((item) =>
+                    item.segments.map((points, index) => (
+                      <polyline
+                        key={`${item.label}-${index}`}
+                        fill="none"
+                        stroke={item.color}
+                        strokeWidth="1.8"
+                        points={points}
+                      />
+                    )),
+                  )}
                   {hover !== null ? (
                     <line x1={(hoverPct / 100) * WIDTH} x2={(hoverPct / 100) * WIDTH} y1={0} y2={HEIGHT} stroke="#CBD5E1" strokeDasharray="2 2" />
                   ) : null}
@@ -415,7 +429,7 @@ function Legend({
     <div className="mb-3 flex flex-wrap gap-3 text-[11px] text-muted-foreground">
       {series.map((item) => {
         const isHidden = hidden.has(item.label);
-        const values = item.values.filter((v) => Number.isFinite(v));
+        const values = item.values.filter((value): value is number => Number.isFinite(value));
         const min = values.length ? Math.min(...values) : 0;
         const max = values.length ? Math.max(...values) : 0;
         const cur = values.length ? values[values.length - 1] : 0;
@@ -484,9 +498,10 @@ function EmptyState({ state, unit }: { state: ChartState; unit?: string }) {
   );
 }
 
-function formatAxis(value: number, unit?: string) {
+function formatAxis(value: number | null | undefined, unit?: string) {
   if (!Number.isFinite(value)) return "-";
-  const formatted = Math.abs(value) >= 1000 ? compactNumber(value) : fixed(value);
+  const numeric = Number(value);
+  const formatted = Math.abs(numeric) >= 1000 ? compactNumber(numeric) : fixed(numeric);
   if (!unit) return formatted;
   return `${formatted}${unit.startsWith("/") ? unit : ` ${unit}`}`;
 }

@@ -645,14 +645,19 @@ const STATUS_FILTER_KEY = "cc-switch.shareMarket.statusFilter";
 const OWNER_FILTER_KEY = "cc-switch.shareMarket.ownerFilter";
 const SORT_PREFS_KEY = "cc-switch.shareMarket.seatSort";
 
-function listingProviderLines(provider: ShareUpstreamProvider | undefined, locale: AppLocale, unavailable: string) {
+function listingProviderLines(
+  provider: ShareUpstreamProvider | undefined,
+  locale: AppLocale,
+  unavailable: string,
+  passthroughLabel: string,
+) {
   if (!provider) {
     return { identity: unavailable, quota: "-", models: "-" };
   }
   return {
     identity: providerStatusIdentity(provider),
     quota: providerQuotaStatusLine(provider, locale),
-    models: providerActualModelNames(provider),
+    models: providerActualModelNames(provider, passthroughLabel),
   };
 }
 
@@ -665,13 +670,7 @@ function listingProviderHeader(provider: ShareUpstreamProvider | undefined, unav
   const tier = tierCandidate && tierCandidate.toLocaleLowerCase() !== name.toLocaleLowerCase()
     ? tierCandidate
     : undefined;
-  const upstreamModels = Array.from(new Set(
-    (provider?.models || [])
-      .filter((item) => String(item.slot || "").trim().toLocaleLowerCase() !== "available")
-      .map((item) => String(item.actualModel || "").trim())
-      .filter(Boolean),
-  ));
-  return { name, tier, upstreamModels, hasProvider: !!provider };
+  return { name, tier, hasProvider: !!provider };
 }
 
 function listingProviderTitle(provider: ShareUpstreamProvider | undefined, unavailable: string, t: TFn) {
@@ -679,9 +678,7 @@ function listingProviderTitle(provider: ShareUpstreamProvider | undefined, unava
   const identity = header.tier ? `${header.name} [${header.tier}]` : header.name;
   const strategy = !header.hasProvider
     ? t("shareMarket.modelUnknown")
-    : header.upstreamModels.length > 0
-    ? t("shareMarket.upstreamModel", { model: header.upstreamModels.join(" / ") })
-    : t("shareMarket.modelPassthrough");
+    : providerActualModelNames(provider, t("shareMarket.modelPassthrough"));
   return `${identity} · ${strategy}`;
 }
 
@@ -916,7 +913,12 @@ function ProviderExpandPanel({
   t: TFn;
 }) {
   const shareUrl = shareOpenUrl(listing.subdomain);
-  const provider = listingProviderLines(listing.upstreamProvider, locale, t("dashboard.providerUnavailable"));
+  const provider = listingProviderLines(
+    listing.upstreamProvider,
+    locale,
+    t("dashboard.providerUnavailable"),
+    t("shareMarket.modelPassthrough"),
+  );
   const tokensUsed = listing.tokensUsed || 0;
   const tokenLimit = listing.tokenLimit;
   const usagePercent =
@@ -1600,9 +1602,10 @@ export function ShareMarketPage() {
       : providerHeader.name;
     const modelStrategy = !providerHeader.hasProvider
       ? t("shareMarket.modelUnknown")
-      : providerHeader.upstreamModels.length > 0
-      ? t("shareMarket.upstreamModel", { model: providerHeader.upstreamModels.join(" / ") })
-      : t("shareMarket.modelPassthrough");
+      : providerActualModelNames(
+          listing.upstreamProvider,
+          t("shareMarket.modelPassthrough"),
+        );
     const listingStatus = listing.status === "closed"
       ? t("shareMarket.closed")
       : listing.shareStatus !== "active"

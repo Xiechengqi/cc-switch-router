@@ -12,7 +12,7 @@ import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import {
   averageRecentLatencyMs,
   formatLatencySeconds,
-  formatThroughputTokensPerSec,
+  formatTtftTps,
   latencyResponseToneClass,
   parallelOccupancyTitle,
   modelHealthTitle,
@@ -22,7 +22,7 @@ import {
   providerQuotaStatusLine,
   providerStatusIdentity,
   isApiProviderRuntime,
-  recentThroughputTokensPerSec,
+  recentSharePerformance,
   resolveShareAppRuntime,
   shareDisplayTitle,
   shareAppSettings,
@@ -111,18 +111,16 @@ export const ShareCard = React.memo(function ShareCard({
       ? (share.activeRequestsByApp?.[app] ?? 0)
       : share.activeRequests || 0;
   const averageLatency = averageRecentLatencyMs(appRequests);
-  const throughputTokensPerSec = recentThroughputTokensPerSec(appRequests);
+  const performance = recentSharePerformance(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
   const modelPolicyEntries = apps.flatMap((entryApp) => {
     const entryRuntime = resolveShareAppRuntime(share, entryApp);
     if (!entryRuntime) return [];
     const policy = entryRuntime.modelPolicy;
-    const text =
-      policy?.mode === "single"
-        ? policy.upstreamModel
-        : policy?.mode === "passthrough"
-          ? t("dashboard.modelPolicyPassthrough")
-          : providerActualModelNames(entryRuntime);
+    const text = providerActualModelNames(
+      entryRuntime,
+      t("dashboard.modelPolicyPassthrough"),
+    );
     const signature =
       policy?.mode === "single"
         ? `single:${policy.upstreamModel}`
@@ -164,7 +162,12 @@ export const ShareCard = React.memo(function ShareCard({
       : share.providerId || t("dashboard.providerUnavailable");
   const actualModels =
     modelPolicySummary ||
-    (providerEnabled && runtime ? providerActualModelNames(runtime) : "-");
+    (providerEnabled && runtime
+      ? providerActualModelNames(
+          runtime,
+          t("dashboard.modelPolicyPassthrough"),
+        )
+      : "-");
   const isApiProvider =
     providerEnabled && runtime ? isApiProviderRuntime(runtime) : false;
   const apiEndpoint =
@@ -469,8 +472,14 @@ export const ShareCard = React.memo(function ShareCard({
               <span className="block text-muted-foreground">
                 {t("dashboard.totalThroughput")}
               </span>
-              <strong className="block truncate tabular-nums font-medium text-foreground">
-                {formatThroughputTokensPerSec(throughputTokensPerSec)}
+              <strong
+                className="block truncate tabular-nums font-medium text-foreground"
+                title={t("dashboard.ttftTpsHint", {
+                  ttftSamples: performance.ttftSampleCount,
+                  tpsSamples: performance.tpsSampleCount,
+                })}
+              >
+                {formatTtftTps(performance)}
               </strong>
             </div>
           </div>

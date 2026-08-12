@@ -941,6 +941,12 @@ pub struct ShareRequestLogPage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ShareRequestLogBatchSyncResult {
+    pub acks: Vec<ShareRequestLogSyncAck>,
+    pub accepted_logs: Vec<ShareRequestLogEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareRequestLogCursor {
@@ -6882,10 +6888,8 @@ impl AppStore {
     pub async fn share_usage_by_email(
         &self,
         share_id: &str,
-        app_type: &str,
         period: &str,
     ) -> Result<ShareUsageByEmailResponse, AppError> {
-        let app = normalize_share_acl_app(app_type)?;
         let window = normalize_usage_period(period)?;
         let period = window.period.clone();
         let bucket_granularity = window.bucket_granularity.clone();
@@ -6895,12 +6899,12 @@ impl AppStore {
             owner_email,
             shared_with_emails_json,
             access_by_app_json,
-            market_access_mode,
+            app_settings_json,
             user_grants_json,
         )): Option<(Option<String>, String, String, String, String)> = conn
             .query_row(
                 "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'),
-                        market_access_mode, COALESCE(user_grants_json, '{}')
+                        COALESCE(app_settings_json, '{}'), COALESCE(user_grants_json, '{}')
                  FROM shares
                  WHERE share_id = ?1",
                 params![share_id],
@@ -6925,10 +6929,12 @@ impl AppStore {
         let access_by_app = parse_share_access_by_app(Some(access_by_app_json)).map_err(|e| {
             AppError::Internal(format!("parse share usage access_by_app failed: {e}"))
         })?;
+        let app_settings: BTreeMap<String, crate::models::ShareAppSettings> =
+            serde_json::from_str(&app_settings_json).unwrap_or_default();
         let user_grants = parse_share_user_grants(Some(user_grants_json))
             .map_err(|e| AppError::Internal(format!("parse share usage grants failed: {e}")))?;
         let deprecated_shareto_emails = user_grants
-            .into_iter()
+            .iter()
             .filter_map(|(key, grant)| {
                 if grant.active || !grant.role.eq_ignore_ascii_case("shareto") {
                     return None;
@@ -6946,20 +6952,27 @@ impl AppStore {
         if let Some(owner) = owner_email.as_deref().and_then(normalize_usage_email) {
             roles.insert(owner, "owner".to_string());
         }
-        let (shareto_emails, app_market_access_mode) = if access_by_app.is_empty() {
-            (shared_with_emails, market_access_mode.clone())
-        } else {
-            let access = access_by_app.get(&app);
-            (
-                access
-                    .map(|access| access.shared_with_emails.clone())
-                    .unwrap_or_default(),
-                access
-                    .map(|access| access.market_access_mode.clone())
-                    .unwrap_or_else(|| "selected".to_string()),
-            )
-        };
-        let include_actual_usage_emails = app_market_access_mode.eq_ignore_ascii_case("all");
+        let mut shareto_emails = shared_with_emails;
+        shareto_emails.extend(
+            access_by_app
+                .values()
+                .flat_map(|access| access.shared_with_emails.iter().cloned()),
+        );
+        shareto_emails.extend(
+            app_settings
+                .values()
+                .flat_map(|settings| settings.shared_with_emails.iter().cloned()),
+        );
+        shareto_emails.extend(user_grants.iter().filter_map(|(key, grant)| {
+            if !grant.active || !grant.role.eq_ignore_ascii_case("shareto") {
+                return None;
+            }
+            Some(if grant.email.trim().is_empty() {
+                key.clone()
+            } else {
+                grant.email.clone()
+            })
+        }));
         for email in shareto_emails {
             if let Some(email) = normalize_usage_email(&email) {
                 roles.entry(email).or_insert_with(|| "shareto".to_string());
@@ -7029,8 +7042,7 @@ impl AppStore {
               AND sl.is_health_check = 0
               AND lower(CASE WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent ELSE sl.app_type END) = lower(ml.request_agent)
              WHERE ml.share_id = ?1
-               AND lower(ml.request_agent) = lower(?2)
-               AND ml.created_at >= ?3
+               AND ml.created_at >= ?2
                AND ml.user_email IS NOT NULL
                AND trim(ml.user_email) != ''
              GROUP BY lower(trim(ml.user_email)), usage_bucket"
@@ -7039,7 +7051,7 @@ impl AppStore {
             AppError::Internal(format!("prepare market share usage query failed: {e}"))
         })?;
         let market_rows = market_stmt
-            .query_map(params![share_id, app, start_rfc3339], |row| {
+            .query_map(params![share_id, start_rfc3339], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -7054,12 +7066,10 @@ impl AppStore {
             let (email, bucket, input, output, cache_read, cache_creation) = row.map_err(|e| {
                 AppError::Internal(format!("read market share usage row failed: {e}"))
             })?;
-            if include_actual_usage_emails {
-                let role = unlisted_usage_role(&email);
-                rows_by_email
-                    .entry(email.clone())
-                    .or_insert_with(|| make_usage_row(&email, role));
-            }
+            let role = unlisted_usage_role(&email);
+            rows_by_email
+                .entry(email.clone())
+                .or_insert_with(|| make_usage_row(&email, role));
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
             };
@@ -7094,8 +7104,7 @@ impl AppStore {
                     COALESCE(SUM(cache_creation_tokens), 0)
              FROM share_request_logs
              WHERE share_id = ?1
-               AND lower(app_type) = lower(?2)
-               AND created_at >= ?3
+               AND created_at >= ?2
                AND is_health_check = 0
                AND user_email IS NOT NULL
                AND trim(user_email) != ''
@@ -7113,7 +7122,7 @@ impl AppStore {
             .prepare(&share_usage_sql)
             .map_err(|e| AppError::Internal(format!("prepare share usage query failed: {e}")))?;
         let rows = stmt
-            .query_map(params![share_id, app, start_ts], |row| {
+            .query_map(params![share_id, start_ts], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -7127,12 +7136,10 @@ impl AppStore {
         for row in rows {
             let (email, bucket, input, output, cache_read, cache_creation) =
                 row.map_err(|e| AppError::Internal(format!("read share usage row failed: {e}")))?;
-            if include_actual_usage_emails {
-                let role = unlisted_usage_role(&email);
-                rows_by_email
-                    .entry(email.clone())
-                    .or_insert_with(|| make_usage_row(&email, role));
-            }
+            let role = unlisted_usage_role(&email);
+            rows_by_email
+                .entry(email.clone())
+                .or_insert_with(|| make_usage_row(&email, role));
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
             };
@@ -7174,7 +7181,6 @@ impl AppStore {
 
         Ok(ShareUsageByEmailResponse {
             share_id: share_id.to_string(),
-            app,
             period,
             bucket_granularity,
             days,
@@ -7186,34 +7192,15 @@ impl AppStore {
     pub async fn share_user_limit_status(
         &self,
         share_id: &str,
-        app_type: &str,
     ) -> Result<ShareUserLimitStatusResponse, AppError> {
-        let app = normalize_share_acl_app(app_type)?;
         let conn = self.conn.lock().await;
-        let Some((
-            owner_email,
-            shared_with_emails_json,
-            access_by_app_json,
-            app_settings_json,
-            user_grants_json,
-        )): Option<(Option<String>, String, String, String, String)> = conn
+        let Some(user_grants_json): Option<String> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json,
-                        COALESCE(access_by_app_json, '{}'),
-                        COALESCE(app_settings_json, '{}'),
-                        COALESCE(user_grants_json, '{}')
+                "SELECT COALESCE(user_grants_json, '{}')
                  FROM shares
                  WHERE share_id = ?1",
                 params![share_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| row.get(0),
             )
             .optional()
             .map_err(|e| {
@@ -7223,43 +7210,12 @@ impl AppStore {
             return Err(AppError::NotFound("share not found".into()));
         };
 
-        let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
-            .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
-        let access_by_app = parse_share_access_by_app(Some(access_by_app_json))
-            .map_err(|e| AppError::Internal(format!("parse share access_by_app failed: {e}")))?;
-        let app_settings: BTreeMap<String, crate::models::ShareAppSettings> =
-            serde_json::from_str(&app_settings_json).unwrap_or_default();
         let user_grants = parse_share_user_grants(Some(user_grants_json))
             .map_err(|e| AppError::Internal(format!("parse share user grants failed: {e}")))?;
-
-        let owner = owner_email
-            .as_deref()
-            .and_then(normalize_usage_email)
-            .unwrap_or_default();
-        let mut allowed_emails = HashSet::<String>::new();
-        if !owner.is_empty() {
-            allowed_emails.insert(owner.clone());
-        }
-        let app_shareto = if let Some(settings) = app_settings.get(&app) {
-            settings.shared_with_emails.clone()
-        } else if let Some(access) = access_by_app.get(&app) {
-            access.shared_with_emails.clone()
-        } else {
-            shared_with_emails
-        };
-        for email in app_shareto {
-            if let Some(email) = normalize_usage_email(&email) {
-                allowed_emails.insert(email);
-            }
-        }
 
         let mut grants: Vec<ShareUserGrant> = user_grants
             .into_values()
             .filter(|grant| grant.active)
-            .filter(|grant| {
-                let email = normalize_usage_email(&grant.email).unwrap_or_default();
-                grant.role.eq_ignore_ascii_case("owner") || allowed_emails.contains(&email)
-            })
             .collect();
         grants.sort_by(|left, right| {
             let left_owner = left.role.eq_ignore_ascii_case("owner");
@@ -7292,7 +7248,6 @@ impl AppStore {
         let usage_by_window = query_share_email_token_totals_for_windows(
             &conn,
             share_id,
-            &app,
             &unique_windows.into_values().collect::<Vec<_>>(),
         )?;
 
@@ -7303,11 +7258,15 @@ impl AppStore {
                 let email = normalize_usage_email(&grant.email)
                     .unwrap_or_else(|| grant.email.trim().to_ascii_lowercase());
                 let period = grant.policy.token_period;
-                let tokens_used = usage_by_window
+                let logged_tokens = usage_by_window
                     .get(&window_key)
                     .and_then(|map| map.get(&email))
                     .copied()
                     .unwrap_or(0);
+                let tokens_used = logged_tokens.max(authoritative_share_user_tokens(
+                    &grant,
+                    window_start.as_ref(),
+                ));
                 let percent = grant
                     .policy
                     .token_limit
@@ -7335,7 +7294,6 @@ impl AppStore {
 
         Ok(ShareUserLimitStatusResponse {
             share_id: share_id.to_string(),
-            app,
             rows,
         })
     }
@@ -9252,7 +9210,7 @@ impl AppStore {
             String,
             (Option<String>, Option<String>, Option<String>),
         >,
-    ) -> Result<Vec<ShareRequestLogSyncAck>, AppError> {
+    ) -> Result<ShareRequestLogBatchSyncResult, AppError> {
         if input.logs.len() > 500 {
             return Err(AppError::BadRequest("too many Share request logs".into()));
         }
@@ -9320,6 +9278,7 @@ impl AppStore {
             ));
         }
         let mut acks = Vec::with_capacity(input.logs.len());
+        let mut accepted_logs = Vec::with_capacity(input.logs.len());
         for mut log in input.logs {
             if !owned_share_ids.contains(log.share_id.trim()) {
                 return Err(AppError::Unauthorized(
@@ -9343,12 +9302,17 @@ impl AppStore {
                 request_id: log.request_id.clone(),
                 usage_revision: log.usage_revision,
             });
-            upsert_share_request_log_tx(&tx, &input.installation_id, log)?;
+            if upsert_share_request_log_tx(&tx, &input.installation_id, log.clone())? {
+                accepted_logs.push(log);
+            }
         }
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit request log batch sync failed: {e}"))
         })?;
-        Ok(acks)
+        Ok(ShareRequestLogBatchSyncResult {
+            acks,
+            accepted_logs,
+        })
     }
 
     pub async fn prepare_share_runtime_refresh(
@@ -12197,7 +12161,7 @@ impl AppStore {
         log: ShareRequestLogEntry,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
-        upsert_share_request_log_tx(&conn, installation_id, log)
+        upsert_share_request_log_tx(&conn, installation_id, log).map(|_| ())
     }
 
     pub async fn record_share_runtime_snapshot(
@@ -13316,8 +13280,8 @@ fn upsert_share_request_log_tx(
     conn: &Connection,
     installation_id: &str,
     log: ShareRequestLogEntry,
-) -> Result<(), AppError> {
-    conn.execute(
+) -> Result<bool, AppError> {
+    let changed = conn.execute(
         "INSERT INTO share_request_logs (
             request_id, installation_id, share_id, share_name, provider_id, provider_name,
             app_type, model, request_model, request_agent, requested_model, actual_model, actual_model_source,
@@ -13404,7 +13368,7 @@ fn upsert_share_request_log_tx(
         ],
     )
     .map_err(|e| AppError::Internal(format!("upsert share request log failed: {e}")))?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 fn validate_market_request_log(log: &MarketRequestLogEntry) -> Result<(), AppError> {
@@ -16759,6 +16723,56 @@ mod token_period_window_tests {
     }
 
     #[test]
+    fn authoritative_usage_only_accepts_the_current_policy_bucket() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 24, 15, 30, 0).unwrap();
+        let current_day_start = Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).unwrap();
+        let mut grant = ShareUserGrant {
+            email: "user@example.com".into(),
+            role: "shareto".into(),
+            active: true,
+            policy: ShareUserPolicy {
+                token_period: ShareTokenPeriod::Day,
+                ..ShareUserPolicy::default()
+            },
+            ..ShareUserGrant::default()
+        };
+        grant.usage.day.started_at_ms = current_day_start.timestamp_millis();
+        grant.usage.day.tokens_used = 41;
+        assert_eq!(
+            authoritative_share_user_tokens(&grant, Some(&current_day_start)),
+            41
+        );
+
+        let stale_day_start = current_day_start - Duration::days(1);
+        assert_eq!(
+            authoritative_share_user_tokens(&grant, Some(&stale_day_start)),
+            0
+        );
+
+        let anchor = Utc.with_ymd_and_hms(2026, 7, 1, 12, 15, 0).unwrap();
+        grant.policy.token_period = ShareTokenPeriod::SevenDays;
+        grant.policy.token_period_anchor_at_ms = Some(anchor.timestamp_millis());
+        let (anchored_start, _) = token_period_window(&grant.policy, now).unwrap();
+        let anchored_start = anchored_start.unwrap();
+        grant.usage.anchored = Some(crate::models::ShareAnchoredUsageBucket {
+            period: ShareTokenPeriod::SevenDays,
+            anchor_at_ms: anchor.timestamp_millis(),
+            started_at_ms: anchored_start.timestamp_millis(),
+            tokens_used: 73,
+            requests_count: 2,
+        });
+        assert_eq!(
+            authoritative_share_user_tokens(&grant, Some(&anchored_start)),
+            73
+        );
+        grant.usage.anchored.as_mut().unwrap().anchor_at_ms += 60_000;
+        assert_eq!(
+            authoritative_share_user_tokens(&grant, Some(&anchored_start)),
+            0
+        );
+    }
+
+    #[test]
     fn batched_usage_keeps_distinct_anchor_windows_and_prefers_quota_tokens() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
@@ -16832,8 +16846,7 @@ mod token_period_window_tests {
             },
         ];
         let totals =
-            query_share_email_token_totals_for_windows(&conn, "share-anchored", "codex", &windows)
-                .unwrap();
+            query_share_email_token_totals_for_windows(&conn, "share-anchored", &windows).unwrap();
         assert_eq!(totals["late"].get("alice@example.com"), None);
         assert_eq!(totals["late"]["bob@example.com"], 11);
         assert_eq!(totals["early"]["alice@example.com"], 7);
@@ -16855,22 +16868,53 @@ fn quota_window_key(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) ->
     }
 }
 
+fn authoritative_share_user_tokens(
+    grant: &ShareUserGrant,
+    window_start: Option<&DateTime<Utc>>,
+) -> u64 {
+    let expected_start_ms = window_start.map(|start| start.timestamp_millis());
+    match grant.policy.token_period {
+        ShareTokenPeriod::Lifetime => (grant.usage.lifetime.started_at_ms == 0)
+            .then_some(grant.usage.lifetime.tokens_used)
+            .unwrap_or(0),
+        ShareTokenPeriod::Day => expected_start_ms
+            .filter(|start| grant.usage.day.started_at_ms == *start)
+            .map(|_| grant.usage.day.tokens_used)
+            .unwrap_or(0),
+        ShareTokenPeriod::Week => expected_start_ms
+            .filter(|start| grant.usage.week.started_at_ms == *start)
+            .map(|_| grant.usage.week.tokens_used)
+            .unwrap_or(0),
+        ShareTokenPeriod::CalendarMonth => expected_start_ms
+            .filter(|start| grant.usage.calendar_month.started_at_ms == *start)
+            .map(|_| grant.usage.calendar_month.tokens_used)
+            .unwrap_or(0),
+        period @ (ShareTokenPeriod::SevenDays | ShareTokenPeriod::ThirtyDays) => grant
+            .usage
+            .anchored
+            .as_ref()
+            .filter(|bucket| {
+                bucket.period == period
+                    && Some(bucket.anchor_at_ms) == grant.policy.token_period_anchor_at_ms
+                    && Some(bucket.started_at_ms) == expected_start_ms
+            })
+            .map(|bucket| bucket.tokens_used)
+            .unwrap_or(0),
+    }
+}
+
 fn query_share_email_token_totals_for_windows(
     conn: &Connection,
     share_id: &str,
-    app: &str,
     windows: &[UserQuotaWindow],
 ) -> Result<HashMap<String, HashMap<String, u64>>, AppError> {
     if windows.is_empty() {
         return Ok(HashMap::new());
     }
     let mut values_sql = Vec::with_capacity(windows.len());
-    let mut values = vec![
-        crate::db::types::Value::Text(share_id.to_string()),
-        crate::db::types::Value::Text(app.to_string()),
-    ];
+    let mut values = vec![crate::db::types::Value::Text(share_id.to_string())];
     for (index, window) in windows.iter().enumerate() {
-        let base = 3 + index * 3;
+        let base = 2 + index * 3;
         values_sql.push(format!("(?{base}, ?{}, ?{})", base + 1, base + 2));
         values.push(crate::db::types::Value::Text(window.key.clone()));
         values.push(match window.start {
@@ -16910,7 +16954,6 @@ fn query_share_email_token_totals_for_windows(
           AND sl.is_health_check = 0
           AND lower(CASE WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent ELSE sl.app_type END) = lower(ml.request_agent)
           WHERE ml.share_id = ?1
-            AND lower(ml.request_agent) = lower(?2)
            AND ml.user_email IS NOT NULL
            AND trim(ml.user_email) != ''
           GROUP BY w.window_key, lower(trim(ml.user_email))
@@ -16923,7 +16966,6 @@ fn query_share_email_token_totals_for_windows(
              ON (w.start_ts IS NULL OR sr.created_at >= w.start_ts)
             AND (w.end_ts IS NULL OR sr.created_at < w.end_ts)
           WHERE sr.share_id = ?1
-            AND lower(sr.app_type) = lower(?2)
             AND sr.is_health_check = 0
             AND sr.user_email IS NOT NULL
             AND trim(sr.user_email) != ''
@@ -27808,7 +27850,6 @@ mod tests {
         let totals = query_share_email_token_totals_for_windows(
             &conn,
             "share-quota",
-            "codex",
             &[UserQuotaWindow {
                 key: "lifetime".to_string(),
                 start: None,
@@ -27918,7 +27959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_usage_by_email_is_public_app_scoped_and_limited_to_acl_emails() {
+    async fn share_usage_by_email_is_public_and_includes_all_apps_after_an_app_is_disabled() {
         let (store, config) = setup_store("share-usage-by-email").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
@@ -27987,22 +28028,36 @@ mod tests {
             codex_log.input_tokens = 500;
             codex_log.output_tokens = 500;
             upsert_share_request_log_tx(&conn, "inst-1", codex_log).expect("insert codex log");
+            conn.execute(
+                "UPDATE shares
+                 SET enabled_codex = 0,
+                     bindings_json = '{\"claude\":\"provider-test\",\"gemini\":\"provider-test\"}'
+                 WHERE share_id = 'share-usage'",
+                [],
+            )
+            .expect("disable Codex after recording its usage");
+            conn.execute(
+                "DELETE FROM share_bindings
+                 WHERE share_id = 'share-usage' AND app_type = 'codex'",
+                [],
+            )
+            .expect("remove disabled Codex binding");
         }
 
         let usage = store
-            .share_usage_by_email("share-usage", "claude", "1w")
+            .share_usage_by_email("share-usage", "1w")
             .await
             .expect("usage");
-        assert_eq!(usage.total_tokens, 150);
-        assert_eq!(usage.rows.len(), 2);
+        assert_eq!(usage.total_tokens, 3037);
+        assert_eq!(usage.rows.len(), 4);
         let owner = usage
             .rows
             .iter()
             .find(|row| row.email == "owner@example.com")
             .expect("owner row");
         assert_eq!(owner.role, "owner");
-        assert_eq!(owner.total_tokens, 100);
-        assert!((owner.percent - 66.666).abs() < 0.1);
+        assert_eq!(owner.total_tokens, 1100);
+        assert!((owner.percent - 36.22).abs() < 0.1);
         let shareto = usage
             .rows
             .iter()
@@ -28011,13 +28066,89 @@ mod tests {
         assert_eq!(shareto.role, "shareto");
         assert_eq!(shareto.total_tokens, 50);
         assert_eq!(shareto.daily.len(), 7);
-        assert!(
+        assert_eq!(
             usage
                 .rows
                 .iter()
-                .all(|row| row.email != "removed@example.com"),
-            "selected access must not expose removed ShareTo emails"
+                .find(|row| row.email == "removed@example.com")
+                .map(|row| (row.role.as_str(), row.total_tokens)),
+            Some(("deprecated", 888))
         );
+        assert_eq!(
+            usage
+                .rows
+                .iter()
+                .find(|row| row.email == "unknown@example.com")
+                .map(|row| (row.role.as_str(), row.total_tokens)),
+            Some(("market", 999))
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_user_limits_use_all_apps_and_never_regress_below_client_usage() {
+        let (store, config) = setup_store("share-user-limits-all-apps").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-limits", "limits-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            let mut owner = test_share_user_grant("owner@example.com", "owner", 1_000);
+            owner.policy.token_period = ShareTokenPeriod::Lifetime;
+            owner.usage.lifetime.tokens_used = 500;
+            let mut user = test_share_user_grant("user@example.com", "shareto", 1_000);
+            user.policy.token_period = ShareTokenPeriod::Lifetime;
+            user.usage.lifetime.tokens_used = 60;
+            let grants = BTreeMap::from([(owner.email.clone(), owner), (user.email.clone(), user)]);
+            conn.execute(
+                "UPDATE shares SET user_grants_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-limits",
+                    serde_json::to_string(&grants).expect("serialize grants")
+                ],
+            )
+            .expect("set grants");
+
+            let now = Utc::now().timestamp();
+            for (request_id, email, app, input, output) in [
+                ("limit-owner-claude", "owner@example.com", "claude", 40, 10),
+                ("limit-owner-codex", "owner@example.com", "codex", 60, 10),
+                ("limit-user-gemini", "user@example.com", "gemini", 20, 10),
+                ("limit-user-codex", "user@example.com", "codex", 30, 10),
+            ] {
+                let mut log = test_share_request_log_entry(request_id, "share-limits", now);
+                log.app_type = app.into();
+                log.request_agent = app.into();
+                log.user_email = Some(email.into());
+                log.input_tokens = input;
+                log.output_tokens = output;
+                upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert usage log");
+            }
+            conn.execute(
+                "UPDATE shares
+                 SET enabled_codex = 0,
+                     bindings_json = '{\"claude\":\"provider-test\",\"gemini\":\"provider-test\"}'
+                 WHERE share_id = 'share-limits'",
+                [],
+            )
+            .expect("disable Codex after usage");
+            conn.execute(
+                "DELETE FROM share_bindings
+                 WHERE share_id = 'share-limits' AND app_type = 'codex'",
+                [],
+            )
+            .expect("remove disabled Codex binding");
+        }
+
+        let status = store
+            .share_user_limit_status("share-limits")
+            .await
+            .expect("limit status");
+        assert_eq!(status.rows.len(), 2);
+        assert_eq!(status.rows[0].email, "owner@example.com");
+        assert_eq!(status.rows[0].tokens_used, 500);
+        assert_eq!(status.rows[1].email, "user@example.com");
+        assert_eq!(status.rows[1].tokens_used, 70);
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -28140,7 +28271,7 @@ mod tests {
         }
 
         let usage = store
-            .share_usage_by_email("share-usage", "codex", "1w")
+            .share_usage_by_email("share-usage", "1w")
             .await
             .expect("usage");
         assert_eq!(usage.total_tokens, 350);
@@ -28267,7 +28398,7 @@ mod tests {
         }
 
         let usage = store
-            .share_usage_by_email("share-usage", "codex", "1w")
+            .share_usage_by_email("share-usage", "1w")
             .await
             .expect("usage with revoked ShareTo history");
         assert_eq!(usage.total_tokens, 105);
@@ -28324,7 +28455,7 @@ mod tests {
             .expect("reactivate removed ShareTo");
         }
         let reactivated_usage = store
-            .share_usage_by_email("share-usage", "codex", "1w")
+            .share_usage_by_email("share-usage", "1w")
             .await
             .expect("usage after ShareTo reactivation");
         assert_eq!(
@@ -28504,7 +28635,7 @@ mod tests {
         }
 
         let usage = store
-            .share_usage_by_email("share-usage", "codex", "")
+            .share_usage_by_email("share-usage", "")
             .await
             .expect("usage");
         assert_eq!(usage.period, "24h");
@@ -39089,7 +39220,7 @@ mod tests {
                 Some("actual@example.com".into()),
             ),
         )]);
-        store
+        let initial_sync = store
             .batch_sync_share_request_logs(
                 ShareRequestLogBatchSyncRequest {
                     installation_id: "inst-logs".into(),
@@ -39107,19 +39238,84 @@ mod tests {
             )
             .await
             .expect("valid signed request log batch sync");
+        assert_eq!(initial_sync.acks.len(), 1);
+        assert_eq!(initial_sync.accepted_logs.len(), 1);
+
+        let stale_logs = vec![ShareRequestLogEntry {
+            usage_state: "pending".into(),
+            stream_status: Some("streaming".into()),
+            usage_revision: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            ..logs[0].clone()
+        }];
+        let stale_timestamp_ms = Utc::now().timestamp_millis();
+        let stale_nonce = Uuid::new_v4().to_string();
+        let stale_signature = sign_test_payload(
+            &signing_key,
+            "inst-logs",
+            "share_request_logs_batch_sync",
+            &stale_logs,
+            stale_timestamp_ms,
+            &stale_nonce,
+        );
+        let stale_sync = store
+            .batch_sync_share_request_logs(
+                ShareRequestLogBatchSyncRequest {
+                    installation_id: "inst-logs".into(),
+                    timestamp_ms: stale_timestamp_ms,
+                    nonce: stale_nonce,
+                    signature: stale_signature,
+                    logs: stale_logs,
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+                HashMap::new(),
+            )
+            .await
+            .expect("stale revision should be acknowledged without being accepted");
+        assert_eq!(stale_sync.acks.len(), 1);
+        assert_eq!(stale_sync.acks[0].usage_revision, 1);
+        assert!(stale_sync.accepted_logs.is_empty());
 
         let conn = store.conn.lock().await;
-        let (stored_count, user_country, user_country_iso3, user_email): (
+        let (
+            stored_count,
+            user_country,
+            user_country_iso3,
+            user_email,
+            usage_state,
+            usage_revision,
+            output_tokens,
+        ): (
             i64,
             Option<String>,
             Option<String>,
             Option<String>,
+            String,
+            i64,
+            i64,
         ) = conn
             .query_row(
-                "SELECT COUNT(*), MAX(user_country), MAX(user_country_iso3), MAX(user_email) FROM share_request_logs
+                "SELECT COUNT(*), MAX(user_country), MAX(user_country_iso3), MAX(user_email),
+                        MAX(usage_state), MAX(usage_revision), MAX(output_tokens)
+                   FROM share_request_logs
                  WHERE installation_id = ?1 AND request_id = ?2",
                 params!["inst-logs", "req-1"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .expect("count synced request logs");
         drop(conn);
@@ -39127,6 +39323,9 @@ mod tests {
         assert_eq!(user_country.as_deref(), Some("JP"));
         assert_eq!(user_country_iso3.as_deref(), Some("JPN"));
         assert_eq!(user_email.as_deref(), Some("actual@example.com"));
+        assert_eq!(usage_state, "observed");
+        assert_eq!(usage_revision, 2);
+        assert_eq!(output_tokens, 20);
 
         let replay_err = store
             .batch_sync_share_request_logs(

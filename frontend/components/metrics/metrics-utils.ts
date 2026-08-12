@@ -5,7 +5,7 @@ export type MetricTone = "default" | "warning" | "critical";
 export type ChartSeries = {
   label: string;
   color: string;
-  values: number[];
+  values: Array<number | null | undefined>;
 };
 
 /**
@@ -54,6 +54,29 @@ export function polyline(values: number[], width: number, height: number, max: n
       return `${x},${Math.max(0, Math.min(height, y))}`;
     })
     .join(" ");
+}
+
+export function polylineSegments(
+  values: Array<number | null | undefined>,
+  width: number,
+  height: number,
+  max: number,
+) {
+  const segments: string[] = [];
+  let current: string[] = [];
+  values.forEach((value, index) => {
+    if (!Number.isFinite(value)) {
+      if (current.length > 0) segments.push(current.join(" "));
+      current = [];
+      return;
+    }
+    const numeric = Number(value);
+    const x = (index / Math.max(values.length - 1, 1)) * width;
+    const y = height - (Math.max(0, numeric) / max) * height;
+    current.push(`${x},${Math.max(0, Math.min(height, y))}`);
+  });
+  if (current.length > 0) segments.push(current.join(" "));
+  return segments;
 }
 
 /**

@@ -84,7 +84,7 @@ export function ShareEditReadView({
     let cancelled = false;
     setLimitLoading(true);
     setLimitError("");
-    getShareUserLimitStatus(share.shareId, shareApp)
+    getShareUserLimitStatus(share.shareId)
       .then((data) => {
         if (!cancelled) setLimitRows(data.rows || []);
       })

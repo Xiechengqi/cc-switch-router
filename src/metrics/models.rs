@@ -179,6 +179,10 @@ pub struct LlmMetricsSnapshot {
     pub rate_limit_per_minute: f64,
     pub p95_latency_ms: Option<u64>,
     pub p95_ttft_ms: Option<u64>,
+    pub average_ttft_ms: Option<f64>,
+    pub average_tps: Option<f64>,
+    pub ttft_sample_count: u64,
+    pub tps_sample_count: u64,
     pub active_models: u64,
     pub active_shares: u64,
     pub failover_success_rate: Option<f64>,
@@ -266,6 +270,10 @@ pub struct LlmMetricsPoint {
     pub concurrency_limited: u64,
     pub p95_latency_ms: Option<u64>,
     pub p95_ttft_ms: Option<u64>,
+    pub average_ttft_ms: Option<f64>,
+    pub average_tps: Option<f64>,
+    pub ttft_sample_count: u64,
+    pub tps_sample_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +293,10 @@ pub struct LlmTopItem {
     pub errors: u64,
     pub error_rate: f64,
     pub p95_latency_ms: Option<u64>,
+    pub average_ttft_ms: Option<f64>,
+    pub average_tps: Option<f64>,
+    pub ttft_sample_count: u64,
+    pub tps_sample_count: u64,
     pub last_request_at: Option<i64>,
 }
 
@@ -337,6 +349,9 @@ pub struct LlmRequestMetric {
     pub ttft_ms: Option<u64>,
     pub stream_started: bool,
     pub stream_completed: bool,
+    pub usage_state: Option<String>,
+    pub stream_status: Option<String>,
+    pub usage_revision: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,

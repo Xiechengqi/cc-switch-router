@@ -480,6 +480,9 @@ impl MetricsRegistry {
                 ttft_ms: None,
                 stream_started: false,
                 stream_completed: log.status == "settled" || log.status == "success",
+                usage_state: Some("observed".into()),
+                stream_status: Some(log.status.clone()),
+                usage_revision: 0,
                 input_tokens: Some(log.input_tokens as u64),
                 output_tokens: Some(log.output_tokens as u64),
                 total_tokens: Some(
@@ -504,6 +507,32 @@ impl MetricsRegistry {
             if log.is_health_check {
                 continue;
             }
+            let stream_status = log
+                .stream_status
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let usage_state = log.usage_state.trim().to_ascii_lowercase();
+            let interrupted = usage_state == "interrupted"
+                || matches!(
+                    stream_status.as_str(),
+                    "client_cancelled"
+                        | "interrupted"
+                        | "timeout"
+                        | "transport_error"
+                        | "protocol_error"
+                );
+            let stream_completed = log.is_streaming
+                && stream_status == "completed"
+                && (200..300).contains(&log.status_code);
+            let status = if log.status_code >= 400 || interrupted {
+                "error"
+            } else if log.is_streaming && !stream_completed {
+                "pending"
+            } else {
+                "success"
+            };
             self.record_llm_request(LlmRequestMetric {
                 timestamp: log.created_at,
                 request_id: Some(log.request_id.clone()),
@@ -516,18 +545,20 @@ impl MetricsRegistry {
                 requested_model: Some(log.requested_model.clone())
                     .filter(|value| !value.is_empty()),
                 actual_model: Some(log.actual_model.clone()).filter(|value| !value.is_empty()),
-                status: if log.status_code < 400 {
-                    "success"
+                status: status.into(),
+                error_kind: if interrupted {
+                    Some("interrupted".into())
                 } else {
-                    "error"
-                }
-                .into(),
-                error_kind: error_kind_from_status("", Some(log.status_code)),
+                    error_kind_from_status("", Some(log.status_code))
+                },
                 http_status: Some(log.status_code),
                 latency_ms: Some(log.latency_ms),
                 ttft_ms: log.first_token_ms,
                 stream_started: log.is_streaming,
-                stream_completed: log.status_code < 400,
+                stream_completed,
+                usage_state: Some(usage_state),
+                stream_status: Some(stream_status).filter(|value| !value.is_empty()),
+                usage_revision: log.usage_revision,
                 input_tokens: Some(log.input_tokens as u64),
                 output_tokens: Some(log.output_tokens as u64),
                 total_tokens: Some(

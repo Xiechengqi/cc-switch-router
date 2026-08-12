@@ -1396,7 +1396,6 @@ pub struct ShareUsageEmailRow {
 #[serde(rename_all = "camelCase")]
 pub struct ShareUsageByEmailResponse {
     pub share_id: String,
-    pub app: String,
     pub period: String,
     pub bucket_granularity: String,
     pub days: u32,
@@ -1566,7 +1565,6 @@ pub struct ShareUserLimitStatusRow {
 #[serde(rename_all = "camelCase")]
 pub struct ShareUserLimitStatusResponse {
     pub share_id: String,
-    pub app: String,
     pub rows: Vec<ShareUserLimitStatusRow>,
 }
 

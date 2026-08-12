@@ -608,13 +608,8 @@ export function ClientBoard({
   }, [hasViewerIdentity, sessionEmail, shareById, sortedClients]);
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
   const canViewClientLogs = React.useCallback(
-    (client: DashboardClient) =>
-      Boolean(
-        client.logCollectionEnabled &&
-        authed &&
-        (session?.isAdmin || normalizeEmail(client.installation.ownerEmail) === sessionEmail),
-      ),
-    [authed, session?.isAdmin, sessionEmail],
+    (client: DashboardClient) => Boolean(client.logCollectionEnabled),
+    [],
   );
   const takeoverSourcesFor = React.useCallback(
     (target: DashboardClient) => {
