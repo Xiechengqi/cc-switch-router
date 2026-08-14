@@ -499,6 +499,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
@@ -4119,6 +4120,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

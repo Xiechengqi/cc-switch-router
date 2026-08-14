@@ -5,23 +5,30 @@ use axum::response::Response;
 use base64::Engine;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock, watch};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
 use crate::config::Config;
-use crate::metrics::MetricsRegistry;
 use crate::metrics::models::LlmRequestMetric;
+use crate::metrics::{MetricsPermit, MetricsRegistry};
+use crate::proxy_stream::{
+    MAX_PROXY_IMAGE_STREAM_EVENT_BYTES, ProxyStreamDetector, ProxyStreamParseError,
+    ProxyStreamProtocol,
+};
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{
     AppStore, IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE, NewImageGenerationRequestLog,
@@ -41,6 +48,7 @@ const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
 const DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES: usize = 48 * 1024 * 1024;
+const MAX_PROXY_ERROR_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const ROUTE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const ROUTE_RECONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const ROUTE_RECONNECT_MAX_WAITERS: usize = 128;
@@ -383,17 +391,6 @@ impl RouteEntry {
     }
 }
 
-#[derive(Debug, Default)]
-struct KeyedConcurrencyLimiter {
-    counters: Mutex<HashMap<String, usize>>,
-}
-
-#[derive(Debug)]
-struct KeyedConcurrencyPermit {
-    limiter: Arc<KeyedConcurrencyLimiter>,
-    key: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConcurrencyLimitExceeded {
     current: usize,
@@ -402,37 +399,479 @@ struct ConcurrencyLimitExceeded {
 
 #[derive(Debug)]
 struct ShareConcurrencyPermit {
-    _share: KeyedConcurrencyPermit,
-    _app: Option<KeyedConcurrencyPermit>,
-    _user: Option<KeyedConcurrencyPermit>,
+    registry: Arc<ShareRequestRegistry>,
+    lease_id: String,
+    started_at: Instant,
+    cancellation: CancellationToken,
+}
+
+impl Drop for ShareConcurrencyPermit {
+    fn drop(&mut self) {
+        self.release_registry_lease();
+    }
+}
+
+impl ShareConcurrencyPermit {
+    fn release_registry_lease(&self) -> bool {
+        self.registry.release_lease(&self.lease_id).is_some()
+    }
+
+    fn register_keyed_permit(&self, permit: &KeyedConcurrencyPermit) {
+        self.registry
+            .attach_keyed_release(&self.lease_id, permit.release_handle());
+    }
+
+    fn mark_response_headers_received(&self) {
+        self.registry
+            .set_phase(&self.lease_id, ShareRequestPhase::AwaitingFirstEvent);
+    }
+
+    fn record_progress(&self) {
+        self.registry.record_progress(&self.lease_id);
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    fn hard_deadline(&self, max_lifetime: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.started_at + max_lifetime)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShareRequestPhase {
+    AwaitingResponseHeaders,
+    AwaitingFirstEvent,
+    Streaming,
+}
+
+impl ShareRequestPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingResponseHeaders => "awaiting_response_headers",
+            Self::AwaitingFirstEvent => "awaiting_first_event",
+            Self::Streaming => "streaming",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ShareRequestEntry {
+    request_id: String,
+    share_id: String,
+    app: Option<String>,
+    user_email: Option<String>,
+    started_at: Instant,
+    phase: ShareRequestPhase,
+    phase_started_at: Instant,
+    last_progress_at: Instant,
+    cancellation: CancellationToken,
+    keyed_releases: Vec<KeyedConcurrencyRelease>,
+}
+
+#[derive(Debug, Default)]
+struct ShareRequestRegistry {
+    requests: StdMutex<HashMap<String, ShareRequestEntry>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShareRequestRegistrySnapshot {
+    pub active_requests: usize,
+    pub oldest_inflight_age_secs: u64,
+    pub oldest_progress_age_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleasedShareRequest {
+    pub lease_id: String,
+    pub request_id: String,
+    pub share_id: String,
+    pub app: Option<String>,
+    pub user_email: Option<String>,
+    pub phase: String,
+    pub age_secs: u64,
+    pub progress_age_secs: u64,
+    pub reason: String,
+}
+
+impl ShareRequestRegistry {
+    async fn try_acquire(
+        self: &Arc<Self>,
+        request_id: &str,
+        share_id: &str,
+        app: Option<&str>,
+        parallel_limit: i64,
+        user_email: Option<&str>,
+    ) -> Result<ShareConcurrencyPermit, ConcurrencyLimitExceeded> {
+        let app = app
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|value| matches!(value.as_str(), "claude" | "codex" | "gemini"));
+        let user_email = user_email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let now = Instant::now();
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = requests
+            .values()
+            .filter(|entry| entry.share_id == share_id)
+            .count();
+        if parallel_limit >= 0 && current >= parallel_limit as usize {
+            return Err(ConcurrencyLimitExceeded {
+                current,
+                limit: parallel_limit as usize,
+            });
+        }
+        let lease_id = format!("lease_{}", Uuid::new_v4().simple());
+        let cancellation = CancellationToken::new();
+        requests.insert(
+            lease_id.clone(),
+            ShareRequestEntry {
+                request_id: request_id.to_string(),
+                share_id: share_id.to_string(),
+                app,
+                user_email,
+                started_at: now,
+                phase: ShareRequestPhase::AwaitingResponseHeaders,
+                phase_started_at: now,
+                last_progress_at: now,
+                cancellation: cancellation.clone(),
+                keyed_releases: Vec::new(),
+            },
+        );
+        Ok(ShareConcurrencyPermit {
+            registry: self.clone(),
+            lease_id,
+            started_at: now,
+            cancellation,
+        })
+    }
+
+    fn release_lease(&self, lease_id: &str) -> Option<ShareRequestEntry> {
+        let entry = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(lease_id);
+        if let Some(entry) = entry.as_ref() {
+            for release in &entry.keyed_releases {
+                release.release();
+            }
+        }
+        entry
+    }
+
+    fn attach_keyed_release(&self, lease_id: &str, release: KeyedConcurrencyRelease) {
+        let attached = {
+            let mut requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = requests.get_mut(lease_id) {
+                entry.keyed_releases.push(release.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !attached {
+            release.release();
+        }
+    }
+
+    fn set_phase(&self, lease_id: &str, phase: ShareRequestPhase) {
+        let now = Instant::now();
+        if let Some(entry) = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(lease_id)
+            && entry.phase != phase
+        {
+            entry.phase = phase;
+            entry.phase_started_at = now;
+        }
+    }
+
+    fn record_progress(&self, lease_id: &str) {
+        let now = Instant::now();
+        if let Some(entry) = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(lease_id)
+        {
+            if entry.phase != ShareRequestPhase::Streaming {
+                entry.phase = ShareRequestPhase::Streaming;
+                entry.phase_started_at = now;
+            }
+            entry.last_progress_at = now;
+        }
+    }
+
+    fn force_release_matching(
+        &self,
+        request_id: Option<&str>,
+        share_id: Option<&str>,
+        reason: &str,
+    ) -> Vec<ReleasedShareRequest> {
+        let now = Instant::now();
+        let removed = {
+            let mut requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lease_ids = requests
+                .iter()
+                .filter(|(_, entry)| {
+                    request_id.is_some_and(|value| entry.request_id == value)
+                        || share_id.is_some_and(|value| entry.share_id == value)
+                })
+                .map(|(lease_id, _)| lease_id.clone())
+                .collect::<Vec<_>>();
+            lease_ids
+                .into_iter()
+                .filter_map(|lease_id| requests.remove(&lease_id).map(|entry| (lease_id, entry)))
+                .collect::<Vec<_>>()
+        };
+        removed
+            .into_iter()
+            .map(|(lease_id, entry)| {
+                for release in &entry.keyed_releases {
+                    release.release();
+                }
+                entry.cancellation.cancel();
+                released_share_request(lease_id, entry, now, reason)
+            })
+            .collect()
+    }
+
+    fn release_stale(
+        &self,
+        config: &crate::config::ProxyStreamConfig,
+    ) -> Vec<ReleasedShareRequest> {
+        let now = Instant::now();
+        let removed = {
+            let mut requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stale = requests
+                .iter()
+                .filter_map(|(lease_id, entry)| {
+                    stale_share_request_reason(entry, config, now)
+                        .map(|reason| (lease_id.clone(), reason))
+                })
+                .collect::<Vec<_>>();
+            stale
+                .into_iter()
+                .filter_map(|(lease_id, reason)| {
+                    requests
+                        .remove(&lease_id)
+                        .map(|entry| (lease_id, entry, reason))
+                })
+                .collect::<Vec<_>>()
+        };
+        removed
+            .into_iter()
+            .map(|(lease_id, entry, reason)| {
+                for release in &entry.keyed_releases {
+                    release.release();
+                }
+                entry.cancellation.cancel();
+                released_share_request(lease_id, entry, now, reason)
+            })
+            .collect()
+    }
+
+    async fn inflight_by_share(&self) -> HashMap<String, usize> {
+        let mut result = HashMap::new();
+        let requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in requests.values() {
+            *result.entry(entry.share_id.clone()).or_default() += 1;
+        }
+        result
+    }
+
+    async fn inflight_by_share_app(&self) -> HashMap<String, BTreeMap<String, usize>> {
+        let mut result = HashMap::<String, BTreeMap<String, usize>>::new();
+        let requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in requests.values() {
+            if let Some(app) = entry.app.as_ref() {
+                *result
+                    .entry(entry.share_id.clone())
+                    .or_default()
+                    .entry(app.clone())
+                    .or_default() += 1;
+            }
+        }
+        result
+    }
+
+    async fn inflight_by_share_user(
+        &self,
+    ) -> HashMap<String, BTreeMap<String, BTreeMap<String, usize>>> {
+        let mut result = HashMap::<String, BTreeMap<String, BTreeMap<String, usize>>>::new();
+        let requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in requests.values() {
+            let Some(user_email) = entry.user_email.as_ref() else {
+                continue;
+            };
+            *result
+                .entry(entry.share_id.clone())
+                .or_default()
+                .entry(entry.app.clone().unwrap_or_else(|| "_".to_string()))
+                .or_default()
+                .entry(user_email.clone())
+                .or_default() += 1;
+        }
+        result
+    }
+
+    async fn snapshot(&self) -> ShareRequestRegistrySnapshot {
+        let now = Instant::now();
+        let requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ShareRequestRegistrySnapshot {
+            active_requests: requests.len(),
+            oldest_inflight_age_secs: requests
+                .values()
+                .map(|entry| now.duration_since(entry.started_at).as_secs())
+                .max()
+                .unwrap_or_default(),
+            oldest_progress_age_secs: requests
+                .values()
+                .map(|entry| now.duration_since(entry.last_progress_at).as_secs())
+                .max()
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn stale_share_request_reason(
+    entry: &ShareRequestEntry,
+    config: &crate::config::ProxyStreamConfig,
+    now: Instant,
+) -> Option<&'static str> {
+    if now.duration_since(entry.started_at) >= Duration::from_secs(config.max_request_lifetime_secs)
+    {
+        return Some("hard_lifetime_timeout");
+    }
+    let phase_age = now.duration_since(entry.phase_started_at);
+    match entry.phase {
+        ShareRequestPhase::AwaitingResponseHeaders
+            if phase_age >= Duration::from_secs(config.response_header_timeout_secs) =>
+        {
+            Some("response_header_timeout")
+        }
+        ShareRequestPhase::AwaitingFirstEvent
+            if phase_age >= Duration::from_secs(config.first_event_timeout_secs) =>
+        {
+            Some("first_event_timeout")
+        }
+        ShareRequestPhase::Streaming
+            if now.duration_since(entry.last_progress_at)
+                >= Duration::from_secs(config.idle_timeout_secs) =>
+        {
+            Some("business_idle_timeout")
+        }
+        _ => None,
+    }
+}
+
+fn released_share_request(
+    lease_id: String,
+    entry: ShareRequestEntry,
+    now: Instant,
+    reason: &str,
+) -> ReleasedShareRequest {
+    ReleasedShareRequest {
+        lease_id,
+        request_id: entry.request_id,
+        share_id: entry.share_id,
+        app: entry.app,
+        user_email: entry.user_email,
+        phase: entry.phase.as_str().to_string(),
+        age_secs: now.duration_since(entry.started_at).as_secs(),
+        progress_age_secs: now.duration_since(entry.last_progress_at).as_secs(),
+        reason: reason.to_string(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct KeyedConcurrencyLimiter {
+    counters: StdMutex<HashMap<String, usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct KeyedConcurrencyRelease {
+    limiter: Arc<KeyedConcurrencyLimiter>,
+    key: String,
+    released: Arc<AtomicBool>,
+}
+
+impl KeyedConcurrencyRelease {
+    fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut counters = self
+            .limiter
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_remove = match counters.get_mut(&self.key) {
+            Some(inflight) if *inflight > 1 => {
+                *inflight -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if should_remove {
+            counters.remove(&self.key);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct KeyedConcurrencyPermit {
+    release: KeyedConcurrencyRelease,
+}
+
+impl KeyedConcurrencyPermit {
+    fn release_handle(&self) -> KeyedConcurrencyRelease {
+        self.release.clone()
+    }
 }
 
 impl Drop for KeyedConcurrencyPermit {
     fn drop(&mut self) {
-        let limiter = self.limiter.clone();
-        let key = self.key.clone();
-        tokio::spawn(async move {
-            let mut counters = limiter.counters.lock().await;
-            let should_remove = match counters.get_mut(&key) {
-                Some(inflight) if *inflight > 1 => {
-                    *inflight -= 1;
-                    false
-                }
-                Some(_) => true,
-                None => false,
-            };
-            if should_remove {
-                counters.remove(&key);
-            }
-        });
+        self.release.release();
     }
 }
 
 /// Lifecycle guard that flips a recorded `RecentTraffic` event from
 /// in-flight to completed when the proxy's response body stream ends. We
-/// pair it with the same drop-then-spawn pattern as
-/// [`KeyedConcurrencyPermit`] so the closure that owns the guard never has
-/// to be `async`.
+/// The async completion is spawned from `Drop` so the closure that owns the
+/// guard never has to be `async`.
 #[derive(Debug)]
 struct RecentTrafficGuard {
     traffic: RecentTraffic,
@@ -485,6 +924,57 @@ struct ShareLlmProxyMetricsGuard {
     status: u16,
     error_kind: Option<String>,
     started: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ProxyResponseLifecycle {
+    _route: Option<RouteInflightGuard>,
+    share: Option<ShareConcurrencyPermit>,
+    _free_share_ip: Option<KeyedConcurrencyPermit>,
+    _image: Option<KeyedConcurrencyPermit>,
+    _market: Option<KeyedConcurrencyPermit>,
+    _recent_traffic: Option<RecentTrafficGuard>,
+    _share_llm_metrics: Option<ShareLlmProxyMetricsGuard>,
+    _metrics: Option<MetricsPermit>,
+}
+
+impl ProxyResponseLifecycle {
+    fn mark_response_headers_received(&self) {
+        if let Some(permit) = self.share.as_ref() {
+            permit.mark_response_headers_received();
+        }
+    }
+
+    fn record_progress(&self) {
+        if let Some(permit) = self.share.as_ref() {
+            permit.record_progress();
+        }
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.share
+            .as_ref()
+            .map(ShareConcurrencyPermit::cancellation_token)
+            .unwrap_or_default()
+    }
+
+    fn hard_deadline(&self, max_lifetime: Duration) -> tokio::time::Instant {
+        self.share
+            .as_ref()
+            .map(|permit| permit.hard_deadline(max_lifetime))
+            .unwrap_or_else(|| tokio::time::Instant::now() + max_lifetime)
+    }
+}
+
+fn finish_proxy_response_lifecycle(lifecycle: &mut Option<ProxyResponseLifecycle>) -> bool {
+    let owns_share_release = lifecycle.as_ref().is_some_and(|lifecycle| {
+        lifecycle
+            .share
+            .as_ref()
+            .is_none_or(ShareConcurrencyPermit::release_registry_lease)
+    });
+    drop(lifecycle.take());
+    owns_share_release
 }
 
 impl Drop for ShareLlmProxyMetricsGuard {
@@ -610,7 +1100,10 @@ impl KeyedConcurrencyLimiter {
         key: &str,
         parallel_limit: i64,
     ) -> Result<KeyedConcurrencyPermit, ConcurrencyLimitExceeded> {
-        let mut counters = self.counters.lock().await;
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let inflight = counters.entry(key.to_string()).or_insert(0);
         if parallel_limit >= 0 {
             let limit = parallel_limit as usize;
@@ -623,13 +1116,19 @@ impl KeyedConcurrencyLimiter {
         }
         *inflight += 1;
         Ok(KeyedConcurrencyPermit {
-            limiter: self.clone(),
-            key: key.to_string(),
+            release: KeyedConcurrencyRelease {
+                limiter: self.clone(),
+                key: key.to_string(),
+                released: Arc::new(AtomicBool::new(false)),
+            },
         })
     }
 
     async fn snapshot(&self) -> HashMap<String, usize> {
-        self.counters.lock().await.clone()
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -638,15 +1137,13 @@ pub struct ProxyRegistry {
     routes: Arc<RwLock<HashMap<String, LogicalRoute>>>,
     pending_routes: RwLock<HashMap<String, PendingRouteEntry>>,
     health_probe_failures: Mutex<HashMap<String, Instant>>,
-    share_limiter: Arc<KeyedConcurrencyLimiter>,
-    share_app_limiter: Arc<KeyedConcurrencyLimiter>,
-    share_user_inflight: Arc<KeyedConcurrencyLimiter>,
+    share_requests: Arc<ShareRequestRegistry>,
     free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
     image_limiter: Arc<KeyedConcurrencyLimiter>,
     /// Tracks requests that actually traversed the market proxy path, keyed by
-    /// lowercased market email. Independent from `share_limiter` so a request
-    /// that hits a share's own subdomain directly is not counted against the
-    /// market it happens to be linked to.
+    /// lowercased market email. A request that hits a Share subdomain directly
+    /// is not counted against the linked market. This stays separate from the
+    /// Share request registry, which owns Share admission and lifecycle state.
     market_limiter: Arc<KeyedConcurrencyLimiter>,
 }
 
@@ -1359,25 +1856,14 @@ impl ProxyRegistry {
     /// Snapshot of in-flight request counts per share_id. Share IDs absent from
     /// the map have zero in-flight requests.
     pub async fn inflight_by_share(&self) -> HashMap<String, usize> {
-        self.share_limiter.snapshot().await
+        self.share_requests.inflight_by_share().await
     }
 
     /// Snapshot of in-flight request counts per share_id and app_type. Unknown
     /// app requests are intentionally omitted from this app-level view while
     /// still counted by `inflight_by_share`.
     pub async fn inflight_by_share_app(&self) -> HashMap<String, BTreeMap<String, usize>> {
-        let snapshot = self.share_app_limiter.snapshot().await;
-        let mut result = HashMap::<String, BTreeMap<String, usize>>::new();
-        for (key, count) in snapshot {
-            let Some((share_id, app)) = key.split_once(':') else {
-                continue;
-            };
-            result
-                .entry(share_id.to_string())
-                .or_default()
-                .insert(app.to_string(), count);
-        }
-        result
+        self.share_requests.inflight_by_share_app().await
     }
 
     /// Snapshot of in-flight request counts per share, app, and user email.
@@ -1385,27 +1871,28 @@ impl ProxyRegistry {
     pub async fn inflight_by_share_user(
         &self,
     ) -> HashMap<String, BTreeMap<String, BTreeMap<String, usize>>> {
-        let snapshot = self.share_user_inflight.snapshot().await;
-        let mut result = HashMap::<String, BTreeMap<String, BTreeMap<String, usize>>>::new();
-        for (key, count) in snapshot {
-            let mut parts = key.splitn(3, ':');
-            let Some(share_id) = parts.next() else {
-                continue;
-            };
-            let Some(app) = parts.next() else {
-                continue;
-            };
-            let Some(user) = parts.next() else {
-                continue;
-            };
-            result
-                .entry(share_id.to_string())
-                .or_default()
-                .entry(app.to_string())
-                .or_default()
-                .insert(user.to_string(), count);
-        }
-        result
+        self.share_requests.inflight_by_share_user().await
+    }
+
+    pub async fn share_request_registry_snapshot(&self) -> ShareRequestRegistrySnapshot {
+        self.share_requests.snapshot().await
+    }
+
+    pub fn release_stale_share_requests(
+        &self,
+        config: &crate::config::ProxyStreamConfig,
+    ) -> Vec<ReleasedShareRequest> {
+        self.share_requests.release_stale(config)
+    }
+
+    pub fn force_release_share_requests(
+        &self,
+        request_id: Option<&str>,
+        share_id: Option<&str>,
+        reason: &str,
+    ) -> Vec<ReleasedShareRequest> {
+        self.share_requests
+            .force_release_matching(request_id, share_id, reason)
     }
 
     /// Snapshot of in-flight request counts per market email (lowercased).
@@ -1435,9 +1922,15 @@ impl ProxyRegistry {
 
     #[cfg(test)]
     pub async fn set_share_inflight_for_test(&self, share_id: &str, count: usize) {
-        for _ in 0..count {
+        for index in 0..count {
             if let Ok(permit) = self
-                .try_acquire_share_permit(share_id, None, -1, None)
+                .try_acquire_share_permit(
+                    &format!("test:{share_id}:{index}:{}", Uuid::new_v4()),
+                    share_id,
+                    None,
+                    -1,
+                    None,
+                )
                 .await
             {
                 std::mem::forget(permit);
@@ -1460,39 +1953,15 @@ impl ProxyRegistry {
 
     async fn try_acquire_share_permit(
         &self,
+        request_id: &str,
         share_id: &str,
         app_type: Option<&str>,
         parallel_limit: i64,
         user_email: Option<&str>,
     ) -> Result<ShareConcurrencyPermit, ConcurrencyLimitExceeded> {
-        let share = self
-            .share_limiter
-            .try_acquire(share_id, parallel_limit)
-            .await?;
-        let app = app_type
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .filter(|value| matches!(value.as_str(), "claude" | "codex" | "gemini"));
-        let app_permit = match app.as_deref() {
-            Some(app) => {
-                let key = format!("{share_id}:{app}");
-                self.share_app_limiter.try_acquire(&key, -1).await.ok()
-            }
-            None => None,
-        };
-        let user = match user_email.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(email) => {
-                let app_key = app.clone().unwrap_or_else(|| "_".to_string());
-                let key = format!("{share_id}:{app_key}:{}", email.to_ascii_lowercase());
-                self.share_user_inflight.try_acquire(&key, -1).await.ok()
-            }
-            None => None,
-        };
-        Ok(ShareConcurrencyPermit {
-            _share: share,
-            _app: app_permit,
-            _user: user,
-        })
+        self.share_requests
+            .try_acquire(request_id, share_id, app_type, parallel_limit, user_email)
+            .await
     }
 
     async fn try_acquire_free_share_ip_permit(
@@ -1695,9 +2164,34 @@ pub async fn market_proxy_handler(
     builder = builder.header(SHARE_DATA_SOURCE_HEADER, "market");
 
     let log_share_id = mask_token(&share_id);
+    let live_request_id = Some(admission_request_id);
+    if let Some(ref request_id) = live_request_id {
+        builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
+    }
+    let body = match read_proxy_request_body(
+        body,
+        proxy_request_body_limit(&path_and_query),
+        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(ProxyRequestBodyReadError::Timeout) => {
+            state.metrics.record_proxy_request_body_timeout();
+            warn!(path = %path_and_query, "market proxy request body timed out");
+            return simple_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
+        }
+        Err(ProxyRequestBodyReadError::Rejected(error)) => {
+            warn!(error = %error, path = %path_and_query, "market proxy request body rejected");
+            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
+        }
+    };
     let share_permit = match state
         .proxy
         .try_acquire_share_permit(
+            live_request_id
+                .as_deref()
+                .expect("market Share requests always have a request id"),
             &share_id,
             Some(&request_app),
             route.parallel_limit,
@@ -1722,7 +2216,9 @@ pub async fn market_proxy_handler(
             record_llm_admission_rejection(
                 &state,
                 &route,
-                &admission_request_id,
+                live_request_id
+                    .as_deref()
+                    .expect("market Share requests always have a request id"),
                 &request_app,
                 "market",
                 Some(&market_email),
@@ -1733,7 +2229,9 @@ pub async fn market_proxy_handler(
                 "share",
                 exceeded.current,
                 exceeded.limit,
-                &admission_request_id,
+                live_request_id
+                    .as_deref()
+                    .expect("market Share requests always have a request id"),
                 format!(
                     "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                     exceeded.current, exceeded.limit
@@ -1741,7 +2239,6 @@ pub async fn market_proxy_handler(
             );
         }
     };
-
     let free_share_ip_permit = if route.is_free_share && state.config.free_share_ip_limit_enabled()
     {
         match state
@@ -1751,10 +2248,13 @@ pub async fn market_proxy_handler(
         {
             Ok(permit) => Some(permit),
             Err(exceeded) => {
+                let request_id = live_request_id
+                    .as_deref()
+                    .expect("market Share requests always have a request id");
                 record_llm_admission_rejection(
                     &state,
                     &route,
-                    &admission_request_id,
+                    request_id,
                     &request_app,
                     "market",
                     Some(&market_email),
@@ -1765,7 +2265,7 @@ pub async fn market_proxy_handler(
                     "free_share_ip",
                     exceeded.current,
                     exceeded.limit,
-                    &admission_request_id,
+                    request_id,
                     format!(
                         "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                         exceeded.current, exceeded.limit
@@ -1776,29 +2276,23 @@ pub async fn market_proxy_handler(
     } else {
         None
     };
-
-    // Tracking-only permit so the dashboard's market PARALLEL counter only
-    // reflects requests that actually traversed the market proxy.
-    let market_permit = state.proxy.acquire_market_permit(&market_email).await;
-
-    let live_request_id = Some(admission_request_id);
-    if let Some(ref request_id) = live_request_id {
-        builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
+    if let Some(permit) = free_share_ip_permit.as_ref() {
+        share_permit.register_keyed_permit(permit);
     }
-    let body = match axum::body::to_bytes(body, proxy_request_body_limit(&path_and_query)).await {
-        Ok(body) => body,
-        Err(error) => {
-            warn!(error = %error, path = %path_and_query, "market proxy request body rejected");
-            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
-        }
-    };
+    let market_permit = state.proxy.acquire_market_permit(&market_email).await;
+    share_permit.register_keyed_permit(&market_permit);
+    let share_cancellation = share_permit.cancellation_token();
     if route.is_share() || route.is_client_web() {
         let installation_id = route.installation_id().unwrap_or_default();
-        let control_secret = match state
-            .store
-            .installation_control_secret(installation_id)
-            .await
-        {
+        let Some(control_secret_result) = await_share_request_or_cancel(
+            &share_cancellation,
+            state.store.installation_control_secret(installation_id),
+        )
+        .await
+        else {
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+        };
+        let control_secret = match control_secret_result {
             Ok(Some(secret)) if !secret.trim().is_empty() => secret,
             Ok(_) => {
                 return simple_response(
@@ -1879,9 +2373,9 @@ pub async fn market_proxy_handler(
             );
     }
     builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
-    state
-        .recent_traffic
-        .record_with_id(
+    if await_share_request_or_cancel(
+        &share_cancellation,
+        state.recent_traffic.record_with_id(
             live_request_id
                 .clone()
                 .expect("market Share requests always have a request id"),
@@ -1890,15 +2384,45 @@ pub async fn market_proxy_handler(
             Some(route.subdomain.clone()),
             client_metadata.country_code.clone(),
             Some(market_email.clone()),
-        )
-        .await;
+        ),
+    )
+    .await
+    .is_none()
+    {
+        return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+    }
     let mut recent_traffic_guard = live_request_id
         .as_ref()
         .map(|id| RecentTrafficGuard::new(state.recent_traffic.clone(), id.clone()));
 
-    let upstream = match builder.body(reqwest::Body::from(body)).send().await {
+    let upstream = match send_proxy_upstream_request(
+        builder.body(reqwest::Body::from(body)),
+        Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs),
+        Some(share_permit.cancellation_token()),
+    )
+    .await
+    {
         Ok(response) => response,
-        Err(err) => {
+        Err(ProxyUpstreamRequestError::ResponseHeaderTimeout) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::GATEWAY_TIMEOUT);
+            }
+            if share_permit.release_registry_lease() {
+                state.metrics.record_proxy_response_header_timeout();
+                warn!(method = %method, host = %host, path = %path_and_query, backend = %backend, share_id = %log_share_id, "market proxy upstream response headers timed out");
+            }
+            return simple_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream-response-header-timeout",
+            );
+        }
+        Err(ProxyUpstreamRequestError::Cancelled) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+        }
+        Err(ProxyUpstreamRequestError::Request(err)) => {
             if let Some(guard) = recent_traffic_guard.as_mut() {
                 guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
             }
@@ -1923,6 +2447,7 @@ pub async fn market_proxy_handler(
         }
     };
 
+    share_permit.mark_response_headers_received();
     let status = upstream.status();
     if let Some(guard) = recent_traffic_guard.as_mut() {
         guard.set_status(status);
@@ -1948,18 +2473,24 @@ pub async fn market_proxy_handler(
         );
     }
     let is_event_stream = is_event_stream_response(&response_headers);
-    let body_stream = upstream
-        .bytes_stream()
-        .scan(false, move |stream_ended, chunk| {
-            let _route_inflight_guard = &route_inflight_guard;
-            let _permit = &share_permit;
-            let _free_share_ip_permit = &free_share_ip_permit;
-            let _market_permit = &market_permit;
-            let _recent_traffic_guard = &recent_traffic_guard;
-            let _metrics_permit = &metrics_permit;
-            let output = proxy_body_chunk(is_event_stream, stream_ended, chunk);
-            futures_util::future::ready(output)
-        });
+    let body_stream = proxy_response_body_stream(
+        upstream.bytes_stream(),
+        is_event_stream
+            .then(|| ProxyStreamProtocol::from_path(&path_and_query))
+            .flatten(),
+        is_event_stream,
+        ProxyResponseTimeouts::from(&state.config.proxy_stream),
+        state.metrics.clone(),
+        ProxyResponseLifecycle {
+            _route: Some(route_inflight_guard),
+            share: Some(share_permit),
+            _free_share_ip: free_share_ip_permit,
+            _market: Some(market_permit),
+            _recent_traffic: recent_traffic_guard,
+            _metrics: Some(metrics_permit),
+            ..Default::default()
+        },
+    );
     let body = Body::from_stream(body_stream);
 
     let mut response = Response::new(body);
@@ -2017,9 +2548,20 @@ pub async fn gateway_proxy_handler(
     let user_asn = trusted_asn_header(&parts.headers, peer);
     let user_agent = header_str(&parts.headers, "user-agent");
 
-    let body_bytes = match axum::body::to_bytes(body, proxy_request_body_limit(&path)).await {
+    let body_bytes = match read_proxy_request_body(
+        body,
+        proxy_request_body_limit(&path),
+        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(ProxyRequestBodyReadError::Timeout) => {
+            state.metrics.record_proxy_request_body_timeout();
+            warn!(method = %method, host = %host, path = %path, "gateway proxy request body timed out");
+            return simple_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
+        }
+        Err(ProxyRequestBodyReadError::Rejected(err)) => {
             warn!(
                 method = %method,
                 host = %host,
@@ -2102,7 +2644,13 @@ pub async fn gateway_proxy_handler(
     let metrics_permit = state.metrics.proxy_request_started();
     let share_permit = match state
         .proxy
-        .try_acquire_share_permit(&share_id, Some(&request_app), route.parallel_limit, None)
+        .try_acquire_share_permit(
+            &admission_request_id,
+            &share_id,
+            Some(&request_app),
+            route.parallel_limit,
+            None,
+        )
         .await
     {
         Ok(permit) => permit,
@@ -2175,6 +2723,9 @@ pub async fn gateway_proxy_handler(
     } else {
         None
     };
+    if let Some(permit) = free_share_ip_permit.as_ref() {
+        share_permit.register_keyed_permit(permit);
+    }
 
     let mut builder = state.proxy_http.request(method.clone(), target);
     let connection_listed_headers = connection_listed_header_names(&parts.headers);
@@ -2197,39 +2748,72 @@ pub async fn gateway_proxy_handler(
 
     let live_request_id = admission_request_id;
     builder = builder.header("X-CC-Switch-Request-Id", live_request_id.as_str());
-    builder = match with_signed_ingress_context(
-        &state,
-        builder,
-        &route,
-        format!("{}.{}", route.subdomain, state.config.tunnel_domain),
-        &live_request_id,
-        None,
-        client_metadata.country_code.clone(),
-        &method,
-        &body_bytes,
+    let share_cancellation = share_permit.cancellation_token();
+    let Some(signed_builder) = await_share_request_or_cancel(
+        &share_cancellation,
+        with_signed_ingress_context(
+            &state,
+            builder,
+            &route,
+            format!("{}.{}", route.subdomain, state.config.tunnel_domain),
+            &live_request_id,
+            None,
+            client_metadata.country_code.clone(),
+            &method,
+            &body_bytes,
+        ),
     )
     .await
-    {
+    else {
+        return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+    };
+    builder = match signed_builder {
         Ok(builder) => builder,
         Err(response) => return response,
     };
-    state
-        .recent_traffic
-        .record_with_id(
+    if await_share_request_or_cancel(
+        &share_cancellation,
+        state.recent_traffic.record_with_id(
             live_request_id.clone(),
             share_id.clone(),
             route.share_name.clone(),
             Some(route.subdomain.clone()),
             client_metadata.country_code.clone(),
             None,
-        )
-        .await;
+        ),
+    )
+    .await
+    .is_none()
+    {
+        return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+    }
     let mut recent_traffic_guard =
         RecentTrafficGuard::new(state.recent_traffic.clone(), live_request_id.clone());
 
-    let upstream = match builder.body(reqwest::Body::from(body_bytes)).send().await {
+    let upstream = match send_proxy_upstream_request(
+        builder.body(reqwest::Body::from(body_bytes)),
+        Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs),
+        Some(share_permit.cancellation_token()),
+    )
+    .await
+    {
         Ok(response) => response,
-        Err(err) => {
+        Err(ProxyUpstreamRequestError::ResponseHeaderTimeout) => {
+            recent_traffic_guard.set_status(StatusCode::GATEWAY_TIMEOUT);
+            if share_permit.release_registry_lease() {
+                state.metrics.record_proxy_response_header_timeout();
+                warn!(method = %method, host = %host, path = %path_and_query, backend = %backend, share_id = %share_id, "gateway proxy upstream response headers timed out");
+            }
+            return simple_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream-response-header-timeout",
+            );
+        }
+        Err(ProxyUpstreamRequestError::Cancelled) => {
+            recent_traffic_guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+        }
+        Err(ProxyUpstreamRequestError::Request(err)) => {
             recent_traffic_guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
             state.metrics.record_proxy_upstream_error(false);
             warn!(
@@ -2252,6 +2836,7 @@ pub async fn gateway_proxy_handler(
         }
     };
 
+    share_permit.mark_response_headers_received();
     let status = upstream.status();
     recent_traffic_guard.set_status(status);
     let response_headers = upstream.headers().clone();
@@ -2272,24 +2857,33 @@ pub async fn gateway_proxy_handler(
             None,
         );
     }
-    let body_stream = {
-        use futures_util::StreamExt;
-
-        upstream.bytes_stream().map(move |chunk| {
-            let _route_inflight_guard = &route_inflight_guard;
-            let _permit = &share_permit;
-            let _free_share_ip_permit = &free_share_ip_permit;
-            let _recent_traffic_guard = &recent_traffic_guard;
-            let _metrics_permit = &metrics_permit;
-            chunk
-        })
-    };
+    let is_event_stream = is_event_stream_response(&response_headers);
+    let body_stream = proxy_response_body_stream(
+        upstream.bytes_stream(),
+        is_event_stream
+            .then(|| ProxyStreamProtocol::from_path(&path_and_query))
+            .flatten(),
+        is_event_stream,
+        ProxyResponseTimeouts::from(&state.config.proxy_stream),
+        state.metrics.clone(),
+        ProxyResponseLifecycle {
+            _route: Some(route_inflight_guard),
+            share: Some(share_permit),
+            _free_share_ip: free_share_ip_permit,
+            _recent_traffic: Some(recent_traffic_guard),
+            _metrics: Some(metrics_permit),
+            ..Default::default()
+        },
+    );
     let body = Body::from_stream(body_stream);
 
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response.headers_mut().clear();
     copy_upstream_response_headers(&response_headers, response.headers_mut());
+    if is_event_stream {
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+    }
     info!(
         method = %method,
         host = %host,
@@ -2718,9 +3312,20 @@ pub async fn proxy_handler(
         && method == axum::http::Method::POST
         && is_image_generation_submit_path(&path)
     {
-        let body_bytes = match axum::body::to_bytes(body, proxy_request_body_limit(&path)).await {
+        let body_bytes = match read_proxy_request_body(
+            body,
+            proxy_request_body_limit(&path),
+            Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+        )
+        .await
+        {
             Ok(body) => body,
-            Err(err) => {
+            Err(ProxyRequestBodyReadError::Timeout) => {
+                state.metrics.record_proxy_request_body_timeout();
+                warn!(method = %method, host = %host, path = %path_and_query, "image generation request body timed out");
+                return json_error_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
+            }
+            Err(ProxyRequestBodyReadError::Rejected(err)) => {
                 warn!(
                     method = %method,
                     host = %host,
@@ -2827,6 +3432,36 @@ pub async fn proxy_handler(
     let admission_request_id =
         (!skips_share_edge_auth && route.is_share()).then(|| Uuid::new_v4().to_string());
 
+    let body = match read_proxy_request_body(
+        body,
+        proxy_request_body_limit(&path),
+        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(ProxyRequestBodyReadError::Timeout) => {
+            state.metrics.record_proxy_request_body_timeout();
+            warn!(method = %method, host = %host, path = %path_and_query, "proxy request body timed out");
+            return simple_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
+        }
+        Err(ProxyRequestBodyReadError::Rejected(err)) => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                backend = %backend,
+                share_id = %log_share_id,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                error = %err,
+                "proxy request body read failed"
+            );
+            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
+        }
+    };
     let share_permit = if skips_share_edge_auth {
         None
     } else if let Some(share_id) = route.share_id.as_deref() {
@@ -2834,6 +3469,9 @@ pub async fn proxy_handler(
         match state
             .proxy
             .try_acquire_share_permit(
+                admission_request_id
+                    .as_deref()
+                    .expect("Share admission requests always have a request id"),
                 share_id,
                 request_app.as_deref(),
                 route.parallel_limit,
@@ -2876,26 +3514,6 @@ pub async fn proxy_handler(
         }
     } else {
         None
-    };
-
-    let body = match axum::body::to_bytes(body, proxy_request_body_limit(&path)).await {
-        Ok(body) => body,
-        Err(err) => {
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path_and_query,
-                backend = %backend,
-                share_id = %log_share_id,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                error = %err,
-                "proxy request body read failed"
-            );
-            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
-        }
     };
 
     let free_share_ip_permit = if !skips_share_edge_auth
@@ -2942,6 +3560,15 @@ pub async fn proxy_handler(
     } else {
         None
     };
+    if let (Some(share_permit), Some(free_share_ip_permit)) =
+        (share_permit.as_ref(), free_share_ip_permit.as_ref())
+    {
+        share_permit.register_keyed_permit(free_share_ip_permit);
+    }
+    let share_cancellation = share_permit
+        .as_ref()
+        .map(ShareConcurrencyPermit::cancellation_token)
+        .unwrap_or_default();
 
     // Generate the downstream identity before signing. Recording happens only after all
     // local request preparation succeeds, so early local failures cannot leak inflight rows.
@@ -2959,11 +3586,15 @@ pub async fn proxy_handler(
     }
     if route.is_share() || route.is_client_web() {
         let installation_id = route.installation_id().unwrap_or_default();
-        let control_secret = match state
-            .store
-            .installation_control_secret(installation_id)
-            .await
-        {
+        let Some(control_secret_result) = await_share_request_or_cancel(
+            &share_cancellation,
+            state.store.installation_control_secret(installation_id),
+        )
+        .await
+        else {
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+        };
+        let control_secret = match control_secret_result {
             Ok(Some(secret)) if !secret.trim().is_empty() => secret,
             Ok(_) => {
                 return simple_response(
@@ -3058,17 +3689,22 @@ pub async fn proxy_handler(
     // closure so completion fires when the upstream stream actually ends.
     if let (Some(request_id), Some(share_id)) = (live_request_id.as_ref(), route.share_id.as_ref())
     {
-        state
-            .recent_traffic
-            .record_with_id(
+        if await_share_request_or_cancel(
+            &share_cancellation,
+            state.recent_traffic.record_with_id(
                 request_id.clone(),
                 share_id.clone(),
                 route.share_name.clone(),
                 Some(route.subdomain.clone()),
                 client_metadata.country_code.clone(),
                 api_user_email.clone(),
-            )
-            .await;
+            ),
+        )
+        .await
+        .is_none()
+        {
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+        }
     }
     let mut recent_traffic_guard = live_request_id
         .as_ref()
@@ -3076,9 +3712,51 @@ pub async fn proxy_handler(
     let share_proxy_started = Instant::now();
     let share_request_app = infer_share_request_app(&path);
 
-    let upstream = match builder.body(body).send().await {
+    let upstream = match send_proxy_upstream_request(
+        builder.body(body),
+        Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs),
+        share_permit
+            .as_ref()
+            .map(ShareConcurrencyPermit::cancellation_token),
+    )
+    .await
+    {
         Ok(response) => response,
-        Err(err) => {
+        Err(ProxyUpstreamRequestError::ResponseHeaderTimeout) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::GATEWAY_TIMEOUT);
+            }
+            let owns_share_release = share_permit
+                .as_ref()
+                .is_none_or(ShareConcurrencyPermit::release_registry_lease);
+            if owns_share_release {
+                state.metrics.record_proxy_response_header_timeout();
+                warn!(method = %method, host = %host, path = %path_and_query, backend = %backend, share_id = %log_share_id, "proxy upstream response headers timed out");
+            }
+            let _share_llm_metrics_guard = share_llm_proxy_metrics_guard(
+                &state,
+                &route,
+                &path,
+                is_share_router_probe,
+                skips_share_edge_auth,
+                live_request_id.as_deref(),
+                StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                Some("timeout".into()),
+                share_proxy_started,
+                share_request_app.clone(),
+            );
+            return simple_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream-response-header-timeout",
+            );
+        }
+        Err(ProxyUpstreamRequestError::Cancelled) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+        }
+        Err(ProxyUpstreamRequestError::Request(err)) => {
             if let Some(guard) = recent_traffic_guard.as_mut() {
                 guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
             }
@@ -3140,6 +3818,9 @@ pub async fn proxy_handler(
         }
     };
 
+    if let Some(permit) = share_permit.as_ref() {
+        permit.mark_response_headers_received();
+    }
     let upstream_status = upstream.status();
     let response_headers = upstream.headers().clone();
     let ingress_rejection = ingress_rejection_response(
@@ -3210,21 +3891,24 @@ pub async fn proxy_handler(
     // Stream the response body instead of buffering it entirely.
     // This is critical for SSE (text/event-stream) responses so that
     // downstream clients receive chunks in real time.
-    let body_stream = upstream
-        .bytes_stream()
-        .scan(false, move |stream_ended, chunk| {
-            let _route_inflight_guard = &route_inflight_guard;
-            let _permit = &share_permit;
-            let _free_share_ip_permit = &free_share_ip_permit;
-            // Hold the recent-traffic guard until the upstream stream ends so
-            // the dashboard ticker keeps the row marked in-flight for the full
-            // request lifecycle (success, client disconnect, or chunk error).
-            let _recent_traffic_guard = &recent_traffic_guard;
-            let _share_llm_metrics_guard = &share_llm_metrics_guard;
-            let _metrics_permit = &metrics_permit;
-            let output = proxy_body_chunk(is_event_stream, stream_ended, chunk);
-            futures_util::future::ready(output)
-        });
+    let body_stream = proxy_response_body_stream(
+        upstream.bytes_stream(),
+        is_event_stream
+            .then(|| ProxyStreamProtocol::from_path(&path))
+            .flatten(),
+        is_event_stream,
+        ProxyResponseTimeouts::from(&state.config.proxy_stream),
+        state.metrics.clone(),
+        ProxyResponseLifecycle {
+            _route: Some(route_inflight_guard),
+            share: share_permit,
+            _free_share_ip: free_share_ip_permit,
+            _recent_traffic: recent_traffic_guard,
+            _share_llm_metrics: share_llm_metrics_guard,
+            _metrics: Some(metrics_permit),
+            ..Default::default()
+        },
+    );
     let body = Body::from_stream(body_stream);
 
     let mut response = Response::new(body);
@@ -3309,6 +3993,98 @@ fn proxy_request_body_limit(path_and_query: &str) -> usize {
     }
 }
 
+#[derive(Debug)]
+enum ProxyRequestBodyReadError {
+    Timeout,
+    Rejected(axum::Error),
+}
+
+async fn read_proxy_request_body(
+    body: Body,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Bytes, ProxyRequestBodyReadError> {
+    match tokio::time::timeout(timeout, axum::body::to_bytes(body, limit)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => Err(ProxyRequestBodyReadError::Rejected(error)),
+        Err(_) => Err(ProxyRequestBodyReadError::Timeout),
+    }
+}
+
+async fn await_share_request_or_cancel<F>(
+    cancellation: &CancellationToken,
+    future: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        output = future => Some(output),
+    }
+}
+
+#[derive(Debug)]
+enum ProxyUpstreamRequestError {
+    ResponseHeaderTimeout,
+    Cancelled,
+    Request(reqwest::Error),
+}
+
+#[derive(Debug)]
+enum ProxyUpstreamBodyReadError {
+    Timeout,
+    Cancelled,
+    TooLarge,
+    Request(reqwest::Error),
+}
+
+async fn send_proxy_upstream_request(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+    cancellation: Option<CancellationToken>,
+) -> Result<reqwest::Response, ProxyUpstreamRequestError> {
+    let cancellation = cancellation.unwrap_or_default();
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ProxyUpstreamRequestError::Cancelled),
+        result = tokio::time::timeout(timeout, request.send()) => match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => Err(ProxyUpstreamRequestError::Request(error)),
+            Err(_) => Err(ProxyUpstreamRequestError::ResponseHeaderTimeout),
+        },
+    }
+}
+
+async fn read_proxy_upstream_body(
+    response: reqwest::Response,
+    limit: usize,
+    timeout: Duration,
+    cancellation: CancellationToken,
+) -> Result<Bytes, ProxyUpstreamBodyReadError> {
+    let read = async move {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(ProxyUpstreamBodyReadError::Request)?;
+            if body.len().saturating_add(chunk.len()) > limit {
+                return Err(ProxyUpstreamBodyReadError::TooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(body))
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ProxyUpstreamBodyReadError::Cancelled),
+        result = tokio::time::timeout(timeout, read) => match result {
+            Ok(result) => result,
+            Err(_) => Err(ProxyUpstreamBodyReadError::Timeout),
+        },
+    }
+}
+
 fn image_generation_request_wants_stream(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -3343,6 +4119,78 @@ async fn handle_image_generation_stream_submit(
         );
     };
     let admission_request_id = Uuid::new_v4().to_string();
+    let share_permit = match state
+        .proxy
+        .try_acquire_share_permit(
+            &admission_request_id,
+            share_id,
+            Some("codex"),
+            route.parallel_limit,
+            api_user_email.as_deref(),
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(exceeded) => {
+            record_llm_admission_rejection(
+                state,
+                route,
+                &admission_request_id,
+                "codex",
+                "direct",
+                None,
+            );
+            return llm_concurrency_response(
+                "codex",
+                "cc_switch_share_concurrency_limit_exceeded",
+                "share",
+                exceeded.current,
+                exceeded.limit,
+                &admission_request_id,
+                format!(
+                    "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                    exceeded.current, exceeded.limit
+                ),
+            );
+        }
+    };
+    let free_share_ip_permit = if route.is_free_share && state.config.free_share_ip_limit_enabled()
+    {
+        match state
+            .proxy
+            .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
+            .await
+        {
+            Ok(permit) => Some(permit),
+            Err(exceeded) => {
+                record_llm_admission_rejection(
+                    state,
+                    route,
+                    &admission_request_id,
+                    "codex",
+                    "direct",
+                    None,
+                );
+                return llm_concurrency_response(
+                    "codex",
+                    "cc_switch_free_share_ip_concurrency_limit_exceeded",
+                    "free_share_ip",
+                    exceeded.current,
+                    exceeded.limit,
+                    &admission_request_id,
+                    format!(
+                        "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
+                        exceeded.current, exceeded.limit
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(permit) = free_share_ip_permit.as_ref() {
+        share_permit.register_keyed_permit(permit);
+    }
     let image_permit = match state
         .proxy
         .try_acquire_image_permit(share_id, IMAGE_JOB_MAX_RUNNING_PER_SHARE as i64)
@@ -3372,6 +4220,8 @@ async fn handle_image_generation_stream_submit(
             );
         }
     };
+    share_permit.register_keyed_permit(&image_permit);
+    let share_cancellation = share_permit.cancellation_token();
 
     let mut payload = match serde_json::from_slice::<Value>(&body) {
         Ok(Value::Object(map)) => map,
@@ -3474,42 +4324,105 @@ async fn handle_image_generation_stream_submit(
 
     let metrics_permit = state.metrics.proxy_request_started();
     let request_id = admission_request_id;
-    builder = match with_signed_ingress_context(
-        state,
-        builder,
-        route,
-        format!("{}.{}", route.subdomain, state.config.tunnel_domain),
-        &request_id,
-        api_user_email.clone(),
-        Some(user_country.clone()),
-        &axum::http::Method::POST,
-        &upstream_body,
+    let Some(signed_builder) = await_share_request_or_cancel(
+        &share_cancellation,
+        with_signed_ingress_context(
+            state,
+            builder,
+            route,
+            format!("{}.{}", route.subdomain, state.config.tunnel_domain),
+            &request_id,
+            api_user_email.clone(),
+            Some(user_country.clone()),
+            &axum::http::Method::POST,
+            &upstream_body,
+        ),
     )
     .await
-    {
+    else {
+        return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+    };
+    builder = match signed_builder {
         Ok(builder) => builder,
         Err(response) => return response,
     };
-    state
-        .recent_traffic
-        .record_with_id(
+    if await_share_request_or_cancel(
+        &share_cancellation,
+        state.recent_traffic.record_with_id(
             request_id.clone(),
             share_id.to_string(),
             route.share_name.clone(),
             Some(route.subdomain.clone()),
             Some(user_country.clone()),
             api_user_email.clone(),
-        )
-        .await;
+        ),
+    )
+    .await
+    .is_none()
+    {
+        return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
+    }
     let mut recent_traffic_guard = Some(RecentTrafficGuard::new(
         state.recent_traffic.clone(),
         request_id.clone(),
     ));
 
     let request_started = Instant::now();
-    let upstream = match builder.body(upstream_body).send().await {
+    let upstream = match send_proxy_upstream_request(
+        builder.body(upstream_body),
+        Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs),
+        Some(share_permit.cancellation_token()),
+    )
+    .await
+    {
         Ok(response) => response,
-        Err(err) => {
+        Err(ProxyUpstreamRequestError::ResponseHeaderTimeout) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::GATEWAY_TIMEOUT);
+            }
+            if share_permit.release_registry_lease() {
+                state.metrics.record_proxy_response_header_timeout();
+            }
+            let message = "upstream response headers timed out";
+            if let Err(log_err) = record_image_stream_log(
+                &state.store,
+                &state.config,
+                &log_meta,
+                ImageStreamLogOutcome {
+                    status: "failed",
+                    status_code: Some(StatusCode::GATEWAY_TIMEOUT.as_u16()),
+                    latency_ms: request_started.elapsed().as_millis() as u64,
+                    completed_at: Some(chrono::Utc::now().timestamp()),
+                    error_message: Some(message.into()),
+                    result_mime_type: None,
+                    result_size_bytes: None,
+                    result_storage_key: None,
+                    result_access_token: None,
+                },
+            )
+            .await
+            {
+                warn!(request_id = %log_meta.request_id, error = %log_err, "record image stream header timeout log failed");
+            }
+            return json_error_response(StatusCode::GATEWAY_TIMEOUT, message);
+        }
+        Err(ProxyUpstreamRequestError::Cancelled) => {
+            if let Some(guard) = recent_traffic_guard.as_mut() {
+                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            let message = "image request cancelled while waiting for response headers";
+            record_image_stream_failure(
+                &state.store,
+                &state.config,
+                &log_meta,
+                request_started,
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                message.into(),
+            )
+            .await;
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, message);
+        }
+        Err(ProxyUpstreamRequestError::Request(err)) => {
             if let Some(guard) = recent_traffic_guard.as_mut() {
                 guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
             }
@@ -3547,6 +4460,7 @@ async fn handle_image_generation_stream_submit(
             );
         }
     };
+    share_permit.mark_response_headers_received();
     let status = upstream.status();
     if let Some(guard) = recent_traffic_guard.as_mut() {
         guard.set_status(status);
@@ -3590,12 +4504,35 @@ async fn handle_image_generation_stream_submit(
     }
     if !status.is_success() {
         let status_code = status;
-        let (response_body, error_message) = match upstream.bytes().await {
+        let (response_body, error_message) = match read_proxy_upstream_body(
+            upstream,
+            MAX_PROXY_ERROR_RESPONSE_BODY_BYTES,
+            Duration::from_secs(state.config.proxy_stream.first_event_timeout_secs),
+            share_permit.cancellation_token(),
+        )
+        .await
+        {
             Ok(body) => {
                 let message = compact_prompt_preview(&String::from_utf8_lossy(&body), 1000);
                 (Some(body), message)
             }
-            Err(error) => (
+            Err(ProxyUpstreamBodyReadError::Timeout) => {
+                if share_permit.release_registry_lease() {
+                    state.metrics.record_proxy_stream_first_event_timeout();
+                }
+                (None, "upstream error response body timed out".into())
+            }
+            Err(ProxyUpstreamBodyReadError::Cancelled) => {
+                (None, "upstream error response body was cancelled".into())
+            }
+            Err(ProxyUpstreamBodyReadError::TooLarge) => (
+                None,
+                format!(
+                    "upstream error response body exceeded {} bytes",
+                    MAX_PROXY_ERROR_RESPONSE_BODY_BYTES
+                ),
+            ),
+            Err(ProxyUpstreamBodyReadError::Request(error)) => (
                 None,
                 format!("failed to read upstream error response: {error}"),
             ),
@@ -3626,146 +4563,26 @@ async fn handle_image_generation_stream_submit(
         };
     }
 
-    let mut upstream_stream = upstream.bytes_stream();
-    let log_store = state.store.clone();
-    let result_config = state.config.clone();
-    let stream = async_stream::stream! {
-        use futures_util::StreamExt;
-
-        let _route_inflight_guard = route_inflight_guard;
-        let _image_permit = image_permit;
-        let _metrics_permit = metrics_permit;
-        let _recent_traffic_guard = recent_traffic_guard;
-        let mut parser = ImageStreamSseParser::default();
-        let mut terminal_logged = false;
-        let completion_guard = ImageStreamCompletionGuard::new(
-            log_store.clone(),
-            result_config.clone(),
-            log_meta.clone(),
-            request_started,
-            status.as_u16(),
-        );
-        let mut keepalive = tokio::time::interval(Duration::from_secs(15));
-        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                chunk = upstream_stream.next() => {
-                    match chunk {
-                        Some(Ok(bytes)) => {
-                            if !terminal_logged {
-                                if let Some(event) = parser.feed(&bytes, &output_format) {
-                                    terminal_logged = true;
-                                    let mut result_storage_key = None;
-                                    let mut result_access_token = None;
-                                    if event.status == "succeeded" {
-                                        if let (Some(image_bytes), Some(ext)) =
-                                            (event.image_bytes.as_deref(), event.result_ext)
-                                        {
-                                            match write_image_result(
-                                                &result_config,
-                                                &log_meta.share_id,
-                                                &log_meta.request_id,
-                                                ext,
-                                                image_bytes,
-                                            )
-                                            .await
-                                            {
-                                                Ok(saved) => {
-                                                    result_storage_key = Some(saved.storage_key);
-                                                    result_access_token = Some(saved.access_token);
-                                                }
-                                                Err(err) => {
-                                                    warn!(request_id = %log_meta.request_id, error = %err, "write image result file failed");
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if let Err(err) = record_image_stream_log(
-                                        &log_store,
-                                        &result_config,
-                                        &log_meta,
-                                        ImageStreamLogOutcome {
-                                            status: event.status,
-                                            status_code: Some(status.as_u16()),
-                                            latency_ms: request_started.elapsed().as_millis() as u64,
-                                            completed_at: Some(chrono::Utc::now().timestamp()),
-                                            error_message: event.error_message,
-                                            result_mime_type: event.result_mime_type,
-                                            result_size_bytes: event.result_size_bytes,
-                                            result_storage_key,
-                                            result_access_token,
-                                        },
-                                    )
-                                    .await
-                                    {
-                                        warn!(request_id = %log_meta.request_id, error = %err, "record image stream terminal log failed");
-                                    }
-                                    completion_guard.mark_terminal();
-                                }
-                            }
-                            yield Ok::<Bytes, std::io::Error>(bytes)
-                        }
-                        Some(Err(err)) => {
-                            if !terminal_logged {
-                                if let Err(log_err) = record_image_stream_log(
-                                    &log_store,
-                                    &result_config,
-                                    &log_meta,
-                                    ImageStreamLogOutcome {
-                                        status: "failed",
-                                        status_code: Some(status.as_u16()),
-                                        latency_ms: request_started.elapsed().as_millis() as u64,
-                                        completed_at: Some(chrono::Utc::now().timestamp()),
-                                        error_message: Some(format!("read upstream stream failed: {err}")),
-                                        result_mime_type: None,
-                                        result_size_bytes: None,
-                                        result_storage_key: None,
-                                        result_access_token: None,
-                                    },
-                                )
-                                .await
-                                {
-                                    warn!(request_id = %log_meta.request_id, error = %log_err, "record image stream read failure log failed");
-                                }
-                                completion_guard.mark_terminal();
-                            }
-                            yield Err(std::io::Error::other(err.to_string()));
-                            break;
-                        }
-                        None => {
-                            if !terminal_logged {
-                                if let Err(err) = record_image_stream_log(
-                                    &log_store,
-                                    &result_config,
-                                    &log_meta,
-                                    ImageStreamLogOutcome {
-                                        status: "failed",
-                                        status_code: Some(status.as_u16()),
-                                        latency_ms: request_started.elapsed().as_millis() as u64,
-                                        completed_at: Some(chrono::Utc::now().timestamp()),
-                                        error_message: Some("stream ended before image_generation.completed".into()),
-                                        result_mime_type: None,
-                                        result_size_bytes: None,
-                                        result_storage_key: None,
-                                        result_access_token: None,
-                                    },
-                                )
-                                .await
-                                {
-                                    warn!(request_id = %log_meta.request_id, error = %err, "record image stream incomplete log failed");
-                                }
-                                completion_guard.mark_terminal();
-                            }
-                            break;
-                        }
-                    }
-                }
-                _ = keepalive.tick() => {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b": keepalive\n\n"));
-                }
-            }
-        }
-    };
+    let stream = image_response_body_stream(
+        upstream.bytes_stream(),
+        output_format,
+        state.store.clone(),
+        state.config.clone(),
+        state.metrics.clone(),
+        ProxyResponseTimeouts::from(&state.config.proxy_stream),
+        ProxyResponseLifecycle {
+            _route: Some(route_inflight_guard),
+            share: Some(share_permit),
+            _free_share_ip: free_share_ip_permit,
+            _image: Some(image_permit),
+            _recent_traffic: recent_traffic_guard,
+            _metrics: Some(metrics_permit),
+            ..Default::default()
+        },
+        log_meta,
+        request_started,
+        status.as_u16(),
+    );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -3780,6 +4597,371 @@ async fn handle_image_generation_stream_submit(
         .headers_mut()
         .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
     response
+}
+
+#[allow(clippy::too_many_arguments)]
+fn image_response_body_stream<S, E>(
+    upstream_stream: S,
+    output_format: String,
+    log_store: AppStore,
+    result_config: Config,
+    stream_metrics: Arc<MetricsRegistry>,
+    timeouts: ProxyResponseTimeouts,
+    lifecycle: ProxyResponseLifecycle,
+    log_meta: ImageStreamLogMeta,
+    request_started: Instant,
+    status_code: u16,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let (sender, mut receiver) = mpsc::channel(PROXY_RESPONSE_CHANNEL_CAPACITY);
+    lifecycle.mark_response_headers_received();
+    let cancellation = lifecycle.cancellation_token();
+    let hard_deadline = lifecycle.hard_deadline(timeouts.max_lifetime);
+    tokio::spawn(async move {
+        let mut upstream_stream = Box::pin(upstream_stream);
+        let mut lifecycle = Some(lifecycle);
+        let mut parser = ImageStreamSseParser::default();
+        let mut meaningful_progress_seen = false;
+        let mut progress_deadline = tokio::time::Instant::now() + timeouts.first_event;
+        let completion_guard = ImageStreamCompletionGuard::new(
+            log_store.clone(),
+            result_config.clone(),
+            log_meta.clone(),
+            request_started,
+            status_code,
+        );
+        let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                _ = sender.closed() => break,
+                _ = tokio::time::sleep_until(hard_deadline) => {
+                    let owns_share_release =
+                        finish_proxy_response_lifecycle(&mut lifecycle);
+                    if owns_share_release {
+                        stream_metrics.record_proxy_request_hard_timeout();
+                    }
+                    let message = format!(
+                        "image stream request hard lifetime exceeded after {} seconds",
+                        timeouts.max_lifetime.as_secs()
+                    );
+                    record_image_stream_failure(
+                        &log_store,
+                        &result_config,
+                        &log_meta,
+                        request_started,
+                        StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        message.clone(),
+                    )
+                    .await;
+                    completion_guard.mark_terminal();
+                    let _ = sender.try_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        message,
+                    )));
+                    break;
+                }
+                _ = tokio::time::sleep_until(progress_deadline) => {
+                    let owns_share_release =
+                        finish_proxy_response_lifecycle(&mut lifecycle);
+                    let message = if meaningful_progress_seen {
+                        if owns_share_release {
+                            stream_metrics.record_proxy_stream_idle_timeout();
+                        }
+                        format!(
+                            "image stream business idle timeout after {} seconds",
+                            timeouts.idle.as_secs()
+                        )
+                    } else {
+                        if owns_share_release {
+                            stream_metrics.record_proxy_stream_first_event_timeout();
+                        }
+                        format!(
+                            "image stream first event timeout after {} seconds",
+                            timeouts.first_event.as_secs()
+                        )
+                    };
+                    record_image_stream_failure(
+                        &log_store,
+                        &result_config,
+                        &log_meta,
+                        request_started,
+                        StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        message.clone(),
+                    )
+                    .await;
+                    completion_guard.mark_terminal();
+                    warn!(
+                        request_id = %log_meta.request_id,
+                        meaningful_progress_seen,
+                        "image stream closed after protocol progress timeout"
+                    );
+                    let _ = sender.try_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        message,
+                    )));
+                    break;
+                }
+                chunk = upstream_stream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => {
+                            let observation = match parser.feed(&bytes, &output_format) {
+                                Ok(observation) => observation,
+                                Err(ImageStreamParseError::EventTooLarge) => {
+                                    stream_metrics.record_proxy_stream_parser_overflow();
+                                    let message = format!(
+                                        "image stream protocol event exceeded the {} byte limit",
+                                        MAX_PROXY_IMAGE_STREAM_EVENT_BYTES
+                                    );
+                                    drop(lifecycle.take());
+                                    record_image_stream_failure(
+                                        &log_store,
+                                        &result_config,
+                                        &log_meta,
+                                        request_started,
+                                        StatusCode::BAD_GATEWAY.as_u16(),
+                                        message.clone(),
+                                    )
+                                    .await;
+                                    completion_guard.mark_terminal();
+                                    let _ = sender.try_send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        message,
+                                    )));
+                                    break;
+                                }
+                            };
+                            if observation.meaningful_progress {
+                                meaningful_progress_seen = true;
+                                progress_deadline = tokio::time::Instant::now() + timeouts.idle;
+                                if let Some(lifecycle) = lifecycle.as_ref() {
+                                    lifecycle.record_progress();
+                                }
+                            }
+                            if let Some(terminal) = observation.terminal {
+                                stream_metrics.record_proxy_stream_semantic_terminal();
+                                drop(lifecycle.take());
+                                let chunk_end = terminal.chunk_end.min(bytes.len());
+                                let event = terminal.event;
+                                let mut result_storage_key = None;
+                                let mut result_access_token = None;
+                                if event.status == "succeeded"
+                                    && let (Some(image_bytes), Some(ext)) =
+                                        (event.image_bytes.as_deref(), event.result_ext)
+                                {
+                                    match write_image_result(
+                                        &result_config,
+                                        &log_meta.share_id,
+                                        &log_meta.request_id,
+                                        ext,
+                                        image_bytes,
+                                    )
+                                    .await
+                                    {
+                                        Ok(saved) => {
+                                            result_storage_key = Some(saved.storage_key);
+                                            result_access_token = Some(saved.access_token);
+                                        }
+                                        Err(error) => warn!(
+                                            request_id = %log_meta.request_id,
+                                            error = %error,
+                                            "write image result file failed"
+                                        ),
+                                    }
+                                }
+                                if let Err(error) = record_image_stream_log(
+                                    &log_store,
+                                    &result_config,
+                                    &log_meta,
+                                    ImageStreamLogOutcome {
+                                        status: event.status,
+                                        status_code: Some(status_code),
+                                        latency_ms: request_started.elapsed().as_millis() as u64,
+                                        completed_at: Some(chrono::Utc::now().timestamp()),
+                                        error_message: event.error_message,
+                                        result_mime_type: event.result_mime_type,
+                                        result_size_bytes: event.result_size_bytes,
+                                        result_storage_key,
+                                        result_access_token,
+                                    },
+                                )
+                                .await
+                                {
+                                    warn!(request_id = %log_meta.request_id, error = %error, "record image stream terminal log failed");
+                                }
+                                completion_guard.mark_terminal();
+                                if chunk_end > 0
+                                    && let Err(error) = send_proxy_response_chunk(
+                                        &sender,
+                                        Ok(bytes.slice(..chunk_end)),
+                                        &cancellation,
+                                        timeouts.downstream_stall,
+                                        hard_deadline,
+                                    )
+                                    .await
+                                {
+                                    let owns_share_release =
+                                        finish_proxy_response_lifecycle(&mut lifecycle);
+                                    record_proxy_chunk_send_failure(
+                                        error,
+                                        &stream_metrics,
+                                        timeouts.downstream_stall,
+                                        timeouts.max_lifetime,
+                                        owns_share_release,
+                                    );
+                                }
+                                break;
+                            }
+                            if let Err(error) = send_proxy_response_chunk(
+                                &sender,
+                                Ok(bytes),
+                                &cancellation,
+                                timeouts.downstream_stall,
+                                hard_deadline,
+                            )
+                            .await
+                            {
+                                let owns_share_release =
+                                    finish_proxy_response_lifecycle(&mut lifecycle);
+                                record_proxy_chunk_send_failure(
+                                    error,
+                                    &stream_metrics,
+                                    timeouts.downstream_stall,
+                                    timeouts.max_lifetime,
+                                    owns_share_release,
+                                );
+                                if matches!(
+                                    error,
+                                    ProxyChunkSendError::DownstreamStalled
+                                        | ProxyChunkSendError::HardLifetime
+                                ) {
+                                    let message = match error {
+                                        ProxyChunkSendError::DownstreamStalled => {
+                                            "image response downstream stalled".to_string()
+                                        }
+                                        _ => "image request hard lifetime exceeded".to_string(),
+                                    };
+                                    record_image_stream_failure(
+                                        &log_store,
+                                        &result_config,
+                                        &log_meta,
+                                        request_started,
+                                        StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                                        message,
+                                    )
+                                    .await;
+                                    completion_guard.mark_terminal();
+                                }
+                                break;
+                            }
+                        }
+                        Some(Err(error)) => {
+                            stream_metrics.record_proxy_stream_upstream_error();
+                            drop(lifecycle.take());
+                            let message = format!("read upstream stream failed: {error}");
+                            record_image_stream_failure(
+                                &log_store,
+                                &result_config,
+                                &log_meta,
+                                request_started,
+                                status_code,
+                                message.clone(),
+                            )
+                            .await;
+                            completion_guard.mark_terminal();
+                            let _ = send_proxy_response_chunk(
+                                &sender,
+                                Err(std::io::Error::other(message)),
+                                &cancellation,
+                                timeouts.downstream_stall,
+                                hard_deadline,
+                            )
+                            .await;
+                            break;
+                        }
+                        None => {
+                            drop(lifecycle.take());
+                            record_image_stream_failure(
+                                &log_store,
+                                &result_config,
+                                &log_meta,
+                                request_started,
+                                status_code,
+                                "stream ended before image_generation.completed".into(),
+                            )
+                            .await;
+                            completion_guard.mark_terminal();
+                            break;
+                        }
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if let Err(error) = send_proxy_response_chunk(
+                        &sender,
+                        Ok(Bytes::from_static(b": keepalive\n\n")),
+                        &cancellation,
+                        timeouts.downstream_stall,
+                        hard_deadline,
+                    )
+                    .await
+                    {
+                        let owns_share_release =
+                            finish_proxy_response_lifecycle(&mut lifecycle);
+                        record_proxy_chunk_send_failure(
+                            error,
+                            &stream_metrics,
+                            timeouts.downstream_stall,
+                            timeouts.max_lifetime,
+                            owns_share_release,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    async_stream::stream! {
+        while let Some(chunk) = receiver.recv().await {
+            yield chunk;
+        }
+    }
+}
+
+async fn record_image_stream_failure(
+    store: &AppStore,
+    config: &Config,
+    meta: &ImageStreamLogMeta,
+    started: Instant,
+    status_code: u16,
+    message: String,
+) {
+    if let Err(error) = record_image_stream_log(
+        store,
+        config,
+        meta,
+        ImageStreamLogOutcome {
+            status: "failed",
+            status_code: Some(status_code),
+            latency_ms: started.elapsed().as_millis() as u64,
+            completed_at: Some(chrono::Utc::now().timestamp()),
+            error_message: Some(message),
+            result_mime_type: None,
+            result_size_bytes: None,
+            result_storage_key: None,
+            result_access_token: None,
+        },
+    )
+    .await
+    {
+        warn!(request_id = %meta.request_id, error = %error, "record image stream failure log failed");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4003,38 +5185,119 @@ struct ImageStreamTerminalEvent {
     image_bytes: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
+struct ImageStreamTerminal {
+    event: ImageStreamTerminalEvent,
+    chunk_end: usize,
+}
+
+#[derive(Debug, Default)]
+struct ImageStreamObservation {
+    meaningful_progress: bool,
+    terminal: Option<ImageStreamTerminal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageStreamParseError {
+    EventTooLarge,
+}
+
 #[derive(Default)]
 struct ImageStreamSseParser {
     buffer: Vec<u8>,
+    scan_from: usize,
 }
 
 impl ImageStreamSseParser {
-    fn feed(&mut self, bytes: &[u8], output_format: &str) -> Option<ImageStreamTerminalEvent> {
+    fn feed(
+        &mut self,
+        bytes: &[u8],
+        output_format: &str,
+    ) -> Result<ImageStreamObservation, ImageStreamParseError> {
+        let previous_buffer_len = self.buffer.len();
         self.buffer.extend_from_slice(bytes);
-        let mut terminal = None;
-        while let Some((index, separator_len)) = find_sse_separator(&self.buffer) {
-            let block = self.buffer[..index].to_vec();
-            self.buffer.drain(..index + separator_len);
-            if let Some(event) = parse_image_stream_sse_block(&block, output_format) {
-                terminal = Some(event);
-                break;
+        let mut consumed = 0usize;
+        let mut observation = ImageStreamObservation::default();
+        while let Some((index, separator_len)) = find_sse_separator(&self.buffer, self.scan_from) {
+            if index > MAX_PROXY_IMAGE_STREAM_EVENT_BYTES {
+                return Err(ImageStreamParseError::EventTooLarge);
             }
+            let boundary_end = index + separator_len;
+            let block = self.buffer[..index].to_vec();
+            self.buffer.drain(..boundary_end);
+            self.scan_from = 0;
+            observation.meaningful_progress |= image_stream_sse_block_is_progress(&block);
+            if let Some(event) = parse_image_stream_sse_block(&block, output_format) {
+                let chunk_end = consumed
+                    .saturating_add(boundary_end)
+                    .saturating_sub(previous_buffer_len)
+                    .min(bytes.len());
+                self.buffer.clear();
+                self.scan_from = 0;
+                observation.terminal = Some(ImageStreamTerminal { event, chunk_end });
+                return Ok(observation);
+            }
+            consumed = consumed.saturating_add(boundary_end);
         }
-        terminal
+        if self.buffer.len() > MAX_PROXY_IMAGE_STREAM_EVENT_BYTES {
+            return Err(ImageStreamParseError::EventTooLarge);
+        }
+        self.scan_from = self.buffer.len().saturating_sub(3);
+        Ok(observation)
     }
 }
 
-fn find_sse_separator(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len().saturating_sub(1) {
-        if buffer[index] == b'\n' && buffer[index + 1] == b'\n' {
+fn image_stream_sse_block_is_progress(block: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return block.iter().any(|byte| !byte.is_ascii_whitespace());
+    };
+    let mut event_name = None;
+    let mut data = Vec::new();
+    let mut has_other_field = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event_name = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim_start());
+        } else {
+            has_other_field = true;
+        }
+    }
+    if event_name.is_some_and(|value| {
+        value.eq_ignore_ascii_case("ping") || value.eq_ignore_ascii_case("keepalive")
+    }) {
+        return false;
+    }
+    let payload = data.join("\n");
+    let payload = payload.trim();
+    if payload.eq_ignore_ascii_case("ping") || payload.eq_ignore_ascii_case("keepalive") {
+        return false;
+    }
+    let payload_is_keepalive = serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .or_else(|| value.get("event"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("ping") || value.eq_ignore_ascii_case("keepalive")
+        });
+    !payload_is_keepalive && (!payload.is_empty() || event_name.is_some() || has_other_field)
+}
+
+fn find_sse_separator(buffer: &[u8], scan_from: usize) -> Option<(usize, usize)> {
+    for index in scan_from.min(buffer.len())..buffer.len() {
+        if buffer.get(index..index + 2) == Some(b"\n\n") {
             return Some((index, 2));
         }
-        if index + 3 < buffer.len()
-            && buffer[index] == b'\r'
-            && buffer[index + 1] == b'\n'
-            && buffer[index + 2] == b'\r'
-            && buffer[index + 3] == b'\n'
-        {
+        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
             return Some((index, 4));
         }
     }
@@ -4065,7 +5328,33 @@ fn parse_image_stream_sse_block(
         return None;
     }
     let value = serde_json::from_str::<Value>(trimmed_data).ok();
-    if event_name.contains("failed") || event_name.contains("error") {
+    let payload_type = value
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let is_failed = matches!(
+        event_name,
+        "image_generation.failed"
+            | "image_generation.cancelled"
+            | "image_generation.canceled"
+            | "image_edit.failed"
+            | "image_edit.cancelled"
+            | "image_edit.canceled"
+            | "error"
+    ) || matches!(
+        payload_type.as_deref(),
+        Some(
+            "image_generation.failed"
+                | "image_generation.cancelled"
+                | "image_generation.canceled"
+                | "image_edit.failed"
+                | "image_edit.cancelled"
+                | "image_edit.canceled"
+                | "error"
+        )
+    );
+    if is_failed {
         return Some(ImageStreamTerminalEvent {
             status: "failed",
             error_message: Some(
@@ -4080,9 +5369,7 @@ fn parse_image_stream_sse_block(
             image_bytes: None,
         });
     }
-    let Some(value) = value else {
-        return None;
-    };
+    let value = value?;
     if let Some(error) = extract_image_stream_error(&value) {
         return Some(ImageStreamTerminalEvent {
             status: "failed",
@@ -4093,12 +5380,23 @@ fn parse_image_stream_sse_block(
             image_bytes: None,
         });
     }
+    let is_completed = matches!(
+        event_name,
+        "image_generation.completed" | "image_edit.completed"
+    ) || matches!(
+        payload_type.as_deref(),
+        Some("image_generation.completed" | "image_edit.completed")
+    );
+    if !is_completed {
+        return None;
+    }
     let b64 = value
         .get("data")
         .and_then(Value::as_array)
         .and_then(|items| items.first())
         .and_then(|item| item.get("b64_json"))
-        .and_then(Value::as_str);
+        .and_then(Value::as_str)
+        .or_else(|| value.get("b64_json").and_then(Value::as_str));
     if let Some(b64) = b64 {
         return match base64::engine::general_purpose::STANDARD.decode(b64) {
             Ok(image_bytes) => {
@@ -4123,19 +5421,14 @@ fn parse_image_stream_sse_block(
             }),
         };
     }
-    if event_name == "image_generation.completed" {
-        return Some(ImageStreamTerminalEvent {
-            status: "failed",
-            error_message: Some(
-                "image_generation.completed did not contain data[0].b64_json".into(),
-            ),
-            result_mime_type: None,
-            result_size_bytes: None,
-            result_ext: None,
-            image_bytes: None,
-        });
-    }
-    None
+    Some(ImageStreamTerminalEvent {
+        status: "failed",
+        error_message: Some(format!("{event_name} did not contain b64_json image data")),
+        result_mime_type: None,
+        result_size_bytes: None,
+        result_ext: None,
+        image_bytes: None,
+    })
 }
 
 fn extract_image_stream_error(value: &Value) -> Option<String> {
@@ -4224,7 +5517,13 @@ fn json_error_response(status: StatusCode, message: &str) -> Response {
 }
 
 fn infer_share_request_app(path: &str) -> Option<String> {
-    let path = path.trim_start_matches('/').to_ascii_lowercase();
+    let path = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
     if path.starts_with("gemini/")
         || path.starts_with("v1beta/")
         || (path.starts_with("v1/models/")
@@ -4232,16 +5531,24 @@ fn infer_share_request_app(path: &str) -> Option<String> {
     {
         return Some("gemini".to_string());
     }
-    if path.starts_with("anthropic/") || path.starts_with("v1/messages") {
+    if path.starts_with("anthropic/")
+        || path.starts_with("claude/")
+        || path.starts_with("v1/messages")
+    {
         return Some("claude".to_string());
     }
     if path.starts_with("codex/")
         || path.starts_with("openai/")
+        || path.starts_with("backend-api/codex/")
         || path.starts_with("v1/chat/")
+        || path.starts_with("v1/v1/chat/")
         || path.starts_with("v1/responses")
+        || path.starts_with("v1/v1/responses")
         || path.starts_with("v1/images/generations")
         || path.starts_with("images/generations")
+        || path == "responses"
         || path.starts_with("responses/")
+        || path.starts_with("chat/")
     {
         return Some("codex".to_string());
     }
@@ -4967,22 +6274,259 @@ fn is_event_stream_response(headers: &HeaderMap) -> bool {
         })
 }
 
-fn proxy_body_chunk<E: std::fmt::Display>(
-    is_event_stream: bool,
-    stream_ended: &mut bool,
-    chunk: Result<Bytes, E>,
-) -> Option<Result<Bytes, E>> {
-    if *stream_ended {
-        return None;
-    }
-    match chunk {
-        Ok(bytes) => Some(Ok(bytes)),
-        Err(error) if is_event_stream => {
-            *stream_ended = true;
-            warn!(error = %error, "proxy SSE upstream stream ended unexpectedly");
-            None
+const PROXY_RESPONSE_CHANNEL_CAPACITY: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct ProxyResponseTimeouts {
+    first_event: Duration,
+    idle: Duration,
+    downstream_stall: Duration,
+    max_lifetime: Duration,
+}
+
+impl From<&crate::config::ProxyStreamConfig> for ProxyResponseTimeouts {
+    fn from(config: &crate::config::ProxyStreamConfig) -> Self {
+        Self {
+            first_event: Duration::from_secs(config.first_event_timeout_secs),
+            idle: Duration::from_secs(config.idle_timeout_secs),
+            downstream_stall: Duration::from_secs(config.downstream_stall_timeout_secs),
+            max_lifetime: Duration::from_secs(config.max_request_lifetime_secs),
         }
-        Err(error) => Some(Err(error)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyChunkSendError {
+    ReceiverClosed,
+    Cancelled,
+    DownstreamStalled,
+    HardLifetime,
+}
+
+async fn send_proxy_response_chunk(
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    chunk: Result<Bytes, std::io::Error>,
+    cancellation: &CancellationToken,
+    downstream_stall: Duration,
+    hard_deadline: tokio::time::Instant,
+) -> Result<(), ProxyChunkSendError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ProxyChunkSendError::Cancelled),
+        _ = sender.closed() => Err(ProxyChunkSendError::ReceiverClosed),
+        _ = tokio::time::sleep_until(hard_deadline) => Err(ProxyChunkSendError::HardLifetime),
+        result = tokio::time::timeout(downstream_stall, sender.send(chunk)) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ProxyChunkSendError::ReceiverClosed),
+            Err(_) => Err(ProxyChunkSendError::DownstreamStalled),
+        },
+    }
+}
+
+fn record_proxy_chunk_send_failure(
+    error: ProxyChunkSendError,
+    metrics: &MetricsRegistry,
+    downstream_stall: Duration,
+    max_lifetime: Duration,
+    owns_share_release: bool,
+) {
+    if !owns_share_release {
+        return;
+    }
+    match error {
+        ProxyChunkSendError::DownstreamStalled => {
+            metrics.record_proxy_downstream_stall_timeout();
+            warn!(
+                timeout_secs = downstream_stall.as_secs(),
+                "proxy response pump closed after downstream stalled"
+            );
+        }
+        ProxyChunkSendError::HardLifetime => {
+            metrics.record_proxy_request_hard_timeout();
+            warn!(
+                timeout_secs = max_lifetime.as_secs(),
+                "proxy response pump closed at request hard lifetime"
+            );
+        }
+        ProxyChunkSendError::ReceiverClosed | ProxyChunkSendError::Cancelled => {}
+    }
+}
+
+fn proxy_response_body_stream<S, E>(
+    upstream_stream: S,
+    protocol: Option<ProxyStreamProtocol>,
+    is_event_stream: bool,
+    timeouts: ProxyResponseTimeouts,
+    metrics: Arc<MetricsRegistry>,
+    lifecycle: ProxyResponseLifecycle,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let (sender, mut receiver) = mpsc::channel(PROXY_RESPONSE_CHANNEL_CAPACITY);
+    lifecycle.mark_response_headers_received();
+    let cancellation = lifecycle.cancellation_token();
+    let hard_deadline = lifecycle.hard_deadline(timeouts.max_lifetime);
+    tokio::spawn(async move {
+        let mut lifecycle = Some(lifecycle);
+        let mut upstream_stream = Box::pin(upstream_stream);
+        let mut detector = protocol.map(ProxyStreamDetector::new);
+        let mut progress_deadline = tokio::time::Instant::now() + timeouts.first_event;
+        let mut meaningful_progress_seen = false;
+
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                _ = sender.closed() => break,
+                _ = tokio::time::sleep_until(hard_deadline) => {
+                    let owns_share_release =
+                        finish_proxy_response_lifecycle(&mut lifecycle);
+                    if owns_share_release {
+                        metrics.record_proxy_request_hard_timeout();
+                        warn!(
+                            timeout_secs = timeouts.max_lifetime.as_secs(),
+                            "proxy response pump closed at request hard lifetime"
+                        );
+                    }
+                    let _ = sender.try_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "proxy request hard lifetime exceeded",
+                    )));
+                    break;
+                }
+                _ = tokio::time::sleep_until(progress_deadline) => {
+                    let owns_share_release =
+                        finish_proxy_response_lifecycle(&mut lifecycle);
+                    let message = if meaningful_progress_seen {
+                        if owns_share_release {
+                            metrics.record_proxy_stream_idle_timeout();
+                            warn!(
+                                timeout_secs = timeouts.idle.as_secs(),
+                                "proxy stream closed after business idle timeout"
+                            );
+                        }
+                        "proxy stream business idle timeout"
+                    } else {
+                        if owns_share_release {
+                            metrics.record_proxy_stream_first_event_timeout();
+                            warn!(
+                                timeout_secs = timeouts.first_event.as_secs(),
+                                "proxy stream closed after first event timeout"
+                            );
+                        }
+                        "proxy stream first event timeout"
+                    };
+                    let _ = sender.try_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        message,
+                    )));
+                    break;
+                }
+                next = upstream_stream.next() => next,
+            };
+
+            match next {
+                Some(Ok(bytes)) => {
+                    let mut terminal_end = None;
+                    let meaningful_progress = if let Some(detector) = detector.as_mut() {
+                        match detector.push(&bytes) {
+                            Ok(observation) => {
+                                terminal_end = observation.terminal_chunk_end;
+                                observation.meaningful_progress
+                            }
+                            Err(ProxyStreamParseError::EventTooLarge) => {
+                                metrics.record_proxy_stream_parser_overflow();
+                                warn!("proxy stream protocol event exceeded parser capacity");
+                                drop(lifecycle.take());
+                                let error = std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "proxy stream protocol event exceeded parser capacity",
+                                );
+                                let _ = sender.try_send(Err(error));
+                                break;
+                            }
+                        }
+                    } else {
+                        !bytes.is_empty()
+                    };
+
+                    if meaningful_progress {
+                        meaningful_progress_seen = true;
+                        progress_deadline = tokio::time::Instant::now() + timeouts.idle;
+                        if let Some(lifecycle) = lifecycle.as_ref() {
+                            lifecycle.record_progress();
+                        }
+                    }
+
+                    let output = terminal_end
+                        .map(|end| bytes.slice(..end.min(bytes.len())))
+                        .unwrap_or(bytes);
+                    if terminal_end.is_some() {
+                        metrics.record_proxy_stream_semantic_terminal();
+                        drop(lifecycle.take());
+                    }
+                    if !output.is_empty()
+                        && let Err(error) = send_proxy_response_chunk(
+                            &sender,
+                            Ok(output),
+                            &cancellation,
+                            timeouts.downstream_stall,
+                            hard_deadline,
+                        )
+                        .await
+                    {
+                        let owns_share_release = finish_proxy_response_lifecycle(&mut lifecycle);
+                        record_proxy_chunk_send_failure(
+                            error,
+                            &metrics,
+                            timeouts.downstream_stall,
+                            timeouts.max_lifetime,
+                            owns_share_release,
+                        );
+                        break;
+                    }
+                    if terminal_end.is_some() {
+                        break;
+                    }
+                }
+                Some(Err(error)) => {
+                    metrics.record_proxy_stream_upstream_error();
+                    warn!(error = %error, "proxy upstream response stream failed");
+                    drop(lifecycle.take());
+                    if !is_event_stream {
+                        let send_error = send_proxy_response_chunk(
+                            &sender,
+                            Err(std::io::Error::other(error.to_string())),
+                            &cancellation,
+                            timeouts.downstream_stall,
+                            hard_deadline,
+                        )
+                        .await;
+                        if let Err(error) = send_error {
+                            let owns_share_release =
+                                finish_proxy_response_lifecycle(&mut lifecycle);
+                            record_proxy_chunk_send_failure(
+                                error,
+                                &metrics,
+                                timeouts.downstream_stall,
+                                timeouts.max_lifetime,
+                                owns_share_release,
+                            );
+                        }
+                    }
+                    break;
+                }
+                None => break,
+            }
+        }
+    });
+
+    async_stream::stream! {
+        while let Some(chunk) = receiver.recv().await {
+            yield chunk;
+        }
     }
 }
 
@@ -5383,6 +6927,7 @@ mod tests {
             tunnel_domain: "router.test".into(),
             ssh_public_addr: String::new(),
             ssh_transport: crate::config::SshTransportConfig::default(),
+            proxy_stream: crate::config::ProxyStreamConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir,
@@ -5671,13 +7216,22 @@ mod tests {
 
     #[test]
     fn request_app_is_inferred_only_from_protocol_path() {
-        for path in ["/v1/messages", "/anthropic/v1/messages"] {
+        for path in [
+            "/v1/messages",
+            "/anthropic/v1/messages",
+            "/claude/v1/messages",
+        ] {
             assert_eq!(infer_share_request_app(path).as_deref(), Some("claude"));
         }
         for path in [
             "/v1/chat/completions",
+            "/v1/v1/chat/completions",
+            "/chat/completions",
             "/v1/responses",
+            "/responses",
+            "/codex/v1/responses",
             "/openai/v1/responses",
+            "/backend-api/codex/responses",
         ] {
             assert_eq!(infer_share_request_app(path).as_deref(), Some("codex"));
         }
@@ -5895,6 +7449,81 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         );
     }
 
+    #[test]
+    fn image_stream_parser_returns_exact_terminal_chunk_boundary() {
+        let first = b"event: image_generation.partial\r\ndata: {\"progress\":50}\r\n\r\nevent: image_generation.completed\r\ndata: {\"data\":[{\"b64_json\":\"iVBORw0KGgo=\"}]";
+        let second = b"}\r\n\r\n: upstream-keepalive\r\n\r\n";
+        let terminal_suffix = b"}\r\n\r\n";
+        let mut parser = ImageStreamSseParser::default();
+
+        let first_observation = parser.feed(first, "png").unwrap();
+        assert!(first_observation.meaningful_progress);
+        assert!(first_observation.terminal.is_none());
+        let terminal = parser
+            .feed(second, "png")
+            .unwrap()
+            .terminal
+            .expect("terminal event");
+
+        assert_eq!(terminal.event.status, "succeeded");
+        assert_eq!(terminal.chunk_end, terminal_suffix.len());
+        assert_eq!(&second[..terminal.chunk_end], terminal_suffix);
+        assert!(!String::from_utf8_lossy(&second[..terminal.chunk_end]).contains("keepalive"));
+    }
+
+    #[test]
+    fn image_stream_parser_detects_terminal_event_across_single_byte_chunks() {
+        let event = b"event: image_generation.completed\r\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"iVBORw0KGgo=\"}\r\n\r\n";
+        let mut parser = ImageStreamSseParser::default();
+
+        for (index, byte) in event.iter().enumerate() {
+            let observation = parser.feed(std::slice::from_ref(byte), "png").unwrap();
+            if index + 1 == event.len() {
+                let terminal = observation.terminal.expect("terminal event");
+                assert_eq!(terminal.event.status, "succeeded");
+                assert_eq!(terminal.chunk_end, 1);
+            } else {
+                assert!(observation.terminal.is_none(), "index={index}");
+            }
+        }
+    }
+
+    #[test]
+    fn image_stream_parser_does_not_treat_partial_image_data_as_terminal() {
+        let partial = br#"event: image_generation.partial_image
+data: {"type":"image_generation.partial_image","b64_json":"iVBORw0KGgo="}
+
+"#;
+        let completed = br#"event: image_generation.completed
+data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
+
+"#;
+        let mut parser = ImageStreamSseParser::default();
+
+        let partial_observation = parser.feed(partial, "png").unwrap();
+        assert!(partial_observation.meaningful_progress);
+        assert!(partial_observation.terminal.is_none());
+
+        let completed_observation = parser.feed(completed, "png").unwrap();
+        let terminal = completed_observation.terminal.expect("completed event");
+        assert_eq!(terminal.event.status, "succeeded");
+        assert_eq!(terminal.chunk_end, completed.len());
+    }
+
+    #[test]
+    fn image_stream_parser_ignores_protocol_keepalives_for_progress() {
+        let mut parser = ImageStreamSseParser::default();
+        for keepalive in [
+            b": keepalive\n\n".as_slice(),
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n".as_slice(),
+            b"data: {\"type\":\"keepalive\"}\n\n".as_slice(),
+        ] {
+            let observation = parser.feed(keepalive, "png").unwrap();
+            assert!(!observation.meaningful_progress);
+            assert!(observation.terminal.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn share_concurrency_limiter_enforces_limit_and_releases_on_drop() {
         let limiter = Arc::new(KeyedConcurrencyLimiter::default());
@@ -5921,8 +7550,6 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         ));
 
         drop(permit_1);
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
 
         let permit_4 = limiter
             .try_acquire("share-1", 3)
@@ -5957,8 +7584,6 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
 
         drop(permit_a);
         drop(permit_b);
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
 
         let snapshot = limiter.snapshot().await;
         assert!(snapshot.get("unlimited-share").is_none());
@@ -6822,25 +8447,638 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         assert!(!is_event_stream_response(&headers));
     }
 
-    #[test]
-    fn event_stream_chunk_errors_become_clean_eof_only_for_sse() {
-        let mut ended = false;
-        let sse = proxy_body_chunk(
+    #[tokio::test]
+    async fn protocol_terminal_ends_pending_upstream_and_releases_registry() {
+        let config = proxy_test_config("terminal-pending-stream");
+        let proxy = Arc::new(ProxyRegistry::default());
+        let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
+        let permit = proxy
+            .try_acquire_share_permit(
+                "req-terminal",
+                "share-terminal",
+                Some("codex"),
+                1,
+                Some("user@example.com"),
+            )
+            .await
+            .unwrap();
+        let terminal = Bytes::from_static(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        ).as_bytes());
+        let upstream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(terminal) })
+            .chain(futures_util::stream::pending());
+        let body = proxy_response_body_stream(
+            upstream,
+            Some(ProxyStreamProtocol::OpenAiResponses),
             true,
-            &mut ended,
-            Err::<Bytes, _>(std::io::Error::other("connection lost")),
+            ProxyResponseTimeouts {
+                first_event: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_secs(1),
+                max_lifetime: Duration::from_secs(5),
+            },
+            metrics.clone(),
+            ProxyResponseLifecycle {
+                share: Some(permit),
+                _metrics: Some(metrics.proxy_request_started()),
+                ..Default::default()
+            },
         );
-        assert!(sse.is_none());
-        assert!(ended);
 
-        let mut ended = false;
-        let regular = proxy_body_chunk(
-            false,
-            &mut ended,
-            Err::<Bytes, _>(std::io::Error::other("connection lost")),
+        futures_util::pin_mut!(body);
+        let chunk = tokio::time::timeout(Duration::from_millis(250), body.next())
+            .await
+            .expect("protocol terminal must produce the terminal chunk")
+            .expect("protocol terminal chunk")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&chunk).contains("response.completed"));
+        assert!(proxy.inflight_by_share().await.is_empty());
+        assert!(proxy.inflight_by_share_app().await.is_empty());
+        assert!(proxy.inflight_by_share_user().await.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), body.next())
+                .await
+                .expect("protocol terminal must end a pending upstream stream")
+                .is_none()
         );
-        assert!(regular.is_some_and(|chunk| chunk.is_err()));
-        assert!(!ended);
+        assert_eq!(
+            metrics
+                .router_status(&proxy)
+                .await
+                .proxy_stream_semantic_terminal_total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn share_registry_keeps_all_concurrency_views_consistent() {
+        let proxy = ProxyRegistry::default();
+        let first = proxy
+            .try_acquire_share_permit("req-a", "share-a", Some("codex"), 2, Some("A@example.com"))
+            .await
+            .unwrap();
+        let second = proxy
+            .try_acquire_share_permit("req-b", "share-a", Some("claude"), 2, Some("b@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(proxy.inflight_by_share().await.get("share-a"), Some(&2));
+        assert_eq!(
+            proxy.inflight_by_share_app().await["share-a"].get("codex"),
+            Some(&1)
+        );
+        assert_eq!(
+            proxy.inflight_by_share_user().await["share-a"]["codex"].get("a@example.com"),
+            Some(&1)
+        );
+        assert_eq!(
+            proxy
+                .try_acquire_share_permit("req-c", "share-a", Some("gemini"), 2, None)
+                .await
+                .unwrap_err(),
+            ConcurrencyLimitExceeded {
+                current: 2,
+                limit: 2
+            }
+        );
+
+        drop(first);
+        assert_eq!(proxy.inflight_by_share().await.get("share-a"), Some(&1));
+        assert!(!proxy.inflight_by_share_app().await["share-a"].contains_key("codex"));
+        drop(second);
+        assert!(proxy.inflight_by_share().await.is_empty());
+        assert!(proxy.inflight_by_share_app().await.is_empty());
+        assert!(proxy.inflight_by_share_user().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_keepalives_do_not_extend_first_event_timeout() {
+        let config = proxy_test_config("stream-keepalive-timeout");
+        let proxy = ProxyRegistry::default();
+        let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
+        let upstream = futures_util::stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Some((
+                Ok::<_, std::io::Error>(Bytes::from_static(b": keepalive\n\n")),
+                (),
+            ))
+        });
+        let body = proxy_response_body_stream(
+            upstream,
+            Some(ProxyStreamProtocol::OpenAiResponses),
+            true,
+            ProxyResponseTimeouts {
+                first_event: Duration::from_millis(60),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_secs(1),
+                max_lifetime: Duration::from_secs(5),
+            },
+            metrics.clone(),
+            ProxyResponseLifecycle {
+                _metrics: Some(metrics.proxy_request_started()),
+                ..Default::default()
+            },
+        );
+
+        let chunks = tokio::time::timeout(Duration::from_millis(250), body.collect::<Vec<_>>())
+            .await
+            .expect("keepalive-only stream must hit the first-event deadline");
+        assert!(chunks.last().is_some_and(Result::is_err));
+        let status = metrics.router_status(&proxy).await;
+        assert_eq!(status.proxy_inflight, 0);
+        assert_eq!(status.proxy_requests_total, 1);
+        assert_eq!(status.proxy_stream_first_event_timeout_total, 1);
+    }
+
+    #[tokio::test]
+    async fn unpolled_response_body_still_releases_on_first_event_timeout() {
+        let config = proxy_test_config("unpolled-first-event-timeout");
+        let proxy = ProxyRegistry::default();
+        let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
+        let permit = proxy
+            .try_acquire_share_permit(
+                "req-unpolled",
+                "share-unpolled",
+                Some("codex"),
+                1,
+                Some("user@example.com"),
+            )
+            .await
+            .unwrap();
+        let body = proxy_response_body_stream(
+            futures_util::stream::pending::<Result<Bytes, std::io::Error>>(),
+            Some(ProxyStreamProtocol::OpenAiResponses),
+            true,
+            ProxyResponseTimeouts {
+                first_event: Duration::from_millis(40),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_secs(1),
+                max_lifetime: Duration::from_secs(5),
+            },
+            metrics.clone(),
+            ProxyResponseLifecycle {
+                share: Some(permit),
+                _metrics: Some(metrics.proxy_request_started()),
+                ..Default::default()
+            },
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(proxy.inflight_by_share().await.is_empty());
+        assert_eq!(
+            metrics
+                .router_status(&proxy)
+                .await
+                .proxy_stream_first_event_timeout_total,
+            1
+        );
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn unpolled_image_response_still_releases_on_first_event_timeout() {
+        let config = proxy_test_config("unpolled-image-first-event-timeout");
+        let proxy = Arc::new(ProxyRegistry::default());
+        let state = proxy_test_state(&config, proxy.clone());
+        let permit = proxy
+            .try_acquire_share_permit(
+                "req-image-unpolled",
+                "share-image-unpolled",
+                Some("codex"),
+                1,
+                Some("user@example.com"),
+            )
+            .await
+            .unwrap();
+        let body = image_response_body_stream(
+            futures_util::stream::pending::<Result<Bytes, std::io::Error>>(),
+            "png".into(),
+            state.store.clone(),
+            config.clone(),
+            state.metrics.clone(),
+            ProxyResponseTimeouts {
+                first_event: Duration::from_millis(40),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_secs(1),
+                max_lifetime: Duration::from_secs(5),
+            },
+            ProxyResponseLifecycle {
+                share: Some(permit),
+                ..Default::default()
+            },
+            ImageStreamLogMeta {
+                request_id: "req-image-unpolled".into(),
+                share_id: "share-image-unpolled".into(),
+                installation_id: "installation-image-unpolled".into(),
+                share_name: "Image Share".into(),
+                provider_id: "provider-image".into(),
+                provider_name: "Image Provider".into(),
+                app_type: "codex".into(),
+                model: "gpt-image".into(),
+                created_at: Utc::now().timestamp(),
+                prompt_preview: None,
+                created_by_email: Some("user@example.com".into()),
+                client_ip: None,
+                user_country: None,
+            },
+            Instant::now(),
+            StatusCode::OK.as_u16(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(proxy.inflight_by_share().await.is_empty());
+        drop(body);
+        let _ = std::fs::remove_file(&config.database.path);
+        let _ = std::fs::remove_file(&config.metrics.db_path);
+    }
+
+    #[tokio::test]
+    async fn downstream_backpressure_releases_unpolled_response_body() {
+        let config = proxy_test_config("downstream-backpressure");
+        let proxy = ProxyRegistry::default();
+        let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
+        let permit = proxy
+            .try_acquire_share_permit(
+                "req-backpressure",
+                "share-backpressure",
+                Some("codex"),
+                1,
+                Some("user@example.com"),
+            )
+            .await
+            .unwrap();
+        let upstream = futures_util::stream::unfold(0_u64, |sequence| async move {
+            Some((
+                Ok::<_, std::io::Error>(Bytes::from(format!("chunk-{sequence}"))),
+                sequence + 1,
+            ))
+        });
+        let body = proxy_response_body_stream(
+            upstream,
+            None,
+            false,
+            ProxyResponseTimeouts {
+                first_event: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_millis(40),
+                max_lifetime: Duration::from_secs(5),
+            },
+            metrics.clone(),
+            ProxyResponseLifecycle {
+                share: Some(permit),
+                _metrics: Some(metrics.proxy_request_started()),
+                ..Default::default()
+            },
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(proxy.inflight_by_share().await.is_empty());
+        let status = metrics.router_status(&proxy).await;
+        assert_eq!(status.proxy_inflight, 0);
+        assert_eq!(status.proxy_requests_total, 1);
+        assert_eq!(status.proxy_downstream_stall_timeout_total, 1);
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn hard_lifetime_releases_even_when_business_data_keeps_arriving() {
+        let config = proxy_test_config("hard-lifetime");
+        let proxy = ProxyRegistry::default();
+        let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
+        let permit = proxy
+            .try_acquire_share_permit("req-hard", "share-hard", Some("codex"), 1, None)
+            .await
+            .unwrap();
+        let upstream = futures_util::stream::unfold(0_u64, |sequence| async move {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            Some((
+                Ok::<_, std::io::Error>(Bytes::from(format!("chunk-{sequence}"))),
+                sequence + 1,
+            ))
+        });
+        let mut body = Box::pin(proxy_response_body_stream(
+            upstream,
+            None,
+            false,
+            ProxyResponseTimeouts {
+                first_event: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_secs(1),
+                max_lifetime: Duration::from_millis(50),
+            },
+            metrics.clone(),
+            ProxyResponseLifecycle {
+                share: Some(permit),
+                ..Default::default()
+            },
+        ));
+        while tokio::time::timeout(Duration::from_millis(150), body.next())
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|chunk| chunk.is_ok())
+        {}
+
+        assert!(proxy.inflight_by_share().await.is_empty());
+        assert_eq!(
+            metrics
+                .router_status(&proxy)
+                .await
+                .proxy_request_hard_timeout_total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_release_is_cancelling_and_idempotent() {
+        let proxy = ProxyRegistry::default();
+        let permit = proxy
+            .try_acquire_share_permit(
+                "req-manual",
+                "share-manual",
+                Some("claude"),
+                1,
+                Some("user@example.com"),
+            )
+            .await
+            .unwrap();
+        let cancellation = permit.cancellation_token();
+
+        let released =
+            proxy.force_release_share_requests(Some("req-manual"), None, "operator recovery");
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].reason, "operator recovery");
+        assert!(cancellation.is_cancelled());
+        assert!(proxy.inflight_by_share().await.is_empty());
+        assert!(
+            proxy
+                .force_release_share_requests(Some("req-manual"), None, "repeat")
+                .is_empty()
+        );
+        drop(permit);
+        assert!(proxy.inflight_by_share().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_pump_and_watchdog_share_one_release_owner() {
+        let proxy = ProxyRegistry::default();
+        let watchdog_permit = proxy
+            .try_acquire_share_permit("req-watchdog", "share-a", Some("codex"), 1, None)
+            .await
+            .unwrap();
+        let mut watchdog_lifecycle = Some(ProxyResponseLifecycle {
+            share: Some(watchdog_permit),
+            ..Default::default()
+        });
+        let keyed_permit = proxy
+            .free_share_ip_limiter
+            .try_acquire("127.0.0.1", 1)
+            .await
+            .unwrap();
+        watchdog_lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.share.as_ref())
+            .unwrap()
+            .register_keyed_permit(&keyed_permit);
+        assert_eq!(
+            proxy
+                .free_share_ip_limiter
+                .snapshot()
+                .await
+                .get("127.0.0.1"),
+            Some(&1)
+        );
+        assert_eq!(
+            proxy
+                .force_release_share_requests(Some("req-watchdog"), None, "watchdog")
+                .len(),
+            1
+        );
+        assert!(proxy.free_share_ip_limiter.snapshot().await.is_empty());
+        assert!(!finish_proxy_response_lifecycle(&mut watchdog_lifecycle));
+        drop(keyed_permit);
+
+        let pump_permit = proxy
+            .try_acquire_share_permit("req-pump", "share-a", Some("codex"), 1, None)
+            .await
+            .unwrap();
+        let mut pump_lifecycle = Some(ProxyResponseLifecycle {
+            share: Some(pump_permit),
+            ..Default::default()
+        });
+        let pump_keyed_permit = proxy
+            .free_share_ip_limiter
+            .try_acquire("127.0.0.2", 1)
+            .await
+            .unwrap();
+        pump_lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.share.as_ref())
+            .unwrap()
+            .register_keyed_permit(&pump_keyed_permit);
+        assert!(finish_proxy_response_lifecycle(&mut pump_lifecycle));
+        assert!(!finish_proxy_response_lifecycle(&mut pump_lifecycle));
+        assert!(proxy.inflight_by_share().await.is_empty());
+        assert!(proxy.free_share_ip_limiter.snapshot().await.is_empty());
+        drop(pump_keyed_permit);
+    }
+
+    #[tokio::test]
+    async fn response_headers_switch_watchdog_to_first_event_deadline() {
+        let proxy = ProxyRegistry::default();
+        let permit = proxy
+            .try_acquire_share_permit("req-first-event", "share-a", Some("codex"), 1, None)
+            .await
+            .unwrap();
+        permit.mark_response_headers_received();
+        {
+            let mut requests = proxy
+                .share_requests
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = requests.values_mut().next().unwrap();
+            entry.phase_started_at = Instant::now() - Duration::from_secs(6);
+        }
+        let config = crate::config::ProxyStreamConfig {
+            response_header_timeout_secs: 5,
+            first_event_timeout_secs: 600,
+            ..Default::default()
+        };
+        assert!(proxy.release_stale_share_requests(&config).is_empty());
+
+        {
+            let mut requests = proxy
+                .share_requests
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = requests.values_mut().next().unwrap();
+            entry.phase_started_at = Instant::now() - Duration::from_secs(601);
+        }
+        let released = proxy.release_stale_share_requests(&config);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].reason, "first_event_timeout");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn watchdog_releases_each_stale_phase_once() {
+        let proxy = ProxyRegistry::default();
+        let permits = vec![
+            proxy
+                .try_acquire_share_permit("req-headers", "share-a", Some("codex"), -1, None)
+                .await
+                .unwrap(),
+            proxy
+                .try_acquire_share_permit("req-first", "share-a", Some("codex"), -1, None)
+                .await
+                .unwrap(),
+            proxy
+                .try_acquire_share_permit("req-idle", "share-a", Some("codex"), -1, None)
+                .await
+                .unwrap(),
+            proxy
+                .try_acquire_share_permit("req-hard", "share-a", Some("codex"), -1, None)
+                .await
+                .unwrap(),
+        ];
+        let now = Instant::now();
+        {
+            let mut requests = proxy
+                .share_requests
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in requests.values_mut() {
+                match entry.request_id.as_str() {
+                    "req-headers" => entry.phase_started_at = now - Duration::from_secs(121),
+                    "req-first" => {
+                        entry.phase = ShareRequestPhase::AwaitingFirstEvent;
+                        entry.phase_started_at = now - Duration::from_secs(121);
+                    }
+                    "req-idle" => {
+                        entry.phase = ShareRequestPhase::Streaming;
+                        entry.last_progress_at = now - Duration::from_secs(901);
+                    }
+                    "req-hard" => entry.started_at = now - Duration::from_secs(7_201),
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        let mut reasons = proxy
+            .release_stale_share_requests(&crate::config::ProxyStreamConfig::default())
+            .into_iter()
+            .map(|released| released.reason)
+            .collect::<Vec<_>>();
+        reasons.sort();
+        assert_eq!(
+            reasons,
+            vec![
+                "business_idle_timeout",
+                "first_event_timeout",
+                "hard_lifetime_timeout",
+                "response_header_timeout",
+            ]
+        );
+        assert!(proxy.inflight_by_share().await.is_empty());
+        assert!(
+            proxy
+                .release_stale_share_requests(&crate::config::ProxyStreamConfig::default())
+                .is_empty()
+        );
+        for permit in permits {
+            assert!(permit.cancellation_token().is_cancelled());
+            drop(permit);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_and_response_header_reads_are_bounded() {
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<Bytes, std::convert::Infallible>,
+        >());
+        assert!(matches!(
+            read_proxy_request_body(body, 1024, Duration::from_millis(20)).await,
+            Err(ProxyRequestBodyReadError::Timeout)
+        ));
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::new();
+        let result = send_proxy_upstream_request(
+            client.get(format!("http://{address}/pending")),
+            Duration::from_millis(30),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ProxyUpstreamRequestError::ResponseHeaderTimeout)
+        ));
+        server.abort();
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = send_proxy_upstream_request(
+            client.get("http://127.0.0.1:1/cancelled"),
+            Duration::from_secs(1),
+            Some(cancellation),
+        )
+        .await;
+        assert!(matches!(result, Err(ProxyUpstreamRequestError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn upstream_error_body_reads_are_size_bounded_and_cancellable() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(any(|| async { "oversized error body" })),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{address}/large"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_proxy_upstream_body(
+                response,
+                4,
+                Duration::from_secs(1),
+                CancellationToken::new(),
+            )
+            .await,
+            Err(ProxyUpstreamBodyReadError::TooLarge)
+        ));
+
+        let response = client
+            .get(format!("http://{address}/cancelled"))
+            .send()
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            read_proxy_upstream_body(response, 1024, Duration::from_secs(1), cancellation).await,
+            Err(ProxyUpstreamBodyReadError::Cancelled)
+        ));
+        server.abort();
     }
 
     #[test]

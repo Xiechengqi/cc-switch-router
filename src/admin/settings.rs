@@ -276,6 +276,78 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("256"),
         dynamic_group: None,
     },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+        label: "Request body timeout (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("30"),
+        description: "Stop reading a downstream request body after this interval (5-300 seconds). Share concurrency is acquired only after the body is complete.",
+        placeholder: Some("30"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
+        label: "Response header timeout (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("120"),
+        description: "Cancel an upstream Share request when response headers do not arrive within 5-600 seconds.",
+        placeholder: Some("120"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
+        label: "First stream event timeout (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("120"),
+        description: "Close a Share stream when no protocol-level business event arrives within this interval (5-600 seconds). SSE comments and keepalives do not reset it.",
+        placeholder: Some("120"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS",
+        label: "Stream business idle timeout (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("900"),
+        description: "Close a Share stream after this period without a protocol-level business event (30-3600 seconds). SSE comments and keepalives do not reset it.",
+        placeholder: Some("900"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS",
+        label: "Downstream stall timeout (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("120"),
+        description: "Cancel a response pump when the downstream client stops consuming the bounded response buffer for 5-600 seconds.",
+        placeholder: Some("120"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
+        label: "Request hard lifetime (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("7200"),
+        description: "Absolute Share request lifetime (60-86400 seconds). It must exceed every phase timeout.",
+        placeholder: Some("7200"),
+        dynamic_group: None,
+    },
     // ── Persistence ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_DATA_DIR",
@@ -1503,6 +1575,7 @@ pub fn validate_and_diff(
     validate_alerting_relations(&next, updates)?;
     validate_database_relations(&next, updates)?;
     validate_ssh_transport_relations(&next, updates)?;
+    validate_proxy_stream_relations(&next, updates)?;
 
     Ok(ApplyOutcome {
         updated_keys: updated,
@@ -1836,6 +1909,62 @@ fn validate_ssh_transport_relations(
             updates,
             "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
             defaults.max_forward_connections_per_tunnel,
+        )?,
+    };
+    config.validate().map_err(AppError::BadRequest)
+}
+
+fn validate_proxy_stream_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<(), AppError> {
+    let keys = [
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
+    ];
+    if !keys.iter().any(|key| updates.contains_key(*key)) {
+        return Ok(());
+    }
+    let config = crate::config::ProxyStreamConfig {
+        request_body_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[0],
+            crate::config::DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS,
+        )?,
+        response_header_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[1],
+            crate::config::DEFAULT_PROXY_RESPONSE_HEADER_TIMEOUT_SECS,
+        )?,
+        first_event_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[2],
+            crate::config::DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS,
+        )?,
+        idle_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[3],
+            crate::config::DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS,
+        )?,
+        downstream_stall_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[4],
+            crate::config::DEFAULT_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS,
+        )?,
+        max_request_lifetime_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[5],
+            crate::config::DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS,
         )?,
     };
     config.validate().map_err(AppError::BadRequest)
@@ -2437,6 +2566,42 @@ mod tests {
     }
 
     #[test]
+    fn proxy_stream_settings_use_runtime_validation_contract() {
+        let existing = HashMap::new();
+        let valid = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS".into(),
+                Some("5".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS".into(),
+                Some("3600".into()),
+            ),
+        ]);
+        let outcome = validate_and_diff(&existing, &valid).expect("valid proxy stream settings");
+        assert_eq!(outcome.restart_required_keys.len(), 2);
+
+        for (key, value) in [
+            (
+                "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
+                "4",
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
+                "601",
+            ),
+            ("CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS", "29"),
+            ("CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS", "3601"),
+        ] {
+            let updates = BTreeMap::from([(key.into(), Some(value.into()))]);
+            assert!(
+                validate_and_diff(&existing, &updates).is_err(),
+                "accepted invalid {key}={value}"
+            );
+        }
+    }
+
+    #[test]
     fn turso_mode_requires_url_and_secret_token() {
         let existing = HashMap::new();
         let mut updates =
@@ -2860,6 +3025,7 @@ mod tests {
             tunnel_domain: "router.example.com".into(),
             ssh_public_addr: String::new(),
             ssh_transport: crate::config::SshTransportConfig::default(),
+            proxy_stream: crate::config::ProxyStreamConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir: std::env::temp_dir(),

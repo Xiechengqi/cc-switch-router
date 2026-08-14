@@ -79,7 +79,10 @@ use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
     route_reconnect_grace, validate_notification_cleanup_window,
 };
-use crate::proxy::{RouteAvailability, gateway_proxy_handler, market_proxy_handler, proxy_handler};
+use crate::proxy::{
+    ReleasedShareRequest, RouteAvailability, gateway_proxy_handler, market_proxy_handler,
+    proxy_handler,
+};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
@@ -200,6 +203,21 @@ struct EmbedUsageQuery {
 #[serde(rename_all = "camelCase")]
 struct InstallationUpgradeStatusQuery {
     task_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForceReleaseShareRequestsRequest {
+    request_id: Option<String>,
+    share_id: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForceReleaseShareRequestsResponse {
+    released_count: usize,
+    released: Vec<ReleasedShareRequest>,
 }
 
 pub fn router(state: ServerState) -> Router {
@@ -485,6 +503,10 @@ pub fn router(state: ServerState) -> Router {
             get(admin_router_log_download),
         )
         .route("/v1/admin/audit", get(admin_audit_list))
+        .route(
+            "/v1/admin/proxy/share-requests/force-release",
+            post(admin_force_release_share_requests),
+        )
         .route("/v1/admin/metrics/snapshot", get(admin_metrics_snapshot))
         .route("/v1/admin/metrics/host/info", get(admin_metrics_host_info))
         .route(
@@ -6341,6 +6363,69 @@ async fn admin_metrics_clear(
         )
         .await;
     Ok(Json(result))
+}
+
+async fn admin_force_release_share_requests(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ForceReleaseShareRequestsRequest>,
+) -> Result<Json<ForceReleaseShareRequestsResponse>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let request_id = input
+        .request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let share_id = input
+        .share_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if request_id.is_some() == share_id.is_some() {
+        return Err(AppError::BadRequest(
+            "provide exactly one of requestId or shareId".into(),
+        ));
+    }
+    let reason = input
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("admin_manual_release");
+    if reason.chars().count() > 200 || reason.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "reason must be at most 200 printable characters".into(),
+        ));
+    }
+
+    let released = state
+        .proxy
+        .force_release_share_requests(request_id, share_id, reason);
+    state
+        .metrics
+        .record_share_request_manual_release(released.len());
+    let response = ForceReleaseShareRequestsResponse {
+        released_count: released.len(),
+        released,
+    };
+    let payload = serde_json::to_value(&response).unwrap_or_else(
+        |_| serde_json::json!({ "releasedCount": response.released_count, "reason": reason }),
+    );
+    let metadata = extract_client_metadata(&headers, addr);
+    if let Err(error) = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "proxy.share_requests.force_release",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, "record Share request force-release audit failed");
+    }
+    Ok(Json(response))
 }
 
 async fn admin_alerting_overview(

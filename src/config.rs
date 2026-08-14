@@ -27,6 +27,12 @@ pub const DEFAULT_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_SSH_MAX_FORWARD_CONNECTIONS: usize = 2_048;
 pub const DEFAULT_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL: usize = 256;
+pub const DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_PROXY_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS: u64 = 900;
+pub const DEFAULT_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS: u64 = 7_200;
 pub const DEFAULT_CLOCK_SOURCES: &[&str] = &[
     "https://www.cloudflare.com/cdn-cgi/trace",
     "https://www.apple.com/library/test/success.html",
@@ -246,6 +252,82 @@ impl SshTransportConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyStreamConfig {
+    pub request_body_timeout_secs: u64,
+    pub response_header_timeout_secs: u64,
+    pub first_event_timeout_secs: u64,
+    pub idle_timeout_secs: u64,
+    pub downstream_stall_timeout_secs: u64,
+    pub max_request_lifetime_secs: u64,
+}
+
+impl Default for ProxyStreamConfig {
+    fn default() -> Self {
+        Self {
+            request_body_timeout_secs: DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS,
+            response_header_timeout_secs: DEFAULT_PROXY_RESPONSE_HEADER_TIMEOUT_SECS,
+            first_event_timeout_secs: DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS,
+            idle_timeout_secs: DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS,
+            downstream_stall_timeout_secs: DEFAULT_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS,
+            max_request_lifetime_secs: DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS,
+        }
+    }
+}
+
+impl ProxyStreamConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+            self.request_body_timeout_secs,
+            5,
+            300,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
+            self.response_header_timeout_secs,
+            5,
+            600,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
+            self.first_event_timeout_secs,
+            5,
+            600,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS",
+            self.idle_timeout_secs,
+            30,
+            3_600,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS",
+            self.downstream_stall_timeout_secs,
+            5,
+            600,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
+            self.max_request_lifetime_secs,
+            60,
+            86_400,
+        )?;
+        let longest_phase_timeout = self
+            .request_body_timeout_secs
+            .max(self.response_header_timeout_secs)
+            .max(self.first_event_timeout_secs)
+            .max(self.idle_timeout_secs)
+            .max(self.downstream_stall_timeout_secs);
+        if self.max_request_lifetime_secs <= longest_phase_timeout {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS must exceed every proxy phase timeout (currently {longest_phase_timeout} seconds)"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
     pub enabled: bool,
@@ -412,6 +494,7 @@ pub struct Config {
     pub tunnel_domain: String,
     pub ssh_public_addr: String,
     pub ssh_transport: SshTransportConfig,
+    pub proxy_stream: ProxyStreamConfig,
     pub use_localhost: bool,
     pub lease_ttl_secs: i64,
     pub data_dir: PathBuf,
@@ -552,6 +635,32 @@ impl Config {
                 max_forward_connections_per_tunnel: env_usize(
                     "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL",
                     DEFAULT_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL,
+                ),
+            },
+            proxy_stream: ProxyStreamConfig {
+                request_body_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+                    DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS,
+                ),
+                response_header_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
+                    DEFAULT_PROXY_RESPONSE_HEADER_TIMEOUT_SECS,
+                ),
+                first_event_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
+                    DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS,
+                ),
+                idle_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS",
+                    DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS,
+                ),
+                downstream_stall_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS",
+                    DEFAULT_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS,
+                ),
+                max_request_lifetime_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
+                    DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS,
                 ),
             },
             use_localhost: env_var("CC_SWITCH_ROUTER_USE_LOCALHOST")
@@ -799,6 +908,20 @@ impl Config {
         self.ssh_transport.validate()
     }
 
+    pub fn validate_proxy_stream_config(&self) -> std::result::Result<(), String> {
+        for key in [
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
+        ] {
+            validate_optional_env_u64(key)?;
+        }
+        self.proxy_stream.validate()
+    }
+
     pub fn tunnel_url(&self, subdomain: &str) -> String {
         let scheme = if self.use_localhost { "http" } else { "https" };
         format!("{scheme}://{subdomain}.{}", self.tunnel_domain)
@@ -931,6 +1054,12 @@ CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS=300
 CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS=300
 CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS=2048
 CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL=256
+CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS=30
+CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS=120
+CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS=120
+CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900
+CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS=120
+CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS=7200
 CC_SWITCH_ROUTER_OWNER_EMAIL=
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
@@ -1240,6 +1369,7 @@ mod tests {
             tunnel_domain: "example.com".into(),
             ssh_public_addr: String::new(),
             ssh_transport: SshTransportConfig::default(),
+            proxy_stream: ProxyStreamConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir: PathBuf::from("/tmp"),
@@ -1407,6 +1537,96 @@ mod tests {
             "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL=256",
         ] {
             assert!(contents.contains(expected), "missing default: {expected}");
+        }
+    }
+
+    #[test]
+    fn proxy_stream_defaults_and_env_surface_are_valid() {
+        let defaults = ProxyStreamConfig::default();
+        assert_eq!(defaults.request_body_timeout_secs, 30);
+        assert_eq!(defaults.response_header_timeout_secs, 120);
+        assert_eq!(defaults.first_event_timeout_secs, 120);
+        assert_eq!(defaults.idle_timeout_secs, 900);
+        assert_eq!(defaults.downstream_stall_timeout_secs, 120);
+        assert_eq!(defaults.max_request_lifetime_secs, 7_200);
+        assert!(defaults.validate().is_ok());
+
+        let contents = default_env_contents();
+        for expected in [
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS=30",
+            "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS=120",
+            "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS=120",
+            "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900",
+            "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS=120",
+            "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS=7200",
+        ] {
+            assert!(contents.contains(expected), "missing default: {expected}");
+        }
+    }
+
+    #[test]
+    fn proxy_stream_rejects_out_of_range_timeouts() {
+        for first_event_timeout_secs in [0, 4, 601] {
+            let config = ProxyStreamConfig {
+                first_event_timeout_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        for idle_timeout_secs in [0, 29, 3_601] {
+            let config = ProxyStreamConfig {
+                idle_timeout_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        for request_body_timeout_secs in [0, 4, 301] {
+            let config = ProxyStreamConfig {
+                request_body_timeout_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        for response_header_timeout_secs in [0, 4, 601] {
+            let config = ProxyStreamConfig {
+                response_header_timeout_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        for downstream_stall_timeout_secs in [0, 4, 601] {
+            let config = ProxyStreamConfig {
+                downstream_stall_timeout_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        for max_request_lifetime_secs in [0, 59, 86_401] {
+            let config = ProxyStreamConfig {
+                max_request_lifetime_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        let config = ProxyStreamConfig {
+            max_request_lifetime_secs: ProxyStreamConfig::default().idle_timeout_secs,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        for first_event_timeout_secs in [5, 600] {
+            let config = ProxyStreamConfig {
+                first_event_timeout_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+        for idle_timeout_secs in [30, 3_600] {
+            let config = ProxyStreamConfig {
+                idle_timeout_secs,
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok());
         }
     }
 

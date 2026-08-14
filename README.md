@@ -62,7 +62,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
 | `/v1/client-market/*` | 33 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
-| `/v1/admin/*` | 约 43 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
+| `/v1/admin/*` | 约 44 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
@@ -80,6 +80,8 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 10 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider` |
 | 其余单例 | 约 15 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`_market/proxy/*`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
+
+Share 请求在请求体、响应头、首业务事件、业务空闲、下游背压和绝对生存时长六个阶段均有独立边界；响应由后台泵读取，因此浏览器或 API 调用方停止消费 Body 时仍会释放并发。10 秒周期的看门狗会按唯一 lease 幂等回收异常残留并触发通用告警，绝不重启 Router。管理员兜底接口 `POST /v1/admin/proxy/share-requests/force-release` 只接受 `requestId` 或 `shareId` 其中一个，可附带 `reason`，每次实际释放都会取消上游任务、增加 metrics 计数并写入 admin audit。
 
 ## 二进制部署
 
@@ -115,6 +117,12 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS` | `300` | 单向 EOF 后剩余方向无进展的超时，范围 30-3600 秒 |
 | `CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS` | `2048` | 全局等待通道建立与活动 bridge 的 forwarded TCP 连接总上限，范围 1-65536 |
 | `CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL` | `256` | 单 SSH 隧道等待通道建立与活动 bridge 的连接总上限，范围 1-4096 且不得超过全局上限 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS` | `30` | 下游请求体读取超时，范围 5-300 秒；请求体完成后才占用 Share 并发 |
+| `CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS` | `120` | 上游响应头等待超时，范围 5-600 秒 |
+| `CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS` | `120` | Share 流首个协议业务事件超时，范围 5-600 秒；SSE 注释与 keepalive 不会续期 |
+| `CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS` | `900` | Share 流后续协议业务事件空闲超时，范围 30-3600 秒；SSE 注释与 keepalive 不会续期 |
+| `CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS` | `120` | 下游停止消费有界响应缓冲区时的终止超时，范围 5-600 秒 |
+| `CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS` | `7200` | Share 请求绝对生存时长，范围 60-86400 秒，必须大于所有阶段超时 |
 | `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期(秒);已连接 client 使用签名续期 API 原连接续期,不按该周期重建 SSH |

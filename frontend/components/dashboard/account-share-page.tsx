@@ -3,100 +3,82 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Chip } from "@heroui/react";
-import { ArrowUpRight, ExternalLink, Loader2 } from "lucide-react";
+import { Button, Chip } from "@heroui/react";
+import {
+  ArrowUpRight,
+  Check,
+  ExternalLink,
+  Loader2,
+  RotateCcw,
+  X,
+} from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getShareMarketCatalog } from "@/lib/api";
+import {
+  acceptShareMarketPriceChange,
+  getShareMarketOwnedListings,
+  getShareMarketSubscriptions,
+  rejectShareMarketPriceChange,
+  releaseShareMarketSubscription,
+} from "@/lib/api";
 import {
   DASHBOARD_ACCOUNT_BILLING_PATH,
   DASHBOARD_ACCOUNT_SHARE_PATH,
   shareMarketHref,
 } from "@/lib/dashboard-nav";
-import type { MessageKey } from "@/lib/i18n";
 import { formatUsdMoney } from "@/lib/market-money";
-import type {
-  ShareMarketCatalog,
-  ShareMarketListing,
-  ShareMarketSubscription,
-} from "@/lib/types";
+import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
+import {
+  isCoreShareApp,
+  subscriptionStatusKey,
+} from "@/components/dashboard/share-market/market-utils";
 
 type ShareMonitorTab = "user" | "provider";
-
-function subscriptionStatusKey(status: string): MessageKey {
-  switch (status) {
-    case "grant_pending":
-      return "shareMarket.subscription.grantPending";
-    case "active_free":
-      return "shareMarket.subscription.activeFree";
-    case "active_postpaid":
-      return "shareMarket.subscription.activePostpaid";
-    case "billing_suspend_pending":
-      return "shareMarket.subscription.billingSuspendPending";
-    case "billing_suspended":
-      return "shareMarket.subscription.billingSuspended";
-    case "billing_resume_pending":
-      return "shareMarket.subscription.billingResumePending";
-    case "billing_control_failed":
-      return "shareMarket.subscription.billingControlRetry";
-    case "revoke_pending":
-      return "shareMarket.subscription.revokePending";
-    case "revoke_failed":
-      return "shareMarket.subscription.revokeFailed";
-    case "grant_failed":
-      return "shareMarket.subscription.grantFailed";
-    case "released":
-      return "shareMarket.subscription.released";
-    default:
-      return "account.share.status.unknown";
-  }
-}
+type PendingAction = {
+  title: string;
+  description: string;
+  label: string;
+  run: () => Promise<unknown>;
+};
 
 function isAnomalous(status: string) {
-  return (
-    status === "grant_pending" ||
-    status === "billing_suspend_pending" ||
-    status === "billing_suspended" ||
-    status === "billing_resume_pending" ||
-    status === "billing_control_failed" ||
-    status === "revoke_pending" ||
-    status === "revoke_failed" ||
-    status === "grant_failed"
-  );
+  return [
+    "grant_pending",
+    "billing_suspend_pending",
+    "billing_suspended",
+    "billing_resume_pending",
+    "billing_control_failed",
+    "revoke_pending",
+    "revoke_failed",
+    "grant_failed",
+  ].includes(status);
 }
 
 function anomalyRank(status: string) {
-  switch (status) {
-    case "billing_control_failed":
-      return 0;
-    case "revoke_failed":
-      return 1;
-    case "grant_failed":
-      return 2;
-    case "billing_suspended":
-      return 3;
-    case "billing_suspend_pending":
-      return 4;
-    case "billing_resume_pending":
-      return 5;
-    case "revoke_pending":
-      return 6;
-    case "grant_pending":
-      return 7;
-    default:
-      return 10;
-  }
+  return [
+    "billing_control_failed",
+    "revoke_failed",
+    "grant_failed",
+    "billing_suspended",
+    "billing_suspend_pending",
+    "billing_resume_pending",
+    "revoke_pending",
+    "grant_pending",
+  ].indexOf(status);
 }
 
 function sortSubscriptions(left: ShareMarketSubscription, right: ShareMarketSubscription) {
+  const leftRank = anomalyRank(left.status);
+  const rightRank = anomalyRank(right.status);
   return (
-    anomalyRank(left.status) - anomalyRank(right.status) ||
-    Date.parse(right.updatedAt) - Date.parse(left.updatedAt) ||
-    left.shareName.localeCompare(right.shareName)
+    (leftRank < 0 ? 99 : leftRank) - (rightRank < 0 ? 99 : rightRank)
+    || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+    || left.shareName.localeCompare(right.shareName)
   );
 }
 
@@ -107,12 +89,7 @@ function offerLabel(
 ) {
   const serviceTerm = subscription.serviceDurationDays == null
     ? t("shareMarket.serviceDuration.permanent")
-    : t(
-        subscription.serviceDurationDays === 1
-          ? "shareMarket.serviceDuration.dayValue"
-          : "shareMarket.serviceDuration.daysValue",
-        { count: subscription.serviceDurationDays },
-      );
+    : t("shareMarket.serviceDuration.daysValue", { count: subscription.serviceDurationDays });
   const price = subscription.dailyRateMinor == null
     ? t("shareMarket.free")
     : `${formatUsdMoney(subscription.dailyRateMinor, locale)} / ${t("marketBilling.day")}`;
@@ -127,116 +104,93 @@ function formatDate(value: string | undefined, locale: string) {
     : value;
 }
 
-function shareOpenUrl(subdomain?: string | null) {
-  return subdomainTunnelUrl(subdomain);
-}
-
-function servicePeriodTiming(
-  subscription: ShareMarketSubscription,
-  locale: string,
-  t: ReturnType<typeof useLocaleText>["t"],
-) {
-  const started = formatDate(subscription.createdAt, locale);
-  if (!subscription.expiresAt) {
-    return `${t("shareMarket.serviceDuration.started")}: ${started} · ${t("shareMarket.serviceDuration.permanent")}`;
-  }
-  const expires = formatDate(subscription.expiresAt, locale);
-  return `${t("shareMarket.serviceDuration.started")}: ${started} · ${t("shareMarket.serviceDuration.expires")}: ${expires}`;
-}
-
-function SubscriptionMonitorCard({
+function SubscriptionCard({
   subscription,
   perspective,
+  busy,
+  onRelease,
+  onAcceptPrice,
+  onRejectPrice,
 }: {
   subscription: ShareMarketSubscription;
   perspective: ShareMonitorTab;
+  busy: boolean;
+  onRelease: () => void;
+  onAcceptPrice: () => void;
+  onRejectPrice: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const anomalous = isAnomalous(subscription.status);
-  const openUrl = shareOpenUrl(subscription.subdomain);
-  const manageHref =
-    perspective === "provider"
-      ? shareMarketHref({ tab: "mine", shareId: subscription.shareId })
-      : shareMarketHref({ tab: "rentals", shareId: subscription.shareId });
-  const serviceTiming = servicePeriodTiming(subscription, locale, t);
-
+  const openUrl = subdomainTunnelUrl(subscription.subdomain);
+  const statusKey = subscriptionStatusKey(subscription.status);
+  const manageHref = perspective === "provider"
+    ? shareMarketHref({ workspace: "selling", shareId: subscription.shareId })
+    : undefined;
+  const serviceTiming = subscription.expiresAt
+    ? `${t("shareMarket.serviceDuration.started")}: ${formatDate(subscription.createdAt, locale)} · ${t("shareMarket.serviceDuration.expires")}: ${formatDate(subscription.expiresAt, locale)}`
+    : `${t("shareMarket.serviceDuration.started")}: ${formatDate(subscription.createdAt, locale)} · ${t("shareMarket.serviceDuration.permanent")}`;
+  const app = isCoreShareApp(subscription.appType) ? subscription.appType : null;
+  const priceChange = subscription.priceChange;
   return (
-    <section
-      className={`grid gap-3 rounded-xl border bg-card p-4 shadow-sm sm:p-5 ${
-        anomalous ? "border-rose-200/80 ring-1 ring-rose-100" : "border-border"
-      }`}
-    >
+    <section className={`grid gap-3 rounded-md border bg-card p-4 shadow-sm sm:p-5 ${anomalous ? "border-rose-200 ring-1 ring-rose-100" : "border-border"}`}>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <ShareAppLogo
-          app={
-            subscription.appType === "claude" || subscription.appType === "gemini"
-              ? subscription.appType
-              : "codex"
-          }
-          size={18}
-        />
+        {app ? <ShareAppLogo app={app} size={18} /> : null}
         <strong className="truncate text-sm">{subscription.shareName}</strong>
-        <Chip size="sm" variant={anomalous ? "primary" : "tertiary"}>
-          {t(subscriptionStatusKey(subscription.status))}
-        </Chip>
-        {subscription.shareOnline != null ? (
-          <Chip size="sm" variant="tertiary">
-            {subscription.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
-          </Chip>
-        ) : null}
+        <Chip size="sm" variant={anomalous ? "primary" : "tertiary"}>{statusKey ? t(statusKey) : subscription.status}</Chip>
+        <Chip size="sm" variant="tertiary">{subscription.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</Chip>
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-          {perspective === "user"
-            ? t("account.share.provider", { owner: subscription.ownerEmail })
-            : t("account.share.renter", { email: subscription.renterEmail })}
+          {perspective === "user" ? t("account.share.provider", { owner: subscription.ownerEmail }) : t("account.share.renter", { email: subscription.renterEmail })}
         </span>
       </div>
-
-      <dl className="grid gap-2 text-sm sm:grid-cols-2">
-        <div className="grid gap-0.5">
+      <dl className="grid gap-3 text-sm sm:grid-cols-2">
+        <div>
           <dt className="text-xs text-muted-foreground">{t("account.share.offer")}</dt>
-          <dd className="font-medium">
-            {offerLabel(subscription, locale, t)}
-          </dd>
-          <dd className="text-xs text-muted-foreground">{serviceTiming}</dd>
+          <dd className="mt-0.5 font-medium">{offerLabel(subscription, locale, t)}</dd>
+          <dd className="mt-0.5 text-xs text-muted-foreground">{serviceTiming}</dd>
         </div>
-        <div className="grid gap-0.5">
+        <div>
           <dt className="text-xs text-muted-foreground">{t("account.share.updated")}</dt>
-          <dd className="text-muted-foreground">
-            {formatDate(subscription.updatedAt, locale)}
-          </dd>
+          <dd className="mt-0.5 text-muted-foreground">{formatDate(subscription.updatedAt, locale)}</dd>
         </div>
       </dl>
-
+      {priceChange ? (
+        <div className="grid gap-2 border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+          <strong>{t(`shareMarket.priceChange.status.${priceChange.status}`)}</strong>
+          <span>{t("shareMarket.priceChange.summary", {
+            previous: formatUsdMoney(priceChange.previousDailyRateMinor, locale),
+            proposed: formatUsdMoney(priceChange.proposedDailyRateMinor, locale),
+          })}</span>
+          {perspective === "user" && priceChange.status === "pending" ? (
+            <div className="flex gap-2">
+              <Button size="sm" variant="primary" isDisabled={busy} onClick={onAcceptPrice}><Check className="h-4 w-4" />{t("shareMarket.priceChange.accept")}</Button>
+              <Button size="sm" variant="outline" isDisabled={busy} onClick={onRejectPrice}><X className="h-4 w-4" />{t("shareMarket.priceChange.reject")}</Button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
-        <p className="text-xs text-muted-foreground">{t("account.share.readOnlyHint")}</p>
+        <p className="text-xs text-muted-foreground">
+          {perspective === "user" ? t("account.share.manageHint") : t("account.share.providerManageHint")}
+        </p>
         <div className="flex flex-wrap gap-2">
           {subscription.dailyRateMinor != null ? (
-            <Link
-              href={DASHBOARD_ACCOUNT_BILLING_PATH}
-              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted"
-            >
-              {t("marketBilling.open")}
-              <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+            <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">
+              {t("marketBilling.open")}<ArrowUpRight className="h-3.5 w-3.5" />
             </Link>
           ) : null}
           {openUrl ? (
-            <a
-              href={openUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted"
-            >
-              {t("account.share.openShare")}
-              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+            <a href={openUrl} target="_blank" rel="noopener noreferrer" className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">
+              {t("account.share.openShare")}<ExternalLink className="h-3.5 w-3.5" />
             </a>
           ) : null}
-          <Link
-            href={manageHref}
-            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted"
-          >
-            {t("account.share.manageInMarket")}
-            <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
-          </Link>
+          {perspective === "user" && subscription.canRelease ? (
+            <Button size="sm" variant="outline" isDisabled={busy} onClick={onRelease}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button>
+          ) : null}
+          {manageHref ? (
+            <Link href={manageHref} className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">
+              {t("account.share.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" />
+            </Link>
+          ) : null}
         </div>
       </div>
     </section>
@@ -245,245 +199,122 @@ function SubscriptionMonitorCard({
 
 function ListingSummaryCard({ listing }: { listing: ShareMarketListing }) {
   const { t } = useLocaleText();
-  const seats = listing.seats;
-  const available = seats.filter((seat) => seat.status === "available").length;
-  const occupied = seats.filter(
-    (seat) => seat.status === "occupied" || seat.status === "reserved" || seat.status === "revoking",
-  ).length;
-  const anomalousSeats = seats.filter((seat) => {
-    const status = seat.subscription?.status;
-    return status ? isAnomalous(status) : false;
-  }).length;
-  const openUrl = shareOpenUrl(listing.subdomain);
-
+  const available = listing.seats.filter((seat) => seat.status === "available").length;
+  const occupied = listing.seats.filter((seat) => ["occupied", "reserved", "revoking"].includes(seat.status)).length;
+  const attention = listing.seats.filter((seat) => seat.subscription && isAnomalous(seat.subscription.status)).length;
+  const openUrl = subdomainTunnelUrl(listing.subdomain);
   return (
-    <section className="grid gap-3 rounded-xl border border-border bg-card p-4 shadow-sm sm:p-5">
+    <section className="grid gap-3 rounded-md border border-border bg-card p-4 shadow-sm sm:p-5">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <ShareAppLogo
-          app={listing.appType === "claude" || listing.appType === "gemini" ? listing.appType : "codex"}
-          size={18}
-        />
+        {listing.supportedApps.filter(isCoreShareApp).map((app) => <ShareAppLogo key={app} app={app} size={18} />)}
         <strong className="truncate text-sm">{listing.shareName}</strong>
-        <Chip size="sm" variant="tertiary">
-          {listing.status === "closed" ? t("shareMarket.closed") : t("account.share.listingActive")}
-        </Chip>
-        <Chip size="sm" variant="tertiary">
-          {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
-        </Chip>
+        <Chip size="sm" variant="tertiary">{listing.status === "closed" ? t("shareMarket.closed") : t("account.share.listingActive")}</Chip>
+        <Chip size="sm" variant="tertiary">{listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</Chip>
       </div>
-      <dl className="grid gap-2 text-sm sm:grid-cols-3">
-        <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t("account.share.seatsAvailable")}</dt>
-          <dd className="font-medium">{available}</dd>
-        </div>
-        <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t("account.share.seatsOccupied")}</dt>
-          <dd className="font-medium">{occupied}</dd>
-        </div>
-        <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t("account.share.seatsAttention")}</dt>
-          <dd className={`font-medium ${anomalousSeats ? "text-rose-600" : ""}`}>{anomalousSeats}</dd>
-        </div>
+      <dl className="grid grid-cols-3 gap-3 text-sm">
+        <div><dt className="text-xs text-muted-foreground">{t("account.share.seatsAvailable")}</dt><dd className="font-medium">{available}</dd></div>
+        <div><dt className="text-xs text-muted-foreground">{t("account.share.seatsOccupied")}</dt><dd className="font-medium">{occupied}</dd></div>
+        <div><dt className="text-xs text-muted-foreground">{t("account.share.seatsAttention")}</dt><dd className={attention ? "font-medium text-rose-600" : "font-medium"}>{attention}</dd></div>
       </dl>
-      {listing.status === "closed" ? (
-        <p className="text-xs text-muted-foreground">{t("account.share.closedListingHint")}</p>
-      ) : null}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
-        <p className="text-xs text-muted-foreground">{t("account.share.readOnlyHint")}</p>
-        <div className="flex flex-wrap gap-2">
-          {openUrl ? (
-            <a
-              href={openUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted"
-            >
-              {t("account.share.openShare")}
-              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-            </a>
-          ) : null}
-          <Link
-            href={shareMarketHref({ tab: "mine", shareId: listing.shareId })}
-            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted"
-          >
-            {t("account.share.manageInMarket")}
-            <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
-          </Link>
-        </div>
+      <div className="flex flex-wrap justify-end gap-2 border-t border-border/70 pt-3">
+        {openUrl ? <a href={openUrl} target="_blank" rel="noopener noreferrer" className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">{t("account.share.openShare")}<ExternalLink className="h-3.5 w-3.5" /></a> : null}
+        <Link href={shareMarketHref({ workspace: "selling", shareId: listing.shareId })} className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">{t("account.share.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link>
       </div>
     </section>
   );
 }
 
-/**
- * Account → Share: read-only Provider / User monitor for Share Market rentals.
- * Actions live exclusively on Share Market.
- */
 export function AccountSharePage() {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const { session } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
-
-  const tabParam = searchParams.get("tab");
-  const tab: ShareMonitorTab = tabParam === "provider" ? "provider" : "user";
-
-  const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(null);
+  const tab: ShareMonitorTab = searchParams.get("tab") === "provider" ? "provider" : "user";
+  const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
+  const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
-  const refreshAbortRef = React.useRef<AbortController | null>(null);
+  const [busyId, setBusyId] = React.useState("");
+  const [action, setAction] = React.useState<PendingAction | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
 
-  const setTab = React.useCallback(
-    (next: ShareMonitorTab) => {
-      const params = new URLSearchParams(searchParams.toString());
-      params.set("tab", next);
-      router.replace(`${DASHBOARD_ACCOUNT_SHARE_PATH}?${params.toString()}`, { scroll: false });
-    },
-    [router, searchParams],
-  );
-
-  const load = React.useCallback(async (options?: { silent?: boolean }) => {
-    const silent = options?.silent === true;
-    if (silent && refreshAbortRef.current) return;
-    if (!silent) refreshAbortRef.current?.abort();
+  const setTab = (next: ShareMonitorTab) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("tab", next);
+    router.replace(`${DASHBOARD_ACCOUNT_SHARE_PATH}?${params.toString()}`, { scroll: false });
+  };
+  const load = React.useCallback(async ({
+    silent = false,
+    skipIfBusy = false,
+  }: { silent?: boolean; skipIfBusy?: boolean } = {}) => {
+    if (!authed) return;
+    if (skipIfBusy && abortRef.current) return;
+    abortRef.current?.abort();
     const controller = new AbortController();
-    refreshAbortRef.current = controller;
-    if (!silent) {
-      setLoading(true);
-      setError("");
-    }
+    abortRef.current = controller;
+    if (!silent) setLoading(true);
+    if (!skipIfBusy) setError("");
     try {
-      const next = await getShareMarketCatalog(controller.signal);
+      const [nextSubscriptions, nextListings] = await Promise.all([
+        getShareMarketSubscriptions(controller.signal),
+        getShareMarketOwnedListings(controller.signal),
+      ]);
       if (controller.signal.aborted) return;
-      setCatalog(next);
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      if (!silent) setError(err instanceof Error ? err.message : String(err));
+      setSubscriptions(nextSubscriptions.subscriptions);
+      setOwnedListings(nextListings.listings);
+    } catch (reason) {
+      if (!controller.signal.aborted && !skipIfBusy) setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      if (refreshAbortRef.current === controller) refreshAbortRef.current = null;
-      if (!silent) setLoading(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setLoading(false);
+      }
     }
-  }, []);
-
-  React.useEffect(() => {
-    if (!authed) {
-      setLoading(false);
-      return;
-    }
-    void load();
-  }, [authed, load]);
-
+  }, [authed]);
+  React.useEffect(() => { if (authed) void load(); else setLoading(false); return () => abortRef.current?.abort(); }, [authed, load]);
   React.useEffect(() => {
     if (!authed) return;
-    const timer = window.setInterval(() => void load({ silent: true }), CLIENT_MARKET_POLL_MS);
+    const timer = window.setInterval(
+      () => void load({ silent: true, skipIfBusy: true }),
+      CLIENT_MARKET_POLL_MS,
+    );
     return () => window.clearInterval(timer);
   }, [authed, load]);
 
-  const userSubscriptions = React.useMemo(
-    () => [...(catalog?.mySubscriptions || [])].sort(sortSubscriptions),
-    [catalog],
-  );
+  const run = async (id: string, operation: () => Promise<unknown>) => {
+    setBusyId(id);
+    setError("");
+    try { await operation(); setAction(null); await load({ silent: true }); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusyId(""); }
+  };
+  const userSubscriptions = React.useMemo(() => [...subscriptions].sort(sortSubscriptions), [subscriptions]);
+  const providerSubscriptions = React.useMemo(() => ownedListings.flatMap((listing) => listing.seats.flatMap((seat) => seat.subscription ? [seat.subscription] : [])).sort(sortSubscriptions), [ownedListings]);
 
-  const ownedListings = React.useMemo(
-    () => (catalog?.listings || []).filter((listing) => listing.isOwner),
-    [catalog],
-  );
-
-  const providerSubscriptions = React.useMemo(() => {
-    const rows: ShareMarketSubscription[] = [];
-    for (const listing of ownedListings) {
-      for (const seat of listing.seats) {
-        if (seat.subscription) rows.push(seat.subscription);
-      }
-    }
-    return rows.sort(sortSubscriptions);
-  }, [ownedListings]);
-
-  if (!authed) {
-    return <p className="py-6 text-sm text-muted-foreground">{t("shareMarket.loginRequired")}</p>;
-  }
-
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />…
-      </div>
-    );
-  }
-
-  if (error) {
-    return <p className="py-6 text-sm text-rose-600">{error}</p>;
-  }
-
+  if (!authed) return <p className="py-6 text-sm text-muted-foreground">{t("shareMarket.loginRequired")}</p>;
+  if (loading) return <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div>;
   return (
-    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
-      <div>
-        <h2 className="text-base font-semibold text-foreground">{t("account.nav.share")}</h2>
-        <p className="mt-0.5 text-sm text-muted-foreground">{t("account.shareHint")}</p>
-      </div>
-
-      <SegmentedControl
-        value={tab}
-        onChange={setTab}
-        ariaLabel={t("account.nav.share")}
-        size="md"
-        className="w-full max-w-sm"
-        fullWidth
-        items={[
-          { id: "user", label: t("account.share.tab.user") },
-          { id: "provider", label: t("account.share.tab.provider") },
-        ]}
-      />
-
+    <div className="grid min-w-0 gap-4">
+      <div><h2 className="text-base font-semibold text-foreground">{t("account.nav.share")}</h2><p className="mt-0.5 text-sm text-muted-foreground">{t("account.shareHint")}</p></div>
+      <SegmentedControl value={tab} onChange={setTab} ariaLabel={t("account.nav.share")} size="md" className="w-full max-w-sm" fullWidth items={[{ id: "user", label: t("account.share.tab.user") }, { id: "provider", label: t("account.share.tab.provider") }]} />
+      {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
       {tab === "user" ? (
-        userSubscriptions.length ? (
-          <div className="grid gap-3">
-            {userSubscriptions.map((subscription) => (
-              <SubscriptionMonitorCard
-                key={`user:${subscription.id}`}
-                subscription={subscription}
-                perspective="user"
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border bg-card/40 px-4 py-12 text-center text-sm text-muted-foreground">
-            <span>{t("account.share.userEmpty")}</span>
-            <Link
-              href={shareMarketHref({ tab: "all" })}
-              className="inline-flex items-center gap-1 text-sm font-medium text-accent hover:underline"
-            >
-              {t("account.share.openMarket")}
-              <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
-            </Link>
-          </div>
-        )
+        userSubscriptions.length ? <div className="grid gap-3">{userSubscriptions.map((subscription) => (
+          <SubscriptionCard
+            key={subscription.id}
+            subscription={subscription}
+            perspective="user"
+            busy={busyId === subscription.id}
+            onRelease={() => setAction({ title: t("shareMarket.confirm.releaseTitle"), description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }), label: t("shareMarket.release"), run: () => releaseShareMarketSubscription(subscription.id) })}
+            onAcceptPrice={() => subscription.priceChange && setAction({ title: t("shareMarket.priceChange.acceptTitle"), description: t("shareMarket.priceChange.acceptDescription", { previous: formatUsdMoney(subscription.priceChange.previousDailyRateMinor, locale), proposed: formatUsdMoney(subscription.priceChange.proposedDailyRateMinor, locale) }), label: t("shareMarket.priceChange.accept"), run: () => acceptShareMarketPriceChange(subscription.priceChange!.id) })}
+            onRejectPrice={() => subscription.priceChange && void run(subscription.id, () => rejectShareMarketPriceChange(subscription.priceChange!.id))}
+          />
+        ))}</div> : <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground"><span>{t("account.share.userEmpty")}</span><Link href={shareMarketHref()} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">{t("account.share.openMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link></div>
       ) : ownedListings.length || providerSubscriptions.length ? (
-        <div className="grid gap-3">
-          {ownedListings.map((listing) => (
-            <ListingSummaryCard key={`listing:${listing.id}`} listing={listing} />
-          ))}
-          {providerSubscriptions.map((subscription) => (
-            <SubscriptionMonitorCard
-              key={`provider:${subscription.id}`}
-              subscription={subscription}
-              perspective="provider"
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border bg-card/40 px-4 py-12 text-center text-sm text-muted-foreground">
-          <span>{t("account.share.providerEmpty")}</span>
-          <Link
-            href={shareMarketHref({ tab: "mine" })}
-            className="inline-flex items-center gap-1 text-sm font-medium text-accent hover:underline"
-          >
-            {t("account.share.openMarket")}
-            <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
-          </Link>
-        </div>
-      )}
+        <div className="grid gap-3">{ownedListings.map((listing) => <ListingSummaryCard key={listing.id} listing={listing} />)}{providerSubscriptions.map((subscription) => <SubscriptionCard key={subscription.id} subscription={subscription} perspective="provider" busy={false} onRelease={() => {}} onAcceptPrice={() => {}} onRejectPrice={() => {}} />)}</div>
+      ) : <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground"><span>{t("account.share.providerEmpty")}</span><Link href={shareMarketHref()} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">{t("account.share.openMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link></div>}
+      <ConfirmAlertDialog open={!!action} title={action?.title || ""} description={action?.description || ""} confirmLabel={action?.label || ""} cancelLabel={t("common.cancel")} tone="warning" busy={!!busyId} onConfirm={() => action && void run("confirm", action.run)} onOpenChange={(open) => !open && !busyId && setAction(null)} />
     </div>
   );
 }

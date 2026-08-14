@@ -31,6 +31,7 @@ mod notifications;
 mod process_lock;
 mod provision_ssh;
 mod proxy;
+mod proxy_stream;
 mod public_hosts;
 mod recent_traffic;
 mod registration_admission;
@@ -120,6 +121,12 @@ async fn main() -> Result<()> {
         ssh_max_forward_connections_per_tunnel = config
             .ssh_transport
             .max_forward_connections_per_tunnel,
+        proxy_request_body_timeout_secs = config.proxy_stream.request_body_timeout_secs,
+        proxy_response_header_timeout_secs = config.proxy_stream.response_header_timeout_secs,
+        proxy_stream_first_event_timeout_secs = config.proxy_stream.first_event_timeout_secs,
+        proxy_stream_idle_timeout_secs = config.proxy_stream.idle_timeout_secs,
+        proxy_downstream_stall_timeout_secs = config.proxy_stream.downstream_stall_timeout_secs,
+        proxy_max_request_lifetime_secs = config.proxy_stream.max_request_lifetime_secs,
         server_label = "server",
         server_lat = server_geo.lat,
         server_lon = server_geo.lon,
@@ -302,6 +309,9 @@ async fn main() -> Result<()> {
     let metrics_registry = state.metrics.clone();
     let metrics_store = state.store.clone();
     let metrics_alerting = state.alerting.clone();
+    let share_request_watchdog_proxy = state.proxy.clone();
+    let share_request_watchdog_config = config.proxy_stream.clone();
+    let share_request_watchdog_metrics = state.metrics.clone();
     let clock_metrics = state.metrics.clone();
     let clock_alerting = state.alerting.clone();
     let alerting_service = state.alerting.clone();
@@ -424,6 +434,37 @@ async fn main() -> Result<()> {
             #[allow(unreachable_code)]
             Ok(())
         });
+    let share_request_watchdog_task = spawn_background_task(
+        "Share request watchdog",
+        background_shutdown_rx.clone(),
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                for released in share_request_watchdog_proxy
+                    .release_stale_share_requests(&share_request_watchdog_config)
+                {
+                    share_request_watchdog_metrics
+                        .record_share_request_watchdog_release(&released.reason);
+                    tracing::warn!(
+                        request_id = %released.request_id,
+                        lease_id = %released.lease_id,
+                        share_id = %released.share_id,
+                        app = released.app.as_deref().unwrap_or("-"),
+                        user_email = released.user_email.as_deref().unwrap_or("-"),
+                        phase = %released.phase,
+                        age_secs = released.age_secs,
+                        progress_age_secs = released.progress_age_secs,
+                        reason = %released.reason,
+                        "Share request watchdog force-released a stale lease"
+                    );
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
     let probe_task = spawn_background_task(
         "route health probe",
         background_shutdown_rx.clone(),
@@ -716,6 +757,7 @@ async fn main() -> Result<()> {
 
     let mut background_tasks = vec![
         ("cleanup", cleanup_task),
+        ("Share request watchdog", share_request_watchdog_task),
         ("IP blacklist logger", ip_blacklist_log_task),
         ("route health probe", probe_task),
         ("Share runtime refresh", runtime_task),
@@ -1322,6 +1364,9 @@ fn validate_runtime_config(config: &Config) -> Result<()> {
     config
         .validate_ssh_transport_config()
         .map_err(anyhow::Error::msg)?;
+    config
+        .validate_proxy_stream_config()
+        .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -1353,6 +1398,12 @@ Environment:
   CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS Half-close idle timeout, default 300
   CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS Global pending + active forward limit, default 2048
   CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL Per-tunnel pending + active limit, default 256
+  CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS Downstream request body timeout, default 30
+  CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS Upstream response header timeout, default 120
+  CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS Share stream first business-event timeout, default 120
+  CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS Share stream business-idle timeout, default 900
+  CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS Downstream response stall timeout, default 120
+  CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS Share request hard lifetime, default 7200
   CC_SWITCH_ROUTER_RESEND_API_KEY        Resend API key for email login, required
   CC_SWITCH_ROUTER_RESEND_FROM           Sender email, default noreply@[TUNNEL_DOMAIN]
   CC_SWITCH_ROUTER_USE_LOCALHOST         Use http for localhost-style domains, default false

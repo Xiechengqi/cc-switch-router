@@ -68,6 +68,8 @@ import type {
   ClientMarketHostTransferDocument,
   ClientMarketHostImportResponse,
   ShareMarketCatalog,
+  ShareMarketOwnedListings,
+  ShareMarketSubscriptions,
   ShareMarketOwnedShare,
   ShareMarketSeatInput,
   AdminMarketBillingDispute,
@@ -1470,9 +1472,21 @@ export async function getShareMarketCatalog(signal?: AbortSignal) {
   );
 }
 
-export async function getShareMarketOwnedShares() {
+export async function getShareMarketOwnedListings(signal?: AbortSignal) {
+  return parseJson<ShareMarketOwnedListings>(
+    await authFetch("/v1/share-market/me/listings", { cache: "no-store", signal }),
+  );
+}
+
+export async function getShareMarketSubscriptions(signal?: AbortSignal) {
+  return parseJson<ShareMarketSubscriptions>(
+    await authFetch("/v1/share-market/me/subscriptions", { cache: "no-store", signal }),
+  );
+}
+
+export async function getShareMarketOwnedShares(signal?: AbortSignal) {
   return parseJson<ShareMarketOwnedShare[]>(
-    await authFetch("/v1/share-market/owned-shares", { cache: "no-store" }),
+    await authFetch("/v1/share-market/owned-shares", { cache: "no-store", signal }),
   );
 }
 

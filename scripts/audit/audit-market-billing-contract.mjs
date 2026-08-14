@@ -284,6 +284,9 @@ function main() {
   for (const requiredRoute of [
     "/v1/client-market/my-rentals",
     "/v1/client-market/clients/:installation_id/rental",
+    "/v1/share-market/listings",
+    "/v1/share-market/me/listings",
+    "/v1/share-market/me/subscriptions",
     "/v1/market-access/dashboard",
     "/v1/market-access/inbox-summary",
     "/v1/market-access/policies/:product_kind/:pricing_kind",
@@ -388,8 +391,8 @@ function main() {
 
   for (const [relativePath, requiredMarkers] of [
     [
-      "frontend/components/dashboard/share-market-page.tsx",
-      ["setRentDialog({ listing, seat })", "shareMarket.rentConfirm.postpaid", "seat.offerRevision"],
+      "frontend/components/dashboard/share-market/buyer-catalog.tsx",
+      ["setRentTarget(item)", "shareMarket.rentConfirm.postpaid", "rentTarget.seat.offerRevision"],
     ],
     [
       "frontend/components/dashboard/create-client-dialog.tsx",

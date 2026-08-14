@@ -8951,6 +8951,7 @@ mod tests {
             tunnel_domain: "router.test".into(),
             ssh_public_addr: String::new(),
             ssh_transport: crate::config::SshTransportConfig::default(),
+            proxy_stream: crate::config::ProxyStreamConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir: root.clone(),

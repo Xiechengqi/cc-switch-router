@@ -25697,6 +25697,7 @@ mod tests {
             tunnel_domain: "127.0.0.1:8787".into(),
             ssh_public_addr: String::new(),
             ssh_transport: crate::config::SshTransportConfig::default(),
+            proxy_stream: crate::config::ProxyStreamConfig::default(),
             use_localhost: true,
             lease_ttl_secs: 60,
             data_dir,

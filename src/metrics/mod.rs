@@ -62,6 +62,17 @@ pub struct MetricsRegistry {
     proxy_requests_total: AtomicU64,
     proxy_upstream_errors_total: AtomicU64,
     proxy_5xx_total: AtomicU64,
+    share_request_watchdog_forced_release_total: AtomicU64,
+    share_request_manual_release_total: AtomicU64,
+    proxy_request_body_timeout_total: AtomicU64,
+    proxy_response_header_timeout_total: AtomicU64,
+    proxy_downstream_stall_timeout_total: AtomicU64,
+    proxy_request_hard_timeout_total: AtomicU64,
+    proxy_stream_semantic_terminal_total: AtomicU64,
+    proxy_stream_first_event_timeout_total: AtomicU64,
+    proxy_stream_idle_timeout_total: AtomicU64,
+    proxy_stream_parser_overflow_total: AtomicU64,
+    proxy_stream_upstream_errors_total: AtomicU64,
     health_probe_failures_total: AtomicU64,
     health_probe_cached_failures_total: AtomicU64,
     db_errors_total: AtomicU64,
@@ -104,6 +115,17 @@ impl MetricsRegistry {
             proxy_requests_total: AtomicU64::new(0),
             proxy_upstream_errors_total: AtomicU64::new(0),
             proxy_5xx_total: AtomicU64::new(0),
+            share_request_watchdog_forced_release_total: AtomicU64::new(0),
+            share_request_manual_release_total: AtomicU64::new(0),
+            proxy_request_body_timeout_total: AtomicU64::new(0),
+            proxy_response_header_timeout_total: AtomicU64::new(0),
+            proxy_downstream_stall_timeout_total: AtomicU64::new(0),
+            proxy_request_hard_timeout_total: AtomicU64::new(0),
+            proxy_stream_semantic_terminal_total: AtomicU64::new(0),
+            proxy_stream_first_event_timeout_total: AtomicU64::new(0),
+            proxy_stream_idle_timeout_total: AtomicU64::new(0),
+            proxy_stream_parser_overflow_total: AtomicU64::new(0),
+            proxy_stream_upstream_errors_total: AtomicU64::new(0),
             health_probe_failures_total: AtomicU64::new(0),
             health_probe_cached_failures_total: AtomicU64::new(0),
             db_errors_total: AtomicU64::new(0),
@@ -283,6 +305,7 @@ impl MetricsRegistry {
 
     pub async fn router_status(&self, proxy: &ProxyRegistry) -> RouterMetricsStatus {
         let counts = proxy.counts().await;
+        let share_requests = proxy.share_request_registry_snapshot().await;
         RouterMetricsStatus {
             active_routes: counts.active_routes as u64,
             pending_routes: counts.pending_routes as u64,
@@ -339,6 +362,42 @@ impl MetricsRegistry {
             proxy_requests_total: self.proxy_requests_total.load(Ordering::Relaxed),
             proxy_upstream_errors_total: self.proxy_upstream_errors_total.load(Ordering::Relaxed),
             proxy_5xx_total: self.proxy_5xx_total.load(Ordering::Relaxed),
+            share_active_requests: share_requests.active_requests as u64,
+            share_oldest_inflight_age_secs: share_requests.oldest_inflight_age_secs,
+            share_oldest_progress_age_secs: share_requests.oldest_progress_age_secs,
+            share_request_watchdog_forced_release_total: self
+                .share_request_watchdog_forced_release_total
+                .load(Ordering::Relaxed),
+            share_request_manual_release_total: self
+                .share_request_manual_release_total
+                .load(Ordering::Relaxed),
+            proxy_request_body_timeout_total: self
+                .proxy_request_body_timeout_total
+                .load(Ordering::Relaxed),
+            proxy_response_header_timeout_total: self
+                .proxy_response_header_timeout_total
+                .load(Ordering::Relaxed),
+            proxy_downstream_stall_timeout_total: self
+                .proxy_downstream_stall_timeout_total
+                .load(Ordering::Relaxed),
+            proxy_request_hard_timeout_total: self
+                .proxy_request_hard_timeout_total
+                .load(Ordering::Relaxed),
+            proxy_stream_semantic_terminal_total: self
+                .proxy_stream_semantic_terminal_total
+                .load(Ordering::Relaxed),
+            proxy_stream_first_event_timeout_total: self
+                .proxy_stream_first_event_timeout_total
+                .load(Ordering::Relaxed),
+            proxy_stream_idle_timeout_total: self
+                .proxy_stream_idle_timeout_total
+                .load(Ordering::Relaxed),
+            proxy_stream_parser_overflow_total: self
+                .proxy_stream_parser_overflow_total
+                .load(Ordering::Relaxed),
+            proxy_stream_upstream_errors_total: self
+                .proxy_stream_upstream_errors_total
+                .load(Ordering::Relaxed),
             health_probe_failures_total: self.health_probe_failures_total.load(Ordering::Relaxed),
             health_probe_cached_failures_total: self
                 .health_probe_cached_failures_total
@@ -369,6 +428,68 @@ impl MetricsRegistry {
             self.health_probe_failures_total
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_proxy_stream_semantic_terminal(&self) {
+        self.proxy_stream_semantic_terminal_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_request_body_timeout(&self) {
+        self.proxy_request_body_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_response_header_timeout(&self) {
+        self.proxy_response_header_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_downstream_stall_timeout(&self) {
+        self.proxy_downstream_stall_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_request_hard_timeout(&self) {
+        self.proxy_request_hard_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_share_request_watchdog_release(&self, reason: &str) {
+        self.share_request_watchdog_forced_release_total
+            .fetch_add(1, Ordering::Relaxed);
+        match reason {
+            "response_header_timeout" => self.record_proxy_response_header_timeout(),
+            "first_event_timeout" => self.record_proxy_stream_first_event_timeout(),
+            "business_idle_timeout" => self.record_proxy_stream_idle_timeout(),
+            "hard_lifetime_timeout" => self.record_proxy_request_hard_timeout(),
+            _ => {}
+        }
+    }
+
+    pub fn record_share_request_manual_release(&self, count: usize) {
+        self.share_request_manual_release_total
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_stream_first_event_timeout(&self) {
+        self.proxy_stream_first_event_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_stream_idle_timeout(&self) {
+        self.proxy_stream_idle_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_stream_parser_overflow(&self) {
+        self.proxy_stream_parser_overflow_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_stream_upstream_error(&self) {
+        self.proxy_stream_upstream_errors_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_health_probe_cached_failure(&self) {
@@ -1008,6 +1129,37 @@ fn build_alert_conditions(
                 }),
             );
         }
+        let watchdog_releases = router
+            .share_request_watchdog_forced_release_total
+            .saturating_sub(previous.share_request_watchdog_forced_release_total);
+        if watchdog_releases > 0 {
+            push(
+                "share_request_watchdog_release",
+                "warning",
+                "Share request leases were force-released",
+                "The proxy watchdog reclaimed Share requests that exceeded a lifecycle deadline",
+                serde_json::json!({
+                    "newReleases": watchdog_releases,
+                    "total": router.share_request_watchdog_forced_release_total,
+                    "activeRequests": router.share_active_requests,
+                }),
+            );
+        }
+        let downstream_stalls = router
+            .proxy_downstream_stall_timeout_total
+            .saturating_sub(previous.proxy_downstream_stall_timeout_total);
+        if downstream_stalls > 0 {
+            push(
+                "proxy_downstream_stall",
+                "warning",
+                "Proxy downstream delivery stalled",
+                "Response pumps stopped after clients failed to consume buffered output",
+                serde_json::json!({
+                    "newTimeouts": downstream_stalls,
+                    "total": router.proxy_downstream_stall_timeout_total,
+                }),
+            );
+        }
     }
     if llm.rpm >= 1.0 && llm.error_rate >= 0.25 {
         push(
@@ -1097,10 +1249,14 @@ mod tests {
 
     use crate::config::{AlertingSettings, MetricsConfig};
     use crate::error::AppError;
+    use crate::metrics::models::{
+        HostMetricsStatus, LlmMetricsSnapshot, NetworkMetricsStatus, ProcessMetricsStatus,
+    };
 
     use super::{
         AlertRouterBaselineState, ForwardBridgeMetricOutcome, ForwardChannelOpenMetricOutcome,
-        MetricsRegistry, RouterMetricsStatus, error_kind_from_status, run_sample_sinks,
+        MetricsRegistry, RouterMetricsStatus, build_alert_conditions, error_kind_from_status,
+        run_sample_sinks,
     };
 
     #[test]
@@ -1134,6 +1290,45 @@ mod tests {
         };
         let previous = state.previous_for(&next).unwrap();
         assert_eq!(previous.ssh_channel_open_timeout_total, 7);
+    }
+
+    #[test]
+    fn share_watchdog_and_downstream_stall_deltas_raise_alerts() {
+        let host = HostMetricsStatus {
+            timestamp: 0,
+            uptime_secs: None,
+            cpu_percent: None,
+            load_1: None,
+            load_5: None,
+            load_15: None,
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            memory_available_bytes: None,
+            swap_used_bytes: None,
+            swap_total_bytes: None,
+            disks: Vec::new(),
+            network: NetworkMetricsStatus::default(),
+            process: ProcessMetricsStatus::default(),
+        };
+        let previous = RouterMetricsStatus::default();
+        let current = RouterMetricsStatus {
+            share_request_watchdog_forced_release_total: 2,
+            proxy_downstream_stall_timeout_total: 1,
+            ..Default::default()
+        };
+        let conditions = build_alert_conditions(
+            &host,
+            &current,
+            Some(&previous),
+            &LlmMetricsSnapshot::default(),
+            None,
+        );
+        let kinds = conditions
+            .iter()
+            .map(|condition| condition.kind.as_str())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"share_request_watchdog_release"));
+        assert!(kinds.contains(&"proxy_downstream_stall"));
     }
 
     #[tokio::test]

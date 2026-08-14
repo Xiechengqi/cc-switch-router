@@ -29,6 +29,9 @@ const MAX_SEATS_PER_LISTING: usize = 20;
 const MAX_SERVICE_DURATION_DAYS: u32 = 365;
 const MAX_CONTROL_ATTEMPTS: i64 = 8;
 const MAX_SUBSCRIPTIONS_PER_RECONCILE: usize = 200;
+const MARKET_AGGREGATE_BATCH_SIZE: usize = 200;
+const MARKET_PERFORMANCE_WINDOW: i64 = 10;
+const HEALTH_WINDOW_MINUTES: u32 = 24 * 60;
 const CONTROL_DISPATCH_WAKE_RETRY_SECS: i64 = 30;
 const CONTROL_EDIT_TTL_SECS: i64 = 5 * 60;
 const CONTROL_RETRY_BASE_SECS: i64 = 15;
@@ -60,8 +63,61 @@ const PRICE_CHANGE_CANCELLED: &str = "cancelled";
 #[serde(rename_all = "camelCase")]
 pub struct ShareMarketCatalog {
     pub listings: Vec<ListingView>,
+    #[serde(skip)]
     pub my_subscriptions: Vec<SubscriptionView>,
     pub trial_hours: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketOwnedListings {
+    pub listings: Vec<ListingView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketSubscriptions {
+    pub subscriptions: Vec<SubscriptionView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketAppCapability {
+    pub app: String,
+    pub provider_family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_level: Option<String>,
+    pub model_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketPerformance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_ttft_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_tps: Option<f64>,
+    pub recent_request_count: u32,
+    pub ttft_sample_count: u32,
+    pub tps_sample_count: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketReliability {
+    pub online_rate_24h: f64,
+    pub observed_minutes_24h: u32,
+    pub observation_coverage_24h: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,18 +128,24 @@ pub struct ListingView {
     pub installation_id: String,
     pub share_name: String,
     pub app_type: String,
+    pub supported_apps: Vec<String>,
+    pub provider_family: String,
+    pub provider_families: Vec<String>,
+    pub app_capabilities: Vec<ShareMarketAppCapability>,
     pub owner_email: String,
     pub status: String,
     pub share_status: String,
     pub subdomain: String,
     pub share_online: bool,
     pub is_owner: bool,
+    #[serde(skip)]
+    pub publicly_listed: bool,
     #[serde(default)]
     pub contacts: Vec<PaymentContact>,
     #[serde(default)]
     pub payment_method_kinds: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_provider: Option<crate::models::ShareUpstreamProvider>,
+    pub performance: ShareMarketPerformance,
+    pub reliability: ShareMarketReliability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +356,11 @@ pub fn router() -> Router<ServerState> {
             "/v1/share-market/listings",
             get(list_catalog).post(create_listing),
         )
+        .route("/v1/share-market/me/listings", get(list_my_listings))
+        .route(
+            "/v1/share-market/me/subscriptions",
+            get(list_my_subscriptions),
+        )
         .route("/v1/share-market/owned-shares", get(list_owned_shares))
         .route("/v1/share-market/listings/:id", delete(close_listing))
         .route("/v1/share-market/listings/:id/delete", post(delete_listing))
@@ -435,6 +502,237 @@ fn supported_share_apps(bindings_json: &str, fallback_app: &str) -> Vec<String> 
         apps.push(fallback_app.to_string());
     }
     apps
+}
+
+fn normalized_provider_family_parts(
+    app: &str,
+    kind: &str,
+    provider_type: Option<&str>,
+    provider_name: Option<&str>,
+) -> String {
+    let typed_identity = [kind, provider_type.unwrap_or_default()]
+        .join(" ")
+        .to_ascii_lowercase();
+    let named_identity = provider_name.unwrap_or_default().to_ascii_lowercase();
+    let classify = |identity: &str| {
+        let third_party_api = [
+            "openai_compatible",
+            "openai compatible",
+            "openrouter",
+            "ollama",
+            "nvidia",
+            "deepseek",
+            "bedrock",
+            "custom",
+        ]
+        .iter()
+        .any(|marker| identity.contains(marker));
+        if third_party_api {
+            Some("api")
+        } else if identity.contains("cursor") {
+            Some("cursor")
+        } else if identity.contains("kiro") {
+            Some("kiro")
+        } else if identity.contains("copilot") || identity.contains("github") {
+            Some("copilot")
+        } else if identity.contains("grok") || identity.contains("xai") || identity.contains("x.ai")
+        {
+            Some("xai")
+        } else if identity.contains("anthropic") || identity.contains("claude") {
+            Some("anthropic")
+        } else if identity.contains("gemini")
+            || identity.contains("google")
+            || identity.contains("antigravity")
+        {
+            Some("google")
+        } else if identity.contains("openai") || identity.contains("codex") {
+            Some("openai")
+        } else if identity.contains("compatible") {
+            Some("api")
+        } else {
+            None
+        }
+    };
+    if let Some(family) = classify(&typed_identity) {
+        family
+    } else if typed_identity.contains("official_oauth") {
+        match app {
+            "claude" => "anthropic",
+            "codex" => "openai",
+            "gemini" => "google",
+            _ => "other",
+        }
+    } else {
+        classify(&named_identity).unwrap_or("other")
+    }
+    .to_string()
+}
+
+fn normalized_provider_family(provider: &crate::models::ShareUpstreamProvider) -> String {
+    normalized_provider_family_parts(
+        &provider.app,
+        &provider.kind,
+        provider.provider_type.as_deref(),
+        provider.provider_name.as_deref(),
+    )
+}
+
+fn app_runtime<'a>(
+    runtimes: &'a crate::models::ShareAppRuntimes,
+    app: &str,
+) -> Option<&'a crate::models::ShareUpstreamProvider> {
+    match app {
+        "claude" => runtimes.claude.as_ref(),
+        "codex" => runtimes.codex.as_ref(),
+        "gemini" => runtimes.gemini.as_ref(),
+        _ => None,
+    }
+}
+
+fn first_nonempty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn public_app_capabilities(
+    bindings_json: &str,
+    app_runtimes_json: Option<&str>,
+    app_providers_json: Option<&str>,
+    fallback_app: &str,
+) -> Vec<ShareMarketAppCapability> {
+    let apps = supported_share_apps(bindings_json, fallback_app);
+    let bindings =
+        serde_json::from_str::<BTreeMap<String, String>>(bindings_json).unwrap_or_default();
+    let runtimes = app_runtimes_json
+        .and_then(|value| serde_json::from_str::<crate::models::ShareAppRuntimes>(value).ok())
+        .unwrap_or_default();
+    let providers = app_providers_json
+        .and_then(|value| serde_json::from_str::<crate::models::ShareAppProviders>(value).ok())
+        .unwrap_or_default();
+    apps.into_iter()
+        .map(|app| {
+            let runtime = app_runtime(&runtimes, &app);
+            let candidates = match app.as_str() {
+                "claude" => providers.claude.as_slice(),
+                "codex" => providers.codex.as_slice(),
+                "gemini" => providers.gemini.as_slice(),
+                _ => &[],
+            };
+            let bound_provider = bindings
+                .get(&app)
+                .and_then(|provider_id| {
+                    candidates
+                        .iter()
+                        .find(|provider| &provider.id == provider_id)
+                })
+                .or_else(|| candidates.iter().find(|provider| provider.is_current))
+                .or_else(|| candidates.first());
+            let model_policy = runtime
+                .and_then(|value| value.model_policy.as_ref())
+                .or_else(|| bound_provider.and_then(|provider| provider.model_policy.as_ref()));
+            let (model_mode, upstream_model) = match model_policy {
+                Some(crate::models::ShareProviderModelPolicy::Passthrough) => {
+                    ("passthrough".to_string(), None)
+                }
+                Some(crate::models::ShareProviderModelPolicy::Single { upstream_model }) => {
+                    ("fixed".to_string(), Some(upstream_model.clone()))
+                }
+                None => ("unknown".to_string(), None),
+            };
+            let collect_models = |models: &[crate::models::ShareUpstreamModel]| {
+                models
+                    .iter()
+                    .map(|model| model.actual_model.trim().to_string())
+                    .filter(|model| !model.is_empty())
+                    .collect::<Vec<_>>()
+            };
+            let mut models = runtime
+                .map(|value| collect_models(&value.models))
+                .unwrap_or_default();
+            if models.is_empty() {
+                models = bound_provider
+                    .map(|provider| collect_models(&provider.models))
+                    .unwrap_or_default();
+            }
+            models.sort();
+            models.dedup();
+            let bound_provider_family = || {
+                bound_provider.map(|provider| {
+                    normalized_provider_family_parts(
+                        &app,
+                        provider.kind.as_deref().unwrap_or_default(),
+                        provider.provider_type.as_deref(),
+                        Some(&provider.name),
+                    )
+                })
+            };
+            let provider_family = match runtime.map(normalized_provider_family) {
+                Some(family) if family != "other" => family,
+                _ => bound_provider_family().unwrap_or_else(|| "other".into()),
+            };
+            ShareMarketAppCapability {
+                app,
+                provider_family,
+                provider_name: first_nonempty([
+                    runtime.and_then(|value| value.provider_name.as_deref()),
+                    bound_provider.map(|provider| provider.name.as_str()),
+                ]),
+                provider_type: first_nonempty([
+                    runtime.and_then(|value| value.provider_type.as_deref()),
+                    runtime.map(|value| value.kind.as_str()),
+                    bound_provider.and_then(|provider| provider.provider_type.as_deref()),
+                    bound_provider.and_then(|provider| provider.kind.as_deref()),
+                ]),
+                subscription_level: first_nonempty([
+                    runtime.and_then(|value| value.subscription_level.as_deref()),
+                    runtime.and_then(|value| {
+                        value.quota.as_ref().and_then(|quota| quota.plan.as_deref())
+                    }),
+                    bound_provider.and_then(|provider| provider.subscription_level.as_deref()),
+                ]),
+                model_mode,
+                upstream_model,
+                models,
+                available: runtime
+                    .and_then(|value| {
+                        value
+                            .available
+                            .or_else(|| value.health.as_ref().map(|health| health.healthy))
+                    })
+                    .or_else(|| {
+                        bound_provider.and_then(|provider| {
+                            provider
+                                .available
+                                .or_else(|| provider.health.as_ref().map(|health| health.healthy))
+                        })
+                    })
+                    .or_else(|| {
+                        bound_provider
+                            .filter(|provider| !provider.enabled)
+                            .map(|_| false)
+                    }),
+            }
+        })
+        .collect()
+}
+
+fn listing_provider_families(capabilities: &[ShareMarketAppCapability]) -> (String, Vec<String>) {
+    let mut families = capabilities
+        .iter()
+        .map(|capability| capability.provider_family.clone())
+        .collect::<Vec<_>>();
+    families.sort();
+    families.dedup();
+    let family = match families.as_slice() {
+        [] => "other".to_string(),
+        [family] => family.clone(),
+        _ => "multi".to_string(),
+    };
+    (family, families)
 }
 
 fn share_event_summary(event_type: &str, share_name: &str) -> String {
@@ -1348,6 +1646,35 @@ struct SubscriptionRecord {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShareMarketCatalogScope {
+    Visible,
+    Public,
+    Owner,
+    Renter,
+}
+
+fn catalog_visibility_predicate(scope: ShareMarketCatalogScope, share_alias: &str) -> String {
+    let public_listing = format!(
+        "listing.status = 'active'
+         AND lower(COALESCE({share_alias}.owner_email, '')) = lower(listing.owner_email)"
+    );
+    match scope {
+        ShareMarketCatalogScope::Visible => format!(
+            "({public_listing})
+             OR listing.owner_user_id = ?1
+             OR EXISTS (
+                 SELECT 1 FROM share_market_subscriptions viewer_sub
+                 WHERE viewer_sub.listing_id = listing.id
+                   AND viewer_sub.renter_user_id = ?1
+             )"
+        ),
+        ShareMarketCatalogScope::Public => format!("?1 = ?1 AND ({public_listing})"),
+        ShareMarketCatalogScope::Owner => "listing.owner_user_id = ?1".into(),
+        ShareMarketCatalogScope::Renter => "?1 = ?1 AND 0".into(),
+    }
+}
+
 fn subscription_record(
     conn: &Connection,
     subscription_id: &str,
@@ -1404,21 +1731,18 @@ fn subscription_record(
 fn catalog_subscription_records(
     conn: &Connection,
     viewer_user_id: &str,
+    scope: ShareMarketCatalogScope,
 ) -> Result<HashMap<String, SubscriptionRecord>, AppError> {
-    conn.prepare(
-        "WITH visible_listings AS (
+    let visibility = catalog_visibility_predicate(scope, "share");
+    let (cte, filter) = match scope {
+        ShareMarketCatalogScope::Visible => (
+            format!(
+                "WITH visible_listings AS (
             SELECT listing.id
             FROM share_market_listings listing
             LEFT JOIN shares share ON share.share_id = listing.share_id
             WHERE listing.deleted_at IS NULL
-              AND ((listing.status = 'active'
-                    AND lower(COALESCE(share.owner_email, '')) = lower(listing.owner_email))
-                   OR listing.owner_user_id = ?1
-                   OR EXISTS (
-                       SELECT 1 FROM share_market_subscriptions viewer_sub
-                       WHERE viewer_sub.listing_id = listing.id
-                         AND viewer_sub.renter_user_id = ?1
-                   ))
+              AND ({visibility})
          ), referenced_subscriptions AS (
             SELECT seat.current_subscription_id AS id
             FROM share_market_seats seat
@@ -1429,7 +1753,38 @@ fn catalog_subscription_records(
             FROM share_market_seats seat
             WHERE seat.listing_id IN (SELECT id FROM visible_listings)
               AND seat.retired_subscription_id IS NOT NULL
-         )
+         )"
+            ),
+            "sub.id IN (SELECT id FROM referenced_subscriptions)
+             OR (?1 != '' AND sub.renter_user_id = ?1)",
+        ),
+        ShareMarketCatalogScope::Owner => (
+            format!(
+                "WITH visible_listings AS (
+            SELECT listing.id
+            FROM share_market_listings listing
+            LEFT JOIN shares share ON share.share_id = listing.share_id
+            WHERE listing.deleted_at IS NULL
+              AND ({visibility})
+         ), referenced_subscriptions AS (
+            SELECT seat.current_subscription_id AS id
+            FROM share_market_seats seat
+            WHERE seat.listing_id IN (SELECT id FROM visible_listings)
+              AND seat.current_subscription_id IS NOT NULL
+            UNION
+            SELECT seat.retired_subscription_id AS id
+            FROM share_market_seats seat
+            WHERE seat.listing_id IN (SELECT id FROM visible_listings)
+              AND seat.retired_subscription_id IS NOT NULL
+         )"
+            ),
+            "sub.id IN (SELECT id FROM referenced_subscriptions)",
+        ),
+        ShareMarketCatalogScope::Public => (String::new(), "?1 = ?1 AND 0"),
+        ShareMarketCatalogScope::Renter => (String::new(), "?1 != '' AND sub.renter_user_id = ?1"),
+    };
+    let sql = format!(
+        "{cte}
          SELECT sub.id, sub.seat_id, sub.listing_id, sub.share_id, sub.installation_id,
                 COALESCE(share.share_name, sub.share_id), COALESCE(share.app_type, ''),
                 COALESCE(share.subdomain, ''), sub.entitlement_id,
@@ -1440,45 +1795,45 @@ fn catalog_subscription_records(
                 sub.created_at, sub.updated_at
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
-         WHERE sub.id IN (SELECT id FROM referenced_subscriptions)
-            OR (?1 != '' AND sub.renter_user_id = ?1)",
-    )
-    .and_then(|mut statement| {
-        statement
-            .query_map(params![viewer_user_id], |row| {
-                let record = SubscriptionRecord {
-                    id: row.get(0)?,
-                    seat_id: row.get(1)?,
-                    listing_id: row.get(2)?,
-                    share_id: row.get(3)?,
-                    installation_id: row.get(4)?,
-                    share_name: row.get(5)?,
-                    app_type: row.get(6)?,
-                    subdomain: row.get(7)?,
-                    entitlement_id: row.get(8)?,
-                    owner_user_id: row.get(9)?,
-                    owner_email: row.get(10)?,
-                    renter_user_id: row.get(11)?,
-                    renter_email: row.get(12)?,
-                    status: row.get(13)?,
-                    daily_rate_minor: row.get(14)?,
-                    currency: row.get(15)?,
-                    service_duration_days: row
-                        .get::<_, Option<i64>>(16)?
-                        .and_then(|value| u32::try_from(value).ok()),
-                    offer_revision: row.get(17)?,
-                    release_reason: row.get(18)?,
-                    activated_at: row.get(19)?,
-                    expires_at: row.get(20)?,
-                    released_at: row.get(21)?,
-                    created_at: row.get(22)?,
-                    updated_at: row.get(23)?,
-                };
-                Ok((record.id.clone(), record))
-            })?
-            .collect::<Result<HashMap<_, _>, _>>()
-    })
-    .map_err(map_db("read Share Market catalog subscriptions"))
+         WHERE {filter}"
+    );
+    conn.prepare(&sql)
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![viewer_user_id], |row| {
+                    let record = SubscriptionRecord {
+                        id: row.get(0)?,
+                        seat_id: row.get(1)?,
+                        listing_id: row.get(2)?,
+                        share_id: row.get(3)?,
+                        installation_id: row.get(4)?,
+                        share_name: row.get(5)?,
+                        app_type: row.get(6)?,
+                        subdomain: row.get(7)?,
+                        entitlement_id: row.get(8)?,
+                        owner_user_id: row.get(9)?,
+                        owner_email: row.get(10)?,
+                        renter_user_id: row.get(11)?,
+                        renter_email: row.get(12)?,
+                        status: row.get(13)?,
+                        daily_rate_minor: row.get(14)?,
+                        currency: row.get(15)?,
+                        service_duration_days: row
+                            .get::<_, Option<i64>>(16)?
+                            .and_then(|value| u32::try_from(value).ok()),
+                        offer_revision: row.get(17)?,
+                        release_reason: row.get(18)?,
+                        activated_at: row.get(19)?,
+                        expires_at: row.get(20)?,
+                        released_at: row.get(21)?,
+                        created_at: row.get(22)?,
+                        updated_at: row.get(23)?,
+                    };
+                    Ok((record.id.clone(), record))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()
+        })
+        .map_err(map_db("read Share Market catalog subscriptions"))
 }
 
 #[derive(Debug)]
@@ -1501,30 +1856,32 @@ struct CatalogSeatRecord {
 fn catalog_seats(
     conn: &Connection,
     viewer_user_id: &str,
+    scope: ShareMarketCatalogScope,
 ) -> Result<HashMap<String, Vec<CatalogSeatRecord>>, AppError> {
+    let visibility = catalog_visibility_predicate(scope, "share");
+    let public_seat_filter = if scope == ShareMarketCatalogScope::Public {
+        "AND seat.status = 'available' AND seat.retired_at IS NULL"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT seat.listing_id, seat.id, seat.position, seat.status,
+                seat.parallel_limit, seat.token_limit, seat.token_period_json,
+                seat.daily_rate_minor, seat.currency, seat.service_duration_days,
+                seat.offer_revision, seat.current_subscription_id,
+                seat.retired_subscription_id, seat.retired_at
+         FROM share_market_seats seat
+         JOIN share_market_listings listing ON listing.id = seat.listing_id
+         LEFT JOIN shares share ON share.share_id = listing.share_id
+         WHERE seat.status != 'deleted' AND listing.deleted_at IS NULL
+           AND ({visibility})
+           {public_seat_filter}
+         ORDER BY seat.listing_id,
+                  CASE WHEN seat.retired_at IS NULL THEN 0 ELSE 1 END,
+                  seat.position"
+    );
     let rows = conn
-        .prepare(
-            "SELECT seat.listing_id, seat.id, seat.position, seat.status,
-                    seat.parallel_limit, seat.token_limit, seat.token_period_json,
-                    seat.daily_rate_minor, seat.currency, seat.service_duration_days,
-                    seat.offer_revision, seat.current_subscription_id,
-                    seat.retired_subscription_id, seat.retired_at
-             FROM share_market_seats seat
-             JOIN share_market_listings listing ON listing.id = seat.listing_id
-             LEFT JOIN shares share ON share.share_id = listing.share_id
-             WHERE seat.status != 'deleted' AND listing.deleted_at IS NULL
-               AND ((listing.status = 'active'
-                     AND lower(COALESCE(share.owner_email, '')) = lower(listing.owner_email))
-                    OR listing.owner_user_id = ?1
-                    OR EXISTS (
-                        SELECT 1 FROM share_market_subscriptions viewer_sub
-                        WHERE viewer_sub.listing_id = listing.id
-                          AND viewer_sub.renter_user_id = ?1
-                    ))
-             ORDER BY seat.listing_id,
-                      CASE WHEN seat.retired_at IS NULL THEN 0 ELSE 1 END,
-                      seat.position",
-        )
+        .prepare(&sql)
         .and_then(|mut statement| {
             statement
                 .query_map(params![viewer_user_id], |row| {
@@ -1557,32 +1914,288 @@ fn catalog_seats(
     Ok(by_listing)
 }
 
+fn active_rented_share_ids(
+    conn: &Connection,
+    viewer_user_id: &str,
+) -> Result<HashSet<String>, AppError> {
+    if viewer_user_id.is_empty() {
+        return Ok(HashSet::new());
+    }
+    conn.prepare(
+        "SELECT DISTINCT share_id
+         FROM share_market_subscriptions
+         WHERE renter_user_id = ?1
+           AND status NOT IN ('released', 'grant_failed')",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![viewer_user_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()
+    })
+    .map_err(map_db("read active Share Market rentals"))
+}
+
+#[derive(Debug, Default)]
+struct PerformanceAccumulator {
+    recent_request_count: u32,
+    ttft_sum_ms: f64,
+    ttft_sample_count: u32,
+    tps_sum: f64,
+    tps_sample_count: u32,
+}
+
+fn share_market_performance(
+    conn: &Connection,
+    share_ids: &[String],
+) -> Result<HashMap<String, ShareMarketPerformance>, AppError> {
+    let mut performance = HashMap::new();
+    for share_ids in share_ids.chunks(MARKET_AGGREGATE_BATCH_SIZE) {
+        performance.extend(share_market_performance_batch(conn, share_ids)?);
+    }
+    Ok(performance)
+}
+
+fn share_market_performance_batch(
+    conn: &Connection,
+    share_ids: &[String],
+) -> Result<HashMap<String, ShareMarketPerformance>, AppError> {
+    let placeholders = std::iter::repeat_n("?", share_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT share_id, status_code, latency_ms, first_token_ms, output_tokens,
+                usage_state, is_streaming, COALESCE(stream_status, '')
+         FROM (
+             SELECT share_id, status_code, latency_ms, first_token_ms, output_tokens,
+                    usage_state, is_streaming, stream_status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY share_id ORDER BY created_at DESC, request_id DESC
+                    ) AS row_num
+             FROM share_request_logs
+             WHERE COALESCE(is_health_check, 0) = 0
+               AND share_id IN ({placeholders})
+         )
+         WHERE row_num <= ?"
+    );
+    let mut values = share_ids
+        .iter()
+        .cloned()
+        .map(crate::db::types::Value::Text)
+        .collect::<Vec<_>>();
+    values.push(crate::db::types::Value::Integer(MARKET_PERFORMANCE_WINDOW));
+    let rows = conn
+        .prepare(&sql)
+        .and_then(|mut statement| {
+            statement
+                .query_map(values, |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get::<_, String>(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read Share Market performance samples"))?;
+    let mut accumulators = HashMap::<String, PerformanceAccumulator>::new();
+    for (
+        share_id,
+        status_code,
+        latency_ms,
+        first_token_ms,
+        output_tokens,
+        usage_state,
+        is_streaming,
+        stream_status,
+    ) in rows
+    {
+        let entry = accumulators.entry(share_id).or_default();
+        entry.recent_request_count += 1;
+        let Some(first_token_ms) = first_token_ms else {
+            continue;
+        };
+        if !is_streaming
+            || !(200..300).contains(&status_code)
+            || !stream_status.eq_ignore_ascii_case("completed")
+            || first_token_ms <= 0
+            || latency_ms <= first_token_ms
+        {
+            continue;
+        }
+        entry.ttft_sum_ms += first_token_ms as f64;
+        entry.ttft_sample_count += 1;
+        if usage_state.eq_ignore_ascii_case("observed") && output_tokens > 0 {
+            let generation_seconds = (latency_ms - first_token_ms) as f64 / 1_000.0;
+            let tps = output_tokens as f64 / generation_seconds;
+            if tps.is_finite() && tps > 0.0 {
+                entry.tps_sum += tps;
+                entry.tps_sample_count += 1;
+            }
+        }
+    }
+    Ok(accumulators
+        .into_iter()
+        .map(|(share_id, entry)| {
+            (
+                share_id,
+                ShareMarketPerformance {
+                    average_ttft_ms: (entry.ttft_sample_count > 0)
+                        .then(|| entry.ttft_sum_ms / f64::from(entry.ttft_sample_count)),
+                    average_tps: (entry.tps_sample_count > 0)
+                        .then(|| entry.tps_sum / f64::from(entry.tps_sample_count)),
+                    recent_request_count: entry.recent_request_count,
+                    ttft_sample_count: entry.ttft_sample_count,
+                    tps_sample_count: entry.tps_sample_count,
+                },
+            )
+        })
+        .collect())
+}
+
+fn share_market_reliability(
+    conn: &Connection,
+    share_ids: &[String],
+) -> Result<HashMap<String, (u32, u32)>, AppError> {
+    let mut reliability = HashMap::new();
+    for share_ids in share_ids.chunks(MARKET_AGGREGATE_BATCH_SIZE) {
+        reliability.extend(share_market_reliability_batch(conn, share_ids)?);
+    }
+    Ok(reliability)
+}
+
+fn share_market_reliability_batch(
+    conn: &Connection,
+    share_ids: &[String],
+) -> Result<HashMap<String, (u32, u32)>, AppError> {
+    let cutoff = Utc::now().timestamp() - i64::from(HEALTH_WINDOW_MINUTES) * 60;
+    let placeholders = std::iter::repeat_n("?", share_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH ranked AS (
+             SELECT share_id, status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY share_id, checked_at / 60
+                        ORDER BY checked_at DESC, id DESC
+                    ) AS row_num
+             FROM share_health_checks
+             WHERE share_id IN ({placeholders}) AND checked_at >= ?
+               AND status IN ('healthy', 'unhealthy')
+         )
+         SELECT share_id,
+                SUM(CASE WHEN status = 'healthy' THEN 1 ELSE 0 END),
+                COUNT(*)
+         FROM ranked
+         WHERE row_num = 1
+         GROUP BY share_id"
+    );
+    let mut values = share_ids
+        .iter()
+        .cloned()
+        .map(crate::db::types::Value::Text)
+        .collect::<Vec<_>>();
+    values.push(crate::db::types::Value::Integer(cutoff));
+    conn.prepare(&sql)
+        .and_then(|mut statement| {
+            statement
+                .query_map(values, |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, i64>(1)?
+                                .clamp(0, i64::from(HEALTH_WINDOW_MINUTES))
+                                as u32,
+                            row.get::<_, i64>(2)?
+                                .clamp(0, i64::from(HEALTH_WINDOW_MINUTES))
+                                as u32,
+                        ),
+                    ))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()
+        })
+        .map_err(map_db("read Share Market reliability"))
+}
+
+fn retain_public_catalog(catalog: &mut ShareMarketCatalog) {
+    catalog.listings.retain_mut(|listing| {
+        if !listing.publicly_listed {
+            return false;
+        }
+        listing.seats.retain_mut(|seat| {
+            seat.subscription = None;
+            seat.status == SEAT_AVAILABLE && !seat.read_only
+        });
+        !listing.seats.is_empty()
+    });
+}
+
+fn reliability_view(sample: Option<(u32, u32)>, share_online: bool) -> ShareMarketReliability {
+    let (mut healthy, mut observed) = sample.unwrap_or_default();
+    if observed == 0 && share_online {
+        healthy = 1;
+        observed = 1;
+    }
+    ShareMarketReliability {
+        online_rate_24h: if observed == 0 {
+            0.0
+        } else {
+            f64::from(healthy) / f64::from(observed) * 100.0
+        },
+        observed_minutes_24h: observed,
+        observation_coverage_24h: f64::from(observed) / f64::from(HEALTH_WINDOW_MINUTES) * 100.0,
+    }
+}
+
 type PaymentProfileSnapshot = (Vec<PaymentMethod>, Vec<PaymentContact>, String);
 
 fn payment_profiles(
     conn: &Connection,
+    user_ids: &[String],
 ) -> Result<HashMap<String, PaymentProfileSnapshot>, AppError> {
-    conn.prepare(
-        "SELECT user_id, methods_json, COALESCE(contacts_json, '[]'), updated_at
-         FROM account_payment_profiles",
-    )
-    .and_then(|mut statement| {
-        statement
-            .query_map([], |row| {
-                let methods = row.get::<_, String>(1)?;
-                let contacts = row.get::<_, String>(2)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (
-                        serde_json::from_str::<Vec<PaymentMethod>>(&methods).unwrap_or_default(),
-                        serde_json::from_str::<Vec<PaymentContact>>(&contacts).unwrap_or_default(),
-                        row.get::<_, String>(3)?,
-                    ),
-                ))
-            })?
-            .collect::<Result<HashMap<_, _>, _>>()
-    })
-    .map_err(map_db("read Share Market payment profiles"))
+    let mut profiles = HashMap::new();
+    for user_ids in user_ids.chunks(MARKET_AGGREGATE_BATCH_SIZE) {
+        let placeholders = std::iter::repeat_n("?", user_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT user_id, methods_json, COALESCE(contacts_json, '[]'), updated_at
+             FROM account_payment_profiles
+             WHERE user_id IN ({placeholders})"
+        );
+        let values = user_ids
+            .iter()
+            .cloned()
+            .map(crate::db::types::Value::Text)
+            .collect::<Vec<_>>();
+        profiles.extend(
+            conn.prepare(&sql)
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(values, |row| {
+                            let methods = row.get::<_, String>(1)?;
+                            let contacts = row.get::<_, String>(2)?;
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                (
+                                    serde_json::from_str::<Vec<PaymentMethod>>(&methods)
+                                        .unwrap_or_default(),
+                                    serde_json::from_str::<Vec<PaymentContact>>(&contacts)
+                                        .unwrap_or_default(),
+                                    row.get::<_, String>(3)?,
+                                ),
+                            ))
+                        })?
+                        .collect::<Result<HashMap<_, _>, _>>()
+                })
+                .map_err(map_db("read Share Market payment profiles"))?,
+        );
+    }
+    Ok(profiles)
 }
 
 fn payment_method_kinds(methods: &[PaymentMethod]) -> Vec<String> {
@@ -1610,35 +2223,52 @@ struct ActivePriceChangeRecord {
 
 fn active_price_changes(
     conn: &Connection,
+    subscription_ids: &[String],
 ) -> Result<HashMap<String, ActivePriceChangeRecord>, AppError> {
-    conn.prepare(
-        "SELECT subscription_id, id, previous_daily_rate_minor,
-                proposed_daily_rate_minor, currency, base_offer_revision,
-                status, created_at, updated_at, responded_at
-         FROM share_market_price_changes
-         WHERE status IN ('pending', 'accepted')",
-    )
-    .and_then(|mut statement| {
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    ActivePriceChangeRecord {
-                        id: row.get(1)?,
-                        previous_daily_rate_minor: row.get(2)?,
-                        proposed_daily_rate_minor: row.get(3)?,
-                        currency: row.get(4)?,
-                        base_offer_revision: row.get(5)?,
-                        status: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
-                        responded_at: row.get(9)?,
-                    },
-                ))
-            })?
-            .collect::<Result<HashMap<_, _>, _>>()
-    })
-    .map_err(map_db("read active Share price changes"))
+    let mut changes = HashMap::new();
+    for subscription_ids in subscription_ids.chunks(MARKET_AGGREGATE_BATCH_SIZE) {
+        let placeholders = std::iter::repeat_n("?", subscription_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT subscription_id, id, previous_daily_rate_minor,
+                    proposed_daily_rate_minor, currency, base_offer_revision,
+                    status, created_at, updated_at, responded_at
+             FROM share_market_price_changes
+             WHERE status IN ('pending', 'accepted')
+               AND subscription_id IN ({placeholders})"
+        );
+        let values = subscription_ids
+            .iter()
+            .cloned()
+            .map(crate::db::types::Value::Text)
+            .collect::<Vec<_>>();
+        changes.extend(
+            conn.prepare(&sql)
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(values, |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                ActivePriceChangeRecord {
+                                    id: row.get(1)?,
+                                    previous_daily_rate_minor: row.get(2)?,
+                                    proposed_daily_rate_minor: row.get(3)?,
+                                    currency: row.get(4)?,
+                                    base_offer_revision: row.get(5)?,
+                                    status: row.get(6)?,
+                                    created_at: row.get(7)?,
+                                    updated_at: row.get(8)?,
+                                    responded_at: row.get(9)?,
+                                },
+                            ))
+                        })?
+                        .collect::<Result<HashMap<_, _>, _>>()
+                })
+                .map_err(map_db("read active Share price changes"))?,
+        );
+    }
+    Ok(changes)
 }
 
 fn active_price_change_view(
@@ -1784,29 +2414,40 @@ impl AppStore {
         viewer: Option<&AuthSession>,
         active_subdomains: &[String],
     ) -> Result<ShareMarketCatalog, AppError> {
+        self.share_market_catalog_with_scope(
+            viewer,
+            active_subdomains,
+            ShareMarketCatalogScope::Visible,
+        )
+        .await
+    }
+
+    async fn share_market_catalog_with_scope(
+        &self,
+        viewer: Option<&AuthSession>,
+        active_subdomains: &[String],
+        scope: ShareMarketCatalogScope,
+    ) -> Result<ShareMarketCatalog, AppError> {
         let conn = self.conn.lock().await;
+        let visibility = catalog_visibility_predicate(scope, "s");
+        let listings_sql = format!(
+            "SELECT listing.id, listing.share_id, COALESCE(s.share_name, listing.share_id),
+                    COALESCE(s.app_type, ''), listing.owner_user_id, listing.owner_email,
+                    listing.status, COALESCE(s.share_status, 'missing'),
+                    COALESCE(s.subdomain, ''), listing.created_at, listing.updated_at,
+                    COALESCE(s.supported_user_token_periods_json, '[]'),
+                    COALESCE(s.owner_email, ''), COALESCE(s.user_grants_json, '{{}}'),
+                    COALESCE(s.bindings_json, '{{}}'), s.app_runtimes_json,
+                    s.app_providers_json, s.token_limit, s.parallel_limit,
+                    COALESCE(s.tokens_used, 0), listing.installation_id
+             FROM share_market_listings listing
+             LEFT JOIN shares s ON s.share_id = listing.share_id
+             WHERE listing.deleted_at IS NULL
+               AND ({visibility})
+             ORDER BY listing.created_at DESC"
+        );
         let mut listings_statement = conn
-            .prepare(
-                "SELECT listing.id, listing.share_id, COALESCE(s.share_name, listing.share_id),
-                        COALESCE(s.app_type, ''), listing.owner_user_id, listing.owner_email,
-                        listing.status, COALESCE(s.share_status, 'missing'),
-                        COALESCE(s.subdomain, ''), listing.created_at, listing.updated_at,
-                        COALESCE(s.supported_user_token_periods_json, '[]'),
-                        COALESCE(s.owner_email, ''), COALESCE(s.user_grants_json, '{}'),
-                        s.upstream_provider_json, s.token_limit, s.parallel_limit,
-                        COALESCE(s.tokens_used, 0), listing.installation_id
-                 FROM share_market_listings listing
-                 LEFT JOIN shares s ON s.share_id = listing.share_id
-                 WHERE listing.deleted_at IS NULL
-                   AND ((listing.status = 'active'
-                        AND lower(COALESCE(s.owner_email, '')) = lower(listing.owner_email))
-                    OR listing.owner_user_id = ?1
-                    OR EXISTS (
-                        SELECT 1 FROM share_market_subscriptions sub
-                        WHERE sub.listing_id = listing.id AND sub.renter_user_id = ?1
-                    ))
-                 ORDER BY listing.created_at DESC",
-            )
+            .prepare(&listings_sql)
             .map_err(map_db("prepare Share Market catalog"))?;
         let viewer_user_id = viewer.map(|value| value.user_id.as_str()).unwrap_or("");
         let listing_rows = listings_statement
@@ -1826,11 +2467,13 @@ impl AppStore {
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
-                    row.get::<_, Option<String>>(14)?,
-                    row.get::<_, Option<i64>>(15)?,
-                    row.get::<_, Option<i64>>(16)?,
-                    row.get::<_, i64>(17)?,
-                    row.get::<_, String>(18)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
+                    row.get::<_, Option<i64>>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, String>(20)?,
                 ))
             })
             .map_err(map_db("query Share Market catalog"))?
@@ -1839,22 +2482,31 @@ impl AppStore {
         drop(listings_statement);
 
         let active_subdomains = active_subdomains.iter().cloned().collect::<HashSet<_>>();
-        let mut seats_by_listing = catalog_seats(&conn, viewer_user_id)?;
-        let subscription_records = catalog_subscription_records(&conn, viewer_user_id)?;
-        let payment_profiles = payment_profiles(&conn)?;
-        let price_changes = active_price_changes(&conn)?;
-        let viewer_active_share_ids = viewer
-            .map(|session| {
+        let catalog_share_ids = listing_rows
+            .iter()
+            .map(|row| row.1.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut seats_by_listing = catalog_seats(&conn, viewer_user_id, scope)?;
+        let subscription_records = catalog_subscription_records(&conn, viewer_user_id, scope)?;
+        let related_user_ids = listing_rows
+            .iter()
+            .map(|row| row.4.clone())
+            .chain(
                 subscription_records
                     .values()
-                    .filter(|record| {
-                        record.renter_user_id == session.user_id
-                            && !matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED)
-                    })
-                    .map(|record| record.share_id.clone())
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+                    .map(|record| record.owner_user_id.clone()),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let subscription_ids = subscription_records.keys().cloned().collect::<Vec<_>>();
+        let payment_profiles = payment_profiles(&conn, &related_user_ids)?;
+        let price_changes = active_price_changes(&conn, &subscription_ids)?;
+        let mut performance_by_share = share_market_performance(&conn, &catalog_share_ids)?;
+        let reliability_by_share = share_market_reliability(&conn, &catalog_share_ids)?;
+        let viewer_active_share_ids = active_rented_share_ids(&conn, viewer_user_id)?;
         let mut eligibility_by_supplier_pricing = HashMap::<
             (String, String, Option<String>),
             crate::market_access::MarketEligibilityView,
@@ -1875,7 +2527,9 @@ impl AppStore {
             supported_periods_json,
             current_owner_email,
             grants_json,
-            upstream_provider_json,
+            bindings_json,
+            app_runtimes_json,
+            app_providers_json,
             token_limit,
             parallel_limit,
             tokens_used,
@@ -1884,6 +2538,17 @@ impl AppStore {
         {
             let is_owner = viewer.is_some_and(|value| value.user_id == owner_user_id);
             let share_online = !subdomain.is_empty() && active_subdomains.contains(&subdomain);
+            let app_capabilities = public_app_capabilities(
+                &bindings_json,
+                app_runtimes_json.as_deref(),
+                app_providers_json.as_deref(),
+                &app_type,
+            );
+            let supported_apps = app_capabilities
+                .iter()
+                .map(|capability| capability.app.clone())
+                .collect::<Vec<_>>();
+            let (provider_family, provider_families) = listing_provider_families(&app_capabilities);
             let viewer_already_renting = viewer_active_share_ids.contains(&share_id);
             let viewer_has_direct_grant = viewer.is_some_and(|session| {
                 let grants: BTreeMap<String, ShareUserGrant> =
@@ -1995,23 +2660,33 @@ impl AppStore {
                 .get(&owner_user_id)
                 .map(|(methods, contacts, _)| (payment_method_kinds(methods), contacts.clone()))
                 .unwrap_or_default();
+            let publicly_listed = status == "active"
+                && share_status == "active"
+                && current_owner_email.eq_ignore_ascii_case(&owner_email);
+            let performance = performance_by_share.remove(&share_id).unwrap_or_default();
+            let reliability =
+                reliability_view(reliability_by_share.get(&share_id).copied(), share_online);
             listings.push(ListingView {
                 id,
                 share_id,
                 installation_id,
                 share_name,
                 app_type,
+                supported_apps,
+                provider_family,
+                provider_families,
+                app_capabilities,
                 owner_email,
                 status,
                 share_status,
                 subdomain: subdomain.clone(),
                 share_online,
                 is_owner,
+                publicly_listed,
                 contacts,
                 payment_method_kinds,
-                upstream_provider: upstream_provider_json
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str(value).ok()),
+                performance,
+                reliability,
                 token_limit,
                 parallel_limit,
                 tokens_used,
@@ -2066,12 +2741,54 @@ async fn list_catalog(
 ) -> Result<Json<ShareMarketCatalog>, AppError> {
     let viewer = crate::api::resolve_router_session(&state, &headers).await?;
     let active_subdomains = state.proxy.active_subdomains().await;
-    Ok(Json(
-        state
-            .store
-            .share_market_catalog(viewer.as_ref(), &active_subdomains)
-            .await?,
-    ))
+    let mut catalog = state
+        .store
+        .share_market_catalog_with_scope(
+            viewer.as_ref(),
+            &active_subdomains,
+            ShareMarketCatalogScope::Public,
+        )
+        .await?;
+    retain_public_catalog(&mut catalog);
+    Ok(Json(catalog))
+}
+
+async fn list_my_listings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ShareMarketOwnedListings>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let active_subdomains = state.proxy.active_subdomains().await;
+    let catalog = state
+        .store
+        .share_market_catalog_with_scope(
+            Some(&session),
+            &active_subdomains,
+            ShareMarketCatalogScope::Owner,
+        )
+        .await?;
+    Ok(Json(ShareMarketOwnedListings {
+        listings: catalog.listings,
+    }))
+}
+
+async fn list_my_subscriptions(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ShareMarketSubscriptions>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let active_subdomains = state.proxy.active_subdomains().await;
+    let catalog = state
+        .store
+        .share_market_catalog_with_scope(
+            Some(&session),
+            &active_subdomains,
+            ShareMarketCatalogScope::Renter,
+        )
+        .await?;
+    Ok(Json(ShareMarketSubscriptions {
+        subscriptions: catalog.my_subscriptions,
+    }))
 }
 
 async fn list_owned_shares(
@@ -6343,6 +7060,712 @@ mod tests {
                 params![share_id, now.timestamp()],
             )
             .expect("insert Share health observation");
+    }
+
+    fn insert_performance_sample(
+        conn: &Connection,
+        request_id: &str,
+        share_id: &str,
+        created_at: i64,
+        status_code: i64,
+        latency_ms: i64,
+        first_token_ms: Option<i64>,
+        output_tokens: i64,
+        usage_state: &str,
+        is_streaming: bool,
+        stream_status: Option<&str>,
+        is_health_check: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO share_request_logs (
+                request_id, installation_id, share_id, share_name, provider_id,
+                provider_name, app_type, model, request_model, usage_state,
+                stream_status, status_code, latency_ms, first_token_ms,
+                input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, is_streaming, is_health_check, created_at
+             ) VALUES (
+                ?1, 'installation-performance', ?2, 'Performance Share',
+                'provider-performance', 'Performance Provider', 'codex', 'gpt-test',
+                'gpt-test', ?3, ?4, ?5, ?6, ?7, 10, ?8, 0, 0, ?9, ?10, ?11
+             )",
+            params![
+                request_id,
+                share_id,
+                usage_state,
+                stream_status,
+                status_code,
+                latency_ms,
+                first_token_ms,
+                output_tokens,
+                i64::from(is_streaming as u8),
+                i64::from(is_health_check as u8),
+                created_at,
+            ],
+        )
+        .expect("insert Share Market performance sample");
+    }
+
+    #[test]
+    fn public_capabilities_cover_all_bound_apps_and_provider_families() {
+        let bindings = serde_json::json!({
+            "claude": "anthropic-provider",
+            "codex": "openai-provider",
+            "gemini": "google-provider",
+        })
+        .to_string();
+        let providers = crate::models::ShareAppProviders {
+            claude: vec![crate::models::ShareAppProvider {
+                id: "anthropic-provider".into(),
+                name: "Anthropic Official".into(),
+                app: "claude".into(),
+                kind: Some("official_oauth".into()),
+                enabled: true,
+                model_policy: Some(crate::models::ShareProviderModelPolicy::Single {
+                    upstream_model: "claude-opus-test".into(),
+                }),
+                models: vec![crate::models::ShareUpstreamModel {
+                    slot: "default".into(),
+                    actual_model: "claude-opus-test".into(),
+                }],
+                ..Default::default()
+            }],
+            codex: vec![crate::models::ShareAppProvider {
+                id: "openai-provider".into(),
+                name: "OpenAI Official".into(),
+                app: "codex".into(),
+                kind: Some("official_oauth".into()),
+                enabled: true,
+                model_policy: Some(crate::models::ShareProviderModelPolicy::Passthrough),
+                ..Default::default()
+            }],
+            gemini: vec![crate::models::ShareAppProvider {
+                id: "google-provider".into(),
+                name: "Google Gemini".into(),
+                app: "gemini".into(),
+                kind: Some("official_oauth".into()),
+                enabled: true,
+                ..Default::default()
+            }],
+        };
+        let providers_json = serde_json::to_string(&providers).expect("encode providers");
+
+        let capabilities = public_app_capabilities(&bindings, None, Some(&providers_json), "codex");
+        assert_eq!(
+            capabilities
+                .iter()
+                .map(|capability| capability.app.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex", "gemini"]
+        );
+        assert_eq!(capabilities[0].provider_family, "anthropic");
+        assert_eq!(capabilities[0].model_mode, "fixed");
+        assert_eq!(
+            capabilities[0].upstream_model.as_deref(),
+            Some("claude-opus-test")
+        );
+        assert_eq!(capabilities[1].provider_family, "openai");
+        assert_eq!(capabilities[1].model_mode, "passthrough");
+        assert_eq!(capabilities[2].provider_family, "google");
+        assert_eq!(
+            listing_provider_families(&capabilities),
+            (
+                "multi".into(),
+                vec!["anthropic".into(), "google".into(), "openai".into()]
+            )
+        );
+    }
+
+    #[test]
+    fn public_capabilities_fall_back_to_bound_provider_without_leaking_secrets() {
+        let bindings = serde_json::json!({ "codex": "provider-secret" }).to_string();
+        let runtimes = crate::models::ShareAppRuntimes {
+            codex: Some(crate::models::ShareUpstreamProvider {
+                app: "codex".into(),
+                kind: String::new(),
+                models: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let providers = crate::models::ShareAppProviders {
+            codex: vec![crate::models::ShareAppProvider {
+                id: "provider-secret".into(),
+                name: "OpenAI Official".into(),
+                app: "codex".into(),
+                kind: Some("official_oauth".into()),
+                provider_type: Some("codex_oauth".into()),
+                enabled: true,
+                account_email: Some("secret-account@example.com".into()),
+                api_url: Some("https://secret.invalid/v1".into()),
+                subscription_level: Some("Pro".into()),
+                model_policy: Some(crate::models::ShareProviderModelPolicy::Single {
+                    upstream_model: "gpt-secret".into(),
+                }),
+                models: vec![crate::models::ShareUpstreamModel {
+                    slot: "default".into(),
+                    actual_model: "gpt-secret".into(),
+                }],
+                available: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let runtimes_json = serde_json::to_string(&runtimes).expect("encode runtimes");
+        let providers_json = serde_json::to_string(&providers).expect("encode providers");
+
+        let capabilities = public_app_capabilities(
+            &bindings,
+            Some(&runtimes_json),
+            Some(&providers_json),
+            "codex",
+        );
+        assert_eq!(capabilities.len(), 1);
+        let capability = &capabilities[0];
+        assert_eq!(capability.provider_family, "openai");
+        assert_eq!(capability.provider_name.as_deref(), Some("OpenAI Official"));
+        assert_eq!(capability.provider_type.as_deref(), Some("codex_oauth"));
+        assert_eq!(capability.subscription_level.as_deref(), Some("Pro"));
+        assert_eq!(capability.model_mode, "fixed");
+        assert_eq!(capability.models, ["gpt-secret"]);
+        assert_eq!(capability.available, Some(true));
+
+        let public_json = serde_json::to_string(&capabilities).expect("encode public capability");
+        assert!(!public_json.contains("secret-account@example.com"));
+        assert!(!public_json.contains("https://secret.invalid/v1"));
+        assert!(!public_json.contains("accountEmail"));
+        assert!(!public_json.contains("apiUrl"));
+    }
+
+    #[test]
+    fn unknown_provider_identity_does_not_fall_back_to_app_family() {
+        let bindings = serde_json::json!({ "codex": "unknown-provider" }).to_string();
+        let providers = crate::models::ShareAppProviders {
+            codex: vec![crate::models::ShareAppProvider {
+                id: "unknown-provider".into(),
+                name: "Acme Compute".into(),
+                app: "codex".into(),
+                kind: Some("mystery_transport".into()),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let providers_json = serde_json::to_string(&providers).expect("encode providers");
+
+        let capabilities = public_app_capabilities(&bindings, None, Some(&providers_json), "codex");
+        assert_eq!(capabilities[0].provider_family, "other");
+        assert_eq!(listing_provider_families(&capabilities).0, "other");
+    }
+
+    #[test]
+    fn provider_family_prioritizes_explicit_third_party_api_types() {
+        for provider_type in [
+            "openai_compatible",
+            "openrouter",
+            "ollama_cloud",
+            "nvidia",
+            "deepseek_api",
+            "aws_bedrock",
+            "custom",
+        ] {
+            assert_eq!(
+                normalized_provider_family_parts(
+                    "codex",
+                    provider_type,
+                    Some(provider_type),
+                    Some("OpenAI compatible provider"),
+                ),
+                "api",
+                "provider type {provider_type} should be grouped as an API provider"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_family_keeps_first_party_provider_types() {
+        assert_eq!(
+            normalized_provider_family_parts(
+                "codex",
+                "official_oauth",
+                Some("codex_oauth"),
+                Some("OpenAI Official"),
+            ),
+            "openai"
+        );
+        assert_eq!(
+            normalized_provider_family_parts(
+                "gemini",
+                "api_key",
+                Some("gemini_api_key"),
+                Some("Google Gemini"),
+            ),
+            "google"
+        );
+        assert_eq!(
+            normalized_provider_family_parts(
+                "claude",
+                "api_key",
+                Some("anthropic_api_key"),
+                Some("Anthropic"),
+            ),
+            "anthropic"
+        );
+        assert_eq!(
+            normalized_provider_family_parts(
+                "codex",
+                "official_oauth",
+                Some("codex_oauth"),
+                Some("Custom OpenAI compatible label"),
+            ),
+            "openai"
+        );
+    }
+
+    #[test]
+    fn performance_uses_latest_ten_non_health_streams_and_observed_output_tokens() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let conn = store.conn.blocking_lock();
+        let share_id = "share-performance";
+        insert_performance_sample(
+            &conn,
+            "health-newest",
+            share_id,
+            121,
+            200,
+            1_000,
+            Some(100),
+            100,
+            "observed",
+            true,
+            Some("completed"),
+            true,
+        );
+        insert_performance_sample(
+            &conn,
+            "valid-a",
+            share_id,
+            120,
+            200,
+            3_000,
+            Some(1_000),
+            40,
+            "observed",
+            true,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "valid-b",
+            share_id,
+            119,
+            201,
+            2_500,
+            Some(500),
+            20,
+            "observed",
+            true,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "pending-usage",
+            share_id,
+            118,
+            200,
+            2_700,
+            Some(700),
+            20,
+            "pending",
+            true,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "zero-output",
+            share_id,
+            117,
+            200,
+            1_600,
+            Some(600),
+            0,
+            "observed",
+            true,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "interrupted",
+            share_id,
+            116,
+            200,
+            2_000,
+            Some(500),
+            20,
+            "observed",
+            true,
+            Some("interrupted"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "non-stream",
+            share_id,
+            115,
+            200,
+            2_000,
+            Some(500),
+            20,
+            "observed",
+            false,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "failed",
+            share_id,
+            114,
+            500,
+            2_000,
+            Some(500),
+            20,
+            "observed",
+            true,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "no-first-token",
+            share_id,
+            113,
+            200,
+            2_000,
+            None,
+            20,
+            "observed",
+            true,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "invalid-latency",
+            share_id,
+            112,
+            200,
+            500,
+            Some(500),
+            20,
+            "observed",
+            true,
+            Some("completed"),
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "not-completed",
+            share_id,
+            111,
+            200,
+            2_000,
+            Some(500),
+            20,
+            "observed",
+            true,
+            None,
+            false,
+        );
+        insert_performance_sample(
+            &conn,
+            "outside-window",
+            share_id,
+            110,
+            200,
+            1_500,
+            Some(500),
+            100,
+            "observed",
+            true,
+            Some("completed"),
+            false,
+        );
+
+        let performance = share_market_performance(&conn, &[share_id.into()])
+            .expect("aggregate performance")
+            .remove(share_id)
+            .expect("Share performance");
+        assert_eq!(performance.recent_request_count, 10);
+        assert_eq!(performance.ttft_sample_count, 4);
+        assert_eq!(performance.tps_sample_count, 2);
+        assert_eq!(performance.average_ttft_ms, Some(700.0));
+        assert_eq!(performance.average_tps, Some(15.0));
+    }
+
+    #[test]
+    fn reliability_uses_last_observation_per_minute_within_24_hours() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let conn = store.conn.blocking_lock();
+        let share_id = "share-reliability";
+        let minute = Utc::now().timestamp().div_euclid(60) * 60;
+        for (checked_at, status) in [
+            (minute - 179, "healthy"),
+            (minute - 141, "unhealthy"),
+            (minute - 119, "unhealthy"),
+            (minute - 81, "healthy"),
+            (minute - 59, "healthy"),
+            (minute - 40, "unknown"),
+            (minute - 25 * 60 * 60, "healthy"),
+        ] {
+            conn.execute(
+                "INSERT INTO share_health_checks (
+                    share_id, checked_at, is_healthy, status, reason, router_epoch
+                 ) VALUES (?1, ?2, ?3, ?4, 'test', 'test')",
+                params![share_id, checked_at, i64::from(status == "healthy"), status],
+            )
+            .expect("insert reliability observation");
+        }
+
+        let samples =
+            share_market_reliability(&conn, &[share_id.into()]).expect("aggregate reliability");
+        assert_eq!(samples.get(share_id), Some(&(2, 3)));
+        let reliability = reliability_view(samples.get(share_id).copied(), false);
+        assert!((reliability.online_rate_24h - 66.666_666_666_666_66).abs() < 1e-9);
+        assert_eq!(reliability.observed_minutes_24h, 3);
+        assert!((reliability.observation_coverage_24h - (3.0 / 14.4)).abs() < 1e-9);
+        assert_eq!(reliability_view(None, true).observed_minutes_24h, 1);
+    }
+
+    #[test]
+    fn market_aggregates_span_query_batches() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let conn = store.conn.blocking_lock();
+        let share_ids = (0..=MARKET_AGGREGATE_BATCH_SIZE)
+            .map(|index| format!("share-batch-{index}"))
+            .collect::<Vec<_>>();
+        let now = Utc::now().timestamp();
+        for (index, share_id) in [share_ids.first(), share_ids.last()]
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            insert_performance_sample(
+                &conn,
+                &format!("request-batch-{index}"),
+                share_id,
+                now + index as i64,
+                200,
+                2_000,
+                Some(500),
+                30,
+                "observed",
+                true,
+                Some("completed"),
+                false,
+            );
+            conn.execute(
+                "INSERT INTO share_health_checks (
+                    share_id, checked_at, is_healthy, status, reason, router_epoch
+                 ) VALUES (?1, ?2, 1, 'healthy', 'test', 'test')",
+                params![share_id, now + index as i64],
+            )
+            .expect("insert batched reliability observation");
+        }
+
+        let performance =
+            share_market_performance(&conn, &share_ids).expect("aggregate batched performance");
+        let reliability =
+            share_market_reliability(&conn, &share_ids).expect("aggregate batched reliability");
+        for share_id in [share_ids.first(), share_ids.last()].into_iter().flatten() {
+            assert_eq!(
+                performance
+                    .get(share_id)
+                    .map(|sample| sample.recent_request_count),
+                Some(1)
+            );
+            assert_eq!(reliability.get(share_id), Some(&(1, 1)));
+        }
+        assert!(
+            share_market_performance(&conn, &[])
+                .expect("empty performance")
+                .is_empty()
+        );
+        assert!(
+            share_market_reliability(&conn, &[])
+                .expect("empty reliability")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_catalog_only_serializes_available_seats_without_renter_identity() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-public", "owner-public@example.com");
+        let renter = session("renter-public", "renter-secret@example.com");
+        insert_share(
+            &store,
+            "share-public",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(&conn, &owner, "USD", 50_000, &now);
+        }
+        let listing_id = store
+            .share_market_create_listing(
+                &owner,
+                CreateListingRequest {
+                    share_id: "share-public".into(),
+                    seats: vec![free_seat(), free_seat()],
+                },
+            )
+            .await
+            .expect("create public listing");
+        let rented_seat: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT id FROM share_market_seats WHERE listing_id = ?1 AND position = 1",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .expect("read first public seat");
+        store
+            .share_market_rent_seat(&renter, &rented_seat, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent public seat");
+
+        let mut catalog = store
+            .share_market_catalog(Some(&renter), &["share-public-route".into()])
+            .await
+            .expect("read catalog before public filtering");
+        assert_eq!(catalog.listings[0].seats.len(), 2);
+        assert_eq!(catalog.my_subscriptions.len(), 1);
+        assert!(
+            catalog.listings[0]
+                .seats
+                .iter()
+                .any(|seat| seat.subscription.is_some())
+        );
+
+        retain_public_catalog(&mut catalog);
+        assert_eq!(catalog.listings.len(), 1);
+        assert_eq!(catalog.listings[0].seats.len(), 1);
+        assert_eq!(catalog.listings[0].seats[0].status, SEAT_AVAILABLE);
+        assert!(catalog.listings[0].seats[0].subscription.is_none());
+        let public_json = serde_json::to_string(&catalog).expect("encode public catalog");
+        assert!(!public_json.contains("renter-secret@example.com"));
+        assert!(!public_json.contains("mySubscriptions"));
+        assert!(!public_json.contains("subscription"));
+    }
+
+    #[tokio::test]
+    async fn catalog_scopes_isolate_public_owner_and_renter_data() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner_a = session("owner-scope-a", "owner-scope-a@example.com");
+        let owner_b = session("owner-scope-b", "owner-scope-b@example.com");
+        let renter = session("renter-scope", "renter-scope@example.com");
+        for (share_id, owner) in [("share-scope-a", &owner_a), ("share-scope-b", &owner_b)] {
+            insert_share(&store, share_id, &owner.email, &[ShareTokenPeriod::Day]).await;
+        }
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(&conn, &owner_a, "USD", 50_000, &now);
+        }
+        let listing_a = store
+            .share_market_create_listing(
+                &owner_a,
+                CreateListingRequest {
+                    share_id: "share-scope-a".into(),
+                    seats: vec![free_seat(), free_seat()],
+                },
+            )
+            .await
+            .expect("create owner A listing");
+        store
+            .share_market_create_listing(
+                &owner_b,
+                CreateListingRequest {
+                    share_id: "share-scope-b".into(),
+                    seats: vec![free_seat()],
+                },
+            )
+            .await
+            .expect("create owner B listing");
+        let seat_a: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT id FROM share_market_seats WHERE listing_id = ?1",
+                params![listing_a],
+                |row| row.get(0),
+            )
+            .expect("read owner A seat");
+        store
+            .share_market_rent_seat(&renter, &seat_a, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent owner A seat");
+        let active_subdomains = vec!["share-scope-a-route".into(), "share-scope-b-route".into()];
+
+        let mut public = store
+            .share_market_catalog_with_scope(
+                Some(&renter),
+                &active_subdomains,
+                ShareMarketCatalogScope::Public,
+            )
+            .await
+            .expect("read public scope");
+        let renter_share = public
+            .listings
+            .iter()
+            .find(|listing| listing.share_id == "share-scope-a")
+            .expect("public scope keeps the Share before available-seat filtering");
+        assert_eq!(renter_share.seats.len(), 1);
+        assert!(renter_share.seats.iter().all(|seat| !seat.can_rent));
+        retain_public_catalog(&mut public);
+        let mut public_share_ids = public
+            .listings
+            .iter()
+            .map(|listing| listing.share_id.as_str())
+            .collect::<Vec<_>>();
+        public_share_ids.sort_unstable();
+        assert_eq!(public_share_ids, ["share-scope-a", "share-scope-b"]);
+        assert!(public.my_subscriptions.is_empty());
+
+        let owned = store
+            .share_market_catalog_with_scope(
+                Some(&owner_a),
+                &active_subdomains,
+                ShareMarketCatalogScope::Owner,
+            )
+            .await
+            .expect("read owner scope");
+        assert_eq!(owned.listings.len(), 1);
+        assert_eq!(owned.listings[0].share_id, "share-scope-a");
+        assert!(owned.listings[0].seats[0].subscription.is_some());
+        assert!(owned.my_subscriptions.is_empty());
+
+        let rented = store
+            .share_market_catalog_with_scope(
+                Some(&renter),
+                &active_subdomains,
+                ShareMarketCatalogScope::Renter,
+            )
+            .await
+            .expect("read renter scope");
+        assert!(rented.listings.is_empty());
+        assert_eq!(rented.my_subscriptions.len(), 1);
+        assert_eq!(rented.my_subscriptions[0].share_id, "share-scope-a");
     }
 
     async fn subscription_status(store: &AppStore, subscription_id: &str) -> String {

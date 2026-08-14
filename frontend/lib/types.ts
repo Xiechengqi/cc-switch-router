@@ -1353,6 +1353,20 @@ export type RouterMetricsStatus = {
   proxyRequestsTotal: number;
   proxyUpstreamErrorsTotal: number;
   proxy5xxTotal: number;
+  shareActiveRequests: number;
+  shareOldestInflightAgeSecs: number;
+  shareOldestProgressAgeSecs: number;
+  shareRequestWatchdogForcedReleaseTotal: number;
+  shareRequestManualReleaseTotal: number;
+  proxyRequestBodyTimeoutTotal: number;
+  proxyResponseHeaderTimeoutTotal: number;
+  proxyDownstreamStallTimeoutTotal: number;
+  proxyRequestHardTimeoutTotal: number;
+  proxyStreamSemanticTerminalTotal: number;
+  proxyStreamFirstEventTimeoutTotal: number;
+  proxyStreamIdleTimeoutTotal: number;
+  proxyStreamParserOverflowTotal: number;
+  proxyStreamUpstreamErrorsTotal: number;
   healthProbeFailuresTotal: number;
   healthProbeCachedFailuresTotal: number;
   dbErrorsTotal: number;
@@ -2281,12 +2295,54 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   subscription?: ShareMarketSubscription;
 };
 
+export type ShareMarketProviderFamily =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "xai"
+  | "cursor"
+  | "kiro"
+  | "copilot"
+  | "api"
+  | "multi"
+  | "other";
+
+export type ShareMarketAppCapability = {
+  app: string;
+  providerFamily: ShareMarketProviderFamily;
+  providerName?: string;
+  providerType?: string;
+  subscriptionLevel?: string;
+  modelMode: "fixed" | "passthrough" | "unknown";
+  upstreamModel?: string;
+  models: string[];
+  available?: boolean;
+};
+
+export type ShareMarketPerformance = {
+  averageTtftMs?: number;
+  averageTps?: number;
+  recentRequestCount: number;
+  ttftSampleCount: number;
+  tpsSampleCount: number;
+};
+
+export type ShareMarketReliability = {
+  onlineRate24h: number;
+  observedMinutes24h: number;
+  observationCoverage24h: number;
+};
+
 export type ShareMarketListing = {
   id: string;
   shareId: string;
   installationId: string;
   shareName: string;
   appType: string;
+  supportedApps: string[];
+  providerFamily: ShareMarketProviderFamily;
+  providerFamilies: ShareMarketProviderFamily[];
+  appCapabilities: ShareMarketAppCapability[];
   ownerEmail: string;
   status: string;
   shareStatus: string;
@@ -2295,7 +2351,8 @@ export type ShareMarketListing = {
   isOwner: boolean;
   contacts?: PaymentContact[];
   paymentMethodKinds: string[];
-  upstreamProvider?: ShareUpstreamProvider;
+  performance: ShareMarketPerformance;
+  reliability: ShareMarketReliability;
   tokenLimit?: number;
   parallelLimit?: number;
   tokensUsed?: number;
@@ -2307,8 +2364,15 @@ export type ShareMarketListing = {
 
 export type ShareMarketCatalog = {
   listings: ShareMarketListing[];
-  mySubscriptions: ShareMarketSubscription[];
   trialHours: number;
+};
+
+export type ShareMarketOwnedListings = {
+  listings: ShareMarketListing[];
+};
+
+export type ShareMarketSubscriptions = {
+  subscriptions: ShareMarketSubscription[];
 };
 
 export type ShareMarketOwnedShare = {
