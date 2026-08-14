@@ -37,6 +37,7 @@ const CONTROL_EDIT_TTL_SECS: i64 = 5 * 60;
 const CONTROL_RETRY_BASE_SECS: i64 = 15;
 const CONTROL_RETRY_MAX_SECS: i64 = 15 * 60;
 pub(crate) const SHARE_MARKET_CONTROL_ACTOR_EMAIL: &str = "share-market@router.internal";
+pub(crate) const SHARE_REVISION_CONFLICT_CODE: &str = "cc_switch_share_revision_conflict";
 
 const SEAT_AVAILABLE: &str = "available";
 const SEAT_DISABLED: &str = "disabled";
@@ -138,6 +139,9 @@ pub struct ListingView {
     pub subdomain: String,
     pub share_online: bool,
     pub is_owner: bool,
+    pub can_delete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_blocked_reason: Option<String>,
     #[serde(skip)]
     pub publicly_listed: bool,
     #[serde(default)]
@@ -177,6 +181,9 @@ pub struct SeatView {
     pub seller_approval_required: bool,
     pub eligibility: crate::market_access::MarketEligibilityView,
     pub read_only: bool,
+    pub can_delete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +223,10 @@ pub struct SubscriptionView {
     pub price_change: Option<PriceChangeView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<String>,
     pub created_at: String,
@@ -1639,6 +1650,10 @@ struct SubscriptionRecord {
     service_duration_days: Option<u32>,
     offer_revision: i64,
     release_reason: Option<String>,
+    failure_code: Option<String>,
+    grant_attempts: Option<i64>,
+    has_active_control_work: bool,
+    has_active_billing_contract: bool,
     activated_at: Option<String>,
     expires_at: Option<String>,
     released_at: Option<String>,
@@ -1688,7 +1703,26 @@ fn subscription_record(
                 sub.daily_rate_minor, sub.currency, sub.service_duration_days,
                 sub.offer_revision, sub.release_reason, sub.activated_at, sub.expires_at,
                 sub.released_at,
-                sub.created_at, sub.updated_at
+                sub.created_at, sub.updated_at,
+                (SELECT edit.error_code
+                 FROM share_control_operations operation
+                 LEFT JOIN share_edit_requests edit ON edit.id = operation.edit_id
+                 WHERE operation.subscription_id = sub.id AND operation.action = 'upsert'
+                 ORDER BY operation.share_sequence DESC LIMIT 1),
+                (SELECT operation.attempts
+                 FROM share_control_operations operation
+                 WHERE operation.subscription_id = sub.id AND operation.action = 'upsert'
+                 ORDER BY operation.share_sequence DESC LIMIT 1),
+                EXISTS (
+                    SELECT 1 FROM share_control_operations operation
+                    WHERE operation.subscription_id = sub.id
+                      AND operation.status IN ('pending', 'dispatched')
+                ),
+                EXISTS (
+                    SELECT 1 FROM market_service_contracts contract
+                    WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                      AND contract.status != 'terminated'
+                )
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -1721,6 +1755,10 @@ fn subscription_record(
                 released_at: row.get(21)?,
                 created_at: row.get(22)?,
                 updated_at: row.get(23)?,
+                failure_code: row.get(24)?,
+                grant_attempts: row.get(25)?,
+                has_active_control_work: row.get::<_, i64>(26)? != 0,
+                has_active_billing_contract: row.get::<_, i64>(27)? != 0,
             })
         },
     )
@@ -1792,7 +1830,26 @@ fn catalog_subscription_records(
                 sub.renter_email, sub.status, sub.daily_rate_minor, sub.currency,
                 sub.service_duration_days, sub.offer_revision,
                 sub.release_reason, sub.activated_at, sub.expires_at, sub.released_at,
-                sub.created_at, sub.updated_at
+                sub.created_at, sub.updated_at,
+                (SELECT edit.error_code
+                 FROM share_control_operations operation
+                 LEFT JOIN share_edit_requests edit ON edit.id = operation.edit_id
+                 WHERE operation.subscription_id = sub.id AND operation.action = 'upsert'
+                 ORDER BY operation.share_sequence DESC LIMIT 1),
+                (SELECT operation.attempts
+                 FROM share_control_operations operation
+                 WHERE operation.subscription_id = sub.id AND operation.action = 'upsert'
+                 ORDER BY operation.share_sequence DESC LIMIT 1),
+                EXISTS (
+                    SELECT 1 FROM share_control_operations operation
+                    WHERE operation.subscription_id = sub.id
+                      AND operation.status IN ('pending', 'dispatched')
+                ),
+                EXISTS (
+                    SELECT 1 FROM market_service_contracts contract
+                    WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                      AND contract.status != 'terminated'
+                )
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -1828,6 +1885,10 @@ fn catalog_subscription_records(
                         released_at: row.get(21)?,
                         created_at: row.get(22)?,
                         updated_at: row.get(23)?,
+                        failure_code: row.get(24)?,
+                        grant_attempts: row.get(25)?,
+                        has_active_control_work: row.get::<_, i64>(26)? != 0,
+                        has_active_billing_contract: row.get::<_, i64>(27)? != 0,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -1851,6 +1912,120 @@ struct CatalogSeatRecord {
     current_subscription_id: Option<String>,
     retired_subscription_id: Option<String>,
     retired_at: Option<String>,
+    subscription_count: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeleteCapability {
+    can_delete: bool,
+    blocked_reason: Option<&'static str>,
+}
+
+impl DeleteCapability {
+    const fn allowed() -> Self {
+        Self {
+            can_delete: true,
+            blocked_reason: None,
+        }
+    }
+
+    const fn blocked(reason: &'static str) -> Self {
+        Self {
+            can_delete: false,
+            blocked_reason: Some(reason),
+        }
+    }
+}
+
+fn seat_delete_capability(
+    is_owner: bool,
+    seat_status: &str,
+    retired_at: Option<&str>,
+    subscription_count: i64,
+    subscription: Option<&SubscriptionRecord>,
+) -> DeleteCapability {
+    if !is_owner {
+        return DeleteCapability::blocked("owner_only");
+    }
+    if subscription_count == 0 && retired_at.is_none() {
+        return if matches!(seat_status, SEAT_AVAILABLE | SEAT_DISABLED) {
+            DeleteCapability::allowed()
+        } else {
+            DeleteCapability::blocked("seat_not_reclaimable")
+        };
+    }
+    let Some(subscription) = subscription else {
+        return DeleteCapability::blocked("rental_history");
+    };
+    if subscription.status != SUB_GRANT_FAILED {
+        return DeleteCapability::blocked("rental_history");
+    }
+    if subscription.has_active_control_work {
+        return DeleteCapability::blocked("control_pending");
+    }
+    if subscription.has_active_billing_contract {
+        return DeleteCapability::blocked("billing_active");
+    }
+    DeleteCapability::allowed()
+}
+
+fn listing_delete_capability_tx(
+    conn: &Connection,
+    listing_id: &str,
+    listing_status: &str,
+    is_owner: bool,
+) -> Result<DeleteCapability, AppError> {
+    if !is_owner {
+        return Ok(DeleteCapability::blocked("owner_only"));
+    }
+    if listing_status != "closed" {
+        return Ok(DeleteCapability::blocked("listing_must_be_closed"));
+    }
+    let (has_nonterminal_subscription, has_active_control_work, has_active_billing_contract) = conn
+        .query_row(
+            "SELECT
+                EXISTS (
+                    SELECT 1 FROM share_market_subscriptions subscription
+                    WHERE subscription.listing_id = ?1
+                      AND subscription.status NOT IN ('released', 'grant_failed')
+                ),
+                EXISTS (
+                    SELECT 1
+                    FROM share_control_operations operation
+                    JOIN share_market_subscriptions subscription
+                      ON subscription.id = operation.subscription_id
+                    WHERE subscription.listing_id = ?1
+                      AND operation.status IN ('pending', 'dispatched')
+                ),
+                EXISTS (
+                    SELECT 1
+                    FROM market_service_contracts contract
+                    JOIN share_market_subscriptions subscription
+                      ON subscription.id = contract.product_ref
+                    WHERE subscription.listing_id = ?1
+                      AND contract.product_kind = 'share'
+                      AND contract.status != 'terminated'
+                )",
+            params![listing_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .map_err(map_db("read Share listing delete capability"))?;
+    if has_nonterminal_subscription {
+        return Ok(DeleteCapability::blocked("active_rentals"));
+    }
+    if has_active_control_work {
+        return Ok(DeleteCapability::blocked("control_pending"));
+    }
+    if has_active_billing_contract {
+        return Ok(DeleteCapability::blocked("billing_active"));
+    }
+    Ok(DeleteCapability::allowed())
 }
 
 fn catalog_seats(
@@ -1869,7 +2044,9 @@ fn catalog_seats(
                 seat.parallel_limit, seat.token_limit, seat.token_period_json,
                 seat.daily_rate_minor, seat.currency, seat.service_duration_days,
                 seat.offer_revision, seat.current_subscription_id,
-                seat.retired_subscription_id, seat.retired_at
+                seat.retired_subscription_id, seat.retired_at,
+                (SELECT COUNT(*) FROM share_market_subscriptions subscription
+                 WHERE subscription.seat_id = seat.id)
          FROM share_market_seats seat
          JOIN share_market_listings listing ON listing.id = seat.listing_id
          LEFT JOIN shares share ON share.share_id = listing.share_id
@@ -1901,6 +2078,7 @@ fn catalog_seats(
                             current_subscription_id: row.get(11)?,
                             retired_subscription_id: row.get(12)?,
                             retired_at: row.get(13)?,
+                            subscription_count: row.get(14)?,
                         },
                     ))
                 })?
@@ -2326,6 +2504,19 @@ fn subscription_view(
         && price_change.is_none();
     let share_online =
         !record.subdomain.is_empty() && active_subdomains.contains(&record.subdomain);
+    let show_failure_details = (is_owner || is_renter) && record.status == SUB_GRANT_FAILED;
+    let release_reason = if record.status == SUB_GRANT_FAILED && !show_failure_details {
+        None
+    } else {
+        record.release_reason
+    };
+    let failure_code = show_failure_details
+        .then(|| record.failure_code.clone())
+        .flatten();
+    let grant_attempts = show_failure_details
+        .then_some(record.grant_attempts)
+        .flatten()
+        .and_then(|attempts| u32::try_from(attempts).ok());
     SubscriptionView {
         id: record.id,
         seat_id: record.seat_id,
@@ -2351,7 +2542,9 @@ fn subscription_view(
         can_force_revoke,
         can_propose_price_change,
         price_change,
-        release_reason: record.release_reason,
+        release_reason,
+        failure_code,
+        grant_attempts,
         released_at: record.released_at,
         created_at: record.created_at,
         updated_at: record.updated_at,
@@ -2597,20 +2790,27 @@ impl AppStore {
                     .current_subscription_id
                     .as_ref()
                     .or(seat.retired_subscription_id.as_ref());
-                let subscription = subscription_id
+                let subscription_record = subscription_id
                     .and_then(|subscription_id| subscription_records.get(subscription_id))
-                    .cloned()
-                    .map(|record| {
-                        let payment_profile = payment_profiles.get(&record.owner_user_id);
-                        let price_change = price_changes.get(&record.id);
-                        subscription_view(
-                            record,
-                            viewer,
-                            &active_subdomains,
-                            payment_profile,
-                            price_change,
-                        )
-                    });
+                    .cloned();
+                let delete_capability = seat_delete_capability(
+                    is_owner,
+                    &seat.status,
+                    seat.retired_at.as_deref(),
+                    seat.subscription_count,
+                    subscription_record.as_ref(),
+                );
+                let subscription = subscription_record.map(|record| {
+                    let payment_profile = payment_profiles.get(&record.owner_user_id);
+                    let price_change = price_changes.get(&record.id);
+                    subscription_view(
+                        record,
+                        viewer,
+                        &active_subdomains,
+                        payment_profile,
+                        price_change,
+                    )
+                });
                 let base_rent_prerequisites = viewer.is_some_and(|session| {
                     status == "active"
                         && share_status == "active"
@@ -2652,6 +2852,8 @@ impl AppStore {
                     seller_approval_required,
                     eligibility,
                     read_only,
+                    can_delete: delete_capability.can_delete,
+                    delete_blocked_reason: delete_capability.blocked_reason.map(str::to_string),
                     retired_at: seat.retired_at,
                     subscription,
                 });
@@ -2666,6 +2868,7 @@ impl AppStore {
             let performance = performance_by_share.remove(&share_id).unwrap_or_default();
             let reliability =
                 reliability_view(reliability_by_share.get(&share_id).copied(), share_online);
+            let delete_capability = listing_delete_capability_tx(&conn, &id, &status, is_owner)?;
             listings.push(ListingView {
                 id,
                 share_id,
@@ -2682,6 +2885,8 @@ impl AppStore {
                 subdomain: subdomain.clone(),
                 share_online,
                 is_owner,
+                can_delete: delete_capability.can_delete,
+                delete_blocked_reason: delete_capability.blocked_reason.map(str::to_string),
                 publicly_listed,
                 contacts,
                 payment_method_kinds,
@@ -3659,19 +3864,47 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(map_db("begin delete Share seat"))?;
-        let row: Option<(String, String, String, Option<String>, i64)> = tx
+        let row: Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        )> = tx
             .query_row(
                 "SELECT listing.owner_user_id, seat.status, seat.listing_id, seat.retired_at,
+                        seat.current_subscription_id, seat.retired_subscription_id,
                         (SELECT COUNT(*) FROM share_market_subscriptions sub WHERE sub.seat_id = seat.id)
                  FROM share_market_seats seat
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
                  WHERE seat.id = ?1",
                 params![seat_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_db("read Share seat for delete"))?;
-        let Some((owner_user_id, status, listing_id, retired_at, subscription_count)) = row else {
+        let Some((
+            owner_user_id,
+            status,
+            listing_id,
+            retired_at,
+            current_subscription_id,
+            retired_subscription_id,
+            subscription_count,
+        )) = row
+        else {
             return Err(AppError::NotFound("seat not found".into()));
         };
         if owner_user_id != session.user_id {
@@ -3679,21 +3912,48 @@ impl AppStore {
                 "only listing owner can delete seat".into(),
             ));
         }
-        if retired_at.is_some() || subscription_count > 0 {
-            return Err(AppError::Conflict(
-                "a seat with rental history is read-only".into(),
-            ));
+        if status == SEAT_DELETED {
+            return Ok(());
         }
-        if status != SEAT_AVAILABLE && status != SEAT_DISABLED {
-            return Err(AppError::Conflict(
-                "reclaim the occupied seat before deleting it".into(),
-            ));
+        let subscription_id = current_subscription_id
+            .as_ref()
+            .or(retired_subscription_id.as_ref());
+        let subscription = subscription_id
+            .map(|subscription_id| subscription_record(&tx, subscription_id))
+            .transpose()?
+            .flatten();
+        let capability = seat_delete_capability(
+            true,
+            &status,
+            retired_at.as_deref(),
+            subscription_count,
+            subscription.as_ref(),
+        );
+        if !capability.can_delete {
+            return Err(AppError::Conflict(format!(
+                "Share seat cannot be deleted: {}",
+                capability.blocked_reason.unwrap_or("delete_blocked")
+            )));
         }
+        let cleanup_reason = if subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.status == SUB_GRANT_FAILED)
+        {
+            "grant_failed_cleanup"
+        } else {
+            "unused_seat_cleanup"
+        };
         tx.execute(
             "UPDATE share_market_seats
-             SET status = ?2, current_subscription_id = NULL, updated_at = ?3
+             SET status = ?2,
+                 retired_subscription_id = COALESCE(retired_subscription_id, current_subscription_id),
+                 retired_at = CASE
+                     WHEN ?4 > 0 THEN COALESCE(retired_at, ?3)
+                     ELSE retired_at
+                 END,
+                 current_subscription_id = NULL, updated_at = ?3
              WHERE id = ?1",
-            params![seat_id, SEAT_DELETED, now],
+            params![seat_id, SEAT_DELETED, now, subscription_count],
         )
         .map_err(map_db("delete Share seat"))?;
         event_tx(
@@ -3703,7 +3963,7 @@ impl AppStore {
             None,
             Some(session),
             "seat_deleted",
-            serde_json::json!({}),
+            serde_json::json!({ "reason": cleanup_reason }),
             &now,
         )?;
         tx.commit().map_err(map_db("commit delete Share seat"))?;
@@ -3772,16 +4032,16 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(map_db("begin delete Share listing"))?;
-        let row: Option<(String, String)> = tx
+        let row: Option<(String, String, Option<String>)> = tx
             .query_row(
-                "SELECT owner_user_id, status FROM share_market_listings
-                 WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT owner_user_id, status, deleted_at FROM share_market_listings
+                 WHERE id = ?1",
                 params![listing_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(map_db("read Share listing for delete"))?;
-        let Some((owner_user_id, status)) = row else {
+        let Some((owner_user_id, status, deleted_at)) = row else {
             return Err(AppError::NotFound("listing not found".into()));
         };
         if owner_user_id != session.user_id {
@@ -3789,26 +4049,25 @@ impl AppStore {
                 "only listing owner can delete listing".into(),
             ));
         }
-        if status != "closed" {
-            return Err(AppError::BadRequest(
-                "only closed listings can be deleted".into(),
-            ));
+        if deleted_at.is_some() {
+            return Ok(());
         }
-        let rental_history: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM share_market_subscriptions
-                 WHERE listing_id = ?1",
-                params![listing_id],
-                |row| row.get(0),
-            )
-            .map_err(map_db("count active Share rentals before delete"))?;
-        if rental_history > 0 {
-            return Err(AppError::Conflict(
-                "cannot delete a listing after a seat has been rented".into(),
-            ));
+        let capability = listing_delete_capability_tx(&tx, listing_id, &status, true)?;
+        if !capability.can_delete {
+            return Err(AppError::Conflict(format!(
+                "Share listing cannot be deleted: {}",
+                capability.blocked_reason.unwrap_or("delete_blocked")
+            )));
         }
         tx.execute(
-            "UPDATE share_market_seats SET status = 'deleted', updated_at = ?2
+            "UPDATE share_market_seats
+             SET status = 'deleted',
+                 retired_subscription_id = COALESCE(retired_subscription_id, current_subscription_id),
+                 retired_at = CASE
+                     WHEN current_subscription_id IS NOT NULL THEN COALESCE(retired_at, ?2)
+                     ELSE retired_at
+                 END,
+                 current_subscription_id = NULL, updated_at = ?2
              WHERE listing_id = ?1 AND status != 'deleted'",
             params![listing_id, now],
         )
@@ -4198,26 +4457,7 @@ impl AppStore {
             })
             .transpose()?;
         let free_usage_seconds = if daily_rate_minor.is_none() {
-            match service_duration_days {
-                Some(days) => {
-                    let seconds = crate::market_billing::claim_free_usage_tx(
-                        &tx,
-                        &session.user_id,
-                        &owner_user_id,
-                        crate::market_access::PRODUCT_SHARE,
-                        &share_id,
-                        days,
-                        &now,
-                    )?;
-                    if seconds == 0 {
-                        return Err(AppError::Conflict(
-                            "the free experience for this Provider has already been used".into(),
-                        ));
-                    }
-                    Some(seconds)
-                }
-                None => None,
-            }
+            service_duration_days.map(|days| i64::from(days) * 86_400)
         } else {
             None
         };
@@ -5818,13 +6058,32 @@ impl AppStore {
                            WHERE edit.share_id = op.share_id AND edit.status = 'pending'
                              AND edit.retired_at IS NULL
                        )
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM share_edit_requests conflict_edit
+                           JOIN shares current_share ON current_share.share_id = op.share_id
+                           WHERE conflict_edit.id = op.edit_id
+                             AND conflict_edit.status = 'rejected'
+                             AND conflict_edit.error_code = ?3
+                             AND (
+                                 COALESCE(json_type(
+                                     conflict_edit.patch_json,
+                                     '$.managedGrant.expectedConfigRevision'
+                                 ), '') != 'integer'
+                                 OR CAST(json_extract(
+                                     conflict_edit.patch_json,
+                                     '$.managedGrant.expectedConfigRevision'
+                                 ) AS INTEGER) >= current_share.config_revision
+                             )
+                       )
                      ORDER BY op.created_at, op.share_sequence",
                 )
                 .map_err(map_db("prepare Share control dispatch"))?;
             statement
-                .query_map(params![MAX_CONTROL_ATTEMPTS, now], |row| {
-                    row.get::<_, String>(0)
-                })
+                .query_map(
+                    params![MAX_CONTROL_ATTEMPTS, now, SHARE_REVISION_CONFLICT_CODE],
+                    |row| row.get::<_, String>(0),
+                )
                 .map_err(map_db("query Share control dispatch"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(map_db("read Share control dispatch"))?
@@ -6164,18 +6423,32 @@ pub(crate) fn handle_control_edit_ack_with_metadata(
     let retry_requested = retryable == Some(true);
     let explicitly_nonretryable = retryable == Some(false);
     let should_retry = retry_requested && attempts < MAX_CONTROL_ATTEMPTS;
+    let revision_conflict = error_code == Some(SHARE_REVISION_CONFLICT_CODE);
     let sanitized_error = error_message.map(crate::store::client_chat::sanitize_system_event_text);
     let error_message = sanitized_error.as_deref();
     if should_retry {
-        let next_attempt_at = control_retry_at(now, attempts)?;
-        conn.execute(
-            "UPDATE share_control_operations
-             SET status = 'pending', edit_id = NULL, updated_at = ?2, last_error = ?3,
-                 next_attempt_at = ?4
-             WHERE id = ?1 AND status = 'dispatched'",
-            params![operation_id, now, error_message, next_attempt_at],
-        )
-        .map_err(map_db("retry Share control operation"))?;
+        if revision_conflict {
+            conn.execute(
+                "UPDATE share_control_operations
+                 SET status = 'pending', updated_at = ?2, last_error = ?3,
+                     next_attempt_at = ?2
+                 WHERE id = ?1 AND status = 'dispatched'",
+                params![operation_id, now, error_message],
+            )
+            .map_err(map_db(
+                "wait for Share revision refresh before control retry",
+            ))?;
+        } else {
+            let next_attempt_at = control_retry_at(now, attempts)?;
+            conn.execute(
+                "UPDATE share_control_operations
+                 SET status = 'pending', edit_id = NULL, updated_at = ?2, last_error = ?3,
+                     next_attempt_at = ?4
+                 WHERE id = ?1 AND status = 'dispatched'",
+                params![operation_id, now, error_message, next_attempt_at],
+            )
+            .map_err(map_db("retry Share control operation"))?;
+        }
         return Ok(());
     }
     let dead_letter =
@@ -6750,21 +7023,25 @@ async fn try_apply_dispatched_edit_via_ctl(
             let message = error.client_message();
             let error_code = error.error_code().map(str::to_string);
             let retryable = error.retryable();
+            let current_config_revision = error.current_config_revision();
+            let current_share = error.current_share().cloned();
             tracing::warn!(
                 share_id = %event.share_id,
                 edit_id = %edit.id,
                 error = %message,
                 "Share Market control RPC rejected managed grant"
             );
-            let _ = state
+            state
                 .store
                 .mark_share_edit_rejected_with_metadata(
                     &edit.id,
                     &message,
                     error_code.as_deref(),
                     Some(retryable),
+                    current_config_revision,
+                    current_share.as_ref(),
                 )
-                .await;
+                .await?;
             Ok(false)
         }
     }
@@ -9081,7 +9358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn free_rental_descriptor_confirmation_recovers_lost_acks() {
+    async fn free_rental_descriptor_confirmation_recovers_lost_acks_and_allows_repeat_rental() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner", "owner@example.com");
         let renter = session("renter", "renter@example.com");
@@ -9171,11 +9448,10 @@ mod tests {
         assert!(retired_at.is_none());
         assert_eq!(revoke_status, "applied");
         assert_eq!(revoke_attempts, 0);
-        let other = session("other", "other@example.com");
         store
-            .share_market_rent_seat(&other, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
-            .expect("reuse released seat");
+            .expect("same renter can reuse released free seat");
 
         let owner_catalog = store
             .share_market_catalog(Some(&owner), &[])
@@ -9193,7 +9469,7 @@ mod tests {
                 .subscription
                 .as_ref()
                 .map(|subscription| subscription.renter_email.as_str()),
-            Some(other.email.as_str())
+            Some(renter.email.as_str())
         );
 
         let renter_catalog = store
@@ -10115,7 +10391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_revision_retry_and_terminal_ack_are_idempotent() {
+    async fn config_revision_retry_waits_for_refresh_and_uses_each_new_revision() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-retry", "owner-retry@example.com");
         let renter = session("renter-retry", "renter-retry@example.com");
@@ -10126,6 +10402,15 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET config_revision = 3 WHERE share_id = 'share-retry'",
+                [],
+            )
+            .expect("seed Share config revision");
         let (_listing_id, seat_id) =
             create_listing(&store, &owner, "share-retry", free_seat()).await;
         let subscription_id = store
@@ -10141,17 +10426,27 @@ mod tests {
                 .len(),
             1
         );
-        let first_edit: String = store
+        let (first_edit, first_patch): (String, String) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT edit_id FROM share_control_operations
-                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                "SELECT operation.edit_id, edit.patch_json
+                 FROM share_control_operations operation
+                 JOIN share_edit_requests edit ON edit.id = operation.edit_id
+                 WHERE operation.subscription_id = ?1 AND operation.action = 'upsert'",
                 params![subscription_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("read first grant edit");
+        let first_patch: serde_json::Value =
+            serde_json::from_str(&first_patch).expect("parse first grant patch");
+        assert_eq!(
+            first_patch
+                .pointer("/managedGrant/expectedConfigRevision")
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
         {
             let conn = store.conn.lock().await;
             conn.execute(
@@ -10163,8 +10458,8 @@ mod tests {
                 &conn,
                 &first_edit,
                 "rejected",
-                Some("expected config revision 1 but found 2"),
-                Some("config_revision_conflict"),
+                Some("managed grant expected config revision 3, current revision is 4"),
+                Some(SHARE_REVISION_CONFLICT_CODE),
                 Some(true),
                 &now.to_rfc3339(),
             )
@@ -10177,17 +10472,40 @@ mod tests {
                 )
                 .expect("read retired retry edit");
             assert!(retired_at.is_some());
-            conn.execute(
-                "UPDATE shares SET config_revision = 9 WHERE share_id = 'share-retry'",
+        }
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(1))
+                .await
+                .expect("wait for authoritative Share refresh")
+                .is_empty()
+        );
+        let blocked_retry: (String, i64, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, attempts, edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read revision-gated retry");
+        assert_eq!(blocked_retry.0, "pending");
+        assert_eq!(blocked_retry.1, 1);
+        assert_eq!(blocked_retry.2, first_edit);
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET config_revision = 4 WHERE share_id = 'share-retry'",
                 [],
             )
-            .expect("advance Share config revision");
-        }
+            .expect("apply authoritative revision four");
         assert_eq!(
             store
-                .share_market_reconcile_and_dispatch(
-                    now + Duration::seconds(CONTROL_RETRY_BASE_SECS),
-                )
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(2))
                 .await
                 .expect("redispatch grant")
                 .len(),
@@ -10217,7 +10535,7 @@ mod tests {
             patch
                 .pointer("/managedGrant/expectedConfigRevision")
                 .and_then(serde_json::Value::as_u64),
-            Some(9)
+            Some(4)
         );
         assert_eq!(
             patch
@@ -10233,24 +10551,79 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE share_edit_requests SET status = 'applied' WHERE id = ?1",
+                "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
                 params![second_edit],
+            )
+            .expect("reject second edit");
+            handle_control_edit_ack_with_metadata(
+                &conn,
+                &second_edit,
+                "rejected",
+                Some("managed grant expected config revision 4, current revision is 5"),
+                Some(SHARE_REVISION_CONFLICT_CODE),
+                Some(true),
+                &(now + Duration::seconds(3)).to_rfc3339(),
+            )
+            .expect("retry second config conflict");
+            conn.execute(
+                "UPDATE shares SET config_revision = 5 WHERE share_id = 'share-retry'",
+                [],
+            )
+            .expect("apply authoritative revision five");
+        }
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(4))
+                .await
+                .expect("dispatch third grant")
+                .len(),
+            1
+        );
+        let (attempts, third_edit, third_patch): (i64, String, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT operation.attempts, operation.edit_id, edit.patch_json
+                 FROM share_control_operations operation
+                 JOIN share_edit_requests edit ON edit.id = operation.edit_id
+                 WHERE operation.subscription_id = ?1 AND operation.action = 'upsert'",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read third grant");
+        assert_eq!(attempts, 3);
+        assert_ne!(third_edit, second_edit);
+        let third_patch: serde_json::Value =
+            serde_json::from_str(&third_patch).expect("parse third grant patch");
+        assert_eq!(
+            third_patch
+                .pointer("/managedGrant/expectedConfigRevision")
+                .and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'applied' WHERE id = ?1",
+                params![third_edit],
             )
             .expect("apply retried edit");
             handle_control_edit_ack(
                 &conn,
-                &second_edit,
+                &third_edit,
                 "applied",
                 None,
-                &(now + Duration::seconds(CONTROL_RETRY_BASE_SECS + 1)).to_rfc3339(),
+                &(now + Duration::seconds(5)).to_rfc3339(),
             )
             .expect("apply retried control operation");
             handle_control_edit_ack(
                 &conn,
-                &second_edit,
+                &third_edit,
                 "rejected",
                 Some("late duplicate rejection"),
-                &(now + Duration::seconds(CONTROL_RETRY_BASE_SECS + 2)).to_rfc3339(),
+                &(now + Duration::seconds(6)).to_rfc3339(),
             )
             .expect("ignore late terminal ack");
         }
@@ -10271,9 +10644,7 @@ mod tests {
         assert_eq!(delayed_subscription_status, SUB_GRANT_PENDING);
         set_entitlement(&store, &subscription_id).await;
         store
-            .share_market_reconcile_and_dispatch(
-                now + Duration::seconds(CONTROL_RETRY_BASE_SECS + 3),
-            )
+            .share_market_reconcile_and_dispatch(now + Duration::seconds(7))
             .await
             .expect("confirm delayed descriptor");
         assert_eq!(
@@ -10532,11 +10903,13 @@ mod tests {
                 params![first_edit],
             )
             .expect("reject grant edit");
-            handle_control_edit_ack(
+            handle_control_edit_ack_with_metadata(
                 &conn,
                 &first_edit,
                 "rejected",
                 Some("managed grant rejected"),
+                Some("grant_policy_rejected"),
+                Some(false),
                 &(now + Duration::seconds(1)).to_rfc3339(),
             )
             .expect("record failed grant");
@@ -10566,6 +10939,86 @@ mod tests {
             Some(first_subscription.as_str())
         );
         assert!(retired_at.is_some());
+        let owner_catalog = store
+            .share_market_catalog_with_scope(Some(&owner), &[], ShareMarketCatalogScope::Owner)
+            .await
+            .expect("read failed seat cleanup capability");
+        let failed_seat = owner_catalog
+            .listings
+            .iter()
+            .find(|listing| listing.id == listing_id)
+            .and_then(|listing| listing.seats.iter().find(|seat| seat.id == seat_id))
+            .expect("failed seat remains visible to owner");
+        assert!(failed_seat.can_delete);
+        let failed_subscription = failed_seat
+            .subscription
+            .as_ref()
+            .expect("failed subscription");
+        assert_eq!(
+            failed_subscription.failure_code.as_deref(),
+            Some("grant_policy_rejected")
+        );
+        assert_eq!(failed_subscription.grant_attempts, Some(1));
+        assert_eq!(
+            failed_subscription.release_reason.as_deref(),
+            Some("managed grant rejected")
+        );
+        store
+            .share_market_delete_seat(&owner, &seat_id)
+            .await
+            .expect("soft-delete failed grant seat");
+        store
+            .share_market_delete_seat(&owner, &seat_id)
+            .await
+            .expect("repeat failed seat cleanup is idempotent");
+        let preserved: (String, Option<String>, String, Option<i64>, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT seat.status, seat.retired_subscription_id, subscription.status,
+                        subscription.free_usage_seconds,
+                        (SELECT COUNT(*) FROM share_control_operations operation
+                         WHERE operation.subscription_id = subscription.id),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = subscription.id)
+                 FROM share_market_seats seat
+                 JOIN share_market_subscriptions subscription
+                   ON subscription.id = seat.retired_subscription_id
+                 WHERE seat.id = ?1",
+                params![seat_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read preserved failed seat history");
+        assert_eq!(preserved.0, SEAT_DELETED);
+        assert_eq!(preserved.1.as_deref(), Some(first_subscription.as_str()));
+        assert_eq!(preserved.2, SUB_GRANT_FAILED);
+        assert_eq!(preserved.3, Some(86_400));
+        assert_eq!(preserved.4, 1);
+        assert!(preserved.5 >= 2);
+        let renter_history = store
+            .share_market_catalog_with_scope(
+                Some(&first_renter),
+                &[],
+                ShareMarketCatalogScope::Renter,
+            )
+            .await
+            .expect("read renter history after owner cleanup");
+        assert!(
+            renter_history
+                .my_subscriptions
+                .iter()
+                .any(|subscription| subscription.id == first_subscription)
+        );
         assert!(matches!(
             store
                 .share_market_rent_seat(
@@ -10589,11 +11042,23 @@ mod tests {
             .await
             .expect("rent replacement seat after failed grant");
         activate_subscription(&store, &second_subscription, now + Duration::seconds(2)).await;
+        assert!(matches!(
+            store
+                .share_market_delete_seat(&owner, &replacement_seat)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
 
         store
             .share_market_request_release(&owner, &second_subscription, true, false)
             .await
             .expect("request revoke");
+        assert!(matches!(
+            store
+                .share_market_delete_seat(&owner, &replacement_seat)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
         store
             .share_market_reconcile_and_dispatch(now + Duration::seconds(3))
             .await
@@ -10630,6 +11095,12 @@ mod tests {
             subscription_status(&store, &second_subscription).await,
             SUB_REVOKE_FAILED
         );
+        assert!(matches!(
+            store
+                .share_market_delete_seat(&owner, &replacement_seat)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
         store
             .share_market_request_release(&owner, &second_subscription, true, false)
             .await
@@ -10856,6 +11327,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_can_soft_delete_closed_listing_with_only_failed_grants() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-delete-failed", "owner-delete-failed@example.com");
+        let renter = session("renter-delete-failed", "renter-delete-failed@example.com");
+        insert_share(
+            &store,
+            "share-delete-failed",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-delete-failed", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent failed listing seat");
+        let now = Utc::now();
+        store
+            .share_market_reconcile_and_dispatch(now)
+            .await
+            .expect("dispatch failed listing grant");
+        let edit_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read failed listing edit");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
+                params![edit_id],
+            )
+            .expect("reject failed listing edit");
+            handle_control_edit_ack_with_metadata(
+                &conn,
+                &edit_id,
+                "rejected",
+                Some("client rejected managed grant"),
+                Some("grant_rejected"),
+                Some(false),
+                &(now + Duration::seconds(1)).to_rfc3339(),
+            )
+            .expect("finish failed listing grant");
+        }
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("close failed listing");
+        let owner_catalog = store
+            .share_market_catalog_with_scope(Some(&owner), &[], ShareMarketCatalogScope::Owner)
+            .await
+            .expect("read failed listing delete capability");
+        assert!(
+            owner_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.id == listing_id)
+                .expect("closed failed listing")
+                .can_delete
+        );
+
+        store
+            .share_market_delete_listing(&owner, &listing_id)
+            .await
+            .expect("soft-delete failed listing");
+        store
+            .share_market_delete_listing(&owner, &listing_id)
+            .await
+            .expect("repeat failed listing cleanup is idempotent");
+        let preserved: (Option<String>, String, String, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT listing.deleted_at, seat.status, subscription.status,
+                        operation.status,
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = subscription.id)
+                 FROM share_market_listings listing
+                 JOIN share_market_seats seat ON seat.listing_id = listing.id
+                 JOIN share_market_subscriptions subscription
+                   ON subscription.id = seat.retired_subscription_id
+                 JOIN share_control_operations operation
+                   ON operation.subscription_id = subscription.id
+                 WHERE listing.id = ?1",
+                params![listing_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read preserved failed listing history");
+        assert!(preserved.0.is_some());
+        assert_eq!(preserved.1, SEAT_DELETED);
+        assert_eq!(preserved.2, SUB_GRANT_FAILED);
+        assert_eq!(preserved.3, "rejected");
+        assert!(preserved.4 >= 2);
+        let renter_history = store
+            .share_market_catalog_with_scope(Some(&renter), &[], ShareMarketCatalogScope::Renter)
+            .await
+            .expect("read renter history after listing cleanup");
+        assert!(
+            renter_history
+                .my_subscriptions
+                .iter()
+                .any(|subscription| subscription.id == subscription_id)
+        );
+    }
+
+    #[tokio::test]
     async fn closed_listing_with_active_rental_blocks_relist() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-hold", "owner-hold@example.com");
@@ -10871,6 +11464,22 @@ mod tests {
             .share_market_close_listing(&owner, &listing_id)
             .await
             .expect("close occupied listing");
+        let owner_catalog = store
+            .share_market_catalog_with_scope(Some(&owner), &[], ShareMarketCatalogScope::Owner)
+            .await
+            .expect("read active listing delete capability");
+        assert!(
+            !owner_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.id == listing_id)
+                .expect("closed occupied listing")
+                .can_delete
+        );
+        assert!(matches!(
+            store.share_market_delete_listing(&owner, &listing_id).await,
+            Err(AppError::Conflict(_))
+        ));
 
         let owned = store
             .share_market_owned_shares(&owner)
@@ -11458,6 +12067,133 @@ mod tests {
         assert_eq!(state.2, new_owner.user_id);
         assert_eq!(state.3, SUB_REVOKE_PENDING);
         assert_eq!(state.4, "terminated");
+    }
+
+    #[tokio::test]
+    async fn grant_retry_exhaustion_exposes_failure_code_attempts_and_cleanup() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-grant-exhausted", "owner-grant-exhausted@example.com");
+        let renter = session(
+            "renter-grant-exhausted",
+            "renter-grant-exhausted@example.com",
+        );
+        let outsider = session(
+            "outsider-grant-exhausted",
+            "outsider-grant-exhausted@example.com",
+        );
+        insert_share(
+            &store,
+            "share-grant-exhausted",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-grant-exhausted", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent exhausted grant seat");
+        let mut dispatched_at = Utc::now();
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(dispatched_at)
+                .await
+                .expect("dispatch initial exhausted grant")
+                .len(),
+            1
+        );
+        for attempt in 1..=MAX_CONTROL_ATTEMPTS {
+            let edit_id: String = store
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT edit_id FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read exhausted grant edit");
+            let rejected_at = dispatched_at + Duration::seconds(1);
+            {
+                let conn = store.conn.lock().await;
+                conn.execute(
+                    "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
+                    params![edit_id],
+                )
+                .expect("reject exhausted grant edit");
+                handle_control_edit_ack_with_metadata(
+                    &conn,
+                    &edit_id,
+                    "rejected",
+                    Some("temporary grant failure"),
+                    Some("temporary_grant_failure"),
+                    Some(true),
+                    &rejected_at.to_rfc3339(),
+                )
+                .expect("record retryable grant failure");
+            }
+            if attempt == MAX_CONTROL_ATTEMPTS {
+                break;
+            }
+            let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0);
+            let delay = CONTROL_RETRY_BASE_SECS
+                .saturating_mul(2_i64.saturating_pow(exponent))
+                .min(CONTROL_RETRY_MAX_SECS);
+            dispatched_at = rejected_at + Duration::seconds(delay);
+            assert_eq!(
+                store
+                    .share_market_reconcile_and_dispatch(dispatched_at)
+                    .await
+                    .expect("dispatch retried grant")
+                    .len(),
+                1
+            );
+        }
+
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_GRANT_FAILED
+        );
+        let catalog = store
+            .share_market_catalog_with_scope(Some(&owner), &[], ShareMarketCatalogScope::Owner)
+            .await
+            .expect("read exhausted grant failure details");
+        let failed_seat = catalog
+            .listings
+            .iter()
+            .flat_map(|listing| &listing.seats)
+            .find(|seat| seat.id == seat_id)
+            .expect("exhausted grant seat");
+        assert!(failed_seat.can_delete);
+        let subscription = failed_seat.subscription.as_ref().expect("failed grant");
+        assert_eq!(
+            subscription.failure_code.as_deref(),
+            Some("temporary_grant_failure")
+        );
+        assert_eq!(
+            subscription.grant_attempts,
+            Some(u32::try_from(MAX_CONTROL_ATTEMPTS).unwrap())
+        );
+        assert_eq!(
+            subscription.release_reason.as_deref(),
+            Some("temporary grant failure")
+        );
+        let outsider_catalog = store
+            .share_market_catalog_with_scope(Some(&outsider), &[], ShareMarketCatalogScope::Visible)
+            .await
+            .expect("read failed grant as unrelated buyer");
+        let outsider_subscription = outsider_catalog
+            .listings
+            .iter()
+            .flat_map(|listing| &listing.seats)
+            .find(|seat| seat.id == seat_id)
+            .and_then(|seat| seat.subscription.as_ref())
+            .expect("failed grant remains visible without private diagnostics");
+        assert!(outsider_subscription.failure_code.is_none());
+        assert!(outsider_subscription.grant_attempts.is_none());
+        assert!(outsider_subscription.release_reason.is_none());
     }
 
     #[tokio::test]

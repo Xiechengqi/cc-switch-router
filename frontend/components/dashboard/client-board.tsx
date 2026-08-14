@@ -28,7 +28,6 @@ import {
   clientRunningDurationMs,
   clientTotalTokensLabel,
   clientTotalTokensUsed,
-  ShareClientPanel,
   ShareEditDialog,
   ShareMarkets,
   ShareModelHealthChecks,
@@ -624,11 +623,6 @@ export function ClientBoard({
     },
     [clients, sessionEmail],
   );
-  const clientByShareId = React.useMemo(() => {
-    const map = new Map<string, DashboardClient>();
-    clients.forEach((client) => (client.shareIds || []).forEach((shareId) => map.set(shareId, client)));
-    return map;
-  }, [clients]);
   const linkedShareIds = React.useMemo(() => {
     const ids = new Set<string>();
     clients.forEach((client) => (client.shareIds || []).forEach((shareId) => ids.add(shareId)));
@@ -1033,9 +1027,6 @@ export function ClientBoard({
                 {selectedShare ? (
                   <div className="grid gap-5">
                     <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
-                    <DrawerSection label={t("dashboard.client")}>
-                      <ShareClientPanel client={clientByShareId.get(selectedShare.shareId)} currentShare={selectedShare} shares={sharesForClient(clientByShareId.get(selectedShare.shareId))} onEdit={openEditShare} t={t} locale={locale} />
-                    </DrawerSection>
                     <DrawerSection label={t("dashboard.markets")}>
                       <ShareMarkets share={selectedShare} t={t} />
                     </DrawerSection>

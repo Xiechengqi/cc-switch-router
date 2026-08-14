@@ -282,8 +282,11 @@ mod tests {
             map_control_error(CtlError::Rejected {
                 status: 403,
                 body: "disabled".into(),
+                message: None,
                 code: None,
                 retryable: Some(false),
+                current_config_revision: None,
+                current_share: None,
             }),
             AppError::Conflict(_)
         ));

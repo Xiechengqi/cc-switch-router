@@ -1,10 +1,9 @@
 "use client";
 
-import { Eye, ExternalLink, Link2, Maximize2, Pencil } from "lucide-react";
+import { Eye, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -45,7 +44,6 @@ import {
   boundProviderIdForApp,
   cacheHitRate,
   clientPlatformLabel,
-  clientTunnelDisplayUrl,
   configuredUpstreamPercent,
   CORE_SHARE_APPS,
   expiryTitle,
@@ -361,8 +359,6 @@ export function ShareConnectChip({
   );
 }
 
-export { ShareClientTag };
-
 export function ShareStatusCell({
   share,
   t,
@@ -484,14 +480,6 @@ export function clientRegionLabel(client?: DashboardClient | null) {
   return client?.installation.countryCode || client?.installation.region || "-";
 }
 
-export function clientDisplayLabel(client?: DashboardClient | null) {
-  return (
-    clientTunnelDisplayUrl(client?.clientTunnel?.tunnelUrl) ||
-    client?.installation.id ||
-    "-"
-  );
-}
-
 export function shareSupportLabel(share: ShareView) {
   const app = resolveShareCoreApp(share);
   if (app && share.support?.[app]) return SHARE_APP_LABELS[app];
@@ -506,72 +494,14 @@ export function shareSaleLabel(share: ShareView, t: TFn) {
   return t("dashboard.no");
 }
 
-export function ClientReference({
-  client,
-  t,
-  locale: _locale,
-  shareCount: _shareCount,
-}: {
-  client?: DashboardClient;
-  t: TFn;
-  locale: AppLocale;
-  shareCount?: number;
-}) {
-  if (!client)
-    return (
-      <span className="text-xs text-muted-foreground">
-        {t("dashboard.noClient")}
-      </span>
-    );
-  const label = clientDisplayLabel(client);
-  const url = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  return (
-    <div className="grid min-w-0 gap-2 rounded-md border border-default/40 bg-muted/20 px-2 py-1.5 text-xs">
-      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0">
-          {url ? (
-            <a
-              href={url}
-              target="_blank"
-              rel="noopener noreferrer"
-              data-no-row-drawer
-              className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono font-semibold text-foreground underline-offset-4 hover:underline"
-              title={url}
-            >
-              <span className="truncate">{label}</span>
-              <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
-            </a>
-          ) : (
-            <strong
-              className="min-w-0 truncate font-mono text-foreground"
-              title={label}
-            >
-              {label}
-            </strong>
-          )}
-        </div>
-        <ShareClientTag client={client} t={t} />
-      </div>
-      <span
-        className="truncate text-muted-foreground"
-        title={clientOwnerEmail(client)}
-      >
-        {clientOwnerEmail(client)}
-      </span>
-    </div>
-  );
-}
-
 export function ShareSummaryItem({
   share,
   onEdit,
   t,
-  compact = false,
 }: {
   share: ShareView;
   onEdit: (share: ShareView) => void;
   t: TFn;
-  compact?: boolean;
 }) {
   const api = shareApiParts(share);
   const support = shareSupportLabel(share);
@@ -586,11 +516,9 @@ export function ShareSummaryItem({
         <ShareEditAction share={share} onEdit={onEdit} t={t} />
       </div>
       <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
-        {!compact ? (
-          <span className="truncate" title={owner}>
-            {owner}
-          </span>
-        ) : null}
+        <span className="truncate" title={owner}>
+          {owner}
+        </span>
         <span>{support || t("dashboard.noProviders")}</span>
         <span>{shareSaleLabel(share, t)}</span>
       </div>
@@ -664,55 +592,6 @@ export function ClientLinkedSharesPanel({
         />
       ))}
     </ul>
-  );
-}
-
-export function ShareClientPanel({
-  client,
-  currentShare,
-  shares,
-  onEdit,
-  t,
-  locale,
-}: {
-  client?: DashboardClient;
-  currentShare: ShareView;
-  shares: ShareView[];
-  onEdit: (share: ShareView) => void;
-  t: TFn;
-  locale: AppLocale;
-}) {
-  if (!client) return <EmptyBlock>{t("dashboard.noClient")}</EmptyBlock>;
-  const otherShares = shares.filter(
-    (share) => share.shareId !== currentShare.shareId,
-  );
-  return (
-    <div className="grid gap-3">
-      <ClientReference
-        client={client}
-        t={t}
-        locale={locale}
-        shareCount={shares.length}
-      />
-      {otherShares.length ? (
-        <div className="grid gap-2">
-          <div className="mono-label text-muted-foreground">
-            {t("dashboard.otherShares")}
-          </div>
-          <ul className="grid gap-2">
-            {otherShares.map((share) => (
-              <ShareSummaryItem
-                key={share.shareId}
-                share={share}
-                onEdit={onEdit}
-                t={t}
-                compact
-              />
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </div>
   );
 }
 

@@ -53,6 +53,14 @@ struct ControlErrorReply {
     error: Option<String>,
     code: Option<String>,
     retryable: Option<bool>,
+    details: Option<ControlErrorDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlErrorDetails {
+    current_config_revision: Option<u64>,
+    current_share: Option<ShareDescriptor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,8 +147,11 @@ pub enum CtlError {
     Rejected {
         status: u16,
         body: String,
+        message: Option<String>,
         code: Option<String>,
         retryable: Option<bool>,
+        current_config_revision: Option<u64>,
+        current_share: Option<Box<ShareDescriptor>>,
     },
     /// Client answered 2xx but the payload was missing/!ok/unparseable.
     Malformed(String),
@@ -184,12 +195,26 @@ impl CtlError {
         )
     }
 
+    pub fn current_config_revision(&self) -> Option<u64> {
+        match self {
+            Self::Rejected {
+                current_config_revision,
+                ..
+            } => *current_config_revision,
+            _ => None,
+        }
+    }
+
+    pub fn current_share(&self) -> Option<&ShareDescriptor> {
+        match self {
+            Self::Rejected { current_share, .. } => current_share.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn client_message(&self) -> String {
         match self {
-            Self::Rejected { body, .. } => serde_json::from_str::<ControlErrorReply>(body)
-                .ok()
-                .and_then(|reply| reply.error)
-                .unwrap_or_else(|| body.clone()),
+            Self::Rejected { body, message, .. } => message.clone().unwrap_or_else(|| body.clone()),
             _ => self.to_string(),
         }
     }
@@ -331,11 +356,23 @@ async fn post_control<T: serde::de::DeserializeOwned>(
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let structured = serde_json::from_str::<ControlErrorReply>(&body).ok();
+        let current_config_revision = structured
+            .as_ref()
+            .and_then(|reply| reply.details.as_ref())
+            .and_then(|details| details.current_config_revision);
+        let current_share = structured
+            .as_ref()
+            .and_then(|reply| reply.details.as_ref())
+            .and_then(|details| details.current_share.clone())
+            .map(Box::new);
         return Err(CtlError::Rejected {
             status: status.as_u16(),
             body: body.chars().take(500).collect(),
+            message: structured.as_ref().and_then(|reply| reply.error.clone()),
             code: structured.as_ref().and_then(|reply| reply.code.clone()),
-            retryable: structured.and_then(|reply| reply.retryable),
+            retryable: structured.as_ref().and_then(|reply| reply.retryable),
+            current_config_revision,
+            current_share,
         });
     }
     resp.json()
@@ -510,8 +547,11 @@ pub async fn fetch_client_log_tail(
         return Err(CtlError::Rejected {
             status: status.as_u16(),
             body: String::from_utf8_lossy(&body).chars().take(500).collect(),
+            message: structured.as_ref().and_then(|reply| reply.error.clone()),
             code: structured.as_ref().and_then(|reply| reply.code.clone()),
-            retryable: structured.and_then(|reply| reply.retryable),
+            retryable: structured.as_ref().and_then(|reply| reply.retryable),
+            current_config_revision: None,
+            current_share: None,
         });
     }
     let reply = serde_json::from_slice::<ClientLogTailReply>(&body)
@@ -730,11 +770,29 @@ mod tests {
             !CtlError::Rejected {
                 status: 422,
                 body: "x".into(),
+                message: None,
                 code: None,
                 retryable: Some(false),
+                current_config_revision: None,
+                current_share: None,
             }
             .is_transport()
         );
         assert!(!CtlError::Malformed("x".into()).is_transport());
+    }
+
+    #[test]
+    fn rejected_client_message_survives_a_truncated_structured_body() {
+        let error = CtlError::Rejected {
+            status: 409,
+            body: "{\"error\":\"truncated".into(),
+            message: Some("authoritative revision conflict".into()),
+            code: Some("cc_switch_share_revision_conflict".into()),
+            retryable: Some(true),
+            current_config_revision: None,
+            current_share: None,
+        };
+
+        assert_eq!(error.client_message(), "authoritative revision conflict");
     }
 }

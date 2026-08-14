@@ -2260,6 +2260,8 @@ export type ShareMarketSubscription = {
   canProposePriceChange: boolean;
   priceChange?: ShareMarketPriceChange;
   releaseReason?: string;
+  failureCode?: string;
+  grantAttempts?: number;
   releasedAt?: string;
   createdAt: string;
   updatedAt: string;
@@ -2291,6 +2293,8 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   sellerApprovalRequired: boolean;
   eligibility: MarketEligibility;
   readOnly: boolean;
+  canDelete: boolean;
+  deleteBlockedReason?: string;
   retiredAt?: string;
   subscription?: ShareMarketSubscription;
 };
@@ -2349,6 +2353,8 @@ export type ShareMarketListing = {
   subdomain?: string;
   shareOnline: boolean;
   isOwner: boolean;
+  canDelete: boolean;
+  deleteBlockedReason?: string;
   contacts?: PaymentContact[];
   paymentMethodKinds: string[];
   performance: ShareMarketPerformance;

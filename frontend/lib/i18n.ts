@@ -159,7 +159,7 @@ export const messages = {
     "shareMarket.confirm.deleteListingTitle":
       "Delete this closed Share listing?",
     "shareMarket.confirm.deleteListingDescription":
-      "Permanently remove the closed listing for {share}. Only listings with no rental history can be deleted.",
+      "Hide the closed listing for {share}. Rental, billing, control, and audit history remains available.",
     "shareMarket.filterClear": "Clear filters",
     "shareMarket.filterOnline": "Filter by online status",
     "shareMarket.filterShare": "Filter by Share",
@@ -233,6 +233,19 @@ export const messages = {
     "shareMarket.subscription.revokePending": "Reclaiming",
     "shareMarket.subscription.revokeFailed": "Reclaim failed",
     "shareMarket.subscription.grantFailed": "Grant failed",
+    "shareMarket.authorizationFailure.revisionConflict":
+      "The Share configuration kept changing while Router tried to grant access.",
+    "shareMarket.authorizationFailure.policyDivergent":
+      "The Share rejected the requested user limits because its local policy differs.",
+    "shareMarket.authorizationFailure.bindingImmutable":
+      "The Share binding changed and the requested grant could not be applied.",
+    "shareMarket.authorizationFailure.controlTimeout":
+      "The Client did not confirm the grant before the control request timed out.",
+    "shareMarket.authorizationFailure.generic":
+      "The Client could not grant this renter access.",
+    "shareMarket.authorizationFailure.code": "Error code: {code}",
+    "shareMarket.authorizationFailure.attempts": "Control attempts: {count}",
+    "shareMarket.authorizationFailure.reason": "Client response: {reason}",
     "shareMarket.subscription.released": "Reclaimed · read-only",
     "shareMarket.confirm.releaseTitle": "Return this seat?",
     "shareMarket.confirm.releaseDescription":
@@ -249,6 +262,9 @@ export const messages = {
     "shareMarket.confirm.deleteTitle": "Delete this seat?",
     "shareMarket.confirm.deleteDescription":
       "Seat {position} will be permanently removed from this listing.",
+    "shareMarket.confirm.deleteFailedTitle": "Remove this failed seat?",
+    "shareMarket.confirm.deleteFailedDescription":
+      "The failed seat will be hidden from this listing. Rental, billing, control, and audit history remains available.",
     "shareMarket.error.positiveInteger": "{field} must be a positive integer.",
     "shareMarket.error.price":
       "Price must be greater than zero with no more than two decimal places.",
@@ -1797,6 +1813,8 @@ export const messages = {
     "chat.title": "Chats",
     "chat.unread": "{count} unread messages",
     "chat.markAllRead": "Mark all read",
+    "chat.muteReminders": "Mute chat reminders in this browser",
+    "chat.unmuteReminders": "Resume chat reminders in this browser",
     "chat.back": "Back to chats",
     "chat.public": "Public chat history",
     "chat.archived": "Archived",
@@ -2181,7 +2199,6 @@ export const messages = {
     "dashboard.noShare": "No share",
     "dashboard.noClients": "No clients yet",
     "dashboard.noMyClients": "No Clients you own or access through ShareTo yet",
-    "dashboard.noClient": "No client",
     "dashboard.unlinkedClients": "UNLINKED",
     "dashboard.scrollSharesLeft": "Scroll shares left",
     "dashboard.scrollSharesRight": "Scroll shares right",
@@ -2320,7 +2337,6 @@ export const messages = {
     "dashboard.noShares": "No shares",
     "dashboard.moreShares": "+{count} more",
     "dashboard.sharesCount": "{count} shares",
-    "dashboard.otherShares": "Other shares",
     "dashboard.noOnlineShares": "No online shares",
     "dashboard.seen": "Seen",
     "dashboard.shares": "Shares",
@@ -2729,7 +2745,7 @@ export const messages = {
     "shareMarket.deleteListing": "删除挂售",
     "shareMarket.confirm.deleteListingTitle": "删除这个已停售的 Share？",
     "shareMarket.confirm.deleteListingDescription":
-      "将永久移除 {share} 的停售记录。只有从未产生租用记录的挂售可以删除。",
+      "将隐藏 {share} 的停售记录；租用、账务、控制和审计历史都会保留。",
     "shareMarket.filterClear": "清除筛选",
     "shareMarket.filterOnline": "筛选在线状态",
     "shareMarket.filterShare": "筛选 Share",
@@ -2802,6 +2818,18 @@ export const messages = {
     "shareMarket.subscription.revokePending": "回收中",
     "shareMarket.subscription.revokeFailed": "回收失败",
     "shareMarket.subscription.grantFailed": "授权失败",
+    "shareMarket.authorizationFailure.revisionConflict":
+      "Router 授权期间 Share 配置持续变化，最终未能完成授权。",
+    "shareMarket.authorizationFailure.policyDivergent":
+      "Share 本地策略与请求的用户限制不一致，因此拒绝授权。",
+    "shareMarket.authorizationFailure.bindingImmutable":
+      "Share 绑定发生变化，当前授权无法应用。",
+    "shareMarket.authorizationFailure.controlTimeout":
+      "Client 未在控制请求超时前确认授权。",
+    "shareMarket.authorizationFailure.generic": "Client 未能为该用户授予访问权限。",
+    "shareMarket.authorizationFailure.code": "错误码：{code}",
+    "shareMarket.authorizationFailure.attempts": "控制尝试：{count} 次",
+    "shareMarket.authorizationFailure.reason": "Client 返回：{reason}",
     "shareMarket.subscription.released": "已回收 · 只读",
     "shareMarket.confirm.releaseTitle": "归还这个拼车位？",
     "shareMarket.confirm.releaseDescription":
@@ -2818,6 +2846,9 @@ export const messages = {
     "shareMarket.confirm.deleteTitle": "删除这个拼车位？",
     "shareMarket.confirm.deleteDescription":
       "拼车位 {position} 将从该挂售中永久删除。",
+    "shareMarket.confirm.deleteFailedTitle": "清理这个授权失败的拼车位？",
+    "shareMarket.confirm.deleteFailedDescription":
+      "该失败拼车位会从挂售中隐藏；租用、账务、控制和审计历史都会保留。",
     "shareMarket.error.positiveInteger": "{field} 必须是正整数。",
     "shareMarket.error.price": "价格必须大于 0，且最多保留两位小数。",
     "shareMarket.error.currency": "币种仅支持 USD。",
@@ -4305,6 +4336,8 @@ export const messages = {
     "chat.title": "聊天室",
     "chat.unread": "{count} 条未读消息",
     "chat.markAllRead": "全部已读",
+    "chat.muteReminders": "静默当前浏览器的聊天提醒",
+    "chat.unmuteReminders": "恢复当前浏览器的聊天提醒",
     "chat.back": "返回聊天室列表",
     "chat.public": "公开聊天记录",
     "chat.archived": "已归档",
@@ -4674,7 +4707,6 @@ export const messages = {
     "dashboard.noShare": "无 share",
     "dashboard.noClients": "暂无 clients",
     "dashboard.noMyClients": "暂无你拥有或通过 ShareTo 使用的 Client",
-    "dashboard.noClient": "无 client",
     "dashboard.unlinkedClients": "未关联",
     "dashboard.scrollSharesLeft": "向左滚动 shares",
     "dashboard.scrollSharesRight": "向右滚动 shares",
@@ -4801,7 +4833,6 @@ export const messages = {
     "dashboard.noShares": "无 shares",
     "dashboard.moreShares": "另有 {count} 个",
     "dashboard.sharesCount": "{count} 个 shares",
-    "dashboard.otherShares": "同 Client 其他 Shares",
     "dashboard.noOnlineShares": "无在线 shares",
     "dashboard.seen": "在线",
     "dashboard.shares": "Shares",

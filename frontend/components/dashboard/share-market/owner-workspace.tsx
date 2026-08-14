@@ -70,6 +70,21 @@ type ConfirmAction = {
   run: () => Promise<unknown>;
 };
 
+function grantFailureMessage(t: TFn, code?: string) {
+  switch (code) {
+    case "cc_switch_share_revision_conflict":
+      return t("shareMarket.authorizationFailure.revisionConflict");
+    case "cc_switch_share_policy_divergent":
+      return t("shareMarket.authorizationFailure.policyDivergent");
+    case "cc_switch_share_binding_immutable":
+      return t("shareMarket.authorizationFailure.bindingImmutable");
+    case "control_ack_timeout":
+      return t("shareMarket.authorizationFailure.controlTimeout");
+    default:
+      return t("shareMarket.authorizationFailure.generic");
+  }
+}
+
 const TOKEN_PERIODS: ShareTokenPeriod[] = [
   "lifetime",
   "day",
@@ -558,9 +573,9 @@ export function ShareMarketOwnerWorkspace({
               <Button size="sm" variant="outline" onClick={() => setSeatDialog({ listing })}><Plus className="h-4 w-4" />{t("shareMarket.addSeat")}</Button>
               {listing.status === "active" ? (
                 <Button size="sm" variant="outline" onClick={() => setConfirm({ title: t("shareMarket.confirm.closeTitle"), description: t("shareMarket.confirm.closeDescription", { share: listing.shareName }), label: t("shareMarket.closeListing"), tone: "warning", run: () => closeShareMarketListing(listing.id) })}><Ban className="h-4 w-4" />{t("shareMarket.closeListing")}</Button>
-              ) : (
+              ) : listing.canDelete ? (
                 <Button size="sm" variant="outline" onClick={() => setConfirm({ title: t("shareMarket.confirm.deleteListingTitle"), description: t("shareMarket.confirm.deleteListingDescription", { share: listing.shareName }), label: t("shareMarket.deleteListing"), tone: "danger", run: () => deleteShareMarketListing(listing.id) })}><Trash2 className="h-4 w-4" />{t("shareMarket.deleteListing")}</Button>
-              )}
+              ) : null}
             </div>
           </header>
 
@@ -581,6 +596,7 @@ export function ShareMarketOwnerWorkspace({
                 {listing.seats.map((seat) => {
                   const subscription = seat.subscription;
                   const statusKey = subscriptionStatusKey(subscription?.status || "");
+                  const grantFailed = subscription?.status === "grant_failed";
                   return (
                     <tr key={seat.id} className="border-t border-slate-100 align-top">
                       <td className="px-3 py-3 font-medium">#{seat.position}</td>
@@ -588,15 +604,43 @@ export function ShareMarketOwnerWorkspace({
                       <td className="px-3 py-3">{seat.parallelLimit ?? t("common.unlimited")}</td>
                       <td className="max-w-[15rem] px-3 py-3">{formatTokenLimit(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}</td>
                       <td className="max-w-[14rem] px-3 py-3"><span className="block truncate" title={subscription?.renterEmail}>{subscription?.renterEmail || "-"}</span></td>
-                      <td className="px-3 py-3">{statusKey ? t(statusKey) : seat.status === "available" ? t("shareMarket.available") : seat.status}</td>
+                      <td className="max-w-[20rem] px-3 py-3">
+                        <span>{statusKey ? t(statusKey) : seat.status === "available" ? t("shareMarket.available") : seat.status}</span>
+                        {grantFailed ? (
+                          <div className="mt-1 grid gap-0.5 text-xs text-slate-600">
+                            <p>{grantFailureMessage(t, subscription.failureCode)}</p>
+                            {subscription.failureCode ? <p className="break-all font-mono text-[10px] text-slate-500">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
+                            {subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
+                            {subscription.releaseReason ? <p className="break-words text-slate-500">{t("shareMarket.authorizationFailure.reason", { reason: subscription.releaseReason })}</p> : null}
+                          </div>
+                        ) : null}
+                      </td>
                       <td className="px-3 py-2">
                         <div className="flex justify-end gap-1">
                           {!subscription && seat.status === "available" && !seat.readOnly ? (
                             <>
                               <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.manage")} onClick={() => setSeatDialog({ listing, seat })}><Pencil className="h-4 w-4" /></Button>
                               <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.copySeat")} onClick={() => void run(() => addShareMarketSeat(listing.id, normalizedSeat(seatDraft(seat), t)))}><Copy className="h-4 w-4" /></Button>
-                              <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.deleteSeat")} onClick={() => setConfirm({ title: t("shareMarket.confirm.deleteTitle"), description: t("shareMarket.confirm.deleteDescription", { position: seat.position }), label: t("shareMarket.deleteSeat"), tone: "danger", run: () => deleteShareMarketSeat(seat.id) })}><Trash2 className="h-4 w-4" /></Button>
                             </>
+                          ) : null}
+                          {seat.canDelete ? (
+                            <Button
+                              isIconOnly
+                              size="sm"
+                              variant="ghost"
+                              aria-label={t("shareMarket.deleteSeat")}
+                              onClick={() => setConfirm({
+                                title: t(grantFailed ? "shareMarket.confirm.deleteFailedTitle" : "shareMarket.confirm.deleteTitle"),
+                                description: grantFailed
+                                  ? t("shareMarket.confirm.deleteFailedDescription")
+                                  : t("shareMarket.confirm.deleteDescription", { position: seat.position }),
+                                label: t("shareMarket.deleteSeat"),
+                                tone: "danger",
+                                run: () => deleteShareMarketSeat(seat.id),
+                              })}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
                           ) : null}
                           {subscription?.canProposePriceChange ? <Button size="sm" variant="ghost" onClick={() => setPriceDialog(subscription)}>{t("shareMarket.priceChange.action")}</Button> : null}
                           {subscription?.priceChange?.canCancel ? <Button size="sm" variant="ghost" onClick={() => void run(() => cancelShareMarketPriceChange(subscription.priceChange!.id))}>{t("shareMarket.priceChange.cancel")}</Button> : null}

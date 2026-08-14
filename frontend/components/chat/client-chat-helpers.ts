@@ -1,6 +1,7 @@
 import type { ClientChatMessage, ClientChatRoom, DashboardClient } from "@/lib/types";
 
 export const ANON_VISITS_KEY = "cc_switch_router_chat_anon_visits_v1";
+export const CHAT_REMINDERS_MUTED_KEY = "cc_switch_router_chat_reminders_muted_v1";
 export const DRAFT_PREFIX = "cc_switch_router_chat_draft_v1:";
 export const ROOM_POLL_MS = 30_000;
 export const LIST_POLL_MS = 20_000;

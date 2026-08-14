@@ -1,10 +1,11 @@
 "use client";
 
-import { Badge, Button } from "@heroui/react";
-import { Loader2, MessageCircle, X } from "lucide-react";
+import { Badge, Button, Tooltip } from "@heroui/react";
+import { Bell, BellOff, Loader2, MessageCircle, X } from "lucide-react";
 import * as React from "react";
 import {
   CLOSED_POLL_MS,
+  CHAT_REMINDERS_MUTED_KEY,
   LIST_POLL_MS,
   clearRecentChatLocalCache,
   findDashboardClient,
@@ -33,6 +34,7 @@ import {
   recordClientChatVisit,
 } from "@/lib/api";
 import type { ClientChatRoom } from "@/lib/types";
+import { usePersistentState } from "@/lib/use-persistent-state";
 
 const CHAT_DOCK_BASE_BOTTOM = 80;
 const CHAT_DOCK_CONSOLE_GAP = 12;
@@ -60,12 +62,20 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
   const [listLoading, setListLoading] = React.useState(false);
   const [markingAllRead, setMarkingAllRead] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [remindersMuted, setRemindersMuted, remindersMutedHydrated] = usePersistentState(
+    CHAT_REMINDERS_MUTED_KEY,
+    false,
+  );
   const importedSessionRef = React.useRef<string | null>(null);
   const openRequestRef = React.useRef(0);
   const openedDeepLinkRef = React.useRef<string | null>(null);
   const roomsLoadedRef = React.useRef(false);
 
-  const unreadByInstallation = React.useMemo(() => unreadByInstallationMap(rooms), [rooms]);
+  const showUnreadReminders = remindersMutedHydrated && !remindersMuted;
+  const unreadByInstallation = React.useMemo(
+    () => (showUnreadReminders ? unreadByInstallationMap(rooms) : new Map<string, number>()),
+    [rooms, showUnreadReminders],
+  );
 
   const loadRooms = React.useCallback(
     async (signal?: AbortSignal) => {
@@ -295,6 +305,8 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
         opening={opening}
         rooms={rooms}
         totalUnread={totalUnread}
+        showUnreadReminders={showUnreadReminders}
+        remindersMuted={remindersMuted}
         selectedRoom={selectedRoom}
         listLoading={listLoading}
         markingAllRead={markingAllRead}
@@ -305,6 +317,7 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
         onRoomChange={setSelectedRoom}
         onRoomsRefresh={refreshRooms}
         onMarkAllRead={() => void markAllRead()}
+        onRemindersMutedChange={setRemindersMuted}
         onBackToList={backToList}
         onMinimize={minimize}
         onClose={close}
@@ -325,6 +338,8 @@ function ClientChatDock({
   opening,
   rooms,
   totalUnread,
+  showUnreadReminders,
+  remindersMuted,
   selectedRoom,
   listLoading,
   markingAllRead,
@@ -335,6 +350,7 @@ function ClientChatDock({
   onRoomChange,
   onRoomsRefresh,
   onMarkAllRead,
+  onRemindersMutedChange,
   onBackToList,
   onMinimize,
   onClose,
@@ -344,6 +360,8 @@ function ClientChatDock({
   opening: boolean;
   rooms: ClientChatRoom[];
   totalUnread: number;
+  showUnreadReminders: boolean;
+  remindersMuted: boolean;
   selectedRoom: ClientChatRoom | null;
   listLoading: boolean;
   markingAllRead: boolean;
@@ -354,6 +372,7 @@ function ClientChatDock({
   onRoomChange: (room: ClientChatRoom) => void;
   onRoomsRefresh: () => void;
   onMarkAllRead: () => void;
+  onRemindersMutedChange: (muted: boolean) => void;
   onBackToList: () => void;
   onMinimize: () => void;
   onClose: () => void;
@@ -405,7 +424,7 @@ function ClientChatDock({
     );
     return (
       <div className="fixed right-5 z-40" style={dockStyle} data-client-chat-dock>
-        {totalUnread > 0 ? (
+        {showUnreadReminders && totalUnread > 0 ? (
           <Badge color="danger" aria-label={t("chat.unread", { count: totalUnread })}>
             <Badge.Anchor>{button}</Badge.Anchor>
             <Badge.Label>{totalUnread > 99 ? "99+" : totalUnread}</Badge.Label>
@@ -437,6 +456,22 @@ function ClientChatDock({
             </h2>
             <p className="truncate text-[11px] text-slate-500">{t("chat.subtitle")}</p>
           </div>
+          <Tooltip>
+            <Tooltip.Trigger>
+              <Button
+                isIconOnly
+                variant="ghost"
+                size="sm"
+                className="rounded-md"
+                onClick={() => onRemindersMutedChange(!remindersMuted)}
+                aria-label={t(remindersMuted ? "chat.unmuteReminders" : "chat.muteReminders")}
+                aria-pressed={remindersMuted}
+              >
+                {remindersMuted ? <BellOff className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+              </Button>
+            </Tooltip.Trigger>
+            <Tooltip.Content>{t(remindersMuted ? "chat.unmuteReminders" : "chat.muteReminders")}</Tooltip.Content>
+          </Tooltip>
           {totalUnread > 0 || markingAllRead ? (
             <Button
               variant="ghost"

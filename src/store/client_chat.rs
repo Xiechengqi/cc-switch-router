@@ -2682,7 +2682,8 @@ fn count_unread_messages(
     user_id: &str,
 ) -> Result<usize, AppError> {
     let sql = "SELECT COUNT(*) FROM chat_messages m
-         WHERE m.room_id = ?1 AND m.status = 'visible' AND m.author_user_id != ?2
+         WHERE m.room_id = ?1 AND m.status = 'visible' AND m.author_kind = 'user'
+           AND m.author_user_id != ?2
            AND m.seq > COALESCE((SELECT last_read_seq FROM chat_visits
                                  WHERE user_id = ?2 AND room_id = ?1), 0)";
     conn.query_row(sql, params![room_id, user_id], |row| row.get::<_, i64>(0))
@@ -2708,7 +2709,7 @@ fn count_visible_messages_after(
     conn.query_row(
         "SELECT COUNT(*)
          FROM chat_messages
-         WHERE room_id = ?1 AND status = 'visible' AND seq > ?2",
+         WHERE room_id = ?1 AND status = 'visible' AND author_kind = 'user' AND seq > ?2",
         params![room_id, last_read_seq.max(0)],
         |row| row.get::<_, i64>(0),
     )

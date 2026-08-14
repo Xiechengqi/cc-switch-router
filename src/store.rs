@@ -9127,7 +9127,7 @@ impl AppStore {
         edit_id: &str,
         error_message: &str,
     ) -> Result<(), AppError> {
-        self.mark_share_edit_rejected_with_metadata(edit_id, error_message, None, None)
+        self.mark_share_edit_rejected_with_metadata(edit_id, error_message, None, None, None, None)
             .await
     }
 
@@ -9137,6 +9137,8 @@ impl AppStore {
         error_message: &str,
         error_code: Option<&str>,
         retryable: Option<bool>,
+        current_config_revision: Option<u64>,
+        current_share: Option<&ShareDescriptor>,
     ) -> Result<(), AppError> {
         let error_message = client_chat::sanitize_system_event_text(error_message);
         let conn = self.conn.lock().await;
@@ -9146,6 +9148,14 @@ impl AppStore {
                 "begin reject share edit transaction failed: {error}"
             ))
         })?;
+        apply_revision_conflict_snapshot_tx(
+            &tx,
+            edit_id,
+            None,
+            error_code,
+            current_config_revision,
+            current_share,
+        )?;
         tx.execute(
             "UPDATE share_edit_requests
              SET status = 'rejected', updated_at = ?2, error_message = ?3
@@ -9243,6 +9253,14 @@ impl AppStore {
         let tx = conn.unchecked_transaction().map_err(|error| {
             AppError::Internal(format!("begin share edit ack transaction failed: {error}"))
         })?;
+        apply_revision_conflict_snapshot_tx(
+            &tx,
+            &ack_edit_id,
+            Some(&input.installation_id),
+            input.ack.error_code.as_deref(),
+            input.ack.current_config_revision,
+            input.ack.current_share.as_ref(),
+        )?;
         let changed = tx
             .execute(
                 "UPDATE share_edit_requests
@@ -12637,6 +12655,70 @@ fn reject_pending_share_edit_reply(
     )
     .map_err(|error| AppError::Internal(format!("reject share edit failed: {error}")))?;
     Ok(())
+}
+
+fn apply_revision_conflict_snapshot_tx(
+    conn: &Connection,
+    edit_id: &str,
+    reported_installation_id: Option<&str>,
+    error_code: Option<&str>,
+    current_config_revision: Option<u64>,
+    current_share: Option<&ShareDescriptor>,
+) -> Result<(), AppError> {
+    if error_code != Some(crate::share_market::SHARE_REVISION_CONFLICT_CODE) {
+        return Ok(());
+    }
+    let Some(current_share) = current_share else {
+        return Ok(());
+    };
+    let current_config_revision = current_config_revision.ok_or_else(|| {
+        AppError::BadRequest(
+            "Share revision-conflict snapshot is missing currentConfigRevision".into(),
+        )
+    })?;
+    if current_share.config_revision != current_config_revision {
+        return Err(AppError::BadRequest(
+            "Share revision-conflict snapshot revision does not match currentConfigRevision".into(),
+        ));
+    }
+    let edit_target: Option<(String, String)> = conn
+        .query_row(
+            "SELECT share_id, installation_id FROM share_edit_requests WHERE id = ?1",
+            params![edit_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read Share revision-conflict edit target failed: {error}"
+            ))
+        })?;
+    let Some((share_id, installation_id)) = edit_target else {
+        return Err(AppError::NotFound("share edit not found".into()));
+    };
+    if reported_installation_id.is_some_and(|reported| reported != installation_id) {
+        return Err(AppError::BadRequest(
+            "Share revision-conflict snapshot installation does not match the edit".into(),
+        ));
+    }
+    if current_share.share_id != share_id {
+        return Err(AppError::BadRequest(
+            "Share revision-conflict snapshot does not match the edited Share".into(),
+        ));
+    }
+    let installation = get_installation(conn, &installation_id)?
+        .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+    let installation_owner = installation
+        .owner_email
+        .as_deref()
+        .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
+        .and_then(normalize_email)?;
+    let mut current_share = current_share.clone();
+    validate_strict_share_descriptor_tx(conn, &current_share)?;
+    ensure_share_id_writable_by_installation(conn, &share_id, &installation_id)?;
+    validate_share_namespace_for_installation(conn, &installation_id, &current_share.subdomain)?;
+    normalize_self_reported_share_owner(&mut current_share, &installation_owner)?;
+    upsert_share_tx(conn, &installation_id, current_share)
 }
 
 fn validate_strict_share_descriptor_tx(
@@ -24997,6 +25079,8 @@ mod tests {
                 error_message: None,
                 error_code: None,
                 retryable: None,
+                current_config_revision: None,
+                current_share: None,
             },
         };
         assert_eq!(
@@ -40764,6 +40848,8 @@ mod tests {
             error_message: None,
             error_code: None,
             retryable: None,
+            current_config_revision: None,
+            current_share: None,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -40865,6 +40951,82 @@ mod tests {
         assert_eq!(stored.1, "rejected");
         assert!(stored.2.unwrap_or_default().contains("expected"));
         drop(conn);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn revision_conflict_rejection_applies_authoritative_share_snapshot() {
+        let (store, config) = setup_store("share-edit-revision-conflict-snapshot").await;
+        let installation_id = "inst-1";
+        let share_id = "share-edit";
+        let subdomain = test_share_host("edit-sub");
+        insert_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+        insert_share(&store, installation_id, share_id, &subdomain, "active").await;
+        let edit = store
+            .create_share_settings_edit(
+                share_id,
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("stale edit".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create stale Share edit")
+            .edit;
+        let mut current_share = test_share_descriptor(share_id, &subdomain);
+        current_share.description = Some("authoritative state".into());
+        current_share.config_revision = 4;
+        current_share.descriptor_generation = 1;
+        current_share.descriptor_fingerprint = "a".repeat(64);
+
+        store
+            .mark_share_edit_rejected_with_metadata(
+                &edit.id,
+                "managed grant expected config revision 3, current revision is 4",
+                Some(crate::share_market::SHARE_REVISION_CONFLICT_CODE),
+                Some(true),
+                Some(4),
+                Some(&current_share),
+            )
+            .await
+            .expect("apply authoritative conflict snapshot");
+
+        let stored: (i64, String, String, i64, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT share.config_revision, share.description, edit.status,
+                        share.descriptor_generation, share.descriptor_fingerprint
+                 FROM shares share
+                 JOIN share_edit_requests edit ON edit.share_id = share.share_id
+                 WHERE edit.id = ?1",
+                params![edit.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read authoritative conflict snapshot");
+        assert_eq!(stored.0, 4);
+        assert_eq!(stored.1, "authoritative state");
+        assert_eq!(stored.2, "rejected");
+        assert_eq!(stored.3, 1);
+        assert_eq!(stored.4, "a".repeat(64));
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -42999,7 +43161,8 @@ mod tests {
                 .expect("list participant rooms");
             assert_eq!(rooms.rooms.len(), 1);
             assert_eq!(rooms.rooms[0].id, room_id);
-            assert_eq!(rooms.rooms[0].unread_count, 1);
+            assert_eq!(rooms.rooms[0].unread_count, 0);
+            assert_eq!(rooms.total_unread, 0);
         }
         let messages = store
             .list_chat_messages(&room_id, Some("renter-user"), None, None, 50)
@@ -43698,6 +43861,27 @@ mod tests {
                 .await
                 .expect("room B message");
         }
+        {
+            let conn = store.conn.lock().await;
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                "chat-client-unread-a",
+                "test",
+                &Uuid::new_v4().to_string(),
+                "service_recovered",
+                serde_json::json!({ "summary": "service recovered" }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("enqueue room A system message");
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize room A system message"),
+            1
+        );
         store
             .create_client_chat_message(
                 &room_a,

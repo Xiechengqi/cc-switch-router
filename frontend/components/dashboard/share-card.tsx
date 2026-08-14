@@ -305,11 +305,6 @@ export const ShareCard = React.memo(function ShareCard({
                   ))}
                 </span>
               ) : null}
-              {modelPolicyScope === "global" ? (
-                <span className="shrink-0 text-[9px] font-semibold text-muted-foreground">
-                  {t("dashboard.modelScopeGlobal")}
-                </span>
-              ) : null}
             </div>
             <div className="flex shrink-0 items-center gap-1">
               <button

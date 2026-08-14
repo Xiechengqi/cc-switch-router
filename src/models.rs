@@ -1129,6 +1129,10 @@ pub struct ShareEditAckPayload {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_config_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_share: Option<ShareDescriptor>,
 }
 
 #[derive(Debug, Deserialize)]
