@@ -14,10 +14,17 @@ export function countryFlagIso2(code?: string | null) {
   return normalizeIso2(cc);
 }
 
+/** Twemoji regional-indicator filename, e.g. TW → 1f1f9-1f1fc. */
+function twemojiFlagSlug(iso2: string) {
+  return [...iso2]
+    .map((ch) => (127397 + ch.charCodeAt(0)).toString(16))
+    .join("-");
+}
+
 /**
- * Renders a country/region flag as an image.
- * Prefer images over regional-indicator emoji: Windows Chrome and many Linux
- * fonts omit flag glyphs (Taiwan 🇹🇼 is a frequent miss).
+ * Renders a country/region flag as Twemoji's wavy glyph.
+ * System emoji fonts often omit flags (Taiwan 🇹🇼 is a frequent miss);
+ * Twemoji ships the same waving shape as an image, including TW.
  */
 export function CountryFlag({
   code,
@@ -31,19 +38,19 @@ export function CountryFlag({
   const iso2 = countryFlagIso2(code);
   if (!iso2) return null;
 
+  const slug = twemojiFlagSlug(iso2);
   return (
     <img
-      src={`https://flagcdn.com/w40/${iso2.toLowerCase()}.png`}
-      srcSet={`https://flagcdn.com/w40/${iso2.toLowerCase()}.png 1x, https://flagcdn.com/w80/${iso2.toLowerCase()}.png 2x`}
+      src={`https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/${slug}.svg`}
       width={20}
-      height={15}
+      height={20}
       alt=""
       title={title || iso2}
       aria-label={title || iso2}
       loading="lazy"
       decoding="async"
       className={cn(
-        "inline-block h-[0.95em] w-auto shrink-0 rounded-[1px] align-[-0.12em] object-cover",
+        "inline-block h-[1.15em] w-[1.15em] shrink-0 align-[-0.2em] object-contain",
         className,
       )}
     />

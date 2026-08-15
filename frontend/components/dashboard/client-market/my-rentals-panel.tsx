@@ -202,7 +202,7 @@ export function MyRentalsPanel({
           >
             <div className="flex min-w-0 flex-wrap items-center gap-2">
               {host?.countryCode ? (
-                <CountryFlag code={host.countryCode} className="h-3.5 w-5 rounded-sm object-cover" />
+                <CountryFlag code={host.countryCode} className="h-4 w-4" />
               ) : null}
               <strong className="truncate text-sm">
                 {subdomain || host?.hostname || rental.installationId.slice(0, 12)}
