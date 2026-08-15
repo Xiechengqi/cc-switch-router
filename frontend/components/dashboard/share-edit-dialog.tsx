@@ -8,7 +8,8 @@ import { ShareEditReadView } from "@/components/dashboard/share-edit/share-edit-
 import { ShareEditFormBody, useShareEditForm } from "@/components/dashboard/share-edit/share-edit-form";
 import { ShareEditStatusBanner } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { resolveShareCoreApp, shareAccessApps, SHARE_APP_LABELS } from "@/lib/share-app";
+import { shareAccessApps, SHARE_APP_LABELS } from "@/lib/share-app";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import type { DashboardMarket, ShareView } from "@/lib/types";
 
 export { FieldGroup } from "@/components/dashboard/share-edit/share-edit-shared";
@@ -27,11 +28,7 @@ export function ShareEditDialog({
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
   const form = useShareEditForm({ share, markets, t, onSaved, onClose });
-  const editShare = share;
-  const shareApp = editShare
-    ? shareAccessApps(editShare)[0] ?? resolveShareCoreApp(editShare)
-    : undefined;
-  const shareAppLabel = shareApp ? SHARE_APP_LABELS[shareApp] : "";
+  const boundApps = share ? shareAccessApps(share) : [];
 
   return (
     <>
@@ -40,29 +37,37 @@ export function ShareEditDialog({
         onOpenChange={(open) => !open && !form?.busy && onClose()}
       >
           <Modal.Container placement="center">
-            <Modal.Dialog className="share-edit-surface light flex max-h-[min(88vh,calc(100vh-2rem))] w-[min(960px,calc(100vw-2rem))] max-w-none flex-col !bg-white !text-slate-900">
+            <Modal.Dialog className="share-edit-surface light flex max-h-[min(90vh,calc(100vh-1.5rem))] w-[min(880px,calc(100vw-1.5rem))] max-w-none flex-col overflow-hidden !bg-white !text-slate-900">
               <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-              <Modal.Header>
+              <Modal.Header className="border-b border-slate-200/80">
                 <div className="pr-8">
                   <Modal.Heading>{readOnly ? t("dashboard.shareViewSettings") : t("dashboard.shareEditSettings")}</Modal.Heading>
-                  <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-                    <span className="break-all">{share?.subdomain || share?.shareName}</span>
-                    {shareAppLabel ? (
-                      <span className="rounded bg-primary/10 px-2 py-0.5 text-[11px] font-semibold text-primary">
-                        {shareAppLabel}
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-600">
+                    <span className="break-all font-medium text-slate-900">{share?.subdomain || share?.shareName}</span>
+                    {boundApps.length ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        {boundApps.map((app) => (
+                          <span
+                            key={app}
+                            className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-700"
+                          >
+                            <ShareAppLogo app={app} size={12} />
+                            {SHARE_APP_LABELS[app]}
+                          </span>
+                        ))}
                       </span>
                     ) : null}
                   </div>
                   {share?.ownerEmail ? (
-                    <p className="mt-1 text-xs text-muted-foreground">{share.ownerEmail}</p>
+                    <p className="mt-1 text-xs text-slate-500">{share.ownerEmail}</p>
                   ) : null}
                 </div>
               </Modal.Header>
-              <Modal.Body className="min-h-0 flex-1 overflow-y-auto !text-slate-900">
+              <Modal.Body className="min-h-0 flex-1 overflow-y-auto !px-6 !py-5 !text-slate-900">
                 {readOnly && share ? (
                   <ShareEditReadView share={share} markets={markets} t={t} />
                 ) : share && form ? (
-                  <div className="grid gap-6">
+                  <div className="grid gap-7">
                     <ShareEditStatusBanner share={share} t={t} />
                     {form.error ? (
                       <Alert status="danger" className="!text-slate-900">

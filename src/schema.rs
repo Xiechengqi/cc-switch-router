@@ -55,6 +55,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         13,
         include_str!("../schema/0013_drop_client_market_recovery.sql"),
     ),
+    (
+        14,
+        include_str!("../schema/0014_share_remote_policy.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

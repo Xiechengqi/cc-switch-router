@@ -2,7 +2,8 @@
 
 import { Checkbox, Input, ListBox, Select, TextArea } from "@heroui/react";
 import * as React from "react";
-import { isOfficialRuntime, marketLabel, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { isOfficialRuntime, marketLabel, runtimeModelSummary, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import type { DashboardMarket, ShareAppRuntimes, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import {
@@ -16,6 +17,10 @@ function providerHint(runtime?: ShareUpstreamProvider) {
   if (!runtime) return "";
   if (isOfficialRuntime(runtime)) return "Official";
   return runtime.accountEmail || runtime.apiUrl || runtime.kind || "";
+}
+
+function providerTitle(runtime?: ShareUpstreamProvider) {
+  return runtime?.providerName || runtime?.kind || runtime?.providerType || "";
 }
 
 export type ShareEditMarketFieldsProps = {
@@ -141,6 +146,40 @@ export function ShareEditMarketFields({
           </FieldGroup>
         </div>
 
+        {activeShareApps.length ? (
+          <div className="grid gap-2">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <span className="mono-label text-muted-foreground">{t("dashboard.shareEdit.boundApps")}</span>
+              <span className="text-xs text-muted-foreground">{t("dashboard.shareEdit.boundAppsHint")}</span>
+            </div>
+            <div className="grid gap-2">
+              {activeShareApps.map((app) => {
+                const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
+                const title = providerTitle(runtime);
+                const hint = providerHint(runtime);
+                const models = runtimeModelSummary(runtime, t("dashboard.shareEdit.passthrough"));
+                return (
+                  <div
+                    key={app}
+                    className="flex min-w-0 items-start gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5"
+                  >
+                    <ShareAppLogo app={app} size={16} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                        <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]}</span>
+                        {title ? <span className="truncate text-xs text-slate-500">{title}</span> : null}
+                      </div>
+                      <div className="mt-0.5 truncate text-[11px] text-slate-500">
+                        {[hint, models].filter(Boolean).join(" · ") || t("dashboard.noCurrentNode")}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+
         {forSale === "Yes" ? (
           <div className="grid gap-1.5 text-sm">
             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -170,12 +209,6 @@ export function ShareEditMarketFields({
                   }));
                 }}
               />
-              <span className="truncate text-[11px] text-muted-foreground">
-                {activeShareApps
-                  .map((app) => providerHint(share?.appRuntimes?.[app as keyof ShareAppRuntimes]))
-                  .filter(Boolean)
-                  .join(" / ") || "-"}
-              </span>
             </div>
             {pricingInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
           </div>

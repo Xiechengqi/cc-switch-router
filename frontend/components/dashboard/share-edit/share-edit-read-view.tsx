@@ -4,14 +4,24 @@ import * as React from "react";
 import { EmptyBlock, ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import {
   expiryTitle,
+  isOfficialRuntime,
   isUnlimitedParallelLimit,
   isUnlimitedTokenLimit,
   marketLabel,
+  runtimeModelSummary,
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
 import { getShareUserLimitStatus } from "@/lib/api";
-import { shareAccessApps, resolveShareCoreApp } from "@/lib/share-app";
-import type { DashboardMarket, ShareUserGrant, ShareUserLimitStatusRow, ShareView } from "@/lib/types";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { shareAccessApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
+import type {
+  DashboardMarket,
+  ShareAppRuntimes,
+  ShareUpstreamProvider,
+  ShareUserGrant,
+  ShareUserLimitStatusRow,
+  ShareView,
+} from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 import {
   forSaleOptionLabel,
@@ -36,6 +46,12 @@ function activeUserLimitGrants(share: ShareView): ShareUserGrant[] {
     });
 }
 
+function providerHint(runtime?: ShareUpstreamProvider) {
+  if (!runtime) return "";
+  if (isOfficialRuntime(runtime)) return "Official";
+  return runtime.accountEmail || runtime.apiUrl || runtime.kind || "";
+}
+
 export function ShareEditReadView({
   share,
   markets,
@@ -45,8 +61,10 @@ export function ShareEditReadView({
   markets: DashboardMarket[];
   t: TFn;
 }) {
-  const shareApp = resolveShareCoreApp(share) ?? shareAccessApps(share)[0];
+  const boundApps = shareAccessApps(share);
+  const shareApp = resolveShareCoreApp(share) ?? boundApps[0];
   const tokenMarkets = markets;
+  const showCodexPolicy = boundApps.includes("codex");
 
   const forSale = (share.forSale as "Yes" | "No" | "Free") || "No";
   const marketAccessMode = (share.marketAccessMode as "selected" | "all") || "selected";
@@ -125,6 +143,31 @@ export function ShareEditReadView({
             value={share.description?.trim() ? share.description : "—"}
           />
         </div>
+        {boundApps.length ? (
+          <div className="grid gap-2">
+            {boundApps.map((app) => {
+              const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
+              const hint = providerHint(runtime);
+              const models = runtimeModelSummary(runtime, t("dashboard.shareEdit.passthrough"));
+              return (
+                <div key={app} className="flex min-w-0 items-start gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5">
+                  <ShareAppLogo app={app} size={16} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-x-2">
+                      <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]}</span>
+                      {runtime?.providerName ? (
+                        <span className="truncate text-xs text-slate-500">{runtime.providerName}</span>
+                      ) : null}
+                    </div>
+                    <div className="mt-0.5 truncate text-[11px] text-slate-500">
+                      {[hint, models].filter(Boolean).join(" · ") || "—"}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
       </ShareEditSection>
 
       {shareApp ? (
@@ -188,6 +231,31 @@ export function ShareEditReadView({
               )}
             </div>
           </ShareEditSection>
+
+          {showCodexPolicy ? (
+            <ShareEditSection title={t("dashboard.shareEdit.section.codexPolicy")}>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <ReadOnlyField
+                  label={t("dashboard.shareEdit.personalCredits")}
+                  value={share.allowPersonalCredits ? t("dashboard.on") : t("dashboard.off")}
+                />
+                <ReadOnlyField
+                  label={t("dashboard.shareEdit.previousResponseCache")}
+                  value={share.previousResponseCacheEnabled ? t("dashboard.on") : t("dashboard.off")}
+                />
+                <ReadOnlyField
+                  label={t("dashboard.shareEdit.autoReset")}
+                  value={share.autoConsumeBankedReset ? t("dashboard.on") : t("dashboard.off")}
+                />
+                {share.autoConsumeBankedReset ? (
+                  <ReadOnlyField
+                    label={t("dashboard.shareEdit.resetLeadMinutes")}
+                    value={String(share.bankedResetExpiryLeadMinutes ?? 60)}
+                  />
+                ) : null}
+              </div>
+            </ShareEditSection>
+          ) : null}
         </>
       ) : (
         <EmptyBlock>{t("dashboard.shareEditNoAppType")}</EmptyBlock>

@@ -386,6 +386,11 @@ export type ShareView = {
   userGrants?: ShareUserGrantMap;
   supportedUserTokenPeriods?: ShareTokenPeriod[];
   configRevision?: number;
+  autoStart?: boolean;
+  allowPersonalCredits?: boolean;
+  autoConsumeBankedReset?: boolean;
+  bankedResetExpiryLeadMinutes?: number;
+  previousResponseCacheEnabled?: boolean;
 };
 
 export type ShareAppAccess = {
@@ -423,6 +428,10 @@ export type ShareSettingsPatch = {
   parallelLimit?: number;
   expiresAt?: string;
   autoStart?: boolean;
+  allowPersonalCredits?: boolean;
+  autoConsumeBankedReset?: boolean;
+  bankedResetExpiryLeadMinutes?: number;
+  previousResponseCacheEnabled?: boolean;
   userGrants?: ShareUserGrantMap;
   managedGrant?: {
     operationId: string;

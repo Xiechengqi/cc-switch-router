@@ -28,8 +28,8 @@ export function ShareEditSection({
   children: React.ReactNode;
 }) {
   return (
-    <section className="grid gap-3">
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">{title}</h3>
+    <section className="grid gap-3 rounded-2xl border border-slate-200/80 bg-white p-4">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{title}</h3>
       {children}
     </section>
   );

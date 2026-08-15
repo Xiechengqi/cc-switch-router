@@ -10,6 +10,9 @@ import type {
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
 export const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
+export const DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES = 60;
+export const MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES = 10;
+export const MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES = 7 * 24 * 60;
 
 export type ShareSettingsDraft = {
   description: string;

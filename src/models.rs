@@ -15,6 +15,30 @@ pub fn default_share_parallel_limit() -> i64 {
     -1
 }
 
+pub const DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 60;
+pub const MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 10;
+pub const MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 7 * 24 * 60;
+
+fn default_banked_reset_expiry_lead_minutes() -> u32 {
+    DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES
+}
+
+fn is_default_banked_reset_expiry_lead_minutes(value: &u32) -> bool {
+    *value == DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES
+}
+
+/// Distinguishes a missing JSON field (`None`) from an explicit `null`
+/// (`Some(None)`). `Option<Option<T>>` with only `default` treats both as
+/// absent, so `"description": null` would never clear the stored value.
+fn deserialize_optional_nullable_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Installation {
@@ -878,7 +902,11 @@ pub struct ShareRuntimeRefreshRequest {
 pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nullable_string"
+    )]
     pub description: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale: Option<String>,
@@ -900,6 +928,14 @@ pub struct ShareSettingsPatch {
     pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_personal_credits: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_consume_banked_reset: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banked_reset_expiry_lead_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_cache_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -950,6 +986,17 @@ mod share_settings_patch_tests {
         let legacy: LegacyShareSettingsPatch =
             serde_json::from_value(value).expect("legacy server accepts patch");
         assert_eq!(legacy.description, Some(Some("updated".to_string())));
+    }
+
+    #[test]
+    fn explicit_null_description_clears_instead_of_being_absent() {
+        let patch: ShareSettingsPatch =
+            serde_json::from_str(r#"{"description":null}"#).expect("parse null description");
+        assert_eq!(patch.description, Some(None));
+
+        let omitted: ShareSettingsPatch =
+            serde_json::from_str(r#"{}"#).expect("parse omitted description");
+        assert_eq!(omitted.description, None);
     }
 }
 
@@ -2357,6 +2404,17 @@ pub struct ShareDescriptor {
     pub model_health: ShareModelHealthSummary,
     #[serde(default, skip_serializing_if = "is_false")]
     pub auto_start: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_personal_credits: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_consume_banked_reset: bool,
+    #[serde(
+        default = "default_banked_reset_expiry_lead_minutes",
+        skip_serializing_if = "is_default_banked_reset_expiry_lead_minutes"
+    )]
+    pub banked_reset_expiry_lead_minutes: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub previous_response_cache_enabled: bool,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
@@ -3215,6 +3273,16 @@ pub struct ShareView {
     pub supported_user_token_periods: Vec<ShareTokenPeriod>,
     #[serde(default)]
     pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_start: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_personal_credits: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_consume_banked_reset: bool,
+    #[serde(default, skip_serializing_if = "is_default_banked_reset_expiry_lead_minutes")]
+    pub banked_reset_expiry_lead_minutes: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub previous_response_cache_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]

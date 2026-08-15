@@ -6949,6 +6949,11 @@ impl AppStore {
             user_grants: visible_user_grants,
             supported_user_token_periods: share.supported_user_token_periods,
             config_revision: share.config_revision,
+            auto_start: share.auto_start,
+            allow_personal_credits: share.allow_personal_credits,
+            auto_consume_banked_reset: share.auto_consume_banked_reset,
+            banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
+            previous_response_cache_enabled: share.previous_response_cache_enabled,
         };
         view.operational_summary = share_operational_summary(&view, Utc::now());
         Ok(view)
@@ -9907,6 +9912,11 @@ impl AppStore {
                     user_grants: visible_user_grants,
                     supported_user_token_periods: share.supported_user_token_periods,
                     config_revision: share.config_revision,
+                    auto_start: share.auto_start,
+                    allow_personal_credits: share.allow_personal_credits,
+                    auto_consume_banked_reset: share.auto_consume_banked_reset,
+                    banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
+                    previous_response_cache_enabled: share.previous_response_cache_enabled,
                 };
                 view.operational_summary = share_operational_summary(&view, Utc::now());
                 view
@@ -12966,8 +12976,9 @@ fn upsert_share_tx(
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
             token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at, capacity_pool_id, for_sale_official_price_percent_by_app_json,
-            descriptor_generation, descriptor_fingerprint
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
+            descriptor_generation, descriptor_fingerprint,
+            auto_start, allow_personal_credits, auto_consume_banked_reset, banked_reset_expiry_lead_minutes, previous_response_cache_enabled
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -13002,6 +13013,11 @@ fn upsert_share_tx(
             for_sale_official_price_percent_by_app_json = excluded.for_sale_official_price_percent_by_app_json,
             descriptor_generation = excluded.descriptor_generation,
             descriptor_fingerprint = excluded.descriptor_fingerprint,
+            auto_start = excluded.auto_start,
+            allow_personal_credits = excluded.allow_personal_credits,
+            auto_consume_banked_reset = excluded.auto_consume_banked_reset,
+            banked_reset_expiry_lead_minutes = excluded.banked_reset_expiry_lead_minutes,
+            previous_response_cache_enabled = excluded.previous_response_cache_enabled,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at
         WHERE excluded.descriptor_generation > shares.descriptor_generation
@@ -13046,6 +13062,11 @@ fn upsert_share_tx(
             official_price_percent_by_app_json,
             i64::try_from(share.descriptor_generation).unwrap_or(i64::MAX),
             share.descriptor_fingerprint,
+            i64::from(share.auto_start as u8),
+            i64::from(share.allow_personal_credits as u8),
+            i64::from(share.auto_consume_banked_reset as u8),
+            i64::from(share.banked_reset_expiry_lead_minutes),
+            i64::from(share.previous_response_cache_enabled as u8),
         ],
     )
     .map_err(map_share_constraint_error)?;
@@ -17253,7 +17274,10 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     s.bindings_json, s.config_revision, COALESCE(s.user_grants_json, '{}'),
                     COALESCE(s.supported_user_token_periods_json, '[]'), s.capacity_pool_id,
                     COALESCE(s.for_sale_official_price_percent_by_app_json, '{}'),
-                    s.descriptor_generation, s.descriptor_fingerprint
+                    s.descriptor_generation, s.descriptor_fingerprint,
+                    COALESCE(s.auto_start, 0), COALESCE(s.allow_personal_credits, 0),
+                    COALESCE(s.auto_consume_banked_reset, 0), COALESCE(s.banked_reset_expiry_lead_minutes, 60),
+                    COALESCE(s.previous_response_cache_enabled, 0)
              FROM shares s
              INNER JOIN installations i ON i.id = s.installation_id
              WHERE i.lifecycle = 'active'
@@ -17299,7 +17323,11 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     app_providers: parse_app_providers(row.get(25)?)?,
                     app_availability: ShareAppAvailability::default(),
                     model_health: ShareModelHealthSummary::default(),
-                    auto_start: false,
+                    auto_start: row.get::<_, i64>(34)? != 0,
+                    allow_personal_credits: row.get::<_, i64>(35)? != 0,
+                    auto_consume_banked_reset: row.get::<_, i64>(36)? != 0,
+                    banked_reset_expiry_lead_minutes: row.get::<_, i64>(37)?.max(0) as u32,
+                    previous_response_cache_enabled: row.get::<_, i64>(38)? != 0,
                     config_revision: row.get::<_, i64>(27)?.max(0) as u64,
                     descriptor_generation: row.get::<_, i64>(32)?.max(0) as u64,
                     descriptor_fingerprint: row.get(33)?,
@@ -17469,6 +17497,10 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.parallel_limit.is_none()
         && patch.expires_at.is_none()
         && patch.auto_start.is_none()
+        && patch.allow_personal_credits.is_none()
+        && patch.auto_consume_banked_reset.is_none()
+        && patch.banked_reset_expiry_lead_minutes.is_none()
+        && patch.previous_response_cache_enabled.is_none()
         && patch.user_grants.is_none()
         && patch.managed_grant.is_none()
 }
@@ -17613,6 +17645,26 @@ fn validate_returned_share_against_patch(
     if let Some(auto_start) = patch.auto_start {
         if auto_start != share.auto_start {
             return Err("autoStart");
+        }
+    }
+    if let Some(allow_personal_credits) = patch.allow_personal_credits {
+        if allow_personal_credits != share.allow_personal_credits {
+            return Err("allowPersonalCredits");
+        }
+    }
+    if let Some(auto_consume_banked_reset) = patch.auto_consume_banked_reset {
+        if auto_consume_banked_reset != share.auto_consume_banked_reset {
+            return Err("autoConsumeBankedReset");
+        }
+    }
+    if let Some(lead_minutes) = patch.banked_reset_expiry_lead_minutes {
+        if lead_minutes != share.banked_reset_expiry_lead_minutes {
+            return Err("bankedResetExpiryLeadMinutes");
+        }
+    }
+    if let Some(previous_response_cache_enabled) = patch.previous_response_cache_enabled {
+        if previous_response_cache_enabled != share.previous_response_cache_enabled {
+            return Err("previousResponseCacheEnabled");
         }
     }
     if let Some(user_grants) = patch.user_grants.as_ref() {
@@ -17952,6 +18004,18 @@ fn normalize_share_settings_patch(
             ));
         }
     }
+    if let Some(lead_minutes) = patch.banked_reset_expiry_lead_minutes {
+        if !(crate::models::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES
+            ..=crate::models::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES)
+            .contains(&lead_minutes)
+        {
+            return Err(AppError::BadRequest(format!(
+                "bankedResetExpiryLeadMinutes must be between {} and {}",
+                crate::models::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+                crate::models::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES
+            )));
+        }
+    }
     Ok(ShareSettingsPatch {
         owner_email: next_owner_email,
         description: match patch.description {
@@ -17971,6 +18035,10 @@ fn normalize_share_settings_patch(
         parallel_limit: patch.parallel_limit,
         expires_at: patch.expires_at,
         auto_start: patch.auto_start,
+        allow_personal_credits: patch.allow_personal_credits,
+        auto_consume_banked_reset: patch.auto_consume_banked_reset,
+        banked_reset_expiry_lead_minutes: patch.banked_reset_expiry_lead_minutes,
+        previous_response_cache_enabled: patch.previous_response_cache_enabled,
         user_grants,
         managed_grant: None,
     })
@@ -25733,6 +25801,23 @@ mod tests {
         assert!(matches!(unbound_app, Err(AppError::BadRequest(_))));
     }
 
+    #[test]
+    fn explicit_null_description_normalizes_to_clear() {
+        let bindings = BTreeMap::from([("codex".to_string(), "provider-codex".to_string())]);
+        let patch: ShareSettingsPatch =
+            serde_json::from_str(r#"{"description":null}"#).expect("parse null description");
+        let normalized = normalize_share_settings_patch(
+            patch,
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("No"),
+            Some(&bindings),
+            None,
+        )
+        .expect("normalize cleared description");
+        assert_eq!(normalized.description, Some(None));
+    }
+
     fn test_config(name: &str) -> Config {
         let db_path =
             std::env::temp_dir().join(format!("cc-switch-router-{name}-{}.db", Uuid::new_v4()));
@@ -26803,6 +26888,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -36377,6 +36466,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -36464,6 +36557,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -37256,6 +37353,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -37349,6 +37450,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -37442,6 +37547,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -37572,6 +37681,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -37845,6 +37958,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -37960,6 +38077,10 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),

@@ -1,6 +1,6 @@
 "use client";
 
-import { Checkbox, Input } from "@heroui/react";
+import { Checkbox, Input, Switch } from "@heroui/react";
 import * as React from "react";
 import { EmptyBlock } from "@/components/dashboard/drawer-panels";
 import {
@@ -11,6 +11,10 @@ import {
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
 import { resolveShareCoreApp, shareAccessApps } from "@/lib/share-app";
+import {
+  MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+  MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+} from "@/lib/share-settings";
 import type { DashboardMarket, ShareAccessByApp, ShareView } from "@/lib/types";
 import { updateShareSettings } from "@/lib/api";
 import {
@@ -42,6 +46,7 @@ export type ShareEditFormApi = {
   parallelInvalid: boolean;
   expiryInvalid: boolean;
   pricingInvalid: boolean;
+  bankedResetInvalid: boolean;
   formInvalid: boolean;
   isDirty: boolean;
   marketSelectKey: number;
@@ -265,8 +270,19 @@ export function useShareEditForm({
       if (!raw) return false;
       return !/^(?:[1-9]|[1-9][0-9]|100)$/.test(raw);
     });
+  const bankedResetLead = Number.parseInt(draft.bankedResetLeadInput, 10);
+  const bankedResetInvalid =
+    draft.autoConsumeBankedReset &&
+    (!Number.isSafeInteger(bankedResetLead) ||
+      bankedResetLead < MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES ||
+      bankedResetLead > MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES);
   const formInvalid =
-    descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid;
+    descriptionInvalid ||
+    tokenInvalid ||
+    parallelInvalid ||
+    expiryInvalid ||
+    pricingInvalid ||
+    bankedResetInvalid;
 
   const currentPatch = buildShareEditPatch(draft, editShare!, activeShareApps, publicMarketEmails);
   const basePatch = buildShareEditPatch(baseDraft, editShare!, activeShareApps, publicMarketEmails);
@@ -371,6 +387,7 @@ export function useShareEditForm({
     parallelInvalid,
     expiryInvalid,
     pricingInvalid,
+    bankedResetInvalid,
     formInvalid,
     isDirty,
     marketSelectKey,
@@ -572,6 +589,95 @@ export function ShareEditFormBody({
           />
         ) : null}
       </ShareEditSection>
+
+      {activeShareApps.includes("codex") ? (
+        <ShareEditSection title={t("dashboard.shareEdit.section.codexPolicy")}>
+          <p className="text-xs leading-relaxed text-slate-500">
+            {t("dashboard.shareEdit.codexPolicyHint")}
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="flex items-start justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-slate-900">
+                  {t("dashboard.shareEdit.personalCredits")}
+                </span>
+                <span className="mt-1 block text-xs leading-relaxed text-slate-500">
+                  {t("dashboard.shareEdit.personalCreditsHint")}
+                </span>
+              </span>
+              <Switch
+                isSelected={draft.allowPersonalCredits}
+                onChange={(value: boolean) =>
+                  form.onDraftChange((current) => ({ ...current, allowPersonalCredits: value }))
+                }
+              />
+            </label>
+            <label className="flex items-start justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-slate-900">
+                  {t("dashboard.shareEdit.previousResponseCache")}
+                </span>
+                <span className="mt-1 block text-xs leading-relaxed text-slate-500">
+                  {t("dashboard.shareEdit.previousResponseCacheHint")}
+                </span>
+              </span>
+              <Switch
+                isSelected={draft.previousResponseCacheEnabled}
+                onChange={(value: boolean) =>
+                  form.onDraftChange((current) => ({
+                    ...current,
+                    previousResponseCacheEnabled: value,
+                  }))
+                }
+              />
+            </label>
+            <label className="flex items-start justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3 sm:col-span-2">
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-slate-900">
+                  {t("dashboard.shareEdit.autoReset")}
+                </span>
+                <span className="mt-1 block text-xs leading-relaxed text-slate-500">
+                  {t("dashboard.shareEdit.autoResetHint")}
+                </span>
+              </span>
+              <Switch
+                isSelected={draft.autoConsumeBankedReset}
+                onChange={(value: boolean) =>
+                  form.onDraftChange((current) => ({
+                    ...current,
+                    autoConsumeBankedReset: value,
+                  }))
+                }
+              />
+            </label>
+          </div>
+          {draft.autoConsumeBankedReset ? (
+            <FieldGroup
+              label={t("dashboard.shareEdit.resetLeadMinutes")}
+              hint={
+                form.bankedResetInvalid
+                  ? t("dashboard.shareEdit.resetLeadInvalid")
+                  : t("dashboard.shareEdit.resetLeadHint")
+              }
+              invalid={form.bankedResetInvalid}
+            >
+              <Input
+                type="number"
+                min={MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES}
+                max={MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES}
+                step={10}
+                value={draft.bankedResetLeadInput}
+                onChange={(event) =>
+                  form.onDraftChange((current) => ({
+                    ...current,
+                    bankedResetLeadInput: event.target.value,
+                  }))
+                }
+              />
+            </FieldGroup>
+          ) : null}
+        </ShareEditSection>
+      ) : null}
     </>
   );
 }
