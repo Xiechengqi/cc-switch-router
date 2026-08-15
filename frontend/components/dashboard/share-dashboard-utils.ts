@@ -911,26 +911,25 @@ export function formatCompactQuotaTier(
     unit?: string;
   },
   locale: AppLocale = "en",
+  maximumUtilizationFractionDigits = 0,
+  utilizationAlreadyPercent = false,
 ) {
   const label = normalizeCompactTierLabel(tier.label || tier.name, locale);
   const utilization =
     typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
-      ? `${utilizationPercentForDisplay(tier.utilization)}%`
+      ? `${utilizationPercentForDisplay(
+          tier.utilization,
+          maximumUtilizationFractionDigits,
+          utilizationAlreadyPercent,
+        )}%`
       : "";
   const countdown = countdownStr(tier.resetsAt);
   const amount = formatQuotaUsageAmount(tier, locale);
   return [label, amount, utilization, countdown].filter(Boolean).join(" ");
 }
 
-export function quotaPlanLabel(runtime: ShareUpstreamProvider, plan?: string) {
+export function quotaPlanLabel(_runtime: ShareUpstreamProvider, plan?: string) {
   const normalized = String(plan || "").trim();
-  if (!normalized) return "";
-  if (
-    isOllamaCloudRuntime(runtime) &&
-    !normalized.toLowerCase().includes("ollama")
-  ) {
-    return `ollama ${normalized}`;
-  }
   return normalized;
 }
 
@@ -1056,10 +1055,35 @@ export function resolveShareAppRuntime(share: ShareView, app: CoreShareApp) {
   return slotRuntime;
 }
 
-export function utilizationPercentForDisplay(value: number) {
+export function utilizationPercentForDisplay(
+  value: number,
+  maximumFractionDigits = 0,
+  valueAlreadyPercent = false,
+) {
   if (!Number.isFinite(value)) return 0;
-  if (value >= 0 && value <= 1) return Math.round(value * 100);
-  return Math.round(value);
+  const percent =
+    !valueAlreadyPercent && value >= 0 && value <= 1 ? value * 100 : value;
+  const digits = Math.max(0, Math.min(6, Math.floor(maximumFractionDigits)));
+  const factor = 10 ** digits;
+  return Math.round(percent * factor) / factor;
+}
+
+function ollamaQuotaTierLabel(label: string, locale: AppLocale) {
+  const normalized = label.trim().toLowerCase();
+  if (normalized === "session")
+    return locale.startsWith("zh") ? "会话" : "Session";
+  if (normalized === "weekly")
+    return locale.startsWith("zh") ? "每周" : "Weekly";
+  return normalizeCompactTierLabel(label, locale);
+}
+
+function ollamaActivityCost(value?: string, locale: AppLocale = "en") {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed)) return "";
+  const label = locale.startsWith("zh") ? "活动费用" : "Activity cost";
+  return `${label} $${parsed.toFixed(1)}`;
 }
 
 export function quotaSummary(
@@ -1083,14 +1107,28 @@ export function quotaSummary(
     if (preferredTiers.length) tiers = preferredTiers;
   }
   const tierText = tiers
-    .map((tier) => formatCompactQuotaTier(tier, locale))
+    .map((tier) => {
+      if (!isOllamaCloudRuntime(runtime)) {
+        return formatCompactQuotaTier(tier, locale);
+      }
+      return formatCompactQuotaTier(
+        { ...tier, label: ollamaQuotaTierLabel(String(tier.label), locale) },
+        locale,
+        1,
+        true,
+      );
+    })
     .filter(Boolean)
     .join(" · ");
   const expireText = providerSubscriptionExpiry(runtime, locale);
+  const activityText = isOllamaCloudRuntime(runtime)
+    ? ollamaActivityCost(quota.activityCost, locale)
+    : "";
   return [
     quotaPlanLabel(runtime, quota.plan || quota.credentialMessage),
     expireText,
     tierText,
+    activityText,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -1204,12 +1242,7 @@ export function providerAccountTierLabel(runtime?: ShareUpstreamProvider) {
   const plan = String(
     runtime.quota?.plan || runtime.quota?.credentialMessage || "",
   ).trim();
-  if (plan) {
-    return isOllamaCloudRuntime(runtime) &&
-      !plan.toLowerCase().includes("ollama")
-      ? `ollama ${plan}`
-      : plan;
-  }
+  if (plan) return plan;
   return runtime.providerName || runtime.kind || "-";
 }
 

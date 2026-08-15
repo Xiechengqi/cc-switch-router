@@ -19373,6 +19373,7 @@ mod quota_runtime_filter_tests {
             quota: Some(ShareUpstreamQuota {
                 status: "ok".to_string(),
                 plan: None,
+                activity_cost: None,
                 queried_at: None,
                 subscription_period_end: None,
                 availability: Some("short_window_exhausted".to_string()),
@@ -19398,6 +19399,7 @@ mod quota_runtime_filter_tests {
             quota: Some(ShareUpstreamQuota {
                 status: "ok".to_string(),
                 plan: Some("ChatGPT Plus".to_string()),
+                activity_cost: None,
                 queried_at: None,
                 subscription_period_end: None,
                 availability: Some("available".to_string()),
@@ -19429,21 +19431,25 @@ mod quota_runtime_filter_tests {
             api_url: None,
             quota: Some(ShareUpstreamQuota {
                 status: "ok".to_string(),
-                plan: Some("pro".to_string()),
+                plan: Some("free".to_string()),
+                activity_cost: Some("0.00000".to_string()),
                 queried_at: None,
-                subscription_period_end: Some((Utc::now() + Duration::days(28)).to_rfc3339()),
-                availability: Some("available".to_string()),
+                subscription_period_end: None,
+                availability: None,
                 blocked_until: None,
                 blocked_reason: None,
                 blocked_scope: None,
-                tiers: vec![crate::models::ShareUpstreamQuotaTier {
-                    label: "xiechengqi01@gmail.com".to_string(),
-                    utilization: 100.0,
-                    resets_at: Some((Utc::now() + Duration::days(28)).to_rfc3339()),
-                    used: None,
-                    limit: None,
-                    unit: None,
-                }],
+                tiers: ["session", "weekly"]
+                    .into_iter()
+                    .map(|label| crate::models::ShareUpstreamQuotaTier {
+                        label: label.to_string(),
+                        utilization: 0.1,
+                        resets_at: None,
+                        used: None,
+                        limit: None,
+                        unit: None,
+                    })
+                    .collect(),
             }),
             models: Vec::new(),
             ..Default::default()
@@ -27838,6 +27844,7 @@ mod tests {
         codex_provider.quota = Some(ShareUpstreamQuota {
             status: "ok".into(),
             plan: Some("ChatGPT Plus".into()),
+            activity_cost: None,
             queried_at: Some(now.timestamp_millis()),
             subscription_period_end: None,
             availability: Some("long_window_exhausted".into()),
@@ -30940,8 +30947,9 @@ mod tests {
             quota_blocked: Some(true),
             quota: Some(ShareUpstreamQuota {
                 status: "ok".into(),
-                plan: None,
-                queried_at: None,
+                plan: Some("free".into()),
+                activity_cost: Some("0.00000".into()),
+                queried_at: Some(1),
                 subscription_period_end: None,
                 availability: None,
                 blocked_until: None,
@@ -30963,8 +30971,15 @@ mod tests {
             available: None,
         };
         let json = serde_json::to_string(&value).expect("serialize provider");
+        let plan = json.find("plan").expect("plan");
+        let activity_cost = json.find("activityCost").expect("activityCost");
+        let queried_at = json.find("queriedAt").expect("queriedAt");
         let api = json.find("apiUrl").expect("apiUrl");
         let models = json.find("models").expect("models");
+        assert!(
+            plan < activity_cost && activity_cost < queried_at,
+            "expected activityCost between plan and queriedAt, got {json}"
+        );
         assert!(api < models, "expected apiUrl before models, got {json}");
     }
 

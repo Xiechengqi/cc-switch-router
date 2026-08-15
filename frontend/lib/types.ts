@@ -972,6 +972,7 @@ export type ShareUpstreamProvider = {
     status?: string;
     plan?: string;
     credentialMessage?: string;
+    activityCost?: string;
     queriedAt?: number;
     subscriptionPeriodEnd?: string;
     availability?: string;

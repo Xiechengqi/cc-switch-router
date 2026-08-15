@@ -306,6 +306,7 @@ mod tests {
         let quota = ShareUpstreamQuota {
             status: "ok".into(),
             plan: None,
+            activity_cost: None,
             queried_at: None,
             subscription_period_end: None,
             availability: None,
@@ -330,6 +331,7 @@ mod tests {
         let quota = ShareUpstreamQuota {
             status: "ok".into(),
             plan: None,
+            activity_cost: None,
             queried_at: None,
             subscription_period_end: None,
             availability: None,
