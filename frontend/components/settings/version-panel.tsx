@@ -26,13 +26,28 @@ function formatBytes(bytes?: number | null) {
 
 type ConfirmAction = "restart" | "upgrade" | "rollback" | "rollbackAgain";
 
+type UpgradeLogLine = { level: string; text: string };
+
+const UPGRADE_LOG_TONES: Record<string, string> = {
+  error: "text-rose-300",
+  warn: "text-amber-300",
+  success: "text-emerald-300",
+  progress: "text-slate-400",
+};
+
+function upgradeLogTime(at?: string) {
+  if (!at) return "";
+  const parsed = new Date(at);
+  return Number.isNaN(parsed.getTime()) ? "" : parsed.toLocaleTimeString();
+}
+
 export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   const { t } = useLocaleText();
   const [info, setInfo] = React.useState<VersionResponse | null>(null);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState<string | null>(null);
   const [upgradeOpen, setUpgradeOpen] = React.useState(false);
-  const [logs, setLogs] = React.useState<string[]>([]);
+  const [logs, setLogs] = React.useState<UpgradeLogLine[]>([]);
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
 
   const refresh = React.useCallback(async () => {
@@ -54,7 +69,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     setError("");
     try {
       await restartService();
-      setLogs((prev) => [...prev, t("version.restartScheduledHealth")]);
+      setLogs((prev) => [...prev, { level: "info", text: t("version.restartScheduledHealth") }]);
       pollHealthAndReload().catch(console.error);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -83,7 +98,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     setError("");
     try {
       await rollbackService();
-      setLogs((prev) => [...prev, t("version.restartScheduledHealth")]);
+      setLogs((prev) => [...prev, { level: "info", text: t("version.restartScheduledHealth") }]);
       pollHealthAndReload().catch(console.error);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -149,21 +164,43 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     const params = new URLSearchParams({ taskId });
     if (token) params.set("accessToken", token);
     const source = new EventSource(`/v1/admin/upgrade/stream?${params}`);
+    // The task keeps the process alive on failure, so the health probe would
+    // succeed and reload the page before anyone reads the error. Remember the
+    // last error line and only reload once the task reports success.
+    let lastError = "";
     source.addEventListener("log", (event) => {
       try {
         const data = JSON.parse((event as MessageEvent).data);
-        setLogs((prev) => [...prev, `${data.ts || ""} ${data.level || "info"} ${data.message || ""}`.trim()]);
+        const level = typeof data.level === "string" ? data.level : "info";
+        const message = typeof data.message === "string" ? data.message : "";
+        if (level === "error" && message) lastError = message;
+        const step = data.step && data.totalSteps ? `[${data.step}/${data.totalSteps}]` : "";
+        setLogs((prev) => [
+          ...prev,
+          { level, text: `${upgradeLogTime(data.at)} ${step} ${level} ${message}`.trim() },
+        ]);
       } catch {
-        setLogs((prev) => [...prev, (event as MessageEvent).data]);
+        setLogs((prev) => [...prev, { level: "info", text: (event as MessageEvent).data }]);
       }
     });
     source.addEventListener("done", (event) => {
-      setLogs((prev) => [...prev, `done ${(event as MessageEvent).data}`]);
       source.close();
+      let status = "";
+      try {
+        status = JSON.parse((event as MessageEvent).data).status || "";
+      } catch {
+        status = "";
+      }
+      setLogs((prev) => [...prev, { level: status === "success" ? "success" : "error", text: `done ${(event as MessageEvent).data}` }]);
+      if (status !== "success") {
+        setError(lastError ? t("version.upgradeFailedWith", { reason: lastError }) : t("version.upgradeFailed"));
+        setBusy(null);
+        return;
+      }
       pollHealthAndReload().catch(console.error);
     });
     source.onerror = () => {
-      setLogs((prev) => [...prev, t("version.streamDisconnected")]);
+      setLogs((prev) => [...prev, { level: "warn", text: t("version.streamDisconnected") }]);
       source.close();
       setBusy(null);
     };
@@ -218,10 +255,19 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
                   <p className="mt-1 text-sm text-muted-foreground">{t("version.upgradeLogDesc")}</p>
                 </div>
               </Modal.Header>
-              <Modal.Body>
+              <Modal.Body className="grid gap-3">
+                {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
                 <ScrollShadow className="h-96 rounded-lg border bg-slate-950 p-4 font-mono text-xs text-slate-100">
                   <div className="grid gap-2 pr-3">
-                    {logs.length ? logs.map((line, index) => <div key={`${index}-${line}`}>{line}</div>) : <div>{t("version.waitingLogs")}</div>}
+                    {logs.length ? (
+                      logs.map((line, index) => (
+                        <div key={`${index}-${line.text}`} className={UPGRADE_LOG_TONES[line.level] || ""}>
+                          {line.text}
+                        </div>
+                      ))
+                    ) : (
+                      <div>{t("version.waitingLogs")}</div>
+                    )}
                   </div>
                 </ScrollShadow>
               </Modal.Body>

@@ -223,6 +223,8 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 **Schema 策略**:仅支持全新环境。空库首次启动在 `BEGIN IMMEDIATE` 事务中安装 `schema/0001_baseline.sql`,随后写入版本与 SHA-256 checksum。非空且没有迁移元数据的旧库、未知版本和 checksum 不匹配都会拒绝启动,不执行历史探测、补列或数据迁移。
 
+**baseline 不可再修改**:已部署的库都记录了 `schema/0001_baseline.sql` 的 SHA-256,改动该文件会让所有既有库以 `database migration 1 checksum mismatch` 拒绝启动,同时使自升级在 `check-db` 自检阶段静默失败。任何后续 schema 变更只能新增 `schema/00NN_*.sql`,`src/schema.rs` 的 `baseline_checksum_stays_frozen` 测试钉死了该文件的 checksum。
+
 **Turso 运行约束**:只支持单个可写 Router 实例,不包含 leader election 或多写协调。`/v1/healthz` 暴露模式、可用状态、最近同步/失败时间、连续失败次数与同步 frame 数；远端故障时返回 503,但不向调用方暴露底层连接错误或 Token。
 
 ### 表分组
@@ -349,10 +351,10 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 
 1. 同目录暂存临时文件(避开跨文件系统 rename 的 EXDEV)
 2. 从 GitHub latest release 下载(180s 超时)
-3. `chmod +x` 并以 `--help` 冒烟自检(5s)
+3. `chmod +x`,以 `--help` 冒烟自检(5s)并用新二进制跑 `check-db`(30s)确认它能接受当前数据库
 4. SHA-256 比对新旧二进制
 5. 原子 `rename(2)` 交换,旧二进制留 `.bak`
 6. 探测服务管理器(systemd 或 nohup)
 7. `setsid -f` 派生子进程延时重启
 
-进度经 broadcast channel 以 SSE 流式推送至前端。
+进度经 broadcast channel 以 SSE 流式推送至前端。任一步失败都在交换二进制之前 `return Err`,进程继续运行旧版本;前端只在收到 `status=success` 的 done 事件后才轮询健康并刷新页面,失败时保留日志弹窗并把最后一条 error 显示为告警。

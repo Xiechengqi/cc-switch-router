@@ -5,6 +5,9 @@ use crate::db::{Connection, TransactionBehavior, params};
 use crate::error::AppError;
 
 const BASELINE_VERSION: i64 = 1;
+// Frozen once released: every managed database records this file's checksum, so
+// editing it makes every existing database fail startup and self-upgrade with a
+// version 1 checksum mismatch. Schema changes belong in a new MIGRATIONS entry.
 const BASELINE_SQL: &str = include_str!("../schema/0001_baseline.sql");
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -47,6 +50,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         12,
         include_str!("../schema/0012_share_request_log_recovery_cursors.sql"),
+    ),
+    (
+        13,
+        include_str!("../schema/0013_drop_client_market_recovery.sql"),
     ),
 ];
 
@@ -282,7 +289,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 12);
+        assert_eq!(versions.len(), 13);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -295,6 +302,73 @@ mod tests {
         assert_eq!(versions[9], (10, migration_checksum(MIGRATIONS[8].1)));
         assert_eq!(versions[10], (11, migration_checksum(MIGRATIONS[9].1)));
         assert_eq!(versions[11], (12, migration_checksum(MIGRATIONS[10].1)));
+        assert_eq!(versions[12], (13, migration_checksum(MIGRATIONS[11].1)));
+    }
+
+    /// Databases in the field record this checksum for version 1; a new value
+    /// here means every existing deployment would refuse to start or upgrade.
+    #[test]
+    fn baseline_checksum_stays_frozen() {
+        assert_eq!(
+            migration_checksum(BASELINE_SQL),
+            "53ee1ae8055a7bf720ba8eaced5be6af2957b385017bd2cb8c2fa32e77a0e5a9",
+            "schema/0001_baseline.sql is immutable; add a migration instead"
+        );
+    }
+
+    #[test]
+    fn migration_13_retires_recovery_state_on_an_existing_database() {
+        let conn = memory_connection();
+        install_baseline(&conn, &migration_checksum(BASELINE_SQL)).expect("install version 1");
+        conn.execute_batch(
+            "INSERT INTO provisioning_jobs (id, type, status, created_at, updated_at)
+                 VALUES ('job-create', 'create', 'succeeded', 'now', 'now'),
+                        ('job-recover', 'recover', 'failed', 'now', 'now');",
+        )
+        .expect("seed legacy provisioning jobs");
+
+        apply(&conn).expect("migrate an existing database");
+
+        let surviving_jobs = conn
+            .query_row("SELECT COUNT(*) FROM provisioning_jobs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count surviving jobs");
+        assert_eq!(surviving_jobs, 1);
+        let legacy_objects = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN (
+                    'client_market_recovery_state',
+                    'idx_client_market_recovery_due',
+                    'client_market_cleanup_recovery_state',
+                    'idx_client_market_cleanup_recovery_due',
+                    'provisioning_jobs_new'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count retired schema objects");
+        assert_eq!(legacy_objects, 0);
+        let job_indexes = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'provisioning_jobs'
+                   AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count rebuilt job indexes");
+        assert_eq!(job_indexes, 5);
+        let error = conn
+            .execute(
+                "INSERT INTO provisioning_jobs
+                    (id, type, status, created_at, updated_at)
+                 VALUES ('job-recover-2', 'recover', 'pending', 'now', 'now')",
+                [],
+            )
+            .expect_err("migrated databases must reject recovery jobs too");
+        assert!(error.to_string().contains("CHECK constraint failed"));
     }
 
     #[test]

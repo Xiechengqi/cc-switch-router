@@ -29,6 +29,7 @@ export function ClientMarketRentalBanner({
   resumeRelease = true,
   readOnly = false,
   manageHref,
+  showSchedule = true,
 }: {
   rental?: ClientMarketRental;
   onChanged: () => Promise<void> | void;
@@ -36,6 +37,8 @@ export function ClientMarketRentalBanner({
   resumeRelease?: boolean;
   readOnly?: boolean;
   manageHref?: string;
+  /** Free-duration schedule is verbose; list rows hide it and surface it in the client drawer instead. */
+  showSchedule?: boolean;
 }) {
   const { locale, t } = useLocaleText();
   if (!clientMarketRentalHasBanner(rental)) return null;
@@ -67,6 +70,7 @@ export function ClientMarketRentalBanner({
   }
 
   if (!rental.dailyRateMinor) {
+    if (!showSchedule) return null;
     const activated = rental.activatedAt
       ? new Date(rental.activatedAt).toLocaleString(locale)
       : null;

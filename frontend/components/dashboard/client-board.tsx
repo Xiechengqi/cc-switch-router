@@ -474,6 +474,7 @@ function ClientCard({
                 onChanged={onRentalChanged}
                 readOnly
                 resumeRelease={false}
+                showSchedule={false}
                 manageHref={rental ? clientMarketMineHref(rental.installationId) : undefined}
               />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
@@ -1026,6 +1027,13 @@ export function ClientBoard({
                             <span className="text-muted-foreground"> · {formatDateTime(selectedClient.removalAt)}</span>
                           </span>
                         ) : null}
+                        <ClientMarketRentalBanner
+                          rental={marketRentals.get(selectedClient.installation.id)}
+                          onChanged={refreshRentalsAndDashboard}
+                          readOnly
+                          resumeRelease={false}
+                          manageHref={clientMarketMineHref(selectedClient.installation.id)}
+                        />
                       </div>
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.linkedShares")}>
