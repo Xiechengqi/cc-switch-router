@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Drawer, toast } from "@heroui/react";
-import { ArrowRightLeft, ChevronDown, ListFilter, MessageCircle, Plus, ScrollText, Search, X } from "lucide-react";
+import { ArrowRightLeft, ChevronDown, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
@@ -40,6 +40,7 @@ import { formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/l
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { getMyClientMarketRentals, recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
+import { clientWebTerminalUrl } from "@/lib/client-web-view";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -177,6 +178,7 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
       onClick={() =>
         openConsole({
           clientId: client.installation.id,
+          kind: "console",
           url: tunnelUrl,
           title,
         })
@@ -185,6 +187,31 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
     >
       <ClientConsoleIcon className="h-3 w-3 shrink-0" />
       <span>{t("dashboard.clientConsole")}</span>
+    </ClientHeaderInlineButton>
+  );
+}
+
+function ClientTerminalButton({ client }: { client: DashboardClient }) {
+  const { t } = useLocaleText();
+  const { openConsole } = useClientConsole();
+  const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
+  if (!tunnelUrl) return null;
+  const title = client.clientTunnel?.subdomain || tunnelUrl;
+  return (
+    <ClientHeaderInlineButton
+      label={t("dashboard.clientTerminal")}
+      onClick={() =>
+        openConsole({
+          clientId: client.installation.id,
+          kind: "terminal",
+          url: clientWebTerminalUrl(tunnelUrl),
+          title: t("dashboard.clientTerminalTitle", { target: title }),
+        })
+      }
+      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 text-[11px] font-medium text-emerald-700 transition-colors hover:border-emerald-300 hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+    >
+      <Terminal className="h-3 w-3 shrink-0" />
+      <span>{t("dashboard.clientTerminal")}</span>
     </ClientHeaderInlineButton>
   );
 }
@@ -430,6 +457,7 @@ function ClientCard({
                   {owner}
                 </span>
               ) : null}
+              <ClientDetailsButton onOpen={openClientDrawer} />
               {summary.primaryReason ? (
                 <span
                   className={`min-w-0 truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : "text-amber-700"}`}
@@ -441,7 +469,6 @@ function ClientCard({
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
-              <ClientDetailsButton onOpen={openClientDrawer} />
               <ClientMarketRentalBanner
                 rental={rental}
                 onChanged={onRentalChanged}
@@ -450,6 +477,7 @@ function ClientCard({
                 manageHref={rental ? clientMarketMineHref(rental.installationId) : undefined}
               />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
+              {tunnelUrl ? <ClientTerminalButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
               {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
               {client.logCollectionEnabled && onOpenLogs ? <ClientLogsButton onOpen={onOpenLogs} /> : null}

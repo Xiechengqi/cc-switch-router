@@ -12,7 +12,23 @@ export const CONSOLE_DOCK_HEIGHT = 56;
 export const CONSOLE_DOCK_BOTTOM_INSET = 80;
 export const CONSOLE_DOCK_RESERVED_HEIGHT = CONSOLE_DOCK_BOTTOM_INSET + CONSOLE_DOCK_HEIGHT;
 export const CONSOLE_BASE_Z_INDEX = 45;
-const SESSION_STORAGE_KEY = "cc_switch_router_console_windows_v2";
+const SESSION_STORAGE_KEY = "cc_switch_router_console_windows_v3";
+const LEGACY_SESSION_STORAGE_KEYS = [
+  "cc_switch_router_console_windows_v2",
+  "cc_switch_router_console_windows_v1",
+] as const;
+
+export type ConsoleWindowKind = "console" | "terminal";
+
+export function inferConsoleWindowKind(url: string | undefined): ConsoleWindowKind {
+  if (!url) return "console";
+  try {
+    const parsed = new URL(url, "https://cc-switch.invalid");
+    return parsed.searchParams.get("view") === "terminal" ? "terminal" : "console";
+  } catch {
+    return /[?&]view=terminal(?:&|$)/.test(url) ? "terminal" : "console";
+  }
+}
 const CHROME_HEIGHT = 88;
 const DEFAULT_IFRAME_HEIGHT = 460;
 
@@ -28,6 +44,7 @@ export type NormalRect = {
 export type ConsoleWindow = {
   id: string;
   clientId: string;
+  kind: ConsoleWindowKind;
   url: string;
   title: string;
   state: ConsoleWindowState;
@@ -38,7 +55,10 @@ export type ConsoleWindow = {
   reloadKey: number;
 };
 
-type PersistedConsoleWindow = Pick<ConsoleWindow, "id" | "clientId" | "url" | "title" | "state" | "normalRect" | "zIndex">;
+type PersistedConsoleWindow = Pick<
+  ConsoleWindow,
+  "id" | "clientId" | "kind" | "url" | "title" | "state" | "normalRect" | "zIndex"
+>;
 
 type ManagerState = {
   windows: ConsoleWindow[];
@@ -48,6 +68,7 @@ type ManagerState = {
 
 type OpenPayload = {
   clientId: string;
+  kind?: ConsoleWindowKind;
   url: string;
   title: string;
 };
@@ -86,6 +107,7 @@ function createWindow(payload: OpenPayload, index: number, zIndex: number): Cons
   return {
     id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
     clientId: payload.clientId,
+    kind: payload.kind ?? inferConsoleWindowKind(payload.url),
     url: payload.url,
     title: payload.title,
     state: "normal",
@@ -103,24 +125,32 @@ function isDocked(window: ConsoleWindow) {
 function readPersistedWindows(): PersistedConsoleWindow[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
-    if (!raw) {
-      const legacy = window.sessionStorage.getItem("cc_switch_router_console_windows_v1");
-      if (!legacy) return [];
-      const parsed = JSON.parse(legacy) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed as PersistedConsoleWindow[];
-    }
+    const raw =
+      window.sessionStorage.getItem(SESSION_STORAGE_KEY) ??
+      LEGACY_SESSION_STORAGE_KEYS.map((key) => window.sessionStorage.getItem(key)).find(Boolean);
+    if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item): item is PersistedConsoleWindow => {
-      return (
-        !!item &&
-        typeof item === "object" &&
-        typeof (item as PersistedConsoleWindow).id === "string" &&
-        typeof (item as PersistedConsoleWindow).clientId === "string" &&
-        typeof (item as PersistedConsoleWindow).url === "string"
-      );
+    return parsed.flatMap((item) => {
+      if (
+        !item ||
+        typeof item !== "object" ||
+        typeof (item as PersistedConsoleWindow).id !== "string" ||
+        typeof (item as PersistedConsoleWindow).clientId !== "string" ||
+        typeof (item as PersistedConsoleWindow).url !== "string"
+      ) {
+        return [];
+      }
+      const windowItem = item as PersistedConsoleWindow;
+      return [
+        {
+          ...windowItem,
+          kind:
+            windowItem.kind === "terminal" || windowItem.kind === "console"
+              ? windowItem.kind
+              : inferConsoleWindowKind(windowItem.url),
+        },
+      ];
     });
   } catch {
     return [];
@@ -130,15 +160,18 @@ function readPersistedWindows(): PersistedConsoleWindow[] {
 function writePersistedWindows(windows: ConsoleWindow[]) {
   if (typeof window === "undefined") return;
   try {
-    const payload: PersistedConsoleWindow[] = windows.map(({ id, clientId, url, title, state, normalRect, zIndex }) => ({
-      id,
-      clientId,
-      url,
-      title,
-      state,
-      normalRect,
-      zIndex,
-    }));
+    const payload: PersistedConsoleWindow[] = windows.map(
+      ({ id, clientId, kind, url, title, state, normalRect, zIndex }) => ({
+        id,
+        clientId,
+        kind,
+        url,
+        title,
+        state,
+        normalRect,
+        zIndex,
+      }),
+    );
     window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
   } catch {
     // sessionStorage may be unavailable.
@@ -186,7 +219,10 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
     }
     case "OPEN": {
       const payload = action.payload as OpenPayload;
-      const existing = state.windows.find((window) => window.clientId === payload.clientId);
+      const kind = payload.kind ?? inferConsoleWindowKind(payload.url);
+      const existing = state.windows.find(
+        (window) => window.clientId === payload.clientId && window.kind === kind,
+      );
       if (existing) {
         const nextState = existing.state === "minimized" || !existing.activated ? "normal" : existing.state;
         const bumped = bumpFocus(state, existing.id);
@@ -194,7 +230,7 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
           ...bumped,
           windows: minimizeOtherVisibleWindows(bumped.windows, existing.id).map((window) =>
             window.id === existing.id
-              ? { ...window, url: payload.url, title: payload.title, state: nextState, activated: true }
+              ? { ...window, kind, url: payload.url, title: payload.title, state: nextState, activated: true }
               : window,
           ),
         };
@@ -383,7 +419,10 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
 
   const openConsole = React.useCallback(
     (payload: OpenPayload) => {
-      const existing = state.windows.find((window) => window.clientId === payload.clientId);
+      const kind = payload.kind ?? inferConsoleWindowKind(payload.url);
+      const existing = state.windows.find(
+        (window) => window.clientId === payload.clientId && window.kind === kind,
+      );
       if (!existing && state.windows.length >= MAX_CONSOLE_WINDOWS) {
         toast.warning(t("dashboard.clientConsole.maxWindows", { count: MAX_CONSOLE_WINDOWS }));
         return;
