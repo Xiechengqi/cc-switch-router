@@ -29,6 +29,11 @@ export function inferConsoleWindowKind(url: string | undefined): ConsoleWindowKi
     return /[?&]view=terminal(?:&|$)/.test(url) ? "terminal" : "console";
   }
 }
+
+/** Label key for a window kind, so console and terminal windows announce themselves correctly. */
+export function consoleWindowKindLabelKey(kind: ConsoleWindowKind) {
+  return kind === "terminal" ? ("dashboard.clientTerminal" as const) : ("dashboard.clientConsole" as const);
+}
 const CHROME_HEIGHT = 88;
 const DEFAULT_IFRAME_HEIGHT = 460;
 

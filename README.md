@@ -51,6 +51,8 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 客户端与 Router 之间的注册、lease、建链、控制平面与身份注入契约,见 [PROTOCOL.md](PROTOCOL.md)。
 
+Clients 页的每个 client 条目提供「控制台」和「终端」两个入口:两者都以 iframe 弹窗打开该 client 自己的 Web 界面,经由 client tunnel 转发,登录态由 client 自身管理。终端入口在 client web URL 上追加 `?view=terminal`,client 登录后直接落到终端视图；若该 client 关闭了 `enableWebTerminal`,它会自行回落到默认视图。控制台与终端各自独立成窗,可同时打开。
+
 ## 边界策略
 
 Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余 `/web-api/*` 默认要求 owner/admin 身份,Router 鉴权后向 client 注入可信身份头。`/api/*`、`/v1/*`、`/_ctl/*` 和 `/_share-router/*` 不通过 client web tunnel 暴露。流式管理接口必须使用 `Authorization` header,不接受 query-string token。

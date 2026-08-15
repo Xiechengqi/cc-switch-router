@@ -9,6 +9,7 @@ import {
   CONSOLE_DOCK_HEIGHT,
   CONSOLE_DOCK_RESERVED_HEIGHT,
   type ConsoleWindow,
+  consoleWindowKindLabelKey,
   type NormalRect,
   useClientConsole,
 } from "@/components/dashboard/client-console/client-console-manager";
@@ -252,7 +253,7 @@ function ClientConsoleWindowShell({
       style={style}
       onPointerDown={minimized ? undefined : onFocus}
       role="dialog"
-      aria-label={`${t("dashboard.clientConsole")} ${window.title}`}
+      aria-label={`${t(consoleWindowKindLabelKey(window.kind))} ${window.title}`}
       aria-modal={maximized && !minimized ? "true" : "false"}
       aria-hidden={minimized}
     >
