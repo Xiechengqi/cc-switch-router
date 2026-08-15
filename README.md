@@ -51,7 +51,7 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 客户端与 Router 之间的注册、lease、建链、控制平面与身份注入契约,见 [PROTOCOL.md](PROTOCOL.md)。
 
-Clients 页的每个 client 条目提供「控制台」和「终端」两个入口:两者都以 iframe 弹窗打开该 client 自己的 Web 界面,经由 client tunnel 转发,登录态由 client 自身管理。终端入口在 client web URL 上追加 `?view=terminal`,client 登录后直接落到终端视图；若该 client 关闭了 `enableWebTerminal`,它会自行回落到默认视图。控制台与终端各自独立成窗,可同时打开。
+Clients 页的每个 client 条目提供「控制台」和「终端」两个入口:两者都以 iframe 弹窗打开该 client 自己的 Web 界面,经由 client tunnel 转发,登录态由 client 自身管理。终端入口在 client web URL 上追加 `?view=terminal&embed=1`,client 登录后直接落到终端视图,并以无边框形态只显示终端本身(页头、连接状态和「结束会话」按钮都由弹窗自己的标题栏取代；结束会话直接在终端里 `exit` 即可)；若该 client 关闭了 `enableWebTerminal`,它会自行回落到默认视图。控制台与终端各自独立成窗,可同时打开。
 
 ## 边界策略
 

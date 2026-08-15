@@ -341,7 +341,7 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 - i18n 覆盖 `en` / `zh-CN`
 - 设计 token 以 `--router-*` CSS 自定义属性承载,dark mode 经 `.dark` class 整体切换
 - **Router 自己的 Web 终端**:xterm.js ↔ WebSocket ↔ `portable-pty` 起 `ssh` 子进程(非 russh client),一次性 ticket + 每用户 2 会话上限 + 空闲/硬超时。**仅 Host Provider 本人可开**,租客与 Router 管理员均不可
-- **Client 自带的 Web 终端**(另一条链路):Clients 页条目上的「终端」按钮,与「控制台」共用同一套 iframe 窗口管理器(`components/dashboard/client-console/`)。它不经过 Router 的 PTY,而是把 client web URL 加上 `?view=terminal`(`lib/client-web-view.ts`)后在 iframe 中打开,请求经 client tunnel 转发到 Server 的 `/web-api/terminal/*`,鉴权由 Server 自身的 Web 登录态负责。窗口按 `clientId + kind` 去重,因此同一 client 的控制台与终端各占一个窗口
+- **Client 自带的 Web 终端**(另一条链路):Clients 页条目上的「终端」按钮,与「控制台」共用同一套 iframe 窗口管理器(`components/dashboard/client-console/`)。它不经过 Router 的 PTY,而是把 client web URL 加上 `?view=terminal&embed=1`(`lib/client-web-view.ts`)后在 iframe 中打开,请求经 client tunnel 转发到 Server 的 `/web-api/terminal/*`,鉴权由 Server 自身的 Web 登录态负责。`embed=1` 让 Server 前端隐藏自己的页头、状态条和「结束会话」按钮,只渲染 xterm 画布——窗口标题栏和关闭按钮由 Router 这侧提供,不重复一遍。窗口按 `clientId + kind` 去重,因此同一 client 的控制台与终端各占一个窗口
 
 ---
 
