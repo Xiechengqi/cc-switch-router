@@ -3995,9 +3995,6 @@ fn client_market_event_is_chat_visible(event_type: &str) -> bool {
             | "cleanup_started"
             | "cleanup_finished"
             | "cleanup_failed"
-            | "client_recovery_succeeded"
-            | "client_recovery_failed"
-            | "client_recovery_blocked"
             | "subscription_force_released"
             | "subscription_release_finalized"
     )
@@ -4026,9 +4023,6 @@ fn client_market_event_fallback_status(event_type: &str) -> &'static str {
             SUBSCRIPTION_RELEASED
         }
         "cleanup_failed" => SUBSCRIPTION_RELEASE_FAILED,
-        "client_recovery_succeeded" | "client_recovery_failed" | "client_recovery_blocked" => {
-            SUBSCRIPTION_ACTIVE
-        }
         _ => "unknown",
     }
 }
@@ -4189,13 +4183,7 @@ fn enqueue_client_market_chat_event_tx(
         "freeDurationDays",
         "activatedAt",
         "expiresAt",
-        "recoveryMethod",
-        "attemptLevel",
-        "nextAttemptAt",
     ] {
-        if event_type == "client_recovery_blocked" && field == "failureCode" {
-            continue;
-        }
         if let Some(value) = detail.get(field) {
             output.insert(field.into(), value.clone());
         }

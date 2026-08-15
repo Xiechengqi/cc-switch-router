@@ -10,7 +10,7 @@ import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-r
 import { CountryFlag } from "@/components/common/country-flag";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { recoveryStateLabelKey } from "@/components/dashboard/client-market/host-utils";
+import { clientConnectionStateLabelKey } from "@/components/dashboard/client-market/host-utils";
 import {
   grantClientMarketProviderTerminalAccess,
   revokeClientMarketProviderTerminalAccess,
@@ -170,7 +170,7 @@ export function MyRentalsPanel({
   hostsByInstallation: Map<string, ClientMarketHost>;
   onChanged: () => Promise<void> | void;
 }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const { openChat, unreadByInstallation } = useClientChat();
 
   const activeRentals = React.useMemo(
@@ -212,9 +212,9 @@ export function MyRentalsPanel({
                   {host.status}
                 </Chip>
               ) : null}
-              {host?.recovery ? (
+              {host?.clientConnection ? (
                 <Chip size="sm" variant="soft">
-                  {t(recoveryStateLabelKey(host.recovery.state))}
+                  {t(clientConnectionStateLabelKey(host.clientConnection.state))}
                 </Chip>
               ) : null}
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
@@ -248,6 +248,18 @@ export function MyRentalsPanel({
               onChanged={onChanged}
               resumeRelease={false}
             />
+            {host?.clientConnection?.state === "offline" ? (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+                <p>{t("clientMarket.connection.manualAction")}</p>
+                {host.clientConnection.lastHeartbeatAt ? (
+                  <p className="mt-1 text-amber-800/80">
+                    {t("clientMarket.connection.lastHeartbeat", {
+                      time: new Date(host.clientConnection.lastHeartbeatAt).toLocaleString(locale),
+                    })}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
             <ProviderTerminalAccessControl rental={rental} onChanged={onChanged} />
           </section>
         );

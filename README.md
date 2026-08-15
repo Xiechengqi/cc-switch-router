@@ -45,9 +45,9 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已移除,详见 [MIGRATION.md](MIGRATION.md)。
 
-远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Client Market 的主机开通流程会自动调用该脚本；脚本优先安装带重启限速的 systemd/OpenRC 服务,没有受支持的服务管理器时才退回 `nohup`。
+远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Client Market 的首次开通会自动调用该脚本并启动一次进程；systemd unit 使用 `Restart=no` 且不启用开机启动，OpenRC 服务不配置 respawn 且不加入默认 runlevel，没有受支持的服务管理器时仅执行一次 `nohup`。
 
-Client Market Client 的 tunnel 连续离线 30 秒后,Router 才会使用 provision key 和已固定的 SSH Host 指纹检查远端进程。进程仍存在时不会 kill/restart；进程缺失时才执行幂等拉起。SSH 命令最长 45 秒,拉起后最长等待 tunnel 90 秒,单个 Router 最多并行 4 个恢复任务。每次介入完成后的重试退避依次为 10 分钟、30 分钟、1 小时、3 小时、6 小时并在 6 小时封顶,持续在线 10 分钟后清零。缺失 binary/config、SSH 身份变化或认证失效会阻断自动重试并等待 Provider 处理；Provider 和 Router 管理员可在 Host 操作菜单暂停、恢复或立即重试。Host 清理和账务释放会原子取消恢复任务。Turso 不可写时无法取得持久化 claim,因此不会执行 SSH。
+首次开通完成后,Router **不会**因为 tunnel 离线而通过 SSH 检查、启动或重启远端 `cc-switch-server`。Router 只保留连接状态观测、心跳、离线告警和页面提示；进程生命周期由 Client owner 负责，离线时应登录 Host 手动排查并启动服务。只有用户明确发起的首次开通、升级、清理或回收操作可以执行对应远端命令。清理失败的后台重试只继续既有的清理流程，不会拉起 Client 服务。
 
 客户端与 Router 之间的注册、lease、建链、控制平面与身份注入契约,见 [PROTOCOL.md](PROTOCOL.md)。
 
@@ -61,7 +61,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
-| `/v1/client-market/*` | 33 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
+| `/v1/client-market/*` | 30 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
 | `/v1/admin/*` | 约 44 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
@@ -158,7 +158,6 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED` | `true` | 是否允许匿名查看最近 5 分钟的脱敏公开投影；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未心跳时标记离线,并清理其 share、lease 与内存路由 |
 | `CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS` | `21600` | 离线 client 的 installation 记录保留时长,超时后删除;必须 >= `CLIENT_STALE_SECS` |
-| `CC_SWITCH_ROUTER_CLIENT_MARKET_RECOVERY_ENABLED` | `true` | Client Market Client 自动恢复总开关；关闭后 Router 不再 SSH 介入,不影响 Host 本机 systemd/OpenRC 守护 |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE` | `60` | 单可信来源每分钟持续注册尝试速率 |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST` | `20` | 单可信来源允许的短时注册尝试突发量 |
 | `CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE` | `600` | Router 全局每分钟持续注册尝试速率 |
@@ -181,7 +180,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_RESEND_REPLY_TO` | 空 | 验证码、Client 生命周期与聊天室邮件的 Reply-To |
 | `CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED` | `true` | Client 注册/离线邮件总开关;通知仅发送至对应 Client 当前已验证的 Owner 邮箱 |
 | `CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS` | `180` | 连续缺少可信签名心跳多久后确认离线;安全下限为 180 秒 |
-| `CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS` | `120` | 离线 Client 恢复后持续稳定多久才结束原离线 episode |
+| `CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS` | `120` | 离线 Client 心跳持续稳定多久后才结束原离线 episode；不会启动或重启进程 |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS` | `1800` | 同一 Client 两次离线通知的最短间隔 |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_BATCH_WINDOW_SECS` | `60` | 同一收件人的离线事件合并窗口;可信注册固定使用 5 秒 debounce |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_WINDOW_SECS` | `300` | 注册或离线通知风暴检测窗口 |

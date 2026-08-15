@@ -704,6 +704,8 @@ mod tests {
             client_owner_email: client_owner.map(str::to_string),
             installation_id: installation.map(str::to_string),
             client_owner_user_id: client_owner.map(|_| "client-1".to_string()),
+            client_tunnel_enabled: installation.map(|_| true),
+            client_last_heartbeat_at: None,
             last_verified_at: None,
             last_error: None,
             note: None,

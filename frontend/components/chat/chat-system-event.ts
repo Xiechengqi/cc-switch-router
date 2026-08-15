@@ -23,7 +23,6 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   activatedAt: "chat.detail.activatedAt",
   address: "chat.detail.address",
   amountMinor: "chat.detail.amount",
-  attemptLevel: "chat.detail.attemptLevel",
   appType: "chat.detail.appType",
   assetUrl: "chat.detail.assetUrl",
   balanceMinor: "chat.detail.balance",
@@ -54,7 +53,6 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   kind: "chat.detail.kind",
   lastHeartbeatAt: "chat.detail.lastHeartbeatAt",
   method: "chat.detail.method",
-  nextAttemptAt: "chat.detail.nextAttemptAt",
   note: "chat.detail.note",
   ownerEmail: "chat.detail.ownerEmail",
   paymentContacts: "chat.detail.paymentContacts",
@@ -66,7 +64,6 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   providerEmail: "chat.detail.providerEmail",
   qrImageUrl: "chat.detail.qrImageUrl",
   reason: "chat.detail.reason",
-  recoveryMethod: "chat.detail.recoveryMethod",
   rejectionReason: "chat.detail.rejectionReason",
   renterEmail: "chat.detail.renterEmail",
   resolution: "chat.detail.resolution",
@@ -117,20 +114,6 @@ const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
   ],
   subscription_release_finalized: ["hostname", "providerEmail", "reason"],
   cleanup_failed: ["failureCode", "reason", "hostname", "providerEmail"],
-  client_recovery_succeeded: ["recoveryMethod", "attemptLevel", "hostname", "providerEmail"],
-  client_recovery_failed: [
-    "failureCode",
-    "recoveryMethod",
-    "attemptLevel",
-    "nextAttemptAt",
-    "hostname",
-    "providerEmail",
-  ],
-  client_recovery_blocked: [
-    "attemptLevel",
-    "hostname",
-    "providerEmail",
-  ],
 
   listing_created: ["seatCount", "dailyRateMinor", "currency"],
   listing_relisted: [],
@@ -643,19 +626,6 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
       return t("chat.event.cleanupFailed", {
         client: payloadString(payload, "clientLabel"),
         error: payloadString(payload, "failureCode"),
-      });
-    case "client_recovery_succeeded":
-      return t("chat.event.clientRecoverySucceeded", {
-        client: payloadString(payload, "clientLabel"),
-      });
-    case "client_recovery_failed":
-      return t("chat.event.clientRecoveryFailed", {
-        client: payloadString(payload, "clientLabel"),
-        error: payloadString(payload, "failureCode"),
-      });
-    case "client_recovery_blocked":
-      return t("chat.event.clientRecoveryBlocked", {
-        client: payloadString(payload, "clientLabel"),
       });
     case "renter_release_requested":
       return t("chat.event.renterReleaseRequested", { seat, renter });

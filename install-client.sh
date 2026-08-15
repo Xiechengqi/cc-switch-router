@@ -87,8 +87,6 @@ install_systemd_service() {
 Description=cc-switch-server
 Wants=network-online.target
 After=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -96,17 +94,13 @@ User=root
 Environment=HOME=/root
 WorkingDirectory=/root
 ExecStart=/usr/local/bin/cc-switch-server
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
+Restart=no
 EOF
   install -m 0644 "${service_tmp}" "${service_file}" \
     || { rm -f "${service_tmp}"; ERROR "Unable to install systemd service"; }
   rm -f "${service_tmp}"
   systemctl daemon-reload || ERROR "Unable to reload systemd"
-  systemctl enable cc-switch-server.service || ERROR "Unable to enable cc-switch-server"
+  systemctl disable cc-switch-server.service >/dev/null 2>&1 || true
   systemctl reset-failed cc-switch-server.service >/dev/null 2>&1 || true
   systemctl start cc-switch-server.service || ERROR "Unable to start cc-switch-server"
   SERVICE_MANAGER="systemd"
@@ -129,10 +123,8 @@ description="cc-switch-server"
 command="/usr/local/bin/cc-switch-server"
 command_user="root:root"
 directory="/root"
-supervisor="supervise-daemon"
-respawn_delay=30
-respawn_max=3
-respawn_period=600
+command_background=true
+pidfile="/run/cc-switch-server.pid"
 
 depend() {
   need net
@@ -142,8 +134,7 @@ EOF
   install -m 0755 "${service_tmp}" "${service_file}" \
     || { rm -f "${service_tmp}"; ERROR "Unable to install OpenRC service"; }
   rm -f "${service_tmp}"
-  rc-update add cc-switch-server default >/dev/null \
-    || ERROR "Unable to enable cc-switch-server OpenRC service"
+  rc-update del cc-switch-server default >/dev/null 2>&1 || true
   rc-service cc-switch-server start || ERROR "Unable to start cc-switch-server OpenRC service"
   SERVICE_MANAGER="openrc"
   return 0
@@ -241,7 +232,7 @@ unset PASSWORD PASSWORD_ARG
 [ "${DISABLE_WEB_TERMINAL}" -eq 1 ] && disable_web_terminal
 start_cc_switch_server
 EXEC "sleep 3"
-INFO "Client process manager: ${SERVICE_MANAGER}"
+INFO "Client process manager: ${SERVICE_MANAGER} (manual restart policy)"
 SUBDOMAIN=$(grep tunnelSubdomain $HOME/.cc-switch-server/server.json  | awk -F '"' '{print $(NF-1)}')
 SUBDOMAIN_URL=$(echo ${ROUTER} | sed "s/:\/\//:\/\/${SUBDOMAIN}\./")
 

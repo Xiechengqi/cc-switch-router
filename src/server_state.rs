@@ -51,8 +51,8 @@ pub struct ServerState {
     pub client_market_job_secrets: Arc<Mutex<ClientMarketJobSecrets>>,
     /// Short-lived web terminal tickets and per-owner session counters.
     pub client_market_terminal: Arc<Mutex<TerminalSessionManager>>,
-    /// Per-installation exclusion and wake-up channel for automatic Client recovery.
-    pub client_market_recovery: Arc<crate::client_market_recovery::ClientMarketRecoveryCoordinator>,
+    /// Serializes conflicting Client Market lifecycle actions per installation.
+    pub client_market_actions: Arc<crate::client_market_coordination::ClientMarketActionLocks>,
     /// Ensures Client subdomain takeover reconciliation has only one active worker.
     pub client_subdomain_takeover_recovery_running: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes external billing suspend/resume/terminate effects across API and worker tasks.

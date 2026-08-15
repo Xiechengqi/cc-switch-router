@@ -6888,8 +6888,8 @@ mod tests {
             client_market_terminal: Arc::new(Mutex::new(
                 crate::client_market_terminal::TerminalSessionManager::default(),
             )),
-            client_market_recovery: Arc::new(
-                crate::client_market_recovery::ClientMarketRecoveryCoordinator::default(),
+            client_market_actions: Arc::new(
+                crate::client_market_coordination::ClientMarketActionLocks::default(),
             ),
             client_subdomain_takeover_recovery_running: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -6950,7 +6950,6 @@ mod tests {
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
-            client_market_recovery_enabled: true,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,

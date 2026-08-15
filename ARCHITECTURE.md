@@ -120,13 +120,15 @@ idle ──► locked ──► allocated ──► draining ──► idle
 
 `reserved` 用于报价锁定期(`client_market_trade.rs:29`)。
 
-**自愈机制**(`src/client_market.rs`):
+**任务与清理对账**(`src/client_market.rs`):
 
 | 场景 | 处理 |
 |---|---|
 | `draining` 停滞超 10 分钟 | 自动派发 cleanup job |
 | `unreachable` 超 5 分钟 | SSH 探测;确认无安装痕迹则清除 DB 记录并复位为 idle |
 | 进程重启导致 job 中断 | 启动时 `reconcile_interrupted_jobs` 以最多 4 并发重跑 |
+
+这里的后台重试仅覆盖 Router 自身的首次开通 job 和显式 cleanup job。首次开通脚本只启动一次 Client 进程，安装的 systemd/OpenRC 服务不启用开机启动、失败重启或 respawn。开通完成后，Router 不会因 tunnel 离线而通过 provision SSH 启动或重启 `cc-switch-server`；只记录 `online`、`reconnecting`、`offline`、`disabled` 连接状态并继续心跳、告警和 UI 提示。Client 进程生命周期完全由 Client owner 管理。
 
 **准入与支付均和 Share Market 共用统一机制**:免费 Host 使用独立的 `client_host/free` 作用域，默认黑名单；可配置 1–365 天固定期限或永久，期限在 Client provisioning 成功后才开始，到期复用安全 cleanup。付费 Host 使用默认白名单的 `client_host/paid` 作用域，还要求买家获得 USD 私有额度，或在该付费作用域切为黑名单后使用有限公共额度。付费 Host 以固定 USD 每日价格提供,先享受 12 小时健康服务时长试用,之后只按 Router 观测到的健康区间累计费用。同一买家和 Host Provider 下的 Host 与 Share 共用 USD 余额,按买家额度出账。Router 只记录链下付款声明,供应商独立核验到账后确认；只有确认到账或管理员作废账单才会解除对应逾期限制。Provider 租用自己的付费 Host 时按免费处理,不会形成自债务。
 

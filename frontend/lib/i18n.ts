@@ -763,28 +763,15 @@ export const messages = {
     "clientMarket.status.disabled": "Disabled",
     "clientMarket.status.unreachable": "Unreachable",
     "clientMarket.status.abnormal": "Abnormal",
-    "clientMarket.recovery.state.online": "Recovery ready",
-    "clientMarket.recovery.state.offline": "Recovery pending",
-    "clientMarket.recovery.state.stabilizing": "Recovery stabilizing",
-    "clientMarket.recovery.state.blocked": "Recovery blocked",
-    "clientMarket.recovery.state.paused": "Recovery paused",
-    "clientMarket.recovery.attempt": "attempt {count}",
-    "clientMarket.recovery.nextAttempt": "Next attempt: {time}",
-    "clientMarket.recovery.pause": "Pause Router recovery",
-    "clientMarket.recovery.resume": "Resume Router recovery",
-    "clientMarket.recovery.retryNow": "Retry recovery now",
-    "clientMarket.recovery.pauseSucceeded": "Router recovery paused",
-    "clientMarket.recovery.resumeSucceeded": "Router recovery resumed",
-    "clientMarket.recovery.retrySucceeded": "Recovery retry queued",
-    "clientMarket.recovery.blocked.missingBinary":
-      "cc-switch-server binary is missing",
-    "clientMarket.recovery.blocked.missingConfig":
-      "cc-switch-server configuration is missing",
-    "clientMarket.recovery.blocked.hostKey":
-      "SSH Host identity requires review",
-    "clientMarket.recovery.blocked.authentication":
-      "Router SSH authentication was rejected",
-    "clientMarket.recovery.blocked.other": "Provider action is required",
+    "clientMarket.connection.state.online": "Client online",
+    "clientMarket.connection.state.reconnecting": "Client reconnecting",
+    "clientMarket.connection.state.offline": "Client offline",
+    "clientMarket.connection.state.disabled": "Connection disabled",
+    "clientMarket.connection.since": "Since {time}",
+    "clientMarket.connection.lastHeartbeat": "Last heartbeat: {time}",
+    "clientMarket.connection.ownerActionRequired": "Client owner action required",
+    "clientMarket.connection.manualAction":
+      "Router does not restart managed Client processes. The Client owner must inspect the Host and start cc-switch-server manually.",
     "clientMarket.statusHint.all": "Show hosts in every status.",
     "clientMarket.statusHint.idle": "Available for online Client provisioning.",
     "clientMarket.statusHint.reserved":
@@ -1904,12 +1891,6 @@ export const messages = {
     "chat.event.cleanupFailed": "Client {client} cleanup failed: {error}",
     "chat.event.releaseFinalized":
       "Client {client} rental ended after cleanup failed; the Host remains quarantined.",
-    "chat.event.clientRecoverySucceeded":
-      "Router restarted Client {client} and its tunnel recovered.",
-    "chat.event.clientRecoveryFailed":
-      "Router could not recover Client {client}: {error}",
-    "chat.event.clientRecoveryBlocked":
-      "Automatic recovery for Client {client} is blocked and requires Provider action.",
     "chat.event.renterReleaseRequested":
       "{renter} requested to return seat {seat}.",
     "chat.event.ownerRevokeRequested":
@@ -1945,7 +1926,6 @@ export const messages = {
     "chat.detail.address": "Address",
     "chat.detail.amount": "Amount",
     "chat.detail.appType": "App",
-    "chat.detail.attemptLevel": "Recovery attempt",
     "chat.detail.assetUrl": "Payment asset URL",
     "chat.detail.balance": "Balance",
     "chat.detail.billingEventType": "Billing event",
@@ -1987,7 +1967,6 @@ export const messages = {
     "chat.detail.listingId": "Listing ID",
     "chat.detail.marketKind": "Market",
     "chat.detail.method": "Payment method",
-    "chat.detail.nextAttemptAt": "Next recovery attempt",
     "chat.detail.note": "Note",
     "chat.detail.offerRevision": "Offer revision",
     "chat.detail.ownerEmail": "Provider email",
@@ -2005,7 +1984,6 @@ export const messages = {
     "chat.detail.rawError": "Raw error",
     "chat.detail.qrImageUrl": "Payment QR code",
     "chat.detail.reason": "Reason",
-    "chat.detail.recoveryMethod": "Recovery method",
     "chat.detail.rejectedAt": "Rejected at",
     "chat.detail.rejectionReason": "Rejection reason",
     "chat.detail.renterEmail": "Renter email",
@@ -2090,6 +2068,8 @@ export const messages = {
     "dashboard.clientFrame.title": "Client",
     "dashboard.clientFrame.openNewTab": "Open in new tab",
     "dashboard.clientConsole": "Console",
+    "dashboard.clientTerminal": "Terminal",
+    "dashboard.clientTerminalTitle": "Terminal · {target}",
     "dashboard.subdomainTakeover.action": "Switch subdomain",
     "dashboard.subdomainTakeover.title": "Switch Client subdomain",
     "dashboard.subdomainTakeover.target": "Online target Client",
@@ -3330,27 +3310,15 @@ export const messages = {
     "clientMarket.status.disabled": "已禁用",
     "clientMarket.status.unreachable": "不可达",
     "clientMarket.status.abnormal": "异常",
-    "clientMarket.recovery.state.online": "恢复就绪",
-    "clientMarket.recovery.state.offline": "等待恢复",
-    "clientMarket.recovery.state.stabilizing": "恢复稳定观察中",
-    "clientMarket.recovery.state.blocked": "自动恢复已阻断",
-    "clientMarket.recovery.state.paused": "自动恢复已暂停",
-    "clientMarket.recovery.attempt": "第 {count} 次",
-    "clientMarket.recovery.nextAttempt": "下次尝试：{time}",
-    "clientMarket.recovery.pause": "暂停 Router 自动恢复",
-    "clientMarket.recovery.resume": "恢复 Router 自动恢复",
-    "clientMarket.recovery.retryNow": "立即重试恢复",
-    "clientMarket.recovery.pauseSucceeded": "Router 自动恢复已暂停",
-    "clientMarket.recovery.resumeSucceeded": "Router 自动恢复已恢复",
-    "clientMarket.recovery.retrySucceeded": "已安排立即重试",
-    "clientMarket.recovery.blocked.missingBinary":
-      "cc-switch-server 二进制文件缺失",
-    "clientMarket.recovery.blocked.missingConfig":
-      "cc-switch-server 配置文件缺失",
-    "clientMarket.recovery.blocked.hostKey": "需要核对 SSH 主机身份",
-    "clientMarket.recovery.blocked.authentication":
-      "Router 的 SSH 身份验证被拒绝",
-    "clientMarket.recovery.blocked.other": "需要 Provider 人工处理",
+    "clientMarket.connection.state.online": "Client 在线",
+    "clientMarket.connection.state.reconnecting": "Client 重连中",
+    "clientMarket.connection.state.offline": "Client 离线",
+    "clientMarket.connection.state.disabled": "连接已禁用",
+    "clientMarket.connection.since": "自 {time} 起",
+    "clientMarket.connection.lastHeartbeat": "最后心跳：{time}",
+    "clientMarket.connection.ownerActionRequired": "需要 Client owner 处理",
+    "clientMarket.connection.manualAction":
+      "Router 不会自动重启托管的 Client 进程，请由 Client owner 检查 Host 并手动启动 cc-switch-server。",
     "clientMarket.statusHint.all": "显示全部状态的主机。",
     "clientMarket.statusHint.idle": "可被在线开通 Client 选用。",
     "clientMarket.statusHint.reserved": "用户正在确认分配报价，暂时预留。",
@@ -4420,12 +4388,6 @@ export const messages = {
     "chat.event.cleanupFailed": "Client {client} 清理失败：{error}",
     "chat.event.releaseFinalized":
       "Client {client} 清理失败后已结束租用，Host 仍保持隔离。",
-    "chat.event.clientRecoverySucceeded":
-      "Router 已拉起 Client {client}，Tunnel 已恢复。",
-    "chat.event.clientRecoveryFailed":
-      "Router 未能恢复 Client {client}：{error}",
-    "chat.event.clientRecoveryBlocked":
-      "Client {client} 的自动恢复已阻断，需要 Provider 处理。",
     "chat.event.renterReleaseRequested": "{renter} 已申请归还拼车位 {seat}。",
     "chat.event.ownerRevokeRequested":
       "车主已申请回收 {renter} 的拼车位 {seat}。",
@@ -4459,7 +4421,6 @@ export const messages = {
     "chat.detail.address": "地址",
     "chat.detail.amount": "金额",
     "chat.detail.appType": "App",
-    "chat.detail.attemptLevel": "恢复尝试次数",
     "chat.detail.assetUrl": "收款资料 URL",
     "chat.detail.balance": "余额",
     "chat.detail.billingEventType": "账单事件",
@@ -4501,7 +4462,6 @@ export const messages = {
     "chat.detail.listingId": "挂售 ID",
     "chat.detail.marketKind": "Market",
     "chat.detail.method": "收款方式",
-    "chat.detail.nextAttemptAt": "下次恢复尝试",
     "chat.detail.note": "备注",
     "chat.detail.offerRevision": "报价版本",
     "chat.detail.ownerEmail": "Provider 邮箱",
@@ -4519,7 +4479,6 @@ export const messages = {
     "chat.detail.rawError": "原始错误",
     "chat.detail.qrImageUrl": "收款二维码",
     "chat.detail.reason": "原因",
-    "chat.detail.recoveryMethod": "恢复方式",
     "chat.detail.rejectedAt": "拒绝时间",
     "chat.detail.rejectionReason": "拒绝原因",
     "chat.detail.renterEmail": "租用人邮箱",
@@ -4603,6 +4562,8 @@ export const messages = {
     "dashboard.clientFrame.title": "Client",
     "dashboard.clientFrame.openNewTab": "新标签页打开",
     "dashboard.clientConsole": "控制台",
+    "dashboard.clientTerminal": "终端",
+    "dashboard.clientTerminalTitle": "终端 · {target}",
     "dashboard.subdomainTakeover.action": "切换域名",
     "dashboard.subdomainTakeover.title": "切换 Client subdomain",
     "dashboard.subdomainTakeover.target": "在线的目标 Client",

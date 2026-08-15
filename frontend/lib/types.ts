@@ -1677,15 +1677,10 @@ export type HostIpIntel = {
   source: string;
 };
 
-export type ClientMarketRecovery = {
-  state: "online" | "offline" | "stabilizing" | "blocked" | "paused" | string;
-  attemptLevel: number;
-  nextAttemptAt?: string;
-  lastAttemptAt?: string;
-  lastOutcome?: string;
-  /** Provider/admin only. Renters receive the state without the SSH-level reason. */
-  blockedReason?: string;
-  updatedAt: string;
+export type ClientMarketConnection = {
+  state: "online" | "reconnecting" | "offline" | "disabled" | string;
+  since?: string;
+  lastHeartbeatAt?: string;
 };
 
 export type ClientMarketHost = {
@@ -1712,9 +1707,8 @@ export type ClientMarketHost = {
   canWebTerminal?: boolean;
   isHostOwner?: boolean;
   isClientOwner?: boolean;
-  canControlRecovery?: boolean;
   canRetireUnreachable?: boolean;
-  recovery?: ClientMarketRecovery;
+  clientConnection?: ClientMarketConnection;
   lastVerifiedAt?: string;
   lastError?: string;
   note?: string;

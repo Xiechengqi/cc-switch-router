@@ -861,7 +861,7 @@ pub(crate) async fn dispatch_actions(state: &ServerState, actions: Vec<BillingAc
                 .await
             }
             (BillingActionKind::Suspend, "client_host") => {
-                let _recovery_guard = state.client_market_recovery.lock(&action.service_ref).await;
+                let _action_guard = state.client_market_actions.lock(&action.service_ref).await;
                 match state
                     .store
                     .client_market_set_billing_suspended(&action.service_ref, true)
@@ -877,7 +877,7 @@ pub(crate) async fn dispatch_actions(state: &ServerState, actions: Vec<BillingAc
                 }
             }
             (BillingActionKind::Resume, "client_host") => {
-                let _recovery_guard = state.client_market_recovery.lock(&action.service_ref).await;
+                let _action_guard = state.client_market_actions.lock(&action.service_ref).await;
                 state
                     .store
                     .client_market_set_billing_suspended(&action.service_ref, false)
@@ -2168,24 +2168,6 @@ impl AppStore {
             ],
         )
         .map_err(map_db("update Client subscription billing suspension"))?;
-        if suspended {
-            tx.execute(
-                "UPDATE provisioning_jobs
-                 SET status = 'failed', phase = 'complete',
-                     failure_code = 'recovery_suspended_for_billing',
-                     log_blob = substr(COALESCE(log_blob, '') || 'recovery cancelled by billing suspension\n', -131072),
-                     updated_at = ?2
-                 WHERE installation_id = ?1 AND type = 'recover'
-                   AND status IN ('pending', 'running')",
-                params![installation_id, now],
-            )
-            .map_err(map_db("cancel Client recovery for billing suspension"))?;
-            tx.execute(
-                "DELETE FROM client_market_recovery_state WHERE installation_id = ?1",
-                params![installation_id],
-            )
-            .map_err(map_db("clear Client recovery for billing suspension"))?;
-        }
         tx.commit()
             .map_err(map_db("commit Client billing suspension"))?;
         Ok(tunnel.0)

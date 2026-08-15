@@ -236,7 +236,25 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 111);
+        assert_eq!(table_count, 110);
+        let removed_client_recovery_table_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'client_market_recovery_state'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count removed Client recovery tables");
+        assert_eq!(removed_client_recovery_table_count, 0);
+        let cleanup_retry_table_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'client_market_cleanup_retry_state'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Client cleanup retry tables");
+        assert_eq!(cleanup_retry_table_count, 1);
         let recovery_cursor_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -277,6 +295,22 @@ mod tests {
         assert_eq!(versions[9], (10, migration_checksum(MIGRATIONS[8].1)));
         assert_eq!(versions[10], (11, migration_checksum(MIGRATIONS[9].1)));
         assert_eq!(versions[11], (12, migration_checksum(MIGRATIONS[10].1)));
+    }
+
+    #[test]
+    fn provisioning_jobs_only_accept_explicit_create_or_cleanup_work() {
+        let conn = memory_connection();
+        apply(&conn).expect("install baseline");
+
+        let error = conn
+            .execute(
+                "INSERT INTO provisioning_jobs
+                    (id, type, status, created_at, updated_at)
+                 VALUES ('job-recover', 'recover', 'pending', 'now', 'now')",
+                [],
+            )
+            .expect_err("automatic recovery jobs must be rejected");
+        assert!(error.to_string().contains("CHECK constraint failed"));
     }
 
     #[test]

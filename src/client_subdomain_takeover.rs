@@ -83,7 +83,7 @@ pub(crate) async fn execute(
     actor_email: &str,
     input: ClientSubdomainTakeoverRequest,
 ) -> Result<ClientSubdomainTakeoverResponse, AppError> {
-    let (first_recovery_guard, second_recovery_guard) = lock_client_market_actions(
+    let (first_action_guard, second_action_guard) = lock_client_market_actions(
         &state,
         &input.target_installation_id,
         &input.source_installation_id,
@@ -137,8 +137,8 @@ pub(crate) async fn execute(
     };
     // The durable Router commit fences B and quiesces both recovery streams. Drop
     // the guards before billing cleanup, which intentionally takes the same lock.
-    drop(second_recovery_guard);
-    drop(first_recovery_guard);
+    drop(second_action_guard);
+    drop(first_action_guard);
     let finalized =
         match finalize_committed_takeover(&state, &plan, &committed, Some(&backend)).await {
             Ok(result) => result,
@@ -187,11 +187,11 @@ async fn lock_client_market_actions(
     } else {
         (source, target)
     };
-    let first_guard = state.client_market_recovery.lock(first).await;
+    let first_guard = state.client_market_actions.lock(first).await;
     let second_guard = if first == second {
         None
     } else {
-        Some(state.client_market_recovery.lock(second).await)
+        Some(state.client_market_actions.lock(second).await)
     };
     (first_guard, second_guard)
 }
@@ -526,7 +526,7 @@ async fn reconcile_recovery(
                 }
                 PreparingRecoveryTiming::Retry => {}
             }
-            let (first_recovery_guard, second_recovery_guard) = lock_client_market_actions(
+            let (first_action_guard, second_action_guard) = lock_client_market_actions(
                 state,
                 &plan.target_installation_id,
                 &plan.source_installation_id,
@@ -540,8 +540,8 @@ async fn reconcile_recovery(
                             .store
                             .mark_client_subdomain_takeover_server_prepared(&plan.id)
                             .await?;
-                        drop(second_recovery_guard);
-                        drop(first_recovery_guard);
+                        drop(second_action_guard);
+                        drop(first_action_guard);
                         commit_recovery(state, &plan, Some(&backend)).await?;
                     }
                     Err(control_error) if !control_error.is_transport() => {
@@ -607,7 +607,7 @@ async fn commit_recovery(
     plan: &ClientSubdomainTakeoverPlan,
     target_backend: Option<&str>,
 ) -> Result<(), AppError> {
-    let (first_recovery_guard, second_recovery_guard) = lock_client_market_actions(
+    let (first_action_guard, second_action_guard) = lock_client_market_actions(
         state,
         &plan.target_installation_id,
         &plan.source_installation_id,
@@ -615,8 +615,8 @@ async fn commit_recovery(
     .await;
     match state.store.commit_client_subdomain_takeover(&plan.id).await {
         Ok(committed) => {
-            drop(second_recovery_guard);
-            drop(first_recovery_guard);
+            drop(second_action_guard);
+            drop(first_action_guard);
             finalize_committed_takeover(state, plan, &committed, target_backend).await?;
         }
         Err(error) => {

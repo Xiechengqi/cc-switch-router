@@ -510,8 +510,6 @@ pub struct Config {
     pub client_stale_secs: i64,
     pub client_installation_retention_secs: i64,
     pub paused_share_stale_secs: i64,
-    /// Router-side SSH fallback for Client Market installations whose tunnel went offline.
-    pub client_market_recovery_enabled: bool,
     pub resend_api_key: Option<String>,
     pub resend_from: Option<String>,
     pub resend_from_name: Option<String>,
@@ -701,10 +699,6 @@ impl Config {
             paused_share_stale_secs: env_var("CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60 * 60),
-            client_market_recovery_enabled: env_bool(
-                "CC_SWITCH_ROUTER_CLIENT_MARKET_RECOVERY_ENABLED",
-                true,
-            ),
             resend_api_key: env_var("CC_SWITCH_ROUTER_RESEND_API_KEY"),
             resend_from: env_var("CC_SWITCH_ROUTER_RESEND_FROM")
                 .or_else(|| crate::startup_config::default_resend_from(&tunnel_domain)),
@@ -1092,8 +1086,6 @@ CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT=1000
 CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT=5000
 CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK=50000
 CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS=3600
-# Router waits 30 seconds before recovering an offline Client Market installation.
-CC_SWITCH_ROUTER_CLIENT_MARKET_RECOVERY_ENABLED=true
 CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS=300
 CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS=60
 CC_SWITCH_ROUTER_AUTH_SESSION_TTL_SECS=1800
@@ -1383,7 +1375,6 @@ mod tests {
             client_stale_secs: 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60,
-            client_market_recovery_enabled: true,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,
@@ -1456,13 +1447,6 @@ mod tests {
     #[test]
     fn default_env_includes_request_log_retention_default() {
         assert!(default_env_contents().contains("CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS=30"));
-    }
-
-    #[test]
-    fn default_env_enables_client_market_recovery() {
-        assert!(
-            default_env_contents().contains("CC_SWITCH_ROUTER_CLIENT_MARKET_RECOVERY_ENABLED=true")
-        );
     }
 
     #[test]

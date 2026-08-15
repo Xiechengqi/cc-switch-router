@@ -81,15 +81,15 @@ const CLEANUP_PURGE_RETRY_BASE: Duration = Duration::from_secs(1);
 const STALE_DRAINING_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Delay before each unattended clean-host probe. Five failed probes are terminal;
 /// Providers retain the explicit retry, reverify, and permanent-retirement actions.
-const CLEANUP_RECOVERY_BACKOFF: [Duration; 5] = [
+const CLEANUP_RETRY_BACKOFF: [Duration; 5] = [
     Duration::from_secs(5 * 60),
     Duration::from_secs(15 * 60),
     Duration::from_secs(60 * 60),
     Duration::from_secs(6 * 60 * 60),
     Duration::from_secs(24 * 60 * 60),
 ];
-const CLEANUP_RECOVERY_CLAIM_LIMIT: usize = 4;
-const CLEANUP_RECOVERY_CLAIM_LEASE: Duration = Duration::from_secs(10 * 60);
+const CLEANUP_RETRY_CLAIM_LIMIT: usize = 4;
+const CLEANUP_RETRY_CLAIM_LEASE: Duration = Duration::from_secs(10 * 60);
 const HOST_REPROBE_CLAIM_LIMIT: usize = 4;
 const HOST_REPROBE_CLAIM_LEASE: Duration = Duration::from_secs(5 * 60);
 const HOST_REPROBE_BACKOFF: [Duration; 4] = [
@@ -687,18 +687,6 @@ pub fn router() -> Router<ServerState> {
             "/v1/client-market/hosts/:id/ssh-host-key/rotate",
             post(rotate_host_ssh_key),
         )
-        .route(
-            "/v1/client-market/hosts/:id/recovery/pause",
-            post(pause_host_recovery),
-        )
-        .route(
-            "/v1/client-market/hosts/:id/recovery/resume",
-            post(resume_host_recovery),
-        )
-        .route(
-            "/v1/client-market/hosts/:id/recovery/retry",
-            post(retry_host_recovery),
-        )
         .route("/v1/client-market/jobs/:id", get(get_job))
         .route(
             "/v1/client-market/clients/:installation_id/release",
@@ -736,6 +724,16 @@ struct ListHostsQuery {
     owner_email: Option<String>,
     country: Option<String>,
     status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientMarketConnectionView {
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_heartbeat_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -782,11 +780,9 @@ struct RouterSshHostView {
     #[serde(default)]
     is_client_owner: bool,
     #[serde(default)]
-    can_control_recovery: bool,
-    #[serde(default)]
     can_retire_unreachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    recovery: Option<crate::client_market_recovery::ClientMarketRecoveryView>,
+    client_connection: Option<ClientMarketConnectionView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_verified_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -840,29 +836,14 @@ async fn list_hosts(
             query.status.as_deref(),
         )
         .await?;
-    let recovery_host_ids = if state.config.client_market_recovery_enabled {
-        viewer
-            .as_ref()
-            .map(|session| {
-                hosts
-                    .iter()
-                    .filter(|host| {
-                        viewer_is_admin
-                            || session_is_host_owner(session, host.provider_id.as_deref())
-                            || host.client_owner_user_id.as_deref()
-                                == Some(session.user_id.as_str())
-                    })
-                    .map(|host| host.id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let reconnect_grace = {
+        let dynamic = state.dynamic.read().await;
+        crate::notifications::route_reconnect_grace(&dynamic.client_notifications)
     };
-    let recovery_by_host = state
-        .store
-        .client_market_recovery_views_for_hosts(&recovery_host_ids)
-        .await?;
+    let route_snapshots = state
+        .proxy
+        .route_availability_snapshots(reconnect_grace)
+        .await;
     let retirable_host_ids = if viewer.is_some() {
         state.store.client_market_retirable_host_ids().await?
     } else {
@@ -926,16 +907,26 @@ async fn list_hosts(
             });
             let reveal_operations = is_host_owner;
             let reveal_installation = reveal_operations || is_client_owner;
-            let reveal_recovery_detail = is_host_owner || viewer_is_admin;
-            let can_control_recovery =
-                state.config.client_market_recovery_enabled && reveal_recovery_detail;
             let can_retire_unreachable = is_host_owner && retirable_host_ids.contains(&host.id);
-            let recovery = if reveal_installation || viewer_is_admin {
-                recovery_by_host.get(&host.id).cloned().map(|mut recovery| {
-                    if !reveal_recovery_detail {
-                        recovery.blocked_reason = None;
+            let client_connection = if reveal_installation || viewer_is_admin {
+                host.client_subdomain.as_deref().map(|subdomain| {
+                    let (state, since) = if host.client_tunnel_enabled == Some(false) {
+                        ("disabled".to_string(), None)
+                    } else if let Some(snapshot) = route_snapshots.get(subdomain) {
+                        let state = match snapshot.state {
+                            RouteAvailability::Active => "online",
+                            RouteAvailability::Reconnecting => "reconnecting",
+                            RouteAvailability::Offline => "offline",
+                        };
+                        (state.to_string(), Some(snapshot.since.to_rfc3339()))
+                    } else {
+                        ("offline".to_string(), None)
+                    };
+                    ClientMarketConnectionView {
+                        state,
+                        since,
+                        last_heartbeat_at: host.client_last_heartbeat_at.clone(),
                     }
-                    recovery
                 })
             } else {
                 None
@@ -1013,9 +1004,8 @@ async fn list_hosts(
                 can_web_terminal,
                 is_host_owner,
                 is_client_owner,
-                can_control_recovery,
                 can_retire_unreachable,
-                recovery,
+                client_connection,
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
                 note: reveal_operations.then_some(host.note).flatten(),
@@ -1679,61 +1669,6 @@ async fn reverify_host(
     Ok(Json(host_to_view(updated, true)))
 }
 
-async fn pause_host_recovery(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<crate::client_market_recovery::ClientMarketRecoveryView>, AppError> {
-    control_host_recovery(
-        &state,
-        &headers,
-        &id,
-        crate::client_market_recovery::RecoveryControlAction::Pause,
-    )
-    .await
-    .map(Json)
-}
-
-async fn resume_host_recovery(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<crate::client_market_recovery::ClientMarketRecoveryView>, AppError> {
-    control_host_recovery(
-        &state,
-        &headers,
-        &id,
-        crate::client_market_recovery::RecoveryControlAction::Resume,
-    )
-    .await
-    .map(Json)
-}
-
-async fn retry_host_recovery(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<crate::client_market_recovery::ClientMarketRecoveryView>, AppError> {
-    control_host_recovery(
-        &state,
-        &headers,
-        &id,
-        crate::client_market_recovery::RecoveryControlAction::Retry,
-    )
-    .await
-    .map(Json)
-}
-
-async fn control_host_recovery(
-    state: &ServerState,
-    headers: &HeaderMap,
-    host_id: &str,
-    action: crate::client_market_recovery::RecoveryControlAction,
-) -> Result<crate::client_market_recovery::ClientMarketRecoveryView, AppError> {
-    let session = require_session(state, headers).await?;
-    crate::client_market_recovery::control_recovery(state, &session, host_id, action).await
-}
-
 async fn scan_host_ssh_key(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1999,7 +1934,7 @@ async fn start_client_cleanup(
         .await?;
     // Session admins are not elevated: only the Host owner or Client owner may cleanup.
     let job_id = {
-        let _recovery_guard = state.client_market_recovery.lock(&installation_id).await;
+        let _action_guard = state.client_market_actions.lock(&installation_id).await;
         state
             .store
             .client_market_begin_cleanup_job_with_context(
@@ -2057,7 +1992,7 @@ pub(crate) async fn terminate_for_billing(
         .client_market_subdomain_for_installation(installation_id)
         .await?;
     let begin_cleanup = {
-        let _recovery_guard = state.client_market_recovery.lock(installation_id).await;
+        let _action_guard = state.client_market_actions.lock(installation_id).await;
         state
             .store
             .client_market_begin_system_cleanup_job(installation_id, reason)
@@ -2268,9 +2203,6 @@ pub async fn reconcile_interrupted_jobs(state: ServerState) -> Result<(), AppErr
                         handle_cleanup_job_failure(&runner_state, &job_id, error).await;
                     }
                 }
-                crate::client_market_recovery::JOB_TYPE_RECOVER => {
-                    crate::client_market_recovery::resume_interrupted_job(runner_state, job).await;
-                }
                 _ => {
                     let _ = runner_state
                         .store
@@ -2376,7 +2308,7 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
             "spawning cleanup for stale draining host"
         );
         let begin_cleanup = {
-            let _recovery_guard = state.client_market_recovery.lock(&installation_id).await;
+            let _action_guard = state.client_market_actions.lock(&installation_id).await;
             state
                 .store
                 .client_market_begin_system_cleanup_job(&installation_id, "stale_draining_recovery")
@@ -2401,20 +2333,20 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
         }
     }
 
-    let cleanup_recovery_claims = state
+    let cleanup_retry_claims = state
         .store
-        .client_market_claim_due_cleanup_recoveries(now, CLEANUP_RECOVERY_CLAIM_LIMIT)
+        .client_market_claim_due_cleanup_retries(now, CLEANUP_RETRY_CLAIM_LIMIT)
         .await?;
-    let cleanup_recovery_results = stream::iter(cleanup_recovery_claims.into_iter().map(|claim| {
+    let cleanup_retry_results = stream::iter(cleanup_retry_claims.into_iter().map(|claim| {
         let runner_state = state.clone();
-        async move { reconcile_cleanup_recovery_claim(runner_state, claim).await }
+        async move { reconcile_cleanup_retry_claim(runner_state, claim).await }
     }))
-    .buffer_unordered(CLEANUP_RECOVERY_CLAIM_LIMIT)
+    .buffer_unordered(CLEANUP_RETRY_CLAIM_LIMIT)
     .collect::<Vec<_>>()
     .await;
-    for result in cleanup_recovery_results {
+    for result in cleanup_retry_results {
         if let Err(error) = result {
-            warn!(error = %error, "cleanup recovery probe failed");
+            warn!(error = %error, "cleanup retry probe failed");
         }
     }
 
@@ -2489,7 +2421,7 @@ async fn reconcile_quarantined_host_reprobe(
         }
         Err(error) => {
             let outcome = format!("probe_failed:{}", classify_cleanup_failure(&error));
-            let retry = !cleanup_recovery_requires_manual_intervention(&outcome);
+            let retry = !cleanup_retry_requires_manual_intervention(&outcome);
             state
                 .store
                 .client_market_finish_quarantined_host_reprobe(&claim, &outcome, retry, Utc::now())
@@ -2519,9 +2451,6 @@ async fn reconcile_expired_job_leases(
                 JOB_TYPE_CLEANUP => {
                     handle_cleanup_job_failure(&runner_state, &job.id, &error).await
                 }
-                crate::client_market_recovery::JOB_TYPE_RECOVER => {
-                    crate::client_market_recovery::expire_stale_job(&runner_state, &job.id).await;
-                }
                 _ => {
                     let _ = runner_state
                         .store
@@ -2534,12 +2463,12 @@ async fn reconcile_expired_job_leases(
     Ok(())
 }
 
-async fn reconcile_cleanup_recovery_claim(
+async fn reconcile_cleanup_retry_claim(
     state: ServerState,
-    claim: CleanupRecoveryClaim,
+    claim: CleanupRetryClaim,
 ) -> Result<(), AppError> {
-    let _recovery_guard = state
-        .client_market_recovery
+    let _action_guard = state
+        .client_market_actions
         .lock(&claim.installation_id)
         .await;
     let Some(host) = state.store.client_market_get_host(&claim.host_id).await? else {
@@ -2575,7 +2504,7 @@ async fn reconcile_cleanup_recovery_claim(
                 Err(error) => {
                     state
                         .store
-                        .client_market_finish_cleanup_recovery_attempt(
+                        .client_market_finish_cleanup_retry_attempt(
                             &claim,
                             &format!("router_finalize_failed: {error}"),
                             Utc::now(),
@@ -2588,18 +2517,14 @@ async fn reconcile_cleanup_recovery_claim(
         Ok(false) => {
             state
                 .store
-                .client_market_finish_cleanup_recovery_attempt(
-                    &claim,
-                    "remote_not_clean",
-                    Utc::now(),
-                )
+                .client_market_finish_cleanup_retry_attempt(&claim, "remote_not_clean", Utc::now())
                 .await
         }
         Err(error) => {
             let outcome = format!("probe_failed:{}", classify_cleanup_failure(&error));
             state
                 .store
-                .client_market_finish_cleanup_recovery_attempt(&claim, &outcome, Utc::now())
+                .client_market_finish_cleanup_retry_attempt(&claim, &outcome, Utc::now())
                 .await?;
             Err(error)
         }
@@ -2867,20 +2792,7 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
         ));
     }
     let router_url = router_public_url(&state.config);
-    let install_cmd = format!(
-        "{deps}\
-         set -eu; \
-         ensure_client_market_deps; \
-         mkdir -p /usr/local/bin /tmp; \
-         script=$(mktemp); trap 'rm -f \"$script\"' EXIT; \
-         curl --fail --silent --show-error --location --max-time 120 {} -o \"$script\"; \
-         bash \"$script\" {} {} --password-stdin {} disableWebTerminal",
-        shell_quote(&format!("{router_url}/install-client.sh")),
-        shell_quote(&router_url),
-        shell_quote(&owner_email),
-        shell_quote(&subdomain),
-        deps = REMOTE_ENSURE_CLIENT_MARKET_DEPS,
-    );
+    let install_cmd = client_market_install_command(&router_url, &owner_email, &subdomain);
     let password_stdin = format!("{password}\n").into_bytes();
     let install_result = ssh_run_remote_with_input(
         &state.provision_ssh_key_path,
@@ -3141,14 +3053,14 @@ fn cleanup_error_is_ssh_unreachable(lower: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-fn cleanup_recovery_next_at(now: DateTime<Utc>, completed_attempts: u32) -> Option<DateTime<Utc>> {
-    CLEANUP_RECOVERY_BACKOFF
+fn cleanup_retry_next_at(now: DateTime<Utc>, completed_attempts: u32) -> Option<DateTime<Utc>> {
+    CLEANUP_RETRY_BACKOFF
         .get(completed_attempts as usize)
         .and_then(|delay| chrono::Duration::from_std(*delay).ok())
         .map(|delay| now + delay)
 }
 
-fn cleanup_recovery_requires_manual_intervention(outcome: &str) -> bool {
+fn cleanup_retry_requires_manual_intervention(outcome: &str) -> bool {
     outcome.contains(CLEANUP_FAILURE_FINGERPRINT) || outcome.contains(CLEANUP_FAILURE_BINDING)
 }
 
@@ -4294,114 +4206,6 @@ async fn ssh_wipe_cc_switch_files(
     .await
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClientRecoveryRemoteOutcome {
-    AlreadyRunning,
-    Started { method: String },
-    MissingBinary,
-    MissingConfig,
-    StartFailed { method: String },
-}
-
-/// Check and, only when absent, start the Client Market process. The command is
-/// idempotent and keeps strict SSH host verification enabled for unattended recovery.
-pub(crate) async fn ssh_recover_market_client_process(
-    state: &ServerState,
-    host: &RouterSshHostRecord,
-) -> Result<ClientRecoveryRemoteOutcome, AppError> {
-    let known_hosts = known_hosts_path(&state.config);
-    require_pinned_host_fingerprint(host, &known_hosts).await?;
-    let command = format!(
-        "{helpers}\
-         set +e; \
-         if cc_switch_server_is_running; then \
-           echo 'CC_SWITCH_RECOVERY=already_running'; exit 0; \
-         fi; \
-         if [ ! -x /usr/local/bin/cc-switch-server ]; then \
-           echo 'CC_SWITCH_RECOVERY=missing_binary'; exit 0; \
-         fi; \
-         home=$(cc_switch_server_home); \
-         if [ ! -r \"$home/.cc-switch-server/server.json\" ]; then \
-           echo 'CC_SWITCH_RECOVERY=missing_config'; exit 0; \
-         fi; \
-         method=nohup; started=0; \
-         if command -v systemctl >/dev/null 2>&1 \
-              && [ -d /run/systemd/system ] \
-              && systemctl cat cc-switch-server.service >/dev/null 2>&1; then \
-           method=systemd; \
-           systemctl start cc-switch-server.service >/dev/null 2>&1 && started=1; \
-         elif command -v rc-service >/dev/null 2>&1 \
-              && [ -x /etc/init.d/cc-switch-server ]; then \
-           method=openrc; \
-           rc-service cc-switch-server start >/dev/null 2>&1 && started=1; \
-         else \
-           cd \"$home\" >/dev/null 2>&1 \
-             && nohup /usr/local/bin/cc-switch-server </dev/null >/dev/null 2>&1 & \
-           started=1; \
-         fi; \
-         if [ \"$started\" -ne 1 ]; then \
-           echo \"CC_SWITCH_RECOVERY=start_failed:$method\"; exit 0; \
-         fi; \
-         sleep 2; \
-         if cc_switch_server_is_running; then \
-           echo \"CC_SWITCH_RECOVERY=started:$method\"; \
-         else \
-           echo \"CC_SWITCH_RECOVERY=start_failed:$method\"; \
-         fi",
-        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
-    );
-    let output = ssh_run_remote_with_input_connect_timeout(
-        &state.provision_ssh_key_path,
-        &known_hosts,
-        &host.ip,
-        host.port,
-        &command,
-        None,
-        Duration::from_secs(45),
-        SshHostKeyPolicy::RequireKnown,
-        10,
-    )
-    .await?;
-    parse_client_recovery_remote_outcome(&output)
-}
-
-fn parse_client_recovery_remote_outcome(
-    output: &str,
-) -> Result<ClientRecoveryRemoteOutcome, AppError> {
-    let marker = output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix("CC_SWITCH_RECOVERY="))
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(
-                "recovery command completed without a valid result marker".into(),
-            )
-        })?;
-    match marker {
-        "already_running" => Ok(ClientRecoveryRemoteOutcome::AlreadyRunning),
-        "missing_binary" => Ok(ClientRecoveryRemoteOutcome::MissingBinary),
-        "missing_config" => Ok(ClientRecoveryRemoteOutcome::MissingConfig),
-        value if value.starts_with("started:") => Ok(ClientRecoveryRemoteOutcome::Started {
-            method: recovery_method(value.trim_start_matches("started:"))?,
-        }),
-        value if value.starts_with("start_failed:") => {
-            Ok(ClientRecoveryRemoteOutcome::StartFailed {
-                method: recovery_method(value.trim_start_matches("start_failed:"))?,
-            })
-        }
-        _ => Err(AppError::ServiceUnavailable(
-            "recovery command returned an unknown result marker".into(),
-        )),
-    }
-}
-
-fn recovery_method(value: &str) -> Result<String, AppError> {
-    matches!(value, "systemd" | "openrc" | "nohup")
-        .then(|| value.to_string())
-        .ok_or_else(|| AppError::ServiceUnavailable("recovery method marker is invalid".into()))
-}
-
 /// True when the remote host has no running process and no install/backup files.
 async fn ssh_remote_is_market_clean(
     state: &ServerState,
@@ -5349,6 +5153,23 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn client_market_install_command(router_url: &str, owner_email: &str, subdomain: &str) -> String {
+    format!(
+        "{deps}\
+         set -eu; \
+         ensure_client_market_deps; \
+         mkdir -p /usr/local/bin /tmp; \
+         script=$(mktemp); trap 'rm -f \"$script\"' EXIT; \
+         curl --fail --silent --show-error --location --max-time 120 {} -o \"$script\"; \
+         bash \"$script\" {} {} --password-stdin {}",
+        shell_quote(&format!("{router_url}/install-client.sh")),
+        shell_quote(router_url),
+        shell_quote(owner_email),
+        shell_quote(subdomain),
+        deps = REMOTE_ENSURE_CLIENT_MARKET_DEPS,
+    )
+}
+
 fn sanitize_job_log_chunk(chunk: &str) -> String {
     let mut output = String::new();
     for line in chunk.lines().take(200) {
@@ -5472,9 +5293,8 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         can_web_terminal: false,
         is_host_owner: false,
         is_client_owner: false,
-        can_control_recovery: false,
         can_retire_unreachable: false,
-        recovery: None,
+        client_connection: None,
         last_verified_at: reveal.then_some(host.last_verified_at).flatten(),
         last_error: reveal.then_some(host.last_error).flatten(),
         note: reveal.then_some(host.note).flatten(),
@@ -5531,6 +5351,8 @@ pub struct RouterSshHostRecord {
     pub client_owner_email: Option<String>,
     pub installation_id: Option<String>,
     pub client_owner_user_id: Option<String>,
+    pub client_tunnel_enabled: Option<bool>,
+    pub client_last_heartbeat_at: Option<String>,
     pub last_verified_at: Option<String>,
     pub last_error: Option<String>,
     pub note: Option<String>,
@@ -5564,7 +5386,7 @@ pub struct ProvisioningJobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CleanupRecoveryClaim {
+struct CleanupRetryClaim {
     host_id: String,
     installation_id: String,
     attempt_count: u32,
@@ -5987,10 +5809,12 @@ impl AppStore {
                               WHERE p.user_id = h.provider_id), '[]'),
                     COALESCE((SELECT contacts_json FROM account_payment_profiles p
                               WHERE p.user_id = h.provider_id), '[]'),
-                    NULLIF(TRIM(h.currency), ''), h.free_duration_days
+                    NULLIF(TRIM(h.currency), ''), h.free_duration_days,
+                    t.enabled, ns.last_heartbeat_at
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
              LEFT JOIN installations i ON i.id = h.installation_id
+             LEFT JOIN installation_notification_state ns ON ns.installation_id = h.installation_id
              LEFT JOIN client_market_subscriptions s ON s.installation_id = h.installation_id
              WHERE 1=1",
         );
@@ -7158,10 +6982,12 @@ impl AppStore {
                                   WHERE p.user_id = h.provider_id), '[]'),
                         COALESCE((SELECT contacts_json FROM account_payment_profiles p
                                   WHERE p.user_id = h.provider_id), '[]'),
-                        NULLIF(TRIM(h.currency), ''), h.free_duration_days
+                        NULLIF(TRIM(h.currency), ''), h.free_duration_days,
+                        t.enabled, ns.last_heartbeat_at
                  FROM router_ssh_hosts h
                  LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
                  LEFT JOIN installations i ON i.id = h.installation_id
+                 LEFT JOIN installation_notification_state ns ON ns.installation_id = h.installation_id
                  LEFT JOIN client_market_subscriptions s ON s.installation_id = h.installation_id
                  WHERE h.status = ?1
                  ORDER BY h.updated_at ASC",
@@ -7207,11 +7033,11 @@ impl AppStore {
         })
     }
 
-    async fn client_market_claim_due_cleanup_recoveries(
+    async fn client_market_claim_due_cleanup_retries(
         &self,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<CleanupRecoveryClaim>, AppError> {
+    ) -> Result<Vec<CleanupRetryClaim>, AppError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -7219,18 +7045,18 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
-                AppError::Internal(format!("begin cleanup recovery claim failed: {error}"))
+                AppError::Internal(format!("begin cleanup retry claim failed: {error}"))
             })?;
         tx.execute(
-            "DELETE FROM client_market_cleanup_recovery_state
+            "DELETE FROM client_market_cleanup_retry_state
              WHERE NOT EXISTS (
                  SELECT 1
                  FROM router_ssh_hosts h
                  JOIN installations i ON i.id = h.installation_id
                  JOIN installation_client_tunnels t ON t.installation_id = i.id
                  JOIN client_market_subscriptions s ON s.installation_id = i.id
-                 WHERE h.id = client_market_cleanup_recovery_state.host_id
-                   AND i.id = client_market_cleanup_recovery_state.installation_id
+                 WHERE h.id = client_market_cleanup_retry_state.host_id
+                   AND i.id = client_market_cleanup_retry_state.installation_id
                    AND h.status = 'unreachable' AND t.enabled = 0
                    AND s.host_id = h.id
                    AND s.status IN ('releasing', 'release_failed', 'released')
@@ -7238,11 +7064,11 @@ impl AppStore {
             [],
         )
         .map_err(|error| {
-            AppError::Internal(format!("prune cleanup recovery state failed: {error}"))
+            AppError::Internal(format!("prune cleanup retry state failed: {error}"))
         })?;
         let now_text = now.to_rfc3339();
         tx.execute(
-            "UPDATE client_market_cleanup_recovery_state
+            "UPDATE client_market_cleanup_retry_state
              SET next_attempt_at = NULL, stopped_at = ?1,
                  last_outcome = 'probe_interrupted', updated_at = ?1
              WHERE stopped_at IS NULL AND attempt_count >= 5
@@ -7251,17 +7077,17 @@ impl AppStore {
             params![now_text],
         )
         .map_err(|error| {
-            AppError::Internal(format!("stop interrupted cleanup recovery failed: {error}"))
+            AppError::Internal(format!("stop interrupted cleanup retry failed: {error}"))
         })?;
-        let claim_lease_until = chrono::Duration::from_std(CLEANUP_RECOVERY_CLAIM_LEASE)
+        let claim_lease_until = chrono::Duration::from_std(CLEANUP_RETRY_CLAIM_LEASE)
             .ok()
             .map(|lease| (now + lease).to_rfc3339())
-            .expect("cleanup recovery claim lease is valid");
+            .expect("cleanup retry claim lease is valid");
         let due = {
             let mut statement = tx
                 .prepare(
                     "SELECT r.host_id, r.installation_id, r.attempt_count
-                     FROM client_market_cleanup_recovery_state r
+                     FROM client_market_cleanup_retry_state r
                      JOIN router_ssh_hosts h ON h.id = r.host_id
                      JOIN installation_client_tunnels t
                        ON t.installation_id = r.installation_id
@@ -7283,7 +7109,7 @@ impl AppStore {
                      LIMIT ?2",
                 )
                 .map_err(|error| {
-                    AppError::Internal(format!("prepare cleanup recovery claims failed: {error}"))
+                    AppError::Internal(format!("prepare cleanup retry claims failed: {error}"))
                 })?;
             let rows = statement
                 .query_map(params![now_text, limit as i64], |row| {
@@ -7294,10 +7120,10 @@ impl AppStore {
                     ))
                 })
                 .map_err(|error| {
-                    AppError::Internal(format!("query cleanup recovery claims failed: {error}"))
+                    AppError::Internal(format!("query cleanup retry claims failed: {error}"))
                 })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
-                AppError::Internal(format!("read cleanup recovery claims failed: {error}"))
+                AppError::Internal(format!("read cleanup retry claims failed: {error}"))
             })?
         };
         let mut claimed = Vec::with_capacity(due.len());
@@ -7305,7 +7131,7 @@ impl AppStore {
             let next_attempt_count = previous_attempt_count.saturating_add(1).min(5);
             let changed = tx
                 .execute(
-                    "UPDATE client_market_cleanup_recovery_state
+                    "UPDATE client_market_cleanup_retry_state
                      SET attempt_count = ?4, next_attempt_at = ?6,
                          last_attempt_at = ?3, last_outcome = 'probing', updated_at = ?3
                      WHERE host_id = ?1 AND installation_id = ?2
@@ -7321,10 +7147,10 @@ impl AppStore {
                     ],
                 )
                 .map_err(|error| {
-                    AppError::Internal(format!("claim cleanup recovery failed: {error}"))
+                    AppError::Internal(format!("claim cleanup retry failed: {error}"))
                 })?;
             if changed == 1 {
-                claimed.push(CleanupRecoveryClaim {
+                claimed.push(CleanupRetryClaim {
                     host_id,
                     installation_id,
                     attempt_count: u32::try_from(next_attempt_count).unwrap_or(5),
@@ -7332,14 +7158,14 @@ impl AppStore {
             }
         }
         tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit cleanup recovery claims failed: {error}"))
+            AppError::Internal(format!("commit cleanup retry claims failed: {error}"))
         })?;
         Ok(claimed)
     }
 
-    async fn client_market_finish_cleanup_recovery_attempt(
+    async fn client_market_finish_cleanup_retry_attempt(
         &self,
-        claim: &CleanupRecoveryClaim,
+        claim: &CleanupRetryClaim,
         outcome: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
@@ -7347,14 +7173,14 @@ impl AppStore {
             .chars()
             .take(500)
             .collect::<String>();
-        let next_attempt_at = (!cleanup_recovery_requires_manual_intervention(&outcome))
-            .then(|| cleanup_recovery_next_at(now, claim.attempt_count))
+        let next_attempt_at = (!cleanup_retry_requires_manual_intervention(&outcome))
+            .then(|| cleanup_retry_next_at(now, claim.attempt_count))
             .flatten();
         let stopped_at = next_attempt_at.is_none().then(|| now.to_rfc3339());
         let conn = self.conn.lock().await;
         let changed = conn
             .execute(
-                "UPDATE client_market_cleanup_recovery_state
+                "UPDATE client_market_cleanup_retry_state
              SET next_attempt_at = ?4, last_outcome = ?5, stopped_at = ?6, updated_at = ?7
              WHERE host_id = ?1 AND installation_id = ?2 AND attempt_count = ?3
                AND last_outcome = 'probing' AND stopped_at IS NULL",
@@ -7369,14 +7195,14 @@ impl AppStore {
                 ],
             )
             .map_err(|error| {
-                AppError::Internal(format!("finish cleanup recovery attempt failed: {error}"))
+                AppError::Internal(format!("finish cleanup retry attempt failed: {error}"))
             })?;
         if changed == 0 {
             tracing::debug!(
                 host_id = %claim.host_id,
                 installation_id = %claim.installation_id,
                 attempt = claim.attempt_count,
-                "discarded stale cleanup recovery result"
+                "discarded stale cleanup retry result"
             );
         }
         Ok(())
@@ -7549,7 +7375,7 @@ impl AppStore {
             })?;
         if eligible.is_none() {
             return Err(AppError::Conflict(
-                "unreachable Host changed before cleanup recovery completed".into(),
+                "unreachable Host changed before cleanup retry completed".into(),
             ));
         }
         let has_subscription: i64 = tx
@@ -7597,7 +7423,7 @@ impl AppStore {
             })?;
         if changed != 1 {
             return Err(AppError::Conflict(
-                "unreachable Host changed while cleanup recovery completed".into(),
+                "unreachable Host changed while cleanup retry completed".into(),
             ));
         }
         tx.commit().map_err(|error| {
@@ -8388,35 +8214,13 @@ impl AppStore {
         }
         let now = Utc::now().to_rfc3339();
         tx.execute(
-            "UPDATE provisioning_jobs
-             SET status = 'failed', phase = 'complete', failure_code = 'recovery_cancelled',
-                 log_blob = substr(COALESCE(log_blob, '') || 'recovery cancelled by cleanup\n', -131072),
-                 updated_at = ?3
-             WHERE host_id = ?1 AND installation_id = ?2 AND type = 'recover'
-               AND status IN ('pending', 'running')",
-            params![host.0, installation_id, now],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("cancel recovery before cleanup failed: {error}"))
-        })?;
-        tx.execute(
-            "DELETE FROM client_market_recovery_state
+            "DELETE FROM client_market_cleanup_retry_state
              WHERE installation_id = ?1 AND host_id = ?2",
             params![installation_id, host.0],
         )
         .map_err(|error| {
             AppError::Internal(format!(
-                "clear recovery state before cleanup failed: {error}"
-            ))
-        })?;
-        tx.execute(
-            "DELETE FROM client_market_cleanup_recovery_state
-             WHERE installation_id = ?1 AND host_id = ?2",
-            params![installation_id, host.0],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "clear cleanup recovery state before retry failed: {error}"
+                "clear cleanup retry state before retry failed: {error}"
             ))
         })?;
         if host.3 == HOST_STATUS_DRAINING {
@@ -8741,14 +8545,14 @@ impl AppStore {
                 "cleanup job changed concurrently".into(),
             ));
         }
-        let requires_manual = cleanup_recovery_requires_manual_intervention(failure_code);
+        let requires_manual = cleanup_retry_requires_manual_intervention(failure_code);
         let next_attempt_at = (!requires_manual)
-            .then(|| cleanup_recovery_next_at(now_at, 0))
+            .then(|| cleanup_retry_next_at(now_at, 0))
             .flatten()
             .map(|value| value.to_rfc3339());
         let stopped_at = requires_manual.then(|| now.clone());
         tx.execute(
-            "INSERT INTO client_market_cleanup_recovery_state (
+            "INSERT INTO client_market_cleanup_retry_state (
                 host_id, installation_id, attempt_count, next_attempt_at,
                 last_attempt_at, last_outcome, stopped_at, updated_at
              ) VALUES (?1, ?2, 0, ?3, NULL, ?4, ?5, ?6)
@@ -8770,7 +8574,7 @@ impl AppStore {
             ],
         )
         .map_err(|error| {
-            AppError::Internal(format!("schedule failed cleanup recovery failed: {error}"))
+            AppError::Internal(format!("schedule failed cleanup retry failed: {error}"))
         })?;
         crate::client_market_trade::cleanup_failed_tx(
             &tx,
@@ -8800,10 +8604,12 @@ fn get_router_ssh_host(
                           WHERE p.user_id = h.provider_id), '[]'),
                 COALESCE((SELECT contacts_json FROM account_payment_profiles p
                           WHERE p.user_id = h.provider_id), '[]'),
-                NULLIF(TRIM(h.currency), ''), h.free_duration_days
+                NULLIF(TRIM(h.currency), ''), h.free_duration_days,
+                t.enabled, ns.last_heartbeat_at
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
          LEFT JOIN installations i ON i.id = h.installation_id
+         LEFT JOIN installation_notification_state ns ON ns.installation_id = h.installation_id
          LEFT JOIN client_market_subscriptions s ON s.installation_id = h.installation_id
          WHERE h.id = ?1",
         params![id],
@@ -8867,6 +8673,8 @@ fn map_router_ssh_host_row(row: &crate::db::Row<'_>) -> crate::db::Result<Router
         client_subdomain: row.get(15)?,
         client_owner_email: row.get(16)?,
         client_owner_user_id: row.get(17)?,
+        client_tunnel_enabled: row.get::<_, Option<i64>>(25)?.map(|value| value != 0),
+        client_last_heartbeat_at: row.get(26)?,
         provider_id: row.get(18)?,
         daily_rate_minor: row.get(19)?,
         offer_revision: row.get(20)?,
@@ -8965,7 +8773,6 @@ mod tests {
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
-            client_market_recovery_enabled: true,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,
@@ -9370,6 +9177,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_market_install_keeps_web_terminal_enabled() {
+        let command = client_market_install_command(
+            "https://sgptokenswitch.cc",
+            "owner@example.com",
+            "alpha-host",
+        );
+        assert!(command.contains("--password-stdin"));
+        assert!(!command.contains("disableWebTerminal"));
+    }
+
     async fn add_host(
         store: &AppStore,
         owner: &str,
@@ -9682,6 +9500,62 @@ mod tests {
             params![installation_id, Uuid::new_v4().to_string(), source, now],
         )
         .expect("insert setup completion");
+    }
+
+    #[tokio::test]
+    async fn host_read_paths_include_client_connection_observations() {
+        let (store, _, root) = test_store("host-connection-observations");
+        let host = add_host(&store, "host@example.com", "198.18.41.1", "US").await;
+        let heartbeat_at = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            insert_installation(&conn, "connection-installation", "client@example.com");
+            insert_tunnel_and_public_host(
+                &conn,
+                "connection-installation",
+                "client@example.com",
+                "connection-client",
+            );
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, monitoring_enabled, presence_state,
+                    last_heartbeat_at, created_at, updated_at
+                 ) VALUES (?1, 1, 'online', ?2, ?2, ?2)",
+                params!["connection-installation", heartbeat_at],
+            )
+            .expect("insert Client connection observation");
+            conn.execute(
+                "UPDATE router_ssh_hosts
+                 SET status = 'allocated', installation_id = ?2
+                 WHERE id = ?1",
+                params![host.id, "connection-installation"],
+            )
+            .expect("bind Host to observed Client");
+        }
+
+        let fetched = store
+            .client_market_get_host(&host.id)
+            .await
+            .expect("read Host")
+            .expect("Host exists");
+        assert_eq!(fetched.client_tunnel_enabled, Some(true));
+        assert_eq!(
+            fetched.client_last_heartbeat_at.as_deref(),
+            Some(heartbeat_at.as_str())
+        );
+        let listed = store
+            .client_market_list_hosts(None, None, None)
+            .await
+            .expect("list Hosts");
+        assert_eq!(listed[0].client_tunnel_enabled, Some(true));
+        let allocated = store
+            .client_market_list_hosts_by_status(HOST_STATUS_ALLOCATED)
+            .await
+            .expect("list allocated Hosts");
+        assert_eq!(allocated[0].client_last_heartbeat_at, Some(heartbeat_at));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -10292,7 +10166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_recovery_after_purge_is_idempotent_and_keeps_label_tombstoned() {
+    async fn cleanup_retry_after_purge_is_idempotent_and_keeps_label_tombstoned() {
         let (store, config, root) = test_store("cleanup-recovery");
         let host = add_host(&store, "host@example.com", "198.18.5.1", "US").await;
         let unrelated_host = add_host(&store, "other@example.com", "198.18.5.2", "US").await;
@@ -10625,6 +10499,8 @@ mod tests {
             client_owner_email: Some("client@example.com".into()),
             installation_id: Some("installation-id".into()),
             client_owner_user_id: Some("client-id".into()),
+            client_tunnel_enabled: Some(true),
+            client_last_heartbeat_at: Some("heartbeat-at".into()),
             last_verified_at: Some("verified-at".into()),
             last_error: Some("diagnostic".into()),
             note: Some("operator note".into()),
@@ -12223,29 +12099,15 @@ mod tests {
     }
 
     #[test]
-    fn recovery_remote_markers_are_strictly_parsed() {
-        assert_eq!(
-            parse_client_recovery_remote_outcome("noise\nCC_SWITCH_RECOVERY=already_running\n")
-                .unwrap(),
-            ClientRecoveryRemoteOutcome::AlreadyRunning
-        );
-        assert_eq!(
-            parse_client_recovery_remote_outcome("CC_SWITCH_RECOVERY=started:systemd\n").unwrap(),
-            ClientRecoveryRemoteOutcome::Started {
-                method: "systemd".into()
-            }
-        );
-        assert_eq!(
-            parse_client_recovery_remote_outcome("CC_SWITCH_RECOVERY=start_failed:openrc\n")
-                .unwrap(),
-            ClientRecoveryRemoteOutcome::StartFailed {
-                method: "openrc".into()
-            }
-        );
-        assert!(
-            parse_client_recovery_remote_outcome("CC_SWITCH_RECOVERY=started:unknown\n").is_err()
-        );
-        assert!(parse_client_recovery_remote_outcome("unstructured output").is_err());
+    fn installer_starts_client_once_without_service_auto_restart() {
+        let installer = include_str!("../install-client.sh");
+        assert!(installer.contains("Restart=no"));
+        assert!(!installer.contains("Restart=on-failure"));
+        assert!(!installer.contains("systemctl enable cc-switch-server.service"));
+        assert!(!installer.contains("rc-update add cc-switch-server default"));
+        assert!(!installer.contains("respawn_delay="));
+        assert!(installer.contains("systemctl disable cc-switch-server.service"));
+        assert!(installer.contains("rc-update del cc-switch-server default"));
     }
 
     #[test]
@@ -12309,15 +12171,15 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_recovery_backoff_is_bounded_and_terminal() {
+    fn cleanup_retry_backoff_is_bounded_and_terminal() {
         let now = Utc::now();
         let expected_seconds = [5 * 60, 15 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60];
         for (completed_attempts, expected) in expected_seconds.into_iter().enumerate() {
-            let next = cleanup_recovery_next_at(now, completed_attempts as u32)
+            let next = cleanup_retry_next_at(now, completed_attempts as u32)
                 .expect("retry remains scheduled");
             assert_eq!((next - now).num_seconds(), expected);
         }
-        assert!(cleanup_recovery_next_at(now, 5).is_none());
+        assert!(cleanup_retry_next_at(now, 5).is_none());
     }
 
     /// `release_failed` had no exit: nothing transitioned a subscription out of it
@@ -12473,7 +12335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_recovery_state_backs_off_stops_and_manual_retry_resets_it() {
+    async fn cleanup_retry_state_backs_off_stops_and_manual_retry_resets_it() {
         let (store, _config, root) = test_store("cleanup-recovery-backoff");
         let host = add_provider_host(
             &store,
@@ -12554,7 +12416,7 @@ mod tests {
             let (attempt_count, next_attempt_at): (i64, String) = conn
                 .query_row(
                     "SELECT attempt_count, next_attempt_at
-                     FROM client_market_cleanup_recovery_state WHERE host_id = ?1",
+                     FROM client_market_cleanup_retry_state WHERE host_id = ?1",
                     params![host.id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -12566,10 +12428,7 @@ mod tests {
         };
         assert!(
             store
-                .client_market_claim_due_cleanup_recoveries(
-                    due_at - chrono::Duration::seconds(1),
-                    1
-                )
+                .client_market_claim_due_cleanup_retries(due_at - chrono::Duration::seconds(1), 1)
                 .await
                 .unwrap()
                 .is_empty()
@@ -12577,32 +12436,32 @@ mod tests {
 
         for expected_attempt in 1..=5 {
             let claims = store
-                .client_market_claim_due_cleanup_recoveries(due_at, 1)
+                .client_market_claim_due_cleanup_retries(due_at, 1)
                 .await
-                .expect("claim due cleanup recovery");
+                .expect("claim due cleanup retry");
             assert_eq!(claims.len(), 1);
             assert_eq!(claims[0].attempt_count, expected_attempt);
             store
-                .client_market_finish_cleanup_recovery_attempt(
+                .client_market_finish_cleanup_retry_attempt(
                     &claims[0],
                     "probe_failed:cleanup_ssh_unreachable",
                     due_at,
                 )
                 .await
-                .expect("finish cleanup recovery attempt");
+                .expect("finish cleanup retry attempt");
             store
-                .client_market_finish_cleanup_recovery_attempt(
+                .client_market_finish_cleanup_retry_attempt(
                     &claims[0],
                     "late_duplicate_result",
                     due_at + chrono::Duration::seconds(1),
                 )
                 .await
-                .expect("discard duplicate cleanup recovery result");
+                .expect("discard duplicate cleanup retry result");
             let conn = store.conn.lock().await;
             let (next, stopped, outcome): (Option<String>, Option<String>, String) = conn
                 .query_row(
                     "SELECT next_attempt_at, stopped_at, last_outcome
-                     FROM client_market_cleanup_recovery_state WHERE host_id = ?1",
+                     FROM client_market_cleanup_retry_state WHERE host_id = ?1",
                     params![host.id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
@@ -12630,7 +12489,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let recovery_rows: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM client_market_cleanup_recovery_state WHERE host_id = ?1",
+                "SELECT COUNT(*) FROM client_market_cleanup_retry_state WHERE host_id = ?1",
                 params![host.id],
                 |row| row.get(0),
             )
@@ -12691,7 +12550,7 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO client_market_cleanup_recovery_state
+                "INSERT INTO client_market_cleanup_retry_state
                     (host_id, installation_id, attempt_count, next_attempt_at,
                      last_outcome, updated_at)
                  VALUES (?1, 'retire-lost-client', 1, ?2,
@@ -12785,7 +12644,7 @@ mod tests {
             assert_eq!(subscription_status, "released");
             let recovery_rows: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM client_market_cleanup_recovery_state
+                    "SELECT COUNT(*) FROM client_market_cleanup_retry_state
                      WHERE host_id = ?1",
                     params![host.id],
                     |row| row.get(0),

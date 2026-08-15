@@ -3,7 +3,7 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, toast } from "@heroui/react";
-import { Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pause, Pencil, Play, Plus, RefreshCw, ServerOff, Trash2 } from "lucide-react";
+import { Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, RefreshCw, ServerOff, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -24,11 +24,8 @@ import {
   cleanupClientMarketProviderRental,
   deleteClientMarketHost,
   getClientMarketJob,
-  pauseClientMarketHostRecovery,
   reverifyClientMarketHost,
   retireUnreachableClientMarketHost,
-  resumeClientMarketHostRecovery,
-  retryClientMarketHostRecovery,
 } from "@/lib/api";
 import { mergeHosts } from "@/lib/client-market-refresh";
 import type { ClientMarketHost, ClientMarketRental, ProvisioningJob } from "@/lib/types";
@@ -48,8 +45,7 @@ import {
   hostCanRetireUnreachable,
   hostDisplayLabel,
   hostStatusGuidanceKey,
-  recoveryBlockedReasonKey,
-  recoveryStateLabelKey,
+  clientConnectionStateLabelKey,
   statusLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
 
@@ -107,9 +103,7 @@ function HostRowImpl({
   const canReverify = hostCanReverify(host, viewerEmail);
   const canRetireUnreachable = hostCanRetireUnreachable(host, viewerEmail);
   const canOpenTerminal = host.canWebTerminal === true;
-  const recovery = host.recovery;
-  const canControlRecovery =
-    host.canControlRecovery === true && host.status === "allocated" && !!recovery;
+  const clientConnection = host.clientConnection;
   const hostLabel = hostDisplayLabel(host);
   const terminalTitle = host.ip || hostLabel;
   const countryName = host.countryCode
@@ -209,21 +203,6 @@ function HostRowImpl({
     }
   };
 
-  const onRecoveryAction = async (action: "pause" | "resume" | "retry") => {
-    setBusy(true);
-    try {
-      if (action === "pause") await pauseClientMarketHostRecovery(host.id);
-      if (action === "resume") await resumeClientMarketHostRecovery(host.id);
-      if (action === "retry") await retryClientMarketHostRecovery(host.id);
-      toast.success(t(`clientMarket.recovery.${action}Succeeded`));
-      onChanged();
-    } catch (err) {
-      toast.danger(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const confirmCopy = confirmAction === "cleanup"
     ? {
         title: t(isRetryCleanup ? "clientMarket.retryCleanupConfirmTitle" : "clientMarket.cleanupConfirmTitle"),
@@ -246,7 +225,7 @@ function HostRowImpl({
             confirmLabel: t("clientMarket.retireUnreachable"),
           }
       : null;
-  const hasActions = canManageHost || canDelete || canCleanup || canReverify || canRetireUnreachable || canControlRecovery;
+  const hasActions = canManageHost || canDelete || canCleanup || canReverify || canRetireUnreachable;
   const ipPort = host.ip ? `${host.ip}${host.port ? `:${host.port}` : ""}` : "";
   const intel = host.ipIntel;
   const locationLabel = formatHostIpLocation(intel, countryName, locale);
@@ -265,15 +244,20 @@ function HostRowImpl({
   const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
   const statusGuidanceSubtitle = statusGuidanceKey ? t(statusGuidanceKey) : "";
   const statusHint = fineStatusHintKey(host.status) ? t(fineStatusHintKey(host.status)!) : "";
-  const recoveryTitle = recovery
+  const clientConnectionTitle = clientConnection
     ? [
-        t(recoveryStateLabelKey(recovery.state)),
-        recovery.blockedReason ? t(recoveryBlockedReasonKey(recovery.blockedReason)) : "",
-        recovery.nextAttemptAt
-          ? t("clientMarket.recovery.nextAttempt", {
-              time: new Date(recovery.nextAttemptAt).toLocaleString(locale),
+        t(clientConnectionStateLabelKey(clientConnection.state)),
+        clientConnection.since
+          ? t("clientMarket.connection.since", {
+              time: new Date(clientConnection.since).toLocaleString(locale),
             })
           : "",
+        clientConnection.lastHeartbeatAt
+          ? t("clientMarket.connection.lastHeartbeat", {
+              time: new Date(clientConnection.lastHeartbeatAt).toLocaleString(locale),
+            })
+          : "",
+        clientConnection.state === "offline" ? t("clientMarket.connection.manualAction") : "",
       ]
         .filter(Boolean)
         .join(" · ")
@@ -308,17 +292,26 @@ function HostRowImpl({
             <Chip size="sm" variant="soft" className="shrink-0">
               {t(statusLabelKey(host.status))}
             </Chip>
-            {recovery ? (
+            {clientConnection ? (
               <span
                 className={`mt-0.5 block truncate text-[11px] leading-4 ${
-                  recovery.state === "blocked" ? "text-rose-600" : "text-muted-foreground"
+                  clientConnection.state === "offline"
+                    ? "text-amber-700"
+                    : clientConnection.state === "online"
+                      ? "text-emerald-700"
+                      : "text-muted-foreground"
                 }`}
-                title={recoveryTitle || undefined}
+                title={clientConnectionTitle || undefined}
               >
-                {t(recoveryStateLabelKey(recovery.state))}
-                {recovery.attemptLevel > 0
-                  ? ` · ${t("clientMarket.recovery.attempt", { count: recovery.attemptLevel })}`
-                  : ""}
+                {t(clientConnectionStateLabelKey(clientConnection.state))}
+              </span>
+            ) : null}
+            {clientConnection?.state === "offline" ? (
+              <span
+                className="mt-0.5 block truncate text-[11px] leading-4 text-amber-700"
+                title={t("clientMarket.connection.manualAction")}
+              >
+                {t("clientMarket.connection.ownerActionRequired")}
               </span>
             ) : null}
             {statusGuidanceSubtitle ? (
@@ -484,24 +477,6 @@ function HostRowImpl({
                       <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
                         <RefreshCw className="h-4 w-4" />
                         {t("clientMarket.reverifyHost")}
-                      </Dropdown.Item>
-                    ) : null}
-                    {canControlRecovery && recovery.state !== "paused" ? (
-                      <Dropdown.Item id="recovery-pause" onAction={() => void onRecoveryAction("pause")}>
-                        <Pause className="h-4 w-4" />
-                        {t("clientMarket.recovery.pause")}
-                      </Dropdown.Item>
-                    ) : null}
-                    {canControlRecovery && recovery.state === "paused" ? (
-                      <Dropdown.Item id="recovery-resume" onAction={() => void onRecoveryAction("resume")}>
-                        <Play className="h-4 w-4" />
-                        {t("clientMarket.recovery.resume")}
-                      </Dropdown.Item>
-                    ) : null}
-                    {canControlRecovery && (recovery.state === "offline" || recovery.state === "blocked") ? (
-                      <Dropdown.Item id="recovery-retry" onAction={() => void onRecoveryAction("retry")}>
-                        <RefreshCw className="h-4 w-4" />
-                        {t("clientMarket.recovery.retryNow")}
                       </Dropdown.Item>
                     ) : null}
                     {canCleanup ? (

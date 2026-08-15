@@ -876,30 +876,6 @@ export async function reverifyClientMarketHost(id: string) {
   );
 }
 
-export async function pauseClientMarketHostRecovery(id: string) {
-  return parseJson<NonNullable<ClientMarketHost["recovery"]>>(
-    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/recovery/pause`, {
-      method: "POST",
-    }),
-  );
-}
-
-export async function resumeClientMarketHostRecovery(id: string) {
-  return parseJson<NonNullable<ClientMarketHost["recovery"]>>(
-    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/recovery/resume`, {
-      method: "POST",
-    }),
-  );
-}
-
-export async function retryClientMarketHostRecovery(id: string) {
-  return parseJson<NonNullable<ClientMarketHost["recovery"]>>(
-    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/recovery/retry`, {
-      method: "POST",
-    }),
-  );
-}
-
 export async function scanClientMarketHostSshKey(id: string, signal?: AbortSignal) {
   return parseJson<ClientMarketSshHostKeyInspection>(
     await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/ssh-host-key/scan`, {

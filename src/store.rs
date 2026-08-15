@@ -2382,12 +2382,6 @@ impl AppStore {
             "suppressed because the Client was permanently fenced by subdomain takeover",
             Utc::now(),
         )?;
-        quiesce_takeover_client_market_recovery_tx(
-            &tx,
-            &row.target_installation_id,
-            &row.source_installation_id,
-            &now,
-        )?;
         for share_id in &source_share_ids {
             retire_share_tx(&tx, share_id, &row.source_installation_id)?;
         }
@@ -22350,9 +22344,9 @@ fn ensure_takeover_client_market_ready_tx(
         ));
     }
 
-    let target_cleanup_recovery = conn
+    let target_cleanup_retry = conn
         .query_row(
-            "SELECT 1 FROM client_market_cleanup_recovery_state
+            "SELECT 1 FROM client_market_cleanup_retry_state
              WHERE installation_id = ?1 AND stopped_at IS NULL",
             params![target_installation_id],
             |row| row.get::<_, i64>(0),
@@ -22360,12 +22354,12 @@ fn ensure_takeover_client_market_ready_tx(
         .optional()
         .map_err(|error| {
             AppError::Internal(format!(
-                "check target Client Market cleanup recovery failed: {error}"
+                "check target Client Market cleanup retry failed: {error}"
             ))
         })?;
-    if target_cleanup_recovery.is_some() {
+    if target_cleanup_retry.is_some() {
         return Err(AppError::Conflict(
-            "target Client Market cleanup recovery must finish before subdomain takeover".into(),
+            "target Client Market cleanup retry must finish before subdomain takeover".into(),
         ));
     }
 
@@ -22374,7 +22368,6 @@ fn ensure_takeover_client_market_ready_tx(
             "SELECT type FROM provisioning_jobs
              WHERE installation_id IN (?1, ?2)
                AND status IN ('pending', 'running')
-               AND type != 'recover'
              ORDER BY created_at LIMIT 1",
             params![target_installation_id, source_installation_id],
             |row| row.get::<_, String>(0),
@@ -22388,40 +22381,6 @@ fn ensure_takeover_client_market_ready_tx(
             "Client Market {job_type} job must finish before subdomain takeover"
         )));
     }
-    Ok(())
-}
-
-fn quiesce_takeover_client_market_recovery_tx(
-    conn: &Connection,
-    target_installation_id: &str,
-    source_installation_id: &str,
-    now: &str,
-) -> Result<(), AppError> {
-    conn.execute(
-        "UPDATE provisioning_jobs
-         SET status = 'failed', phase = 'complete', failure_code = 'client_subdomain_takeover',
-             log_blob = substr(
-                 COALESCE(log_blob, '') || 'recovery cancelled by Client subdomain takeover\n',
-                 -131072
-             ),
-             updated_at = ?3
-         WHERE installation_id IN (?1, ?2) AND type = 'recover'
-           AND status IN ('pending', 'running')",
-        params![target_installation_id, source_installation_id, now],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!("cancel Client takeover recoveries failed: {error}"))
-    })?;
-    conn.execute(
-        "DELETE FROM client_market_recovery_state
-         WHERE installation_id IN (?1, ?2)",
-        params![target_installation_id, source_installation_id],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!(
-            "clear Client takeover recovery state failed: {error}"
-        ))
-    })?;
     Ok(())
 }
 
@@ -25806,7 +25765,6 @@ mod tests {
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
-            client_market_recovery_enabled: true,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,
@@ -44395,16 +44353,6 @@ mod tests {
                 &now,
             )
             .expect("enqueue source chat event before takeover");
-            conn.execute(
-                "INSERT INTO provisioning_jobs (
-                    id, type, installation_id, status, phase, log_blob, created_at, updated_at
-                 ) VALUES (
-                    'target-active-recovery', 'recover', ?1, 'running',
-                    'recovery_waiting', '', ?2, ?2
-                 )",
-                params![target_id, now],
-            )
-            .expect("insert target recovery job before takeover");
         }
 
         let plan = store
@@ -44575,14 +44523,6 @@ mod tests {
                 "completed".into()
             )
         );
-        let recovery_job_status: String = conn
-            .query_row(
-                "SELECT status FROM provisioning_jobs WHERE id = 'target-active-recovery'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read cancelled target recovery job");
-        assert_eq!(recovery_job_status, "failed");
         client_chat::enqueue_client_system_event_tx(
             &conn,
             source_id,
@@ -45029,12 +44969,12 @@ mod tests {
             )
             .expect("reactivate target subscription");
             conn.execute(
-                "INSERT INTO client_market_cleanup_recovery_state (
+                "INSERT INTO client_market_cleanup_retry_state (
                     host_id, installation_id, attempt_count, next_attempt_at, updated_at
                  ) VALUES (?1, ?2, 0, ?3, ?3)",
                 params![host_id, target_id, now],
             )
-            .expect("insert target cleanup recovery");
+            .expect("insert target cleanup retry");
         }
         let error = store
             .begin_client_subdomain_takeover(
@@ -45044,16 +44984,16 @@ mod tests {
                 Utc::now().timestamp_millis() + 10_000,
             )
             .await
-            .expect_err("target cleanup recovery must block takeover");
-        assert!(error.to_string().contains("cleanup recovery must finish"));
+            .expect_err("target cleanup retry must block takeover");
+        assert!(error.to_string().contains("cleanup retry must finish"));
 
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "DELETE FROM client_market_cleanup_recovery_state WHERE installation_id = ?1",
+                "DELETE FROM client_market_cleanup_retry_state WHERE installation_id = ?1",
                 params![target_id],
             )
-            .expect("clear target cleanup recovery");
+            .expect("clear target cleanup retry");
             conn.execute(
                 "UPDATE router_ssh_hosts SET status = 'unreachable' WHERE id = ?1",
                 params![host_id],
