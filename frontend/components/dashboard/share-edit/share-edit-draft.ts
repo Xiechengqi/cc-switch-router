@@ -46,10 +46,6 @@ export type ShareEditDraft = {
   priceInputs: Record<PriceApp, string>;
   userGrantsSupported: boolean;
   userGrants: ShareUserGrantMap;
-  allowPersonalCredits: boolean;
-  autoConsumeBankedReset: boolean;
-  bankedResetLeadInput: string;
-  previousResponseCacheEnabled: boolean;
   enabledApps: Record<PriceApp, boolean>;
 };
 
@@ -202,10 +198,6 @@ export function buildShareEditDraft(
     priceInputs,
     userGrantsSupported,
     userGrants,
-    allowPersonalCredits: Boolean(share.allowPersonalCredits),
-    autoConsumeBankedReset: Boolean(share.autoConsumeBankedReset),
-    bankedResetLeadInput: String(share.bankedResetExpiryLeadMinutes ?? 60),
-    previousResponseCacheEnabled: Boolean(share.previousResponseCacheEnabled),
     enabledApps: {
       claude: activeShareApps.includes("claude") && (share.support ? share.support.claude !== false : true),
       codex: activeShareApps.includes("codex") && (share.support ? share.support.codex !== false : true),
@@ -307,9 +299,6 @@ export function buildShareEditPatch(
     tokenLimit,
     parallelLimit,
     forSaleOfficialPricePercentByApp: buildShareEditPricingPayload(draft, activeShareApps),
-    allowPersonalCredits: draft.allowPersonalCredits,
-    autoConsumeBankedReset: draft.autoConsumeBankedReset,
-    previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
     support: {
       claude: Boolean(draft.enabledApps.claude),
       codex: Boolean(draft.enabledApps.codex),
@@ -318,10 +307,6 @@ export function buildShareEditPatch(
   };
   if (draft.userGrantsSupported) patch.userGrants = userGrants;
   if (expiresIso) patch.expiresAt = expiresIso;
-  if (draft.autoConsumeBankedReset) {
-    const lead = Number.parseInt(draft.bankedResetLeadInput, 10);
-    if (Number.isFinite(lead)) patch.bankedResetExpiryLeadMinutes = lead;
-  }
   return patch;
 }
 

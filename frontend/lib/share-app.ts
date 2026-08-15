@@ -2,6 +2,8 @@ import type { ShareView } from "@/lib/types";
 
 export type CoreShareApp = "claude" | "codex" | "gemini";
 
+export const CORE_SHARE_APPS: CoreShareApp[] = ["claude", "codex", "gemini"];
+
 export const SHARE_APP_LABELS: Record<CoreShareApp, string> = {
   claude: "Claude",
   codex: "Codex",

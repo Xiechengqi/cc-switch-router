@@ -13,7 +13,7 @@ import {
 } from "@/components/dashboard/share-dashboard-utils";
 import { getShareUserLimitStatus } from "@/lib/api";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { shareAccessApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
+import { CORE_SHARE_APPS, shareAccessApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
   DashboardMarket,
   ShareAppRuntimes,
@@ -64,7 +64,6 @@ export function ShareEditReadView({
   const boundApps = shareAccessApps(share);
   const shareApp = resolveShareCoreApp(share) ?? boundApps[0];
   const tokenMarkets = markets;
-  const showCodexPolicy = boundApps.includes("codex");
 
   const forSale = (share.forSale as "Yes" | "No" | "Free") || "No";
   const marketAccessMode = (share.marketAccessMode as "selected" | "all") || "selected";
@@ -143,53 +142,52 @@ export function ShareEditReadView({
             value={share.description?.trim() ? share.description : "—"}
           />
         </div>
-        {boundApps.length ? (
-          <div className="grid gap-2">
-            {boundApps.map((app) => {
-              const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
-              const hint = providerHint(runtime);
-              const models = runtimeModelSummary(runtime, t("dashboard.shareEdit.passthrough"));
-              return (
-                <div key={app} className="flex min-w-0 items-start gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5">
-                  <ShareAppLogo app={app} size={16} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-x-2">
-                      <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]} API</span>
-                      {runtime?.providerName ? (
-                        <span className="truncate text-xs text-slate-500">{runtime.providerName}</span>
-                      ) : null}
-                      <span className="text-[11px] font-medium text-slate-500">
-                        {share.support && share.support[app] === false
-                          ? t("dashboard.off")
-                          : t("dashboard.on")}
-                      </span>
-                    </div>
+      </ShareEditSection>
+
+      <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
+        <div className="grid gap-2">
+          {CORE_SHARE_APPS.map((app) => {
+            const bound = boundApps.includes(app);
+            const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
+            const hint = providerHint(runtime);
+            const models = runtimeModelSummary(runtime, t("dashboard.shareEdit.passthrough"));
+            const enabled = bound && !(share.support && share.support[app] === false);
+            return (
+              <div
+                key={app}
+                className={`flex min-w-0 items-start gap-3 rounded-xl border px-3 py-2.5 ${
+                  bound ? "border-slate-200 bg-slate-50/70" : "border-dashed border-slate-200 bg-slate-50/40"
+                }`}
+              >
+                <ShareAppLogo app={app} size={16} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-x-2">
+                    <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]} API</span>
+                    {bound && runtime?.providerName ? (
+                      <span className="truncate text-xs text-slate-500">{runtime.providerName}</span>
+                    ) : null}
+                    <span className="text-[11px] font-medium text-slate-500">
+                      {!bound
+                        ? t("dashboard.shareEdit.appApiUnbound")
+                        : enabled
+                          ? t("dashboard.on")
+                          : t("dashboard.off")}
+                    </span>
+                  </div>
+                  {bound ? (
                     <div className="mt-0.5 truncate text-[11px] text-slate-500">
                       {[hint, models].filter(Boolean).join(" · ") || "—"}
                     </div>
-                  </div>
+                  ) : null}
                 </div>
-              );
-            })}
-          </div>
-        ) : null}
+              </div>
+            );
+          })}
+        </div>
       </ShareEditSection>
 
       {shareApp ? (
         <>
-          {forSale === "Yes" ? (
-            <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
-              <ReadOnlyField
-                label={t("dashboard.field.modelPricing")}
-                value={
-                  typeof pricingPercent === "number" && pricingPercent > 0
-                    ? `${pricingPercent}%`
-                    : t("common.unset")
-                }
-              />
-            </ShareEditSection>
-          ) : null}
-
           <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
             <div className="grid gap-3 sm:grid-cols-2">
               <ReadOnlyField label={t("dashboard.field.forSale")} value={forSaleOptionLabel(forSale, t)} />
@@ -200,6 +198,16 @@ export function ShareEditReadView({
                     marketAccessDisplay ?? (
                       <ReadOnlyChipList items={selectedTokenMarketLabels} />
                     )
+                  }
+                />
+              ) : null}
+              {forSale === "Yes" ? (
+                <ReadOnlyField
+                  label={t("dashboard.field.modelPricing")}
+                  value={
+                    typeof pricingPercent === "number" && pricingPercent > 0
+                      ? `${pricingPercent}%`
+                      : t("common.unset")
                   }
                 />
               ) : null}
@@ -234,31 +242,6 @@ export function ShareEditReadView({
               )}
             </div>
           </ShareEditSection>
-
-          {showCodexPolicy ? (
-            <ShareEditSection title={t("dashboard.shareEdit.section.codexPolicy")}>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <ReadOnlyField
-                  label={t("dashboard.shareEdit.personalCredits")}
-                  value={share.allowPersonalCredits ? t("dashboard.on") : t("dashboard.off")}
-                />
-                <ReadOnlyField
-                  label={t("dashboard.shareEdit.previousResponseCache")}
-                  value={share.previousResponseCacheEnabled ? t("dashboard.on") : t("dashboard.off")}
-                />
-                <ReadOnlyField
-                  label={t("dashboard.shareEdit.autoReset")}
-                  value={share.autoConsumeBankedReset ? t("dashboard.on") : t("dashboard.off")}
-                />
-                {share.autoConsumeBankedReset ? (
-                  <ReadOnlyField
-                    label={t("dashboard.shareEdit.resetLeadMinutes")}
-                    value={String(share.bankedResetExpiryLeadMinutes ?? 60)}
-                  />
-                ) : null}
-              </div>
-            </ShareEditSection>
-          ) : null}
         </>
       ) : (
         <EmptyBlock>{t("dashboard.shareEditNoAppType")}</EmptyBlock>

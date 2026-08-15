@@ -1,11 +1,11 @@
 "use client";
 
-import { Input, ListBox, Select, Switch, TextArea } from "@heroui/react";
+import { Checkbox, Input, ListBox, Select, TextArea } from "@heroui/react";
 import * as React from "react";
 import { isOfficialRuntime, marketLabel, runtimeModelSummary, type TFn } from "@/components/dashboard/share-dashboard-utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import type { DashboardMarket, ShareAppRuntimes, ShareUpstreamProvider, ShareView } from "@/lib/types";
-import { SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
+import { CORE_SHARE_APPS, SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import {
   applyRecommendedMarketDefaults,
   type ShareEditDraft,
@@ -26,8 +26,10 @@ function providerTitle(runtime?: ShareUpstreamProvider) {
 export type ShareEditSaleAccessFieldsProps = {
   t: TFn;
   draft: ShareEditDraft;
+  activeShareApps: CoreShareApp[];
   tokenMarkets: DashboardMarket[];
   marketSelectKey: number;
+  pricingInvalid: boolean;
   onForSaleChange: (next: "Yes" | "No" | "Free") => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
   onMarketPicked: (raw: string) => void;
@@ -36,13 +38,16 @@ export type ShareEditSaleAccessFieldsProps = {
 export function ShareEditSaleAccessFields({
   t,
   draft,
+  activeShareApps,
   tokenMarkets,
   marketSelectKey,
+  pricingInvalid,
   onForSaleChange,
   onDraftChange,
   onMarketPicked,
 }: ShareEditSaleAccessFieldsProps) {
-  const { forSale, marketAccessMode, selectedMarketEmails } = draft;
+  const { forSale, marketAccessMode, selectedMarketEmails, priceInputs } = draft;
+  const sharedPriceApp = activeShareApps[0];
 
   const availableMarkets = React.useMemo(() => {
     const blocked = new Set(selectedMarketEmails);
@@ -148,6 +153,40 @@ export function ShareEditSaleAccessFields({
           </button>
         </div>
       ) : null}
+
+      {forSale === "Yes" ? (
+        <div className="grid gap-1.5 text-sm">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="mono-label text-muted-foreground">{t("dashboard.field.modelPricing")}</span>
+            <span className="text-xs text-muted-foreground">{t("dashboard.hint.modelPricing")}</span>
+          </div>
+          <div className="grid max-w-sm gap-1">
+            <span className="mono-label text-muted-foreground">
+              {activeShareApps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}
+            </span>
+            <Input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={sharedPriceApp ? priceInputs[sharedPriceApp] : ""}
+              disabled={!sharedPriceApp}
+              placeholder={sharedPriceApp ? t("common.unset") : t("dashboard.noCurrentNode")}
+              onChange={(event) => {
+                const value = event.target.value;
+                onDraftChange((current) => ({
+                  ...current,
+                  priceInputs: {
+                    ...current.priceInputs,
+                    ...Object.fromEntries(activeShareApps.map((app) => [app, value])),
+                  },
+                }));
+              }}
+            />
+          </div>
+          {pricingInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
+        </div>
+      ) : null}
     </>
   );
 }
@@ -159,7 +198,6 @@ export type ShareEditMarketFieldsProps = {
   draft: ShareEditDraft;
   descriptionLength: number;
   descriptionInvalid: boolean;
-  pricingInvalid: boolean;
   appApiInvalid: boolean;
   onDescriptionChange: (value: string) => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
@@ -172,14 +210,10 @@ export function ShareEditMarketFields({
   draft,
   descriptionLength,
   descriptionInvalid,
-  pricingInvalid,
   appApiInvalid,
   onDescriptionChange,
   onDraftChange,
 }: ShareEditMarketFieldsProps) {
-  const { forSale, priceInputs } = draft;
-  const sharedPriceApp = activeShareApps[0];
-
   return (
     <>
       <ShareEditSection title={t("dashboard.shareEdit.section.overview")}>
@@ -202,94 +236,64 @@ export function ShareEditMarketFields({
       </ShareEditSection>
 
       <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
-        {activeShareApps.length ? (
-          <div className="grid gap-2">
-            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-              <span className="mono-label text-muted-foreground">{t("dashboard.shareEdit.boundApps")}</span>
-              <span className="text-xs text-muted-foreground">{t("dashboard.shareEdit.appApiHint")}</span>
-            </div>
-            <div className="grid gap-2">
-              {activeShareApps.map((app) => {
-                const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
-                const title = providerTitle(runtime);
-                const hint = providerHint(runtime);
-                const models = runtimeModelSummary(runtime, t("dashboard.shareEdit.passthrough"));
-                const enabled = draft.enabledApps[app];
-                const lastEnabled = enabled && !activeShareApps.some((other) => other !== app && draft.enabledApps[other]);
-                return (
-                  <div
-                    key={app}
-                    className="flex min-w-0 items-start gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5"
-                  >
+        <div className="grid gap-2">
+          {CORE_SHARE_APPS.map((app) => {
+            const bound = activeShareApps.includes(app);
+            const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
+            const title = providerTitle(runtime);
+            const hint = providerHint(runtime);
+            const models = runtimeModelSummary(runtime, t("dashboard.shareEdit.passthrough"));
+            const enabled = bound && draft.enabledApps[app];
+            const lastEnabled =
+              enabled && !activeShareApps.some((other) => other !== app && draft.enabledApps[other]);
+            return (
+              <Checkbox
+                key={app}
+                className={`w-full items-start rounded-xl border px-3 py-2.5 ${
+                  bound ? "border-slate-200 bg-slate-50/70" : "border-dashed border-slate-200 bg-slate-50/40"
+                }`}
+                isSelected={enabled}
+                isDisabled={!bound || lastEnabled}
+                aria-label={t("dashboard.shareEdit.appApiToggle", { app: SHARE_APP_LABELS[app] })}
+                onChange={(value: boolean) => {
+                  if (!bound) return;
+                  onDraftChange((current) => {
+                    if (!value && !activeShareApps.some((other) => other !== app && current.enabledApps[other])) {
+                      return current;
+                    }
+                    return {
+                      ...current,
+                      enabledApps: { ...current.enabledApps, [app]: value },
+                    };
+                  });
+                }}
+              >
+                <Checkbox.Control className="mt-0.5">
+                  <Checkbox.Indicator />
+                </Checkbox.Control>
+                <Checkbox.Content className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-start gap-3">
                     <ShareAppLogo app={app} size={16} />
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                         <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]} API</span>
-                        {title ? <span className="truncate text-xs text-slate-500">{title}</span> : null}
+                        {bound && title ? <span className="truncate text-xs text-slate-500">{title}</span> : null}
                       </div>
                       <div className="mt-0.5 truncate text-[11px] text-slate-500">
-                        {[hint, models].filter(Boolean).join(" · ") || t("dashboard.noCurrentNode")}
+                        {bound
+                          ? [hint, models].filter(Boolean).join(" · ") || t("dashboard.noCurrentNode")
+                          : t("dashboard.shareEdit.appApiUnbound")}
                       </div>
                     </div>
-                    <Switch
-                      isSelected={enabled}
-                      isDisabled={lastEnabled}
-                      aria-label={t("dashboard.shareEdit.appApiToggle", { app: SHARE_APP_LABELS[app] })}
-                      onChange={(value: boolean) =>
-                        onDraftChange((current) => {
-                          if (!value && !activeShareApps.some((other) => other !== app && current.enabledApps[other])) {
-                            return current;
-                          }
-                          return {
-                            ...current,
-                            enabledApps: { ...current.enabledApps, [app]: value },
-                          };
-                        })
-                      }
-                    />
                   </div>
-                );
-              })}
-            </div>
-            {appApiInvalid ? (
-              <span className="text-xs text-red-600">{t("dashboard.shareEdit.appApiRequired")}</span>
-            ) : null}
-          </div>
-        ) : null}
-
-        {forSale === "Yes" ? (
-          <div className="grid gap-1.5 text-sm">
-            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-              <span className="mono-label text-muted-foreground">{t("dashboard.field.modelPricing")}</span>
-              <span className="text-xs text-muted-foreground">{t("dashboard.hint.modelPricing")}</span>
-            </div>
-            <div className="grid max-w-sm gap-1">
-              <span className="mono-label text-muted-foreground">
-                {activeShareApps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}
-              </span>
-              <Input
-                type="number"
-                min={1}
-                max={100}
-                step={1}
-                value={sharedPriceApp ? priceInputs[sharedPriceApp] : ""}
-                disabled={!sharedPriceApp}
-                placeholder={sharedPriceApp ? t("common.unset") : t("dashboard.noCurrentNode")}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  onDraftChange((current) => ({
-                    ...current,
-                    priceInputs: {
-                      ...current.priceInputs,
-                      ...Object.fromEntries(activeShareApps.map((app) => [app, value])),
-                    },
-                  }));
-                }}
-              />
-            </div>
-            {pricingInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
-          </div>
-        ) : null}
+                </Checkbox.Content>
+              </Checkbox>
+            );
+          })}
+          {appApiInvalid ? (
+            <span className="text-xs text-red-600">{t("dashboard.shareEdit.appApiRequired")}</span>
+          ) : null}
+        </div>
       </ShareEditSection>
     </>
   );

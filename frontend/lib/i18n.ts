@@ -2424,31 +2424,12 @@ export const messages = {
     "dashboard.openShareDrawer": "Open share details",
     "dashboard.shareEditSettings": "Edit share settings",
     "dashboard.shareEdit.section.overview": "Overview",
-    "dashboard.shareEdit.section.market": "Market & sale",
+    "dashboard.shareEdit.section.market": "App APIs",
     "dashboard.shareEdit.section.access": "Sharing & limits",
-    "dashboard.shareEdit.section.codexPolicy": "Codex remote policy",
-    "dashboard.shareEdit.boundApps": "App APIs",
-    "dashboard.shareEdit.boundAppsHint":
-      "This share is bound to one provider bundle across the apps below. Bindings are configured on the server.",
-    "dashboard.shareEdit.appApiHint":
-      "Turn an app API off without removing its provider binding. At least one API must stay on.",
     "dashboard.shareEdit.appApiToggle": "{app} API",
     "dashboard.shareEdit.appApiRequired": "Keep at least one app API enabled.",
+    "dashboard.shareEdit.appApiUnbound": "Not bound",
     "dashboard.shareEdit.passthrough": "passthrough",
-    "dashboard.shareEdit.codexPolicyHint":
-      "These Codex execution switches stay on the share and apply to every bound app that uses this provider.",
-    "dashboard.shareEdit.personalCredits": "Allow personal credits",
-    "dashboard.shareEdit.personalCreditsHint":
-      "Let this share keep using the bound Codex account after the included quota is exhausted.",
-    "dashboard.shareEdit.previousResponseCache": "Previous-response cache",
-    "dashboard.shareEdit.previousResponseCacheHint":
-      "Reuse prior Codex response context for follow-up turns on this share.",
-    "dashboard.shareEdit.autoReset": "Auto-consume banked reset",
-    "dashboard.shareEdit.autoResetHint":
-      "Automatically spend a banked Codex reset when the current window is about to expire.",
-    "dashboard.shareEdit.resetLeadMinutes": "Reset lead time (minutes)",
-    "dashboard.shareEdit.resetLeadHint": "Between 10 and 10080 minutes. Default is 60.",
-    "dashboard.shareEdit.resetLeadInvalid": "Enter an integer between 10 and 10080.",
     "dashboard.shareEditNoAppType":
       "No app binding is configured for this share.",
     "dashboard.field.description": "Description",
@@ -4925,31 +4906,12 @@ export const messages = {
     "dashboard.openShareDrawer": "打开 share 详情",
     "dashboard.shareEditSettings": "编辑 share 设置",
     "dashboard.shareEdit.section.overview": "概览",
-    "dashboard.shareEdit.section.market": "市场与出售",
+    "dashboard.shareEdit.section.market": "应用接口",
     "dashboard.shareEdit.section.access": "共享与配额",
-    "dashboard.shareEdit.section.codexPolicy": "Codex 远程策略",
-    "dashboard.shareEdit.boundApps": "App API",
-    "dashboard.shareEdit.boundAppsHint":
-      "此 share 由同一个供应商捆绑到下列应用。绑定关系在 Server 上配置。",
-    "dashboard.shareEdit.appApiHint":
-      "关闭某个 App API 不会解除供应商绑定。至少保留一个 API 开启。",
     "dashboard.shareEdit.appApiToggle": "{app} API",
     "dashboard.shareEdit.appApiRequired": "至少保留一个 App API 开启。",
+    "dashboard.shareEdit.appApiUnbound": "未绑定",
     "dashboard.shareEdit.passthrough": "透传",
-    "dashboard.shareEdit.codexPolicyHint":
-      "这些 Codex 执行开关保存在 share 上，并对使用该供应商的全部绑定应用生效。",
-    "dashboard.shareEdit.personalCredits": "允许使用个人额度",
-    "dashboard.shareEdit.personalCreditsHint":
-      "套餐额度用尽后，仍允许此 share 继续使用绑定的 Codex 账号。",
-    "dashboard.shareEdit.previousResponseCache": "上一轮响应缓存",
-    "dashboard.shareEdit.previousResponseCacheHint":
-      "在后续轮次复用此 share 上一次 Codex 响应的上下文。",
-    "dashboard.shareEdit.autoReset": "自动消耗预存重置",
-    "dashboard.shareEdit.autoResetHint":
-      "当前窗口即将到期时，自动消耗一次预存的 Codex 重置。",
-    "dashboard.shareEdit.resetLeadMinutes": "重置提前量（分钟）",
-    "dashboard.shareEdit.resetLeadHint": "范围为 10 到 10080 分钟，默认 60。",
-    "dashboard.shareEdit.resetLeadInvalid": "请输入 10 到 10080 之间的整数。",
     "dashboard.shareEditNoAppType": "此 share 未配置 app 绑定。",
     "dashboard.field.description": "描述",
     "dashboard.field.ownerEmail": "Owner Email",
