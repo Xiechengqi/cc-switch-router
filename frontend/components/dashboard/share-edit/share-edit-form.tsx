@@ -26,7 +26,7 @@ import {
   type PriceApp,
   type ShareEditDraft,
 } from "./share-edit-draft";
-import { ShareEditMarketFields } from "./share-edit-market-fields";
+import { ShareEditMarketFields, ShareEditSaleAccessFields } from "./share-edit-market-fields";
 import { EmailTagsField, FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
@@ -47,6 +47,7 @@ export type ShareEditFormApi = {
   expiryInvalid: boolean;
   pricingInvalid: boolean;
   bankedResetInvalid: boolean;
+  appApiInvalid: boolean;
   formInvalid: boolean;
   isDirty: boolean;
   marketSelectKey: number;
@@ -276,13 +277,15 @@ export function useShareEditForm({
     (!Number.isSafeInteger(bankedResetLead) ||
       bankedResetLead < MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES ||
       bankedResetLead > MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES);
+  const appApiInvalid = !activeShareApps.some((app) => draft.enabledApps[app]);
   const formInvalid =
     descriptionInvalid ||
     tokenInvalid ||
     parallelInvalid ||
     expiryInvalid ||
     pricingInvalid ||
-    bankedResetInvalid;
+    bankedResetInvalid ||
+    appApiInvalid;
 
   const currentPatch = buildShareEditPatch(draft, editShare!, activeShareApps, publicMarketEmails);
   const basePatch = buildShareEditPatch(baseDraft, editShare!, activeShareApps, publicMarketEmails);
@@ -388,6 +391,7 @@ export function useShareEditForm({
     expiryInvalid,
     pricingInvalid,
     bankedResetInvalid,
+    appApiInvalid,
     formInvalid,
     isDirty,
     marketSelectKey,
@@ -444,18 +448,25 @@ export function ShareEditFormBody({
         share={share}
         activeShareApps={activeShareApps}
         draft={draft}
-        tokenMarkets={form.tokenMarkets}
-        marketSelectKey={form.marketSelectKey}
         descriptionLength={form.descriptionLength}
         descriptionInvalid={form.descriptionInvalid}
         pricingInvalid={form.pricingInvalid}
+        appApiInvalid={form.appApiInvalid}
         onDescriptionChange={form.onDescriptionChange}
-        onForSaleChange={form.handleForSaleChange}
         onDraftChange={form.onDraftChange}
-        onMarketPicked={form.onMarketPicked}
       />
 
       <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
+        <ShareEditSaleAccessFields
+          t={t}
+          draft={draft}
+          tokenMarkets={form.tokenMarkets}
+          marketSelectKey={form.marketSelectKey}
+          onForSaleChange={form.handleForSaleChange}
+          onDraftChange={form.onDraftChange}
+          onMarketPicked={form.onMarketPicked}
+        />
+
         {!draft.userGrantsSupported ? (
           <FieldGroup label={t("dashboard.field.sharedWith")} hint={t("dashboard.hint.sharedWith")}>
             <EmailTagsField

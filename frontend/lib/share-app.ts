@@ -34,3 +34,15 @@ export function boundProviderIdForShareApp(share: ShareView | null | undefined, 
   if (!share) return undefined;
   return share.bindings?.[app] || (share.appType === app ? share.providerId : undefined);
 }
+
+export function shareAppApiEnabled(share: ShareView | null | undefined, app: CoreShareApp) {
+  if (!shareAccessApps(share).includes(app)) return false;
+  const support = share?.support;
+  if (!support) return true;
+  if (support.claude == null && support.codex == null && support.gemini == null) return true;
+  return Boolean(support[app]);
+}
+
+export function shareEnabledApps(share: ShareView | null | undefined): CoreShareApp[] {
+  return shareAccessApps(share).filter((app) => shareAppApiEnabled(share, app));
+}

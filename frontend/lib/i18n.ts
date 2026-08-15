@@ -2427,9 +2427,13 @@ export const messages = {
     "dashboard.shareEdit.section.market": "Market & sale",
     "dashboard.shareEdit.section.access": "Sharing & limits",
     "dashboard.shareEdit.section.codexPolicy": "Codex remote policy",
-    "dashboard.shareEdit.boundApps": "Bound apps",
+    "dashboard.shareEdit.boundApps": "App APIs",
     "dashboard.shareEdit.boundAppsHint":
       "This share is bound to one provider bundle across the apps below. Bindings are configured on the server.",
+    "dashboard.shareEdit.appApiHint":
+      "Turn an app API off without removing its provider binding. At least one API must stay on.",
+    "dashboard.shareEdit.appApiToggle": "{app} API",
+    "dashboard.shareEdit.appApiRequired": "Keep at least one app API enabled.",
     "dashboard.shareEdit.passthrough": "passthrough",
     "dashboard.shareEdit.codexPolicyHint":
       "These Codex execution switches stay on the share and apply to every bound app that uses this provider.",
@@ -2499,7 +2503,6 @@ export const messages = {
     "dashboard.userLimit.loading": "Loading user limits…",
     "dashboard.field.maintenanceMessage": "Maintenance message",
     "dashboard.hint.maxChars": "Maximum 200 characters.",
-    "dashboard.hint.forSaleOnly": "Only applies when ForSale = Yes",
     "dashboard.hint.selectedMarkets":
       "Click x to remove; empty = no market is authorized",
     "dashboard.hint.sharedWith":
@@ -4925,9 +4928,13 @@ export const messages = {
     "dashboard.shareEdit.section.market": "市场与出售",
     "dashboard.shareEdit.section.access": "共享与配额",
     "dashboard.shareEdit.section.codexPolicy": "Codex 远程策略",
-    "dashboard.shareEdit.boundApps": "绑定应用",
+    "dashboard.shareEdit.boundApps": "App API",
     "dashboard.shareEdit.boundAppsHint":
       "此 share 由同一个供应商捆绑到下列应用。绑定关系在 Server 上配置。",
+    "dashboard.shareEdit.appApiHint":
+      "关闭某个 App API 不会解除供应商绑定。至少保留一个 API 开启。",
+    "dashboard.shareEdit.appApiToggle": "{app} API",
+    "dashboard.shareEdit.appApiRequired": "至少保留一个 App API 开启。",
     "dashboard.shareEdit.passthrough": "透传",
     "dashboard.shareEdit.codexPolicyHint":
       "这些 Codex 执行开关保存在 share 上，并对使用该供应商的全部绑定应用生效。",
@@ -4996,7 +5003,6 @@ export const messages = {
     "dashboard.userLimit.loading": "正在加载用户限制…",
     "dashboard.field.maintenanceMessage": "维护提示",
     "dashboard.hint.maxChars": "最多 200 字。",
-    "dashboard.hint.forSaleOnly": "仅 ForSale = Yes 时生效",
     "dashboard.hint.selectedMarkets": "点 x 移除；空 = 不授权任何 market",
     "dashboard.hint.sharedWith":
       "多个邮箱用换行/逗号分隔。这些邮箱登录 dashboard 后可查看此 share。",

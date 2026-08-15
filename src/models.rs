@@ -937,6 +937,8 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_cache_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support: Option<ShareSupport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
@@ -2016,7 +2018,7 @@ pub struct ResendUsageResponse {
     pub quota_header: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareSupport {
     pub claude: bool,

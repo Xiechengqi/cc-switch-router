@@ -154,10 +154,15 @@ export function ShareEditReadView({
                   <ShareAppLogo app={app} size={16} />
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-x-2">
-                      <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]}</span>
+                      <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]} API</span>
                       {runtime?.providerName ? (
                         <span className="truncate text-xs text-slate-500">{runtime.providerName}</span>
                       ) : null}
+                      <span className="text-[11px] font-medium text-slate-500">
+                        {share.support && share.support[app] === false
+                          ? t("dashboard.off")
+                          : t("dashboard.on")}
+                      </span>
                     </div>
                     <div className="mt-0.5 truncate text-[11px] text-slate-500">
                       {[hint, models].filter(Boolean).join(" · ") || "—"}
@@ -172,23 +177,8 @@ export function ShareEditReadView({
 
       {shareApp ? (
         <>
-          <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
-            <div className="grid gap-3">
-              <ReadOnlyField label={t("dashboard.field.forSale")} value={forSaleOptionLabel(forSale, t)} />
-            </div>
-
-            {forSale === "Yes" ? (
-              <ReadOnlyField
-                label={t("dashboard.field.marketAccess")}
-                value={
-                  marketAccessDisplay ?? (
-                    <ReadOnlyChipList items={selectedTokenMarketLabels} />
-                  )
-                }
-              />
-            ) : null}
-
-            {forSale === "Yes" ? (
+          {forSale === "Yes" ? (
+            <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
               <ReadOnlyField
                 label={t("dashboard.field.modelPricing")}
                 value={
@@ -197,10 +187,23 @@ export function ShareEditReadView({
                     : t("common.unset")
                 }
               />
-            ) : null}
-          </ShareEditSection>
+            </ShareEditSection>
+          ) : null}
 
           <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <ReadOnlyField label={t("dashboard.field.forSale")} value={forSaleOptionLabel(forSale, t)} />
+              {forSale === "Yes" ? (
+                <ReadOnlyField
+                  label={t("dashboard.field.marketAccess")}
+                  value={
+                    marketAccessDisplay ?? (
+                      <ReadOnlyChipList items={selectedTokenMarketLabels} />
+                    )
+                  }
+                />
+              ) : null}
+            </div>
             <div className="grid gap-3 sm:grid-cols-3">
               <ReadOnlyField
                 label={t("dashboard.field.tokenLimit")}

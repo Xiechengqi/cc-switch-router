@@ -50,6 +50,7 @@ export type ShareEditDraft = {
   autoConsumeBankedReset: boolean;
   bankedResetLeadInput: string;
   previousResponseCacheEnabled: boolean;
+  enabledApps: Record<PriceApp, boolean>;
 };
 
 export function splitEmails(value: string) {
@@ -205,6 +206,11 @@ export function buildShareEditDraft(
     autoConsumeBankedReset: Boolean(share.autoConsumeBankedReset),
     bankedResetLeadInput: String(share.bankedResetExpiryLeadMinutes ?? 60),
     previousResponseCacheEnabled: Boolean(share.previousResponseCacheEnabled),
+    enabledApps: {
+      claude: activeShareApps.includes("claude") && (share.support ? share.support.claude !== false : true),
+      codex: activeShareApps.includes("codex") && (share.support ? share.support.codex !== false : true),
+      gemini: activeShareApps.includes("gemini") && (share.support ? share.support.gemini !== false : true),
+    },
   };
 
   return draft;
@@ -304,6 +310,11 @@ export function buildShareEditPatch(
     allowPersonalCredits: draft.allowPersonalCredits,
     autoConsumeBankedReset: draft.autoConsumeBankedReset,
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
+    support: {
+      claude: Boolean(draft.enabledApps.claude),
+      codex: Boolean(draft.enabledApps.codex),
+      gemini: Boolean(draft.enabledApps.gemini),
+    },
   };
   if (draft.userGrantsSupported) patch.userGrants = userGrants;
   if (expiresIso) patch.expiresAt = expiresIso;

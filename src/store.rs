@@ -6977,9 +6977,13 @@ impl AppStore {
             access_by_app_json,
             app_settings_json,
             for_sale,
-        )): Option<(Option<String>, String, String, String, String)> = conn
+            enabled_claude,
+            enabled_codex,
+            enabled_gemini,
+        )): Option<(Option<String>, String, String, String, String, i64, i64, i64)> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'), for_sale
+                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'), for_sale,
+                        COALESCE(enabled_claude, 0), COALESCE(enabled_codex, 0), COALESCE(enabled_gemini, 0)
                  FROM shares
                  WHERE share_id = ?1
                    AND EXISTS (
@@ -6987,13 +6991,33 @@ impl AppStore {
                        WHERE share_id = ?1 AND app_type = ?2
                    )",
                 params![share_id, app_type],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share invoke acl failed: {e}")))?
         else {
             return Ok(false);
         };
+        let app_enabled = match app_type.as_str() {
+            "claude" => enabled_claude != 0,
+            "codex" => enabled_codex != 0,
+            "gemini" => enabled_gemini != 0,
+            _ => false,
+        };
+        if !app_enabled {
+            return Ok(false);
+        }
         if for_sale == "Free" {
             return Ok(true);
         }
@@ -12804,9 +12828,20 @@ fn validate_share_descriptor_bindings(share: &ShareDescriptor) -> Result<(), App
                 "share binding providerId must be non-empty and trimmed".into(),
             ));
         }
-        if !share_supports_app(&share.support, app) {
+    }
+    let enabled_apps = ["claude", "codex", "gemini"]
+        .into_iter()
+        .filter(|app| share_supports_app(&share.support, app))
+        .collect::<Vec<_>>();
+    if enabled_apps.is_empty() {
+        return Err(AppError::BadRequest(
+            "at least one bound app API must stay enabled".into(),
+        ));
+    }
+    for app in &enabled_apps {
+        if !share.bindings.contains_key(*app) {
             return Err(AppError::BadRequest(format!(
-                "share support must include bound app {app}"
+                "share support includes unbound app {app}"
             )));
         }
     }
@@ -17501,6 +17536,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.auto_consume_banked_reset.is_none()
         && patch.banked_reset_expiry_lead_minutes.is_none()
         && patch.previous_response_cache_enabled.is_none()
+        && patch.support.is_none()
         && patch.user_grants.is_none()
         && patch.managed_grant.is_none()
 }
@@ -17665,6 +17701,11 @@ fn validate_returned_share_against_patch(
     if let Some(previous_response_cache_enabled) = patch.previous_response_cache_enabled {
         if previous_response_cache_enabled != share.previous_response_cache_enabled {
             return Err("previousResponseCacheEnabled");
+        }
+    }
+    if let Some(support) = patch.support.as_ref() {
+        if support != &share.support {
+            return Err("support");
         }
     }
     if let Some(user_grants) = patch.user_grants.as_ref() {
@@ -18016,6 +18057,10 @@ fn normalize_share_settings_patch(
             )));
         }
     }
+    let support = match patch.support {
+        Some(value) => Some(normalize_share_support(value, current_bindings)?),
+        None => None,
+    };
     Ok(ShareSettingsPatch {
         owner_email: next_owner_email,
         description: match patch.description {
@@ -18039,9 +18084,38 @@ fn normalize_share_settings_patch(
         auto_consume_banked_reset: patch.auto_consume_banked_reset,
         banked_reset_expiry_lead_minutes: patch.banked_reset_expiry_lead_minutes,
         previous_response_cache_enabled: patch.previous_response_cache_enabled,
+        support,
         user_grants,
         managed_grant: None,
     })
+}
+
+fn normalize_share_support(
+    support: ShareSupport,
+    current_bindings: Option<&BTreeMap<String, String>>,
+) -> Result<ShareSupport, AppError> {
+    let Some(bindings) = current_bindings else {
+        return Err(AppError::BadRequest(
+            "share app API support requires existing bindings".into(),
+        ));
+    };
+    for (app, enabled) in [
+        ("claude", support.claude),
+        ("codex", support.codex),
+        ("gemini", support.gemini),
+    ] {
+        if enabled && !bindings.contains_key(app) {
+            return Err(AppError::BadRequest(format!(
+                "share support includes unbound app {app}"
+            )));
+        }
+    }
+    if !support.claude && !support.codex && !support.gemini {
+        return Err(AppError::BadRequest(
+            "at least one bound app API must stay enabled".into(),
+        ));
+    }
+    Ok(support)
 }
 
 fn normalize_share_description(description: Option<String>) -> Result<Option<String>, AppError> {
@@ -25816,6 +25890,55 @@ mod tests {
         )
         .expect("normalize cleared description");
         assert_eq!(normalized.description, Some(None));
+    }
+
+    #[test]
+    fn share_support_can_disable_a_bound_app_but_not_all() {
+        let bindings = BTreeMap::from([
+            ("claude".to_string(), "provider-claude".to_string()),
+            ("codex".to_string(), "provider-codex".to_string()),
+        ]);
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                support: Some(ShareSupport {
+                    claude: true,
+                    codex: false,
+                    gemini: false,
+                }),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("No"),
+            Some(&bindings),
+            None,
+        )
+        .expect("disable one bound app");
+        assert_eq!(
+            normalized.support,
+            Some(ShareSupport {
+                claude: true,
+                codex: false,
+                gemini: false,
+            })
+        );
+
+        let rejected = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                support: Some(ShareSupport {
+                    claude: false,
+                    codex: false,
+                    gemini: false,
+                }),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("No"),
+            Some(&bindings),
+            None,
+        );
+        assert!(matches!(rejected, Err(AppError::BadRequest(_))));
     }
 
     fn test_config(name: &str) -> Config {

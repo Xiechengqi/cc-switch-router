@@ -432,6 +432,7 @@ export type ShareSettingsPatch = {
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;
   previousResponseCacheEnabled?: boolean;
+  support?: ShareSupport;
   userGrants?: ShareUserGrantMap;
   managedGrant?: {
     operationId: string;
