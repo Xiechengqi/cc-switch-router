@@ -195,7 +195,13 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 认证滥用 | 10 分钟 10 次失败 → 封禁 1 小时 | 内存(`abuse.rs:6-8`) |
 | 请求体体积 | 三档上限:普通 2 MB / 视频 32 MB / 图片 48 MB(可配置) | 内存缓冲上限(`proxy.rs` `proxy_request_body_limit()`) |
 
-请求体体积不是速率限制,而是**内存缓冲天花板**:请求体经 `axum::body::to_bytes` 一次性读入内存,峰值内存 ≈ 单档上限 × 并发请求数。三档由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置(MB 为单位,改后需重启)。读取发生在 `try_acquire_share_permit` 之前,因此超限请求返回 413 且不消耗 Share 并发额度。Client 侧 `router_ingress_body_limit()` 有一份镜像上限,仅放宽 Router 一侧不会提高实际天花板。
+请求体体积不是速率限制,而是**内存缓冲天花板**:请求体经 `axum::body::to_bytes` 一次性读入内存,峰值内存 ≈ 单档上限 × 并发请求数。三档由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置(MB 为单位,改后需重启)。读取发生在 `try_acquire_share_permit` 之前,因此超限请求返回 413 且不消耗 Share 并发额度。
+
+Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的 `x-cc-switch-ingress-body-limit`(十进制字节,值 = 该请求命中的档位),Client 取 `min(本地上限, 声明值)` 作为本次 ingress 的生效上限。因此:
+
+- 该头不必签名——伪造只能把上限压低(伪造者自伤),抬不高 Client 的本地配置;`is_internal_share_context_header()` 还会剥离来自公网的同名头。
+- 两端可独立升级:旧 Client 忽略该头、沿用自身硬编码值;旧 Router 不发该头,新 Client 回退到历史默认值(普通 2 MiB / 视频 32 MiB / 图片 48 MiB)。
+- 新版 Client 的本地上限默认取 Router 允许的最大档位(64/256/256 MB),所以默认由 Router settings 决定实际天花板;卖家可在 `server.json` 的 `requestBodyLimits` 或 `CC_SWITCH_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 中主动收紧。
 
 并发限流键位:`share_id`、`share_id:app`、`share_id:app:email`、用户 IP(免费档)、图片任务、市场邮箱。
 

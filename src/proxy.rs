@@ -2323,6 +2323,8 @@ pub async fn market_proxy_handler(
                 );
             }
         };
+        let ingress_body_limit =
+            proxy_request_body_limit(&signed_path_and_query, &state.config.proxy_stream);
         let signed = match crate::ingress_context::sign(
             crate::ingress_context::IngressContext {
                 protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
@@ -2367,6 +2369,10 @@ pub async fn market_proxy_handler(
             .header(
                 crate::ingress_context::INGRESS_SIGNATURE_HEADER,
                 signed.signature,
+            )
+            .header(
+                crate::ingress_context::INGRESS_BODY_LIMIT_HEADER,
+                ingress_body_limit.to_string(),
             );
     }
     builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
@@ -3625,6 +3631,8 @@ pub async fn proxy_handler(
                 );
             }
         };
+        let ingress_body_limit =
+            proxy_request_body_limit(&signed_path_and_query, &state.config.proxy_stream);
         let signed = match crate::ingress_context::sign(
             crate::ingress_context::IngressContext {
                 protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
@@ -3678,6 +3686,10 @@ pub async fn proxy_handler(
             .header(
                 crate::ingress_context::INGRESS_SIGNATURE_HEADER,
                 signed.signature,
+            )
+            .header(
+                crate::ingress_context::INGRESS_BODY_LIMIT_HEADER,
+                ingress_body_limit.to_string(),
             );
     }
     // Bind a completion guard to the recorded request id. While this binding
@@ -5852,6 +5864,7 @@ async fn with_signed_ingress_context(
             "ingress-context-signing-failed",
         )
     })?;
+    let ingress_body_limit = proxy_request_body_limit(&path_and_query, &state.config.proxy_stream);
     let signed = crate::ingress_context::sign(
         crate::ingress_context::IngressContext {
             signature_version: crate::ingress_context::SIGNATURE_VERSION,
@@ -5892,6 +5905,10 @@ async fn with_signed_ingress_context(
         .header(
             crate::ingress_context::INGRESS_SIGNATURE_HEADER,
             signed.signature,
+        )
+        .header(
+            crate::ingress_context::INGRESS_BODY_LIMIT_HEADER,
+            ingress_body_limit.to_string(),
         ))
 }
 
@@ -5935,6 +5952,7 @@ fn is_internal_share_context_header(name: &str) -> bool {
                 | "x-share-router-probe"
                 | crate::ingress_context::INGRESS_CONTEXT_HEADER
                 | crate::ingress_context::INGRESS_SIGNATURE_HEADER
+                | crate::ingress_context::INGRESS_BODY_LIMIT_HEADER
         )
 }
 
@@ -8319,6 +8337,9 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
             "x-user-country-iso3",
             "x-share-router-health-check",
             "x-share-router-probe",
+            crate::ingress_context::INGRESS_CONTEXT_HEADER,
+            crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+            crate::ingress_context::INGRESS_BODY_LIMIT_HEADER,
         ] {
             assert!(is_internal_share_context_header(name), "{name}");
         }

@@ -8,6 +8,16 @@ use crate::namespace::PROTOCOL_EPOCH;
 
 pub const INGRESS_CONTEXT_HEADER: &str = "x-cc-switch-ingress-context";
 pub const INGRESS_SIGNATURE_HEADER: &str = "x-cc-switch-ingress-signature";
+/// Router 为本次请求实际应用的请求体上限（字节，十进制）。
+///
+/// 该头**不参与签名**：它只承载 Router 侧的天花板声明，Client 永远取
+/// `min(本地上限, 声明值)`。因此伪造只能把上限压低（伪造者自伤），无法抬高
+/// Client 的本地配置。同时 `is_internal_share_context_header()` 会剥离来自
+/// 公网的同名头，客户端看到的值只可能由 Router 写入。
+///
+/// 旧版 Client 不认识该头，会沿用自身硬编码上限；旧版 Router 不发送该头，
+/// 新版 Client 会回退到历史默认值。两个方向都可独立升级。
+pub const INGRESS_BODY_LIMIT_HEADER: &str = "x-cc-switch-ingress-body-limit";
 pub const INTERNAL_INGRESS_ERROR_HEADER: &str = "x-cc-switch-internal-ingress-error";
 pub const INTERNAL_INGRESS_AGE_MS_HEADER: &str = "x-cc-switch-internal-ingress-age-ms";
 pub const INTERNAL_INGRESS_SERVER_TIME_MS_HEADER: &str =
@@ -139,6 +149,15 @@ pub fn normalize_path_and_query(path_and_query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingress_body_limit_header_is_a_distinct_valid_header_name() {
+        // `HeaderName::from_static` 要求全小写；Client 侧也按同名常量解析。
+        let name = axum::http::HeaderName::from_static(INGRESS_BODY_LIMIT_HEADER);
+        assert_eq!(name.as_str(), INGRESS_BODY_LIMIT_HEADER);
+        assert_ne!(INGRESS_BODY_LIMIT_HEADER, INGRESS_CONTEXT_HEADER);
+        assert_ne!(INGRESS_BODY_LIMIT_HEADER, INGRESS_SIGNATURE_HEADER);
+    }
 
     fn context() -> IngressContext {
         IngressContext {

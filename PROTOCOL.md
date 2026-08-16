@@ -381,6 +381,19 @@ Router 对所有上游响应无条件剥离 `x-cc-switch-internal-*`。带 typed
 
 滚动发布必须先部署剥离/识别这些内部头的 Router,再部署发送诊断头的 Server；回滚先 Server 后 Router。
 
+### 9.0 请求体上限声明:`x-cc-switch-ingress-body-limit`
+
+与签名上下文同批注入,但**不参与签名**:值是十进制字节数,等于 Router 为本次请求命中的档位上限(普通 / 视频 / 图片,见 `src/proxy.rs` `proxy_request_body_limit()`)。
+
+Server 侧契约:生效上限取 `min(本地上限, 声明值)`。因此该头无需签名——伪造只能把上限压低(伪造者自伤),抬不高 Server 的本地配置;Router 还会通过 `is_internal_share_context_header()` 剥离来自公网的同名头,Server 看到的值只可能由 Router 写入。
+
+两端可独立升级,任意顺序:
+
+- 旧 Server 不认识该头 → 沿用自身硬编码上限,行为不变。
+- 旧 Router 不发送该头 → 新 Server 回退到历史默认值(普通 2 MiB / 视频 32 MiB / 图片 48 MiB)。
+
+Server 的本地上限默认取 Router 允许的最大档位,使 Router settings 成为默认的唯一天花板;Server owner 可用 `requestBodyLimits` / `CC_SWITCH_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 主动收紧。
+
 ### 9.1 推理身份与本地并发错误
 
 - Direct Share 使用 Router API Token 解析出的规范化邮箱作为 `IngressContext.userEmail`。
