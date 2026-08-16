@@ -18,7 +18,7 @@ import {
   validateShareSettingsDraft,
   type ShareSettingsDraft,
 } from "@/lib/share-settings";
-import { resolveShareCoreApp, shareAccessApps, SHARE_APP_LABELS } from "@/lib/share-app";
+import { resolveShareCoreApp, shareAccessApps, shareEnabledApps, SHARE_APP_LABELS } from "@/lib/share-app";
 import { compactTokens, formatDateTime } from "@/lib/utils";
 import { CompactSelect } from "@/components/common/compact-select";
 
@@ -175,7 +175,7 @@ function ShareSettingsForm({
   const [notice, setNotice] = React.useState("");
   const [error, setError] = React.useState("");
   const shareApp = resolveShareCoreApp(share);
-  const accessibleApps = shareAccessApps(share);
+  const accessibleApps = shareEnabledApps(share);
   const tokenMarkets = markets;
   const publicMarketEmails = React.useMemo(
     () => new Set(markets.map((market) => market.email.toLowerCase()).filter(Boolean)),

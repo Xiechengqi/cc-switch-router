@@ -9,7 +9,7 @@ import { getUserApiToken } from "@/lib/api";
 import { ShareConnectionTestRow } from "@/components/dashboard/share-connection-test";
 import {
   boundProviderIdForShareApp,
-  shareAccessApps,
+  shareEnabledApps,
   SHARE_APP_LABELS,
 } from "@/lib/share-app";
 import type { ShareView, UserApiTokenStatus } from "@/lib/types";
@@ -138,7 +138,7 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
     return `mailto:${ownerEmail}?subject=${subject}`;
   }, [ownerEmail, share?.subdomain, share?.shareId]);
 
-  const shareApps = shareAccessApps(share);
+  const shareApps = shareEnabledApps(share);
   const shareAppLabel = shareApps.map((app) => SHARE_APP_LABELS[app]).join(" / ");
 
   if (!share) return null;

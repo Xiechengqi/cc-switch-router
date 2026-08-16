@@ -8931,6 +8931,7 @@ impl AppStore {
             current_config_revision,
             user_grants_json,
             supported_user_token_periods_json,
+            app_providers_json,
         ): (
             String,
             String,
@@ -8940,11 +8941,12 @@ impl AppStore {
             i64,
             String,
             String,
+            String,
         ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, COALESCE(bindings_json, '{}'), config_revision, COALESCE(user_grants_json, '{}'), COALESCE(supported_user_token_periods_json, '[]') FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, COALESCE(bindings_json, '{}'), config_revision, COALESCE(user_grants_json, '{}'), COALESCE(supported_user_token_periods_json, '[]'), COALESCE(app_providers_json, '{}') FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, parse_share_bindings(row.get(4)?)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, parse_share_bindings(row.get(4)?)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
@@ -8959,6 +8961,9 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
         let existing_user_grants = parse_share_user_grants(Some(user_grants_json))
             .map_err(|e| AppError::Internal(format!("parse share user grants failed: {e}")))?;
+        let current_app_providers = parse_app_providers(Some(app_providers_json))
+            .map_err(|e| AppError::Internal(format!("parse share app providers failed: {e}")))?;
+        let supported_apps = supported_apps_from_providers(&current_app_providers);
         let patch = normalize_share_settings_patch(
             patch,
             Some(&owner_email),
@@ -8966,6 +8971,7 @@ impl AppStore {
             Some(&current_for_sale),
             Some(&current_bindings),
             Some(&existing_user_grants),
+            Some(supported_apps.as_slice()),
         )?;
         let supported_user_token_periods =
             parse_supported_user_token_periods(&supported_user_token_periods_json);
@@ -17864,6 +17870,7 @@ fn normalize_share_settings_patch(
     current_for_sale: Option<&str>,
     current_bindings: Option<&BTreeMap<String, String>>,
     existing_user_grants: Option<&BTreeMap<String, ShareUserGrant>>,
+    supported_apps: Option<&[String]>,
 ) -> Result<ShareSettingsPatch, AppError> {
     if patch.managed_grant.is_some() {
         return Err(AppError::Forbidden(
@@ -18058,7 +18065,11 @@ fn normalize_share_settings_patch(
         }
     }
     let support = match patch.support {
-        Some(value) => Some(normalize_share_support(value, current_bindings)?),
+        Some(value) => Some(normalize_share_support(
+            value,
+            current_bindings,
+            supported_apps,
+        )?),
         None => None,
     };
     Ok(ShareSettingsPatch {
@@ -18090,21 +18101,52 @@ fn normalize_share_settings_patch(
     })
 }
 
+fn supported_apps_from_providers(providers: &ShareAppProviders) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut apps = Vec::new();
+    for provider in providers
+        .claude
+        .iter()
+        .chain(providers.codex.iter())
+        .chain(providers.gemini.iter())
+    {
+        for app in &provider.supported_apps {
+            let app = app.trim().to_ascii_lowercase();
+            if matches!(app.as_str(), "claude" | "codex" | "gemini") && seen.insert(app.clone()) {
+                apps.push(app);
+            }
+        }
+    }
+    apps
+}
+
 fn normalize_share_support(
     support: ShareSupport,
     current_bindings: Option<&BTreeMap<String, String>>,
+    supported_apps: Option<&[String]>,
 ) -> Result<ShareSupport, AppError> {
     let Some(bindings) = current_bindings else {
         return Err(AppError::BadRequest(
             "share app API support requires existing bindings".into(),
         ));
     };
+    let supported = supported_apps
+        .unwrap_or(&[])
+        .iter()
+        .map(|app| app.trim().to_ascii_lowercase())
+        .filter(|app| matches!(app.as_str(), "claude" | "codex" | "gemini"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let allowed = if supported.is_empty() {
+        bindings.keys().cloned().collect()
+    } else {
+        supported
+    };
     for (app, enabled) in [
         ("claude", support.claude),
         ("codex", support.codex),
         ("gemini", support.gemini),
     ] {
-        if enabled && !bindings.contains_key(app) {
+        if enabled && !allowed.contains(app) {
             return Err(AppError::BadRequest(format!(
                 "share support includes unbound app {app}"
             )));
@@ -25754,6 +25796,7 @@ mod tests {
             Some("Yes"),
             Some(&bindings),
             None,
+            None,
         )
         .expect("eligible pricing");
         assert_eq!(
@@ -25779,6 +25822,7 @@ mod tests {
             Some(&[]),
             Some("Yes"),
             Some(&bindings),
+            None,
             None,
         )
         .expect("equal multi-app pricing");
@@ -25809,6 +25853,7 @@ mod tests {
             Some("Yes"),
             Some(&bindings),
             None,
+            None,
         );
 
         assert!(matches!(rejected, Err(AppError::BadRequest(_))));
@@ -25834,6 +25879,7 @@ mod tests {
             Some("Yes"),
             Some(&bindings),
             None,
+            None,
         );
 
         assert!(matches!(rejected, Err(AppError::BadRequest(_))));
@@ -25855,6 +25901,7 @@ mod tests {
             Some("Yes"),
             Some(&bindings),
             None,
+            None,
         );
         assert!(matches!(rejected, Err(AppError::BadRequest(_))));
 
@@ -25871,6 +25918,7 @@ mod tests {
             Some("Yes"),
             Some(&bindings),
             None,
+            None,
         );
         assert!(matches!(unbound_app, Err(AppError::BadRequest(_))));
     }
@@ -25886,6 +25934,7 @@ mod tests {
             Some(&[]),
             Some("No"),
             Some(&bindings),
+            None,
             None,
         )
         .expect("normalize cleared description");
@@ -25912,6 +25961,7 @@ mod tests {
             Some("No"),
             Some(&bindings),
             None,
+            None,
         )
         .expect("disable one bound app");
         assert_eq!(
@@ -25937,8 +25987,38 @@ mod tests {
             Some("No"),
             Some(&bindings),
             None,
+            None,
         );
         assert!(matches!(rejected, Err(AppError::BadRequest(_))));
+
+        let rebound = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                support: Some(ShareSupport {
+                    claude: true,
+                    codex: true,
+                    gemini: false,
+                }),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("No"),
+            Some(&BTreeMap::from([(
+                "claude".to_string(),
+                "provider-claude".to_string(),
+            )])),
+            None,
+            Some(&["claude".to_string(), "codex".to_string()]),
+        )
+        .expect("re-enable a family-supported unbound app");
+        assert_eq!(
+            rebound.support,
+            Some(ShareSupport {
+                claude: true,
+                codex: true,
+                gemini: false,
+            })
+        );
     }
 
     fn test_config(name: &str) -> Config {
@@ -27013,7 +27093,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -27076,6 +27157,7 @@ mod tests {
                 "provider-codex".to_string(),
             )])),
             None,
+            None,
         )
         .expect("normalize user grants");
         let grants = normalized.user_grants.expect("normalized grants");
@@ -27120,6 +27202,7 @@ mod tests {
                 "provider-codex".to_string(),
             )])),
             Some(&existing),
+            None,
         )
         .expect("normalize user grants with existing");
         let grants = normalized.user_grants.expect("normalized grants");
@@ -27164,6 +27247,7 @@ mod tests {
                 "provider-codex".to_string(),
             )])),
             Some(&existing),
+            None,
         )
         .expect_err("ordinary edit must not reactivate revoked market grant");
 
@@ -36591,7 +36675,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -36682,7 +36767,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -37478,7 +37564,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -37575,7 +37662,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -37672,7 +37760,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -37806,7 +37895,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -38083,7 +38173,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,
@@ -38202,7 +38293,8 @@ mod tests {
             auto_start: false,
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
-            banked_reset_expiry_lead_minutes: crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            banked_reset_expiry_lead_minutes:
+                crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
             config_revision: 0,
             descriptor_generation: 0,

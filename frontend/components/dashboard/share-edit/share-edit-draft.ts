@@ -1,4 +1,4 @@
-import { shareAccessApps, SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
+import { shareProviderSupportedApps, SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import type {
   DashboardMarket,
   ShareAccessByApp,
@@ -73,7 +73,7 @@ export function fromLocalDateTimeValue(value: string) {
 export function effectiveShareAccessByApp(share: ShareView): ShareAccessByApp {
   if (share.accessByApp && Object.keys(share.accessByApp).length > 0) return share.accessByApp;
   const result: ShareAccessByApp = {};
-  for (const app of shareAccessApps(share)) {
+  for (const app of shareProviderSupportedApps(share)) {
     result[app] = {
       sharedWithEmails: share.sharedWithEmails ?? [],
       marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
@@ -114,7 +114,7 @@ export function buildShareEditDraft(
   share: ShareView,
   publicMarketEmails: ReadonlySet<string>,
 ): ShareEditDraft {
-  const activeShareApps = shareAccessApps(share);
+  const activeShareApps = shareProviderSupportedApps(share);
   const pendingPricing =
     share.activeEdit?.status === "rejected"
       ? share.activeEdit.patch.forSaleOfficialPricePercentByApp || {}

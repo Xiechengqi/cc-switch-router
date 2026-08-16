@@ -13,7 +13,7 @@ import {
 } from "@/components/dashboard/share-dashboard-utils";
 import { getShareUserLimitStatus } from "@/lib/api";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { CORE_SHARE_APPS, shareAccessApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
+import { shareProviderSupportedApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
   DashboardMarket,
   ShareAppRuntimes,
@@ -61,7 +61,7 @@ export function ShareEditReadView({
   markets: DashboardMarket[];
   t: TFn;
 }) {
-  const boundApps = shareAccessApps(share);
+  const boundApps = shareProviderSupportedApps(share);
   const shareApp = resolveShareCoreApp(share) ?? boundApps[0];
   const tokenMarkets = markets;
 
@@ -146,39 +146,30 @@ export function ShareEditReadView({
 
       <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
         <div className="grid gap-2">
-          {CORE_SHARE_APPS.map((app) => {
-            const bound = boundApps.includes(app);
+          {boundApps.map((app) => {
             const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
             const hint = providerHint(runtime);
             const models = runtimeModelSummary(runtime, t("dashboard.shareEdit.passthrough"));
-            const enabled = bound && !(share.support && share.support[app] === false);
+            const enabled = !(share.support && share.support[app] === false);
             return (
               <div
                 key={app}
-                className={`flex min-w-0 items-start gap-3 rounded-xl border px-3 py-2.5 ${
-                  bound ? "border-slate-200 bg-slate-50/70" : "border-dashed border-slate-200 bg-slate-50/40"
-                }`}
+                className="flex min-w-0 items-start gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5"
               >
                 <ShareAppLogo app={app} size={16} />
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-x-2">
                     <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]} API</span>
-                    {bound && runtime?.providerName ? (
+                    {runtime?.providerName ? (
                       <span className="truncate text-xs text-slate-500">{runtime.providerName}</span>
                     ) : null}
                     <span className="text-[11px] font-medium text-slate-500">
-                      {!bound
-                        ? t("dashboard.shareEdit.appApiUnbound")
-                        : enabled
-                          ? t("dashboard.on")
-                          : t("dashboard.off")}
+                      {enabled ? t("dashboard.on") : t("dashboard.off")}
                     </span>
                   </div>
-                  {bound ? (
-                    <div className="mt-0.5 truncate text-[11px] text-slate-500">
-                      {[hint, models].filter(Boolean).join(" · ") || "—"}
-                    </div>
-                  ) : null}
+                  <div className="mt-0.5 truncate text-[11px] text-slate-500">
+                    {[hint, models].filter(Boolean).join(" · ") || "—"}
+                  </div>
                 </div>
               </div>
             );

@@ -8,7 +8,7 @@ import { ShareEditReadView } from "@/components/dashboard/share-edit/share-edit-
 import { ShareEditFormBody, useShareEditForm } from "@/components/dashboard/share-edit/share-edit-form";
 import { ShareEditStatusBanner } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { shareAccessApps, SHARE_APP_LABELS } from "@/lib/share-app";
+import { shareProviderSupportedApps, SHARE_APP_LABELS } from "@/lib/share-app";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import type { DashboardMarket, ShareView } from "@/lib/types";
 
@@ -28,7 +28,7 @@ export function ShareEditDialog({
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
   const form = useShareEditForm({ share, markets, t, onSaved, onClose });
-  const boundApps = share ? shareAccessApps(share) : [];
+  const boundApps = share ? shareProviderSupportedApps(share) : [];
 
   return (
     <>

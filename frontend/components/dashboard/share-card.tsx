@@ -39,7 +39,7 @@ import {
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import {
   resolveShareCoreApp,
-  shareAccessApps,
+  shareEnabledApps,
   SHARE_APP_LABELS,
 } from "@/lib/share-app";
 import { recordDashboardUxEvent } from "@/lib/api";
@@ -94,7 +94,7 @@ export const ShareCard = React.memo(function ShareCard({
   const focus = useDashboardFocus();
   const cardRef = React.useRef<HTMLDivElement | null>(null);
   const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
-  const apps = shareAccessApps(share);
+  const apps = shareEnabledApps(share);
   const app = resolveShareCoreApp(share);
   const settings = app ? shareAppSettings(share, app) : null;
   const appRequests =

@@ -10,7 +10,7 @@ import {
   UNLIMITED_TOKEN_LIMIT,
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
-import { resolveShareCoreApp, shareAccessApps } from "@/lib/share-app";
+import { resolveShareCoreApp, shareProviderSupportedApps } from "@/lib/share-app";
 import type { DashboardMarket, ShareAccessByApp, ShareView } from "@/lib/types";
 import { updateShareSettings } from "@/lib/api";
 import {
@@ -88,7 +88,7 @@ export function useShareEditForm({
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
 
   const editShare = baseShare || share;
-  const activeShareApps = React.useMemo(() => shareAccessApps(editShare), [editShare]);
+  const activeShareApps = React.useMemo(() => shareProviderSupportedApps(editShare), [editShare]);
   const shareApp = activeShareApps[0] ?? resolveShareCoreApp(editShare);
   const tokenMarkets = markets;
   const publicMarketEmails = React.useMemo(
