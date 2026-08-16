@@ -33,6 +33,12 @@ pub const DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS: u64 = 7_200;
+pub const DEFAULT_PROXY_REQUEST_BODY_LIMIT_MB: u64 = 2;
+pub const DEFAULT_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB: u64 = 32;
+pub const DEFAULT_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB: u64 = 48;
+pub const MIN_PROXY_REQUEST_BODY_LIMIT_MB: u64 = 1;
+pub const MAX_PROXY_REQUEST_BODY_LIMIT_MB: u64 = 64;
+pub const MAX_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB: u64 = 256;
 pub const DEFAULT_CLOCK_SOURCES: &[&str] = &[
     "https://www.cloudflare.com/cdn-cgi/trace",
     "https://www.apple.com/library/test/success.html",
@@ -260,6 +266,9 @@ pub struct ProxyStreamConfig {
     pub idle_timeout_secs: u64,
     pub downstream_stall_timeout_secs: u64,
     pub max_request_lifetime_secs: u64,
+    pub request_body_limit_mb: u64,
+    pub media_request_body_limit_mb: u64,
+    pub image_request_body_limit_mb: u64,
 }
 
 impl Default for ProxyStreamConfig {
@@ -271,11 +280,32 @@ impl Default for ProxyStreamConfig {
             idle_timeout_secs: DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS,
             downstream_stall_timeout_secs: DEFAULT_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS,
             max_request_lifetime_secs: DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS,
+            request_body_limit_mb: DEFAULT_PROXY_REQUEST_BODY_LIMIT_MB,
+            media_request_body_limit_mb: DEFAULT_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB,
+            image_request_body_limit_mb: DEFAULT_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB,
         }
     }
 }
 
 impl ProxyStreamConfig {
+    /// Buffered request body ceiling for ordinary text APIs (`/v1/responses`,
+    /// `/v1/messages`, ...). Bodies are read fully into memory, so the worst
+    /// case resident size is this value times the in-flight request count.
+    pub fn request_body_limit_bytes(&self) -> usize {
+        mb_to_bytes(self.request_body_limit_mb)
+    }
+
+    /// Buffered request body ceiling for video generation submissions.
+    pub fn media_request_body_limit_bytes(&self) -> usize {
+        mb_to_bytes(self.media_request_body_limit_mb)
+    }
+
+    /// Buffered request body ceiling for image generation/edit submissions,
+    /// which carry base64 inline attachments.
+    pub fn image_request_body_limit_bytes(&self) -> usize {
+        mb_to_bytes(self.image_request_body_limit_mb)
+    }
+
     pub fn validate(&self) -> std::result::Result<(), String> {
         validate_u64_range(
             "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
@@ -322,6 +352,36 @@ impl ProxyStreamConfig {
         if self.max_request_lifetime_secs <= longest_phase_timeout {
             return Err(format!(
                 "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS must exceed every proxy phase timeout (currently {longest_phase_timeout} seconds)"
+            ));
+        }
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB",
+            self.request_body_limit_mb,
+            MIN_PROXY_REQUEST_BODY_LIMIT_MB,
+            MAX_PROXY_REQUEST_BODY_LIMIT_MB,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB",
+            self.media_request_body_limit_mb,
+            MIN_PROXY_REQUEST_BODY_LIMIT_MB,
+            MAX_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB,
+        )?;
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB",
+            self.image_request_body_limit_mb,
+            MIN_PROXY_REQUEST_BODY_LIMIT_MB,
+            MAX_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB,
+        )?;
+        if self.media_request_body_limit_mb < self.request_body_limit_mb {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB must be at least CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB ({} MB)",
+                self.request_body_limit_mb
+            ));
+        }
+        if self.image_request_body_limit_mb < self.request_body_limit_mb {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB must be at least CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB ({} MB)",
+                self.request_body_limit_mb
             ));
         }
         Ok(())
@@ -659,6 +719,18 @@ impl Config {
                 max_request_lifetime_secs: env_u64(
                     "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
                     DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS,
+                ),
+                request_body_limit_mb: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB",
+                    DEFAULT_PROXY_REQUEST_BODY_LIMIT_MB,
+                ),
+                media_request_body_limit_mb: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB",
+                    DEFAULT_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB,
+                ),
+                image_request_body_limit_mb: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB",
+                    DEFAULT_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB,
                 ),
             },
             use_localhost: env_var("CC_SWITCH_ROUTER_USE_LOCALHOST")
@@ -1054,6 +1126,9 @@ CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS=120
 CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900
 CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS=120
 CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS=7200
+CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB=2
+CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB=32
+CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB=48
 CC_SWITCH_ROUTER_OWNER_EMAIL=
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
@@ -1165,6 +1240,13 @@ fn env_i64(key: &str, default: i64) -> i64 {
     env_var(key)
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+/// Converts a megabyte setting into a byte count, saturating instead of
+/// overflowing on 32-bit targets. Validation keeps the accepted range far
+/// below `usize::MAX`, so saturation is a safety net rather than a code path.
+fn mb_to_bytes(megabytes: u64) -> usize {
+    usize::try_from(megabytes.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -1533,6 +1615,12 @@ mod tests {
         assert_eq!(defaults.idle_timeout_secs, 900);
         assert_eq!(defaults.downstream_stall_timeout_secs, 120);
         assert_eq!(defaults.max_request_lifetime_secs, 7_200);
+        assert_eq!(defaults.request_body_limit_mb, 2);
+        assert_eq!(defaults.media_request_body_limit_mb, 32);
+        assert_eq!(defaults.image_request_body_limit_mb, 48);
+        assert_eq!(defaults.request_body_limit_bytes(), 2 * 1024 * 1024);
+        assert_eq!(defaults.media_request_body_limit_bytes(), 32 * 1024 * 1024);
+        assert_eq!(defaults.image_request_body_limit_bytes(), 48 * 1024 * 1024);
         assert!(defaults.validate().is_ok());
 
         let contents = default_env_contents();
@@ -1543,9 +1631,70 @@ mod tests {
             "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900",
             "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS=120",
             "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS=7200",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB=2",
+            "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB=32",
+            "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB=48",
         ] {
             assert!(contents.contains(expected), "missing default: {expected}");
         }
+    }
+
+    #[test]
+    fn proxy_stream_rejects_out_of_range_body_limits() {
+        for request_body_limit_mb in [0, MAX_PROXY_REQUEST_BODY_LIMIT_MB + 1] {
+            let config = ProxyStreamConfig {
+                request_body_limit_mb,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{request_body_limit_mb}");
+        }
+        for media_request_body_limit_mb in [0, MAX_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB + 1] {
+            let config = ProxyStreamConfig {
+                media_request_body_limit_mb,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{media_request_body_limit_mb}");
+        }
+        for image_request_body_limit_mb in [0, MAX_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB + 1] {
+            let config = ProxyStreamConfig {
+                image_request_body_limit_mb,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{image_request_body_limit_mb}");
+        }
+    }
+
+    #[test]
+    fn proxy_stream_rejects_media_limits_below_the_default_lane() {
+        let config = ProxyStreamConfig {
+            request_body_limit_mb: 16,
+            media_request_body_limit_mb: 8,
+            ..Default::default()
+        };
+        let error = config.validate().expect_err("media below default lane");
+        assert!(
+            error.contains("CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB"),
+            "{error}"
+        );
+
+        let config = ProxyStreamConfig {
+            request_body_limit_mb: 16,
+            image_request_body_limit_mb: 8,
+            ..Default::default()
+        };
+        let error = config.validate().expect_err("image below default lane");
+        assert!(
+            error.contains("CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB"),
+            "{error}"
+        );
+
+        let config = ProxyStreamConfig {
+            request_body_limit_mb: 16,
+            media_request_body_limit_mb: 16,
+            image_request_body_limit_mb: 64,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

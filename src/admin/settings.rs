@@ -348,6 +348,42 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("7200"),
         dynamic_group: None,
     },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB",
+        label: "Request body limit (MB)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("2"),
+        description: "Buffered request body ceiling for ordinary API paths such as /v1/responses and /v1/messages (1-64 MB). Oversized requests get 413 before they take a Share concurrency slot. Bodies are held in memory, so plan for this value times the in-flight request count. The client enforces its own ceiling too, so raising this alone will not admit larger bodies.",
+        placeholder: Some("2"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB",
+        label: "Video request body limit (MB)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("32"),
+        description: "Buffered request body ceiling for /v1/videos/generations (1-256 MB). Must not be lower than the ordinary request body limit.",
+        placeholder: Some("32"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB",
+        label: "Image request body limit (MB)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("48"),
+        description: "Buffered request body ceiling for /v1/images/generations and /v1/images/edits, which carry inline base64 attachments (1-256 MB). Must not be lower than the ordinary request body limit.",
+        placeholder: Some("48"),
+        dynamic_group: None,
+    },
     // ── Persistence ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_DATA_DIR",
@@ -1925,6 +1961,9 @@ fn validate_proxy_stream_relations(
         "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS",
         "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS",
         "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB",
+        "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB",
+        "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB",
     ];
     if !keys.iter().any(|key| updates.contains_key(*key)) {
         return Ok(());
@@ -1965,6 +2004,24 @@ fn validate_proxy_stream_relations(
             updates,
             keys[5],
             crate::config::DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS,
+        )?,
+        request_body_limit_mb: resolved_ssh_u64(
+            next,
+            updates,
+            keys[6],
+            crate::config::DEFAULT_PROXY_REQUEST_BODY_LIMIT_MB,
+        )?,
+        media_request_body_limit_mb: resolved_ssh_u64(
+            next,
+            updates,
+            keys[7],
+            crate::config::DEFAULT_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB,
+        )?,
+        image_request_body_limit_mb: resolved_ssh_u64(
+            next,
+            updates,
+            keys[8],
+            crate::config::DEFAULT_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB,
         )?,
     };
     config.validate().map_err(AppError::BadRequest)

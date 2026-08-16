@@ -193,6 +193,9 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 未绑定 Owner 水位 | 默认 50000,达到后暂停新身份准入 | 业务 libSQL |
 | 请求并发 | 6 个 `KeyedConcurrencyLimiter` | 内存(`proxy.rs:562-573`) |
 | 认证滥用 | 10 分钟 10 次失败 → 封禁 1 小时 | 内存(`abuse.rs:6-8`) |
+| 请求体体积 | 三档上限:普通 2 MB / 视频 32 MB / 图片 48 MB(可配置) | 内存缓冲上限(`proxy.rs` `proxy_request_body_limit()`) |
+
+请求体体积不是速率限制,而是**内存缓冲天花板**:请求体经 `axum::body::to_bytes` 一次性读入内存,峰值内存 ≈ 单档上限 × 并发请求数。三档由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置(MB 为单位,改后需重启)。读取发生在 `try_acquire_share_permit` 之前,因此超限请求返回 413 且不消耗 Share 并发额度。Client 侧 `router_ingress_body_limit()` 有一份镜像上限,仅放宽 Router 一侧不会提高实际天花板。
 
 并发限流键位:`share_id`、`share_id:app`、`share_id:app:email`、用户 IP(免费档)、图片任务、市场邮箱。
 

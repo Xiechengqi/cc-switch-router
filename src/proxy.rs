@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::config::Config;
+use crate::config::{Config, ProxyStreamConfig};
 use crate::metrics::models::LlmRequestMetric;
 use crate::metrics::{MetricsPermit, MetricsRegistry};
 use crate::proxy_stream::{
@@ -45,9 +45,6 @@ const SHARE_USER_COUNTRY_HEADER: &str = "X-CC-Switch-User-Country";
 const SHARE_USER_COUNTRY_ISO3_HEADER: &str = "X-CC-Switch-User-Country-Iso3";
 const SHARE_DATA_SOURCE_HEADER: &str = "X-CC-Switch-Data-Source";
 const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
-const DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
-const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
-const CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES: usize = 48 * 1024 * 1024;
 const MAX_PROXY_ERROR_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const ROUTE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const ROUTE_RECONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2170,7 +2167,7 @@ pub async fn market_proxy_handler(
     }
     let body = match read_proxy_request_body(
         body,
-        proxy_request_body_limit(&path_and_query),
+        proxy_request_body_limit(&path_and_query, &state.config.proxy_stream),
         Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
     )
     .await
@@ -2550,7 +2547,7 @@ pub async fn gateway_proxy_handler(
 
     let body_bytes = match read_proxy_request_body(
         body,
-        proxy_request_body_limit(&path),
+        proxy_request_body_limit(&path, &state.config.proxy_stream),
         Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
     )
     .await
@@ -3314,7 +3311,7 @@ pub async fn proxy_handler(
     {
         let body_bytes = match read_proxy_request_body(
             body,
-            proxy_request_body_limit(&path),
+            proxy_request_body_limit(&path, &state.config.proxy_stream),
             Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
         )
         .await
@@ -3434,7 +3431,7 @@ pub async fn proxy_handler(
 
     let body = match read_proxy_request_body(
         body,
-        proxy_request_body_limit(&path),
+        proxy_request_body_limit(&path, &state.config.proxy_stream),
         Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
     )
     .await
@@ -3979,17 +3976,17 @@ fn is_image_generation_submit_path(path: &str) -> bool {
     )
 }
 
-fn proxy_request_body_limit(path_and_query: &str) -> usize {
+fn proxy_request_body_limit(path_and_query: &str, limits: &ProxyStreamConfig) -> usize {
     match path_and_query
         .split_once('?')
         .map_or(path_and_query, |(path, _)| path)
         .trim_start_matches('/')
     {
         "v1/images/generations" | "images/generations" | "v1/images/edits" | "images/edits" => {
-            CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
+            limits.image_request_body_limit_bytes()
         }
-        "v1/videos/generations" | "videos/generations" => MEDIA_REQUEST_BODY_LIMIT_BYTES,
-        _ => DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES,
+        "v1/videos/generations" | "videos/generations" => limits.media_request_body_limit_bytes(),
+        _ => limits.request_body_limit_bytes(),
     }
 }
 
@@ -7278,6 +7275,10 @@ mod tests {
 
     #[test]
     fn proxy_request_body_limits_match_server_ingress_envelopes() {
+        // The shipped defaults must keep matching the client's
+        // `router_ingress_body_limit` envelopes, otherwise an oversized body
+        // is accepted here only to be rejected on the seller's machine.
+        let limits = ProxyStreamConfig::default();
         for path in [
             "/v1/images/generations",
             "/images/generations?stream=true",
@@ -7285,21 +7286,48 @@ mod tests {
             "/images/edits?mask=true",
         ] {
             assert_eq!(
-                proxy_request_body_limit(path),
-                CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+                proxy_request_body_limit(path, &limits),
+                48 * 1024 * 1024,
                 "{path}"
             );
         }
         for path in ["/v1/videos/generations", "/videos/generations?async=true"] {
             assert_eq!(
-                proxy_request_body_limit(path),
-                MEDIA_REQUEST_BODY_LIMIT_BYTES,
+                proxy_request_body_limit(path, &limits),
+                32 * 1024 * 1024,
                 "{path}"
             );
         }
         assert_eq!(
-            proxy_request_body_limit("/v1/messages?beta=true"),
-            DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES
+            proxy_request_body_limit("/v1/messages?beta=true", &limits),
+            2 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn proxy_request_body_limits_follow_configured_megabytes() {
+        let limits = ProxyStreamConfig {
+            request_body_limit_mb: 16,
+            media_request_body_limit_mb: 64,
+            image_request_body_limit_mb: 96,
+            ..Default::default()
+        };
+        assert!(limits.validate().is_ok());
+        assert_eq!(
+            proxy_request_body_limit("/v1/responses", &limits),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            proxy_request_body_limit("/v1/messages?beta=true", &limits),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            proxy_request_body_limit("/v1/videos/generations", &limits),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            proxy_request_body_limit("/images/edits?mask=true", &limits),
+            96 * 1024 * 1024
         );
     }
 

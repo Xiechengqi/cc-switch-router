@@ -125,6 +125,9 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS` | `900` | Share 流后续协议业务事件空闲超时，范围 30-3600 秒；SSE 注释与 keepalive 不会续期 |
 | `CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS` | `120` | 下游停止消费有界响应缓冲区时的终止超时，范围 5-600 秒 |
 | `CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS` | `7200` | Share 请求绝对生存时长，范围 60-86400 秒，必须大于所有阶段超时 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB` | `2` | 普通 API（`/v1/responses`、`/v1/messages` 等）请求体上限，范围 1-64 MB；超限在占用 Share 并发前返回 413。请求体整体驻留内存，峰值内存 ≈ 该值 × 并发请求数。Client 侧另有同名上限，只调 Router 不会放宽实际天花板 |
+| `CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB` | `32` | `/v1/videos/generations` 请求体上限，范围 1-256 MB，且不得小于普通 API 上限 |
+| `CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB` | `48` | `/v1/images/generations` 与 `/v1/images/edits` 请求体上限（含内联 base64 附件），范围 1-256 MB，且不得小于普通 API 上限 |
 | `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期(秒);已连接 client 使用签名续期 API 原连接续期,不按该周期重建 SSH |
