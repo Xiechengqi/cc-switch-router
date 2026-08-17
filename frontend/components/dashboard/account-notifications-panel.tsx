@@ -18,6 +18,8 @@ import { cn, formatDateTime } from "@/lib/utils";
 /** How long to keep watching for the `/start` handshake after opening the tab. */
 const BIND_POLL_INTERVAL_MS = 3_000;
 const BIND_POLL_TIMEOUT_MS = 5 * 60_000;
+const BOT_STATUS_POLL_INTERVAL_MS = 3_000;
+const BOT_ERROR_STATUS_POLL_INTERVAL_MS = 10_000;
 
 type ChannelOption = {
   value: string;
@@ -72,6 +74,33 @@ export function AccountNotificationsPanel() {
     if (!authed) return;
     load().catch(console.error);
   }, [authed, load]);
+
+  React.useEffect(() => {
+    const status = settings?.telegramBotStatus;
+    if (!authed || !settings?.telegramBotConfigured || status === "ready") return;
+    let active = true;
+    let refreshing = false;
+    const refresh = () => {
+      if (refreshing) return;
+      refreshing = true;
+      void getMyNotificationSettings()
+        .then((next) => {
+          if (active) setSettings(next);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          refreshing = false;
+        });
+    };
+    const timer = window.setInterval(
+      refresh,
+      status === "error" ? BOT_ERROR_STATUS_POLL_INTERVAL_MS : BOT_STATUS_POLL_INTERVAL_MS,
+    );
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [authed, settings?.telegramBotConfigured, settings?.telegramBotStatus]);
 
   // The binding is completed in Telegram, not here: the only way this page
   // learns about it is by asking again until the chat shows up.
@@ -186,8 +215,31 @@ export function AccountNotificationsPanel() {
   }
 
   const telegram = channelSettings(settings, "telegram");
-  const botEnabled = settings?.telegramBotStatus === "ready";
+  const botStatus = settings?.telegramBotStatus ?? "disabled";
+  const botConfigured = settings?.telegramBotConfigured === true;
+  const botReady = botConfigured
+    && botStatus === "ready"
+    && telegram?.available === true
+    && !!settings?.telegramBotUsername;
+  const botReconciling = botConfigured && (botStatus === "reconciling" || botStatus === "disabled");
+  const botError = botStatus === "error";
   const bound = telegram?.state === "ready";
+  const botHint = botReady
+    ? t("account.notifications.telegramHint")
+    : botReconciling
+      ? t("account.notifications.telegramReconciling")
+      : botError
+        ? t("account.notifications.telegramError")
+        : botStatus === "disabled"
+          ? t("account.notifications.telegramDisabled")
+          : t("account.notifications.telegramUnavailable");
+  const botStatusLabel = botReady
+    ? t("account.notifications.botReady")
+    : botReconciling
+      ? t("account.notifications.botReconciling")
+      : botError
+        ? t("account.notifications.botError")
+        : t("account.notifications.botDisabled");
 
   return (
     <div className="grid min-w-0 gap-6">
@@ -253,21 +305,48 @@ export function AccountNotificationsPanel() {
               <Send className="h-4 w-4 text-muted-foreground" aria-hidden />
               {t("account.notifications.telegramTitle")}
             </h3>
-            <p className="mt-0.5 text-sm text-muted-foreground">
-              {botEnabled
-                ? t("account.notifications.telegramHint")
-                : t("account.notifications.telegramUnavailable")}
-            </p>
+            <p className="mt-0.5 text-sm text-muted-foreground">{botHint}</p>
           </div>
-          <span
-            className={cn(
-              "inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium",
-              bound ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600",
-            )}
-          >
-            <span className={cn("h-1.5 w-1.5 rounded-full", bound ? "bg-emerald-500" : "bg-slate-400")} aria-hidden />
-            {bound ? t("account.notifications.bound") : t("account.notifications.notBound")}
-          </span>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <span
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium",
+                botReady
+                  ? "bg-emerald-50 text-emerald-700"
+                  : botError
+                    ? "bg-red-50 text-red-700"
+                    : botReconciling
+                      ? "bg-amber-50 text-amber-700"
+                      : "bg-slate-100 text-slate-600",
+              )}
+            >
+              {botReconciling ? (
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+              ) : (
+                <span
+                  className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    botReady
+                      ? "bg-emerald-500"
+                      : botError
+                        ? "bg-red-500"
+                        : "bg-slate-400",
+                  )}
+                  aria-hidden
+                />
+              )}
+              {botStatusLabel}
+            </span>
+            <span
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium",
+                bound ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600",
+              )}
+            >
+              <span className={cn("h-1.5 w-1.5 rounded-full", bound ? "bg-emerald-500" : "bg-slate-400")} aria-hidden />
+              {bound ? t("account.notifications.bound") : t("account.notifications.notBound")}
+            </span>
+          </div>
         </div>
 
         {bound ? (
@@ -291,10 +370,10 @@ export function AccountNotificationsPanel() {
           <Button
             size="sm"
             variant={bound ? "outline" : "primary"}
-            isDisabled={!botEnabled || busy}
+            isDisabled={!botReady || busy}
             onClick={() => void startBinding()}
           >
-            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />}
+            {busy || botReconciling ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />}
             {bound ? t("account.notifications.rebind") : t("account.notifications.bind")}
           </Button>
           {bound ? (

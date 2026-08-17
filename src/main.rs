@@ -46,6 +46,7 @@ mod ssh;
 mod startup_config;
 mod store;
 mod telegram;
+mod user_notification_health;
 mod usage_account;
 
 use std::collections::HashSet;

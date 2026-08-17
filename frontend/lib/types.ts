@@ -513,6 +513,7 @@ export type NotificationSettings = {
   email: string;
   enabledChannels: string[];
   channels: NotificationChannelSettings[];
+  telegramBotConfigured: boolean;
   telegramBotStatus: "disabled" | "reconciling" | "ready" | "error" | string;
   telegramBotUsername?: string;
 };
@@ -1330,6 +1331,31 @@ export type AlertChannelTestResponse = {
   channel: string;
   providerMessageId?: string | null;
   testedAt: number;
+};
+
+export type UserNotificationChannelState = {
+  channel: string;
+  enabled: boolean;
+  configured: boolean;
+  status:
+    "disabled" | "misconfigured" | "reconciling" | "ready" | "healthy" | "degraded" | string;
+  runtimeReady: boolean;
+  providerLabel?: string | null;
+  runtimeVerifiedAt?: string | null;
+  lastAttemptAt?: string | null;
+  lastSuccessAt?: string | null;
+  lastError?: string | null;
+  testTargetAvailable: boolean;
+  testTargetLabel?: string | null;
+  bindingVerifiedAt?: string | null;
+};
+
+export type UserNotificationChannelTestResponse = {
+  ok: boolean;
+  channel: string;
+  targetLabel?: string | null;
+  providerMessageId?: string | null;
+  testedAt: string;
 };
 
 export type AlertingOverview = {

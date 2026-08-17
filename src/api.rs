@@ -551,6 +551,14 @@ pub fn router(state: ServerState) -> Router {
             post(admin_alerting_channel_test),
         )
         .route(
+            "/v1/admin/user-notifications/channels",
+            get(admin_user_notification_channels),
+        )
+        .route(
+            "/v1/admin/user-notifications/channels/:channel/test",
+            post(admin_user_notification_channel_test),
+        )
+        .route(
             "/v1/admin/alerting/incidents/:incident_id/acknowledge",
             post(admin_alerting_incident_acknowledge),
         )
@@ -2743,7 +2751,9 @@ async fn get_my_notification_settings(
     headers: HeaderMap,
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
-    Ok(Json(state.store.get_notification_settings(&email).await?))
+    let mut response = state.store.get_notification_settings(&email).await?;
+    response.telegram_bot_configured = state.dynamic.read().await.telegram_bot.is_operational();
+    Ok(Json(response))
 }
 
 async fn update_my_notification_settings(
@@ -2752,12 +2762,12 @@ async fn update_my_notification_settings(
     Json(patch): Json<UpdateNotificationSettingsRequest>,
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .update_notification_settings(&email, patch)
-            .await?,
-    ))
+    let mut response = state
+        .store
+        .update_notification_settings(&email, patch)
+        .await?;
+    response.telegram_bot_configured = state.dynamic.read().await.telegram_bot.is_operational();
+    Ok(Json(response))
 }
 
 /// Mint a single-use `t.me` deep link. The token is a bearer credential for
@@ -2770,6 +2780,11 @@ async fn create_my_telegram_bind_link(
 ) -> Result<Json<TelegramBindLinkResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
     let settings = state.dynamic.read().await.telegram_bot.clone();
+    if !settings.is_operational() {
+        return Err(AppError::ServiceUnavailable(
+            "the Telegram notification bot is disabled or not configured".into(),
+        ));
+    }
     let metadata = extract_client_metadata(&headers, addr);
     Ok(Json(
         state
@@ -2788,7 +2803,9 @@ async fn unbind_my_telegram_chat(
     headers: HeaderMap,
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
-    Ok(Json(state.store.unbind_telegram(&email).await?))
+    let mut response = state.store.unbind_telegram(&email).await?;
+    response.telegram_bot_configured = state.dynamic.read().await.telegram_bot.is_operational();
+    Ok(Json(response))
 }
 
 /// Telegram's webhook callback. Authenticated solely by the secret header from
@@ -6643,7 +6660,7 @@ async fn admin_alerting_channel_test(
 ) -> Result<Json<crate::alerting::models::AlertChannelTestResponse>, AppError> {
     let session = require_admin_session(&state, &headers).await?;
     let result = state.alerting.test_channel(&channel).await;
-    record_alerting_admin_audit(
+    record_notification_admin_audit(
         &state,
         &headers,
         addr,
@@ -6673,7 +6690,7 @@ async fn admin_alerting_incident_acknowledge(
             Utc::now().timestamp(),
         )
         .await?;
-    record_alerting_admin_audit(
+    record_notification_admin_audit(
         &state,
         &headers,
         addr,
@@ -6704,7 +6721,7 @@ async fn admin_alerting_incident_silence(
             input.duration_secs,
         )
         .await?;
-    record_alerting_admin_audit(
+    record_notification_admin_audit(
         &state,
         &headers,
         addr,
@@ -6739,7 +6756,7 @@ async fn admin_alerting_incident_resume(
             policy,
         )
         .await?;
-    record_alerting_admin_audit(
+    record_notification_admin_audit(
         &state,
         &headers,
         addr,
@@ -6763,7 +6780,7 @@ async fn admin_alerting_delivery_retry(
         .store()
         .retry_delivery(delivery_id.clone(), Utc::now().timestamp())
         .await?;
-    record_alerting_admin_audit(
+    record_notification_admin_audit(
         &state,
         &headers,
         addr,
@@ -6775,7 +6792,60 @@ async fn admin_alerting_delivery_retry(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn record_alerting_admin_audit(
+async fn admin_user_notification_channels(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::user_notification_health::UserNotificationChannelState>>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let settings = state.dynamic.read().await.telegram_bot.clone();
+    Ok(Json(
+        crate::user_notification_health::channel_states(
+            &state.store,
+            &settings,
+            &session.email,
+        )
+        .await?,
+    ))
+}
+
+async fn admin_user_notification_channel_test(
+    State(state): State<ServerState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<crate::user_notification_health::UserNotificationChannelTestResponse>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let settings = state.dynamic.read().await.telegram_bot.clone();
+    let scheme = if state.config.use_localhost {
+        "http"
+    } else {
+        "https"
+    };
+    let dashboard_url = format!(
+        "{scheme}://{}",
+        state.config.tunnel_domain.trim_end_matches('/')
+    );
+    let result = crate::user_notification_health::test_channel(
+        &state.store,
+        &settings,
+        &session.email,
+        &channel,
+        &dashboard_url,
+    )
+    .await;
+    record_notification_admin_audit(
+        &state,
+        &headers,
+        addr,
+        &session.email,
+        "user_notifications.channel.test",
+        serde_json::json!({ "channel": channel, "ok": result.is_ok() }),
+    )
+    .await;
+    Ok(Json(result?))
+}
+
+async fn record_notification_admin_audit(
     state: &ServerState,
     headers: &HeaderMap,
     addr: SocketAddr,

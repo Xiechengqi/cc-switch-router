@@ -451,8 +451,18 @@ export const messages = {
     "account.notifications.telegramTitle": "Telegram account",
     "account.notifications.telegramHint":
       "Bind your own Telegram account to receive bot notifications.",
+    "account.notifications.telegramReconciling":
+      "The notification bot configuration is being verified. Binding will become available automatically when it is ready.",
+    "account.notifications.telegramError":
+      "The notification bot could not connect to Telegram. Router will retry automatically; ask the Router owner to check Notifications > Telegram in Settings.",
+    "account.notifications.telegramDisabled":
+      "The notification bot is disabled. Ask the Router owner to enable it in Settings.",
     "account.notifications.telegramUnavailable":
       "The notification bot is unavailable or still reconciling. Ask the Router owner to check Settings.",
+    "account.notifications.botReady": "Bot ready",
+    "account.notifications.botReconciling": "Bot activating",
+    "account.notifications.botError": "Bot unavailable",
+    "account.notifications.botDisabled": "Bot disabled",
     "account.notifications.bound": "Bound",
     "account.notifications.notBound": "Not bound",
     "account.notifications.telegramAccount": "Telegram account",
@@ -1490,17 +1500,38 @@ export const messages = {
     "settings.secretWillClear": "The saved secret will be cleared",
     "settings.clearSecret": "Clear secret",
     "settings.secretPlaceholder": "Leave blank to keep; type - to clear",
-    "settings.alertChannels.title": "Channel health",
+    "settings.alertChannels.title": "Notification channel verification",
     "settings.alertChannels.description":
-      "Status reflects real delivery or test attempts, not only saved credentials.",
+      "Operator alerts and user notifications use separate credentials and targets. Verify each channel independently.",
+    "settings.alertChannels.operator.title": "{channel} operator alerts",
+    "settings.alertChannels.operator.description":
+      "Uses the operator alert credentials and fixed destination configured above.",
+    "settings.alertChannels.operator.telegramDescription":
+      "Uses the operator alert Bot Token and fixed Chat ID configured above.",
+    "settings.alertChannels.operator.testSent": "Operator alert test message sent.",
+    "settings.alertChannels.user.title": "{channel} user notifications",
+    "settings.alertChannels.user.description":
+      "Uses the user notification provider and each user's private destination. Tests are sent to the current administrator.",
+    "settings.alertChannels.user.telegramDescription":
+      "Uses the user notification Bot and per-user private bindings. Tests are sent to the current administrator.",
+    "settings.alertChannels.user.provider": "Provider: {provider}",
+    "settings.alertChannels.user.runtimeVerified": "Provider verified: {time}",
+    "settings.alertChannels.user.target": "Test target: {target}",
+    "settings.alertChannels.user.privateTarget": "bound private destination",
+    "settings.alertChannels.user.bindingRequired":
+      "Bind the current administrator to this channel before testing.",
+    "settings.alertChannels.user.runtimeUnavailable":
+      "The channel must finish configuration verification before binding or testing is available.",
+    "settings.alertChannels.user.bindAction": "Open account notification settings",
+    "settings.alertChannels.user.testSent": "User notification test sent to {target}.",
     "settings.alertChannels.lastSuccess": "Last successful delivery: {time}",
     "settings.alertChannels.neverSucceeded": "No successful delivery recorded.",
     "settings.alertChannels.configureFirst":
       "Configure the channel credentials before testing.",
     "settings.alertChannels.sendTest": "Send test",
-    "settings.alertChannels.testSent": "{channel} test message sent.",
     "settings.alertChannels.status.disabled": "Disabled",
     "settings.alertChannels.status.misconfigured": "Incomplete",
+    "settings.alertChannels.status.reconciling": "Activating",
     "settings.alertChannels.status.ready": "Ready",
     "settings.alertChannels.status.healthy": "Healthy",
     "settings.alertChannels.status.degraded": "Degraded",
@@ -3104,8 +3135,18 @@ export const messages = {
     "account.notifications.emailTarget": "账号邮箱：",
     "account.notifications.telegramTitle": "Telegram 账号",
     "account.notifications.telegramHint": "绑定自己 Telegram 账号以接收机器人通知。",
+    "account.notifications.telegramReconciling":
+      "正在验证通知 Bot 配置；验证成功后，绑定按钮会自动恢复。",
+    "account.notifications.telegramError":
+      "通知 Bot 暂时无法连接 Telegram，Router 会自动重试；请联系 Router owner 检查“设置 > 通知 > Telegram”中的渠道状态。",
+    "account.notifications.telegramDisabled":
+      "通知 Bot 尚未启用，请联系 Router owner 在设置中启用。",
     "account.notifications.telegramUnavailable":
       "通知机器人当前不可用或仍在协调配置，请联系 Router owner 检查设置。",
+    "account.notifications.botReady": "Bot 已就绪",
+    "account.notifications.botReconciling": "Bot 启用中",
+    "account.notifications.botError": "Bot 不可用",
+    "account.notifications.botDisabled": "Bot 未启用",
     "account.notifications.bound": "已绑定",
     "account.notifications.notBound": "未绑定",
     "account.notifications.telegramAccount": "Telegram 账号",
@@ -4104,16 +4145,37 @@ export const messages = {
     "settings.secretWillClear": "保存后将清除当前密钥",
     "settings.clearSecret": "清除密钥",
     "settings.secretPlaceholder": "留空保持不变；输入 - 清除",
-    "settings.alertChannels.title": "渠道健康状态",
+    "settings.alertChannels.title": "通知渠道验证",
     "settings.alertChannels.description":
-      "状态基于真实投递或测试结果，而不只判断是否保存了凭据。",
+      "运维告警和用户通知使用独立的凭据与目标，请分别验证各个渠道。",
+    "settings.alertChannels.operator.title": "{channel} 运维告警",
+    "settings.alertChannels.operator.description":
+      "使用上方配置的运维告警凭据和固定目标。",
+    "settings.alertChannels.operator.telegramDescription":
+      "使用上方配置的运维告警 Bot Token 和固定 Chat ID。",
+    "settings.alertChannels.operator.testSent": "运维告警测试消息已发送。",
+    "settings.alertChannels.user.title": "{channel} 用户通知",
+    "settings.alertChannels.user.description":
+      "使用用户通知服务和每位用户的私有目标；测试消息发送给当前管理员。",
+    "settings.alertChannels.user.telegramDescription":
+      "使用用户通知 Bot 和每位用户的私聊绑定；测试消息发送给当前管理员。",
+    "settings.alertChannels.user.provider": "服务：{provider}",
+    "settings.alertChannels.user.runtimeVerified": "服务验证时间：{time}",
+    "settings.alertChannels.user.target": "测试目标：{target}",
+    "settings.alertChannels.user.privateTarget": "已绑定的私有目标",
+    "settings.alertChannels.user.bindingRequired":
+      "发送测试前，请先将当前管理员绑定到此渠道。",
+    "settings.alertChannels.user.runtimeUnavailable":
+      "渠道完成配置验证后，才可以绑定账号或发送测试。",
+    "settings.alertChannels.user.bindAction": "打开账户通知设置",
+    "settings.alertChannels.user.testSent": "用户通知测试已发送至 {target}。",
     "settings.alertChannels.lastSuccess": "最近成功投递：{time}",
     "settings.alertChannels.neverSucceeded": "尚无成功投递记录。",
     "settings.alertChannels.configureFirst": "请先完整配置渠道凭据。",
     "settings.alertChannels.sendTest": "发送测试",
-    "settings.alertChannels.testSent": "{channel} 测试消息已发送。",
     "settings.alertChannels.status.disabled": "已禁用",
     "settings.alertChannels.status.misconfigured": "配置不完整",
+    "settings.alertChannels.status.reconciling": "启用中",
     "settings.alertChannels.status.ready": "待验证",
     "settings.alertChannels.status.healthy": "健康",
     "settings.alertChannels.status.degraded": "异常",

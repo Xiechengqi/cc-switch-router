@@ -1612,6 +1612,7 @@ pub struct NotificationSettingsResponse {
     pub email: String,
     pub enabled_channels: Vec<String>,
     pub channels: Vec<NotificationChannelSettingsResponse>,
+    pub telegram_bot_configured: bool,
     pub telegram_bot_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telegram_bot_username: Option<String>,

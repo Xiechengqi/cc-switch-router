@@ -36,6 +36,8 @@ import type {
   MetricEvent,
   AlertChannelState,
   AlertChannelTestResponse,
+  UserNotificationChannelState,
+  UserNotificationChannelTestResponse,
   AlertIncident,
   AlertingOverview,
   MapDisplaySettings,
@@ -621,6 +623,20 @@ export async function getAlertingChannels() {
 export async function testAlertingChannel(channel: string) {
   return parseJson<AlertChannelTestResponse>(
     await authFetch(`/v1/admin/alerting/channels/${encodeURIComponent(channel)}/test`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function getUserNotificationChannels() {
+  return parseJson<UserNotificationChannelState[]>(
+    await authFetch("/v1/admin/user-notifications/channels", { cache: "no-store" }),
+  );
+}
+
+export async function testUserNotificationChannel(channel: string) {
+  return parseJson<UserNotificationChannelTestResponse>(
+    await authFetch(`/v1/admin/user-notifications/channels/${encodeURIComponent(channel)}/test`, {
       method: "POST",
     }),
   );

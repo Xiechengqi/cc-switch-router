@@ -245,6 +245,7 @@ fn settings_response(
         email: email.to_string(),
         enabled_channels,
         channels,
+        telegram_bot_configured: false,
         telegram_bot_status: runtime.readiness.clone(),
         telegram_bot_username: runtime.username.clone(),
     }

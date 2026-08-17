@@ -57,6 +57,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (14, include_str!("../schema/0014_share_remote_policy.sql")),
     (15, include_str!("../schema/0015_notification_channels.sql")),
+    (
+        16,
+        include_str!("../schema/0016_user_notification_channel_checks.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -245,7 +249,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 116);
+        assert_eq!(table_count, 117);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -291,7 +295,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 15);
+        assert_eq!(versions.len(), 16);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -307,6 +311,7 @@ mod tests {
         assert_eq!(versions[12], (13, migration_checksum(MIGRATIONS[11].1)));
         assert_eq!(versions[13], (14, migration_checksum(MIGRATIONS[12].1)));
         assert_eq!(versions[14], (15, migration_checksum(MIGRATIONS[13].1)));
+        assert_eq!(versions[15], (16, migration_checksum(MIGRATIONS[14].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -424,6 +429,36 @@ mod tests {
                 .expect("inspect legacy notification table");
             assert_eq!(exists, 0, "legacy table {legacy} must be retired");
         }
+    }
+
+    #[test]
+    fn migration_16_installs_user_notification_channel_checks() {
+        let conn = memory_connection();
+        apply(&conn).expect("install final schema");
+        let exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'user_notification_channel_checks'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("inspect user notification channel checks");
+        assert_eq!(exists, 1);
+        conn.execute(
+            "INSERT INTO user_notification_channel_checks (
+                id, channel, config_fingerprint, status, actor_email, tested_at
+             ) VALUES ('check-valid', 'telegram', ?1, 'success', 'admin@example.com', 'now')",
+            params!["a".repeat(64)],
+        )
+        .expect("accept a fingerprint-scoped channel check");
+        let invalid = conn.execute(
+            "INSERT INTO user_notification_channel_checks (
+                id, channel, config_fingerprint, status, actor_email, tested_at
+             ) VALUES ('check-invalid', 'telegram', 'old-bot', 'success',
+                       'admin@example.com', 'now')",
+            [],
+        );
+        assert!(invalid.is_err(), "channel checks must carry a SHA-256 fingerprint");
     }
 
     #[test]
