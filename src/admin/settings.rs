@@ -2034,8 +2034,7 @@ fn dependencies_for_field(key: &str) -> Vec<FieldDependency> {
             "true",
         )),
         "CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS"
-        | "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS"
-        | "CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED" => {
+        | "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS" => {
             Some(("CC_SWITCH_ROUTER_ALERTING_ENABLED", "true"))
         }
         "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN"
@@ -4664,8 +4663,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 119);
-        assert_eq!(schema.fields.len(), 119);
+        assert_eq!(SETTINGS_FIELDS.len(), 118);
+        assert_eq!(schema.fields.len(), 118);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -4679,7 +4678,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            119
+            118
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema
@@ -4693,6 +4692,15 @@ mod tests {
             "CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE"
         );
         assert_eq!(webhook.dependencies[0].equals, "webhook");
+        let operator_telegram = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED")
+            .expect("operator Telegram channel field");
+        assert!(
+            operator_telegram.dependencies.is_empty(),
+            "operator channel configuration must remain available while alert delivery is disabled"
+        );
         let clock_sources = schema
             .fields
             .iter()

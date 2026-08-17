@@ -63,6 +63,34 @@ import type {
 type DirtyValue = string | boolean | null;
 type ActiveSection = "overview" | SettingsCategoryId;
 type Banner = { kind: "default" | "success" | "destructive" | "warning"; text: string };
+type SettingsPanel = "map" | "announcement" | "channel_health" | "provision_key";
+type SettingsSubsection = {
+  id: string;
+  label: string;
+  groups?: string[];
+  panel?: SettingsPanel;
+  fieldCount?: number;
+  dirtyCount: number;
+};
+
+const PANEL_SUBSECTION_IDS: Record<SettingsPanel, string> = {
+  map: "panel:map",
+  announcement: "panel:announcement",
+  channel_health: "panel:channel_health",
+  provision_key: "panel:provision_key",
+};
+
+const NOTIFICATION_SUBSECTION_IDS = {
+  system: "notifications:system",
+  business: "notifications:business",
+  channels: "notifications:channels",
+} as const;
+
+const NOTIFICATION_SUBSECTION_GROUPS = {
+  system: ["Alerting"],
+  business: ["Client notifications"],
+  channels: ["Email (Resend)", "Telegram alerts", "Telegram bot"],
+} as const;
 
 const CATEGORY_ICONS: Record<SettingsCategoryId, React.ComponentType<{ className?: string }>> = {
   general_display: Settings2,
@@ -79,6 +107,7 @@ export function SettingsPage() {
   const { t } = useLocaleText();
   const [snapshot, setSnapshot] = React.useState<SettingsSnapshot | null>(null);
   const [activeSection, setActiveSection] = React.useState<ActiveSection>("overview");
+  const [activeSubsections, setActiveSubsections] = React.useState<Partial<Record<SettingsCategoryId, string>>>({});
   const [query, setQuery] = React.useState("");
   const [dirty, setDirty] = React.useState<Record<string, DirtyValue>>({});
   const [fieldErrors, setFieldErrors] = React.useState<Record<string, string[]>>({});
@@ -91,6 +120,7 @@ export function SettingsPage() {
   const [provisionSshKey, setProvisionSshKey] = React.useState<ProvisionSshKey | null>(null);
   const [provisionError, setProvisionError] = React.useState("");
   const [settingsRevision, setSettingsRevision] = React.useState(0);
+  const subsectionPanelId = React.useId().replaceAll(":", "");
 
   const isAdmin = !!session?.isAdmin;
   const mapDirty = !sameMapDisplaySettings(mapDraft, mapSaved);
@@ -163,9 +193,18 @@ export function SettingsPage() {
 
   const schema = snapshot?.schema;
   const normalizedQuery = query.trim().toLocaleLowerCase();
+  const activeCategory = activeSection === "overview" ? undefined : activeSection;
+  const categoryFields = (schema?.fields || []).filter((field) => field.category === activeCategory);
+  const subsections = activeCategory
+    ? buildSettingsSubsections(activeCategory, categoryFields, values, dirty, mapDirty, t)
+    : [];
+  const requestedSubsection = activeCategory ? activeSubsections[activeCategory] : undefined;
+  const activeSubsection = subsections.find((item) => item.id === requestedSubsection) || subsections[0];
+  const activeSubsectionIndex = Math.max(0, subsections.findIndex((item) => item.id === activeSubsection?.id));
   const matchingFields = (schema?.fields || []).filter((field) => {
-    if (!normalizedQuery && activeSection !== "overview" && field.category !== activeSection) return false;
-    if (!normalizedQuery) return activeSection !== "overview";
+    if (!normalizedQuery) {
+      return !!activeSubsection?.groups?.includes(field.group) && field.category === activeCategory;
+    }
     return [
       field.key,
       settingsFieldLabel(t, field),
@@ -175,9 +214,9 @@ export function SettingsPage() {
   });
   const visibleFields = matchingFields.filter((field) => dependenciesSatisfied(field, schema?.fields || [], values, dirty));
   const groupedFields = groupFields(visibleFields);
-  const showGeneralPanels = !normalizedQuery && activeSection === "general_display";
-  const showProvisionKey = !normalizedQuery && activeSection === "marketplace";
-  const showChannelHealth = !normalizedQuery && activeSection === "notifications";
+  const keepGeneralPanelsMounted = activeSection === "general_display";
+  const keepProvisionKeyMounted = activeSection === "marketplace";
+  const keepChannelHealthMounted = activeSection === "notifications";
 
   return (
     <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10 text-foreground">
@@ -217,16 +256,19 @@ export function SettingsPage() {
               label={t("settings.overview")}
               count={dirtyCount || undefined}
               icon={Eye}
-              onClick={() => { setActiveSection("overview"); setQuery(""); }}
+              onClick={() => selectCategory("overview")}
             />
             {(schema?.categories || []).map((category) => (
               <SettingsNavButton
                 key={category.id}
                 active={activeSection === category.id && !normalizedQuery}
                 label={settingsCategoryLabel(t, category)}
-                count={categoryDirtyCount(category.id, schema?.fields || [], dirty) || undefined}
+                count={(
+                  categoryDirtyCount(category.id, schema?.fields || [], dirty)
+                  + (category.id === "general_display" && mapDirty ? 1 : 0)
+                ) || undefined}
                 icon={CATEGORY_ICONS[category.id]}
-                onClick={() => { setActiveSection(category.id); setQuery(""); }}
+                onClick={() => selectCategory(category.id)}
               />
             ))}
           </nav>
@@ -250,7 +292,7 @@ export function SettingsPage() {
               {t("settings.loading")}
             </div>
           ) : activeSection === "overview" && !normalizedQuery ? (
-            <SettingsOverview snapshot={snapshot} dirtyCount={dirtyCount} onSelect={setActiveSection} />
+            <SettingsOverview snapshot={snapshot} dirtyCount={dirtyCount} onSelect={selectCategory} />
           ) : (
             <div className="grid gap-8">
               <div>
@@ -266,52 +308,79 @@ export function SettingsPage() {
                 </p>
               </div>
 
-              {groupedFields.map(([group, fields]) => (
-                <section key={group} className="border-t pt-5">
-                  <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-                    <h3 className="text-base font-semibold">{settingsGroupLabel(t, group)}</h3>
-                    <span className="text-xs tabular-nums text-muted-foreground">{t("settings.fieldCount", { count: fields.length })}</span>
+              {!normalizedQuery && activeCategory && subsections.length ? (
+                <SettingsSubnav
+                  items={subsections}
+                  value={activeSubsection?.id || ""}
+                  panelId={subsectionPanelId}
+                  onChange={(id) => selectSubsection(activeCategory, id)}
+                />
+              ) : null}
+
+              <div
+                id={!normalizedQuery && activeCategory ? subsectionPanelId : undefined}
+                role={!normalizedQuery && activeCategory ? "tabpanel" : undefined}
+                aria-labelledby={!normalizedQuery && activeCategory ? `${subsectionPanelId}-tab-${activeSubsectionIndex}` : undefined}
+                className="grid gap-8"
+              >
+                {groupedFields.map(([group, fields]) => (
+                  <section key={group} className="border-t pt-5">
+                    <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="text-base font-semibold">{settingsGroupLabel(t, group)}</h3>
+                      <span className="text-xs tabular-nums text-muted-foreground">{t("settings.fieldCount", { count: fields.length })}</span>
+                    </div>
+                    <div className="divide-y border-y">
+                      {fields.map((field) => (
+                        <SettingsFieldRow
+                          key={field.key}
+                          field={field}
+                          entry={values[field.key]}
+                          value={dirtyValue(field, values[field.key], dirty)}
+                          dirty={Object.prototype.hasOwnProperty.call(dirty, field.key)}
+                          errors={fieldErrors[field.key] || []}
+                          t={t}
+                          onChange={(value) => updateDirty(field, value)}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                ))}
+
+                {!visibleFields.length && normalizedQuery ? (
+                  <div className="border-y py-14 text-center text-sm text-muted-foreground">{t("settings.noSearchResults")}</div>
+                ) : null}
+
+                {keepGeneralPanelsMounted ? (
+                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "map"}>
+                    <MapDisplayPanel
+                      canEdit
+                      value={mapDraft}
+                      onChange={setMapDraft}
+                      dirty={mapDirty}
+                      loading={mapLoading}
+                    />
+                    {mapError ? <Alert status="danger">{mapError}</Alert> : null}
                   </div>
-                  <div className="divide-y border-y">
-                    {fields.map((field) => (
-                      <SettingsFieldRow
-                        key={field.key}
-                        field={field}
-                        entry={values[field.key]}
-                        value={dirtyValue(field, values[field.key], dirty)}
-                        dirty={Object.prototype.hasOwnProperty.call(dirty, field.key)}
-                        errors={fieldErrors[field.key] || []}
-                        t={t}
-                        onChange={(value) => updateDirty(field, value)}
-                      />
-                    ))}
+                ) : null}
+
+                {keepGeneralPanelsMounted ? (
+                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "announcement"}>
+                    <AnnouncementPanel />
                   </div>
-                </section>
-              ))}
+                ) : null}
 
-              {!visibleFields.length && normalizedQuery ? (
-                <div className="border-y py-14 text-center text-sm text-muted-foreground">{t("settings.noSearchResults")}</div>
-              ) : null}
+                {keepProvisionKeyMounted ? (
+                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "provision_key"}>
+                    <ProvisionKeyPanel value={provisionSshKey} error={provisionError} />
+                  </div>
+                ) : null}
 
-              {showGeneralPanels ? (
-                <>
-                  <MapDisplayPanel
-                    canEdit
-                    value={mapDraft}
-                    onChange={setMapDraft}
-                    dirty={mapDirty}
-                    loading={mapLoading}
-                  />
-                  {mapError ? <Alert status="danger">{mapError}</Alert> : null}
-                  <AnnouncementPanel />
-                </>
-              ) : null}
-
-              {showProvisionKey ? (
-                <ProvisionKeyPanel value={provisionSshKey} error={provisionError} />
-              ) : null}
-
-              {showChannelHealth ? <AlertChannelsPanel refreshToken={settingsRevision} /> : null}
+                {keepChannelHealthMounted ? (
+                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "channel_health"}>
+                    <AlertChannelsPanel refreshToken={settingsRevision} />
+                  </div>
+                ) : null}
+              </div>
             </div>
           )}
         </div>
@@ -334,6 +403,23 @@ export function SettingsPage() {
       }
       return { ...current, [field.key]: value };
     });
+  }
+
+  function selectCategory(category: ActiveSection) {
+    setActiveSection(category);
+    setQuery("");
+  }
+
+  function selectSubsection(category: SettingsCategoryId, id: string) {
+    setActiveSubsections((current) => ({ ...current, [category]: id }));
+  }
+
+  function revealFirstFieldError(errors: Record<string, string[]>) {
+    const field = snapshot?.schema.fields.find((candidate) => errors[candidate.key]?.length);
+    if (!field) return;
+    setActiveSection(field.category);
+    selectSubsection(field.category, subsectionIdForField(field));
+    setQuery("");
   }
 
   function resetDraft() {
@@ -363,6 +449,7 @@ export function SettingsPage() {
         const validation = await validateSettings(snapshot.revision, updates);
         if (!validation.valid) {
           setFieldErrors(validation.fieldErrors);
+          revealFirstFieldError(validation.fieldErrors);
           setBanner({
             kind: "destructive",
             text: validation.formErrors[0] || t("settings.validationFailed"),
@@ -432,6 +519,9 @@ export function SettingsPage() {
           setMapSaved(latest);
           setMapDraft(rebaseMapDisplaySettings(latest, mapSaved, mapDraft));
           setMapError("");
+          setActiveSection("general_display");
+          selectSubsection("general_display", PANEL_SUBSECTION_IDS.map);
+          setQuery("");
           setBanner({
             kind: "warning",
             text: settingsSaved
@@ -448,7 +538,11 @@ export function SettingsPage() {
       }
       if (cause instanceof ApiError && cause.code === "SETTINGS_VALIDATION_FAILED") {
         const errors = cause.details?.fieldErrors;
-        if (errors && typeof errors === "object") setFieldErrors(errors as Record<string, string[]>);
+        if (errors && typeof errors === "object") {
+          const nextErrors = errors as Record<string, string[]>;
+          setFieldErrors(nextErrors);
+          revealFirstFieldError(nextErrors);
+        }
       }
       setBanner({
         kind: "destructive",
@@ -550,6 +644,93 @@ function SettingsNavButton({
   );
 }
 
+function SettingsSubnav({
+  items,
+  value,
+  panelId,
+  onChange,
+}: {
+  items: SettingsSubsection[];
+  value: string;
+  panelId: string;
+  onChange: (id: string) => void;
+}) {
+  const { t } = useLocaleText();
+  const listRef = React.useRef<HTMLDivElement>(null);
+  const selectedIndex = Math.max(0, items.findIndex((item) => item.id === value));
+
+  const selectAt = (index: number) => {
+    const item = items[index];
+    if (!item) return;
+    onChange(item.id);
+    listRef.current
+      ?.querySelector<HTMLButtonElement>(`[data-settings-subsection-index="${index}"]`)
+      ?.focus();
+  };
+
+  return (
+    <div className="max-w-full overflow-x-auto pb-1">
+      <div
+        ref={listRef}
+        role="tablist"
+        aria-label={t("settings.groupsAria")}
+        aria-orientation="horizontal"
+        className="flex min-w-max gap-2 border-b pb-2"
+        onKeyDown={(event) => {
+          if (event.key === "ArrowRight") {
+            event.preventDefault();
+            selectAt((selectedIndex + 1) % items.length);
+          } else if (event.key === "ArrowLeft") {
+            event.preventDefault();
+            selectAt((selectedIndex - 1 + items.length) % items.length);
+          } else if (event.key === "Home") {
+            event.preventDefault();
+            selectAt(0);
+          } else if (event.key === "End") {
+            event.preventDefault();
+            selectAt(items.length - 1);
+          }
+        }}
+      >
+        {items.map((item, index) => {
+          const selected = item.id === value;
+          const fieldCountLabel = item.fieldCount == null
+            ? ""
+            : t("settings.fieldCount", { count: item.fieldCount });
+          const dirtyCountLabel = item.dirtyCount
+            ? t("settings.changedFieldCount", { count: item.dirtyCount })
+            : "";
+          return (
+            <button
+              key={item.id}
+              type="button"
+              role="tab"
+              id={`${panelId}-tab-${index}`}
+              data-settings-subsection-index={index}
+              aria-controls={panelId}
+              aria-selected={selected}
+              aria-label={[item.label, fieldCountLabel, dirtyCountLabel].filter(Boolean).join(", ")}
+              tabIndex={selected ? 0 : -1}
+              onClick={() => onChange(item.id)}
+              className={`grid min-h-[58px] min-w-[9rem] content-center rounded-md border px-3 py-2 text-left transition-colors ${selected
+                ? "border-primary bg-primary/10 text-foreground"
+                : "border-border bg-background text-muted-foreground hover:border-foreground/30 hover:bg-muted/40 hover:text-foreground"}`}
+            >
+              <span className="whitespace-nowrap text-sm font-medium">{item.label}</span>
+              {fieldCountLabel || dirtyCountLabel ? (
+                <span className="mt-1 flex items-center gap-2 whitespace-nowrap text-[11px] tabular-nums">
+                  {fieldCountLabel ? <span>{fieldCountLabel}</span> : null}
+                  {dirtyCountLabel ? <span className="font-medium text-amber-700">{dirtyCountLabel}</span> : null}
+                </span>
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function SettingsFieldRow({
   field,
   entry,
@@ -604,10 +785,22 @@ function SettingsFieldRow({
 
       <div className="grid content-start gap-2">
         {field.fieldType === "bool" ? (
-          <div className="flex min-h-10 items-center justify-between border px-3">
-            <span className="text-sm text-muted-foreground">{Boolean(value) ? t("common.enabled") : t("common.disabled")}</span>
-            <Switch isSelected={Boolean(value)} onChange={(selected: boolean) => onChange(selected)} isDisabled={locked} />
-          </div>
+          <Switch
+            aria-label={settingsFieldLabel(t, field)}
+            isSelected={Boolean(value)}
+            onChange={(selected: boolean) => onChange(selected)}
+            isDisabled={locked}
+            className="flex min-h-10 w-full items-center justify-between rounded-none border px-3"
+          >
+            <Switch.Content>
+              <span className="text-sm text-muted-foreground">
+                {Boolean(value) ? t("common.enabled") : t("common.disabled")}
+              </span>
+            </Switch.Content>
+            <Switch.Control>
+              <Switch.Thumb />
+            </Switch.Control>
+          </Switch>
         ) : field.fieldType === "select" ? (
           <CompactSelect
             value={String(value || field.default || "")}
@@ -689,6 +882,122 @@ function groupFields(fields: SettingsField[]) {
   const groups = new Map<string, SettingsField[]>();
   for (const field of fields) groups.set(field.group, [...(groups.get(field.group) || []), field]);
   return [...groups.entries()];
+}
+
+function groupSubsectionId(group: string) {
+  return `group:${group}`;
+}
+
+function buildSettingsSubsections(
+  category: SettingsCategoryId,
+  fields: SettingsField[],
+  values: Record<string, SettingValueEntry>,
+  dirty: Record<string, DirtyValue>,
+  mapDirty: boolean,
+  t: ReturnType<typeof useLocaleText>["t"],
+) {
+  if (category === "notifications") {
+    return buildNotificationSubsections(fields, values, dirty, t);
+  }
+
+  const items: SettingsSubsection[] = groupFields(fields).map(([group, groupItems]) => ({
+    id: groupSubsectionId(group),
+    label: settingsGroupLabel(t, group),
+    groups: [group],
+    fieldCount: groupItems.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length,
+    dirtyCount: groupItems.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length,
+  }));
+
+  if (category === "general_display") {
+    items.push(
+      {
+        id: PANEL_SUBSECTION_IDS.map,
+        label: t("settings.map"),
+        panel: "map",
+        dirtyCount: mapDirty ? 1 : 0,
+      },
+      {
+        id: PANEL_SUBSECTION_IDS.announcement,
+        label: t("settings.announcement"),
+        panel: "announcement",
+        dirtyCount: 0,
+      },
+    );
+  } else if (category === "marketplace") {
+    items.push({
+      id: PANEL_SUBSECTION_IDS.provision_key,
+      label: t("settings.provisionSshKeyTitle"),
+      panel: "provision_key",
+      dirtyCount: 0,
+    });
+  }
+
+  return items;
+}
+
+function buildNotificationSubsections(
+  fields: SettingsField[],
+  values: Record<string, SettingValueEntry>,
+  dirty: Record<string, DirtyValue>,
+  t: ReturnType<typeof useLocaleText>["t"],
+) {
+  const knownGroups = new Set<string>(Object.values(NOTIFICATION_SUBSECTION_GROUPS).flat());
+  const subsection = (
+    id: string,
+    label: string,
+    groups: readonly string[],
+    panel?: SettingsPanel,
+  ): SettingsSubsection => {
+    const subsectionFields = fields.filter((field) => groups.includes(field.group));
+    return {
+      id,
+      label,
+      groups: [...groups],
+      panel,
+      fieldCount: subsectionFields.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length,
+      dirtyCount: subsectionFields.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length,
+    };
+  };
+
+  const items = [
+    subsection(
+      NOTIFICATION_SUBSECTION_IDS.system,
+      t("settings.notifications.system"),
+      NOTIFICATION_SUBSECTION_GROUPS.system,
+    ),
+    subsection(
+      NOTIFICATION_SUBSECTION_IDS.business,
+      t("settings.notifications.business"),
+      NOTIFICATION_SUBSECTION_GROUPS.business,
+    ),
+    subsection(
+      NOTIFICATION_SUBSECTION_IDS.channels,
+      t("settings.notifications.channels"),
+      NOTIFICATION_SUBSECTION_GROUPS.channels,
+      "channel_health",
+    ),
+  ];
+
+  const unclassified = fields.filter((field) => !knownGroups.has(field.group));
+  items.push(...groupFields(unclassified).map(([group, groupItems]) => ({
+    id: groupSubsectionId(group),
+    label: settingsGroupLabel(t, group),
+    groups: [group],
+    fieldCount: groupItems.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length,
+    dirtyCount: groupItems.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length,
+  })));
+
+  return items;
+}
+
+function subsectionIdForField(field: SettingsField) {
+  if (field.category !== "notifications") return groupSubsectionId(field.group);
+  for (const [subsection, groups] of Object.entries(NOTIFICATION_SUBSECTION_GROUPS)) {
+    if ((groups as readonly string[]).includes(field.group)) {
+      return NOTIFICATION_SUBSECTION_IDS[subsection as keyof typeof NOTIFICATION_SUBSECTION_IDS];
+    }
+  }
+  return groupSubsectionId(field.group);
 }
 
 function categoryDirtyCount(category: SettingsCategoryId, fields: SettingsField[], dirty: Record<string, DirtyValue>) {
