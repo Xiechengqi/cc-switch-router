@@ -1400,7 +1400,7 @@ export const messages = {
     "auth.useDifferentEmail": "Use a different email",
     "settings.title": "Settings",
     "settings.workspaceDescription":
-      "Manage persisted Router configuration by domain. Runtime values, environment overrides, and restart boundaries are shown alongside each field.",
+      "Manage Router configuration by domain. Every managed setting is saved through this page, with runtime values and restart boundaries shown alongside each field.",
     "settings.adminRequired": "Admin access required",
     "settings.adminRequiredDesc":
       "Sign in as a configured router administrator to edit runtime settings.",
@@ -1414,8 +1414,6 @@ export const messages = {
     "settings.pendingRestart": "{count} saved setting(s) are waiting for a Router restart.",
     "settings.pendingRestartShort": "pending restart",
     "settings.pendingRestartLabel": "Pending restart",
-    "settings.environmentOverrides": "Environment overrides",
-    "settings.environmentManaged": "Managed by process environment",
     "settings.persistedSource": "saved: {source}",
     "settings.runtimeSource": "runtime: {source}",
     "settings.effectiveValue": "Current runtime value: {value}",
@@ -1436,8 +1434,6 @@ export const messages = {
     "settings.validationFailed": "Review the highlighted settings before saving.",
     "settings.revisionConflict":
       "Settings changed elsewhere. Latest values were loaded and your edits were preserved. Review them before saving again.",
-    "settings.environmentOverrideChanged":
-      "One or more settings are now managed by the process environment. Latest values were loaded and locked fields were removed from this draft.",
     "settings.mapRevisionConflict":
       "Map display changed elsewhere. The latest saved version was loaded and your draft was preserved for review.",
     "settings.mapRevisionConflictAfterSettings":
@@ -4021,7 +4017,7 @@ export const messages = {
     "auth.useDifferentEmail": "使用其他邮箱",
     "settings.title": "设置",
     "settings.workspaceDescription":
-      "按配置域管理 Router 持久化设置，并同时查看运行时有效值、进程环境覆盖和重启生效边界。",
+      "按配置域管理 Router 配置。所有受管设置均可在此页面保存，并同时展示运行时有效值和重启生效边界。",
     "settings.adminRequired": "需要管理员权限",
     "settings.adminRequiredDesc":
       "请使用已配置的 router 管理员账号登录后编辑运行时设置。",
@@ -4034,8 +4030,6 @@ export const messages = {
     "settings.pendingRestart": "有 {count} 项已保存设置正在等待 Router 重启后生效。",
     "settings.pendingRestartShort": "等待重启",
     "settings.pendingRestartLabel": "等待重启",
-    "settings.environmentOverrides": "环境变量覆盖",
-    "settings.environmentManaged": "由进程环境变量管理",
     "settings.persistedSource": "持久化：{source}",
     "settings.runtimeSource": "运行时：{source}",
     "settings.effectiveValue": "当前运行值：{value}",
@@ -4056,8 +4050,6 @@ export const messages = {
     "settings.validationFailed": "请检查标出的设置后再保存。",
     "settings.revisionConflict":
       "设置已被其他操作修改。已加载最新值并保留你的草稿，请复核后再次保存。",
-    "settings.environmentOverrideChanged":
-      "部分设置现已由进程环境变量接管。已加载最新值，并从草稿中移除被锁定字段。",
     "settings.mapRevisionConflict":
       "地图显示已被其他操作修改。已加载最新版本并保留你的地图草稿，请复核后再次保存。",
     "settings.mapRevisionConflictAfterSettings":

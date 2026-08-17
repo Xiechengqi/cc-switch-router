@@ -94,13 +94,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let external_settings_env =
-        crate::admin::settings::SettingsRuntimeSnapshot::capture_external_env();
     let env_path = ensure_default_env_file()?;
     load_env_file(&env_path)?;
     ensure_startup_config(&env_path, StartupConfigMode::Start)?;
-    let settings_runtime =
-        crate::admin::settings::SettingsRuntimeSnapshot::capture(external_settings_env, &env_path)?;
+    let settings_runtime = crate::admin::settings::SettingsRuntimeSnapshot::capture(&env_path)?;
 
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())

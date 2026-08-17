@@ -191,14 +191,12 @@ pub struct SettingValueEntry {
     pub effective_value: Option<String>,
     pub effective_has_value: bool,
     pub effective_source: ValueSource,
-    pub overridden_by_environment: bool,
     pub pending_restart: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValueSource {
-    ProcessEnv,
     EnvFile,
     Default,
     Runtime,
@@ -214,27 +212,12 @@ pub struct SettingsValuesResponse {
 
 #[derive(Debug, Clone)]
 pub struct SettingsRuntimeSnapshot {
-    external_env: Arc<HashMap<String, String>>,
     startup_effective: Arc<HashMap<String, String>>,
     startup_file_keys: Arc<HashSet<String>>,
 }
 
 impl SettingsRuntimeSnapshot {
-    pub fn capture_external_env() -> HashMap<String, String> {
-        SETTINGS_FIELDS
-            .iter()
-            .filter_map(|field| {
-                std::env::var(field.key)
-                    .ok()
-                    .map(|value| (field.key.to_string(), value))
-            })
-            .collect()
-    }
-
-    pub fn capture(
-        external_env: HashMap<String, String>,
-        env_path: &Path,
-    ) -> Result<Self, AppError> {
+    pub fn capture(env_path: &Path) -> Result<Self, AppError> {
         let startup_file_keys = read_env_file(env_path)?.into_keys().collect();
         let startup_effective = SETTINGS_FIELDS
             .iter()
@@ -245,7 +228,6 @@ impl SettingsRuntimeSnapshot {
             })
             .collect();
         Ok(Self {
-            external_env: Arc::new(external_env),
             startup_effective: Arc::new(startup_effective),
             startup_file_keys: Arc::new(startup_file_keys),
         })
@@ -253,14 +235,9 @@ impl SettingsRuntimeSnapshot {
 
     pub fn for_tests() -> Self {
         Self {
-            external_env: Arc::new(HashMap::new()),
             startup_effective: Arc::new(HashMap::new()),
             startup_file_keys: Arc::new(HashSet::new()),
         }
-    }
-
-    pub fn is_environment_override(&self, key: &str) -> bool {
-        self.external_env.contains_key(key)
     }
 }
 
@@ -273,7 +250,6 @@ pub struct SettingsSnapshotResponse {
     pub schema: SettingsSchemaResponse,
     pub values: Vec<SettingValueEntry>,
     pub pending_restart_keys: Vec<String>,
-    pub environment_override_keys: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2146,11 +2122,6 @@ pub fn snapshot_response(
         .filter(|entry| entry.pending_restart)
         .map(|entry| entry.key.clone())
         .collect();
-    let environment_override_keys = values
-        .iter()
-        .filter(|entry| entry.overridden_by_environment)
-        .map(|entry| entry.key.clone())
-        .collect();
     Ok(SettingsSnapshotResponse {
         revision: settings_revision(&file_kv),
         generated_at: chrono::Utc::now().to_rfc3339(),
@@ -2158,7 +2129,6 @@ pub fn snapshot_response(
         schema: schema_response(),
         values,
         pending_restart_keys,
-        environment_override_keys,
     })
 }
 
@@ -2184,7 +2154,6 @@ fn value_entries(
         .iter()
         .map(|field| {
             let (source, configured) = configured_value(field, file_kv);
-            let overridden_by_environment = runtime.is_environment_override(field.key);
             let live_dynamic = if field.dynamic_group.is_some() {
                 dynamic_state
                     .map(|(dynamic, config)| dynamic_effective_value(field, dynamic, config))
@@ -2192,17 +2161,7 @@ fn value_entries(
             } else {
                 None
             };
-            let (effective_source, effective) = if overridden_by_environment {
-                let effective = live_dynamic.unwrap_or_else(|| {
-                    runtime
-                        .external_env
-                        .get(field.key)
-                        .filter(|value| !value.trim().is_empty())
-                        .cloned()
-                        .or_else(|| resolved_default_value(field))
-                });
-                (ValueSource::ProcessEnv, effective)
-            } else if let Some(effective) = live_dynamic {
+            let (effective_source, effective) = if let Some(effective) = live_dynamic {
                 (
                     dynamic_effective_source(
                         field,
@@ -2238,9 +2197,8 @@ fn value_entries(
             let is_secret = matches!(field.field_type, FieldType::Secret);
             let values_differ = normalized_field_comparison(field, configured.as_deref())
                 != normalized_field_comparison(field, effective.as_deref());
-            let pending_restart = !overridden_by_environment
-                && values_differ
-                && (field.restart_required || field.dynamic_group.is_some());
+            let pending_restart =
+                values_differ && (field.restart_required || field.dynamic_group.is_some());
             Ok(SettingValueEntry {
                 key: field.key.to_string(),
                 value: (!is_secret).then_some(configured).flatten(),
@@ -2250,7 +2208,6 @@ fn value_entries(
                 effective_value: (!is_secret).then_some(effective).flatten(),
                 effective_has_value,
                 effective_source,
-                overridden_by_environment,
                 pending_restart,
             })
         })
@@ -2495,28 +2452,11 @@ fn normalized_field_comparison(field: &SettingsField, value: Option<&str>) -> Op
         .or_else(|| normalized_comparison(Some(value)))
 }
 
-#[cfg(test)]
 pub fn validation_response(
     existing: &HashMap<String, String>,
     updates: &BTreeMap<String, Option<String>>,
 ) -> SettingsValidationResponse {
-    validation_response_with_environment(existing, updates, &HashMap::new())
-}
-
-pub fn validation_response_with_runtime(
-    existing: &HashMap<String, String>,
-    updates: &BTreeMap<String, Option<String>>,
-    runtime: &SettingsRuntimeSnapshot,
-) -> SettingsValidationResponse {
-    validation_response_with_environment(existing, updates, &runtime.external_env)
-}
-
-fn validation_response_with_environment(
-    existing: &HashMap<String, String>,
-    updates: &BTreeMap<String, Option<String>>,
-    environment: &HashMap<String, String>,
-) -> SettingsValidationResponse {
-    match validate_and_diff_with_environment(existing, updates, environment) {
+    match validate_and_diff(existing, updates) {
         Ok(outcome) => SettingsValidationResponse {
             valid: true,
             field_errors: BTreeMap::new(),
@@ -2563,26 +2503,9 @@ pub struct ApplyOutcome {
 /// Validate updates against the schema and compute the new in-memory env
 /// state. Does not touch disk — the caller writes the file under the same
 /// lock that protects DynamicSettings.
-#[cfg(test)]
 pub fn validate_and_diff(
     existing: &HashMap<String, String>,
     updates: &BTreeMap<String, Option<String>>,
-) -> Result<ApplyOutcome, AppError> {
-    validate_and_diff_with_environment(existing, updates, &HashMap::new())
-}
-
-pub fn validate_and_diff_with_runtime(
-    existing: &HashMap<String, String>,
-    updates: &BTreeMap<String, Option<String>>,
-    runtime: &SettingsRuntimeSnapshot,
-) -> Result<ApplyOutcome, AppError> {
-    validate_and_diff_with_environment(existing, updates, &runtime.external_env)
-}
-
-fn validate_and_diff_with_environment(
-    existing: &HashMap<String, String>,
-    updates: &BTreeMap<String, Option<String>>,
-    environment: &HashMap<String, String>,
 ) -> Result<ApplyOutcome, AppError> {
     let mut updated = Vec::new();
     let mut unchanged = Vec::new();
@@ -2601,25 +2524,35 @@ fn validate_and_diff_with_environment(
             None => None,
         };
         let prev = existing.get(key).cloned();
-        let prev_normalized = prev.as_deref().map(str::trim).map(str::to_string);
-        let next_normalized = next_value.as_deref().map(str::trim).map(str::to_string);
+        let prev_normalized = prev
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let next_normalized = next_value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
 
-        if prev_normalized == next_normalized {
-            unchanged.push(key.clone());
-            continue;
-        }
         if field.required && next_normalized.as_deref().unwrap_or("").is_empty() {
             return Err(AppError::BadRequest(format!(
                 "{} is required and cannot be cleared",
                 field.key
             )));
         }
+        if prev_normalized == next_normalized
+            && (next_normalized.is_some() || existing.contains_key(key))
+        {
+            unchanged.push(key.clone());
+            continue;
+        }
         match &next_normalized {
             Some(v) if !v.is_empty() => {
                 next.insert(key.clone(), v.clone());
             }
             _ => {
-                next.remove(key);
+                next.insert(key.clone(), String::new());
             }
         }
         updated.push(key.clone());
@@ -2635,7 +2568,11 @@ fn validate_and_diff_with_environment(
             }
         }
     }
-    let effective_next = effective_validation_values(&next, updates, environment);
+    let effective_next = next
+        .iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     validate_registration_admission_relations(&effective_next, updates)?;
     validate_client_notification_relations(&effective_next, updates)?;
     validate_alerting_relations(&effective_next, updates)?;
@@ -2654,26 +2591,6 @@ fn validate_and_diff_with_environment(
         dynamic_groups: groups,
         new_env_kv: next,
     })
-}
-
-fn effective_validation_values(
-    persisted: &BTreeMap<String, String>,
-    updates: &BTreeMap<String, Option<String>>,
-    environment: &HashMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut effective = persisted.clone();
-    for (key, value) in environment {
-        if updates.contains_key(key) {
-            continue;
-        }
-        let value = value.trim();
-        if value.is_empty() {
-            effective.remove(key);
-        } else {
-            effective.insert(key.clone(), value.to_string());
-        }
-    }
-    effective
 }
 
 /// Write the env file atomically: stage to `<path>.new`, fsync, rename over
@@ -3774,9 +3691,8 @@ fn effective_integer_setting(next: &BTreeMap<String, String>, key: &str) -> Resu
 /// This is the only path that mutates the in-memory dynamic state at
 /// runtime. It is intentionally diff-based:
 ///
-/// - Keys *not* mentioned in `updates` are left untouched — the boot
-///   snapshot (including values supplied via process env / systemd
-///   `Environment=`) survives an unrelated PATCH.
+/// - Keys *not* mentioned in `updates` are left untouched, so unrelated
+///   settings keep their current live value.
 /// - `Some(non_empty)` sets the field.
 /// - `Some(empty)` / `None` clears the field. Clearing means resetting
 ///   to its canonical "no override" state (which is the same default
@@ -4456,6 +4372,46 @@ mod tests {
     }
 
     #[test]
+    fn clearing_optional_field_persists_an_empty_assignment() {
+        let existing = HashMap::from([(
+            "CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL".into(),
+            "https://t.me/example".into(),
+        )]);
+        let updates = BTreeMap::from([("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL".into(), None)]);
+
+        let outcome = validate_and_diff(&existing, &updates).expect("clear optional setting");
+
+        assert_eq!(
+            outcome
+                .new_env_kv
+                .get("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL")
+                .map(String::as_str),
+            Some("")
+        );
+
+        let missing = HashMap::new();
+        let materialized =
+            validate_and_diff(&missing, &updates).expect("materialize empty assignment");
+        assert_eq!(
+            materialized
+                .new_env_kv
+                .get("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL")
+                .map(String::as_str),
+            Some("")
+        );
+
+        let already_empty =
+            HashMap::from([("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL".into(), String::new())]);
+        let unchanged =
+            validate_and_diff(&already_empty, &updates).expect("keep existing empty assignment");
+        assert!(unchanged.updated_keys.is_empty());
+        assert_eq!(
+            unchanged.unchanged_keys,
+            vec!["CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL"]
+        );
+    }
+
+    #[test]
     fn validate_returns_diff_and_dynamic_groups() {
         let mut existing = HashMap::new();
         existing.insert("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(), "7".into());
@@ -4553,8 +4509,7 @@ mod tests {
     #[test]
     fn clearing_admin_emails_revokes_extras_immediately() {
         let static_config = test_static_config();
-        // Start with a runtime that already has an extra admin loaded
-        // (the "boot-extra@example.com" from process env).
+        // Start with a runtime that already has an extra admin loaded at boot.
         let mut current = DynamicSettings::from_config(&static_config);
         assert!(current.admin_emails.contains("boot-extra@example.com"));
 
@@ -4729,7 +4684,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_snapshot_distinguishes_pending_restart_and_process_override() {
+    fn settings_snapshot_reports_persisted_restart_boundary() {
         let path = std::env::temp_dir().join(format!(
             "cc-switch-router-settings-snapshot-{}.env",
             uuid::Uuid::new_v4()
@@ -4737,7 +4692,6 @@ mod tests {
         std::fs::write(&path, "CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:81\n")
             .expect("write settings fixture");
         let startup = SettingsRuntimeSnapshot {
-            external_env: Arc::new(HashMap::new()),
             startup_effective: Arc::new(HashMap::from([(
                 "CC_SWITCH_ROUTER_API_ADDR".into(),
                 "0.0.0.0:80".into(),
@@ -4756,26 +4710,6 @@ mod tests {
         assert!(api_addr.pending_restart);
         assert_eq!(api_addr.value.as_deref(), Some("0.0.0.0:81"));
         assert_eq!(api_addr.effective_value.as_deref(), Some("0.0.0.0:80"));
-
-        let overridden = SettingsRuntimeSnapshot {
-            external_env: Arc::new(HashMap::from([(
-                "CC_SWITCH_ROUTER_API_ADDR".into(),
-                "0.0.0.0:82".into(),
-            )])),
-            startup_effective: startup.startup_effective,
-            startup_file_keys: startup.startup_file_keys,
-        };
-        let snapshot =
-            snapshot_response(&path, &overridden, &dynamic, &config).expect("overridden snapshot");
-        let api_addr = snapshot
-            .values
-            .iter()
-            .find(|entry| entry.key == "CC_SWITCH_ROUTER_API_ADDR")
-            .expect("API address entry");
-        assert!(api_addr.overridden_by_environment);
-        assert!(!api_addr.pending_restart);
-        assert_eq!(api_addr.effective_source, ValueSource::ProcessEnv);
-        assert_eq!(api_addr.effective_value.as_deref(), Some("0.0.0.0:82"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -4844,11 +4778,11 @@ mod tests {
     }
 
     #[test]
-    fn cross_field_validation_uses_process_environment_overrides() {
+    fn cross_field_validation_uses_persisted_settings() {
         let existing = HashMap::from([
             (
                 "CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT".into(),
-                "10".into(),
+                "80".into(),
             ),
             (
                 "CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT".into(),
@@ -4860,38 +4794,36 @@ mod tests {
             ),
             ("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN".into(), String::new()),
         ]);
-        let runtime = SettingsRuntimeSnapshot {
-            external_env: Arc::new(HashMap::from([
-                (
-                    "CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT".into(),
-                    "80".into(),
-                ),
-                (
-                    "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN".into(),
-                    "external-token".into(),
-                ),
-            ])),
-            startup_effective: Arc::new(HashMap::new()),
-            startup_file_keys: Arc::new(HashSet::new()),
-        };
 
         let too_low = BTreeMap::from([(
             "CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT".into(),
             Some("60".into()),
         )]);
-        assert!(validate_and_diff_with_runtime(&existing, &too_low, &runtime).is_err());
+        assert!(validate_and_diff(&existing, &too_low).is_err());
 
         let valid_cap = BTreeMap::from([(
             "CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT".into(),
             Some("100".into()),
         )]);
-        assert!(validate_and_diff_with_runtime(&existing, &valid_cap, &runtime).is_ok());
+        assert!(validate_and_diff(&existing, &valid_cap).is_ok());
 
         let enable_bot = BTreeMap::from([(
             "CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED".into(),
             Some("true".into()),
         )]);
-        assert!(validate_and_diff_with_runtime(&existing, &enable_bot, &runtime).is_ok());
+        assert!(validate_and_diff(&existing, &enable_bot).is_err());
+
+        let enable_bot_with_token = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED".into(),
+                Some("true".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN".into(),
+                Some("persisted-token".into()),
+            ),
+        ]);
+        assert!(validate_and_diff(&existing, &enable_bot_with_token).is_ok());
     }
 
     #[test]

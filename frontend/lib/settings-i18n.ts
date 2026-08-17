@@ -54,7 +54,7 @@ export function settingsFieldPlaceholder(t: TranslateFn, field: SettingsField) {
 
 export function settingsValueSource(t: TranslateFn, source?: string) {
   if (!source) return t("common.unset");
-  const normalized = source === "env_file" ? "envFile" : source === "process_env" ? "processEnv" : source;
+  const normalized = source === "env_file" ? "envFile" : source;
   const key = `settings.source.${normalized}` as MessageKey;
   return translateSettings(t, key, source);
 }

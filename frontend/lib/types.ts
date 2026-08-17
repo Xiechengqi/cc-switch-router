@@ -1153,11 +1153,10 @@ export type SettingValueEntry = {
   value?: string | null;
   hasValue: boolean;
   isSecret: boolean;
-  source: "process_env" | "env_file" | "default" | "runtime" | "unset";
+  source: "env_file" | "default" | "runtime" | "unset";
   effectiveValue?: string | null;
   effectiveHasValue: boolean;
-  effectiveSource: "process_env" | "env_file" | "default" | "runtime" | "unset";
-  overriddenByEnvironment: boolean;
+  effectiveSource: "env_file" | "default" | "runtime" | "unset";
   pendingRestart: boolean;
 };
 
@@ -1168,7 +1167,6 @@ export type SettingsSnapshot = {
   schema: SettingsSchema;
   values: SettingValueEntry[];
   pendingRestartKeys: string[];
-  environmentOverrideKeys: string[];
 };
 
 export type SettingsValidationResponse = {

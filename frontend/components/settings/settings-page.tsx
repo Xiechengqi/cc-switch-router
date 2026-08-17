@@ -8,7 +8,6 @@ import {
   Eye,
   KeyRound,
   Loader2,
-  LockKeyhole,
   RefreshCw,
   RotateCcw,
   Save,
@@ -497,22 +496,6 @@ export function SettingsPage() {
         }
         return;
       }
-      if (cause instanceof ApiError && cause.code === "SETTINGS_ENVIRONMENT_OVERRIDE") {
-        try {
-          const latest = await getSettings();
-          setSnapshot(latest);
-          setDirty(reconcileDirty(latest, dirty));
-          setFieldErrors({});
-          setSettingsRevision((revision) => revision + 1);
-          setBanner({ kind: "warning", text: t("settings.environmentOverrideChanged") });
-        } catch (reloadCause) {
-          setBanner({
-            kind: "destructive",
-            text: t("settings.conflictReloadFailed", { reason: errorMessage(reloadCause) }),
-          });
-        }
-        return;
-      }
       if (cause instanceof ApiError && cause.code === "MAP_DISPLAY_REVISION_CONFLICT") {
         try {
           const latest = await getMapDisplay();
@@ -569,10 +552,9 @@ function SettingsOverview({
   if (!snapshot) return null;
   return (
     <div className="grid gap-7">
-      <section className="grid border-y sm:grid-cols-3 sm:divide-x">
+      <section className="grid border-y sm:grid-cols-2 sm:divide-x">
         <OverviewStat label={t("settings.configuredFields")} value={snapshot.schema.fields.length} />
         <OverviewStat label={t("settings.pendingRestartLabel")} value={snapshot.pendingRestartKeys.length} tone={snapshot.pendingRestartKeys.length ? "warning" : "default"} />
-        <OverviewStat label={t("settings.environmentOverrides")} value={snapshot.environmentOverrideKeys.length} tone={snapshot.environmentOverrideKeys.length ? "warning" : "default"} />
       </section>
 
       {dirtyCount ? <Alert status="warning">{t("settings.unsavedChanges", { count: dirtyCount })}</Alert> : null}
@@ -748,7 +730,6 @@ function SettingsFieldRow({
   t: ReturnType<typeof useLocaleText>["t"];
   onChange: (value: DirtyValue) => void;
 }) {
-  const locked = !!entry?.overriddenByEnvironment;
   const secretClearing = field.fieldType === "secret" && value === null;
   const inputValue = secretClearing ? "" : String(value ?? "");
   return (
@@ -769,14 +750,13 @@ function SettingsFieldRow({
           <span>·</span>
           <span>{t("settings.runtimeSource", { source: settingsValueSource(t, entry?.effectiveSource) })}</span>
           {entry?.pendingRestart ? <span className="text-amber-700">· {t("settings.pendingRestartShort")}</span> : null}
-          {locked ? <span className="inline-flex items-center gap-1 text-amber-700"><LockKeyhole className="h-3 w-3" />{t("settings.environmentManaged")}</span> : null}
         </div>
-        {(entry?.pendingRestart || locked) && !entry?.isSecret ? (
+        {entry?.pendingRestart && !entry?.isSecret ? (
           <p className="mt-2 text-xs text-muted-foreground">
             {t("settings.effectiveValue", { value: entry.effectiveValue || t("common.unset") })}
           </p>
         ) : null}
-        {(entry?.pendingRestart || locked) && entry?.isSecret ? (
+        {entry?.pendingRestart && entry?.isSecret ? (
           <p className="mt-2 text-xs text-muted-foreground">
             {entry.effectiveHasValue ? t("settings.effectiveSecretSet") : t("settings.effectiveSecretUnset")}
           </p>
@@ -789,7 +769,6 @@ function SettingsFieldRow({
             aria-label={settingsFieldLabel(t, field)}
             isSelected={Boolean(value)}
             onChange={(selected: boolean) => onChange(selected)}
-            isDisabled={locked}
             className="flex min-h-10 w-full items-center justify-between rounded-none border px-3"
           >
             <Switch.Content>
@@ -811,13 +790,11 @@ function SettingsFieldRow({
             onChange={onChange}
             ariaLabel={settingsFieldLabel(t, field)}
             triggerClassName="min-h-10 text-sm"
-            disabled={locked}
           />
         ) : field.fieldType === "email_list" || field.fieldType === "ip_list" || field.fieldType === "url_list" ? (
           <TextArea
             id={field.key}
             value={inputValue}
-            disabled={locked}
             onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
             placeholder={settingsFieldPlaceholder(t, field)}
           />
@@ -829,7 +806,6 @@ function SettingsFieldRow({
             max={field.constraints.max}
             step={field.constraints.step}
             value={inputValue}
-            disabled={locked}
             onChange={(event) => onChange(event.target.value)}
             placeholder={field.fieldType === "secret" && entry?.hasValue
               ? t("settings.secretKeepPlaceholder")
@@ -838,7 +814,7 @@ function SettingsFieldRow({
         )}
 
         {field.unit ? <span className="text-right text-xs text-muted-foreground">{field.unit}</span> : null}
-        {field.fieldType === "secret" && !locked ? (
+        {field.fieldType === "secret" ? (
           <div className="flex min-h-8 items-center justify-between gap-3">
             <span className={`text-xs ${secretClearing ? "text-red-600" : "text-muted-foreground"}`}>
               {secretClearing
@@ -1018,7 +994,7 @@ function dependenciesSatisfied(
 }
 
 function baseValue(field: SettingsField, entry?: SettingValueEntry): DirtyValue {
-  const configured = entry?.overriddenByEnvironment ? entry.effectiveValue : entry?.value;
+  const configured = entry?.value;
   if (field.fieldType === "bool") {
     const raw = configured || field.default || "";
     return raw === "true" || raw === "1" || raw === "yes" || raw === "on";
@@ -1062,7 +1038,7 @@ function reconcileDirty(snapshot: SettingsSnapshot, current: Record<string, Dirt
   for (const [key, value] of Object.entries(current)) {
     const field = snapshot.schema.fields.find((candidate) => candidate.key === key);
     const entry = entries[key];
-    if (!field || entry?.overriddenByEnvironment) continue;
+    if (!field) continue;
     if (field.fieldType === "secret") {
       if (value === null ? entry?.hasValue : String(value).trim()) next[key] = value;
       continue;

@@ -89,7 +89,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。
 
-进程启动前显式注入的环境变量优先于 `.env`，Settings 将这类字段标记为只读，并同时展示持久化来源与运行时来源。热更新字段的运行值直接读取当前 `DynamicSettings`；绕过 API 手工修改 `.env` 时，页面会保留实际内存值并标记等待重启，不会把文件值误报为已生效。Secret 只返回是否已配置，API 从不返回明文；清除 Secret 必须使用显式操作。`.env` 与备份写入采用 `0600` 权限、临时文件 fsync 和同目录原子 rename，需要重启的字段保存后会持续显示 pending restart，直到新进程读取该值。
+Settings 管理的 `.env` 是 Router 配置的唯一权威来源，启动时会覆盖进程中预先存在的同名变量，全部字段均可通过 Web 修改。热更新字段的运行值直接读取当前 `DynamicSettings`；绕过 API 手工修改 `.env` 时，页面会保留实际内存值并标记等待重启，不会把文件值误报为已生效。Secret 只返回是否已配置，API 从不返回明文；清除 Secret 必须使用显式操作。`.env` 与备份写入采用 `0600` 权限、临时文件 fsync 和同目录原子 rename，需要重启的字段保存后会持续显示 pending restart，直到新进程读取该值。
 
 配置契约由 Rust 单元测试和前端审计共同保护。修改 Settings 字段时需运行：
 
@@ -118,7 +118,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 
 默认配置文件路径:`$HOME/.cc-switch-router/.env`
 
-启动时如果这个文件不存在,`cc-switch-router` 会自动生成默认 `.env`,然后按该文件加载配置。进程环境变量优先级更高,会覆盖 `.env` 里的同名配置。
+启动时如果这个文件不存在,`cc-switch-router` 会自动生成默认 `.env`,然后按该文件加载配置。`.env` 中的受管配置优先于进程中预先存在的同名变量，后续通过 Web Settings 统一修改。
 
 可用环境变量:
 

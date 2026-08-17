@@ -145,7 +145,6 @@ export const SETTINGS_GROUP_SLUG: Record<string, string> = {
 };
 
 export const settingsMessagesEn = {
-  "settings.source.processEnv": "process environment",
   "settings.source.envFile": "env file",
   "settings.source.default": "default",
   "settings.source.runtime": "in-memory state",
@@ -425,7 +424,6 @@ export const settingsMessagesEn = {
 } as const;
 
 export const settingsMessagesZh = {
-  "settings.source.processEnv": "进程环境变量",
   "settings.source.envFile": "环境文件",
   "settings.source.default": "默认值",
   "settings.source.runtime": "内存状态",

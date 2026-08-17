@@ -1216,17 +1216,15 @@ pub fn load_env_file(path: &PathBuf) -> Result<()> {
             anyhow::bail!("empty env key on line {} in {}", index + 1, path.display());
         }
 
-        if env::var_os(key).is_none() {
-            let value = decode_env_value(raw_value).map_err(|message| {
-                anyhow::anyhow!(
-                    "invalid env value on line {} in {}: {message}",
-                    index + 1,
-                    path.display()
-                )
-            })?;
-            unsafe {
-                env::set_var(key, value);
-            }
+        let value = decode_env_value(raw_value).map_err(|message| {
+            anyhow::anyhow!(
+                "invalid env value on line {} in {}: {message}",
+                index + 1,
+                path.display()
+            )
+        })?;
+        unsafe {
+            env::set_var(key, value);
         }
     }
 
@@ -2239,5 +2237,57 @@ mod tests {
         unsafe {
             env::remove_var("CC_SWITCH_ROUTER_TEST_BOOL_GARBAGE");
         }
+    }
+
+    #[test]
+    fn managed_env_file_overrides_process_environment() {
+        let key = "CC_SWITCH_ROUTER_MANAGED_ENV_PRECEDENCE_TEST";
+        let previous = env::var_os(key);
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-managed-env-{}.env",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, format!("{key}=from-settings\n")).expect("write managed env fixture");
+        unsafe {
+            env::set_var(key, "from-process");
+        }
+
+        load_env_file(&path).expect("load managed env");
+        assert_eq!(env::var(key).as_deref(), Ok("from-settings"));
+
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var(key, value);
+            } else {
+                env::remove_var(key);
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_env_file_empty_value_clears_process_environment() {
+        let key = "CC_SWITCH_ROUTER_MANAGED_ENV_CLEAR_TEST";
+        let previous = env::var_os(key);
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-managed-env-clear-{}.env",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, format!("{key}=\n")).expect("write managed env fixture");
+        unsafe {
+            env::set_var(key, "from-process");
+        }
+
+        load_env_file(&path).expect("load managed env");
+        assert_eq!(env::var(key).as_deref(), Ok(""));
+
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var(key, value);
+            } else {
+                env::remove_var(key);
+            }
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

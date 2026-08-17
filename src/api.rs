@@ -23,8 +23,7 @@ use crate::admin::{
     settings::{
         SettingsSnapshotResponse, SettingsUpdateRequest, SettingsUpdateResponse,
         SettingsValidationResponse, apply_updates_to_dynamic, read_env_file, settings_revision,
-        snapshot_response, validate_and_diff_with_runtime, validation_response_with_runtime,
-        write_env_file_atomic,
+        snapshot_response, validate_and_diff, validation_response, write_env_file_atomic,
     },
     upgrade::{UpgradeLogEntry, UpgradeStatus},
     version::{
@@ -5698,12 +5697,7 @@ async fn admin_settings_validate(
     let _settings_guard = state.dynamic.read().await;
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
-    ensure_settings_not_environment_overridden(&state, &input)?;
-    Ok(Json(validation_response_with_runtime(
-        &existing,
-        &input.updates,
-        &state.settings_runtime,
-    )))
+    Ok(Json(validation_response(&existing, &input.updates)))
 }
 
 async fn admin_settings_apply(
@@ -5723,23 +5717,16 @@ async fn admin_settings_apply(
     // 2) load current env, validate updates against the schema.
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
-    ensure_settings_not_environment_overridden(&state, &input)?;
-    let outcome =
-        validate_and_diff_with_runtime(&existing, &input.updates, &state.settings_runtime)
-            .map_err(|error| {
-                let validation = validation_response_with_runtime(
-                    &existing,
-                    &input.updates,
-                    &state.settings_runtime,
-                );
-                AppError::Coded {
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    code: "SETTINGS_VALIDATION_FAILED",
-                    message: error.to_string(),
-                    details: serde_json::to_value(validation)
-                        .unwrap_or_else(|_| serde_json::json!({ "valid": false })),
-                }
-            })?;
+    let outcome = validate_and_diff(&existing, &input.updates).map_err(|error| {
+        let validation = validation_response(&existing, &input.updates);
+        AppError::Coded {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "SETTINGS_VALIDATION_FAILED",
+            message: error.to_string(),
+            details: serde_json::to_value(validation)
+                .unwrap_or_else(|_| serde_json::json!({ "valid": false })),
+        }
+    })?;
     let mut next_dynamic = dynamic_guard.clone();
     apply_updates_to_dynamic(&mut next_dynamic, &input.updates, &state.config);
     let telegram_settings_changed = next_dynamic.telegram_bot != dynamic_guard.telegram_bot;
@@ -5766,9 +5753,8 @@ async fn admin_settings_apply(
             ))
         })?;
     }
-    // Process-level environment variables can make the live value differ from
-    // the value already present in .env. Compare the actual runtime policies so
-    // re-applying an unchanged file value still advances the durable boundary.
+    // Compare the actual runtime policies so re-applying a persisted value can
+    // still advance the durable activation boundary after an interrupted sync.
     let needs_client_notification_sync =
         next_dynamic.client_notifications != dynamic_guard.client_notifications
             || telegram_settings_changed;
@@ -5928,26 +5914,6 @@ fn ensure_settings_revision(
         "SETTINGS_REVISION_CONFLICT",
         "settings changed after this page was loaded; reload and review the latest values",
         serde_json::json!({ "currentRevision": current_revision }),
-    ))
-}
-
-fn ensure_settings_not_environment_overridden(
-    state: &ServerState,
-    input: &SettingsUpdateRequest,
-) -> Result<(), AppError> {
-    let keys = input
-        .updates
-        .keys()
-        .filter(|key| state.settings_runtime.is_environment_override(key))
-        .cloned()
-        .collect::<Vec<_>>();
-    if keys.is_empty() {
-        return Ok(());
-    }
-    Err(AppError::coded_conflict(
-        "SETTINGS_ENVIRONMENT_OVERRIDE",
-        "settings supplied by the process environment cannot be changed from the Router UI",
-        serde_json::json!({ "keys": keys }),
     ))
 }
 
