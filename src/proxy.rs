@@ -6916,6 +6916,7 @@ mod tests {
             upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
             share_edit_events,
             env_path: std::env::temp_dir().join("cc-switch-router-proxy-test.env"),
+            settings_runtime: crate::admin::settings::SettingsRuntimeSnapshot::for_tests(),
             start_instant: Instant::now(),
             scheduling_overrides: crate::scheduling_signals::OverrideStore::new(),
             clock_health: crate::clock_health::ClockHealthService::new(config.clock_health.clone())
@@ -6970,6 +6971,7 @@ mod tests {
             resend_from_name: None,
             resend_reply_to: None,
             client_notifications: crate::config::ClientNotificationSettings::default(),
+            telegram_bot: crate::config::TelegramBotSettings::default(),
             auth_code_ttl_secs: 600,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 7 * 24 * 60 * 60,
@@ -7318,7 +7320,7 @@ mod tests {
         }
         assert_eq!(
             proxy_request_body_limit("/v1/messages?beta=true", &limits),
-            2 * 1024 * 1024
+            10 * 1024 * 1024
         );
     }
 

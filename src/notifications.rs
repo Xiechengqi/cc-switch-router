@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,9 +10,10 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{ClientNotificationSettings, Config};
+use crate::config::{ClientNotificationSettings, Config, TelegramBotSettings};
 use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
+use crate::notification_channels::NotificationChannelId;
 use crate::store::AppStore;
 
 const DELIVERY_INTERVAL_SECS: u64 = 5;
@@ -150,6 +152,38 @@ pub struct NotificationTemplateContext {
     pub delivery_configured: bool,
     /// Changes whenever a restart loads different delivery configuration.
     pub delivery_config_fingerprint: String,
+    /// Refreshed from dynamic settings on every delivery tick, so enabling or
+    /// disabling the bot takes effect without a restart.
+    pub telegram: TelegramNotificationContext,
+}
+
+/// Telegram half of the delivery configuration.
+///
+/// The caps are deliberately *not* the email caps: an email costs Resend
+/// quota, a Telegram message does not, and the operator sizes them
+/// independently. Attempts are counted per channel, so enabling Telegram does
+/// not consume or delay an email delivery slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramNotificationContext {
+    pub enabled: bool,
+    pub recipient_hourly_limit: i64,
+    pub global_hourly_limit: i64,
+}
+
+impl Default for TelegramNotificationContext {
+    fn default() -> Self {
+        Self::from_settings(&TelegramBotSettings::default())
+    }
+}
+
+impl TelegramNotificationContext {
+    pub fn from_settings(settings: &TelegramBotSettings) -> Self {
+        Self {
+            enabled: settings.is_operational(),
+            recipient_hourly_limit: settings.recipient_hourly_limit.max(0),
+            global_hourly_limit: settings.global_hourly_limit.max(0),
+        }
+    }
 }
 
 impl NotificationTemplateContext {
@@ -182,6 +216,7 @@ impl NotificationTemplateContext {
             reply_to,
             delivery_configured,
             delivery_config_fingerprint,
+            telegram: TelegramNotificationContext::from_settings(&config.telegram_bot),
         }
     }
 }
@@ -224,12 +259,22 @@ impl NotificationAggregateStats {
     }
 }
 
-/// A fully frozen Resend request. Retried deliveries must reuse every field and
-/// the idempotency key byte-for-byte.
+/// A fully frozen delivery request. Retried deliveries must reuse every field
+/// and the idempotency key byte-for-byte.
+///
+/// `channel` decides how the frozen fields are read: `Email` uses the RFC
+/// envelope (`from`/`reply_to`/`subject`/`html`), `Telegram` uses
+/// `subject` + `text` as the message body and `channel_target` as the chat id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientNotificationBatch {
     pub id: String,
+    pub attempt_id: String,
     pub recipient: String,
+    pub recipient_user_id: Option<String>,
+    pub channel: NotificationChannelId,
+    pub channel_target: Option<String>,
+    pub target_revision: i64,
+    pub provider_identity: Option<String>,
     pub from: String,
     pub reply_to: Option<String>,
     pub subject: String,
@@ -250,11 +295,14 @@ pub enum ClientNotificationClaim {
 #[serde(rename_all = "camelCase")]
 pub struct ClientNotificationDeliveryView {
     pub id: String,
+    pub channel: String,
     pub delivery_kind: String,
     pub event_kind: String,
     pub event_count: u64,
-    pub recipient_masked: String,
+    pub target_masked: String,
     pub status: String,
+    pub failure_kind: Option<String>,
+    pub blocked_reason_code: Option<String>,
     pub attempts: u32,
     pub created_at: String,
     pub next_attempt_at: Option<String>,
@@ -300,6 +348,14 @@ pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
         now: DateTime<Utc>,
     ) -> Result<bool, AppError>;
 
+    async fn start_client_notification_attempt(
+        &self,
+        batch_id: &str,
+        attempt_id: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError>;
+
     async fn mark_client_notification_batch_sent(
         &self,
         batch_id: &str,
@@ -321,6 +377,7 @@ pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
         &self,
         batch_id: &str,
         worker_id: &str,
+        failure_kind: &str,
         error: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError>;
@@ -329,9 +386,19 @@ pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
         &self,
         batch_id: &str,
         worker_id: &str,
+        reason_code: &str,
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError>;
+
+    async fn handle_unreachable_telegram_delivery(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        chat_id: &str,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>, AppError>;
 }
 
 #[async_trait]
@@ -370,6 +437,19 @@ impl ClientNotificationStore for AppStore {
         now: DateTime<Utc>,
     ) -> Result<bool, AppError> {
         AppStore::validate_client_notification_batch(self, batch_id, worker_id, policy, now).await
+    }
+
+    async fn start_client_notification_attempt(
+        &self,
+        batch_id: &str,
+        attempt_id: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        AppStore::start_client_notification_attempt(
+            self, batch_id, attempt_id, worker_id, now,
+        )
+        .await
     }
 
     async fn mark_client_notification_batch_sent(
@@ -412,24 +492,218 @@ impl ClientNotificationStore for AppStore {
         &self,
         batch_id: &str,
         worker_id: &str,
+        failure_kind: &str,
         error: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        AppStore::mark_client_notification_batch_dead_letter(self, batch_id, worker_id, error, now)
-            .await
+        AppStore::mark_client_notification_batch_dead_letter(
+            self,
+            batch_id,
+            worker_id,
+            failure_kind,
+            error,
+            now,
+        )
+        .await
     }
 
     async fn mark_client_notification_batch_blocked_config(
         &self,
         batch_id: &str,
         worker_id: &str,
+        reason_code: &str,
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         AppStore::mark_client_notification_batch_blocked_config(
-            self, batch_id, worker_id, reason, now,
+            self, batch_id, worker_id, reason_code, reason, now,
         )
         .await
+    }
+
+    async fn handle_unreachable_telegram_delivery(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        chat_id: &str,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>, AppError> {
+        AppStore::handle_unreachable_telegram_delivery(
+            self, batch_id, worker_id, chat_id, error, now,
+        )
+        .await
+    }
+}
+
+#[derive(Debug)]
+enum TransportValidationFailure {
+    BlockedConfig {
+        reason_code: &'static str,
+        message: &'static str,
+    },
+    InvalidPayload(&'static str),
+}
+
+#[derive(Debug)]
+enum TransportSendFailure {
+    Delivery(DeliveryFailure),
+    EndpointUnreachable(String),
+}
+
+#[async_trait]
+trait NotificationTransport: Send + Sync {
+    fn channel(&self) -> &'static str;
+
+    fn validate(
+        &self,
+        batch: &ClientNotificationBatch,
+    ) -> Result<(), TransportValidationFailure>;
+
+    async fn send(
+        &self,
+        batch: &ClientNotificationBatch,
+    ) -> Result<String, TransportSendFailure>;
+}
+
+struct EmailNotificationTransport<'a> {
+    http: &'a reqwest::Client,
+    api_key: Option<&'a str>,
+}
+
+#[async_trait]
+impl NotificationTransport for EmailNotificationTransport<'_> {
+    fn channel(&self) -> &'static str {
+        "email"
+    }
+
+    fn validate(
+        &self,
+        batch: &ClientNotificationBatch,
+    ) -> Result<(), TransportValidationFailure> {
+        if self.api_key.is_none_or(|key| key.trim().is_empty()) {
+            return Err(TransportValidationFailure::BlockedConfig {
+                reason_code: "email_provider_unavailable",
+                message: "resend API key is not configured",
+            });
+        }
+        if !valid_frozen_batch(batch) {
+            return Err(TransportValidationFailure::InvalidPayload(
+                "frozen email envelope is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn send(
+        &self,
+        batch: &ClientNotificationBatch,
+    ) -> Result<String, TransportSendFailure> {
+        send_resend_email(
+            self.http,
+            self.api_key.expect("validated email API key"),
+            batch,
+        )
+        .await
+        .map_err(TransportSendFailure::Delivery)
+    }
+}
+
+struct TelegramNotificationTransport<'a> {
+    http: &'a reqwest::Client,
+    token: Option<&'a str>,
+}
+
+#[async_trait]
+impl NotificationTransport for TelegramNotificationTransport<'_> {
+    fn channel(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn validate(
+        &self,
+        batch: &ClientNotificationBatch,
+    ) -> Result<(), TransportValidationFailure> {
+        if self.token.is_none_or(|token| token.trim().is_empty()) {
+            return Err(TransportValidationFailure::BlockedConfig {
+                reason_code: "telegram_bot_unavailable",
+                message: "telegram bot is not ready",
+            });
+        }
+        if batch
+            .channel_target
+            .as_deref()
+            .is_none_or(|chat_id| chat_id.trim().is_empty())
+        {
+            return Err(TransportValidationFailure::InvalidPayload(
+                "telegram delivery has no chat id",
+            ));
+        }
+        if !valid_telegram_batch(batch) {
+            return Err(TransportValidationFailure::InvalidPayload(
+                "frozen telegram message is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn send(
+        &self,
+        batch: &ClientNotificationBatch,
+    ) -> Result<String, TransportSendFailure> {
+        match crate::telegram::send_message(
+            self.http,
+            self.token.expect("validated Telegram token"),
+            batch
+                .channel_target
+                .as_deref()
+                .expect("validated Telegram chat id"),
+            None,
+            &batch.text,
+        )
+        .await
+        {
+            Ok(success) => Ok(success.provider_message_id.unwrap_or_default()),
+            Err(failure) if failure.chat_unreachable => Err(
+                TransportSendFailure::EndpointUnreachable(failure.message),
+            ),
+            Err(failure) => Err(TransportSendFailure::Delivery(
+                telegram_delivery_failure(failure),
+            )),
+        }
+    }
+}
+
+struct NotificationChannelRegistry<'a> {
+    transports: HashMap<&'static str, Box<dyn NotificationTransport + 'a>>,
+}
+
+impl<'a> NotificationChannelRegistry<'a> {
+    fn new(
+        http: &'a reqwest::Client,
+        resend_api_key: Option<&'a str>,
+        telegram_bot_token: Option<&'a str>,
+    ) -> Self {
+        let transports: Vec<Box<dyn NotificationTransport + 'a>> = vec![
+            Box::new(EmailNotificationTransport {
+                http,
+                api_key: resend_api_key,
+            }),
+            Box::new(TelegramNotificationTransport {
+                http,
+                token: telegram_bot_token,
+            }),
+        ];
+        Self {
+            transports: transports
+                .into_iter()
+                .map(|transport| (transport.channel(), transport))
+                .collect(),
+        }
+    }
+
+    fn get(&self, channel: &NotificationChannelId) -> Option<&dyn NotificationTransport> {
+        self.transports.get(channel.as_str()).map(Box::as_ref)
     }
 }
 
@@ -445,7 +719,7 @@ pub async fn run_client_notification_service(
         .timeout(Duration::from_secs(20))
         .build()?;
     let worker_id = format!("router-{}", Uuid::new_v4());
-    let template = NotificationTemplateContext::from_config(&config);
+    let mut template = NotificationTemplateContext::from_config(&config);
     let mut interval = tokio::time::interval(Duration::from_secs(DELIVERY_INTERVAL_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_policy_warning: Option<String> = None;
@@ -454,7 +728,36 @@ pub async fn run_client_notification_service(
 
     loop {
         interval.tick().await;
-        let settings = dynamic.read().await.client_notifications.clone();
+        let (settings, telegram_bot) = {
+            let dynamic = dynamic.read().await;
+            (
+                dynamic.client_notifications.clone(),
+                dynamic.telegram_bot.clone(),
+            )
+        };
+        // Telegram is hot-reloadable; the email envelope is not, so only the
+        // Telegram half of the template is refreshed per tick.
+        template.telegram = TelegramNotificationContext::from_settings(&telegram_bot);
+        let telegram_fingerprint = telegram_bot.token().map(|token| {
+            crate::telegram::bind::telegram_config_fingerprint(
+                token,
+                telegram_bot.mode.as_str(),
+                telegram_bot.webhook_secret.as_deref(),
+            )
+        });
+        let telegram_ready = match store.telegram_bot_runtime().await {
+            Ok(runtime) => {
+                runtime.ready()
+                    && telegram_fingerprint.as_deref()
+                        == runtime.config_fingerprint.as_deref()
+            }
+            Err(error) => {
+                warn!(error = %error, "read Telegram runtime readiness failed");
+                false
+            }
+        };
+        template.telegram.enabled &= telegram_ready;
+        let telegram_token = telegram_ready.then(|| telegram_bot.token()).flatten();
         let (policy, policy_warning) = ClientNotificationPolicy::for_runtime(&settings, &config);
         if policy_warning != last_policy_warning {
             if let Some(message) = policy_warning.as_deref() {
@@ -467,6 +770,7 @@ pub async fn run_client_notification_service(
             &policy,
             &template,
             config.resend_api_key.as_deref(),
+            telegram_token,
             &http,
             &worker_id,
             should_reconcile_presence(tick_index, started_at.elapsed(), presence_grace),
@@ -484,6 +788,7 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
     policy: &ClientNotificationPolicy,
     template: &NotificationTemplateContext,
     resend_api_key: Option<&str>,
+    telegram_bot_token: Option<&str>,
     http: &reqwest::Client,
     worker_id: &str,
     reconcile_presence: bool,
@@ -526,6 +831,8 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
         );
     }
 
+    let registry =
+        NotificationChannelRegistry::new(http, resend_api_key, telegram_bot_token);
     for _ in 0..MAX_BATCHES_PER_CYCLE {
         let claim_now = Utc::now();
         let batch = match store
@@ -545,32 +852,59 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
             continue;
         }
 
-        let Some(api_key) = resend_api_key.filter(|key| !key.trim().is_empty()) else {
+        let Some(transport) = registry.get(&batch.channel) else {
             store
                 .mark_client_notification_batch_blocked_config(
                     &batch.id,
                     worker_id,
-                    "resend API key is not configured",
+                    "channel_unregistered",
+                    "notification channel is not registered in this Router",
                     Utc::now(),
                 )
                 .await?;
-            warn!(batch_id = %batch.id, "client notification blocked by missing Resend API key");
             continue;
         };
-        if !valid_frozen_batch(&batch) {
-            store
-                .mark_client_notification_batch_blocked_config(
-                    &batch.id,
-                    worker_id,
-                    "frozen email envelope is invalid",
-                    Utc::now(),
-                )
-                .await?;
-            warn!(batch_id = %batch.id, "client notification blocked by invalid email envelope");
-            continue;
+        match transport.validate(&batch) {
+            Ok(()) => {}
+            Err(TransportValidationFailure::BlockedConfig {
+                reason_code,
+                message,
+            }) => {
+                store
+                    .mark_client_notification_batch_blocked_config(
+                        &batch.id,
+                        worker_id,
+                        reason_code,
+                        message,
+                        Utc::now(),
+                    )
+                    .await?;
+                warn!(batch_id = %batch.id, channel = %batch.channel, message, "notification blocked by channel configuration");
+                continue;
+            }
+            Err(TransportValidationFailure::InvalidPayload(message)) => {
+                store
+                    .mark_client_notification_batch_dead_letter(
+                        &batch.id,
+                        worker_id,
+                        "invalid_payload",
+                        message,
+                        Utc::now(),
+                    )
+                    .await?;
+                warn!(batch_id = %batch.id, channel = %batch.channel, message, "notification has an invalid frozen payload");
+                continue;
+            }
         }
-
-        match send_resend_email(http, api_key, &batch).await {
+        store
+            .start_client_notification_attempt(
+                &batch.id,
+                &batch.attempt_id,
+                worker_id,
+                Utc::now(),
+            )
+            .await?;
+        match transport.send(&batch).await {
             Ok(provider_message_id) => {
                 store
                     .mark_client_notification_batch_sent(
@@ -580,14 +914,40 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
                         Utc::now(),
                     )
                     .await?;
-                info!(batch_id = %batch.id, provider_message_id, "client notification sent");
+                info!(batch_id = %batch.id, channel = %batch.channel, provider_message_id, "client notification sent");
             }
-            Err(failure) => {
+            Err(TransportSendFailure::EndpointUnreachable(message)) => {
+                let error = sanitize_delivery_error(&message);
+                let chat_id = batch.channel_target.as_deref().unwrap_or_default();
+                let unbound = store
+                    .handle_unreachable_telegram_delivery(
+                        &batch.id,
+                        worker_id,
+                        chat_id,
+                        &error,
+                        Utc::now(),
+                    )
+                    .await?;
+                warn!(batch_id = %batch.id, unbound = unbound.is_some(), error, "notification endpoint invalidated after permanent failure");
+            }
+            Err(TransportSendFailure::Delivery(failure)) => {
                 record_delivery_failure(store, &batch, worker_id, failure).await?;
             }
         }
     }
     Ok(())
+}
+
+/// Telegram reports `retry_after` as a wall-clock unix timestamp; the delivery
+/// pipeline speaks `DateTime<Utc>`.
+fn telegram_delivery_failure(failure: crate::telegram::TelegramFailure) -> DeliveryFailure {
+    DeliveryFailure {
+        retryable: failure.retryable,
+        retry_at: failure
+            .retry_at
+            .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0)),
+        message: failure.message,
+    }
 }
 
 async fn record_delivery_failure<S: ClientNotificationStore>(
@@ -619,7 +979,13 @@ async fn record_delivery_failure<S: ClientNotificationStore>(
         );
     } else {
         store
-            .mark_client_notification_batch_dead_letter(&batch.id, worker_id, &error, Utc::now())
+            .mark_client_notification_batch_dead_letter(
+                &batch.id,
+                worker_id,
+                "permanent_transport",
+                &error,
+                Utc::now(),
+            )
             .await?;
         warn!(
             batch_id = %batch.id,
@@ -839,6 +1205,26 @@ fn valid_frozen_batch(batch: &ClientNotificationBatch) -> bool {
             .unwrap_or(true)
 }
 
+/// The Telegram counterpart of [`valid_frozen_batch`]. There is no envelope to
+/// validate — only that a message body exists, fits Telegram's limit, and is
+/// addressed to a plausible chat id (Telegram chat ids are signed 64-bit
+/// integers; anything else means the binding column was corrupted).
+fn valid_telegram_batch(batch: &ClientNotificationBatch) -> bool {
+    let chat_id_ok = batch
+        .channel_target
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|chat_id| {
+            !chat_id.is_empty() && chat_id.len() <= 32 && chat_id.parse::<i64>().is_ok()
+        });
+    chat_id_ok
+        && is_basic_email(&batch.recipient)
+        && !batch.text.trim().is_empty()
+        && batch.text.chars().count() <= crate::telegram::MAX_MESSAGE_CHARS
+        && (1..=256).contains(&batch.idempotency_key.len())
+        && !contains_header_controls(&batch.idempotency_key)
+}
+
 pub(crate) fn is_basic_email(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || value.len() > 320 || !value.is_ascii() || contains_header_controls(value)
@@ -902,6 +1288,29 @@ pub fn mask_email_address(value: &str) -> String {
     };
     let visible = local.chars().next().unwrap_or('*');
     format!("{visible}***@{domain}")
+}
+
+pub fn mask_notification_target(
+    channel: &str,
+    recipient: &str,
+    channel_target: Option<&str>,
+) -> String {
+    if channel == crate::notification_channels::EMAIL_CHANNEL {
+        return mask_email_address(recipient);
+    }
+    let target = channel_target.unwrap_or_default().trim();
+    if target.is_empty() {
+        return "***".into();
+    }
+    let suffix = target
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("***{suffix}")
 }
 
 pub fn mask_email_like_tokens(value: &str) -> String {
@@ -1372,7 +1781,7 @@ fn render_email_document(document: EmailDocument<'_>) -> (String, String) {
         format!("\n\n{}", document.extra_text.trim())
     };
     let text = format!(
-        "CC-Switch Router\n\n{title}\n\n{introduction}\n\n{rows_text}{extra_text}{note_text}\n\n{action_label}: {action_url}\nRouter dashboard: {dashboard_url}\n\nThis transactional email was sent because this address is the currently verified Owner of the affected Client.",
+        "{EMAIL_TEXT_BRAND_LINE}\n\n{title}\n\n{introduction}\n\n{rows_text}{extra_text}{note_text}\n\n{action_label}: {action_url}\nRouter dashboard: {dashboard_url}\n\n{EMAIL_TEXT_FOOTER}",
         title = document.title,
         introduction = document.introduction,
         rows_text = rows_text,
@@ -1385,6 +1794,55 @@ fn render_email_document(document: EmailDocument<'_>) -> (String, String) {
     .trim()
     .to_string();
     (html, text)
+}
+
+/// First line of every plain-text email body. Telegram strips it: the chat
+/// already shows who is talking.
+const EMAIL_TEXT_BRAND_LINE: &str = "CC-Switch Router";
+/// Last line of every plain-text email body. It explains *email* addressing,
+/// which is meaningless in a chat the user bound themselves.
+const EMAIL_TEXT_FOOTER: &str = "This transactional email was sent because this address is the currently verified Owner of the affected Client.";
+
+/// Render the Telegram counterpart of an already-rendered notification.
+///
+/// Deliberately derived from the email's plain-text alternative rather than
+/// written from scratch: one notification must not be able to say two
+/// different things depending on where it lands. What changes is the framing —
+/// the brand header and the RFC footer come off, the subject becomes the title
+/// line, and the footer is replaced by a link to the page where the user can
+/// change or drop the channel (the chat's own opt-out path).
+///
+/// Telegram is asked for plain text (no `parse_mode`), so nothing here needs
+/// escaping — a client hostname containing `_` or `*` stays literal.
+pub fn render_telegram_message(
+    rendered: &RenderedNotificationEmail,
+    dashboard_url: &str,
+) -> String {
+    let mut body = String::new();
+    for line in rendered.text.lines() {
+        let line = line.trim_end();
+        if line == EMAIL_TEXT_BRAND_LINE || line == EMAIL_TEXT_FOOTER {
+            continue;
+        }
+        if line.is_empty() && body.ends_with("\n\n") {
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    let settings_url = format!(
+        "{}/account/notifications",
+        dashboard_url.trim_end_matches('/')
+    );
+    let message = format!(
+        "{subject}\n\n{body}\n管理通知渠道 / Manage notifications: {settings_url}",
+        subject = rendered.subject.trim(),
+        body = body.trim(),
+    );
+    message
+        .chars()
+        .take(crate::telegram::MAX_MESSAGE_CHARS)
+        .collect()
 }
 
 fn short_installation_id(value: &str) -> String {
@@ -1451,6 +1909,7 @@ mod tests {
         blocked_batches: Arc<Mutex<Vec<String>>>,
         retry_errors: Arc<Mutex<Vec<String>>>,
         dead_letter_errors: Arc<Mutex<Vec<String>>>,
+        unbound_chats: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1496,6 +1955,16 @@ mod tests {
             Ok(self.validations.lock().await.pop_front().unwrap_or(true))
         }
 
+        async fn start_client_notification_attempt(
+            &self,
+            _batch_id: &str,
+            _attempt_id: &str,
+            _worker_id: &str,
+            _now: DateTime<Utc>,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
         async fn mark_client_notification_batch_sent(
             &self,
             _batch_id: &str,
@@ -1522,6 +1991,7 @@ mod tests {
             &self,
             _batch_id: &str,
             _worker_id: &str,
+            _failure_kind: &str,
             error: &str,
             _now: DateTime<Utc>,
         ) -> Result<(), AppError> {
@@ -1533,11 +2003,24 @@ mod tests {
             &self,
             batch_id: &str,
             _worker_id: &str,
+            _reason_code: &str,
             _reason: &str,
             _now: DateTime<Utc>,
         ) -> Result<(), AppError> {
             self.blocked_batches.lock().await.push(batch_id.to_string());
             Ok(())
+        }
+
+        async fn handle_unreachable_telegram_delivery(
+            &self,
+            _batch_id: &str,
+            _worker_id: &str,
+            chat_id: &str,
+            _error: &str,
+            _now: DateTime<Utc>,
+        ) -> Result<Option<String>, AppError> {
+            self.unbound_chats.lock().await.push(chat_id.to_string());
+            Ok(Some("owner@example.com".into()))
         }
     }
 
@@ -1596,13 +2079,39 @@ mod tests {
     fn test_batch() -> ClientNotificationBatch {
         ClientNotificationBatch {
             id: "b1".into(),
+            attempt_id: "attempt-b1".into(),
             recipient: "ops@example.com".into(),
+            recipient_user_id: Some("user-1".into()),
+            channel: NotificationChannelId::email(),
+            channel_target: None,
+            target_revision: 1,
+            provider_identity: None,
             from: "Router <noreply@example.com>".into(),
             reply_to: Some("support@example.com".into()),
             subject: "Client offline".into(),
             html: "<p>offline</p>".into(),
             text: "offline".into(),
             idempotency_key: "client-notification/b1".into(),
+            attempts: 1,
+        }
+    }
+
+    fn test_telegram_batch() -> ClientNotificationBatch {
+        ClientNotificationBatch {
+            id: "t1".into(),
+            attempt_id: "attempt-t1".into(),
+            recipient: "ops@example.com".into(),
+            recipient_user_id: Some("user-1".into()),
+            channel: NotificationChannelId::telegram(),
+            channel_target: Some("4242".into()),
+            target_revision: 1,
+            provider_identity: Some("7".into()),
+            from: String::new(),
+            reply_to: None,
+            subject: "Client offline".into(),
+            html: String::new(),
+            text: "Client offline\n\nClient: abcdef12".into(),
+            idempotency_key: "client-notification/t1:telegram".into(),
             attempts: 1,
         }
     }
@@ -1624,6 +2133,7 @@ mod tests {
             blocked_batches: Arc::new(Mutex::new(Vec::new())),
             retry_errors: Arc::new(Mutex::new(Vec::new())),
             dead_letter_errors: Arc::new(Mutex::new(Vec::new())),
+            unbound_chats: Arc::new(Mutex::new(Vec::new())),
         };
         let policy = ClientNotificationPolicy::from(&ClientNotificationSettings {
             enabled: true,
@@ -1635,12 +2145,14 @@ mod tests {
             reply_to: None,
             delivery_configured: false,
             delivery_config_fingerprint: "test".into(),
+            telegram: TelegramNotificationContext::default(),
         };
 
         run_notification_cycle(
             &store,
             &policy,
             &template,
+            None,
             None,
             &reqwest::Client::new(),
             "cycle-worker",
@@ -1654,6 +2166,225 @@ mod tests {
             vec!["valid-batch".to_string()]
         );
         assert!(store.claims.lock().await.is_empty());
+    }
+
+    /// A Telegram row must not be handed to the Resend path, and must not be
+    /// sent at all while the bot is unconfigured — a message with no token is
+    /// a configuration fault, not something to retry twelve times.
+    #[tokio::test]
+    async fn malformed_telegram_batches_are_dead_lettered_without_unbinding() {
+        let mut no_chat = test_telegram_batch();
+        no_chat.id = "no-chat".into();
+        no_chat.channel_target = Some("   ".into());
+        let mut bad_chat = test_telegram_batch();
+        bad_chat.id = "bad-chat".into();
+        bad_chat.channel_target = Some("not-a-chat-id".into());
+
+        let store = CycleStore {
+            claims: Arc::new(Mutex::new(VecDeque::from([
+                ClientNotificationClaim::Batch(no_chat),
+                ClientNotificationClaim::Batch(bad_chat),
+                ClientNotificationClaim::Empty,
+            ]))),
+            ..CycleStore::default()
+        };
+        let policy = ClientNotificationPolicy::from(&ClientNotificationSettings {
+            enabled: true,
+            ..ClientNotificationSettings::default()
+        });
+        let template = NotificationTemplateContext {
+            dashboard_url: "https://router.example.com".into(),
+            sender: Some("Router <router@example.com>".into()),
+            reply_to: None,
+            delivery_configured: true,
+            delivery_config_fingerprint: "test".into(),
+            telegram: TelegramNotificationContext::default(),
+        };
+
+        run_notification_cycle(
+            &store,
+            &policy,
+            &template,
+            Some("resend-key"),
+            Some("bot-token"),
+            &reqwest::Client::new(),
+            "cycle-worker",
+            false,
+        )
+        .await
+        .expect("run notification cycle");
+
+        assert_eq!(store.dead_letter_errors.lock().await.len(), 2);
+        assert!(store.blocked_batches.lock().await.is_empty());
+        assert!(store.retry_errors.lock().await.is_empty());
+        assert!(
+            store.unbound_chats.lock().await.is_empty(),
+            "a malformed row must not cost the user their binding"
+        );
+    }
+
+    /// The Resend key and the bot token are independent: one channel being
+    /// unconfigured must not block the other, and neither may borrow the
+    /// other's credential.
+    #[tokio::test]
+    async fn a_missing_bot_token_blocks_only_telegram_rows() {
+        let store = CycleStore {
+            claims: Arc::new(Mutex::new(VecDeque::from([
+                ClientNotificationClaim::Batch(test_telegram_batch()),
+                ClientNotificationClaim::Empty,
+            ]))),
+            ..CycleStore::default()
+        };
+        let policy = ClientNotificationPolicy::from(&ClientNotificationSettings {
+            enabled: true,
+            ..ClientNotificationSettings::default()
+        });
+        let template = NotificationTemplateContext {
+            dashboard_url: "https://router.example.com".into(),
+            sender: Some("Router <router@example.com>".into()),
+            reply_to: None,
+            delivery_configured: true,
+            delivery_config_fingerprint: "test".into(),
+            telegram: TelegramNotificationContext::default(),
+        };
+
+        run_notification_cycle(
+            &store,
+            &policy,
+            &template,
+            Some("resend-key"),
+            None,
+            &reqwest::Client::new(),
+            "cycle-worker",
+            false,
+        )
+        .await
+        .expect("run notification cycle");
+
+        assert_eq!(*store.blocked_batches.lock().await, vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn telegram_envelope_validation_matches_the_bot_api_limits() {
+        assert!(valid_telegram_batch(&test_telegram_batch()));
+
+        let mut oversized = test_telegram_batch();
+        oversized.text = "字".repeat(crate::telegram::MAX_MESSAGE_CHARS + 1);
+        assert!(
+            !valid_telegram_batch(&oversized),
+            "length is counted in chars, not bytes"
+        );
+        let mut at_limit = test_telegram_batch();
+        at_limit.text = "字".repeat(crate::telegram::MAX_MESSAGE_CHARS);
+        assert!(valid_telegram_batch(&at_limit));
+
+        for chat_id in ["", "   ", "abc", "12.5", &"9".repeat(33)] {
+            let mut batch = test_telegram_batch();
+            batch.channel_target = Some(chat_id.to_string());
+            assert!(!valid_telegram_batch(&batch), "chat id {chat_id:?}");
+        }
+        // Group and channel chats are negative; supergroups are long.
+        for chat_id in ["4242", "-1001234567890"] {
+            let mut batch = test_telegram_batch();
+            batch.channel_target = Some(chat_id.to_string());
+            assert!(valid_telegram_batch(&batch), "chat id {chat_id:?}");
+        }
+
+        let mut empty_text = test_telegram_batch();
+        empty_text.text = "  \n ".into();
+        assert!(!valid_telegram_batch(&empty_text));
+
+        // The recipient stays the owner email even on Telegram rows: it is
+        // what the storm and ownership queries key on.
+        let mut bad_recipient = test_telegram_batch();
+        bad_recipient.recipient = "not-an-email".into();
+        assert!(!valid_telegram_batch(&bad_recipient));
+    }
+
+    #[test]
+    fn telegram_delivery_failures_keep_their_retry_classification() {
+        let retry_at = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+        let mapped = telegram_delivery_failure(crate::telegram::TelegramFailure {
+            retryable: true,
+            retry_at: Some(retry_at.timestamp()),
+            http_status: Some(429),
+            message: "Telegram sendMessage returned HTTP 429".into(),
+            chat_unreachable: false,
+        });
+        assert!(mapped.retryable);
+        assert_eq!(mapped.retry_at, Some(retry_at));
+
+        let permanent = telegram_delivery_failure(crate::telegram::TelegramFailure::config(
+            "Telegram bot token is not configured",
+        ));
+        assert!(!permanent.retryable);
+        assert_eq!(permanent.retry_at, None);
+    }
+
+    #[test]
+    fn telegram_message_reframes_the_email_without_changing_it() {
+        let rendered = RenderedNotificationEmail {
+            subject: "Client offline".into(),
+            html: "<p>ignored</p>".into(),
+            text: format!(
+                "{EMAIL_TEXT_BRAND_LINE}
+
+Client offline
+
+Client: abcdef12
+
+
+
+Open the dashboard: https://router.example.com
+
+{EMAIL_TEXT_FOOTER}
+"
+            ),
+        };
+
+        let message = render_telegram_message(&rendered, "https://router.example.com/");
+
+        assert!(message.starts_with(
+            "Client offline
+
+"
+        ));
+        assert!(!message.contains(EMAIL_TEXT_BRAND_LINE));
+        assert!(
+            !message.contains(EMAIL_TEXT_FOOTER),
+            "the RFC footer is meaningless in a chat"
+        );
+        assert!(message.contains("Client: abcdef12"));
+        assert!(
+            !message.contains(
+                "
+
+
+"
+            ),
+            "blank runs are collapsed"
+        );
+        assert!(message.ends_with(
+            "管理通知渠道 / Manage notifications: https://router.example.com/account/notifications"
+        ));
+        assert!(message.chars().count() <= crate::telegram::MAX_MESSAGE_CHARS);
+    }
+
+    #[test]
+    fn telegram_message_is_truncated_to_what_the_bot_api_accepts() {
+        let rendered = RenderedNotificationEmail {
+            subject: "Client offline".into(),
+            html: String::new(),
+            text: "line
+"
+            .repeat(4_000),
+        };
+        let message = render_telegram_message(&rendered, "https://router.example.com");
+        assert_eq!(
+            message.chars().count(),
+            crate::telegram::MAX_MESSAGE_CHARS,
+            "a runaway digest must still be sendable"
+        );
     }
 
     #[tokio::test]

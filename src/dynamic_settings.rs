@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use crate::config::{AlertingSettings, ClientNotificationSettings, Config};
+use crate::config::{AlertingSettings, ClientNotificationSettings, Config, TelegramBotSettings};
 
 /// Settings that can change at runtime without restarting the process.
 ///
@@ -15,6 +15,10 @@ pub struct DynamicSettings {
     pub security: SecuritySettings,
     pub client_notifications: ClientNotificationSettings,
     pub alerting: AlertingSettings,
+    /// User-facing Telegram notification bot. Hot-reloading this group has to
+    /// restart the update listener and re-run `getMe`; see
+    /// `crate::telegram::service`.
+    pub telegram_bot: TelegramBotSettings,
     pub market_usd_cny_rate_micros: i64,
     pub footer_telegram_url: String,
     pub server_log_public_enabled: bool,
@@ -40,6 +44,7 @@ impl DynamicSettings {
             },
             client_notifications: config.client_notifications.clone(),
             alerting: config.metrics.alerting.clone(),
+            telegram_bot: config.telegram_bot.clone(),
             market_usd_cny_rate_micros: config.market_usd_cny_rate_micros,
             footer_telegram_url: config.footer_telegram_url.clone(),
             server_log_public_enabled: crate::server_logs::public_enabled_from_env(),

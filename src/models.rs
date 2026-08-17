@@ -1591,6 +1591,51 @@ pub struct UpdateUsageCardSettingsRequest {
     pub public_stats_enabled: bool,
 }
 
+/// One account notification channel. Delivery targets are deliberately
+/// omitted; only a safe label such as a Telegram username is returned.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationChannelSettingsResponse {
+    pub channel: String,
+    pub enabled: bool,
+    pub available: bool,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationSettingsResponse {
+    pub email: String,
+    pub enabled_channels: Vec<String>,
+    pub channels: Vec<NotificationChannelSettingsResponse>,
+    pub telegram_bot_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_bot_username: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateNotificationSettingsRequest {
+    pub enabled_channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelegramBindLinkResponse {
+    /// `https://t.me/<bot>?start=<token>` — opened in a new tab.
+    pub url: String,
+    /// Returned once and never persisted in plaintext; the client only needs
+    /// it to render a manual fallback (`/start <token>`) when the deep link is
+    /// blocked.
+    pub token: String,
+    pub bot_username: String,
+    pub expires_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareUserLimitStatusRow {
@@ -2496,6 +2541,8 @@ pub struct MapDisplaySettings {
     pub show_flows: bool,
     pub show_heat: bool,
     pub viewport: MapViewportSettings,
+    #[serde(default)]
+    pub revision: String,
 }
 
 impl Default for MapDisplaySettings {
@@ -2504,6 +2551,7 @@ impl Default for MapDisplaySettings {
             show_flows: true,
             show_heat: true,
             viewport: MapViewportSettings::default(),
+            revision: "0".into(),
         }
     }
 }
@@ -2517,6 +2565,7 @@ pub struct MapViewportSettingsUpdate {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MapDisplaySettingsUpdate {
+    pub expected_revision: String,
     pub show_flows: Option<bool>,
     pub show_heat: Option<bool>,
     pub viewport: Option<MapViewportSettingsUpdate>,
@@ -2537,7 +2586,7 @@ impl Default for AnnouncementSettings {
             enabled: false,
             content_en: String::new(),
             content_zh_cn: String::new(),
-            updated_at: Utc::now(),
+            updated_at: DateTime::from_timestamp(0, 0).expect("Unix epoch must be valid"),
         }
     }
 }
@@ -2545,6 +2594,7 @@ impl Default for AnnouncementSettings {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnouncementSettingsUpdate {
+    pub expected_revision: String,
     pub enabled: Option<bool>,
     pub content_en: Option<String>,
     pub content_zh_cn: Option<String>,
@@ -3281,7 +3331,10 @@ pub struct ShareView {
     pub allow_personal_credits: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub auto_consume_banked_reset: bool,
-    #[serde(default, skip_serializing_if = "is_default_banked_reset_expiry_lead_minutes")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_banked_reset_expiry_lead_minutes"
+    )]
     pub banked_reset_expiry_lead_minutes: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub previous_response_cache_enabled: bool,

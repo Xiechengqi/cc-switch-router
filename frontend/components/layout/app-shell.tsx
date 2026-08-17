@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, Toast } from "@heroui/react";
-import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, Settings, Share2, Store, UserRound } from "lucide-react";
+import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, ServerCog, Settings, Share2, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -344,6 +344,10 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                     </Dropdown.Item>
                     {session?.isAdmin ? (
                       <>
+                        <Dropdown.Item id="operations" onAction={() => window.open("/operations/", "_blank", "noopener,noreferrer")}>
+                          <ServerCog className="h-4 w-4" />
+                          {t("nav.operations")}
+                        </Dropdown.Item>
                         <Dropdown.Item id="metrics" onAction={() => window.open("/metrics/", "_blank", "noopener,noreferrer")}>
                           <Activity className="h-4 w-4" />
                           {t("nav.metrics")}

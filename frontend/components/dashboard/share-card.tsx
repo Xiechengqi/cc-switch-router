@@ -36,7 +36,10 @@ import {
   formatDateTime,
   preferredScrollBehavior,
 } from "@/lib/utils";
-import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import {
+  resolveShareProviderLogo,
+  ShareProviderLogo,
+} from "@/components/dashboard/share-provider-logo";
 import {
   resolveShareCoreApp,
   shareEnabledApps,
@@ -113,6 +116,28 @@ export const ShareCard = React.memo(function ShareCard({
   const averageLatency = averageRecentLatencyMs(appRequests);
   const performance = recentSharePerformance(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
+  const providerLogos = apps.reduce<
+    Array<{
+      app: CoreShareApp;
+      provider: NonNullable<ReturnType<typeof resolveShareAppRuntime>>;
+      key: string;
+    }>
+  >((entries, entryApp) => {
+    const entryRuntime = resolveShareAppRuntime(share, entryApp) || {
+      app: entryApp,
+    };
+    const resolvedLogo = resolveShareProviderLogo(entryRuntime);
+    const key =
+      resolvedLogo?.key ||
+      [entryRuntime.providerType, entryRuntime.kind, entryRuntime.providerName]
+        .filter(Boolean)
+        .join(":") ||
+      entryApp;
+    if (!entries.some((entry) => entry.key === key)) {
+      entries.push({ app: entryApp, provider: entryRuntime, key });
+    }
+    return entries;
+  }, []);
   const modelPolicyEntries = apps.flatMap((entryApp) => {
     const entryRuntime = resolveShareAppRuntime(share, entryApp);
     if (!entryRuntime) return [];
@@ -294,13 +319,14 @@ export const ShareCard = React.memo(function ShareCard({
               {hasSubdomain ? (
                 <SubdomainCopyButton subdomain={subdomain} />
               ) : null}
-              {apps.length > 0 ? (
+              {providerLogos.length > 0 ? (
                 <span className="inline-flex shrink-0 items-center gap-1">
-                  {apps.map((supportedApp) => (
-                    <ShareAppLogo
-                      key={supportedApp}
-                      app={supportedApp}
-                      size={14}
+                  {providerLogos.map((entry) => (
+                    <ShareProviderLogo
+                      key={entry.key}
+                      provider={entry.provider}
+                      fallbackApp={entry.app}
+                      size={16}
                     />
                   ))}
                 </span>

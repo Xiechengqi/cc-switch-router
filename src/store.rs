@@ -94,9 +94,12 @@ use crate::notifications::{
     ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
     ClientNotificationPolicy, DigestEmailClient, DigestEmailData, NotificationAggregateStats,
     NotificationReconcileStats, NotificationTemplateContext, OfflineEmailData,
-    RegistrationEmailData, RegistrationOverflowEmailData, mask_email_address,
-    mask_email_like_tokens, render_digest_email, render_offline_email, render_registration_email,
-    render_registration_overflow_email,
+    RegistrationEmailData, RegistrationOverflowEmailData, mask_email_like_tokens,
+    mask_notification_target, render_digest_email, render_offline_email,
+    render_registration_email, render_registration_overflow_email, render_telegram_message,
+};
+use crate::notification_channels::{
+    NotificationChannelId, NotificationTargets,
 };
 #[cfg(test)]
 use crate::proxy::RouteKind;
@@ -1306,15 +1309,20 @@ impl NotificationLane {
         }
     }
 
-    fn hourly_limits(self, policy: &ClientNotificationPolicy) -> (i64, i64) {
+    /// Whether a lane may leave the mailbox.
+    ///
+    /// Registration mail carries the Client's setup password hint — a
+    /// credential the account owner proved control of by verifying the address.
+    /// A Telegram chat is bound with a deep link, which is a weaker proof, so
+    /// the hint never leaves email. Everything the offline lane says is already
+    /// visible on the dashboard to anyone holding the session.
+    fn allows_telegram(self) -> bool {
         match self {
-            Self::Offline => (policy.recipient_hourly_limit, policy.global_hourly_limit),
-            Self::Registration => (
-                policy.registration_recipient_hourly_limit,
-                policy.registration_global_hourly_limit,
-            ),
+            Self::Offline => true,
+            Self::Registration => false,
         }
     }
+
 }
 
 const OWNER_NOTIFICATION_RECIPIENT_PRIORITY: i64 = 0;
@@ -3951,7 +3959,7 @@ impl AppStore {
             for recipient in recipients {
                 let already_materialized = tx
                     .query_row(
-                        "SELECT 1 FROM email_delivery_batch_items
+                        "SELECT 1 FROM notification_delivery_items
                          WHERE event_id = ?1 AND LOWER(recipient) = LOWER(?2) LIMIT 1",
                         params![event.id, recipient.email],
                         |_| Ok(()),
@@ -3970,47 +3978,17 @@ impl AppStore {
             }
         }
 
-        let hour_cutoff = (now - Duration::hours(1)).to_rfc3339();
-        let (recipient_hourly_limit, global_hourly_limit) = lane.hourly_limits(policy);
-        let mut global_count = tx
-            .query_row(
-                "SELECT COUNT(*) FROM email_delivery_batches
-                 WHERE created_at >= ?1
-                   AND notification_lane = ?2
-                   AND status NOT IN ('suppressed_disabled', 'suppressed_recipient_removed',
-                                      'suppressed_rate_limit', 'suppressed_storm',
-                                      'suppressed_config_changed', 'cancelled_recovered',
-                                      'dead_letter')",
-                params![hour_cutoff, lane.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("count hourly notification batches failed: {error}"))
-            })?;
         for ((recipient_priority, recipient), mut recipient_events) in by_recipient {
             recipient_events.truncate(100);
-            let global_capped = global_count >= global_hourly_limit;
-            let recipient_count = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM email_delivery_batches
-                     WHERE created_at >= ?1 AND LOWER(recipient) = LOWER(?2)
-                       AND notification_lane = ?3
-                       AND status NOT IN ('suppressed_disabled', 'suppressed_recipient_removed',
-                                          'suppressed_rate_limit', 'suppressed_storm',
-                                          'suppressed_config_changed', 'cancelled_recovered',
-                                          'dead_letter')",
-                    params![hour_cutoff, recipient, lane.as_str()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!(
-                        "count recipient notification batches failed: {error}"
-                    ))
-                })?;
-            let recipient_capped = recipient_count >= recipient_hourly_limit;
-            if recipient_capped {
-                stats.deferred_by_recipient_cap += recipient_events.len() as u64;
-            }
+            // A binding read inside the transaction: if the user unbinds while
+            // this pass runs, the fan-out either fully includes Telegram or
+            // fully excludes it.
+            let targets = crate::telegram::bind::notification_targets_tx(&tx, &recipient)?
+                .unwrap_or_else(|| NotificationTargets::email_only(recipient.clone()));
+            let delivery_targets = targets.delivery_targets(
+                template.telegram.enabled,
+                lane.allows_telegram(),
+            );
             let event_family = lane.as_str();
             let storm_kind = Some(lane.storm_event_kind());
             let storm_window_start =
@@ -4073,7 +4051,7 @@ impl AppStore {
                 incident.then(|| format!("{}:{recipient}:{event_family}", lane.as_str()));
             let storm_suppressed = if let Some(incident_key) = incident_key.as_deref() {
                 tx.query_row(
-                    "SELECT 1 FROM email_delivery_batches
+                    "SELECT 1 FROM notification_deliveries
                      WHERE incident_key = ?1 AND created_at >= ?2
                        AND status IN ('pending', 'claimed', 'retry', 'blocked_config', 'sent')
                      LIMIT 1",
@@ -4091,9 +4069,6 @@ impl AppStore {
             } else {
                 false
             };
-            if global_capped {
-                stats.deferred_by_global_cap += recipient_events.len() as u64;
-            }
             let rendered = if incident {
                 let incident_clients = load_incident_clients(
                     &tx,
@@ -4122,83 +4097,152 @@ impl AppStore {
                     now,
                 )?
             };
-            let batch_id = Uuid::new_v4().to_string();
-            let idempotency_key = format!("client-notification-{batch_id}");
+            // One notification, one correlation id, one row per channel. The
+            // rows share the id (and the incident key) so an operator reading
+            // the outbox can see that the email and the Telegram message are
+            // the same event rather than two.
+            let correlation_id = Uuid::new_v4().to_string();
             let timestamp = now.to_rfc3339();
-            let (batch_status, batch_error) = if recipient_capped || global_capped {
-                (
-                    "suppressed_rate_limit",
-                    Some("notification hourly hard cap reached"),
+            let telegram_text = delivery_targets
+                .iter()
+                .any(|target| target.channel.is_telegram())
+                .then(|| render_telegram_message(&rendered, &template.dashboard_url));
+            let recipient_user_id = tx
+                .query_row(
+                    "SELECT id FROM users WHERE email_normalized = LOWER(?1)",
+                    params![recipient],
+                    |row| row.get::<_, String>(0),
                 )
-            } else if storm_suppressed {
-                ("suppressed_storm", Some("incident reminder window active"))
-            } else if sender.is_empty() {
-                (
-                    "blocked_config",
-                    Some("notification sender is not configured"),
-                )
-            } else {
-                ("pending", None)
-            };
-            let delivery_kind = if batch_status.starts_with("suppressed_") {
-                "suppressed"
-            } else if incident {
-                "incident"
-            } else {
-                "lifecycle"
-            };
-            let next_attempt_at = (batch_status == "pending").then_some(timestamp.clone());
-            tx.execute(
-                "INSERT INTO email_delivery_batches (
-                    id, notification_lane, recipient, recipient_priority,
-                    from_address, reply_to, subject, html_body, text_body,
-                    idempotency_key, status, attempts, not_before, next_attempt_at,
-                    template_fingerprint, delivery_kind, incident_key, error_message,
-                    created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17, ?12, ?12)",
-                params![
-                    batch_id,
-                    lane.as_str(),
-                    recipient,
-                    recipient_priority,
-                    sender,
-                    template.reply_to,
-                    rendered.subject,
-                    rendered.html,
-                    rendered.text,
-                    idempotency_key,
-                    batch_status,
-                    timestamp,
-                    next_attempt_at,
-                    template.delivery_config_fingerprint,
-                    delivery_kind,
-                    incident_key,
-                    batch_error,
-                ],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "insert notification delivery batch failed: {error}"
-                ))
-            })?;
-            for event in &recipient_events {
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("query notification recipient user failed: {error}"))
+                })?;
+            for target in &delivery_targets {
+                let channel = &target.channel;
+                let batch_id = Uuid::new_v4().to_string();
+                let idempotency_key = if channel.is_email() {
+                    format!("client-notification-{correlation_id}")
+                } else {
+                    format!("client-notification-{correlation_id}:{}", channel.as_str())
+                };
+                let (batch_status, batch_error, blocked_reason_code) = if storm_suppressed {
+                    (
+                        "suppressed_storm",
+                        Some("incident reminder window active"),
+                        None,
+                    )
+                } else if channel.is_email() && sender.is_empty() {
+                    (
+                        "blocked_config",
+                        Some("notification sender is not configured"),
+                        Some("email_sender_missing"),
+                    )
+                } else {
+                    ("pending", None, None)
+                };
+                let delivery_kind = if batch_status.starts_with("suppressed_") {
+                    "suppressed"
+                } else if incident {
+                    "incident"
+                } else {
+                    "lifecycle"
+                };
+                let next_attempt_at = (batch_status == "pending").then_some(timestamp.clone());
+                // Telegram rows carry no RFC envelope: the chat is the address,
+                // the subject is kept only so the deliveries view stays
+                // readable, and the message itself lives in text_body.
+                let (from_address, reply_to, html_body, text_body) = if channel.is_email() {
+                    (
+                        sender,
+                        template.reply_to.clone(),
+                        rendered.html.clone(),
+                        rendered.text.clone(),
+                    )
+                } else {
+                    (
+                        "",
+                        None,
+                        String::new(),
+                        telegram_text.clone().unwrap_or_default(),
+                    )
+                };
+                let payload_json = if channel.is_email() {
+                    serde_json::json!({
+                        "from": from_address,
+                        "replyTo": reply_to,
+                        "subject": &rendered.subject,
+                        "html": &html_body,
+                        "text": &text_body,
+                    })
+                } else {
+                    serde_json::json!({
+                        "text": &text_body,
+                    })
+                }
+                .to_string();
                 tx.execute(
-                    "INSERT OR IGNORE INTO email_delivery_batch_items (batch_id, event_id, recipient)
-                     VALUES (?1, ?2, ?3)",
-                    params![batch_id, event.id, recipient],
+                    "INSERT INTO notification_deliveries (
+                        id, notification_lane, recipient, recipient_priority,
+                        recipient_user_id, channel, channel_target, target_revision,
+                        provider_identity, payload_version, payload_json,
+                        from_address, reply_to, subject, html_body, text_body,
+                        idempotency_key, status, attempts, not_before, next_attempt_at,
+                        template_fingerprint, delivery_kind, incident_key, error_message,
+                        blocked_reason_code, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10,
+                               ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18, ?19,
+                               ?20, ?21, ?22, ?23, ?24, ?18, ?18)",
+                    params![
+                        batch_id,
+                        lane.as_str(),
+                        recipient,
+                        recipient_priority,
+                        recipient_user_id,
+                        channel.as_str(),
+                        target.address,
+                        target.revision,
+                        target.provider_identity,
+                        payload_json,
+                        from_address,
+                        reply_to,
+                        rendered.subject,
+                        html_body,
+                        text_body,
+                        idempotency_key,
+                        batch_status,
+                        timestamp,
+                        next_attempt_at,
+                        template.delivery_config_fingerprint,
+                        delivery_kind,
+                        incident_key,
+                        batch_error,
+                        blocked_reason_code,
+                    ],
                 )
                 .map_err(|error| {
-                    AppError::Internal(format!("insert notification batch item failed: {error}"))
+                    AppError::Internal(format!(
+                        "insert notification delivery batch failed: {error}"
+                    ))
                 })?;
-            }
-            if !batch_status.starts_with("suppressed_") {
-                global_count += 1;
-            }
-            if batch_status == "pending" || batch_status == "blocked_config" {
-                stats.batches_created += 1;
+                for event in &recipient_events {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO notification_delivery_items
+                            (batch_id, event_id, recipient, channel)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![batch_id, event.id, recipient, channel.as_str()],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "insert notification batch item failed: {error}"
+                        ))
+                    })?;
+                }
+                if batch_status == "pending" || batch_status == "blocked_config" {
+                    stats.batches_created += 1;
+                }
             }
             stats.events_batched += recipient_events.len() as u64;
-            if incident && !storm_suppressed && batch_status != "suppressed_rate_limit" {
+            if incident && !storm_suppressed {
                 stats.incident_digests += 1;
             }
         }
@@ -4211,7 +4255,7 @@ impl AppStore {
             let materialized = tx
                 .query_row(
                     "SELECT COUNT(DISTINCT LOWER(recipient))
-                     FROM email_delivery_batch_items WHERE event_id = ?1",
+                     FROM notification_delivery_items WHERE event_id = ?1",
                     params![event.id],
                     |row| row.get::<_, i64>(0),
                 )
@@ -4257,7 +4301,7 @@ impl AppStore {
         let timestamp = now.to_rfc3339();
         let candidate = tx
             .query_row(
-                "SELECT id, recipient, notification_lane FROM email_delivery_batches
+                "SELECT id, recipient, notification_lane, channel FROM notification_deliveries
                  WHERE not_before <= ?1
                    AND (
                        (status IN ('pending', 'retry')
@@ -4273,6 +4317,7 @@ impl AppStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -4280,23 +4325,42 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("select notification batch claim failed: {error}"))
             })?;
-        let Some((batch_id, recipient, lane_value)) = candidate else {
+        let Some((batch_id, recipient, lane_value, channel_value)) = candidate else {
             tx.commit().map_err(|error| {
                 AppError::Internal(format!("commit empty notification claim failed: {error}"))
             })?;
             return Ok(ClientNotificationClaim::Empty);
         };
         let lane = NotificationLane::from_db(&lane_value)?;
+        let channel = NotificationChannelId::parse(&channel_value)?;
+        tx.execute(
+            "UPDATE notification_delivery_attempts
+             SET status = CASE WHEN status = 'started' THEN 'failed' ELSE 'cancelled' END,
+                 finished_at = ?2,
+                 error_message = CASE
+                     WHEN status = 'started' THEN 'delivery worker disappeared after provider call started'
+                     ELSE 'delivery reservation expired before provider call'
+                 END
+             WHERE delivery_id = ?1 AND status IN ('reserved', 'started')
+               AND reservation_expires_at <= ?2",
+            params![batch_id, timestamp],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("retire expired notification attempt failed: {error}"))
+        })?;
         let (
             offline_recipient_limit,
             offline_global_limit,
             registration_recipient_limit,
             registration_global_limit,
+            telegram_recipient_limit,
+            telegram_global_limit,
         ) = tx
             .query_row(
                 "SELECT recipient_hourly_limit, global_hourly_limit,
                         registration_recipient_hourly_limit,
-                        registration_global_hourly_limit
+                        registration_global_hourly_limit,
+                        telegram_recipient_hourly_limit, telegram_global_hourly_limit
                  FROM client_notification_runtime WHERE id = 1",
                 [],
                 |row| {
@@ -4305,26 +4369,33 @@ impl AppStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 },
             )
             .map_err(|error| {
                 AppError::Internal(format!("read notification claim caps failed: {error}"))
             })?;
-        let (recipient_limit, global_limit) = match lane {
-            NotificationLane::Offline => (offline_recipient_limit, offline_global_limit),
-            NotificationLane::Registration => {
+        let (recipient_limit, global_limit) = if channel.is_telegram() {
+            (telegram_recipient_limit, telegram_global_limit)
+        } else {
+            match lane {
+                NotificationLane::Offline => (offline_recipient_limit, offline_global_limit),
+                NotificationLane::Registration => {
                 (registration_recipient_limit, registration_global_limit)
+                }
             }
         };
         let sent_cutoff = (now - Duration::hours(1)).to_rfc3339();
         let global_reserved = tx
             .query_row(
-                "SELECT COUNT(*) FROM email_delivery_batches
+                "SELECT COUNT(*) FROM notification_delivery_attempts
                  WHERE notification_lane = ?3
-                   AND ((status = 'sent' AND sent_at >= ?1)
-                        OR (status = 'claimed' AND claim_expires_at > ?2))",
-                params![sent_cutoff, timestamp, lane.as_str()],
+                   AND channel = ?4
+                   AND ((status IN ('started', 'sent', 'retry', 'failed') AND started_at >= ?1)
+                        OR (status = 'reserved' AND reservation_expires_at > ?2))",
+                params![sent_cutoff, timestamp, lane.as_str(), channel.as_str()],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| {
@@ -4332,19 +4403,17 @@ impl AppStore {
             })?;
         if global_reserved >= global_limit {
             tx.execute(
-                "UPDATE email_delivery_batches
-                 SET status = 'suppressed_rate_limit',
-                     error_message = 'notification send-time hourly hard cap reached',
-                     next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                "UPDATE notification_deliveries
+                 SET status = 'retry', failure_kind = 'rate_limit',
+                     error_message = 'notification hourly send cap reached',
+                     next_attempt_at = ?2, claim_owner = NULL, claim_expires_at = NULL,
                      updated_at = ?1
-                 WHERE not_before <= ?1
-                   AND notification_lane = ?2
-                   AND (
-                       (status IN ('pending', 'retry')
-                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
-                       OR (status = 'claimed' AND claim_expires_at <= ?1)
-                   )",
-                params![timestamp, lane.as_str()],
+                 WHERE id = ?3",
+                params![
+                    timestamp,
+                    (now + Duration::minutes(1)).to_rfc3339(),
+                    batch_id
+                ],
             )
             .map_err(|error| {
                 AppError::Internal(format!(
@@ -4358,12 +4427,19 @@ impl AppStore {
         }
         let recipient_reserved = tx
             .query_row(
-                "SELECT COUNT(*) FROM email_delivery_batches
+                "SELECT COUNT(*) FROM notification_delivery_attempts
                  WHERE LOWER(recipient) = LOWER(?3)
                    AND notification_lane = ?4
-                   AND ((status = 'sent' AND sent_at >= ?1)
-                        OR (status = 'claimed' AND claim_expires_at > ?2))",
-                params![sent_cutoff, timestamp, recipient, lane.as_str()],
+                   AND channel = ?5
+                   AND ((status IN ('started', 'sent', 'retry', 'failed') AND started_at >= ?1)
+                        OR (status = 'reserved' AND reservation_expires_at > ?2))",
+                params![
+                    sent_cutoff,
+                    timestamp,
+                    recipient,
+                    lane.as_str(),
+                    channel.as_str()
+                ],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| {
@@ -4373,19 +4449,17 @@ impl AppStore {
             })?;
         if recipient_reserved >= recipient_limit {
             tx.execute(
-                "UPDATE email_delivery_batches
-                 SET status = 'suppressed_rate_limit',
-                     error_message = 'notification send-time recipient hourly hard cap reached',
-                     next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                "UPDATE notification_deliveries
+                 SET status = 'retry', failure_kind = 'rate_limit',
+                     error_message = 'notification recipient hourly send cap reached',
+                     next_attempt_at = ?2, claim_owner = NULL, claim_expires_at = NULL,
                      updated_at = ?1
-                 WHERE LOWER(recipient) = LOWER(?2) AND not_before <= ?1
-                   AND notification_lane = ?3
-                   AND (
-                       (status IN ('pending', 'retry')
-                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
-                       OR (status = 'claimed' AND claim_expires_at <= ?1)
-                   )",
-                params![timestamp, recipient, lane.as_str()],
+                 WHERE id = ?3",
+                params![
+                    timestamp,
+                    (now + Duration::minutes(1)).to_rfc3339(),
+                    batch_id
+                ],
             )
             .map_err(|error| {
                 AppError::Internal(format!(
@@ -4400,7 +4474,7 @@ impl AppStore {
         let claim_expires_at = (now + Duration::seconds(lease_secs.max(1))).to_rfc3339();
         let changed = tx
             .execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET status = 'claimed', attempts = attempts + 1, claim_owner = ?2,
                      claim_expires_at = ?3, updated_at = ?4
                  WHERE id = ?1
@@ -4420,17 +4494,46 @@ impl AppStore {
             })?;
             return Ok(ClientNotificationClaim::Empty);
         }
+        let attempt_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO notification_delivery_attempts (
+                id, delivery_id, channel, notification_lane, recipient, status,
+                reserved_at, reservation_expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7)",
+            params![
+                attempt_id,
+                batch_id,
+                channel.as_str(),
+                lane.as_str(),
+                recipient,
+                timestamp,
+                claim_expires_at,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("reserve notification delivery attempt failed: {error}"))
+        })?;
         let batch = tx
             .query_row(
                 "SELECT id, recipient, from_address, reply_to, subject, html_body,
-                        text_body, idempotency_key, attempts
-                 FROM email_delivery_batches WHERE id = ?1",
+                        text_body, idempotency_key, attempts, channel, channel_target,
+                        recipient_user_id, target_revision, provider_identity
+                 FROM notification_deliveries WHERE id = ?1",
                 params![batch_id],
                 |row| {
                     let attempts = row.get::<_, i64>(8)?;
+                    let channel_value = row.get::<_, String>(9)?;
+                    let channel = NotificationChannelId::parse(&channel_value)
+                        .map_err(|_| crate::db::Error::InvalidColumnType(9))?;
                     Ok(ClientNotificationBatch {
                         id: row.get(0)?,
+                        attempt_id: attempt_id.clone(),
                         recipient: row.get(1)?,
+                        recipient_user_id: row.get(11)?,
+                        channel,
+                        channel_target: row.get(10)?,
+                        target_revision: row.get(12)?,
+                        provider_identity: row.get(13)?,
                         from: row.get(2)?,
                         reply_to: row.get(3)?,
                         subject: row.get(4)?,
@@ -4468,7 +4571,7 @@ impl AppStore {
         if !client_notification_policy_is_current(&tx, policy)? {
             let runtime_enabled = client_notification_runtime_enabled(&tx)?;
             tx.execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET status = ?3, next_attempt_at = CASE WHEN ?3 = 'retry' THEN ?4 ELSE NULL END,
                      error_message = 'notification policy changed before delivery',
                      claim_owner = NULL, claim_expires_at = NULL, updated_at = ?4
@@ -4494,19 +4597,40 @@ impl AppStore {
             })?;
             return Ok(false);
         }
-        let claimed_recipient = tx
+        let claimed_delivery = tx
             .query_row(
-                "SELECT recipient, recipient_priority FROM email_delivery_batches
+                "SELECT recipient, recipient_priority, recipient_user_id, channel,
+                        channel_target, target_revision, provider_identity
+                 FROM notification_deliveries
                  WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2
                    AND claim_expires_at > ?3",
                 params![batch_id, worker_id, now.to_rfc3339()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| {
                 AppError::Internal(format!("read notification batch claim failed: {error}"))
             })?;
-        let Some((recipient, recipient_priority)) = claimed_recipient else {
+        let Some((
+            recipient,
+            recipient_priority,
+            recipient_user_id,
+            channel,
+            channel_target,
+            target_revision,
+            provider_identity,
+        )) = claimed_delivery
+        else {
             tx.commit().map_err(|error| {
                 AppError::Internal(format!("commit invalid batch validation failed: {error}"))
             })?;
@@ -4556,10 +4680,67 @@ impl AppStore {
             })?;
             return Ok(false);
         }
+        if let Some(user_id) = recipient_user_id.as_deref().filter(|_| target_revision > 0) {
+            let channel_is_current = tx
+                .query_row(
+                    "SELECT 1 FROM user_notification_channels
+                     WHERE user_id = ?1 AND channel = ?2 AND enabled = 1 AND state = 'ready'
+                       AND revision = ?3 AND target = ?4
+                       AND COALESCE(provider_identity, '') = COALESCE(?5, '')",
+                    params![
+                        user_id,
+                        channel,
+                        target_revision,
+                        channel_target,
+                        provider_identity
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "validate notification channel revision failed: {error}"
+                    ))
+                })?
+                .is_some();
+            if !channel_is_current {
+                cancel_notification_batch_tx(
+                    &tx,
+                    batch_id,
+                    worker_id,
+                    "cancelled_channel_changed",
+                    "notification channel changed before delivery",
+                    now,
+                )?;
+                requeue_notification_batch_events_tx(&tx, batch_id, now)?;
+                tx.commit().map_err(|error| {
+                    AppError::Internal(format!(
+                        "commit stale notification channel cancellation failed: {error}"
+                    ))
+                })?;
+                return Ok(false);
+            }
+        } else if channel != "email" {
+            cancel_notification_batch_tx(
+                &tx,
+                batch_id,
+                worker_id,
+                "cancelled_channel_changed",
+                "notification target has no owning account",
+                now,
+            )?;
+            requeue_notification_batch_events_tx(&tx, batch_id, now)?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit ownerless notification channel cancellation failed: {error}"
+                ))
+            })?;
+            return Ok(false);
+        }
         let expected_priority = OWNER_NOTIFICATION_RECIPIENT_PRIORITY;
         if recipient_priority != expected_priority {
             tx.execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET recipient_priority = ?3, updated_at = ?4
                  WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
                 params![batch_id, worker_id, expected_priority, now.to_rfc3339()],
@@ -4574,7 +4755,7 @@ impl AppStore {
         let stale_offline_events = tx
             .query_row(
                 "SELECT COUNT(*)
-                 FROM email_delivery_batch_items bi
+                 FROM notification_delivery_items bi
                  INNER JOIN client_notification_events e ON e.id = bi.event_id
                  LEFT JOIN installation_notification_state ns
                    ON ns.installation_id = e.installation_id
@@ -4597,7 +4778,7 @@ impl AppStore {
                                 e.kind = 'client_offline'
                                 AND (ns.installation_id IS NULL OR ns.offline_episode != e.episode
                                      OR ns.presence_state NOT IN ('offline', 'recovering'))
-                         FROM email_delivery_batch_items bi
+                         FROM notification_delivery_items bi
                          INNER JOIN client_notification_events e ON e.id = bi.event_id
                          LEFT JOIN installation_notification_state ns
                            ON ns.installation_id = e.installation_id
@@ -4654,7 +4835,7 @@ impl AppStore {
                 })?;
                 tx.execute(
                     &format!(
-                        "DELETE FROM email_delivery_batch_items
+                        "DELETE FROM notification_delivery_items
                          WHERE batch_id = ?1 AND event_id IN ({placeholders})"
                     ),
                     params_from_iter(
@@ -4710,12 +4891,44 @@ impl AppStore {
             batch_id,
             worker_id,
             "sent",
+            None,
             Some(provider_message_id),
             None,
             None,
             now,
         )
         .await
+    }
+
+    pub async fn start_client_notification_attempt(
+        &self,
+        batch_id: &str,
+        attempt_id: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE notification_delivery_attempts
+                 SET status = 'started', started_at = ?4
+                 WHERE id = ?2 AND delivery_id = ?1 AND status = 'reserved'
+                   AND EXISTS (
+                       SELECT 1 FROM notification_deliveries
+                       WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?3
+                         AND claim_expires_at > ?4
+                   )",
+                params![batch_id, attempt_id, worker_id, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("start notification delivery attempt failed: {error}"))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "notification delivery attempt is no longer reserved".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn mark_client_notification_batch_retry(
@@ -4730,6 +4943,7 @@ impl AppStore {
             batch_id,
             worker_id,
             "retry",
+            Some("transient_transport"),
             None,
             Some(error),
             Some(next_attempt_at),
@@ -4742,6 +4956,7 @@ impl AppStore {
         &self,
         batch_id: &str,
         worker_id: &str,
+        failure_kind: &str,
         error: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
@@ -4749,6 +4964,7 @@ impl AppStore {
             batch_id,
             worker_id,
             "dead_letter",
+            Some(failure_kind),
             None,
             Some(error),
             None,
@@ -4761,19 +4977,46 @@ impl AppStore {
         &self,
         batch_id: &str,
         worker_id: &str,
+        reason_code: &str,
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        self.finish_client_notification_batch(
-            batch_id,
-            worker_id,
-            "blocked_config",
-            None,
-            Some(reason),
-            None,
-            now,
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin blocked notification finish failed: {error}"))
+            })?;
+        let changed = tx
+            .execute(
+                "UPDATE notification_deliveries
+                 SET status = 'blocked_config', failure_kind = 'config',
+                     blocked_reason_code = ?3, error_message = ?4, next_attempt_at = NULL,
+                     claim_owner = NULL, claim_expires_at = NULL, updated_at = ?5
+                 WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
+                params![batch_id, worker_id, reason_code, reason, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("block notification delivery failed: {error}"))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "notification batch claim is no longer owned by this worker".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE notification_delivery_attempts
+             SET status = 'cancelled', finished_at = ?2, error_message = ?3
+             WHERE delivery_id = ?1 AND status IN ('reserved', 'started')",
+            params![batch_id, now.to_rfc3339(), reason],
         )
-        .await
+        .map_err(|error| {
+            AppError::Internal(format!("cancel blocked delivery attempt failed: {error}"))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit blocked notification finish failed: {error}"))
+        })?;
+        Ok(())
     }
 
     async fn finish_client_notification_batch(
@@ -4781,6 +5024,7 @@ impl AppStore {
         batch_id: &str,
         worker_id: &str,
         status: &str,
+        failure_kind: Option<&str>,
         provider_message_id: Option<&str>,
         error: Option<&str>,
         next_attempt_at: Option<DateTime<Utc>>,
@@ -4800,18 +5044,20 @@ impl AppStore {
             })?;
         let changed = tx
             .execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET status = ?3, provider_message_id = COALESCE(?4, provider_message_id),
-                     error_message = ?5, next_attempt_at = ?6,
+                     failure_kind = ?5, blocked_reason_code = NULL,
+                     error_message = ?6, next_attempt_at = ?7,
                      claim_owner = NULL, claim_expires_at = NULL,
-                     sent_at = CASE WHEN ?3 = 'sent' THEN ?7 ELSE sent_at END,
-                     updated_at = ?7
+                     sent_at = CASE WHEN ?3 = 'sent' THEN ?8 ELSE sent_at END,
+                     updated_at = ?8
                  WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
                 params![
                     batch_id,
                     worker_id,
                     status,
                     provider_message_id.map(|value| value.chars().take(512).collect::<String>()),
+                    failure_kind,
                     error.map(|value| value.chars().take(2_000).collect::<String>()),
                     next_attempt_at.map(|value| value.to_rfc3339()),
                     now.to_rfc3339(),
@@ -4825,6 +5071,29 @@ impl AppStore {
                 "notification batch claim is no longer owned by this worker".into(),
             ));
         }
+        let attempt_status = match status {
+            "sent" => "sent",
+            "retry" => "retry",
+            "dead_letter" => "failed",
+            _ => "cancelled",
+        };
+        tx.execute(
+            "UPDATE notification_delivery_attempts
+             SET status = ?2, finished_at = ?3,
+                 provider_message_id = COALESCE(?4, provider_message_id),
+                 error_message = ?5
+             WHERE delivery_id = ?1 AND status IN ('reserved', 'started')",
+            params![
+                batch_id,
+                attempt_status,
+                now.to_rfc3339(),
+                provider_message_id,
+                error
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("finish notification delivery attempt failed: {error}"))
+        })?;
         if status == "sent" {
             tx.execute(
                 "INSERT OR IGNORE INTO email_send_logs (
@@ -4833,7 +5102,7 @@ impl AppStore {
                  )
                  SELECT id, 'client_notification', recipient, provider_message_id,
                         'sent', NULL, ?2
-                 FROM email_delivery_batches WHERE id = ?1",
+                 FROM notification_deliveries WHERE id = ?1",
                 params![batch_id, now.to_rfc3339()],
             )
             .map_err(|error| {
@@ -4855,9 +5124,10 @@ impl AppStore {
         let mut statement = conn
             .prepare(
                 "WITH recent_batches AS (
-                     SELECT id, recipient, status, attempts, created_at,
-                            next_attempt_at, sent_at, error_message, delivery_kind
-                     FROM email_delivery_batches
+                     SELECT id, recipient, channel, channel_target, status, attempts, created_at,
+                            next_attempt_at, sent_at, error_message, delivery_kind,
+                            failure_kind, blocked_reason_code
+                     FROM notification_deliveries
                      ORDER BY created_at DESC, id DESC
                      LIMIT ?1
                  )
@@ -4876,10 +5146,11 @@ impl AppStore {
                             )
                             ELSE 1
                         END), 0),
-                        b.recipient, b.status, b.attempts,
-                        b.created_at, b.next_attempt_at, b.sent_at, b.error_message
+                        b.recipient, b.channel, b.channel_target, b.status, b.attempts,
+                        b.created_at, b.next_attempt_at, b.sent_at, b.error_message,
+                        b.failure_kind, b.blocked_reason_code
                  FROM recent_batches b
-                 LEFT JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 LEFT JOIN notification_delivery_items bi ON bi.batch_id = b.id
                  LEFT JOIN client_notification_events e ON e.id = bi.event_id
                  GROUP BY b.id
                  ORDER BY b.created_at DESC, b.id DESC",
@@ -4890,22 +5161,31 @@ impl AppStore {
         let rows = statement
             .query_map(params![limit.clamp(1, 100) as i64], |row| {
                 let recipient = row.get::<_, String>(4)?;
-                let recipient_masked = mask_email_address(&recipient);
+                let channel = row.get::<_, String>(5)?;
+                let channel_target = row.get::<_, Option<String>>(6)?;
+                let target_masked = mask_notification_target(
+                    &channel,
+                    &recipient,
+                    channel_target.as_deref(),
+                );
                 let error_message = row
-                    .get::<_, Option<String>>(10)?
+                    .get::<_, Option<String>>(12)?
                     .map(|value| mask_email_like_tokens(&value))
                     .map(|value| value.chars().take(500).collect());
                 Ok(ClientNotificationDeliveryView {
                     id: row.get(0)?,
+                    channel,
                     delivery_kind: row.get(1)?,
                     event_kind: row.get(2)?,
                     event_count: row.get::<_, i64>(3)?.max(0) as u64,
-                    recipient_masked,
-                    status: row.get(5)?,
-                    attempts: row.get::<_, i64>(6)?.max(0) as u32,
-                    created_at: row.get(7)?,
-                    next_attempt_at: row.get(8)?,
-                    sent_at: row.get(9)?,
+                    target_masked,
+                    status: row.get(7)?,
+                    failure_kind: row.get(13)?,
+                    blocked_reason_code: row.get(14)?,
+                    attempts: row.get::<_, i64>(8)?.max(0) as u32,
+                    created_at: row.get(9)?,
+                    next_attempt_at: row.get(10)?,
+                    sent_at: row.get(11)?,
                     error_message,
                 })
             })
@@ -10155,6 +10435,13 @@ impl AppStore {
     ) -> Result<MapDisplaySettings, AppError> {
         let conn = self.conn.lock().await;
         let mut current = read_map_display_settings(&conn)?;
+        if update.expected_revision != current.revision {
+            return Err(AppError::coded_conflict(
+                "MAP_DISPLAY_REVISION_CONFLICT",
+                "map display settings changed after this page was loaded",
+                serde_json::json!({ "currentRevision": current.revision }),
+            ));
+        }
         if let Some(show_flows) = update.show_flows {
             current.show_flows = show_flows;
         }
@@ -10168,7 +10455,7 @@ impl AppStore {
         }
         current = sanitize_map_display_settings(current);
         write_map_display_settings(&conn, &current)?;
-        Ok(current)
+        read_map_display_settings(&conn)
     }
 
     pub async fn announcement_settings(&self) -> Result<AnnouncementSettings, AppError> {
@@ -10192,6 +10479,14 @@ impl AppStore {
     ) -> Result<AnnouncementSettings, AppError> {
         let conn = self.conn.lock().await;
         let mut current = read_announcement_settings(&conn)?;
+        let current_revision = current.updated_at.to_rfc3339();
+        if update.expected_revision != current_revision {
+            return Err(AppError::coded_conflict(
+                "ANNOUNCEMENT_REVISION_CONFLICT",
+                "announcement settings changed after this page was loaded",
+                serde_json::json!({ "currentRevision": current_revision }),
+            ));
+        }
         if let Some(enabled) = update.enabled {
             current.enabled = enabled;
         }
@@ -10449,8 +10744,8 @@ impl AppStore {
                                      OR (e.kind = 'client_offline' AND e.status = 'pending')
                                      OR (e.kind = 'client_offline' AND e.status = 'batched' AND EXISTS (
                                          SELECT 1
-                                         FROM email_delivery_batch_items bi
-                                         INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                                         FROM notification_delivery_items bi
+                                         INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                                          WHERE bi.event_id = e.id
                                            AND b.status IN ('pending', 'claimed', 'retry', 'blocked_config')
                                      ))
@@ -10796,7 +11091,7 @@ impl AppStore {
                 cleanup_client_notification_queue_tx(&tx, Utc::now())?;
             let deleted_notification_batches = bounded_notification_batches
                 + tx.execute(
-                    "DELETE FROM email_delivery_batches
+                    "DELETE FROM notification_deliveries
                      WHERE updated_at < ?1
                        AND status IN (
                            'sent', 'dead_letter', 'suppressed_disabled',
@@ -10817,7 +11112,7 @@ impl AppStore {
                      WHERE updated_at < ?1
                        AND status NOT IN ('pending', 'awaiting_owner', 'awaiting_setup')
                        AND NOT EXISTS (
-                           SELECT 1 FROM email_delivery_batch_items bi
+                           SELECT 1 FROM notification_delivery_items bi
                            WHERE bi.event_id = client_notification_events.id
                        )",
                     params![notification_audit_cutoff],
@@ -13865,26 +14160,27 @@ fn normalize_stored_map_display_settings(stored: StoredMapDisplaySettings) -> Ma
             visible_start_px: (stored.viewport.visible_start_px - stored.viewport.vertical_pan_px)
                 .clamp(0, 5000),
         },
+        revision: "0".into(),
     }
 }
 
 fn read_map_display_settings(conn: &Connection) -> Result<MapDisplaySettings, AppError> {
-    let json: Option<String> = conn
+    let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT settings_json FROM router_map_display_settings WHERE id = 1",
+            "SELECT settings_json, updated_at FROM router_map_display_settings WHERE id = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| AppError::Internal(format!("read map display settings failed: {e}")))?;
-    match json {
-        Some(raw) => {
+    match row {
+        Some((raw, revision)) => {
             let parsed = serde_json::from_str::<StoredMapDisplaySettings>(&raw).map_err(|e| {
                 AppError::Internal(format!("parse map display settings failed: {e}"))
             })?;
-            Ok(sanitize_map_display_settings(
-                normalize_stored_map_display_settings(parsed),
-            ))
+            let mut settings = normalize_stored_map_display_settings(parsed);
+            settings.revision = revision;
+            Ok(sanitize_map_display_settings(settings))
         }
         None => Ok(MapDisplaySettings::default()),
     }
@@ -14179,25 +14475,25 @@ fn prepare_legacy_setup_notification_adoption_tx(
             .prepare(
                 "SELECT e.id, e.status,
                         EXISTS(
-                            SELECT 1 FROM email_delivery_batch_items bi
-                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            SELECT 1 FROM notification_delivery_items bi
+                            INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                             WHERE bi.event_id = e.id AND b.status = 'sent'
                         ),
                         EXISTS(
-                            SELECT 1 FROM email_delivery_batch_items bi
-                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            SELECT 1 FROM notification_delivery_items bi
+                            INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                             WHERE bi.event_id = e.id
                               AND b.status = 'claimed'
                         ),
                         EXISTS(
-                            SELECT 1 FROM email_delivery_batch_items bi
-                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            SELECT 1 FROM notification_delivery_items bi
+                            INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                             WHERE bi.event_id = e.id
                               AND b.status IN ('pending', 'retry', 'blocked_config')
                         ),
                         EXISTS(
-                            SELECT 1 FROM email_delivery_batch_items bi
-                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            SELECT 1 FROM notification_delivery_items bi
+                            INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                             WHERE bi.event_id = e.id AND b.status = 'suppressed_disabled'
                         )
                  FROM client_notification_events e
@@ -14275,8 +14571,8 @@ fn prepare_legacy_setup_notification_adoption_tx(
         let mut statement = conn
             .prepare(
                 "SELECT DISTINCT b.id
-                 FROM email_delivery_batches b
-                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 FROM notification_deliveries b
+                 INNER JOIN notification_delivery_items bi ON bi.batch_id = b.id
                  INNER JOIN client_notification_events e ON e.id = bi.event_id
                  WHERE e.installation_id = ?1 AND e.kind = 'client_registered'
                    AND b.status IN ('pending', 'retry', 'blocked_config')",
@@ -14298,7 +14594,7 @@ fn prepare_legacy_setup_notification_adoption_tx(
     let timestamp = now.to_rfc3339();
     for batch_id in active_batch_ids {
         conn.execute(
-            "UPDATE email_delivery_batches
+            "UPDATE notification_deliveries
              SET status = 'suppressed_config_changed',
                  error_message = 'superseded by explicit setup completion',
                  next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
@@ -14312,7 +14608,7 @@ fn prepare_legacy_setup_notification_adoption_tx(
             ))
         })?;
         conn.execute(
-            "DELETE FROM email_delivery_batch_items WHERE batch_id = ?1",
+            "DELETE FROM notification_delivery_items WHERE batch_id = ?1",
             params![batch_id],
         )
         .map_err(|error| {
@@ -14405,7 +14701,7 @@ fn suppress_disabled_notification_work_tx(
         })?;
     stats.suppressed_disabled += suppressed as u64;
     conn.execute(
-        "UPDATE email_delivery_batches
+        "UPDATE notification_deliveries
          SET status = 'suppressed_disabled', error_message = 'notifications disabled',
              next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
              updated_at = ?1
@@ -14440,8 +14736,8 @@ fn clear_inactive_setup_password_hints_tx(
                              e.status = 'batched'
                              AND EXISTS (
                                  SELECT 1
-                                 FROM email_delivery_batch_items bi
-                                 INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                                 FROM notification_delivery_items bi
+                                 INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                                  WHERE bi.event_id = e.id
                                    AND b.status IN ('pending', 'claimed', 'retry', 'blocked_config')
                              )
@@ -14492,23 +14788,37 @@ fn sync_client_notification_runtime_tx(
             )
         })
         .unwrap_or((0, None));
+    let telegram_recipient_hourly_limit = template
+        .map(|value| value.telegram.recipient_hourly_limit)
+        .unwrap_or(10);
+    let telegram_global_hourly_limit = template
+        .map(|value| value.telegram.global_hourly_limit)
+        .unwrap_or(50);
     conn.execute(
         "INSERT INTO client_notification_runtime (
             id, enabled, enabled_since, policy_fingerprint, delivery_configured,
             template_fingerprint, recipient_hourly_limit, global_hourly_limit,
             registration_recipient_hourly_limit, registration_global_hourly_limit,
-            updated_at
-         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            telegram_recipient_hourly_limit, telegram_global_hourly_limit, updated_at
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(id) DO UPDATE SET
             enabled = excluded.enabled,
             enabled_since = excluded.enabled_since,
             policy_fingerprint = excluded.policy_fingerprint,
-            delivery_configured = CASE WHEN ?11 = 1 THEN excluded.delivery_configured ELSE delivery_configured END,
+            delivery_configured = CASE WHEN ?13 = 1 THEN excluded.delivery_configured ELSE delivery_configured END,
             template_fingerprint = COALESCE(excluded.template_fingerprint, template_fingerprint),
             recipient_hourly_limit = excluded.recipient_hourly_limit,
             global_hourly_limit = excluded.global_hourly_limit,
             registration_recipient_hourly_limit = excluded.registration_recipient_hourly_limit,
             registration_global_hourly_limit = excluded.registration_global_hourly_limit,
+            telegram_recipient_hourly_limit = CASE
+                WHEN ?13 = 1 THEN excluded.telegram_recipient_hourly_limit
+                ELSE telegram_recipient_hourly_limit
+            END,
+            telegram_global_hourly_limit = CASE
+                WHEN ?13 = 1 THEN excluded.telegram_global_hourly_limit
+                ELSE telegram_global_hourly_limit
+            END,
             registration_overflow_active = CASE
                 WHEN excluded.enabled = 0 THEN 0
                 ELSE registration_overflow_active
@@ -14524,6 +14834,8 @@ fn sync_client_notification_runtime_tx(
             policy.global_hourly_limit,
             policy.registration_recipient_hourly_limit,
             policy.registration_global_hourly_limit,
+            telegram_recipient_hourly_limit,
+            telegram_global_hourly_limit,
             timestamp,
             i64::from(template.is_some()),
         ],
@@ -14555,64 +14867,13 @@ fn sync_client_notification_runtime_tx(
     }
 
     if template.is_some_and(|value| value.delivery_configured) {
-        let invalid_batches = {
-            let mut statement = conn
-                .prepare(
-                    "SELECT id FROM email_delivery_batches
-                     WHERE status = 'blocked_config' AND from_address = ''",
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!(
-                        "prepare invalid notification batches failed: {error}"
-                    ))
-                })?;
-            let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|error| {
-                    AppError::Internal(format!(
-                        "query invalid notification batches failed: {error}"
-                    ))
-                })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
-                AppError::Internal(format!("read invalid notification batches failed: {error}"))
-            })?
-        };
-        for batch_id in invalid_batches {
-            conn.execute(
-                "UPDATE client_notification_events
-                 SET status = 'pending', updated_at = ?2
-                 WHERE status = 'batched' AND id IN (
-                     SELECT event_id FROM email_delivery_batch_items WHERE batch_id = ?1
-                 )",
-                params![batch_id, timestamp],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("requeue invalid-envelope events failed: {error}"))
-            })?;
-            conn.execute(
-                "DELETE FROM email_delivery_batch_items WHERE batch_id = ?1",
-                params![batch_id],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("release invalid-envelope items failed: {error}"))
-            })?;
-            conn.execute(
-                "UPDATE email_delivery_batches
-                 SET status = 'suppressed_config_changed',
-                     error_message = 'delivery envelope became valid after batch freeze',
-                     next_attempt_at = NULL, updated_at = ?2
-                 WHERE id = ?1 AND status = 'blocked_config'",
-                params![batch_id, timestamp],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("suppress invalid-envelope batch failed: {error}"))
-            })?;
-        }
         conn.execute(
-            "UPDATE email_delivery_batches
+            "UPDATE notification_deliveries
              SET status = 'retry', next_attempt_at = ?1, error_message = NULL,
+                 failure_kind = NULL, blocked_reason_code = NULL,
                  claim_owner = NULL, claim_expires_at = NULL, updated_at = ?1
-             WHERE status = 'blocked_config' AND from_address != ''",
+             WHERE status = 'blocked_config' AND channel = 'email'
+               AND blocked_reason_code IN ('email_provider_unavailable', 'email_sender_missing')",
             params![timestamp],
         )
         .map_err(|error| {
@@ -14635,7 +14896,7 @@ fn suppress_removed_notification_recipients(
     let candidates = {
         let mut statement = conn
             .prepare(
-                "SELECT id, recipient FROM email_delivery_batches
+                "SELECT id, recipient FROM notification_deliveries
                  WHERE status IN ('pending', 'retry', 'blocked_config')
                     OR (status = 'claimed' AND claim_expires_at <= ?1)",
             )
@@ -14663,7 +14924,7 @@ fn suppress_removed_notification_recipients(
             };
         if let Some(recipient_priority) = recipient_priority {
             conn.execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET recipient_priority = ?2, updated_at = ?3
                  WHERE id = ?1 AND recipient_priority != ?2",
                 params![batch_id, recipient_priority, timestamp],
@@ -14677,7 +14938,7 @@ fn suppress_removed_notification_recipients(
         }
         let changed = conn
             .execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET status = 'suppressed_recipient_removed',
                      error_message = 'recipient authorization removed',
                      next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
@@ -14711,7 +14972,7 @@ fn notification_batch_is_authorized_for_current_owner(
                          AND TRIM(i.owner_email) != ''
                          AND LOWER(i.owner_email) = LOWER(?2)
                         THEN 1 ELSE 0 END), 0)
-             FROM email_delivery_batch_items bi
+             FROM notification_delivery_items bi
              INNER JOIN client_notification_events e ON e.id = bi.event_id
              LEFT JOIN installations i ON i.id = e.installation_id
              WHERE bi.batch_id = ?1",
@@ -15270,7 +15531,7 @@ fn cancel_notification_batch_tx(
 ) -> Result<(), AppError> {
     let changed = conn
         .execute(
-            "UPDATE email_delivery_batches
+            "UPDATE notification_deliveries
              SET status = ?3, error_message = ?4, next_attempt_at = NULL, claim_owner = NULL,
                  claim_expires_at = NULL, updated_at = ?5
              WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
@@ -15284,6 +15545,15 @@ fn cancel_notification_batch_tx(
             "notification batch claim is no longer owned by this worker".into(),
         ));
     }
+    conn.execute(
+        "UPDATE notification_delivery_attempts
+         SET status = 'cancelled', finished_at = ?2, error_message = ?3
+         WHERE delivery_id = ?1 AND status IN ('reserved', 'started')",
+        params![batch_id, now.to_rfc3339(), reason],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("cancel notification delivery attempt failed: {error}"))
+    })?;
     Ok(())
 }
 
@@ -15294,7 +15564,7 @@ fn requeue_notification_batch_events_tx(
 ) -> Result<(), AppError> {
     let event_ids = {
         let mut statement = conn
-            .prepare("SELECT DISTINCT event_id FROM email_delivery_batch_items WHERE batch_id = ?1")
+            .prepare("SELECT DISTINCT event_id FROM notification_delivery_items WHERE batch_id = ?1")
             .map_err(|error| {
                 AppError::Internal(format!(
                     "prepare notification recipient requeue failed: {error}"
@@ -15317,7 +15587,7 @@ fn requeue_notification_batch_events_tx(
         return Ok(());
     }
     conn.execute(
-        "DELETE FROM email_delivery_batch_items WHERE batch_id = ?1",
+        "DELETE FROM notification_delivery_items WHERE batch_id = ?1",
         params![batch_id],
     )
     .map_err(|error| {
@@ -15377,8 +15647,8 @@ fn cleanup_client_notification_queue_tx(
              WHERE (e.status LIKE 'suppressed_%' OR e.status = 'batched')
                AND NOT EXISTS (
                     SELECT 1
-                    FROM email_delivery_batch_items bi
-                    INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                    FROM notification_delivery_items bi
+                    INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                     WHERE bi.event_id = e.id AND b.status NOT LIKE 'suppressed_%'
                )",
             [],
@@ -15396,18 +15666,18 @@ fn cleanup_client_notification_queue_tx(
     };
     let event_driven_deleted_batches = if events_to_release > 0 {
         conn.execute(
-            "DELETE FROM email_delivery_batches
+            "DELETE FROM notification_deliveries
              WHERE status LIKE 'suppressed_%'
                AND id IN (
                    SELECT DISTINCT bi.batch_id
-                   FROM email_delivery_batch_items bi
+                   FROM notification_delivery_items bi
                    WHERE bi.event_id IN (
                        SELECT e.id FROM client_notification_events e
                        WHERE (e.status LIKE 'suppressed_%' OR e.status = 'batched')
                          AND NOT EXISTS (
                              SELECT 1
-                             FROM email_delivery_batch_items candidate_bi
-                             INNER JOIN email_delivery_batches candidate_b
+                             FROM notification_delivery_items candidate_bi
+                             INNER JOIN notification_deliveries candidate_b
                                ON candidate_b.id = candidate_bi.batch_id
                              WHERE candidate_bi.event_id = e.id
                                AND candidate_b.status NOT LIKE 'suppressed_%'
@@ -15429,7 +15699,7 @@ fn cleanup_client_notification_queue_tx(
 
     let suppressed_batch_count = conn
         .query_row(
-            "SELECT COUNT(*) FROM email_delivery_batches
+            "SELECT COUNT(*) FROM notification_deliveries
              WHERE status LIKE 'suppressed_%'",
             [],
             |row| row.get::<_, i64>(0),
@@ -15446,9 +15716,9 @@ fn cleanup_client_notification_queue_tx(
     };
     let watermark_deleted_batches = if batches_to_delete > 0 {
         conn.execute(
-            "DELETE FROM email_delivery_batches
+            "DELETE FROM notification_deliveries
              WHERE id IN (
-                 SELECT id FROM email_delivery_batches
+                 SELECT id FROM notification_deliveries
                  WHERE status LIKE 'suppressed_%'
                  ORDER BY updated_at, id
                  LIMIT ?1
@@ -15474,7 +15744,7 @@ fn cleanup_client_notification_queue_tx(
              updated_at = ?1
          WHERE status = 'batched'
            AND NOT EXISTS (
-               SELECT 1 FROM email_delivery_batch_items bi
+               SELECT 1 FROM notification_delivery_items bi
                WHERE bi.event_id = client_notification_events.id
            )",
         params![timestamp],
@@ -15490,7 +15760,7 @@ fn cleanup_client_notification_queue_tx(
             "SELECT COUNT(*) FROM client_notification_events e
              WHERE e.status LIKE 'suppressed_%'
                AND NOT EXISTS (
-                   SELECT 1 FROM email_delivery_batch_items bi WHERE bi.event_id = e.id
+                   SELECT 1 FROM notification_delivery_items bi WHERE bi.event_id = e.id
                )",
             [],
             |row| row.get::<_, i64>(0),
@@ -15514,7 +15784,7 @@ fn cleanup_client_notification_queue_tx(
                  SELECT e.id FROM client_notification_events e
                  WHERE e.status LIKE 'suppressed_%'
                    AND NOT EXISTS (
-                       SELECT 1 FROM email_delivery_batch_items bi WHERE bi.event_id = e.id
+                       SELECT 1 FROM notification_delivery_items bi WHERE bi.event_id = e.id
                    )
                  ORDER BY e.occurred_at, e.id
                  LIMIT ?1
@@ -23074,8 +23344,8 @@ fn registration_overflow_should_capture_tx(
                    e.status IN ('pending', 'awaiting_owner', 'awaiting_setup')
                    OR (e.status = 'batched' AND EXISTS (
                        SELECT 1
-                       FROM email_delivery_batch_items bi
-                       INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                       FROM notification_delivery_items bi
+                       INNER JOIN notification_deliveries b ON b.id = bi.batch_id
                        WHERE bi.event_id = e.id
                          AND b.notification_lane = 'registration'
                          AND b.status IN ('pending', 'claimed', 'retry', 'blocked_config')
@@ -23091,7 +23361,7 @@ fn registration_overflow_should_capture_tx(
         })?;
     let active_batch_count = conn
         .query_row(
-            "SELECT COUNT(*) FROM email_delivery_batches
+            "SELECT COUNT(*) FROM notification_deliveries
              WHERE notification_lane = 'registration'
                AND status IN ('pending', 'claimed', 'retry', 'blocked_config')",
             [],
@@ -26058,6 +26328,7 @@ mod tests {
             resend_from_name: None,
             resend_reply_to: None,
             client_notifications: crate::config::ClientNotificationSettings::default(),
+            telegram_bot: crate::config::TelegramBotSettings::default(),
             auth_code_ttl_secs: 600,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 7 * 24 * 60 * 60,
@@ -26142,6 +26413,7 @@ mod tests {
             reply_to: Some("support@example.com".into()),
             delivery_configured: true,
             delivery_config_fingerprint: "test-delivery-config".into(),
+            telegram: crate::notifications::TelegramNotificationContext::default(),
         }
     }
 
@@ -26190,7 +26462,7 @@ mod tests {
         sent_at: Option<DateTime<Utc>>,
     ) {
         conn.execute(
-            "INSERT INTO email_delivery_batches (
+            "INSERT INTO notification_deliveries (
                 id, notification_lane, recipient, from_address, subject, html_body, idempotency_key,
                 status, attempts, not_before, next_attempt_at, claim_owner,
                 claim_expires_at, template_fingerprint, delivery_kind,
@@ -29893,7 +30165,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let (html, text): (String, String) = conn
             .query_row(
-                "SELECT html_body, text_body FROM email_delivery_batches LIMIT 1",
+                "SELECT html_body, text_body FROM notification_deliveries LIMIT 1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -30095,7 +30367,7 @@ mod tests {
         let state: (String, String, String, String, String, i64) = conn
             .query_row(
                 "SELECT e.status, e.occurred_at, e.not_before, isc.source, isc.setup_id,
-                        (SELECT COUNT(*) FROM email_delivery_batches)
+                        (SELECT COUNT(*) FROM notification_deliveries)
                  FROM client_notification_events e
                  INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
                  WHERE e.installation_id = ?1",
@@ -30187,7 +30459,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let (batch_count, html): (i64, String) = conn
             .query_row(
-                "SELECT COUNT(*), MAX(html_body) FROM email_delivery_batches",
+                "SELECT COUNT(*), MAX(html_body) FROM notification_deliveries",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -30239,9 +30511,9 @@ mod tests {
             let state: (String, String, i64, Option<String>) = conn
                 .query_row(
                     "SELECT b.status, e.status,
-                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id),
+                            (SELECT COUNT(*) FROM notification_delivery_items WHERE batch_id = b.id),
                             isc.password_hint
-                     FROM email_delivery_batches b
+                     FROM notification_deliveries b
                      CROSS JOIN client_notification_events e
                      INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
                      WHERE e.installation_id = ?1",
@@ -30274,7 +30546,7 @@ mod tests {
                 "SELECT COUNT(*),
                         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
                         MAX(CASE WHEN status = 'pending' THEN html_body ELSE '' END)
-                 FROM email_delivery_batches",
+                 FROM notification_deliveries",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -30343,10 +30615,10 @@ mod tests {
             let state: (String, String, i64, Option<String>) = conn
                 .query_row(
                     "SELECT b.status, e.status,
-                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id),
+                            (SELECT COUNT(*) FROM notification_delivery_items WHERE batch_id = b.id),
                             isc.password_hint
-                     FROM email_delivery_batches b
-                     INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                     FROM notification_deliveries b
+                     INNER JOIN notification_delivery_items bi ON bi.batch_id = b.id
                      INNER JOIN client_notification_events e ON e.id = bi.event_id
                      INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
                      WHERE b.id = ?1",
@@ -30378,7 +30650,7 @@ mod tests {
         let counts: (i64, i64) = conn
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1),
-                        (SELECT COUNT(*) FROM email_delivery_batches)",
+                        (SELECT COUNT(*) FROM notification_deliveries)",
                 params![installation_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -30656,7 +30928,7 @@ mod tests {
                     .expect("classify sent legacy delivery"),
                 LegacySetupNotificationState::Sent { .. }
             ));
-            conn.execute("DELETE FROM email_delivery_batches", [])
+            conn.execute("DELETE FROM notification_deliveries", [])
                 .expect("clean sent legacy batch audit");
             conn.execute(
                 "DELETE FROM client_notification_events WHERE installation_id = ?1",
@@ -34064,7 +34336,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let statuses = conn
             .prepare(
-                "SELECT status, COUNT(*) FROM email_delivery_batches
+                "SELECT status, COUNT(*) FROM notification_deliveries
                  WHERE incident_key IS NOT NULL GROUP BY status ORDER BY status",
             )
             .expect("prepare incident statuses")
@@ -34132,7 +34404,7 @@ mod tests {
             .expect("aggregate owner notification");
         let conn = store.conn.lock().await;
         let recipients = conn
-            .prepare("SELECT recipient FROM email_delivery_batches ORDER BY recipient")
+            .prepare("SELECT recipient FROM notification_deliveries ORDER BY recipient")
             .expect("prepare owner recipients")
             .query_map([], |row| row.get::<_, String>(0))
             .expect("query owner recipients")
@@ -34215,7 +34487,7 @@ mod tests {
             .expect("read disabled runtime");
         let batch_status: String = conn
             .query_row(
-                "SELECT status FROM email_delivery_batches WHERE id = 'policy-version-batch'",
+                "SELECT status FROM notification_deliveries WHERE id = 'policy-version-batch'",
                 [],
                 |row| row.get(0),
             )
@@ -34249,9 +34521,18 @@ mod tests {
                 None,
                 Some(now),
             );
+            conn.execute(
+                "INSERT INTO notification_delivery_attempts (
+                    id, delivery_id, channel, notification_lane, recipient, status,
+                    reserved_at, reservation_expires_at, started_at, finished_at
+                 ) VALUES ('sent-cap-attempt', 'sent-at-cap', 'email', 'offline',
+                           'ops@example.com', 'sent', ?1, ?2, ?1, ?1)",
+                params![now.to_rfc3339(), (now + Duration::seconds(30)).to_rfc3339()],
+            )
+            .expect("seed sent attempt at recipient cap");
             insert_test_notification_batch(
                 &conn,
-                "expired-claim",
+                "a-expired-claim",
                 "ops@example.com",
                 "claimed",
                 now,
@@ -34259,19 +34540,21 @@ mod tests {
                 Some(now - Duration::seconds(1)),
                 None,
             );
+            conn.execute(
+                "INSERT INTO notification_delivery_attempts (
+                    id, delivery_id, channel, notification_lane, recipient, status,
+                    reserved_at, reservation_expires_at
+                 ) VALUES ('expired-reservation', 'a-expired-claim', 'email', 'offline',
+                           'ops@example.com', 'reserved', ?1, ?2)",
+                params![
+                    (now - Duration::seconds(30)).to_rfc3339(),
+                    (now - Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .expect("seed expired delivery reservation");
             insert_test_notification_batch(
                 &conn,
-                "capped-retry",
-                "ops@example.com",
-                "retry",
-                now,
-                None,
-                None,
-                None,
-            );
-            insert_test_notification_batch(
-                &conn,
-                "other-recipient",
+                "z-other-recipient",
                 "other@example.com",
                 "pending",
                 now,
@@ -34292,31 +34575,20 @@ mod tests {
                 .expect("claim next recipient"),
             "next batch must not starve",
         );
-        assert_eq!(second.id, "other-recipient");
+        assert_eq!(second.id, "z-other-recipient");
         let conn = store.conn.lock().await;
-        let capped = conn
-            .prepare(
-                "SELECT id, status, claim_owner FROM email_delivery_batches
-                 WHERE id IN ('expired-claim', 'capped-retry') ORDER BY id",
+        let capped: (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT delivery.status, delivery.claim_owner, attempt.status
+                 FROM notification_deliveries delivery
+                 INNER JOIN notification_delivery_attempts attempt
+                   ON attempt.delivery_id = delivery.id
+                 WHERE delivery.id = 'a-expired-claim'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("prepare capped notification batches")
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .expect("query capped notification batches")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read capped notification batches");
-        assert_eq!(
-            capped,
-            vec![
-                ("capped-retry".into(), "suppressed_rate_limit".into(), None),
-                ("expired-claim".into(), "suppressed_rate_limit".into(), None),
-            ]
-        );
+            .expect("read capped expired claim");
+        assert_eq!(capped, ("retry".into(), None, "cancelled".into()));
         drop(conn);
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -34371,7 +34643,7 @@ mod tests {
         assert_eq!(result.deleted_notification_events, 1);
         let conn = store.conn.lock().await;
         let batches = conn
-            .prepare("SELECT id FROM email_delivery_batches ORDER BY id")
+            .prepare("SELECT id FROM notification_deliveries ORDER BY id")
             .expect("prepare retained notification batches")
             .query_map([], |row| row.get::<_, String>(0))
             .expect("query retained notification batches")
@@ -34407,7 +34679,7 @@ mod tests {
                 None,
             );
             conn.execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET error_message = 'provider rejected Operations@Example.com; sender Sender+Alerts@Mail.Example.net is unverified.'
                  WHERE id = 'privacy-batch'",
                 [],
@@ -34420,7 +34692,7 @@ mod tests {
             .await
             .expect("list notification deliveries");
         assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].recipient_masked, "o***@example.com");
+        assert_eq!(deliveries[0].target_masked, "o***@example.com");
         assert_eq!(
             deliveries[0].error_message.as_deref(),
             Some("provider rejected O***@Example.com; sender S***@Mail.Example.net is unverified.")
@@ -34450,6 +34722,7 @@ mod tests {
             reply_to: None,
             delivery_configured: false,
             delivery_config_fingerprint: "missing-sender".into(),
+            telegram: crate::notifications::TelegramNotificationContext::default(),
         };
         let first_delivery_at = now + Duration::seconds(6);
         store
@@ -34476,7 +34749,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let statuses = conn
             .prepare(
-                "SELECT status, COUNT(*) FROM email_delivery_batches
+                "SELECT status, COUNT(*) FROM notification_deliveries
                  GROUP BY status ORDER BY status",
             )
             .expect("prepare config recovery statuses")
@@ -34537,7 +34810,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let delivery_kind: String = conn
             .query_row(
-                "SELECT delivery_kind FROM email_delivery_batches",
+                "SELECT delivery_kind FROM notification_deliveries",
                 [],
                 |row| row.get(0),
             )
@@ -34604,7 +34877,7 @@ mod tests {
             .expect("aggregate owner offline event");
         let conn = store.conn.lock().await;
         let recipients = conn
-            .prepare("SELECT recipient FROM email_delivery_batches ORDER BY recipient")
+            .prepare("SELECT recipient FROM notification_deliveries ORDER BY recipient")
             .expect("prepare offline recipients")
             .query_map([], |row| row.get::<_, String>(0))
             .expect("query offline recipients")
@@ -34612,6 +34885,875 @@ mod tests {
             .expect("read offline recipients");
         assert_eq!(recipients, vec!["owner@example.com".to_string()]);
         drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    /// Template context for a Router whose user-facing bot is live. Aggregation
+    /// reads Telegram availability and caps from here rather than from the
+    /// store, so this is the only switch a test needs to flip.
+    fn notification_template_with_telegram(
+        recipient_hourly_limit: i64,
+        global_hourly_limit: i64,
+    ) -> NotificationTemplateContext {
+        NotificationTemplateContext {
+            telegram: crate::notifications::TelegramNotificationContext::from_settings(
+                &crate::config::TelegramBotSettings {
+                    enabled: true,
+                    bot_token: Some("123:test-token".into()),
+                    recipient_hourly_limit,
+                    global_hourly_limit,
+                    ..crate::config::TelegramBotSettings::default()
+                },
+            ),
+            ..notification_template()
+        }
+    }
+
+    /// Seed one offline event whose verified owner is `owner@example.com`.
+    async fn seed_offline_event_for_owner(
+        store: &AppStore,
+        installation_id: &str,
+        email_enabled: bool,
+        telegram_enabled: bool,
+        telegram_chat_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) {
+        let _signing_key = insert_signed_installation(store, installation_id).await;
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+             VALUES ('owner-user', 'owner@example.com', 'active', ?1, ?1)",
+            params![now.to_rfc3339()],
+        )
+        .expect("insert verified owner user");
+        conn.execute(
+            "INSERT INTO user_notification_channels (
+                user_id, channel, enabled, state, target, revision,
+                verified_at, created_at, updated_at
+             ) VALUES ('owner-user', 'email', ?1, 'ready', 'owner@example.com', 1, ?2, ?2, ?2)",
+            params![i64::from(email_enabled), now.to_rfc3339()],
+        )
+        .expect("insert owner email channel");
+        if let Some(chat_id) = telegram_chat_id {
+            conn.execute(
+                "INSERT INTO user_notification_channels (
+                    user_id, channel, enabled, state, target, provider_identity,
+                    revision, verified_at, created_at, updated_at
+                 ) VALUES ('owner-user', 'telegram', ?1, 'ready', ?2, '123', 1, ?3, ?3, ?3)",
+                params![
+                    i64::from(telegram_enabled),
+                    chat_id,
+                    now.to_rfc3339()
+                ],
+            )
+            .expect("insert owner Telegram channel");
+        }
+        conn.execute(
+            "INSERT INTO installation_notification_state (
+                installation_id, monitoring_enabled, presence_state, last_heartbeat_at,
+                offline_since, offline_episode, created_at, updated_at
+             ) VALUES (?1, 1, 'offline', ?2, ?2, 1, ?2, ?2)",
+            params![installation_id, now.to_rfc3339()],
+        )
+        .expect("insert owner offline state");
+        conn.execute(
+            "INSERT INTO client_notification_events (
+                id, dedupe_key, kind, installation_id, episode, status,
+                occurred_at, not_before, snapshot_json, created_at, updated_at
+             ) VALUES (?1, ?2, 'client_offline', ?3, 1, 'pending', ?4, ?4, ?5, ?4, ?4)",
+            params![
+                Uuid::new_v4().to_string(),
+                format!("{installation_id}-offline"),
+                installation_id,
+                now.to_rfc3339(),
+                serde_json::json!({
+                    "installationId": installation_id,
+                    "ownerEmail": "owner@example.com",
+                    "lastHeartbeatAt": now,
+                    "offlineSince": now,
+                })
+                .to_string(),
+            ],
+        )
+        .expect("insert owner offline event");
+    }
+
+    /// (channel, channel_target, idempotency_key, text_body) per frozen row.
+    async fn frozen_delivery_rows(
+        store: &AppStore,
+    ) -> Vec<(String, Option<String>, String, String)> {
+        let conn = store.conn.lock().await;
+        conn.prepare(
+            "SELECT channel, channel_target, idempotency_key, text_body
+             FROM notification_deliveries ORDER BY channel",
+        )
+        .expect("prepare frozen rows")
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("query frozen rows")
+        .collect::<Result<Vec<_>, _>>()
+            .expect("read frozen rows")
+    }
+
+    async fn bind_test_telegram(
+        store: &AppStore,
+        email: &str,
+        bot_id: &str,
+        chat_id: &str,
+    ) {
+        store
+            .get_notification_settings(email)
+            .await
+            .expect("initialize notification settings");
+        let link = store
+            .create_telegram_bind_link(email, 900, Some("127.0.0.1"))
+            .await
+            .expect("create Telegram bind link");
+        assert!(matches!(
+            store
+                .consume_telegram_bind_token(bot_id, &link.token, chat_id, Some("owner_chat"))
+                .await
+                .expect("consume Telegram bind link"),
+            crate::telegram::bind::BindOutcome::Bound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_telegram_bot_rotation_preserves_binding_and_recovers_blocked_delivery() {
+        let (store, config) = setup_store("telegram-same-bot-rotation").await;
+        store
+            .apply_telegram_bot_identity("123", "router_bot", "fingerprint-1")
+            .await
+            .expect("apply initial Telegram identity");
+        bind_test_telegram(&store, "owner@example.com", "123", "4242").await;
+        let pending_link = store
+            .create_telegram_bind_link("owner@example.com", 900, Some("127.0.0.1"))
+            .await
+            .expect("create pending rotation link");
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "telegram-blocked",
+                "owner@example.com",
+                "blocked_config",
+                Utc::now(),
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "UPDATE notification_deliveries
+                 SET channel = 'telegram', channel_target = '4242', provider_identity = '123',
+                     blocked_reason_code = 'telegram_bot_unavailable'
+                 WHERE id = 'telegram-blocked'",
+                [],
+            )
+            .expect("seed blocked Telegram delivery");
+        }
+
+        let applied = store
+            .apply_telegram_bot_identity("123", "renamed_router_bot", "fingerprint-2")
+            .await
+            .expect("rotate token for same Telegram bot");
+        assert!(!applied.identity_changed);
+        assert_eq!(applied.invalidated_bindings, 0);
+        let settings = store
+            .get_notification_settings("owner@example.com")
+            .await
+            .expect("read preserved binding");
+        let telegram = settings
+            .channels
+            .iter()
+            .find(|channel| channel.channel == "telegram")
+            .expect("Telegram channel");
+        assert!(telegram.enabled);
+        assert_eq!(telegram.state, "ready");
+        assert!(settings.enabled_channels.contains(&"telegram".into()));
+        assert!(matches!(
+            store
+                .consume_telegram_bind_token("123", &pending_link.token, "4242", None)
+                .await
+                .expect("reject pre-rotation link"),
+            crate::telegram::bind::BindOutcome::InvalidToken
+        ));
+        let conn = store.conn.lock().await;
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM notification_deliveries WHERE id = 'telegram-blocked'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read recovered Telegram delivery");
+        assert_eq!(status, "retry");
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn different_telegram_bot_invalidates_binding_and_requeues_email_fallback() {
+        let config = enabled_notification_config("telegram-different-bot-rotation");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        store
+            .apply_telegram_bot_identity("123", "router_bot", "fingerprint-1")
+            .await
+            .expect("apply initial Telegram identity");
+        seed_offline_event_for_owner(
+            &store,
+            "inst-telegram-identity-change",
+            false,
+            true,
+            Some("4242"),
+            now,
+        )
+        .await;
+        let policy = notification_policy(&config);
+        let template = notification_template_with_telegram(10, 50);
+        store
+            .sync_client_notification_runtime(&policy, &template, now)
+            .await
+            .expect("publish notification runtime");
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &template,
+                now + Duration::seconds(policy.batch_window_secs + 1),
+            )
+            .await
+            .expect("aggregate Telegram delivery");
+
+        let applied = store
+            .apply_telegram_bot_identity("456", "replacement_bot", "fingerprint-2")
+            .await
+            .expect("apply replacement Telegram identity");
+        assert!(applied.identity_changed);
+        assert_eq!(applied.invalidated_bindings, 1);
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &template,
+                now + Duration::seconds(policy.batch_window_secs + 2),
+            )
+            .await
+            .expect("aggregate email fallback");
+
+        let conn = store.conn.lock().await;
+        let channel_state: (i64, String, i64) = conn
+            .query_row(
+                "SELECT telegram.enabled, telegram.state, email.enabled
+                 FROM user_notification_channels telegram
+                 INNER JOIN user_notification_channels email ON email.user_id = telegram.user_id
+                 WHERE telegram.channel = 'telegram' AND email.channel = 'email'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read invalidated binding");
+        assert_eq!(channel_state, (0, "invalid".into(), 1));
+        let deliveries = conn
+            .prepare(
+                "SELECT channel, status, COUNT(*) FROM notification_deliveries
+                 GROUP BY channel, status ORDER BY channel, status",
+            )
+            .expect("prepare identity-change deliveries")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("query identity-change deliveries")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read identity-change deliveries");
+        assert_eq!(
+            deliveries,
+            vec![
+                ("email".into(), "pending".into(), 1),
+                ("telegram".into(), "cancelled_channel_changed".into(), 1),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn telegram_unbind_cancels_reservations_but_allows_started_send_to_finish() {
+        let (store, config) = setup_store("telegram-unbind-send-race").await;
+        let now = Utc::now();
+        store
+            .apply_telegram_bot_identity("123", "router_bot", "fingerprint-1")
+            .await
+            .expect("apply Telegram identity");
+        bind_test_telegram(&store, "owner@example.com", "123", "4242").await;
+        let user_id = {
+            let conn = store.conn.lock().await;
+            let user_id: String = conn
+                .query_row(
+                    "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read notification user");
+            for (id, attempt_status) in [
+                ("reserved-delivery", "reserved"),
+                ("started-delivery", "started"),
+            ] {
+                insert_test_notification_batch(
+                    &conn,
+                    id,
+                    "owner@example.com",
+                    "claimed",
+                    now,
+                    Some("worker"),
+                    Some(now + Duration::seconds(30)),
+                    None,
+                );
+                conn.execute(
+                    "UPDATE notification_deliveries
+                     SET channel = 'telegram', channel_target = '4242', recipient_user_id = ?2,
+                         target_revision = 1, provider_identity = '123'
+                     WHERE id = ?1",
+                    params![id, user_id],
+                )
+                .expect("set Telegram delivery target");
+                conn.execute(
+                    "INSERT INTO notification_delivery_attempts (
+                        id, delivery_id, channel, notification_lane, recipient, status,
+                        reserved_at, reservation_expires_at, started_at
+                     ) VALUES (?1, ?2, 'telegram', 'offline', 'owner@example.com', ?3,
+                               ?4, ?5, CASE WHEN ?3 = 'started' THEN ?4 ELSE NULL END)",
+                    params![
+                        format!("{id}-attempt"),
+                        id,
+                        attempt_status,
+                        now.to_rfc3339(),
+                        (now + Duration::seconds(30)).to_rfc3339()
+                    ],
+                )
+                .expect("insert Telegram delivery attempt");
+            }
+            user_id
+        };
+
+        store
+            .unbind_telegram("owner@example.com")
+            .await
+            .expect("unbind Telegram");
+        store
+            .mark_client_notification_batch_sent(
+                "started-delivery",
+                "worker",
+                "telegram-message-1",
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("finish already-started Telegram send");
+        let conn = store.conn.lock().await;
+        let states = conn
+            .prepare(
+                "SELECT delivery.id, delivery.status, attempt.status
+                 FROM notification_deliveries delivery
+                 INNER JOIN notification_delivery_attempts attempt
+                   ON attempt.delivery_id = delivery.id
+                 WHERE delivery.id IN ('reserved-delivery', 'started-delivery')
+                 ORDER BY delivery.id",
+            )
+            .expect("prepare unbind race state")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query unbind race state")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read unbind race state");
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "reserved-delivery".into(),
+                    "cancelled_channel_changed".into(),
+                    "cancelled".into(),
+                ),
+                ("started-delivery".into(), "sent".into(), "sent".into()),
+            ]
+        );
+        let channel_state: (i64, String) = conn
+            .query_row(
+                "SELECT enabled, state FROM user_notification_channels
+                 WHERE user_id = ?1 AND channel = 'telegram'",
+                params![user_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read unbound channel");
+        assert_eq!(channel_state, (0, "unbound".into()));
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn unreachable_telegram_delivery_falls_back_to_email_exactly_once() {
+        let config = enabled_notification_config("telegram-unreachable-fallback");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        store
+            .apply_telegram_bot_identity("123", "router_bot", "fingerprint-1")
+            .await
+            .expect("apply Telegram identity");
+        seed_offline_event_for_owner(
+            &store,
+            "inst-telegram-unreachable",
+            false,
+            true,
+            Some("4242"),
+            now,
+        )
+        .await;
+        let policy = notification_policy(&config);
+        let template = notification_template_with_telegram(10, 50);
+        store
+            .sync_client_notification_runtime(&policy, &template, now)
+            .await
+            .expect("publish notification runtime");
+        let delivery_at = now + Duration::seconds(policy.batch_window_secs + 1);
+        store
+            .aggregate_client_notification_batches(&policy, &template, delivery_at)
+            .await
+            .expect("aggregate Telegram delivery");
+        let batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch("telegram-worker", delivery_at, 30)
+                .await
+                .expect("claim Telegram delivery"),
+            "Telegram delivery",
+        );
+        assert!(
+            store
+                .validate_client_notification_batch(
+                    &batch.id,
+                    "telegram-worker",
+                    &policy,
+                    delivery_at,
+                )
+                .await
+                .expect("validate Telegram delivery")
+        );
+        store
+            .start_client_notification_attempt(
+                &batch.id,
+                &batch.attempt_id,
+                "telegram-worker",
+                delivery_at,
+            )
+            .await
+            .expect("start Telegram attempt");
+        assert_eq!(
+            store
+                .handle_unreachable_telegram_delivery(
+                    &batch.id,
+                    "telegram-worker",
+                    "4242",
+                    "Forbidden: bot was blocked by the user",
+                    delivery_at,
+                )
+                .await
+                .expect("handle unreachable Telegram endpoint")
+                .as_deref(),
+            Some("owner@example.com")
+        );
+        assert!(matches!(
+            store
+                .handle_unreachable_telegram_delivery(
+                    &batch.id,
+                    "telegram-worker",
+                    "4242",
+                    "duplicate callback",
+                    delivery_at,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &template,
+                delivery_at + Duration::seconds(1),
+            )
+            .await
+            .expect("aggregate email fallback");
+        let conn = store.conn.lock().await;
+        let states = conn
+            .prepare(
+                "SELECT channel, status, COUNT(*) FROM notification_deliveries
+                 GROUP BY channel, status ORDER BY channel, status",
+            )
+            .expect("prepare fallback states")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("query fallback states")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read fallback states");
+        assert_eq!(
+            states,
+            vec![
+                ("email".into(), "pending".into(), 1),
+                ("telegram".into(), "dead_letter".into(), 1),
+            ]
+        );
+        let attempt: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error_message FROM notification_delivery_attempts
+                 WHERE delivery_id = ?1",
+                params![batch.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read failed Telegram attempt");
+        assert_eq!(attempt.0, "failed");
+        assert!(attempt.1.is_some());
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_link_limit_survives_repeated_revocation() {
+        let (store, config) = setup_store("telegram-bind-link-rate-limit").await;
+        store
+            .apply_telegram_bot_identity("123", "router_bot", "fingerprint-1")
+            .await
+            .expect("apply Telegram identity");
+        for _ in 0..10 {
+            store
+                .create_telegram_bind_link("owner@example.com", 900, Some("127.0.0.1"))
+                .await
+                .expect("issue bind link within cap");
+        }
+        assert!(matches!(
+            store
+                .create_telegram_bind_link("owner@example.com", 900, Some("127.0.0.1"))
+                .await,
+            Err(AppError::TooManyRequests(_))
+        ));
+        let conn = store.conn.lock().await;
+        let retained: i64 = conn
+            .query_row("SELECT COUNT(*) FROM telegram_bind_tokens", [], |row| row.get(0))
+            .expect("count retained bind tokens");
+        assert_eq!(retained, 10);
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn telegram_inbound_persistence_is_atomic_and_webhook_idempotent() {
+        let (store, mut config) = setup_store("telegram-inbound-durability").await;
+        let rollback = store
+            .persist_telegram_updates(
+                "123",
+                &[serde_json::json!({"update_id": 10}), serde_json::json!({})],
+            )
+            .await;
+        assert!(rollback.is_err());
+        assert_eq!(store.telegram_poll_offset("123").await.expect("read cursor"), 0);
+
+        config.telegram_bot.enabled = true;
+        config.telegram_bot.bot_token = Some("123:test-token".into());
+        config.telegram_bot.mode = crate::config::TelegramBotMode::Webhook;
+        config.telegram_bot.webhook_secret = Some("webhook-secret".into());
+        let fingerprint = crate::telegram::bind::telegram_config_fingerprint(
+            "123:test-token",
+            "webhook",
+            Some("webhook-secret"),
+        );
+        store
+            .apply_telegram_bot_identity("123", "router_bot", &fingerprint)
+            .await
+            .expect("apply webhook bot identity");
+        let dynamic = Arc::new(tokio::sync::RwLock::new(
+            crate::dynamic_settings::DynamicSettings::from_config(&config),
+        ));
+        let update = serde_json::json!({"update_id": 11, "message": {"chat": {"id": 42}}});
+        for _ in 0..2 {
+            crate::telegram::service::handle_webhook_update(
+                &store,
+                &dynamic,
+                &config,
+                Some("webhook-secret"),
+                update.clone(),
+            )
+            .await
+            .expect("persist webhook update");
+        }
+        let conn = store.conn.lock().await;
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM telegram_inbound_updates WHERE bot_id = '123'),
+                    (SELECT next_offset FROM telegram_poll_cursors WHERE bot_id = '123')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read durable webhook state");
+        assert_eq!(counts, (1, 12));
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn enabled_channels_fan_out_into_one_email_and_one_telegram_batch() {
+        let config = enabled_notification_config("notification-fanout-multiple");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        seed_offline_event_for_owner(
+            &store,
+            "inst-fanout-multiple",
+            true,
+            true,
+            Some("4242"),
+            now,
+        )
+        .await;
+
+        let policy = notification_policy(&config);
+        let template = notification_template_with_telegram(10, 50);
+        store
+            .sync_client_notification_runtime(&policy, &template, now)
+            .await
+            .expect("publish notification policy");
+        let delivery_at = now + Duration::seconds(policy.batch_window_secs + 1);
+        let stats = store
+            .aggregate_client_notification_batches(
+                &policy,
+                &template,
+                delivery_at,
+            )
+            .await
+            .expect("aggregate offline event");
+
+        assert_eq!(stats.batches_created, 2);
+        assert_eq!(stats.incident_digests, 0);
+
+        let rows = frozen_delivery_rows(&store).await;
+        assert_eq!(rows.len(), 2, "expected one row per channel, got {rows:?}");
+        let (email_channel, email_target, email_key, email_text) = rows[0].clone();
+        let (tg_channel, tg_target, tg_key, tg_text) = rows[1].clone();
+        assert_eq!(email_channel, "email");
+        assert_eq!(email_target.as_deref(), Some("owner@example.com"));
+        assert_eq!(tg_channel, "telegram");
+        assert_eq!(tg_target.as_deref(), Some("4242"));
+        // The rows describe the same incident, so they share a correlation id
+        // and differ only by the channel suffix.
+        assert_eq!(tg_key, format!("{email_key}:telegram"));
+        assert!(email_text.contains("CC-Switch Router"));
+        assert!(
+            !tg_text.contains("CC-Switch Router"),
+            "the email brand header does not belong in a chat"
+        );
+        assert!(tg_text.ends_with("/account/notifications"));
+
+        // Every event is accounted for on each enabled channel, so replay protection
+        // has to be per channel too.
+        let conn = store.conn.lock().await;
+        let item_channels: Vec<String> = conn
+            .prepare("SELECT channel FROM notification_delivery_items ORDER BY channel")
+            .expect("prepare items")
+            .query_map([], |row| row.get(0))
+            .expect("query items")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read items");
+        assert_eq!(item_channels, vec!["email".to_string(), "telegram".into()]);
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn telegram_preference_falls_back_to_email_when_the_bot_is_off() {
+        let config = enabled_notification_config("notification-fanout-bot-off");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        seed_offline_event_for_owner(
+            &store,
+            "inst-fanout-bot-off",
+            false,
+            true,
+            Some("4242"),
+            now,
+        )
+        .await;
+
+        let policy = notification_policy(&config);
+        // Bot disabled Router-wide: a telegram-only account must not go silent.
+        let template = notification_template();
+        store
+            .sync_client_notification_runtime(&policy, &template, now)
+            .await
+            .expect("publish notification policy");
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &template,
+                now + Duration::seconds(policy.batch_window_secs + 1),
+            )
+            .await
+            .expect("aggregate offline event");
+
+        let rows = frozen_delivery_rows(&store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "email");
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn registration_notifications_stay_on_email_even_for_telegram_users() {
+        let config = enabled_notification_config("notification-registration-email-only");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        insert_installation(&store, "inst-registration-telegram").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert telegram-only owner");
+            let now_text = now.to_rfc3339();
+            conn.execute(
+                "INSERT INTO user_notification_channels
+                    (user_id, channel, enabled, state, target, revision,
+                     verified_at, created_at, updated_at)
+                 VALUES ('owner-user', 'email', 0, 'ready', 'owner@example.com', 1,
+                         ?1, ?1, ?1)",
+                params![now_text],
+            )
+            .expect("insert disabled owner email channel");
+            conn.execute(
+                "INSERT INTO user_notification_channels
+                    (user_id, channel, enabled, state, target, provider_identity,
+                     revision, verified_at, created_at, updated_at)
+                 VALUES ('owner-user', 'telegram', 1, 'ready', '4242', '123', 1,
+                         ?1, ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert enabled owner Telegram channel");
+            conn.execute(
+                "UPDATE installations SET owner_email = 'owner@example.com',
+                     owner_verified_at = ?1 WHERE id = 'inst-registration-telegram'",
+                params![now.to_rfc3339()],
+            )
+            .expect("mark installation owner verified");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('registration-telegram-event', 'registration-telegram-event',
+                           'client_registered', 'inst-registration-telegram', 0, 'pending',
+                           ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-registration-telegram",
+                        "platform": "linux",
+                        "registeredAt": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert registration event");
+        }
+
+        let policy = notification_policy(&config);
+        let template = notification_template_with_telegram(10, 50);
+        store
+            .sync_client_notification_runtime(&policy, &template, now)
+            .await
+            .expect("publish notification policy");
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &template,
+                now + Duration::seconds(policy.batch_window_secs + 1),
+            )
+            .await
+            .expect("aggregate registration event");
+
+        let rows = frozen_delivery_rows(&store).await;
+        assert!(
+            rows.iter().all(|row| row.0 == "email"),
+            "registration mail carries the web password hint and must not be \
+             mirrored into a chat: {rows:?}"
+        );
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn a_telegram_cap_does_not_hold_back_the_email_copy() {
+        let config = enabled_notification_config("notification-telegram-cap");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        seed_offline_event_for_owner(
+            &store,
+            "inst-telegram-cap",
+            true,
+            true,
+            Some("4242"),
+            now,
+        )
+        .await;
+
+        let policy = notification_policy(&config);
+        // Telegram budget exhausted, email budget untouched.
+        let template = notification_template_with_telegram(0, 50);
+        store
+            .sync_client_notification_runtime(&policy, &template, now)
+            .await
+            .expect("publish notification policy");
+        let delivery_at = now + Duration::seconds(policy.batch_window_secs + 1);
+        let stats = store
+            .aggregate_client_notification_batches(
+                &policy,
+                &template,
+                delivery_at,
+            )
+            .await
+            .expect("aggregate offline event");
+
+        let rows = frozen_delivery_rows(&store).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(stats.batches_created, 2);
+        assert_eq!(
+            stats.deferred_by_recipient_cap, 0,
+            "attempt caps are enforced when delivery is claimed"
+        );
+        let first = store
+            .claim_client_notification_batch("cap-worker", delivery_at, 30)
+            .await
+            .expect("claim first channel");
+        let second = store
+            .claim_client_notification_batch("cap-worker", delivery_at, 30)
+            .await
+            .expect("claim second channel");
+        let claims = [first, second];
+        assert!(
+            claims.iter().any(|claim| matches!(
+                claim,
+                ClientNotificationClaim::Batch(batch) if batch.channel.is_email()
+            )),
+            "email claim missing: {claims:?}"
+        );
+        assert!(
+            claims
+                .iter()
+                .any(|claim| matches!(claim, ClientNotificationClaim::SuppressedByRateLimit)),
+            "Telegram cap was not applied: {claims:?}"
+        );
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -34650,7 +35792,7 @@ mod tests {
             .expect("send registration to installation-verified owner");
         let conn = store.conn.lock().await;
         let recipients = conn
-            .prepare("SELECT recipient FROM email_delivery_batches ORDER BY recipient")
+            .prepare("SELECT recipient FROM notification_deliveries ORDER BY recipient")
             .expect("prepare registration recipients")
             .query_map([], |row| row.get::<_, String>(0))
             .expect("query registration recipients")
@@ -34739,7 +35881,7 @@ mod tests {
         assert_eq!(stats.batches_created, 0);
         let conn = store.conn.lock().await;
         let batch_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
+            .query_row("SELECT COUNT(*) FROM notification_deliveries", [], |row| {
                 row.get(0)
             })
             .expect("count disabled owner-wait batches");
@@ -34844,9 +35986,9 @@ mod tests {
             let state: (String, String, i64, Option<String>) = conn
                 .query_row(
                     "SELECT b.status, e.status,
-                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id),
+                            (SELECT COUNT(*) FROM notification_delivery_items WHERE batch_id = b.id),
                             isc.password_hint
-                     FROM email_delivery_batches b
+                     FROM notification_deliveries b
                      CROSS JOIN client_notification_events e
                      INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
                      WHERE b.id = ?1 AND e.id = 'registration-owner-change-event'",
@@ -34875,7 +36017,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let batches = conn
             .prepare(
-                "SELECT recipient, status, html_body FROM email_delivery_batches
+                "SELECT recipient, status, html_body FROM notification_deliveries
                  ORDER BY created_at, recipient",
             )
             .expect("prepare rerouted owner batches")
@@ -34953,7 +36095,7 @@ mod tests {
                 None,
             );
             conn.execute(
-                "INSERT INTO email_delivery_batch_items (batch_id, event_id, recipient)
+                "INSERT INTO notification_delivery_items (batch_id, event_id, recipient)
                  VALUES ('legacy-operations-batch', 'legacy-operations-event', 'ops@example.com'),
                         ('legacy-operations-batch', 'legacy-operations-other-event', 'ops@example.com')",
                 [],
@@ -34982,7 +36124,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let batches = conn
             .prepare(
-                "SELECT recipient, status FROM email_delivery_batches
+                "SELECT recipient, status FROM notification_deliveries
                  ORDER BY created_at, recipient",
             )
             .expect("prepare migrated owner batches")
@@ -35006,8 +36148,8 @@ mod tests {
         let routed_events = conn
             .prepare(
                 "SELECT b.recipient, e.id
-                 FROM email_delivery_batches b
-                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 FROM notification_deliveries b
+                 INNER JOIN notification_delivery_items bi ON bi.batch_id = b.id
                  INNER JOIN client_notification_events e ON e.id = bi.event_id
                  WHERE b.status = 'pending'
                  ORDER BY b.recipient",
@@ -35100,7 +36242,7 @@ mod tests {
             let conn = store.conn.lock().await;
             let former_explicit: (String, i64) = conn
                 .query_row(
-                    "SELECT status, recipient_priority FROM email_delivery_batches
+                    "SELECT status, recipient_priority FROM notification_deliveries
                      WHERE recipient = 'owner@example.com'",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
@@ -35139,7 +36281,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let batches = conn
             .prepare(
-                "SELECT recipient, status, recipient_priority FROM email_delivery_batches
+                "SELECT recipient, status, recipient_priority FROM notification_deliveries
                  WHERE recipient IN ('owner@example.com', 'ops@example.com')
                  ORDER BY recipient",
             )
@@ -35174,7 +36316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_notification_does_not_preempt_global_cap_reservation() {
+    async fn owner_notification_waits_without_preempting_global_attempt_cap() {
         let mut config = enabled_notification_config("notification-explicit-preemption");
         config.client_notifications.global_hourly_limit = 1;
         let store = AppStore::new(&config).expect("create store");
@@ -35192,10 +36334,29 @@ mod tests {
                 None,
             );
             conn.execute(
-                "UPDATE email_delivery_batches SET recipient_priority = ?2 WHERE id = ?1",
+                "UPDATE notification_deliveries SET recipient_priority = ?2 WHERE id = ?1",
                 params!["owner-reservation", OWNER_NOTIFICATION_RECIPIENT_PRIORITY],
             )
             .expect("mark owner reservation priority");
+            insert_test_notification_batch(
+                &conn,
+                "global-cap-consumer",
+                "already-sent@example.com",
+                "sent",
+                now,
+                None,
+                None,
+                Some(now),
+            );
+            conn.execute(
+                "INSERT INTO notification_delivery_attempts (
+                    id, delivery_id, channel, notification_lane, recipient, status,
+                    reserved_at, reservation_expires_at, started_at, finished_at
+                 ) VALUES ('global-cap-attempt', 'global-cap-consumer', 'email', 'offline',
+                           'already-sent@example.com', 'sent', ?1, ?2, ?1, ?1)",
+                params![now.to_rfc3339(), (now + Duration::seconds(30)).to_rfc3339()],
+            )
+            .expect("seed consumed global attempt capacity");
             insert_test_notification_event(&conn, "inst-owner-capped", "client_offline", now);
         }
         let policy = notification_policy(&config);
@@ -35204,42 +36365,51 @@ mod tests {
             .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
             .await
             .expect("aggregate explicit notification at global cap");
-        assert_eq!(stats.batches_created, 0);
+        assert_eq!(stats.batches_created, 1);
         {
             let conn = store.conn.lock().await;
             let owner_status: String = conn
                 .query_row(
-                    "SELECT status FROM email_delivery_batches WHERE id = 'owner-reservation'",
+                    "SELECT status FROM notification_deliveries WHERE id = 'owner-reservation'",
                     [],
                     |row| row.get(0),
                 )
                 .expect("read preempted owner reservation");
-            let capped_owner: (String, i64, String) = conn
+            let newly_queued_owner: (String, i64, String) = conn
                 .query_row(
                     "SELECT status, recipient_priority, recipient
-                     FROM email_delivery_batches WHERE recipient = 'owner@example.com'",
+                     FROM notification_deliveries WHERE recipient = 'owner@example.com'",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
-                .expect("read capped owner reservation");
+                .expect("read newly queued owner notification");
             assert_eq!(owner_status, "pending");
             assert_eq!(
-                capped_owner,
+                newly_queued_owner,
                 (
-                    "suppressed_rate_limit".into(),
+                    "pending".into(),
                     OWNER_NOTIFICATION_RECIPIENT_PRIORITY,
                     "owner@example.com".into()
                 )
             );
         }
-        let claimed = expect_notification_batch(
+        assert_eq!(
             store
                 .claim_client_notification_batch("priority-worker", delivery_at, 30)
                 .await
-                .expect("claim explicit notification"),
-            "existing owner notification batch",
+                .expect("apply global attempt cap"),
+            ClientNotificationClaim::SuppressedByRateLimit,
         );
-        assert_eq!(claimed.recipient, "a-owner@example.com");
+        let conn = store.conn.lock().await;
+        let deferred_status: String = conn
+            .query_row(
+                "SELECT status FROM notification_deliveries WHERE id = 'owner-reservation'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read deferred owner notification");
+        assert_eq!(deferred_status, "retry");
+        drop(conn);
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -35270,7 +36440,7 @@ mod tests {
                 None,
             );
             conn.execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET recipient_priority = CASE id
                      WHEN 'a-owner-batch' THEN ?1 ELSE ?2 END",
                 params![
@@ -35362,8 +36532,8 @@ mod tests {
         let lanes = conn
             .prepare(
                 "SELECT b.notification_lane, COUNT(DISTINCT e.kind)
-                 FROM email_delivery_batches b
-                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 FROM notification_deliveries b
+                 INNER JOIN notification_delivery_items bi ON bi.batch_id = b.id
                  INNER JOIN client_notification_events e ON e.id = bi.event_id
                  GROUP BY b.notification_lane
                  ORDER BY b.notification_lane",
@@ -35427,7 +36597,7 @@ mod tests {
         let incidents = conn
             .prepare(
                 "SELECT notification_lane, delivery_kind, incident_key
-                 FROM email_delivery_batches ORDER BY notification_lane",
+                 FROM notification_deliveries ORDER BY notification_lane",
             )
             .expect("prepare lane incidents")
             .query_map([], |row| {
@@ -35480,7 +36650,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let offline_batches: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM email_delivery_batches
+                "SELECT COUNT(*) FROM notification_deliveries
                  WHERE notification_lane = 'offline'",
                 [],
                 |row| row.get(0),
@@ -35541,7 +36711,7 @@ mod tests {
                 None,
             );
             conn.execute(
-                "UPDATE email_delivery_batches
+                "UPDATE notification_deliveries
                  SET recipient_priority = CASE id
                      WHEN 'offline-owner' THEN ?1 ELSE ?2 END",
                 params![
@@ -35637,7 +36807,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let status: String = conn
             .query_row(
-                "SELECT status FROM email_delivery_batches
+                "SELECT status FROM notification_deliveries
                  WHERE id = 'registration-capped'",
                 [],
                 |row| row.get(0),
@@ -35709,7 +36879,7 @@ mod tests {
                  SELECT 0
                  UNION ALL SELECT value + 1 FROM batches WHERE value < 499
              )
-             INSERT INTO email_delivery_batches (
+             INSERT INTO notification_deliveries (
                  id, notification_lane, recipient, from_address, subject, html_body,
                  idempotency_key, status, attempts, not_before, next_attempt_at,
                  template_fingerprint, delivery_kind, created_at, updated_at
@@ -35724,14 +36894,14 @@ mod tests {
         .expect("insert batches at high watermark");
         assert!(registration_overflow_should_capture_tx(&conn, now).expect("batch high"));
         conn.execute(
-            "DELETE FROM email_delivery_batches
+            "DELETE FROM notification_deliveries
              WHERE id >= 'watermark-batch-400' AND id <= 'watermark-batch-499'",
             [],
         )
         .expect("drop batches to low watermark");
         assert!(registration_overflow_should_capture_tx(&conn, now).expect("batch low"));
         conn.execute(
-            "DELETE FROM email_delivery_batches WHERE id = 'watermark-batch-399'",
+            "DELETE FROM notification_deliveries WHERE id = 'watermark-batch-399'",
             [],
         )
         .expect("drop batches below low watermark");
@@ -35786,7 +36956,7 @@ mod tests {
             )
             .expect("count overflow summary events");
         let batch_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
+            .query_row("SELECT COUNT(*) FROM notification_deliveries", [], |row| {
                 row.get(0)
             })
             .expect("read overflow summary batch");
@@ -35873,7 +37043,7 @@ mod tests {
             )
             .expect("read expired awaiting-owner registration");
         let batch_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
+            .query_row("SELECT COUNT(*) FROM notification_deliveries", [], |row| {
                 row.get(0)
             })
             .expect("count expired awaiting-owner batches");
@@ -35909,7 +37079,7 @@ mod tests {
                  SELECT 0
                  UNION ALL SELECT value + 1 FROM batches WHERE value < 1000
              )
-             INSERT INTO email_delivery_batches (
+             INSERT INTO notification_deliveries (
                  id, notification_lane, recipient, from_address, subject, html_body,
                  idempotency_key, status, attempts, not_before, next_attempt_at,
                  template_fingerprint, delivery_kind, created_at, updated_at
@@ -35923,9 +37093,9 @@ mod tests {
         )
         .expect("insert condensed suppressed batches");
         conn.execute(
-            "INSERT INTO email_delivery_batch_items (batch_id, event_id, recipient)
+            "INSERT INTO notification_delivery_items (batch_id, event_id, recipient, channel)
              SELECT printf('audit-batch-%04d', value / 100),
-                    printf('audit-%06d', value), 'ops@example.com'
+                    printf('audit-%06d', value), 'ops@example.com', 'email'
              FROM (
                  WITH RECURSIVE audit(value) AS (
                      SELECT 0
@@ -35968,7 +37138,7 @@ mod tests {
         assert_eq!(remaining, CLIENT_NOTIFICATION_AUDIT_TARGET);
         let suppressed_batches: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM email_delivery_batches
+                "SELECT COUNT(*) FROM notification_deliveries
                  WHERE status = 'suppressed_rate_limit'",
                 [],
                 |row| row.get(0),
@@ -35977,7 +37147,7 @@ mod tests {
         assert_eq!(suppressed_batches, 800);
         let protected_statuses = conn
             .prepare(
-                "SELECT id, status FROM email_delivery_batches
+                "SELECT id, status FROM notification_deliveries
                  WHERE id LIKE 'retained-%' ORDER BY id",
             )
             .expect("prepare protected audit batches")
@@ -36056,7 +37226,7 @@ mod tests {
         let conn = store.conn.lock().await;
         let bodies = conn
             .prepare(
-                "SELECT recipient, html_body FROM email_delivery_batches
+                "SELECT recipient, html_body FROM notification_deliveries
                  WHERE recipient = 'new-owner@example.com'
                  ORDER BY recipient",
             )
@@ -36118,9 +37288,12 @@ mod tests {
         let global_cap_plan = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
-                 SELECT COUNT(*) FROM email_delivery_batches
-                 WHERE (status = 'sent' AND sent_at >= '2026-01-01T00:00:00Z')
-                    OR (status = 'claimed' AND claim_expires_at > '2026-01-01T00:00:00Z')",
+                 SELECT COUNT(*) FROM notification_delivery_attempts
+                 WHERE notification_lane = 'registration' AND channel = 'email'
+                   AND ((status IN ('started', 'sent', 'retry', 'failed')
+                         AND started_at >= '2026-01-01T00:00:00Z')
+                        OR (status = 'reserved'
+                            AND reservation_expires_at > '2026-01-01T00:00:00Z'))",
             )
             .expect("prepare global send-cap query plan")
             .query_map([], |row| row.get::<_, String>(3))
@@ -36130,21 +37303,19 @@ mod tests {
         assert!(
             global_cap_plan
                 .iter()
-                .any(|detail| detail.contains("idx_email_delivery_batches_send_cap"))
-        );
-        assert!(
-            global_cap_plan
-                .iter()
-                .any(|detail| detail.contains("idx_email_delivery_batches_claim_cap"))
+                .any(|detail| detail.contains("idx_notification_attempts_channel_cap"))
         );
 
         let recipient_cap_plan = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
-                 SELECT COUNT(*) FROM email_delivery_batches
+                 SELECT COUNT(*) FROM notification_delivery_attempts
                  WHERE LOWER(recipient) = LOWER('ops@example.com')
-                   AND ((status = 'sent' AND sent_at >= '2026-01-01T00:00:00Z')
-                        OR (status = 'claimed' AND claim_expires_at > '2026-01-01T00:00:00Z'))",
+                   AND notification_lane = 'registration' AND channel = 'email'
+                   AND ((status IN ('started', 'sent', 'retry', 'failed')
+                         AND started_at >= '2026-01-01T00:00:00Z')
+                        OR (status = 'reserved'
+                            AND reservation_expires_at > '2026-01-01T00:00:00Z'))",
             )
             .expect("prepare recipient send-cap query plan")
             .query_map([], |row| row.get::<_, String>(3))
@@ -36154,19 +37325,14 @@ mod tests {
         assert!(
             recipient_cap_plan
                 .iter()
-                .any(|detail| { detail.contains("idx_email_delivery_batches_recipient_send_cap") })
-        );
-        assert!(
-            recipient_cap_plan.iter().any(|detail| {
-                detail.contains("idx_email_delivery_batches_recipient_claim_cap")
-            })
+                .any(|detail| detail.contains("idx_notification_attempts_recipient_cap"))
         );
 
         let lane_claim_plan = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
-                 SELECT id FROM email_delivery_batches
-                 WHERE notification_lane = 'offline'
+                 SELECT id FROM notification_deliveries
+                 WHERE channel = 'email' AND notification_lane = 'offline'
                    AND status = 'pending'
                    AND next_attempt_at <= '2026-01-01T00:00:00Z'
                  ORDER BY notification_lane, recipient_priority, next_attempt_at
@@ -36180,26 +37346,7 @@ mod tests {
         assert!(
             lane_claim_plan
                 .iter()
-                .any(|detail| detail.contains("idx_email_delivery_batches_lane_claim"))
-        );
-
-        let lane_cap_plan = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT COUNT(*) FROM email_delivery_batches
-                 WHERE notification_lane = 'registration'
-                   AND status = 'sent'
-                   AND sent_at >= '2026-01-01T00:00:00Z'",
-            )
-            .expect("prepare lane cap query plan")
-            .query_map([], |row| row.get::<_, String>(3))
-            .expect("query lane cap plan")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read lane cap plan");
-        assert!(
-            lane_cap_plan
-                .iter()
-                .any(|detail| detail.contains("idx_email_delivery_batches_lane_send_cap"))
+                .any(|detail| detail.contains("idx_notification_deliveries_channel_claim"))
         );
 
         let lane_pending_plan = conn
@@ -43239,6 +44386,7 @@ mod tests {
 
         let updated = store
             .update_announcement_settings(AnnouncementSettingsUpdate {
+                expected_revision: initial.revision.clone(),
                 enabled: Some(true),
                 content_en: Some("<p>Hello</p>".into()),
                 content_zh_cn: Some("<p>你好</p>".into()),
@@ -43262,9 +44410,11 @@ mod tests {
     #[tokio::test]
     async fn announcement_content_update_keeps_disabled_until_explicitly_enabled() {
         let (store, _config) = setup_store("announcement-stays-disabled").await;
+        let initial = store.announcement_response().await.expect("read default");
 
         let updated = store
             .update_announcement_settings(AnnouncementSettingsUpdate {
+                expected_revision: initial.revision,
                 enabled: None,
                 content_en: Some("<p>Hello</p>".into()),
                 content_zh_cn: Some("<p>你好</p>".into()),
@@ -43279,6 +44429,78 @@ mod tests {
             .expect("read announcement");
         assert!(!response.enabled);
         assert_eq!(response.content_en, "<p>Hello</p>");
+    }
+
+    #[tokio::test]
+    async fn map_display_settings_reject_stale_revision() {
+        let (store, config) = setup_store("map-display-stale-revision").await;
+        let initial = store
+            .map_display_settings()
+            .await
+            .expect("read default map");
+        let updated = store
+            .update_map_display_settings(MapDisplaySettingsUpdate {
+                expected_revision: initial.revision.clone(),
+                show_flows: Some(false),
+                show_heat: None,
+                viewport: None,
+            })
+            .await
+            .expect("update map");
+        assert_ne!(updated.revision, initial.revision);
+
+        let error = store
+            .update_map_display_settings(MapDisplaySettingsUpdate {
+                expected_revision: initial.revision,
+                show_flows: None,
+                show_heat: Some(false),
+                viewport: None,
+            })
+            .await
+            .expect_err("stale map revision must fail");
+        assert_eq!(error.code(), Some("MAP_DISPLAY_REVISION_CONFLICT"));
+
+        let current = store
+            .map_display_settings()
+            .await
+            .expect("read current map");
+        assert!(!current.show_flows);
+        assert!(current.show_heat);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn announcement_settings_reject_stale_revision() {
+        let (store, config) = setup_store("announcement-stale-revision").await;
+        let initial = store.announcement_response().await.expect("read default");
+        let updated = store
+            .update_announcement_settings(AnnouncementSettingsUpdate {
+                expected_revision: initial.revision.clone(),
+                enabled: Some(true),
+                content_en: Some("first".into()),
+                content_zh_cn: None,
+            })
+            .await
+            .expect("update announcement");
+        assert_ne!(updated.updated_at.to_rfc3339(), initial.revision);
+
+        let error = store
+            .update_announcement_settings(AnnouncementSettingsUpdate {
+                expected_revision: initial.revision,
+                enabled: None,
+                content_en: Some("stale".into()),
+                content_zh_cn: None,
+            })
+            .await
+            .expect_err("stale announcement revision must fail");
+        assert_eq!(error.code(), Some("ANNOUNCEMENT_REVISION_CONFLICT"));
+
+        let current = store
+            .announcement_response()
+            .await
+            .expect("read current announcement");
+        assert_eq!(current.content_en, "first");
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     fn chat_test_session(user_id: &str, email: &str) -> AuthSession {

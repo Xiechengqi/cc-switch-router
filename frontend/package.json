@@ -8,6 +8,7 @@
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check",
+    "audit:settings-contract": "node ../scripts/audit/audit-settings-contract.mjs --check",
     "audit:market-billing-contract": "node ../scripts/audit/audit-market-billing-contract.mjs --check"
   },
   "dependencies": {

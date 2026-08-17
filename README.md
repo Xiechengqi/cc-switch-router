@@ -64,7 +64,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
 | `/v1/client-market/*` | 30 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
-| `/v1/admin/*` | 约 44 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`market-billing/disputes` |
+| `/v1/admin/*` | 约 44 | Session + admin 判定 | `settings`、`settings/validate`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
@@ -80,8 +80,25 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/account/*` | 2 | Session | `payment-profile`、`payment-assets/:id` |
 | `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
-| `/v1/dashboard/*`、`/v1/me/*` | 10 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider` |
-| 其余单例 | 约 15 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`_market/proxy/*`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
+| `/v1/dashboard/*`、`/v1/me/*` | 13 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link` |
+| 其余单例 | 约 16 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`integrations/telegram/webhook`、`_market/proxy/*`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
+
+## 管理设置与运维
+
+管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；地图和公告留在 General & Display，通知渠道健康检查留在 Notifications。
+
+Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。
+
+进程启动前显式注入的环境变量优先于 `.env`，Settings 将这类字段标记为只读，并同时展示持久化来源与运行时来源。热更新字段的运行值直接读取当前 `DynamicSettings`；绕过 API 手工修改 `.env` 时，页面会保留实际内存值并标记等待重启，不会把文件值误报为已生效。Secret 只返回是否已配置，API 从不返回明文；清除 Secret 必须使用显式操作。`.env` 与备份写入采用 `0600` 权限、临时文件 fsync 和同目录原子 rename，需要重启的字段保存后会持续显示 pending restart，直到新进程读取该值。
+
+配置契约由 Rust 单元测试和前端审计共同保护。修改 Settings 字段时需运行：
+
+```bash
+cargo test admin::settings
+cd frontend
+npm run audit:settings-i18n
+npm run audit:settings-contract
+```
 
 Share 请求在请求体、响应头、首业务事件、业务空闲、下游背压和绝对生存时长六个阶段均有独立边界；响应由后台泵读取，因此浏览器或 API 调用方停止消费 Body 时仍会释放并发。10 秒周期的看门狗会按唯一 lease 幂等回收异常残留并触发通用告警，绝不重启 Router。管理员兜底接口 `POST /v1/admin/proxy/share-requests/force-release` 只接受 `requestId` 或 `shareId` 其中一个，可附带 `reason`，每次实际释放都会取消上游任务、增加 metrics 计数并写入 admin audit。
 
@@ -125,7 +142,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS` | `900` | Share 流后续协议业务事件空闲超时，范围 30-3600 秒；SSE 注释与 keepalive 不会续期 |
 | `CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS` | `120` | 下游停止消费有界响应缓冲区时的终止超时，范围 5-600 秒 |
 | `CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS` | `7200` | Share 请求绝对生存时长，范围 60-86400 秒，必须大于所有阶段超时 |
-| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB` | `2` | 普通 API（`/v1/responses`、`/v1/messages` 等）请求体上限，范围 1-64 MB；超限在占用 Share 并发前返回 413。请求体整体驻留内存，峰值内存 ≈ 该值 × 并发请求数。该值会随每个转发请求声明给 Client（`x-cc-switch-ingress-body-limit`），Client 取 `min(本地上限, 声明值)`；新版 Client 本地默认已是该范围上限，因此通常只调这里即可 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB` | `10` | 普通 API（`/v1/responses`、`/v1/messages` 等）请求体上限，范围 1-64 MB；超限在占用 Share 并发前返回 413。请求体整体驻留内存，峰值内存 ≈ 该值 × 并发请求数。该值会随每个转发请求声明给 Client（`x-cc-switch-ingress-body-limit`），Client 取 `min(本地上限, 声明值)`；新版 Client 本地默认已是该范围上限，因此通常只调这里即可 |
 | `CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB` | `32` | `/v1/videos/generations` 请求体上限，范围 1-256 MB，且不得小于普通 API 上限。同样随请求声明给 Client，取 `min(本地上限, 声明值)`。超过约 100 MB 时通常先被边缘代理（如 Cloudflare）拦下；大体积上传也可能先撞 `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS` |
 | `CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB` | `48` | `/v1/images/generations` 与 `/v1/images/edits` 请求体上限（含内联 base64 附件），范围 1-256 MB，且不得小于普通 API 上限。同样随请求声明给 Client，取 `min(本地上限, 声明值)`。注意 multipart 形式的 `/v1/images/edits` 另受 Client 内容层限制（单张 20 MiB、合计 32 MiB、最多 16 张，超限返回 400），该值调到 32 MB 以上不会放宽这条路径 |
 | `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
@@ -196,6 +213,13 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT` | `50` | Offline lane 的 Router 全局每小时发送硬上限 |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT` | `3` | Registration lane 单收件人每小时发送硬上限 |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT` | `10` | Registration lane 的 Router 全局每小时发送硬上限 |
+| `CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED` | `false` | 用户通知 Telegram Bot 总开关;关闭时账户页只能选择邮件 |
+| `CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN` | 空 | 用户通知 Bot 的 `botfather` token;与运维告警渠道的 Telegram 配置相互独立 |
+| `CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE` | `polling` | 接收 `/start` 的方式:`polling` 或 `webhook` |
+| `CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET` | 空 | webhook 模式下校验 `x-telegram-bot-api-secret-token` 的共享密钥;未设置时 webhook 不启用 |
+| `CC_SWITCH_ROUTER_TELEGRAM_BIND_TOKEN_TTL_SECS` | `900` | 绑定深链 token 有效期(秒) |
+| `CC_SWITCH_ROUTER_TELEGRAM_RECIPIENT_HOURLY_LIMIT` | `10` | 单用户每小时 Telegram 通知硬上限;与邮件额度互不占用 |
+| `CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT` | `50` | Router 全局每小时 Telegram 通知硬上限 |
 | `CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS` | `300` | 邮件验证码有效期(秒) |
 | `CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS` | `60` | 同邮箱 / 设备发验证码冷却(秒) |
 | `CC_SWITCH_ROUTER_AUTH_SESSION_TTL_SECS` | `1800` | Access token 有效期(秒) |
@@ -263,7 +287,17 @@ CC_SWITCH_ROUTER_RESEND_FROM=noreply@example.com
 EOF
 ```
 
-Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离线 episode 去重,注册与离线邮件都只发送至对应 Client 当前已验证的 Owner 邮箱。关闭总开关时,Router 会推进在线状态 baseline 并抑制待发记录;以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度,registration lane 使用独立的 `3/10` 小时额度,两者互不占用。未完成的 outbox 会持续保留,已发送、dead-letter、取消和抑制记录保留 30 天供审计。
+Client 生命周期通知使用持久化 outbox、稳定幂等键和离线 episode 去重,注册与离线通知都只面向对应 Client 当前已验证的 Owner 账号。关闭总开关时,Router 会推进在线状态 baseline 并抑制待发记录;以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度,registration lane 使用独立的 `3/10` 小时额度,两者互不占用。未完成的 outbox 会持续保留,已发送、dead-letter、取消和抑制记录保留 30 天供审计。
+
+### 用户通知渠道（邮件 / Telegram）
+
+用户通知在「账户 → 通知设置」页通过独立开关启用邮件和 Telegram，至少保留一个渠道。偏好按渠道逐行保存在 `user_notification_channels`，每行带目标、Bot 身份和单调递增的 revision；投递前会再次校验该 revision，因此解绑、换绑或关闭渠道会使尚未发送的旧目标失效。渠道偏好是账号级全局设置，不按 Client 或事件类型分别配置。
+
+绑定流程：点击「绑定 Telegram」时 Router 生成 128 位一次性 token（只存 SHA-256），并使用已经由 Telegram `getMe` 验证的 Bot username 在新标签页打开 `https://t.me/<username>?start=<token>`。用户点 Start 后，polling 或 webhook 会先把 update 持久化到 `telegram_inbound_updates`，后台处理器再消费 `/start <token>` 并写入 Telegram 渠道行。前端轮询 `GET /v1/me/notifications`，直到 `verifiedAt` 变化；弹窗被拦截时会展示可复制的深链与 `/start <token>` 命令。token 默认 900 秒过期且一次性消费，已撤销记录仍保留到清理期以防反复换链接绕过签发限额；同一个 Bot 下一个 chat 最多绑定一个账号。绑定会启用 Telegram 但不会关闭邮件，用户随后可独立调整两个开关。解绑会确保邮件回落，取消尚未开始的 Telegram 投递；已经进入外部 provider 调用的发送可能完成。
+
+Router owner 的配置只有三步：向 `@BotFather` 申请一个 Bot、把 token 填入 `CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN`、打开 `CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED`。Bot ID 与 username 不接受人工配置，服务会调用 `getMe` 验证后写入 runtime 状态。相同 Bot ID 的 token 轮换保留现有绑定，不同 Bot ID 会使旧绑定失效并启用邮件回落。以上键可在 Settings 热更新。默认 polling 不要求入站可达性；webhook 需要公网域名和 `CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET`，回调路径 `POST /v1/integrations/telegram/webhook` 已从 IP 黑名单中豁免。两种模式使用相同的持久化 inbox 和幂等 update key，poll cursor 与一批 updates 在同一事务提交，处理失败不会跳过 update。该 Bot 与运维告警 Telegram 渠道相互独立：前者面向终端用户并按账号扇出，后者是面向单一运维会话的告警 adapter；两者可以复用 token，但配置项和状态不共享。
+
+投递语义：同一事件按所有已启用渠道生成独立的 `notification_deliveries`，共享事件关联但各自冻结载荷、重试和结束状态。小时额度统计真实 started attempt 与仍有效的 reservation，不在 outbox 生成时预占；因此 Telegram 不会消耗或阻塞 Resend 额度。Telegram 暂时不可用时自动回落邮件；注册通知固定只走邮件，因为其正文包含首次登录口令提示。Bot 明确报告 chat 不可达时，当前 attempt 失败、仅匹配当前 Bot/目标的绑定被置为 invalid，并且原事件只重新排队一次邮件回落。Operations 中的投递历史只展示渠道、脱敏目标、结构化失败类型和阻断原因，不返回 Bot token 或原始 chat id。
 
 ### LLM 性能指标
 

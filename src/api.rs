@@ -21,9 +21,10 @@ use crate::ServerState;
 use crate::admin::{
     restart::{RestartStrategy, schedule_restart},
     settings::{
-        SettingsSchemaResponse, SettingsUpdateRequest, SettingsUpdateResponse,
-        SettingsValuesResponse, apply_updates_to_dynamic, read_env_file, schema_response,
-        validate_and_diff, values_response, write_env_file_atomic,
+        SettingsSnapshotResponse, SettingsUpdateRequest, SettingsUpdateResponse,
+        SettingsValidationResponse, apply_updates_to_dynamic, read_env_file, settings_revision,
+        snapshot_response, validate_and_diff_with_runtime, validation_response_with_runtime,
+        write_env_file_atomic,
     },
     upgrade::{UpgradeLogEntry, UpgradeStatus},
     version::{
@@ -57,23 +58,24 @@ use crate::models::{
     MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
     MarketShareRuntimeStateReleaseRequest, MarketShareRuntimeStateReleaseResponse,
     MarketShareRuntimeStateSyncRequest, MarketShareRuntimeStateSyncResponse, MarketShareView,
-    MarketsResponse, PostClientChatMessageRequest, ProviderUsageResponse, PublicMapPointsResponse,
-    PublicNetworkStatsResponse, RefreshSessionRequest, RegisterAuthDeviceRequest,
-    RegisterAuthDeviceResponse, RegisterGatewayRequest, RegisterGatewayResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RenewLeaseRequest, RenewLeaseResponse, ReportInstallationStatusRequest,
-    ReportInstallationStatusResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
-    ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareDescriptorBatchSyncResponse, ShareEditAckRequest, ShareEditAvailableEvent,
-    ShareEditEventSignaturePayload, ShareHeartbeatRequest, SharePendingEditsRequest,
-    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogBatchSyncResponse,
-    ShareRequestLogEntry, ShareRuntimeRefreshRequest, ShareSettingsPatch,
-    ShareSettingsUpdateRequest, ShareSyncRequest, SubdomainAvailabilityResponse,
-    TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse, UpdateUsageCardSettingsRequest,
-    UpgradeInstallationRequest, UpgradeInstallationResponse, UpgradeInstallationStatusResponse,
-    UsageCardSettingsResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse,
-    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    MarketsResponse, NotificationSettingsResponse, PostClientChatMessageRequest,
+    ProviderUsageResponse, PublicMapPointsResponse, PublicNetworkStatsResponse,
+    RefreshSessionRequest, RegisterAuthDeviceRequest, RegisterAuthDeviceResponse,
+    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
+    RegisterInstallationResponse, RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse,
+    ReportInstallationStatusRequest, ReportInstallationStatusResponse, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser,
+    ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptorBatchSyncResponse,
+    ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
+    ShareHeartbeatRequest, SharePendingEditsRequest, SharePruneRequest,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogBatchSyncResponse, ShareRequestLogEntry,
+    ShareRuntimeRefreshRequest, ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
+    SubdomainAvailabilityResponse, TelegramBindLinkResponse, TunnelActivateRequest,
+    TunnelStateRequest, TunnelStateResponse, UpdateNotificationSettingsRequest,
+    UpdateUsageCardSettingsRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
+    UpgradeInstallationStatusResponse, UsageCardSettingsResponse, UserApiTokenResetResponse,
+    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -399,6 +401,22 @@ pub fn router(state: ServerState) -> Router {
             "/v1/me/usage-card",
             get(get_my_usage_card_settings).patch(update_my_usage_card_settings),
         )
+        .route(
+            "/v1/me/notifications",
+            get(get_my_notification_settings).patch(update_my_notification_settings),
+        )
+        .route(
+            "/v1/me/notifications/telegram/bind-link",
+            post(create_my_telegram_bind_link),
+        )
+        .route(
+            "/v1/me/notifications/telegram",
+            delete(unbind_my_telegram_chat),
+        )
+        .route(
+            crate::telegram::service::WEBHOOK_PATH,
+            post(telegram_webhook),
+        )
         .route("/v1/me/usage/consumer", get(my_usage_consumer))
         .route("/v1/me/usage/provider", get(my_usage_provider))
         .route("/v1/me/shares", get(my_shares))
@@ -481,17 +499,17 @@ pub fn router(state: ServerState) -> Router {
             "/v1/admin/chat/deliveries/:delivery_id/requeue",
             post(admin_requeue_client_chat_delivery),
         )
-        .route("/v1/admin/settings/schema", get(admin_settings_schema))
+        .route(
+            "/v1/admin/settings",
+            get(admin_settings_get).patch(admin_settings_apply),
+        )
+        .route("/v1/admin/settings/validate", post(admin_settings_validate))
         .route(
             "/v1/admin/client-notifications/deliveries",
             get(admin_client_notification_deliveries),
         )
         .route("/v1/admin/map-display", patch(admin_map_display_update))
         .route("/v1/admin/announcement", patch(admin_announcement_update))
-        .route(
-            "/v1/admin/settings/values",
-            get(admin_settings_values).patch(admin_settings_apply),
-        )
         .route("/v1/admin/version", get(admin_version))
         .route("/v1/admin/restart", post(admin_restart))
         .route("/v1/admin/upgrade", post(admin_upgrade_start))
@@ -567,6 +585,13 @@ async fn ip_blacklist_middleware(
     req: Request,
     next: Next,
 ) -> Response {
+    // Telegram's webhook senders live in ranges the operator does not control
+    // and cannot enumerate; a blacklist entry that happens to cover one would
+    // break account binding silently. The route carries its own authentication
+    // (the `setWebhook` secret header), so exempting it costs nothing.
+    if req.uri().path() == crate::telegram::service::WEBHOOK_PATH {
+        return next.run(req).await;
+    }
     if let Some(ip) = source_ip_from_request(&req)
         && state.dynamic.read().await.is_ip_blacklisted(ip)
     {
@@ -2709,6 +2734,84 @@ async fn update_my_usage_card_settings(
             .update_usage_card_settings(&email, patch)
             .await?,
     ))
+}
+
+/// Read the caller's notification channel preference plus the Router-level
+/// Telegram bot availability, so the account page can render the whole section
+/// from one request.
+async fn get_my_notification_settings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<NotificationSettingsResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok(Json(state.store.get_notification_settings(&email).await?))
+}
+
+async fn update_my_notification_settings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(patch): Json<UpdateNotificationSettingsRequest>,
+) -> Result<Json<NotificationSettingsResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .update_notification_settings(&email, patch)
+            .await?,
+    ))
+}
+
+/// Mint a single-use `t.me` deep link. The token is a bearer credential for
+/// this account's notification channel, so it is minted only for a live
+/// session and never returned to anyone else.
+async fn create_my_telegram_bind_link(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<TelegramBindLinkResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let settings = state.dynamic.read().await.telegram_bot.clone();
+    let metadata = extract_client_metadata(&headers, addr);
+    Ok(Json(
+        state
+            .store
+            .create_telegram_bind_link(
+                &email,
+                settings.bind_token_ttl_secs,
+                metadata.ip.as_deref(),
+            )
+            .await?,
+    ))
+}
+
+async fn unbind_my_telegram_chat(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<NotificationSettingsResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok(Json(state.store.unbind_telegram(&email).await?))
+}
+
+/// Telegram's webhook callback. Authenticated solely by the secret header from
+/// `setWebhook`; see `crate::telegram::service` for why this route is also
+/// exempt from the IP blacklist.
+async fn telegram_webhook(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(update): Json<serde_json::Value>,
+) -> Result<StatusCode, AppError> {
+    let secret = headers
+        .get(crate::telegram::service::WEBHOOK_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok());
+    crate::telegram::service::handle_webhook_update(
+        &state.store,
+        &state.dynamic,
+        &state.config,
+        secret,
+        update,
+    )
+    .await?;
+    Ok(StatusCode::OK)
 }
 
 async fn my_usage_consumer(
@@ -5563,12 +5666,18 @@ async fn admin_requeue_client_chat_delivery(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn admin_settings_schema(
+async fn admin_settings_get(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<SettingsSchemaResponse>, AppError> {
+) -> Result<Json<SettingsSnapshotResponse>, AppError> {
     require_admin_session(&state, &headers).await?;
-    Ok(Json(schema_response()))
+    let settings_guard = state.dynamic.read().await;
+    Ok(Json(snapshot_response(
+        &state.env_path,
+        &state.settings_runtime,
+        &settings_guard,
+        &state.config,
+    )?))
 }
 
 async fn admin_client_notification_deliveries(
@@ -5580,12 +5689,21 @@ async fn admin_client_notification_deliveries(
     Ok(Json(ClientNotificationDeliveriesResponse { deliveries }))
 }
 
-async fn admin_settings_values(
+async fn admin_settings_validate(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<SettingsValuesResponse>, AppError> {
+    Json(input): Json<SettingsUpdateRequest>,
+) -> Result<Json<SettingsValidationResponse>, AppError> {
     require_admin_session(&state, &headers).await?;
-    Ok(Json(values_response(&state.env_path)?))
+    let _settings_guard = state.dynamic.read().await;
+    let existing = read_env_file(&state.env_path)?;
+    ensure_settings_revision(&existing, &input.expected_revision)?;
+    ensure_settings_not_environment_overridden(&state, &input)?;
+    Ok(Json(validation_response_with_runtime(
+        &existing,
+        &input.updates,
+        &state.settings_runtime,
+    )))
 }
 
 async fn admin_settings_apply(
@@ -5604,14 +5722,56 @@ async fn admin_settings_apply(
 
     // 2) load current env, validate updates against the schema.
     let existing = read_env_file(&state.env_path)?;
-    let outcome = validate_and_diff(&existing, &input.updates)?;
+    ensure_settings_revision(&existing, &input.expected_revision)?;
+    ensure_settings_not_environment_overridden(&state, &input)?;
+    let outcome =
+        validate_and_diff_with_runtime(&existing, &input.updates, &state.settings_runtime)
+            .map_err(|error| {
+                let validation = validation_response_with_runtime(
+                    &existing,
+                    &input.updates,
+                    &state.settings_runtime,
+                );
+                AppError::Coded {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "SETTINGS_VALIDATION_FAILED",
+                    message: error.to_string(),
+                    details: serde_json::to_value(validation)
+                        .unwrap_or_else(|_| serde_json::json!({ "valid": false })),
+                }
+            })?;
     let mut next_dynamic = dynamic_guard.clone();
     apply_updates_to_dynamic(&mut next_dynamic, &input.updates, &state.config);
+    let telegram_settings_changed = next_dynamic.telegram_bot != dynamic_guard.telegram_bot;
+    let telegram_identity_config_changed = next_dynamic.telegram_bot.enabled
+        != dynamic_guard.telegram_bot.enabled
+        || next_dynamic.telegram_bot.bot_token != dynamic_guard.telegram_bot.bot_token
+        || next_dynamic.telegram_bot.mode != dynamic_guard.telegram_bot.mode
+        || next_dynamic.telegram_bot.webhook_secret
+            != dynamic_guard.telegram_bot.webhook_secret;
+    if telegram_identity_config_changed && next_dynamic.telegram_bot.enabled {
+        let token = next_dynamic.telegram_bot.token().ok_or_else(|| {
+            AppError::BadRequest("Telegram notification bot token is required".into())
+        })?;
+        let http = crate::telegram::build_send_http_client(
+            "cc-switch-router/0.1 settings-telegram-validation",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("build Telegram validation client failed: {error}"))
+        })?;
+        crate::telegram::get_me(&http, token).await.map_err(|failure| {
+            AppError::BadRequest(format!(
+                "Telegram notification bot validation failed: {}",
+                failure.message
+            ))
+        })?;
+    }
     // Process-level environment variables can make the live value differ from
     // the value already present in .env. Compare the actual runtime policies so
     // re-applying an unchanged file value still advances the durable boundary.
     let needs_client_notification_sync =
-        next_dynamic.client_notifications != dynamic_guard.client_notifications;
+        next_dynamic.client_notifications != dynamic_guard.client_notifications
+            || telegram_settings_changed;
     let needs_client_notification_validation = needs_client_notification_sync
         || outcome.updated_keys.iter().any(|key| {
             key == "CC_SWITCH_ROUTER_CLIENT_STALE_SECS"
@@ -5663,7 +5823,10 @@ async fn admin_settings_apply(
             &next_dynamic.client_notifications,
             &state.config,
         );
-        let template = NotificationTemplateContext::from_config(&state.config);
+        let mut template = NotificationTemplateContext::from_config(&state.config);
+        template.telegram = crate::notifications::TelegramNotificationContext::from_settings(
+            &next_dynamic.telegram_bot,
+        );
         if let Err(sync_error) = state
             .store
             .sync_client_notification_runtime(&policy, &template, chrono::Utc::now())
@@ -5679,6 +5842,34 @@ async fn admin_settings_apply(
                 )));
             }
             return Err(sync_error);
+        }
+    }
+    if telegram_identity_config_changed {
+        let runtime_result = if next_dynamic.telegram_bot.enabled {
+            let token = next_dynamic.telegram_bot.token().unwrap_or_default();
+            let fingerprint = crate::telegram::bind::telegram_config_fingerprint(
+                token,
+                next_dynamic.telegram_bot.mode.as_str(),
+                next_dynamic.telegram_bot.webhook_secret.as_deref(),
+            );
+            state
+                .store
+                .mark_telegram_bot_reconciling(&fingerprint)
+                .await
+        } else {
+            state.store.mark_telegram_bot_disabled().await
+        };
+        if let Err(runtime_error) = runtime_result {
+            let rollback_env = existing
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if let Err(rollback_error) = write_env_file_atomic(&state.env_path, &rollback_env) {
+                return Err(AppError::Internal(format!(
+                    "sync Telegram runtime failed: {runtime_error}; env rollback also failed: {rollback_error}"
+                )));
+            }
+            return Err(runtime_error);
         }
     }
     state
@@ -5715,7 +5906,49 @@ async fn admin_settings_apply(
         restart_required_keys: outcome.restart_required_keys,
         dynamic_groups_refreshed: dynamic_groups,
         env_path: state.env_path.display().to_string(),
+        revision: settings_revision(
+            &outcome
+                .new_env_kv
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
     }))
+}
+
+fn ensure_settings_revision(
+    existing: &HashMap<String, String>,
+    expected_revision: &str,
+) -> Result<(), AppError> {
+    let current_revision = settings_revision(existing);
+    if expected_revision == current_revision {
+        return Ok(());
+    }
+    Err(AppError::coded_conflict(
+        "SETTINGS_REVISION_CONFLICT",
+        "settings changed after this page was loaded; reload and review the latest values",
+        serde_json::json!({ "currentRevision": current_revision }),
+    ))
+}
+
+fn ensure_settings_not_environment_overridden(
+    state: &ServerState,
+    input: &SettingsUpdateRequest,
+) -> Result<(), AppError> {
+    let keys = input
+        .updates
+        .keys()
+        .filter(|key| state.settings_runtime.is_environment_override(key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::coded_conflict(
+        "SETTINGS_ENVIRONMENT_OVERRIDE",
+        "settings supplied by the process environment cannot be changed from the Router UI",
+        serde_json::json!({ "keys": keys }),
+    ))
 }
 
 async fn admin_version(

@@ -4,9 +4,9 @@ import type {
   MarketShare,
   ShareSessionLoad,
   ClearMetricsResponse,
-  SettingsSchema,
+  SettingsSnapshot,
+  SettingsValidationResponse,
   SettingsUpdateResponse,
-  SettingsValuesResponse,
   ShareSettingsPatch,
   ShareEditView,
   ShareConnectionTestRequest,
@@ -18,6 +18,8 @@ import type {
   ShareUserLimitStatusResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
+  NotificationSettings,
+  TelegramBindLink,
   AccountUsagePeriod,
   AccountUsageResponse,
   ProviderUsageResponse,
@@ -43,6 +45,7 @@ import type {
   AnnouncementResponse,
   ClientNotificationDeliveriesResponse,
   ClientChatDeliveriesResponse,
+  AdminAuditResponse,
   ClientChatMessage,
   ClientChatMessageListResponse,
   ClientChatRoom,
@@ -285,6 +288,34 @@ export async function resetUserApiToken() {
   );
 }
 
+export async function getMyNotificationSettings() {
+  return parseJson<NotificationSettings>(
+    await authFetch("/v1/me/notifications", { cache: "no-store" }),
+  );
+}
+
+export async function updateMyNotificationSettings(enabledChannels: string[]) {
+  return parseJson<NotificationSettings>(
+    await authFetch("/v1/me/notifications", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabledChannels }),
+    }),
+  );
+}
+
+export async function createTelegramBindLink() {
+  return parseJson<TelegramBindLink>(
+    await authFetch("/v1/me/notifications/telegram/bind-link", { method: "POST" }),
+  );
+}
+
+export async function unbindMyTelegramChat() {
+  return parseJson<NotificationSettings>(
+    await authFetch("/v1/me/notifications/telegram", { method: "DELETE" }),
+  );
+}
+
 export async function getMyUsageConsumer(period: AccountUsagePeriod | string) {
   const params = new URLSearchParams({ period });
   return parseJson<AccountUsageResponse>(
@@ -385,12 +416,10 @@ export async function releaseMarketShareState(
   );
 }
 
-export async function getSettingsSchema() {
-  return parseJson<SettingsSchema>(await authFetch("/v1/admin/settings/schema", { cache: "no-store" }));
-}
-
-export async function getSettingsValues() {
-  return parseJson<SettingsValuesResponse>(await authFetch("/v1/admin/settings/values", { cache: "no-store" }));
+export async function getSettings() {
+  return parseJson<SettingsSnapshot>(
+    await authFetch("/v1/admin/settings", { cache: "no-store" }),
+  );
 }
 
 export async function getClientNotificationDeliveries() {
@@ -405,6 +434,13 @@ export async function getClientChatDeliveries() {
   );
 }
 
+export async function getAdminAudit(limit = 100) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return parseJson<AdminAuditResponse>(
+    await authFetch(`/v1/admin/audit?${params}`, { cache: "no-store" }),
+  );
+}
+
 export async function requeueClientChatDelivery(deliveryId: string) {
   return parseJson<{ ok: boolean }>(
     await authFetch(`/v1/admin/chat/deliveries/${encodeURIComponent(deliveryId)}/requeue`, {
@@ -413,12 +449,28 @@ export async function requeueClientChatDelivery(deliveryId: string) {
   );
 }
 
-export async function saveSettings(updates: Record<string, string | null>) {
+export async function validateSettings(
+  expectedRevision: string,
+  updates: Record<string, string | null>,
+) {
+  return parseJson<SettingsValidationResponse>(
+    await authFetch("/v1/admin/settings/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision, updates }),
+    }),
+  );
+}
+
+export async function saveSettings(
+  expectedRevision: string,
+  updates: Record<string, string | null>,
+) {
   return parseJson<SettingsUpdateResponse>(
-    await authFetch("/v1/admin/settings/values", {
+    await authFetch("/v1/admin/settings", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ updates }),
+      body: JSON.stringify({ expectedRevision, updates }),
     }),
   );
 }

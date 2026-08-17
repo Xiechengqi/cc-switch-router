@@ -55,10 +55,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         13,
         include_str!("../schema/0013_drop_client_market_recovery.sql"),
     ),
-    (
-        14,
-        include_str!("../schema/0014_share_remote_policy.sql"),
-    ),
+    (14, include_str!("../schema/0014_share_remote_policy.sql")),
+    (15, include_str!("../schema/0015_notification_channels.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -247,7 +245,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 110);
+        assert_eq!(table_count, 116);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -293,7 +291,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 13);
+        assert_eq!(versions.len(), 15);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -307,6 +305,24 @@ mod tests {
         assert_eq!(versions[10], (11, migration_checksum(MIGRATIONS[9].1)));
         assert_eq!(versions[11], (12, migration_checksum(MIGRATIONS[10].1)));
         assert_eq!(versions[12], (13, migration_checksum(MIGRATIONS[11].1)));
+        assert_eq!(versions[13], (14, migration_checksum(MIGRATIONS[12].1)));
+        assert_eq!(versions[14], (15, migration_checksum(MIGRATIONS[13].1)));
+    }
+
+    /// The history assertion above is easy to forget when adding a migration
+    /// (versions 14 and 15 both landed with it stale). Pin the relationship
+    /// itself so the next omission fails loudly instead of silently skipping
+    /// the newest entries.
+    #[test]
+    fn migration_history_covers_every_registered_migration() {
+        let conn = memory_connection();
+        apply(&conn).expect("install baseline");
+        let recorded = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count migration history");
+        assert_eq!(recorded as usize, MIGRATIONS.len() + 1);
     }
 
     /// Databases in the field record this checksum for version 1; a new value
@@ -373,6 +389,79 @@ mod tests {
             )
             .expect_err("migrated databases must reject recovery jobs too");
         assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[test]
+    fn migration_15_installs_channel_neutral_notification_contract() {
+        let conn = memory_connection();
+        apply(&conn).expect("install final schema");
+        for table in [
+            "notification_deliveries",
+            "notification_delivery_items",
+            "notification_delivery_attempts",
+            "user_notification_channels",
+            "telegram_bot_runtime",
+            "telegram_bind_tokens",
+            "telegram_inbound_updates",
+            "telegram_poll_cursors",
+        ] {
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("inspect notification table");
+            assert_eq!(exists, 1, "missing {table}");
+        }
+        for legacy in ["email_delivery_batches", "email_delivery_batch_items"] {
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![legacy],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("inspect legacy notification table");
+            assert_eq!(exists, 0, "legacy table {legacy} must be retired");
+        }
+    }
+
+    #[test]
+    fn migration_15_normalizes_extensible_user_channels() {
+        let conn = memory_connection();
+        apply(&conn).expect("install baseline");
+        conn.execute_batch(
+            "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+             VALUES ('user-a', 'a@example.com', 'now', 'now'),
+                    ('user-b', 'b@example.com', 'now', 'now');",
+        )
+        .expect("seed users");
+
+        conn.execute_batch(
+            "INSERT INTO user_notification_channels
+                (user_id, channel, enabled, state, target, provider_identity,
+                 revision, verified_at, created_at, updated_at)
+             VALUES ('user-a', 'telegram', 1, 'ready', '4242', 'bot-1', 1, 'now', 'now', 'now');",
+        )
+        .expect("bind the first account");
+        let conflict = conn
+            .execute(
+                "INSERT INTO user_notification_channels
+                    (user_id, channel, enabled, state, target, provider_identity,
+                     revision, verified_at, created_at, updated_at)
+                 VALUES ('user-b', 'telegram', 1, 'ready', '4242', 'bot-1', 1, 'now', 'now', 'now')",
+                [],
+            )
+            .expect_err("a chat must not back two accounts");
+        assert!(conflict.to_string().contains("UNIQUE constraint failed"));
+
+        conn.execute(
+            "INSERT INTO user_notification_channels
+                (user_id, channel, enabled, state, target, revision, created_at, updated_at)
+             VALUES ('user-b', 'matrix', 0, 'unbound', NULL, 1, 'now', 'now')",
+            [],
+        )
+        .expect("schema permits future registered channels without a migration");
     }
 
     #[test]

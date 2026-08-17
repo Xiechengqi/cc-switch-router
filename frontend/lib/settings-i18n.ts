@@ -1,6 +1,7 @@
 import type { MessageKey } from "@/lib/i18n";
 import { SETTINGS_GROUP_SLUG, settingsMessagesEn } from "@/lib/settings-messages";
 import type { SettingsField } from "@/lib/types";
+import type { SettingsCategory } from "@/lib/types";
 
 type TranslateFn = (key: MessageKey, values?: Record<string, string | number>) => string;
 
@@ -13,6 +14,28 @@ export function settingsGroupLabel(t: TranslateFn, group: string) {
   const slug = SETTINGS_GROUP_SLUG[group];
   if (!slug) return group;
   return translateSettings(t, `settings.group.${slug}` as MessageKey, group);
+}
+
+const CATEGORY_SLUG: Record<string, string> = {
+  general_display: "generalDisplay",
+  connectivity: "connectivity",
+  data_lifecycle: "dataLifecycle",
+  identity_security: "identitySecurity",
+  notifications: "notifications",
+  observability: "observability",
+  marketplace: "marketplace",
+};
+
+export function settingsCategoryLabel(t: TranslateFn, category?: SettingsCategory) {
+  if (!category) return "";
+  const slug = CATEGORY_SLUG[category.id];
+  return translateSettings(t, `settings.category.${slug}` as MessageKey, category.label);
+}
+
+export function settingsCategoryDescription(t: TranslateFn, category?: SettingsCategory) {
+  if (!category) return "";
+  const slug = CATEGORY_SLUG[category.id];
+  return translateSettings(t, `settings.category.${slug}.description` as MessageKey, category.description);
 }
 
 export function settingsFieldLabel(t: TranslateFn, field: SettingsField) {
@@ -31,6 +54,7 @@ export function settingsFieldPlaceholder(t: TranslateFn, field: SettingsField) {
 
 export function settingsValueSource(t: TranslateFn, source?: string) {
   if (!source) return t("common.unset");
-  const key = `settings.source.${source}` as MessageKey;
+  const normalized = source === "env_file" ? "envFile" : source === "process_env" ? "processEnv" : source;
+  const key = `settings.source.${normalized}` as MessageKey;
   return translateSettings(t, key, source);
 }

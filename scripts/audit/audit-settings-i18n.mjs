@@ -69,7 +69,7 @@ function main() {
     if (!zhKeys.has(messageKey)) errors.push(`missing zh-CN ${messageKey}`);
   }
 
-  for (const source of ["envFile", "default", "unset"]) {
+  for (const source of ["processEnv", "envFile", "default", "unset"]) {
     const messageKey = `settings.source.${source}`;
     if (!enKeys.has(messageKey)) errors.push(`missing en ${messageKey}`);
     if (!zhKeys.has(messageKey)) errors.push(`missing zh-CN ${messageKey}`);

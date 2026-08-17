@@ -4,7 +4,7 @@ import { Eye, Loader2, RotateCcw, Save } from "lucide-react";
 import { Alert, Button, Card, Checkbox, Chip, Modal, ScrollShadow, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getAnnouncement, updateAnnouncement } from "@/lib/api";
+import { ApiError, getAnnouncement, updateAnnouncement } from "@/lib/api";
 import { sanitizeAnnouncementHtml } from "@/lib/announcement-html";
 import type { AnnouncementResponse, AnnouncementSettingsUpdate } from "@/lib/types";
 
@@ -44,6 +44,19 @@ function sameDraft(a: AnnouncementDraft, b: AnnouncementDraft) {
   );
 }
 
+function rebaseDraft(
+  latest: AnnouncementDraft,
+  base: AnnouncementDraft,
+  draft: AnnouncementDraft,
+): AnnouncementDraft {
+  return {
+    revision: latest.revision,
+    enabled: draft.enabled !== base.enabled ? draft.enabled : latest.enabled,
+    contentEn: draft.contentEn !== base.contentEn ? draft.contentEn : latest.contentEn,
+    contentZhCn: draft.contentZhCn !== base.contentZhCn ? draft.contentZhCn : latest.contentZhCn,
+  };
+}
+
 export function AnnouncementPanel() {
   const { locale, t } = useLocaleText();
   const [saved, setSaved] = React.useState<AnnouncementDraft>(EMPTY_DRAFT);
@@ -67,7 +80,20 @@ export function AnnouncementPanel() {
       setSaved(next);
       setDraft(next);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (err instanceof ApiError && err.code === "ANNOUNCEMENT_REVISION_CONFLICT") {
+        try {
+          const latest = toDraft(await getAnnouncement());
+          setSaved(latest);
+          setDraft(rebaseDraft(latest, saved, draft));
+          setError(t("settings.announcementRevisionConflict"));
+        } catch (reloadError) {
+          setError(t("settings.conflictReloadFailed", {
+            reason: reloadError instanceof Error ? reloadError.message : String(reloadError),
+          }));
+        }
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setLoading(false);
     }
@@ -82,11 +108,11 @@ export function AnnouncementPanel() {
     setError("");
     setSuccess("");
     try {
-      const update: AnnouncementSettingsUpdate = {};
+      const update: AnnouncementSettingsUpdate = { expectedRevision: saved.revision };
       if (draft.enabled !== saved.enabled) update.enabled = draft.enabled;
       if (draft.contentEn !== saved.contentEn) update.contentEn = draft.contentEn;
       if (draft.contentZhCn !== saved.contentZhCn) update.contentZhCn = draft.contentZhCn;
-      if (!Object.keys(update).length) return;
+      if (Object.keys(update).length === 1) return;
       const savedSettings = await updateAnnouncement(update);
       const next: AnnouncementDraft = {
         enabled: savedSettings.enabled,

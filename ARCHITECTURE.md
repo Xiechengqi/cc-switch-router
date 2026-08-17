@@ -193,7 +193,7 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 未绑定 Owner 水位 | 默认 50000,达到后暂停新身份准入 | 业务 libSQL |
 | 请求并发 | 6 个 `KeyedConcurrencyLimiter` | 内存(`proxy.rs:562-573`) |
 | 认证滥用 | 10 分钟 10 次失败 → 封禁 1 小时 | 内存(`abuse.rs:6-8`) |
-| 请求体体积 | 三档上限:普通 2 MB / 视频 32 MB / 图片 48 MB(可配置) | 内存缓冲上限(`proxy.rs` `proxy_request_body_limit()`) |
+| 请求体体积 | 三档上限:普通 10 MB / 视频 32 MB / 图片 48 MB(可配置) | 内存缓冲上限(`proxy.rs` `proxy_request_body_limit()`) |
 
 请求体体积不是速率限制,而是**内存缓冲天花板**:请求体经 `axum::body::to_bytes` 一次性读入内存,峰值内存 ≈ 单档上限 × 并发请求数。三档由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置(MB 为单位,改后需重启)。读取发生在 `try_acquire_share_permit` 之前,因此超限请求返回 413 且不消耗 Share 并发额度。
 
@@ -220,7 +220,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 
 ## 5. 数据层
 
-业务库与 metrics 库分离。业务库当前有 109 张业务表,另有 1 张 `schema_migrations` 元数据表。
+业务库与 metrics 库分离。业务库当前有 110 张业务表,另有 1 张 `schema_migrations` 元数据表。
 
 **数据库模式**:
 
@@ -246,7 +246,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 | 统一市场账务 | `supplier_billing_profiles`、`market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines`、`market_payment_*`、`market_billing_*`、`market_credit_restrictions` |
 | 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`account_payment_*` |
 | 联邦与市场 | `router_markets`、`router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions` |
-| 通知 | `client_notification_events`、`email_delivery_batches` 等 9 张 |
+| 通知 | `installation_notification_state`、`client_notification_events`、`client_notification_runtime`、`notification_deliveries`、`notification_delivery_items`、`notification_delivery_attempts`、`user_notification_channels`、`telegram_bot_runtime`、`telegram_bind_tokens`、`telegram_inbound_updates`、`telegram_poll_cursors` |
 | 运维告警信号 | `operator_alert_signal_outbox` |
 | 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
 | 认证 | `users`（含用量卡片公开开关）、`user_sessions`、`user_api_tokens`、`email_login_challenges` |
@@ -304,7 +304,8 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 | `resend_usage_task` | 10min | Resend 配额轮询 |
 | `metrics_task` | — | 指标采集 |
 | `alerting_task` | 2s | Client 信号入库、静默到期、已注册 IM 渠道投递与重试 |
-| `notification_task` | 5s | 离线/恢复邮件 outbox |
+| `notification_task` | 5s | 离线/恢复通知 outbox(邮件 + Telegram) |
+| `telegram bot` | 长轮询 | 用户通知 Bot 的入站半边:消费 `/start` 深链完成账号绑定 |
 | `chat_notification_task` | — | 聊天邮件投递 |
 | `client_market_trade_task` | 20s | Client Market 报价、免费期限、释放与清理状态对账 |
 | `share_market_task` | 5s | managed grant、免费期限与 Share 租约状态对账 |
@@ -322,17 +323,29 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 采用 outbox 模式,三阶段循环(`src/notifications.rs`):
 
 1. **reconcile** —— 扫描在线状态,产出离线/恢复事件;推进持久化 baseline,使停用期间的事件不会补发
-2. **aggregate** —— 同收件人事件在窗口内(默认 60s)合并为一个批次;风暴检测触发时进一步合并为 digest
-3. **deliver** —— worker 以 90 秒租约认领批次,经 Resend 发送
+2. **aggregate** —— 同收件人事件在窗口内(默认 60s)合并为一个批次;风暴检测触发时进一步合并为 digest,并按用户启用的渠道集合扇出独立投递
+3. **deliver** —— worker 以 90 秒租约认领批次,按批次自身的 `channel` 经 Resend 或 Telegram Bot API 发送
 
 可靠性设计:
 
-- `FrozenEmailEnvelope` 保证重试时载荷不变,配合固定 Resend 幂等键
+- 聚合时冻结渠道载荷和稳定幂等键,重试不会重新渲染正文
 - 12 次尝试后进入死信
 - 可重试状态码:408、425、429、5xx,以及带 `concurrent_idempotent_requests` 的 409
-- 单收件人与全局双层小时配额,offline 与 registration 两条 lane 额度互不占用
+- 单收件人与全局双层小时配额按真实发送 attempt 统计,offline 与 registration 两条 lane 额度互不占用
 
-### 8.1 运维事故与 IM 渠道
+### 8.1 通知渠道抽象
+
+渠道 ID 使用可扩展的小写字符串(`src/notification_channels.rs`),用户偏好、outbox、attempt 和 transport registry 均不依赖组合枚举。`user_notification_channels` 每个用户/渠道一行,`enabled` 与绑定 `state` 分离；目标、provider identity 和 revision 会冻结到 `notification_deliveries`。外部调用开始前再次验证 revision,因此关闭、解绑、换绑或 Bot 身份变化会取消尚未开始的旧目标。`target_revision = 0` 只用于没有账户渠道归属的强制注册邮件与兜底邮件。
+
+- **通用 outbox**:`notification_deliveries` 保存具体渠道、脱敏归属、冻结 payload 与结构化失败信息；`notification_delivery_items` 以 event/recipient/channel 唯一,同一事件可以在多个渠道各投递一次。
+- **attempt 级额度**:claim 时先写 `reserved`,provider 调用前改为 `started`,结果最终进入 `sent`、`retry`、`failed` 或 `cancelled`。小时额度统计 started attempt 与未过期 reservation；过期 attempt 会先终结再重新认领,不会永久占住 live-attempt 唯一索引。
+- **回落而非丢弃**:目标集合为空、Bot 未启用或 Bot 身份不可用时至少生成 Email。Registration lane 固定走邮件,首次登录口令提示不进入第三方 IM。
+- **并发关闭语义**:禁用渠道或解绑会取消 pending/retry 及未开始的 reservation；已经进入 provider 调用的 started attempt 可完成,避免在未知发送结果下重复投递。
+- **不可达处理**:Telegram 明确返回 chat 不可达时,事务会校验 delivery 归属、Bot identity 与 chat target,结束当前 attempt,只使匹配绑定失效,并释放原事件生成一次邮件回落。
+
+绑定链路:`POST /v1/me/notifications/telegram/bind-link` 只持久化 128 位 token 的 SHA-256,返回基于已验证 Bot username 的深链。已撤销 token 继续保留到清理期,所以反复申请/撤销不能绕过用户与 IP 小时限额。polling 与 webhook 都先以 `(bot_id, update_id)` 幂等写入 `telegram_inbound_updates`;polling cursor 与整批 insert 在同一事务推进,handler 使用租约重试并且不会因单条失败丢弃后续输入。Bot token 热更新后先调用 `getMe`:Bot ID 不变时保留绑定并恢复对应阻断投递,Bot ID 变化时撤销旧链接、使旧绑定失效并启用邮件回落。该 Bot 与下节的运维告警 Telegram adapter 配置和状态相互独立。
+
+### 8.2 运维事故与 IM 渠道
 
 `src/alerting/` 使用 metrics SQLite 保存 `alert_incidents`、`alert_transitions`、`alert_deliveries`、`alert_delivery_attempts`、`alert_channel_checks` 和 `alert_source_events`。Fingerprint 保证同一条件同时只有一个活跃事故；Metrics 条件按完整观测集 reconcile，Client presence 则通过业务库 `operator_alert_signal_outbox` 跨库传递，source event ID 同时在两侧去重。
 
@@ -348,6 +361,11 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 
 - 无外部状态库,纯 React Context
 - i18n 覆盖 `en` / `zh-CN`
+- **Settings 控制面**(`/settings/`):受管环境变量按 7 个稳定配置域组织。后端 schema 是字段类型、约束、依赖、风险和重启边界的唯一来源，前端 i18n catalog 只覆盖文案。`GET /v1/admin/settings` 在一个快照中返回 schema、持久化值、进程有效值、来源和 SHA-256 revision；validate/PATCH 都要求 `expectedRevision`。进程启动前已有的环境变量被标记为只读 override，Secret 只暴露 `hasValue`。静态字段以启动快照计算 durable pending-restart，动态字段保存后直接更新 `DynamicSettings`；快照从当前 `DynamicSettings` 反向生成热更新字段的运行值，因此手工修改 `.env` 也不会被误报为已经生效
+- **持久化边界**:`PATCH /v1/admin/settings` 在 `DynamicSettings` 写锁内完成 revision 校验、整组关系校验、`.env.new` 写入与 fsync、旧文件备份、原子 rename、目录 fsync，再发布动态快照。通知 lifecycle 同步失败会回写旧 `.env`。地图和公告使用独立 revision，前端在 409 时加载最新版本并保留用户草稿供复核
+- **Operations 控制面**(`/operations/`):版本/服务操作、Router 日志、通知投递历史和 admin audit 从 Settings 中独立出来，避免配置编辑与即时运维动作混在同一导航和保存状态机中
+- **配置契约审计**:`cargo test admin::settings` 覆盖后端 schema、来源、关系和文件权限；`npm run audit:settings-i18n` 保证所有字段与分组都有中英文文案；`npm run audit:settings-contract` 保证 Rust schema、默认 `.env` 和前端字段 catalog 精确一致，且旧 Settings API 不会回流
+- **账户 → 通知设置**(`/account/notifications`):邮件与 Telegram 使用独立开关,至少启用一个渠道；Telegram 未绑定或 Bot 未就绪时不可开启,服务端执行相同约束。绑定按钮在 `await` 前先 `window.open("about:blank")` 保留用户手势,失败则回落为可复制深链与 `/start <token>`。绑定完成发生在 Telegram 侧,页面以 3 秒间隔轮询 `GET /v1/me/notifications`,并以 `verifiedAt` 变化识别重新绑定而不是误用旧绑定状态；5 分钟后自动停止
 - 设计 token 以 `--router-*` CSS 自定义属性承载,dark mode 经 `.dark` class 整体切换
 - **Router 自己的 Web 终端**:xterm.js ↔ WebSocket ↔ `portable-pty` 起 `ssh` 子进程(非 russh client),一次性 ticket + 每用户 2 会话上限 + 空闲/硬超时。**仅 Host Provider 本人可开**,租客与 Router 管理员均不可
 - **Client 自带的 Web 终端**(另一条链路):Clients 页条目上的「终端」按钮,与「控制台」共用同一套 iframe 窗口管理器(`components/dashboard/client-console/`)。它不经过 Router 的 PTY,而是把 client web URL 加上 `?view=terminal&embed=1`(`lib/client-web-view.ts`)后在 iframe 中打开,请求经 client tunnel 转发到 Server 的 `/web-api/terminal/*`,鉴权由 Server 自身的 Web 登录态负责。`embed=1` 让 Server 前端隐藏自己的页头、状态条和「结束会话」按钮,只渲染 xterm 画布——窗口标题栏和关闭按钮由 Router 这侧提供,不重复一遍。窗口按 `clientId + kind` 去重,因此同一 client 的控制台与终端各占一个窗口

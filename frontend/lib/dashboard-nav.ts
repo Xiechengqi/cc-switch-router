@@ -4,6 +4,7 @@ export const DASHBOARD_SHARE_MARKET_PATH = "/share-market/";
 export const DASHBOARD_CLIENT_MARKET_PATH = "/client-market/";
 export const DASHBOARD_ACCOUNT_PATH = "/account/";
 export const DASHBOARD_ACCOUNT_API_KEYS_PATH = "/account/api-keys/";
+export const DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH = "/account/notifications/";
 export const DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH = "/account/provider-usage/";
 export const DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH = "/account/consumer-usage/";
 export const DASHBOARD_ACCOUNT_MARKET_READINESS_PATH = "/account/market-readiness/";
@@ -22,6 +23,7 @@ export type DashboardRoute =
   | typeof DASHBOARD_CLIENT_MARKET_PATH
   | typeof DASHBOARD_ACCOUNT_PATH
   | typeof DASHBOARD_ACCOUNT_API_KEYS_PATH
+  | typeof DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH
   | typeof DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH
   | typeof DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH
   | typeof DASHBOARD_ACCOUNT_MARKET_READINESS_PATH
@@ -31,7 +33,7 @@ export type DashboardRoute =
   | typeof DASHBOARD_ACCOUNT_SHARE_PATH
   | typeof DASHBOARD_ACCOUNT_CLIENT_PATH
   | typeof DASHBOARD_ACCOUNT_RENTALS_PATH;
-export type DashboardShellActive = "clients" | "markets" | "share-market" | "client-market" | "account" | "settings" | "metrics";
+export type DashboardShellActive = "clients" | "markets" | "share-market" | "client-market" | "account" | "settings" | "operations" | "metrics";
 
 export function normalizeDashboardPath(pathname: string): DashboardRoute | null {
   if (pathname.startsWith("/account/rentals")) return DASHBOARD_ACCOUNT_RENTALS_PATH;
@@ -44,6 +46,7 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account/provider-usage")) return DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH;
   if (pathname.startsWith("/account/consumer-usage")) return DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH;
   if (pathname.startsWith("/account/api-keys")) return DASHBOARD_ACCOUNT_API_KEYS_PATH;
+  if (pathname.startsWith("/account/notifications")) return DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH;
   if (pathname.startsWith("/account")) return DASHBOARD_ACCOUNT_PATH;
   if (pathname.startsWith("/client-market")) return DASHBOARD_CLIENT_MARKET_PATH;
   if (pathname.startsWith("/share-market")) return DASHBOARD_SHARE_MARKET_PATH;
@@ -80,6 +83,7 @@ export function pathnameForDashboardShell(pathname: string): DashboardShellActiv
   if (pathname.startsWith("/markets")) return "markets";
   if (pathname.startsWith("/clients")) return "clients";
   if (pathname.startsWith("/metrics")) return "metrics";
+  if (pathname.startsWith("/operations")) return "operations";
   if (pathname.startsWith("/settings")) return "settings";
   return "clients";
 }
@@ -104,6 +108,7 @@ export const ACCOUNT_NAV_STORAGE_KEY = "cc_switch_router_account_nav_v1";
 
 const ACCOUNT_NAV_HREFS = [
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 const APP_NAME: &str = "cc-switch-router";
+#[cfg(test)]
 pub const DEFAULT_FOOTER_TELEGRAM_URL: &str = "https://t.me/tokenswitchorg";
 pub const DEFAULT_REQUEST_LOG_RETENTION_DAYS: u32 = 30;
 pub const MIN_REQUEST_LOG_RETENTION_DAYS: u32 = 1;
@@ -33,7 +34,7 @@ pub const DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_PROXY_MAX_REQUEST_LIFETIME_SECS: u64 = 7_200;
-pub const DEFAULT_PROXY_REQUEST_BODY_LIMIT_MB: u64 = 2;
+pub const DEFAULT_PROXY_REQUEST_BODY_LIMIT_MB: u64 = 10;
 pub const DEFAULT_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB: u64 = 32;
 pub const DEFAULT_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB: u64 = 48;
 pub const MIN_PROXY_REQUEST_BODY_LIMIT_MB: u64 = 1;
@@ -510,6 +511,106 @@ impl fmt::Debug for AlertingSettings {
     }
 }
 
+/// How the Router receives inbound Telegram updates for the *user-facing*
+/// notification bot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramBotMode {
+    /// Long polling via `getUpdates`. Requires no inbound connectivity and no
+    /// public callback registration, but only one Router process may poll a
+    /// given bot token (Telegram answers 409 to a second poller).
+    Polling,
+    /// Telegram pushes updates to `/v1/integrations/telegram/webhook`. Needs a
+    /// publicly reachable HTTPS origin and a shared secret.
+    Webhook,
+}
+
+impl TelegramBotMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Polling => "polling",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "polling" => Some(Self::Polling),
+            "webhook" => Some(Self::Webhook),
+            _ => None,
+        }
+    }
+}
+
+/// User-facing Telegram notification bot.
+///
+/// Deliberately independent from [`AlertingSettings`]: the alerting bot is a
+/// send-only operator channel pinned to one chat, whereas this bot receives
+/// `/start <token>` deep links and fans notifications out to per-user chats.
+/// Operators may reuse the same bot token in both places, but the knobs stay
+/// separate so rotating one does not break the other.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TelegramBotSettings {
+    pub enabled: bool,
+    pub bot_token: Option<String>,
+    pub mode: TelegramBotMode,
+    pub webhook_secret: Option<String>,
+    pub bind_token_ttl_secs: i64,
+    pub recipient_hourly_limit: i64,
+    pub global_hourly_limit: i64,
+}
+
+impl Default for TelegramBotSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: None,
+            mode: TelegramBotMode::Polling,
+            webhook_secret: None,
+            bind_token_ttl_secs: 900,
+            recipient_hourly_limit: 10,
+            global_hourly_limit: 50,
+        }
+    }
+}
+
+impl TelegramBotSettings {
+    /// Whether the bot can actually deliver: enabled and holding a token.
+    pub fn is_operational(&self) -> bool {
+        self.enabled
+            && self
+                .bot_token
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|token| !token.is_empty())
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        self.bot_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
+
+}
+
+impl fmt::Debug for TelegramBotSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TelegramBotSettings")
+            .field("enabled", &self.enabled)
+            .field("bot_token", &self.bot_token.as_ref().map(|_| "[REDACTED]"))
+            .field("mode", &self.mode.as_str())
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("bind_token_ttl_secs", &self.bind_token_ttl_secs)
+            .field("recipient_hourly_limit", &self.recipient_hourly_limit)
+            .field("global_hourly_limit", &self.global_hourly_limit)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientNotificationSettings {
     pub enabled: bool,
@@ -575,6 +676,7 @@ pub struct Config {
     pub resend_from_name: Option<String>,
     pub resend_reply_to: Option<String>,
     pub client_notifications: ClientNotificationSettings,
+    pub telegram_bot: TelegramBotSettings,
     pub auth_code_ttl_secs: i64,
     pub auth_code_cooldown_secs: i64,
     pub auth_session_ttl_secs: i64,
@@ -809,6 +911,20 @@ impl Config {
                     10,
                 ),
             },
+            telegram_bot: TelegramBotSettings {
+                enabled: env_bool("CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED", false),
+                bot_token: env_var("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN"),
+                mode: env_var("CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE")
+                    .and_then(|value| TelegramBotMode::parse(&value))
+                    .unwrap_or(TelegramBotMode::Polling),
+                webhook_secret: env_var("CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET"),
+                bind_token_ttl_secs: env_i64("CC_SWITCH_ROUTER_TELEGRAM_BIND_TOKEN_TTL_SECS", 900),
+                recipient_hourly_limit: env_i64(
+                    "CC_SWITCH_ROUTER_TELEGRAM_RECIPIENT_HOURLY_LIMIT",
+                    10,
+                ),
+                global_hourly_limit: env_i64("CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT", 50),
+            },
             auth_code_ttl_secs: env_var("CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5 * 60),
@@ -854,10 +970,10 @@ impl Config {
             ux_telemetry_retention_days: env_var("CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(7),
-            footer_telegram_url: env_var("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL")
+            footer_telegram_url: env::var("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL")
+                .ok()
                 .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| DEFAULT_FOOTER_TELEGRAM_URL.to_string()),
+                .unwrap_or_default(),
             metrics: MetricsConfig {
                 enabled: env_bool("CC_SWITCH_ROUTER_METRICS_ENABLED", true),
                 db_path: env_var("CC_SWITCH_ROUTER_METRICS_DB_PATH")
@@ -1071,6 +1187,12 @@ pub fn ensure_default_env_file() -> Result<PathBuf> {
         fs::write(&env_path, default_env_contents())
             .with_context(|| format!("write default env failed: {}", env_path.display()))?;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure env file failed: {}", env_path.display()))?;
+    }
 
     Ok(env_path)
 }
@@ -1085,7 +1207,7 @@ pub fn load_env_file(path: &PathBuf) -> Result<()> {
             continue;
         }
 
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((key, raw_value)) = line.split_once('=') else {
             anyhow::bail!("invalid env line {} in {}", index + 1, path.display());
         };
 
@@ -1095,7 +1217,13 @@ pub fn load_env_file(path: &PathBuf) -> Result<()> {
         }
 
         if env::var_os(key).is_none() {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
+            let value = decode_env_value(raw_value).map_err(|message| {
+                anyhow::anyhow!(
+                    "invalid env value on line {} in {}: {message}",
+                    index + 1,
+                    path.display()
+                )
+            })?;
             unsafe {
                 env::set_var(key, value);
             }
@@ -1103,6 +1231,52 @@ pub fn load_env_file(path: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub(crate) fn decode_env_value(raw: &str) -> std::result::Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return Ok(inner.to_string());
+    }
+    if !value.starts_with('"') {
+        if value.ends_with('"') || value.starts_with('\'') || value.ends_with('\'') {
+            return Err("unmatched quote".into());
+        }
+        return Ok(value.to_string());
+    }
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| "unmatched quote".to_string())?;
+    let mut decoded = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let escaped = chars
+            .next()
+            .ok_or_else(|| "trailing escape character".to_string())?;
+        match escaped {
+            '\\' => decoded.push('\\'),
+            '"' => decoded.push('"'),
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            other => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+        }
+    }
+    Ok(decoded)
 }
 
 fn default_env_contents() -> String {
@@ -1126,7 +1300,7 @@ CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS=120
 CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900
 CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS=120
 CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS=7200
-CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB=2
+CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB=10
 CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB=32
 CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB=48
 CC_SWITCH_ROUTER_OWNER_EMAIL=
@@ -1139,9 +1313,17 @@ CC_SWITCH_ROUTER_DB_PATH={}
 CC_SWITCH_ROUTER_TURSO_URL=
 CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN=
 CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS=60
+CC_SWITCH_ROUTER_HOST_KEY_PATH=
+CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH=
+CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH=
 CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS=300
 CC_SWITCH_ROUTER_LEASE_RETENTION_SECS=86400
 CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS=30
+CC_SWITCH_ROUTER_SERVER_LOG_INGEST_ENABLED=true
+CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED=true
+CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR=
+CC_SWITCH_ROUTER_SERVER_LOG_RETENTION_DAYS=7
+CC_SWITCH_ROUTER_SERVER_LOG_MAX_TOTAL_MIB=1024
 CC_SWITCH_ROUTER_CLIENT_STALE_SECS=3600
 CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS=21600
 CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE=60
@@ -1172,9 +1354,14 @@ CC_SWITCH_ROUTER_AUTH_SOURCE_HOURLY_LIMIT=10
 CC_SWITCH_ROUTER_IP_BLACKLIST=
 CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE=7
+CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS=http://3.0.3.0,http://3.0.2.1,http://3.0.2.9
+CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL=https://tokenswitch.org
+CC_SWITCH_ROUTER_VERIFICATION_SERVICE_API_KEY=
 CC_SWITCH_ROUTER_RESEND_API_KEY=
 # CC_SWITCH_ROUTER_RESEND_FROM defaults to noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]
 CC_SWITCH_ROUTER_RESEND_FROM=
+CC_SWITCH_ROUTER_RESEND_FROM_NAME=
+CC_SWITCH_ROUTER_RESEND_REPLY_TO=
 # Client lifecycle email notifications default to enabled and go to each currently verified owner.
 CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED=true
 CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS=180
@@ -1211,6 +1398,13 @@ CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN=
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID=
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID=
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY=warning
+CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED=false
+CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN=
+CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE=polling
+CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET=
+CC_SWITCH_ROUTER_TELEGRAM_BIND_TOKEN_TTL_SECS=900
+CC_SWITCH_ROUTER_TELEGRAM_RECIPIENT_HOURLY_LIMIT=10
+CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT=50
 ",
         default_data_dir().display(),
         default_db_path().display(),
@@ -1462,6 +1656,7 @@ mod tests {
             resend_from_name: None,
             resend_reply_to: None,
             client_notifications: ClientNotificationSettings::default(),
+            telegram_bot: TelegramBotSettings::default(),
             auth_code_ttl_secs: 300,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 300,
@@ -1615,10 +1810,10 @@ mod tests {
         assert_eq!(defaults.idle_timeout_secs, 900);
         assert_eq!(defaults.downstream_stall_timeout_secs, 120);
         assert_eq!(defaults.max_request_lifetime_secs, 7_200);
-        assert_eq!(defaults.request_body_limit_mb, 2);
+        assert_eq!(defaults.request_body_limit_mb, 10);
         assert_eq!(defaults.media_request_body_limit_mb, 32);
         assert_eq!(defaults.image_request_body_limit_mb, 48);
-        assert_eq!(defaults.request_body_limit_bytes(), 2 * 1024 * 1024);
+        assert_eq!(defaults.request_body_limit_bytes(), 10 * 1024 * 1024);
         assert_eq!(defaults.media_request_body_limit_bytes(), 32 * 1024 * 1024);
         assert_eq!(defaults.image_request_body_limit_bytes(), 48 * 1024 * 1024);
         assert!(defaults.validate().is_ok());
@@ -1631,7 +1826,7 @@ mod tests {
             "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900",
             "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS=120",
             "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS=7200",
-            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB=2",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB=10",
             "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB=32",
             "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB=48",
         ] {

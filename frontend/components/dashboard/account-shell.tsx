@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Activity, BarChart3, ClipboardCheck, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
+import { Activity, BarChart3, Bell, ClipboardCheck, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -15,6 +15,7 @@ import {
   DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
   DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
+  DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH,
   DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
@@ -34,6 +35,7 @@ const NAV_ITEMS: {
     | "account.nav.group.market";
   labelKey:
     | "account.nav.apiKeys"
+    | "account.nav.notifications"
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
     | "account.nav.billing"
@@ -53,6 +55,14 @@ const NAV_ITEMS: {
     icon: KeyRound,
     match: (pathname: string) =>
       pathname.startsWith("/account/api-keys") || pathname === "/account" || pathname === "/account/",
+  },
+  {
+    id: "notifications",
+    href: DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH,
+    groupLabelKey: "account.nav.group.security",
+    labelKey: "account.nav.notifications",
+    icon: Bell,
+    match: (pathname: string) => pathname.startsWith("/account/notifications"),
   },
   {
     id: "provider-usage",

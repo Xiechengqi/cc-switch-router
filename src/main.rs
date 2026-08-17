@@ -28,6 +28,7 @@ mod metrics;
 mod models;
 mod namespace;
 mod notifications;
+mod notification_channels;
 mod process_lock;
 mod provision_ssh;
 mod proxy;
@@ -44,6 +45,7 @@ mod share_market;
 mod ssh;
 mod startup_config;
 mod store;
+mod telegram;
 mod usage_account;
 
 use std::collections::HashSet;
@@ -92,9 +94,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let external_settings_env =
+        crate::admin::settings::SettingsRuntimeSnapshot::capture_external_env();
     let env_path = ensure_default_env_file()?;
     load_env_file(&env_path)?;
     ensure_startup_config(&env_path, StartupConfigMode::Start)?;
+    let settings_runtime =
+        crate::admin::settings::SettingsRuntimeSnapshot::capture(external_settings_env, &env_path)?;
 
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
@@ -237,6 +243,7 @@ async fn main() -> Result<()> {
         upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
         share_edit_events: broadcast::channel(512).0,
         env_path: env_path.clone(),
+        settings_runtime,
         start_instant: Instant::now(),
         scheduling_overrides: OverrideStore::new(),
         metrics: metrics.clone(),
@@ -321,6 +328,9 @@ async fn main() -> Result<()> {
     let notification_store = state.store.clone();
     let notification_dynamic = state.dynamic.clone();
     let notification_config = config.clone();
+    let telegram_bot_store = state.store.clone();
+    let telegram_bot_dynamic = state.dynamic.clone();
+    let telegram_bot_config = config.clone();
     let chat_notification_store = state.store.clone();
     let chat_notification_config = config.clone();
     let client_market_trade_state = state.clone();
@@ -645,6 +655,21 @@ async fn main() -> Result<()> {
             result
         },
     );
+    // Inbound half of the user-facing Telegram bot. Idles cheaply when the bot
+    // is disabled, and picks up settings changes without a restart.
+    let telegram_bot_task =
+        spawn_background_task("telegram bot", background_shutdown_rx.clone(), async move {
+            let result = crate::telegram::service::run_telegram_bot_service(
+                telegram_bot_store,
+                telegram_bot_dynamic,
+                telegram_bot_config,
+            )
+            .await;
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "telegram bot service stopped");
+            }
+            result
+        });
     let chat_notification_task = spawn_background_task(
         "chat email notifications",
         background_shutdown_rx.clone(),
@@ -756,6 +781,7 @@ async fn main() -> Result<()> {
         ("clock health", clock_health_task),
         ("operator alerting", alerting_task),
         ("client notifications", notification_task),
+        ("telegram bot", telegram_bot_task),
         ("chat email notifications", chat_notification_task),
         ("Client Market trade", client_market_trade_task),
         ("Share Market", share_market_task),

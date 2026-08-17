@@ -6,6 +6,7 @@ use resend_rs::Resend;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::abuse::AbuseTracker;
+use crate::admin::settings::SettingsRuntimeSnapshot;
 use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::alerting::AlertingService;
 use crate::client_logs::ClientLogAccessLimiter;
@@ -71,6 +72,9 @@ pub struct ServerState {
     pub share_edit_events: broadcast::Sender<ShareEditAvailableEvent>,
     /// Path to the live env file (also the apply target).
     pub env_path: PathBuf,
+    /// Immutable boot-time values used to distinguish live settings from
+    /// persisted values waiting for a restart.
+    pub settings_runtime: SettingsRuntimeSnapshot,
     /// When the process started; powers the uptime value on /v1/admin/version.
     pub start_instant: Instant,
     /// Per-owner penalty multipliers seeded by market 429/rate-limit feedback.

@@ -47,11 +47,12 @@ export function ClientNotificationDeliveriesPanel() {
       <Card.Content className="grid gap-4">
         {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
         <div className="overflow-x-auto rounded-lg border">
-          <table className="w-full min-w-[820px] text-left text-sm">
+          <table className="w-full min-w-[960px] text-left text-sm">
             <thead className="bg-muted/50 text-xs text-muted-foreground">
               <tr>
                 <th className="px-4 py-3 font-medium">{t("notifications.event")}</th>
-                <th className="px-4 py-3 font-medium">{t("notifications.recipient")}</th>
+                <th className="px-4 py-3 font-medium">{t("notifications.channel")}</th>
+                <th className="px-4 py-3 font-medium">{t("notifications.target")}</th>
                 <th className="px-4 py-3 font-medium">{t("notifications.status")}</th>
                 <th className="px-4 py-3 font-medium">{t("notifications.attempts")}</th>
                 <th className="px-4 py-3 font-medium">{t("notifications.created")}</th>
@@ -70,12 +71,18 @@ export function ClientNotificationDeliveriesPanel() {
                       <div className="mt-1 text-xs font-normal text-muted-foreground">{eventLabel(delivery.eventKind, t)}</div>
                     ) : null}
                   </td>
-                  <td className="px-4 py-3 font-mono text-xs">{delivery.recipientMasked}</td>
+                  <td className="px-4 py-3"><Chip size="sm" variant="soft">{channelLabel(delivery.channel, t)}</Chip></td>
+                  <td className="px-4 py-3 font-mono text-xs">{delivery.targetMasked}</td>
                   <td className="px-4 py-3"><DeliveryStatus status={delivery.status} /></td>
                   <td className="px-4 py-3 tabular-nums">{delivery.attempts}</td>
                   <td className="px-4 py-3 whitespace-nowrap">{formatTime(delivery.createdAt, locale)}</td>
                   <td className="max-w-[300px] px-4 py-3">
                     <div className="whitespace-nowrap">{formatTime(deliveryResultTime(delivery), locale)}</div>
+                    {delivery.failureKind || delivery.blockedReasonCode ? (
+                      <div className="mt-1 break-words font-mono text-[10px] text-muted-foreground">
+                        {[delivery.failureKind, delivery.blockedReasonCode].filter(Boolean).join(" / ")}
+                      </div>
+                    ) : null}
                     {delivery.errorMessage ? <div className="mt-1 break-words text-xs text-danger" title={delivery.errorMessage}>{delivery.errorMessage}</div> : null}
                   </td>
                 </tr>
@@ -222,6 +229,12 @@ function eventLabel(kind: string, t: ReturnType<typeof useLocaleText>["t"]) {
   return kind;
 }
 
+function channelLabel(channel: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  if (channel === "email") return t("account.notifications.channel.email");
+  if (channel === "telegram") return t("account.notifications.channel.telegram");
+  return channel;
+}
+
 function deliveryLabel(kind: string, eventKind: string, status: string, t: ReturnType<typeof useLocaleText>["t"]) {
   if (kind === "incident") return t("notifications.incident");
   if (!eventKind && status === "suppressed_config_changed") return t("notifications.configSuperseded");
@@ -246,6 +259,7 @@ function statusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
     cancelled_message_deleted: "notifications.status.cancelledMessageDeleted",
     cancelled_room_archived: "notifications.status.cancelledRoomArchived",
     blocked_config: "notifications.status.blocked",
+    cancelled_channel_changed: "notifications.status.cancelledChannelChanged",
     suppressed_rate_limit: "notifications.status.suppressedRateLimit",
     suppressed_storm: "notifications.status.suppressedStorm",
     suppressed_disabled: "notifications.status.suppressedDisabled",

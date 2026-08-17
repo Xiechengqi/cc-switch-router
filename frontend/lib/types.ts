@@ -18,9 +18,11 @@ export type MapDisplaySettings = {
   showFlows: boolean;
   showHeat: boolean;
   viewport: MapViewportSettings;
+  revision: string;
 };
 
 export type MapDisplaySettingsUpdate = {
+  expectedRevision: string;
   showFlows?: boolean;
   showHeat?: boolean;
   viewport?: Partial<MapViewportSettings>;
@@ -34,6 +36,7 @@ export type AnnouncementSettings = {
 };
 
 export type AnnouncementSettingsUpdate = {
+  expectedRevision: string;
   enabled?: boolean;
   contentEn?: string;
   contentZhCn?: string;
@@ -494,6 +497,32 @@ export type UserApiTokenResponse = {
 export type UserApiTokenResetResponse = {
   apiToken: string;
   token: UserApiTokenStatus;
+};
+
+export type NotificationChannelSettings = {
+  channel: string;
+  enabled: boolean;
+  available: boolean;
+  state: "ready" | "unbound" | "invalid" | string;
+  targetLabel?: string;
+  verifiedAt?: string;
+};
+
+/** GET/PATCH /v1/me/notifications */
+export type NotificationSettings = {
+  email: string;
+  enabledChannels: string[];
+  channels: NotificationChannelSettings[];
+  telegramBotStatus: "disabled" | "reconciling" | "ready" | "error" | string;
+  telegramBotUsername?: string;
+};
+
+/** POST /v1/me/notifications/telegram/bind-link — single use, short lived. */
+export type TelegramBindLink = {
+  url: string;
+  token: string;
+  botUsername: string;
+  expiresAt: string;
 };
 
 export type AccountUsagePeriod = "24h" | "7d" | "30d";
@@ -1061,10 +1090,27 @@ export type HealthTimelineBucket = {
   failureCount: number;
 };
 
+export type SettingsCategoryId =
+  | "general_display"
+  | "connectivity"
+  | "data_lifecycle"
+  | "identity_security"
+  | "notifications"
+  | "observability"
+  | "marketplace";
+
+export type SettingsCategory = {
+  id: SettingsCategoryId;
+  label: string;
+  description: string;
+  fieldCount: number;
+};
+
 export type SettingsField = {
   key: string;
   label: string;
   group: string;
+  category: SettingsCategoryId;
   fieldType:
     | "text"
     | "select"
@@ -1076,18 +1122,30 @@ export type SettingsField = {
     | "email"
     | "email_list"
     | "ip_list"
+    | "url_list"
     | "secret";
   required: boolean;
   restartRequired: boolean;
+  risk: "normal" | "caution" | "critical";
   default?: string | null;
   description: string;
   placeholder?: string | null;
+  unit?: string | null;
+  constraints: {
+    min?: number;
+    max?: number;
+    step?: number;
+    minItems?: number;
+    maxItems?: number;
+  };
+  dependencies?: Array<{ key: string; equals: string }>;
   options?: string[];
 };
 
 export type SettingsSchema = {
   fields: SettingsField[];
   groups: string[];
+  categories: SettingsCategory[];
 };
 
 export type SettingValueEntry = {
@@ -1095,11 +1153,29 @@ export type SettingValueEntry = {
   value?: string | null;
   hasValue: boolean;
   isSecret: boolean;
-  source: "env_file" | "default" | "unset";
+  source: "process_env" | "env_file" | "default" | "runtime" | "unset";
+  effectiveValue?: string | null;
+  effectiveHasValue: boolean;
+  effectiveSource: "process_env" | "env_file" | "default" | "runtime" | "unset";
+  overriddenByEnvironment: boolean;
+  pendingRestart: boolean;
 };
 
-export type SettingsValuesResponse = {
+export type SettingsSnapshot = {
+  revision: string;
+  generatedAt: string;
+  envPath: string;
+  schema: SettingsSchema;
   values: SettingValueEntry[];
+  pendingRestartKeys: string[];
+  environmentOverrideKeys: string[];
+};
+
+export type SettingsValidationResponse = {
+  valid: boolean;
+  fieldErrors: Record<string, string[]>;
+  formErrors: string[];
+  restartRequiredKeys: string[];
 };
 
 export type SettingsUpdateResponse = {
@@ -1108,15 +1184,19 @@ export type SettingsUpdateResponse = {
   restartRequiredKeys: string[];
   dynamicGroupsRefreshed: string[];
   envPath: string;
+  revision: string;
 };
 
 export type ClientNotificationDelivery = {
   id: string;
+  channel: string;
   deliveryKind: string;
   eventKind: string;
   eventCount: number;
-  recipientMasked: string;
+  targetMasked: string;
   status: string;
+  failureKind?: string | null;
+  blockedReasonCode?: string | null;
   attempts: number;
   createdAt: string;
   nextAttemptAt?: string | null;
@@ -1145,6 +1225,19 @@ export type ClientChatDelivery = {
 
 export type ClientChatDeliveriesResponse = {
   deliveries: ClientChatDelivery[];
+};
+
+export type AdminAuditEntry = {
+  id: string;
+  actorEmail?: string | null;
+  action: string;
+  payloadJson?: string | null;
+  ip?: string | null;
+  createdAt: string;
+};
+
+export type AdminAuditResponse = {
+  entries: AdminAuditEntry[];
 };
 
 export type VersionResponse = {
