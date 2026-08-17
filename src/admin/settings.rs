@@ -3508,10 +3508,27 @@ fn validate_telegram_bot_relations(
         .map(|value| parse_bool_truthy(&value))
         .unwrap_or(false);
 
-    if enabled && configured("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN").is_none() {
+    let bot_token = configured("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN");
+    if enabled && bot_token.is_none() {
         return Err(AppError::BadRequest(
             "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN is required when the Telegram notification bot is enabled".into(),
         ));
+    }
+    if let Some(token) = bot_token {
+        let token = token.trim();
+        let valid = token.split_once(':').is_some_and(|(bot_id, secret)| {
+            !bot_id.is_empty()
+                && bot_id.bytes().all(|byte| byte.is_ascii_digit())
+                && !secret.is_empty()
+                && secret
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        });
+        if !valid {
+            return Err(AppError::BadRequest(
+                "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN must use the BotFather format <numeric bot id>:<token>".into(),
+            ));
+        }
     }
 
     let webhook_mode = configured("CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE")
@@ -4820,10 +4837,23 @@ mod tests {
             ),
             (
                 "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN".into(),
-                Some("persisted-token".into()),
+                Some("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi".into()),
             ),
         ]);
         assert!(validate_and_diff(&existing, &enable_bot_with_token).is_ok());
+
+        for invalid_token in [
+            "missing-colon",
+            "bot-id:validSecret",
+            "123456789:contains/slash",
+            "123456789:",
+        ] {
+            let invalid = BTreeMap::from([(
+                "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN".into(),
+                Some(invalid_token.into()),
+            )]);
+            assert!(validate_and_diff(&existing, &invalid).is_err());
+        }
     }
 
     #[test]

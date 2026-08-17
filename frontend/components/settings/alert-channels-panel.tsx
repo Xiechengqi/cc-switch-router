@@ -43,7 +43,7 @@ export function AlertChannelsPanel({
     : channels;
 
   return (
-    <section className="grid gap-3 border-b pb-5">
+    <section className="grid gap-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold">{t("settings.alertChannels.title")}</h3>

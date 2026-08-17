@@ -13,6 +13,7 @@
 pub mod bind;
 pub mod service;
 
+use std::error::Error as StdError;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -289,16 +290,44 @@ fn require<'a>(value: Option<&'a str>, message: &str) -> Result<&'a str, Telegra
 }
 
 fn request_failure(method: &str, error: reqwest::Error, secret: Option<&str>) -> TelegramFailure {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    };
     TelegramFailure {
         retryable: error.is_timeout() || error.is_connect() || error.is_request(),
         retry_at: None,
         http_status: error.status().map(|status| status.as_u16()),
         message: sanitize(
-            &format!("Telegram {method} request failed: {error}"),
+            &format!(
+                "Telegram {method} request failed ({kind}): {}",
+                error_chain(&error)
+            ),
             secret,
         ),
         chat_unreachable: false,
     }
+}
+
+fn error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if parts.last().is_none_or(|previous| previous != &message) {
+            parts.push(message);
+        }
+        if parts.len() >= 6 {
+            break;
+        }
+        source = cause.source();
+    }
+    parts.join("; cause: ")
 }
 
 pub fn is_retryable_status(status: u16) -> bool {
@@ -357,6 +386,7 @@ pub fn truncate(value: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
 
     #[test]
     fn bot_token_is_redacted_from_messages() {
@@ -366,6 +396,44 @@ mod tests {
         );
         assert!(!message.contains("secret-token"));
         assert!(message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn error_chain_preserves_nested_transport_cause() {
+        #[derive(Debug)]
+        struct NestedError;
+
+        impl fmt::Display for NestedError {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("dns lookup failed")
+            }
+        }
+
+        impl StdError for NestedError {}
+
+        #[derive(Debug)]
+        struct RequestError {
+            source: NestedError,
+        }
+
+        impl fmt::Display for RequestError {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("request failed")
+            }
+        }
+
+        impl StdError for RequestError {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.source)
+            }
+        }
+
+        assert_eq!(
+            error_chain(&RequestError {
+                source: NestedError,
+            }),
+            "request failed; cause: dns lookup failed"
+        );
     }
 
     #[test]

@@ -248,7 +248,7 @@ export function SettingsPage() {
       ) : null}
 
       <section className="grid gap-5 lg:grid-cols-[230px_minmax(0,1fr)]">
-        <aside className="h-fit border-r pr-4 lg:sticky lg:top-4">
+        <aside className="h-fit rounded-md bg-muted/35 p-2 lg:sticky lg:top-4">
           <nav aria-label={t("settings.categoriesAria")} className="grid gap-1">
             <SettingsNavButton
               active={activeSection === "overview" && !normalizedQuery}
@@ -323,12 +323,12 @@ export function SettingsPage() {
                 className="grid gap-8"
               >
                 {groupedFields.map(([group, fields]) => (
-                  <section key={group} className="border-t pt-5">
-                    <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-                      <h3 className="text-base font-semibold">{settingsGroupLabel(t, group)}</h3>
+                  <section key={group} className="grid gap-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+                      <h3 className="text-lg font-semibold">{settingsGroupLabel(t, group)}</h3>
                       <span className="text-xs tabular-nums text-muted-foreground">{t("settings.fieldCount", { count: fields.length })}</span>
                     </div>
-                    <div className="divide-y border-y">
+                    <div className="grid gap-1 rounded-md bg-muted/30 p-1">
                       {fields.map((field) => (
                         <SettingsFieldRow
                           key={field.key}
@@ -346,7 +346,7 @@ export function SettingsPage() {
                 ))}
 
                 {!visibleFields.length && normalizedQuery ? (
-                  <div className="border-y py-14 text-center text-sm text-muted-foreground">{t("settings.noSearchResults")}</div>
+                  <div className="rounded-md bg-muted/30 py-14 text-center text-sm text-muted-foreground">{t("settings.noSearchResults")}</div>
                 ) : null}
 
                 {keepGeneralPanelsMounted ? (
@@ -552,7 +552,7 @@ function SettingsOverview({
   if (!snapshot) return null;
   return (
     <div className="grid gap-7">
-      <section className="grid border-y sm:grid-cols-2 sm:divide-x">
+      <section className="grid rounded-md bg-muted/35 sm:grid-cols-2">
         <OverviewStat label={t("settings.configuredFields")} value={snapshot.schema.fields.length} />
         <OverviewStat label={t("settings.pendingRestartLabel")} value={snapshot.pendingRestartKeys.length} tone={snapshot.pendingRestartKeys.length ? "warning" : "default"} />
       </section>
@@ -561,7 +561,7 @@ function SettingsOverview({
 
       <section>
         <h2 className="font-display text-2xl">{t("settings.configurationDomains")}</h2>
-        <div className="mt-4 divide-y border-y">
+        <div className="mt-4 grid gap-1 rounded-md bg-muted/30 p-1">
           {snapshot.schema.categories.map((category) => {
             const Icon = CATEGORY_ICONS[category.id];
             return (
@@ -569,7 +569,7 @@ function SettingsOverview({
                 key={category.id}
                 type="button"
                 onClick={() => onSelect(category.id)}
-                className="grid w-full gap-3 px-2 py-4 text-left transition-colors hover:bg-muted/40 sm:grid-cols-[32px_minmax(0,1fr)_auto] sm:items-center"
+                className="grid w-full gap-3 rounded-sm px-3 py-4 text-left transition-colors hover:bg-background/80 sm:grid-cols-[32px_minmax(0,1fr)_auto] sm:items-center"
               >
                 <Icon className="h-5 w-5 text-muted-foreground" />
                 <span className="min-w-0">
@@ -617,7 +617,7 @@ function SettingsNavButton({
     <button
       type="button"
       onClick={onClick}
-      className={`flex min-h-10 w-full items-center gap-2 px-2.5 text-left text-sm transition-colors ${active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"}`}
+      className={`flex min-h-10 w-full items-center gap-2 rounded-sm px-2.5 text-left text-sm transition-colors ${active ? "bg-background font-medium text-foreground" : "text-muted-foreground hover:bg-background/70 hover:text-foreground"}`}
     >
       <Icon className="h-4 w-4 shrink-0" />
       <span className="min-w-0 flex-1 truncate">{label}</span>
@@ -657,7 +657,7 @@ function SettingsSubnav({
         role="tablist"
         aria-label={t("settings.groupsAria")}
         aria-orientation="horizontal"
-        className="flex min-w-max gap-2 border-b pb-2"
+        className="flex min-w-max gap-1 rounded-md bg-muted/40 p-1"
         onKeyDown={(event) => {
           if (event.key === "ArrowRight") {
             event.preventDefault();
@@ -694,9 +694,9 @@ function SettingsSubnav({
               aria-label={[item.label, fieldCountLabel, dirtyCountLabel].filter(Boolean).join(", ")}
               tabIndex={selected ? 0 : -1}
               onClick={() => onChange(item.id)}
-              className={`grid min-h-[58px] min-w-[9rem] content-center rounded-md border px-3 py-2 text-left transition-colors ${selected
-                ? "border-primary bg-primary/10 text-foreground"
-                : "border-border bg-background text-muted-foreground hover:border-foreground/30 hover:bg-muted/40 hover:text-foreground"}`}
+              className={`relative grid min-h-[58px] min-w-[9rem] content-center rounded-sm px-3 py-2 text-left transition-colors after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:transition-colors ${selected
+                ? "bg-background text-foreground after:bg-primary"
+                : "text-muted-foreground after:bg-transparent hover:bg-background/60 hover:text-foreground"}`}
             >
               <span className="whitespace-nowrap text-sm font-medium">{item.label}</span>
               {fieldCountLabel || dirtyCountLabel ? (
@@ -732,8 +732,15 @@ function SettingsFieldRow({
 }) {
   const secretClearing = field.fieldType === "secret" && value === null;
   const inputValue = secretClearing ? "" : String(value ?? "");
+  const rowState = errors.length
+    ? "bg-danger/5 hover:bg-danger/10"
+    : dirty
+      ? "bg-primary/5 hover:bg-primary/10"
+      : entry?.pendingRestart
+        ? "bg-warning/10 hover:bg-warning/15"
+        : "hover:bg-background/75";
   return (
-    <div className="grid gap-4 py-5 md:grid-cols-[minmax(230px,0.9fr)_minmax(0,1.1fr)]">
+    <div className={`grid gap-4 rounded-sm px-4 py-5 transition-colors md:grid-cols-[minmax(230px,0.9fr)_minmax(0,1.1fr)] ${rowState}`}>
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <label className="font-medium" htmlFor={field.key}>{settingsFieldLabel(t, field)}</label>
@@ -840,7 +847,7 @@ function SettingsFieldRow({
 function ProvisionKeyPanel({ value, error }: { value: ProvisionSshKey | null; error: string }) {
   const { t } = useLocaleText();
   return (
-    <section className="border-t pt-5">
+    <section>
       <h3 className="text-base font-semibold">{t("settings.provisionSshKeyTitle")}</h3>
       <p className="mt-2 text-sm text-muted-foreground">{t("settings.provisionSshKeyDesc")}</p>
       {error ? <Alert status="danger" className="mt-4">{error}</Alert> : null}

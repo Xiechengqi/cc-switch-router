@@ -5734,30 +5734,16 @@ async fn admin_settings_apply(
         != dynamic_guard.telegram_bot.enabled
         || next_dynamic.telegram_bot.bot_token != dynamic_guard.telegram_bot.bot_token
         || next_dynamic.telegram_bot.mode != dynamic_guard.telegram_bot.mode
-        || next_dynamic.telegram_bot.webhook_secret
-            != dynamic_guard.telegram_bot.webhook_secret;
-    if telegram_identity_config_changed && next_dynamic.telegram_bot.enabled {
-        let token = next_dynamic.telegram_bot.token().ok_or_else(|| {
-            AppError::BadRequest("Telegram notification bot token is required".into())
-        })?;
-        let http = crate::telegram::build_send_http_client(
-            "cc-switch-router/0.1 settings-telegram-validation",
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("build Telegram validation client failed: {error}"))
-        })?;
-        crate::telegram::get_me(&http, token).await.map_err(|failure| {
-            AppError::BadRequest(format!(
-                "Telegram notification bot validation failed: {}",
-                failure.message
-            ))
-        })?;
-    }
+        || next_dynamic.telegram_bot.webhook_secret != dynamic_guard.telegram_bot.webhook_secret;
+    // Telegram reachability is runtime state, not configuration validity. The
+    // background service performs getMe and retries while the persisted bot
+    // state remains reconciling; settings writes must not depend on an external
+    // network call while holding the dynamic-settings write lock.
     // Compare the actual runtime policies so re-applying a persisted value can
     // still advance the durable activation boundary after an interrupted sync.
-    let needs_client_notification_sync =
-        next_dynamic.client_notifications != dynamic_guard.client_notifications
-            || telegram_settings_changed;
+    let needs_client_notification_sync = next_dynamic.client_notifications
+        != dynamic_guard.client_notifications
+        || telegram_settings_changed;
     let needs_client_notification_validation = needs_client_notification_sync
         || outcome.updated_keys.iter().any(|key| {
             key == "CC_SWITCH_ROUTER_CLIENT_STALE_SECS"
