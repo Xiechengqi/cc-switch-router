@@ -252,7 +252,7 @@ function HostRowImpl({
   };
 
   const sortedHistory = React.useMemo(() => {
-    if (!history?.length) return history;
+    if (!history?.length) return [];
     return [...history].sort((left, right) => {
       const byStart = historyTime(right.startedAt) - historyTime(left.startedAt);
       if (byStart !== 0) return byStart;
