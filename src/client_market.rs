@@ -491,6 +491,99 @@ fn reservation_has_active_create_job(
     }))
 }
 
+/// A Client Market owner may reuse a subdomain only after release has finished:
+/// the old installation is gone, the Client label is tombstoned, and the
+/// released subscription still names this owner. Takeover-retired names stay
+/// blocked because their subject installation is still live.
+pub(crate) fn client_market_owner_can_reclaim_tombstoned_label(
+    conn: &Connection,
+    subdomain: &str,
+    owner_email: &str,
+    owner_user_id: Option<&str>,
+) -> Result<bool, AppError> {
+    let email = normalize_market_email(owner_email)?;
+    let label = subdomain.trim().to_ascii_lowercase();
+    let Some(existing) = crate::public_hosts::get_by_label(conn, &label)
+        .map_err(map_client_market_public_host_error)?
+    else {
+        return Ok(false);
+    };
+    if existing.kind != crate::namespace::PublicHostKind::Client
+        || existing.lifecycle != crate::public_hosts::PublicHostLifecycle::Tombstoned
+    {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT 1
+         FROM public_hosts p
+         JOIN client_market_subscriptions s ON s.installation_id = p.subject_id
+         WHERE p.label = ?1 COLLATE NOCASE
+           AND p.kind = 'client'
+           AND p.lifecycle = 'tombstoned'
+           AND s.status = 'released'
+           AND lower(trim(s.client_owner_email)) = ?2
+           AND (?3 IS NULL OR s.client_user_id = ?3)
+           AND NOT EXISTS (SELECT 1 FROM installations i WHERE i.id = p.subject_id)
+           AND NOT EXISTS (
+               SELECT 1 FROM installation_client_tunnels t
+               WHERE t.subdomain = p.label COLLATE NOCASE
+           )",
+        params![label, email, owner_user_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(|error| AppError::Internal(format!("check Client subdomain reclaim failed: {error}")))
+}
+
+pub(crate) fn client_market_label_blocks_new_client(
+    conn: &Connection,
+    subdomain: &str,
+    owner_email: &str,
+    owner_user_id: Option<&str>,
+) -> Result<bool, AppError> {
+    let label = subdomain.trim().to_ascii_lowercase();
+    let Some(existing) = crate::public_hosts::get_by_label(conn, &label)
+        .map_err(map_client_market_public_host_error)?
+    else {
+        return Ok(false);
+    };
+    if existing.kind == crate::namespace::PublicHostKind::Client
+        && existing.lifecycle == crate::public_hosts::PublicHostLifecycle::Tombstoned
+        && client_market_owner_can_reclaim_tombstoned_label(
+            conn,
+            &label,
+            owner_email,
+            owner_user_id,
+        )?
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn map_client_market_public_host_error(
+    error: crate::public_hosts::PublicHostCatalogError,
+) -> AppError {
+    match error {
+        crate::public_hosts::PublicHostCatalogError::Invalid(message) => {
+            AppError::BadRequest(message.into())
+        }
+        crate::public_hosts::PublicHostCatalogError::Conflict(message) => {
+            AppError::Conflict(message)
+        }
+        crate::public_hosts::PublicHostCatalogError::Corrupt(message) => {
+            AppError::Internal(message)
+        }
+        crate::public_hosts::PublicHostCatalogError::Database(error) if error.is_unavailable() => {
+            AppError::ServiceUnavailable(format!("public host catalog: {error}"))
+        }
+        crate::public_hosts::PublicHostCatalogError::Database(error) => {
+            AppError::Internal(format!("public host catalog database error: {error}"))
+        }
+    }
+}
+
 /// Apply the global Client Market reservation to the public availability API.
 /// Calls from the selected host are allowed through so the setup preflight can run;
 /// every other installation sees the label as unavailable.
@@ -6292,16 +6385,7 @@ impl AppStore {
                 "too many active client provisioning jobs".into(),
             ));
         }
-        let existing_host: Option<String> = tx
-            .query_row(
-                "SELECT label FROM public_hosts
-                 WHERE label = ?1 COLLATE NOCASE",
-                params![subdomain],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| AppError::Internal(format!("check subdomain catalog failed: {e}")))?;
-        if existing_host.is_some() {
+        if client_market_label_blocks_new_client(&tx, subdomain, &client_owner, None)? {
             return Err(AppError::Conflict("subdomain is already in use".into()));
         }
         let reservation_owner: Option<String> = tx
@@ -6840,20 +6924,6 @@ impl AppStore {
                 "subdomain reservation does not belong to this job".into(),
             ));
         }
-        let existing_host: Option<String> = tx
-            .query_row(
-                "SELECT label FROM public_hosts
-                 WHERE label = ?1 COLLATE NOCASE",
-                params![subdomain],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| AppError::Internal(format!("query public host subdomain failed: {e}")))?;
-        if existing_host.is_some() {
-            return Err(AppError::Conflict("subdomain already in use".into()));
-        }
-        let owner_placeholders = placeholders(owners.len());
-        let region_placeholders = placeholders(regions.len());
         let client_identity: (Option<String>, String) = tx
             .query_row(
                 "SELECT client_owner_user_id, client_owner_email
@@ -6862,6 +6932,16 @@ impl AppStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| AppError::Internal(format!("read claim client identity failed: {e}")))?;
+        if client_market_label_blocks_new_client(
+            &tx,
+            subdomain,
+            &client_identity.1,
+            client_identity.0.as_deref(),
+        )? {
+            return Err(AppError::Conflict("subdomain already in use".into()));
+        }
+        let owner_placeholders = placeholders(owners.len());
+        let region_placeholders = placeholders(regions.len());
         let client_user_id = client_identity.0.ok_or_else(|| {
             AppError::Conflict("provisioning job has no authenticated client owner".into())
         })?;
@@ -10327,11 +10407,213 @@ mod tests {
                 "cleanup-client",
                 None,
                 Some("198.18.5.1"),
+                None,
             )
             .await
             .unwrap();
         assert!(!availability.available);
         assert_eq!(availability.reason.as_deref(), Some("previously_claimed"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn released_client_owner_can_reuse_the_tombstoned_subdomain() {
+        let (store, config, root) = test_store("released-owner-reclaim");
+        let host = add_provider_host(
+            &store,
+            "provider-reclaim",
+            "host@example.com",
+            "198.18.6.1",
+            "US",
+            None,
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            insert_installation(&conn, "released-installation", "client@example.com");
+            conn.execute(
+                "UPDATE installations
+                 SET provision_source = ?2, provision_host_id = ?3
+                 WHERE id = ?1",
+                params![
+                    "released-installation",
+                    PROVISION_SOURCE_ROUTER_MARKET,
+                    host.id
+                ],
+            )
+            .unwrap();
+            insert_tunnel_and_public_host(
+                &conn,
+                "released-installation",
+                "client@example.com",
+                "released-client",
+            );
+            conn.execute(
+                "UPDATE router_ssh_hosts
+                 SET status = 'allocated', installation_id = 'released-installation'
+                 WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, offer_revision,
+                     created_at, updated_at)
+                 VALUES ('released-installation', ?1, ?2, 'host@example.com',
+                         'client-owner', 'client@example.com', 'active', 1, ?3, ?3)",
+                params![host.id, host.provider_id.clone().unwrap(), now],
+            )
+            .unwrap();
+        }
+
+        let job_id = store
+            .client_market_begin_cleanup_job("released-installation", "host@example.com", false)
+            .await
+            .unwrap();
+        store
+            .purge_installation_for_client_market("released-installation")
+            .await
+            .unwrap();
+        store
+            .client_market_fail_cleanup_job(
+                &job_id,
+                &host.id,
+                "post_purge_crash",
+                "recover after purge",
+            )
+            .await
+            .unwrap();
+
+        let owner = market_session("client-owner", "client@example.com");
+        let stranger = market_session("other-owner", "other@example.com");
+        let owner_availability = store
+            .check_client_tunnel_subdomain_availability(
+                &config,
+                "released-client",
+                None,
+                Some("198.18.6.1"),
+                Some(&owner),
+            )
+            .await
+            .unwrap();
+        assert!(owner_availability.available);
+        let stranger_availability = store
+            .check_client_tunnel_subdomain_availability(
+                &config,
+                "released-client",
+                None,
+                Some("198.18.6.1"),
+                Some(&stranger),
+            )
+            .await
+            .unwrap();
+        assert!(!stranger_availability.available);
+        assert_eq!(
+            stranger_availability.reason.as_deref(),
+            Some("previously_claimed")
+        );
+
+        let stranger_create = store
+            .client_market_create_job(
+                "stranger-job",
+                JOB_TYPE_CREATE,
+                "other@example.com",
+                &["host@example.com".into()],
+                &["US".into()],
+                "released-client",
+                None,
+            )
+            .await
+            .expect_err("a different owner cannot reserve the tombstoned Client subdomain");
+        assert!(stranger_create.to_string().contains("already in use"));
+        store
+            .client_market_create_job(
+                "reclaim-job",
+                JOB_TYPE_CREATE,
+                "client@example.com",
+                &["host@example.com".into()],
+                &["US".into()],
+                "released-client",
+                None,
+            )
+            .await
+            .expect("original owner may reserve the released Client subdomain");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn host_usage_history_returns_recent_released_and_active_rentals() {
+        let (store, _config, root) = test_store("host-usage-history");
+        let host = add_provider_host(
+            &store,
+            "provider-history",
+            "host@example.com",
+            "198.18.7.1",
+            "US",
+            Some(500),
+        )
+        .await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_installation(&conn, "current-installation", "client@example.com");
+            insert_tunnel_and_public_host(
+                &conn,
+                "current-installation",
+                "client@example.com",
+                "current-client",
+            );
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     currency, offer_revision, activated_at, created_at, updated_at,
+                     client_subdomain)
+                 VALUES ('old-installation', ?1, 'provider-history', 'host@example.com',
+                         'client-owner', 'client@example.com', 'released', 500,
+                         'USD', 1, ?2, ?2, ?3, 'old-client')",
+                params![
+                    host.id,
+                    (now - chrono::Duration::days(3)).to_rfc3339(),
+                    (now - chrono::Duration::days(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     currency, offer_revision, activated_at, created_at, updated_at)
+                 VALUES ('current-installation', ?1, 'provider-history', 'host@example.com',
+                         'client-owner', 'client@example.com', 'active', 500,
+                         'USD', 1, ?2, ?2, ?2)",
+                params![host.id, now.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let history = store
+            .client_market_host_usage_history(&host.id)
+            .await
+            .expect("load Host usage history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].installation_id, "current-installation");
+        assert_eq!(
+            history[0].client_subdomain.as_deref(),
+            Some("current-client")
+        );
+        assert_eq!(history[0].status, "active");
+        assert!(history[0].ended_at.is_none());
+        assert_eq!(history[1].installation_id, "old-installation");
+        assert_eq!(history[1].client_subdomain.as_deref(), Some("old-client"));
+        assert_eq!(history[1].status, "released");
+        assert!(history[1].ended_at.is_some());
+
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

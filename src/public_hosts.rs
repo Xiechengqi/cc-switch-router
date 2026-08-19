@@ -114,6 +114,74 @@ pub fn claim(
     })
 }
 
+/// Bind a tombstoned Client label to a new installation.
+///
+/// Share labels stay permanently retired. Client Market release also tombstones
+/// the Client label; the original owner may reclaim that exact label after the
+/// old installation has been purged. Takeover-retired names stay blocked because
+/// their subject installation is still live.
+pub(crate) fn reclaim_tombstoned_client_label(
+    conn: &Connection,
+    input: NewPublicHost<'_>,
+) -> Result<PublicHostRecord, PublicHostCatalogError> {
+    validate_claim(&input)?;
+    if input.kind != PublicHostKind::Client {
+        return Err(PublicHostCatalogError::Invalid(
+            "only Client labels can be reclaimed from tombstone",
+        ));
+    }
+    let label = input.label.trim().to_ascii_lowercase();
+    let existing = get_by_label(conn, &label)?.ok_or_else(|| {
+        PublicHostCatalogError::Conflict(format!(
+            "label {label} has no Client tombstone to reclaim"
+        ))
+    })?;
+    if existing.kind != PublicHostKind::Client
+        || existing.lifecycle != PublicHostLifecycle::Tombstoned
+    {
+        return Err(PublicHostCatalogError::Conflict(format!(
+            "label {label} is already assigned to {} {} with lifecycle {}",
+            kind_str(existing.kind),
+            existing.subject_id,
+            existing.lifecycle.as_str(),
+        )));
+    }
+    if let Some(live) = get_live_by_subject(conn, input.kind, input.subject_id)? {
+        return Err(PublicHostCatalogError::Conflict(format!(
+            "{} {} already owns label {}",
+            kind_str(input.kind),
+            input.subject_id,
+            live.label
+        )));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let changed = conn.execute(
+        "UPDATE public_hosts
+         SET route_id = ?2, kind = ?3, subject_id = ?4, installation_id = ?5,
+             target_lane_id = ?6, lifecycle = 'active', revision = revision + 1,
+             updated_at = ?7
+         WHERE label = ?1 AND kind = 'client' AND lifecycle = 'tombstoned'",
+        params![
+            label,
+            input.route_id,
+            kind_str(input.kind),
+            input.subject_id,
+            input.installation_id,
+            input.target_lane_id,
+            now,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(PublicHostCatalogError::Conflict(format!(
+            "label {label} could not be reclaimed from tombstone"
+        )));
+    }
+    get_by_label(conn, &label)?.ok_or_else(|| {
+        PublicHostCatalogError::Corrupt("reclaimed Client host cannot be read back".into())
+    })
+}
+
 pub(crate) fn reconcile_share_claim_in_transaction(
     conn: &Connection,
     input: NewPublicHost<'_>,
@@ -688,6 +756,61 @@ mod tests {
             PublicHostLifecycle::Active
         );
         assert!(claim(&conn, client_claim(&old)).is_err());
+    }
+
+    #[test]
+    fn tombstoned_client_label_can_be_reclaimed_by_a_new_installation() {
+        let conn = database();
+        let label = "alpha-main".to_string();
+        claim(&conn, client_claim(&label)).unwrap();
+        assert!(tombstone_subject(&conn, PublicHostKind::Client, "installation-1").unwrap());
+        assert_eq!(
+            get_by_label(&conn, &label).unwrap().unwrap().lifecycle,
+            PublicHostLifecycle::Tombstoned
+        );
+
+        let reclaimed = reclaim_tombstoned_client_label(
+            &conn,
+            NewPublicHost {
+                label: &label,
+                route_id: "client:installation-2",
+                kind: PublicHostKind::Client,
+                subject_id: "installation-2",
+                installation_id: Some("installation-2"),
+                target_lane_id: "installation-2",
+            },
+        )
+        .unwrap();
+        assert_eq!(reclaimed.subject_id, "installation-2");
+        assert_eq!(reclaimed.lifecycle, PublicHostLifecycle::Active);
+        assert_eq!(
+            get_by_label(&conn, &label)
+                .unwrap()
+                .unwrap()
+                .installation_id
+                .as_deref(),
+            Some("installation-2")
+        );
+    }
+
+    #[test]
+    fn live_client_label_cannot_be_reclaimed() {
+        let conn = database();
+        let label = "alpha-main".to_string();
+        claim(&conn, client_claim(&label)).unwrap();
+        let error = reclaim_tombstoned_client_label(
+            &conn,
+            NewPublicHost {
+                label: &label,
+                route_id: "client:installation-2",
+                kind: PublicHostKind::Client,
+                subject_id: "installation-2",
+                installation_id: Some("installation-2"),
+                target_lane_id: "installation-2",
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PublicHostCatalogError::Conflict(_)));
     }
 
     #[test]

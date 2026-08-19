@@ -3,7 +3,7 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, toast } from "@heroui/react";
-import { Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, RefreshCw, ServerOff, Trash2 } from "lucide-react";
+import { ChevronDown, Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, RefreshCw, ServerOff, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -23,12 +23,18 @@ import { ReleaseRentalAction } from "@/components/dashboard/client-market/releas
 import {
   cleanupClientMarketProviderRental,
   deleteClientMarketHost,
+  getClientMarketHostUsageHistory,
   getClientMarketJob,
   reverifyClientMarketHost,
   retireUnreachableClientMarketHost,
 } from "@/lib/api";
 import { mergeHosts } from "@/lib/client-market-refresh";
-import type { ClientMarketHost, ClientMarketRental, ProvisioningJob } from "@/lib/types";
+import type {
+  ClientMarketHost,
+  ClientMarketHostUsageHistoryEntry,
+  ClientMarketRental,
+  ProvisioningJob,
+} from "@/lib/types";
 import {
   cleanupFailureGuidanceKey,
   cleanupPhaseLabelKey,
@@ -48,6 +54,7 @@ import {
   clientConnectionStateLabelKey,
   statusLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
+import { formatUsdMoney } from "@/lib/market-money";
 
 function HostRowImpl({
   host,
@@ -86,6 +93,10 @@ function HostRowImpl({
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
   const [hostKeyOpen, setHostKeyOpen] = React.useState(false);
+  const [historyOpen, setHistoryOpen] = React.useState(false);
+  const [historyLoading, setHistoryLoading] = React.useState(false);
+  const [historyError, setHistoryError] = React.useState("");
+  const [history, setHistory] = React.useState<ClientMarketHostUsageHistoryEntry[] | null>(null);
 
   React.useEffect(() => {
     const locked = offerOpen || hostKeyOpen || cleanupOpen || confirmAction != null || busy;
@@ -189,6 +200,73 @@ function HostRowImpl({
     }
   };
 
+  React.useEffect(() => {
+    if (!historyOpen) return;
+    const controller = new AbortController();
+    setHistoryLoading(true);
+    setHistoryError("");
+    void getClientMarketHostUsageHistory(host.id, controller.signal)
+      .then((entries) => {
+        if (!controller.signal.aborted) setHistory(entries);
+      })
+      .catch((reason) => {
+        if (!controller.signal.aborted) {
+          setHistoryError(reason instanceof Error ? reason.message : String(reason));
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setHistoryLoading(false);
+      });
+    return () => controller.abort();
+  }, [historyOpen, host.id]);
+
+  const rentalStatusLabelKey = (status: string) => {
+    switch (status) {
+      case "active":
+        return "account.client.status.active";
+      case "billing_suspended":
+        return "account.client.status.billingSuspended";
+      case "releasing":
+        return "account.client.status.releasing";
+      case "release_failed":
+        return "account.client.status.releaseFailed";
+      case "released":
+        return "account.client.status.released";
+      default:
+        return "account.client.status.unknown";
+    }
+  };
+
+  const formatHistoryTime = (value?: string) => {
+    if (!value) return t("clientMarket.usageHistory.ongoing");
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) return value;
+    return new Date(parsed).toLocaleString(locale);
+  };
+
+  const formatHistoryCharges = (entry: ClientMarketHostUsageHistoryEntry) => {
+    if (!entry.dailyRateMinor) {
+      return locale.startsWith("zh") ? "免费" : "Free";
+    }
+    const total = formatUsdMoney(entry.chargesMinor, locale);
+    const parts = [total];
+    if (entry.invoicedMinor > 0) {
+      parts.push(
+        t("clientMarket.usageHistory.invoiced", {
+          amount: formatUsdMoney(entry.invoicedMinor, locale),
+        }),
+      );
+    }
+    if (entry.unbilledMinor > 0) {
+      parts.push(
+        t("clientMarket.usageHistory.unbilled", {
+          amount: formatUsdMoney(entry.unbilledMinor, locale),
+        }),
+      );
+    }
+    return parts.join(" · ");
+  };
+
   const onRetireUnreachable = async () => {
     setConfirmAction(null);
     setBusy(true);
@@ -268,12 +346,15 @@ function HostRowImpl({
     <>
       <tr
         id={host.installationId ? `client-market-host-${host.installationId}` : undefined}
-        className={`border-b border-border/80 transition-colors hover:bg-muted/40 ${
+        className={`cursor-pointer border-b border-border/80 transition-colors hover:bg-muted/40 ${
           highlighted ? "bg-accent/[0.06] ring-2 ring-inset ring-accent/40" : ""
         }`}
+        onClick={() => setHistoryOpen((open) => !open)}
+        aria-expanded={historyOpen}
+        title={t(historyOpen ? "clientMarket.usageHistory.collapse" : "clientMarket.usageHistory.expand")}
       >
         {selectionMode ? (
-          <td className="w-10 px-2 py-2 align-middle">
+          <td className="w-10 px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
             <Checkbox
               isSelected={selected}
               onChange={(next) => onSelectedChange(host.id, next)}
@@ -352,7 +433,7 @@ function HostRowImpl({
               {formatHostOffer(host.dailyRateMinor, locale, host.freeDurationDays)}
             </span>
             {showRenterRental && rental ? (
-              <div className="mt-0.5 min-w-0">
+              <div className="mt-0.5 min-w-0" onClick={(event) => event.stopPropagation()}>
                 <ClientMarketRentalBanner
                   rental={rental}
                   onChanged={onChanged}
@@ -394,8 +475,14 @@ function HostRowImpl({
             <span className="text-xs text-muted-foreground/50">—</span>
           )}
         </td>
-        <td className="whitespace-nowrap px-2 py-2 align-middle">
+        <td className="whitespace-nowrap px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
+            <ChevronDown
+              className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${
+                historyOpen ? "rotate-180" : ""
+              }`}
+              aria-hidden
+            />
             {host.installationId ? (
               <span className="relative inline-flex" title={t("clientMarket.openGroupChat")}>
                 <Button
@@ -511,6 +598,59 @@ function HostRowImpl({
           </div>
         </td>
       </tr>
+      {historyOpen ? (
+        <tr className="border-b border-border/60 bg-muted/15">
+          <td colSpan={colSpan} className="px-3 py-2.5 align-top">
+            <div className="grid gap-2">
+              <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                {t("clientMarket.usageHistory.title")}
+              </div>
+              {historyLoading ? (
+                <p className="text-xs text-muted-foreground">{t("clientMarket.usageHistory.loading")}</p>
+              ) : historyError ? (
+                <p className="text-xs text-rose-600">{historyError || t("clientMarket.usageHistory.error")}</p>
+              ) : !history?.length ? (
+                <p className="text-xs text-muted-foreground">{t("clientMarket.usageHistory.empty")}</p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[42rem] border-collapse text-xs">
+                    <thead>
+                      <tr className="text-left text-[11px] text-muted-foreground">
+                        <th className="px-1.5 py-1 font-medium">{t("clientMarket.usageHistory.renter")}</th>
+                        <th className="px-1.5 py-1 font-medium">{t("clientMarket.usageHistory.subdomain")}</th>
+                        <th className="px-1.5 py-1 font-medium">{t("clientMarket.usageHistory.period")}</th>
+                        <th className="px-1.5 py-1 font-medium">{t("clientMarket.col.status")}</th>
+                        <th className="px-1.5 py-1 text-right font-medium">{t("clientMarket.usageHistory.charges")}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {history.map((entry) => (
+                        <tr key={`${entry.installationId}:${entry.startedAt}`} className="border-t border-border/50">
+                          <td className="max-w-[12rem] truncate px-1.5 py-1.5" title={entry.clientOwnerEmail}>
+                            {entry.clientOwnerEmail}
+                          </td>
+                          <td className="max-w-[10rem] truncate px-1.5 py-1.5 font-mono" title={entry.clientSubdomain || undefined}>
+                            {entry.clientSubdomain || "—"}
+                          </td>
+                          <td className="px-1.5 py-1.5 text-muted-foreground">
+                            {formatHistoryTime(entry.startedAt)}
+                            {" → "}
+                            {formatHistoryTime(entry.endedAt)}
+                          </td>
+                          <td className="px-1.5 py-1.5">{t(rentalStatusLabelKey(entry.status))}</td>
+                          <td className="px-1.5 py-1.5 text-right font-medium">
+                            {formatHistoryCharges(entry)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </td>
+        </tr>
+      ) : null}
       {showSubrow ? (
         <tr className="border-b border-border/60 bg-muted/20">
           <td colSpan={colSpan} className="px-2 py-1.5 align-middle">

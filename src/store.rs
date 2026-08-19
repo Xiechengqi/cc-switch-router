@@ -6282,6 +6282,7 @@ impl AppStore {
         subdomain: &str,
         installation_id: Option<&str>,
         source_ip: Option<&str>,
+        session: Option<&AuthSession>,
     ) -> Result<SubdomainAvailabilityResponse, AppError> {
         let subdomain = normalize_subdomain(subdomain)?;
         normalize_client_subdomain(&subdomain)
@@ -6316,10 +6317,29 @@ impl AppStore {
                 reason: Some("already_claimed".into()),
             });
         }
-        if crate::public_hosts::get_by_label(&conn, &subdomain)
-            .map_err(map_public_host_error)?
-            .is_some()
+        if let Some(existing) =
+            crate::public_hosts::get_by_label(&conn, &subdomain).map_err(map_public_host_error)?
         {
+            let reclaimable = match session {
+                Some(session) => {
+                    crate::client_market::client_market_owner_can_reclaim_tombstoned_label(
+                        &conn,
+                        &subdomain,
+                        &session.email,
+                        Some(&session.user_id),
+                    )?
+                }
+                None => false,
+            };
+            if existing.kind == PublicHostKind::Client
+                && existing.lifecycle == crate::public_hosts::PublicHostLifecycle::Tombstoned
+                && reclaimable
+            {
+                return Ok(SubdomainAvailabilityResponse {
+                    available: true,
+                    reason: None,
+                });
+            }
             return Ok(SubdomainAvailabilityResponse {
                 available: false,
                 reason: Some("previously_claimed".into()),
@@ -6437,18 +6457,25 @@ impl AppStore {
                 &owner_email,
                 metadata.ip.as_deref(),
             )?;
-            crate::public_hosts::claim(
+            let host_claim = crate::public_hosts::NewPublicHost {
+                label: &subdomain,
+                route_id: &format!("client:{installation_id}"),
+                kind: PublicHostKind::Client,
+                subject_id: &installation_id,
+                installation_id: Some(&installation_id),
+                target_lane_id: &installation_id,
+            };
+            if crate::client_market::client_market_owner_can_reclaim_tombstoned_label(
                 &tx,
-                crate::public_hosts::NewPublicHost {
-                    label: &subdomain,
-                    route_id: &format!("client:{installation_id}"),
-                    kind: PublicHostKind::Client,
-                    subject_id: &installation_id,
-                    installation_id: Some(&installation_id),
-                    target_lane_id: &installation_id,
-                },
-            )
-            .map_err(map_public_host_error)?;
+                &subdomain,
+                &owner_email,
+                None,
+            )? {
+                crate::public_hosts::reclaim_tombstoned_client_label(&tx, host_claim)
+                    .map_err(map_public_host_error)?;
+            } else {
+                crate::public_hosts::claim(&tx, host_claim).map_err(map_public_host_error)?;
+            }
             crate::public_hosts::set_lifecycle(
                 &tx,
                 &subdomain,
@@ -6477,6 +6504,10 @@ impl AppStore {
             ],
             )
             .map_err(map_client_tunnel_constraint_error)?;
+            crate::client_market_trade::persist_subscription_client_subdomain_tx(
+                &tx,
+                &installation_id,
+            )?;
             if action == "client_tunnel_claim" && signed_payload.enabled {
                 insert_legacy_setup_fallback_tx(
                     &tx,
@@ -34244,6 +34275,74 @@ mod tests {
         assert_eq!(stored.subdomain, "client-alpha");
         assert!(!stored.enabled);
         drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn released_client_owner_can_reclaim_tombstoned_subdomain_on_claim() {
+        let (store, config) = setup_store("released-client-reclaim-claim").await;
+        let old_installation = "inst-released-old";
+        let new_installation = "inst-released-new";
+        let signing_key = insert_signed_installation(&store, old_installation).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            old_installation,
+            "released-alpha",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, offer_revision,
+                     created_at, updated_at, released_at)
+                 VALUES (?1, 'host-released', 'provider-released', 'host@example.com',
+                         'owner-id', 'owner@example.com', 'released', 1, ?2, ?2, ?2)",
+                params![old_installation, now],
+            )
+            .expect("insert released subscription");
+        }
+        {
+            let conn = store.conn.lock().await;
+            crate::public_hosts::tombstone_subject(&conn, PublicHostKind::Client, old_installation)
+                .expect("tombstone released Client label");
+            conn.execute(
+                "DELETE FROM installation_client_tunnels WHERE installation_id = ?1",
+                params![old_installation],
+            )
+            .expect("delete released Client tunnel");
+            conn.execute(
+                "DELETE FROM installations WHERE id = ?1",
+                params![old_installation],
+            )
+            .expect("delete released installation");
+        }
+
+        let new_key = insert_signed_installation(&store, new_installation).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &new_key,
+            new_installation,
+            "released-alpha",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            let host = crate::public_hosts::get_by_label(&conn, "released-alpha")
+                .expect("read reclaimed host")
+                .expect("reclaimed host exists");
+            assert_eq!(host.subject_id, new_installation);
+            assert_eq!(
+                host.lifecycle,
+                crate::public_hosts::PublicHostLifecycle::Active
+            );
+        }
+
         let _ = std::fs::remove_file(&config.database.path);
     }
 

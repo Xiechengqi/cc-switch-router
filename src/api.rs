@@ -1313,6 +1313,7 @@ async fn check_client_tunnel_subdomain_availability(
     Query(query): Query<SubdomainAvailabilityQuery>,
 ) -> Result<Json<SubdomainAvailabilityResponse>, AppError> {
     let metadata = extract_client_metadata(&headers, addr);
+    let session = resolve_router_session(&state, &headers).await?;
     Ok(Json(
         state
             .store
@@ -1321,6 +1322,7 @@ async fn check_client_tunnel_subdomain_availability(
                 &query.subdomain,
                 query.installation_id.as_deref(),
                 metadata.ip.as_deref(),
+                session.as_ref(),
             )
             .await?,
     ))

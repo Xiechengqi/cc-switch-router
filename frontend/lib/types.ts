@@ -2081,6 +2081,20 @@ export type ClientMarketRental = {
   updatedAt: string;
 };
 
+export type ClientMarketHostUsageHistoryEntry = {
+  installationId: string;
+  clientOwnerEmail: string;
+  clientSubdomain?: string;
+  status: string;
+  startedAt: string;
+  endedAt?: string;
+  dailyRateMinor?: number;
+  currency?: string;
+  chargesMinor: number;
+  unbilledMinor: number;
+  invoicedMinor: number;
+};
+
 export type ClientMarketHostTransferDocument = {
   version: number;
   exportedAt?: string;

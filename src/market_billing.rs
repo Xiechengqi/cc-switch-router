@@ -472,6 +472,10 @@ fn clean_optional(
     Ok(value)
 }
 
+pub(crate) fn ceil_minor_units(amount_units: i64) -> i64 {
+    ceil_minor(amount_units)
+}
+
 fn ceil_minor(amount_units: i64) -> i64 {
     if amount_units <= 0 {
         0

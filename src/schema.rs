@@ -82,6 +82,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         21,
         include_str!("../schema/0021_physically_retire_legacy_token_market.sql"),
     ),
+    (
+        22,
+        include_str!("../schema/0022_client_market_subscription_subdomain.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

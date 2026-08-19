@@ -283,6 +283,28 @@ pub struct RentalView {
     pub updated_at: String,
 }
 
+const HOST_USAGE_HISTORY_LIMIT: i64 = 10;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUsageHistoryEntry {
+    pub installation_id: String,
+    pub client_owner_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_subdomain: Option<String>,
+    pub status: String,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_rate_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    pub charges_minor: i64,
+    pub unbilled_minor: i64,
+    pub invoiced_minor: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateProviderTerminalAuthorizationRequest {
@@ -329,6 +351,10 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/client-market/quotes/:id/commit", post(commit_quote))
         .route("/v1/client-market/batches/:id", get(get_client_batch))
         .route("/v1/client-market/my-rentals", get(list_my_rentals))
+        .route(
+            "/v1/client-market/hosts/:id/usage-history",
+            get(list_host_usage_history),
+        )
         .route("/v1/client-market/clients", post(commit_client_batch))
         .route(
             "/v1/client-market/clients/:installation_id/rental",
@@ -1380,6 +1406,15 @@ async fn list_my_rentals(
             .store
             .client_market_list_rentals_for_viewer(&session)
             .await?,
+    ))
+}
+
+async fn list_host_usage_history(
+    State(state): State<ServerState>,
+    AxumPath(host_id): AxumPath<String>,
+) -> Result<Json<Vec<HostUsageHistoryEntry>>, AppError> {
+    Ok(Json(
+        state.store.client_market_host_usage_history(&host_id).await?,
     ))
 }
 
@@ -2904,19 +2939,26 @@ impl AppStore {
                     "quote items and subdomains must be unique".into(),
                 ));
             }
-            let unavailable: i64 = tx
+            let reserved: i64 = tx
                 .query_row(
-                    "SELECT
-                       EXISTS(SELECT 1 FROM public_hosts WHERE label = ?1 COLLATE NOCASE)
-                       OR EXISTS(SELECT 1 FROM subdomain_reservations
+                    "SELECT EXISTS(SELECT 1 FROM subdomain_reservations
                                  WHERE subdomain = ?1 COLLATE NOCASE AND expires_at_ms > ?2)",
                     params![subdomain, now.timestamp_millis()],
                     |row| row.get(0),
                 )
                 .map_err(|error| {
-                    AppError::Internal(format!("check quoted subdomain failed: {error}"))
+                    AppError::Internal(format!(
+                        "check quoted subdomain reservation failed: {error}"
+                    ))
                 })?;
-            if unavailable != 0 {
+            if reserved != 0
+                || crate::client_market::client_market_label_blocks_new_client(
+                    &tx,
+                    subdomain,
+                    &session.email,
+                    Some(&session.user_id),
+                )?
+            {
                 return Err(AppError::Conflict(format!(
                     "subdomain {subdomain} is already in use"
                 )));
@@ -3291,6 +3333,127 @@ impl AppStore {
     ) -> Result<Vec<RentalView>, AppError> {
         let conn = self.conn.lock().await;
         load_rental_views(&conn, None, session)
+    }
+
+    pub async fn client_market_host_usage_history(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<HostUsageHistoryEntry>, AppError> {
+        let conn = self.conn.lock().await;
+        let host_exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM router_ssh_hosts WHERE id = ?1",
+                params![host_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read Host for usage history failed: {error}"))
+            })?;
+        if host_exists.is_none() {
+            return Err(AppError::NotFound("host not found".into()));
+        }
+        let mut statement = conn
+            .prepare(
+                "SELECT s.installation_id, s.client_owner_email, s.status,
+                        COALESCE(NULLIF(TRIM(s.client_subdomain), ''),
+                                 (SELECT t.subdomain FROM installation_client_tunnels t
+                                  WHERE t.installation_id = s.installation_id),
+                                 (SELECT p.label FROM public_hosts p
+                                  WHERE p.kind = 'client' AND p.subject_id = s.installation_id
+                                  ORDER BY p.updated_at DESC LIMIT 1)),
+                        COALESCE(s.activated_at, s.created_at),
+                        CASE
+                            WHEN s.status = 'released' THEN COALESCE(s.released_at, s.updated_at)
+                            ELSE NULL
+                        END,
+                        s.daily_rate_minor, s.currency,
+                        COALESCE((
+                            SELECT SUM(accrual.amount_units)
+                            FROM market_service_contracts contract
+                            JOIN market_accrual_entries accrual
+                              ON accrual.contract_id = contract.id
+                            WHERE contract.product_kind = 'client_host'
+                              AND contract.service_ref = s.installation_id
+                        ), 0),
+                        COALESCE((
+                            SELECT SUM(accrual.amount_units)
+                            FROM market_service_contracts contract
+                            JOIN market_accrual_entries accrual
+                              ON accrual.contract_id = contract.id
+                            WHERE contract.product_kind = 'client_host'
+                              AND contract.service_ref = s.installation_id
+                              AND accrual.status = 'unbilled'
+                        ), 0),
+                        COALESCE((
+                            SELECT SUM(line.amount_minor)
+                            FROM market_invoice_lines line
+                            WHERE line.product_kind = 'client_host'
+                              AND line.service_ref = s.installation_id
+                        ), 0)
+                 FROM client_market_subscriptions s
+                 WHERE s.host_id = ?1
+                 ORDER BY COALESCE(s.activated_at, s.created_at) DESC, s.installation_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare Host usage history failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![host_id, HOST_USAGE_HISTORY_LIMIT], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query Host usage history failed: {error}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                AppError::Internal(format!("read Host usage history failed: {error}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    installation_id,
+                    client_owner_email,
+                    status,
+                    client_subdomain,
+                    started_at,
+                    ended_at,
+                    daily_rate_minor,
+                    currency,
+                    charge_units,
+                    unbilled_units,
+                    invoiced_minor,
+                )| HostUsageHistoryEntry {
+                    installation_id,
+                    client_owner_email,
+                    client_subdomain: client_subdomain
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    status,
+                    started_at,
+                    ended_at,
+                    daily_rate_minor,
+                    currency,
+                    charges_minor: crate::market_billing::ceil_minor_units(charge_units),
+                    unbilled_minor: crate::market_billing::ceil_minor_units(unbilled_units),
+                    invoiced_minor,
+                },
+            )
+            .collect())
     }
 
     pub async fn client_market_grant_provider_terminal_authorization(
@@ -4341,6 +4504,28 @@ fn client_label_tx(tx: &Transaction<'_>, installation_id: &str) -> Result<String
         .unwrap_or_else(|| installation_id.to_string()))
 }
 
+pub(crate) fn persist_subscription_client_subdomain_tx(
+    tx: &Transaction<'_>,
+    installation_id: &str,
+) -> Result<(), AppError> {
+    let subdomain = client_label_tx(tx, installation_id)?;
+    if subdomain == installation_id {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE client_market_subscriptions
+         SET client_subdomain = COALESCE(NULLIF(TRIM(client_subdomain), ''), ?2)
+         WHERE installation_id = ?1",
+        params![installation_id, subdomain],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "persist Client subscription subdomain failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 pub(crate) fn complete_provisioning_tx(
     tx: &Transaction<'_>,
     job_id: &str,
@@ -4468,6 +4653,7 @@ pub(crate) fn complete_provisioning_tx(
     .map_err(|error| {
         AppError::Internal(format!("create Client Market subscription failed: {error}"))
     })?;
+    persist_subscription_client_subdomain_tx(tx, installation_id)?;
     let label = client_label_tx(tx, installation_id)?;
     if let Some(daily_rate_minor) = price {
         let currency = currency
@@ -4600,6 +4786,7 @@ pub(crate) fn cleanup_started_tx(
             )?;
         }
     }
+    persist_subscription_client_subdomain_tx(tx, installation_id)?;
     tx.execute(
         "UPDATE installation_client_tunnels SET enabled = 0, updated_at = ?2
          WHERE installation_id = ?1",

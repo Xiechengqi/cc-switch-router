@@ -68,6 +68,7 @@ import type {
   ClientMarketCommitQuoteResponse,
   ClientMarketBatch,
   ClientMarketRental,
+  ClientMarketHostUsageHistoryEntry,
   ClientMarketHostTransferDocument,
   ClientMarketHostImportResponse,
   ShareMarketCatalog,
@@ -1377,6 +1378,18 @@ export async function cancelClientMarketQuote(quoteId: string) {
 export async function getMyClientMarketRentals(signal?: AbortSignal) {
   return parseJson<ClientMarketRental[]>(
     await authFetch("/v1/client-market/my-rentals", { cache: "no-store", signal }),
+  );
+}
+
+export async function getClientMarketHostUsageHistory(
+  hostId: string,
+  signal?: AbortSignal,
+) {
+  return parseJson<ClientMarketHostUsageHistoryEntry[]>(
+    await authFetch(
+      `/v1/client-market/hosts/${encodeURIComponent(hostId)}/usage-history`,
+      { cache: "no-store", signal },
+    ),
   );
 }
 
