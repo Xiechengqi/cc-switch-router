@@ -98,6 +98,7 @@ export function ShareUserGrantsEditor({
   const normalizedOwner = ownerEmail.trim().toLowerCase();
   const [editingEmail, setEditingEmail] = React.useState<string | null>(null);
   const [grantDraft, setGrantDraft] = React.useState<GrantDraft | null>(null);
+  const [selecting, setSelecting] = React.useState(false);
   const [selectedEmails, setSelectedEmails] = React.useState<Set<string>>(new Set());
   const [batchDraft, setBatchDraft] = React.useState<BatchGrantDraft | null>(null);
   const [error, setError] = React.useState("");
@@ -174,7 +175,16 @@ export function ShareUserGrantsEditor({
     setGrantDraft(makeDraft(grant.email, grant.policy));
   };
 
+  const exitSelecting = () => {
+    setSelecting(false);
+    setSelectedEmails(new Set());
+  };
+
   const openBatchEdit = () => {
+    if (!selecting) {
+      setSelecting(true);
+      return;
+    }
     const firstSelected = grants.find((grant) => selectedEditableEmails.has(grant.email));
     if (!firstSelected) return;
     setError("");
@@ -310,6 +320,7 @@ export function ShareUserGrantsEditor({
     setSelectedEmails(new Set());
     setBatchDraft(null);
     setError("");
+    setSelecting(false);
   };
 
   const limit = (value?: number) =>
@@ -319,36 +330,43 @@ export function ShareUserGrantsEditor({
 
   return (
     <div className="grid gap-3">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="flex items-center gap-1">
-            <div className="mono-label text-muted-foreground">{t("dashboard.userLimit.title")}</div>
-            <Tooltip>
-              <Tooltip.Trigger>
-                <Button
-                  isIconOnly
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 w-6 min-w-6 text-muted-foreground"
-                  aria-label={t("dashboard.userLimit.parallelScopeHint")}
-                >
-                  <Info className="h-3.5 w-3.5" />
-                </Button>
-              </Tooltip.Trigger>
-              <Tooltip.Content>{t("dashboard.userLimit.parallelScopeHint")}</Tooltip.Content>
-            </Tooltip>
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.userLimit.hint")}</p>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-1">
+          <div className="mono-label text-muted-foreground">{t("dashboard.userLimit.title")}</div>
+          <Tooltip>
+            <Tooltip.Trigger>
+              <Button
+                isIconOnly
+                size="sm"
+                variant="ghost"
+                className="h-6 w-6 min-w-6 text-muted-foreground"
+                aria-label={t("dashboard.userLimit.parallelScopeHint")}
+              >
+                <Info className="h-3.5 w-3.5" />
+              </Button>
+            </Tooltip.Trigger>
+            <Tooltip.Content>{t("dashboard.userLimit.parallelScopeHint")}</Tooltip.Content>
+          </Tooltip>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
+          {selecting ? (
+            <Button size="sm" variant="ghost" onClick={exitSelecting}>
+              {t("common.cancel")}
+            </Button>
+          ) : null}
           <Button
             size="sm"
             variant="outline"
-            isDisabled={selectedEditableEmails.size === 0}
+            isDisabled={
+              selectableEmails.length === 0 ||
+              (selecting && selectedEditableEmails.size === 0)
+            }
             onClick={openBatchEdit}
           >
             <Pencil className="h-4 w-4" />
-            {t("dashboard.userLimit.batchEdit", { count: selectedEditableEmails.size })}
+            {selecting
+              ? t("dashboard.userLimit.batchEditSelected", { count: selectedEditableEmails.size })
+              : t("dashboard.userLimit.batchEdit")}
           </Button>
           <Button size="sm" variant="outline" onClick={openAdd}>
             <Plus className="h-4 w-4" />
@@ -358,25 +376,27 @@ export function ShareUserGrantsEditor({
       </div>
 
       <div className="overflow-x-auto rounded-md border border-slate-200">
-        <table className="w-full min-w-[760px] text-left text-sm">
+        <table className={`w-full text-left text-sm ${selecting ? "min-w-[800px]" : "min-w-[720px]"}`}>
           <thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
             <tr>
-              <th className="w-10 px-3 py-2">
-                <Checkbox
-                  isSelected={allSelected}
-                  isIndeterminate={someSelected && !allSelected}
-                  isDisabled={!selectableEmails.length}
-                  onChange={(checked) =>
-                    setSelectedEmails(new Set(checked ? selectableEmails : []))
-                  }
-                  aria-label={t("dashboard.userLimit.selectAll")}
-                  className="shrink-0"
-                >
-                  <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
-                    <Checkbox.Indicator />
-                  </Checkbox.Control>
-                </Checkbox>
-              </th>
+              {selecting ? (
+                <th className="w-10 px-3 py-2">
+                  <Checkbox
+                    isSelected={allSelected}
+                    isIndeterminate={someSelected && !allSelected}
+                    isDisabled={!selectableEmails.length}
+                    onChange={(checked) =>
+                      setSelectedEmails(new Set(checked ? selectableEmails : []))
+                    }
+                    aria-label={t("dashboard.userLimit.selectAll")}
+                    className="shrink-0"
+                  >
+                    <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
+                      <Checkbox.Indicator />
+                    </Checkbox.Control>
+                  </Checkbox>
+                </th>
+              ) : null}
               <th className="px-3 py-2 font-medium">Email</th>
               <th className="px-3 py-2 font-medium">{t("dashboard.field.parallelLimit")}</th>
               <th className="px-3 py-2 font-medium">Token</th>
@@ -387,26 +407,28 @@ export function ShareUserGrantsEditor({
           <tbody className="divide-y divide-slate-100">
             {grants.map((grant) => (
               <tr key={grant.email}>
-                <td className="w-10 px-3 py-2">
-                  <Checkbox
-                    isSelected={selectedEmails.has(grant.email)}
-                    isDisabled={protectedEmails.has(grant.email)}
-                    onChange={(checked) => {
-                      setSelectedEmails((current) => {
-                        const next = new Set(current);
-                        if (checked) next.add(grant.email);
-                        else next.delete(grant.email);
-                        return next;
-                      });
-                    }}
-                    aria-label={t("dashboard.userLimit.selectUser", { email: grant.email })}
-                    className="shrink-0"
-                  >
-                    <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
-                      <Checkbox.Indicator />
-                    </Checkbox.Control>
-                  </Checkbox>
-                </td>
+                {selecting ? (
+                  <td className="w-10 px-3 py-2">
+                    <Checkbox
+                      isSelected={selectedEmails.has(grant.email)}
+                      isDisabled={protectedEmails.has(grant.email)}
+                      onChange={(checked) => {
+                        setSelectedEmails((current) => {
+                          const next = new Set(current);
+                          if (checked) next.add(grant.email);
+                          else next.delete(grant.email);
+                          return next;
+                        });
+                      }}
+                      aria-label={t("dashboard.userLimit.selectUser", { email: grant.email })}
+                      className="shrink-0"
+                    >
+                      <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
+                        <Checkbox.Indicator />
+                      </Checkbox.Control>
+                    </Checkbox>
+                  </td>
+                ) : null}
                 <td className="px-3 py-2">
                   <div className="flex items-center gap-2">
                     <span className="max-w-[250px] truncate">{grant.email}</span>

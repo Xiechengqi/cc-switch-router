@@ -164,10 +164,7 @@ export function ShareEditReadView({
               />
             </div>
             <div className="grid gap-2 border-t border-slate-200 pt-3">
-              <div>
-                <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
-                <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.userLimit.hint")}</p>
-              </div>
+              <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
               {limitLoading ? (
                 <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock>
               ) : limitError ? (

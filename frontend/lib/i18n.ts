@@ -2537,11 +2537,12 @@ export const messages = {
       "Add private Share users here and configure their quotas. In public-free mode, listed users receive quota overrides rather than exclusive access.",
     "dashboard.userLimit.parallelScopeHint":
       "A user's parallel limit is shared across Claude, Codex, and Gemini requests within this Share.",
-    "dashboard.userLimit.add": "Add authorized user",
+    "dashboard.userLimit.add": "Add user",
     "dashboard.userLimit.edit": "Edit user authorization & quotas",
     "dashboard.userLimit.selectAll": "Select all editable users",
     "dashboard.userLimit.selectUser": "Select {email}",
-    "dashboard.userLimit.batchEdit": "Batch edit ({count})",
+    "dashboard.userLimit.batchEdit": "Batch edit",
+    "dashboard.userLimit.batchEditSelected": "Edit selected ({count})",
     "dashboard.userLimit.batchTitle": "Batch edit user limits",
     "dashboard.userLimit.batchHint":
       "{count} users selected. Only checked parameters are overwritten; all other parameters stay unchanged. Blank limits mean unlimited, and a blank expiration means permanent.",
@@ -5094,11 +5095,12 @@ export const messages = {
       "在这里添加私有 Share 的授权用户并配置配额。公开免费模式下，列表中的用户是个人配额覆盖，不是准入名单。",
     "dashboard.userLimit.parallelScopeHint":
       "同一 Share 内，用户并发限制由 Claude、Codex 和 Gemini 请求共同占用。",
-    "dashboard.userLimit.add": "添加授权用户",
+    "dashboard.userLimit.add": "添加用户",
     "dashboard.userLimit.edit": "编辑用户授权与配额",
     "dashboard.userLimit.selectAll": "选择全部可编辑用户",
     "dashboard.userLimit.selectUser": "选择 {email}",
-    "dashboard.userLimit.batchEdit": "批量编辑（{count}）",
+    "dashboard.userLimit.batchEdit": "批量编辑",
+    "dashboard.userLimit.batchEditSelected": "编辑已选（{count}）",
     "dashboard.userLimit.batchTitle": "批量编辑用户限制",
     "dashboard.userLimit.batchHint":
       "已选择 {count} 个用户。仅覆盖勾选的参数，其他参数保持不变；空限额表示无限，空到期时间表示永久。",
