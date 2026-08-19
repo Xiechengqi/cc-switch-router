@@ -139,43 +139,15 @@ export const ShareCard = React.memo(function ShareCard({
   const modelPolicyEntries = apps.flatMap((entryApp) => {
     const entryRuntime = resolveShareAppRuntime(share, entryApp);
     if (!entryRuntime) return [];
-    const policy = entryRuntime.modelPolicy;
     const text = providerActualModelNames(
       entryRuntime,
       t("dashboard.modelPolicyPassthrough"),
     );
-    const signature =
-      policy?.mode === "single"
-        ? `single:${policy.upstreamModel}`
-        : policy?.mode || `legacy:${text}`;
-    return [{ app: entryApp, runtime: entryRuntime, text, signature }];
+    return [{ app: entryApp, runtime: entryRuntime, text }];
   });
-  const modelPolicyScope = modelPolicyEntries.find(
-    (entry) => entry.runtime.modelPolicyScope,
-  )?.runtime.modelPolicyScope;
-  const bundleGlobalModels = modelPolicyEntries.filter(
-    (entry) => entry.runtime.modelPolicySource === "bundle_global",
-  );
-  const globalModelsConsistent =
-    new Set(bundleGlobalModels.map((entry) => entry.signature)).size <= 1;
-  const modelPolicySummary =
-    modelPolicyScope === "global" &&
-    bundleGlobalModels.length &&
-    globalModelsConsistent
-      ? [
-          `${t("dashboard.modelScopeGlobal")}: ${bundleGlobalModels[0]?.text}`,
-          ...modelPolicyEntries
-            .filter(
-              (entry) => entry.runtime.modelPolicySource === "profile_fixed",
-            )
-            .map(
-              (entry) =>
-                `${SHARE_APP_LABELS[entry.app]}: ${entry.text}`,
-            ),
-        ].join(" · ")
-      : modelPolicyEntries
-          .map((entry) => `${SHARE_APP_LABELS[entry.app]}: ${entry.text}`)
-          .join(" · ");
+  const modelPolicySummary = modelPolicyEntries
+    .map((entry) => `${SHARE_APP_LABELS[entry.app]}: ${entry.text}`)
+    .join(" · ");
   const providerEnabled = app ? !!share.support?.[app] : !!runtime;
   const quotaStatusLine =
     providerEnabled && runtime ? providerQuotaStatusLine(runtime, locale) : "-";

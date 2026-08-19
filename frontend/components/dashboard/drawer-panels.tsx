@@ -35,7 +35,7 @@ import {
 } from "@/lib/utils";
 import {
   resolveShareCoreApp,
-  shareAccessApps,
+  shareEnabledApps,
   SHARE_APP_LABELS,
 } from "@/lib/share-app";
 import {
@@ -689,52 +689,14 @@ export function ProviderCard({
   const apps = supportedApps?.length
     ? supportedApps
     : normalizeProviderApps(provider);
-  const policySignature = (value: ShareUpstreamProvider | undefined) => {
-    if (value?.modelPolicy?.mode === "single") {
-      return `single:${value.modelPolicy.upstreamModel}`;
-    }
-    if (value?.modelPolicy?.mode === "passthrough") return "passthrough";
-    return `legacy:${providerModelMap(value)}`;
-  };
-  const policyText = (value: ShareUpstreamProvider | undefined) => {
-    return providerModelMap(
-      value,
+  const modelLines = entries.map((entry) => ({
+    key: entry.app,
+    label: SHARE_APP_LABELS[entry.app],
+    text: providerModelMap(
+      entry.runtime,
       t("dashboard.modelPolicyPassthrough"),
-    );
-  };
-  const explicitScope = entries.find((entry) => entry.runtime?.modelPolicyScope)
-    ?.runtime?.modelPolicyScope;
-  const bundleGlobalEntries = entries.filter(
-    (entry) => entry.runtime?.modelPolicySource === "bundle_global",
-  );
-  const globalPolicyConsistent =
-    new Set(bundleGlobalEntries.map((entry) => policySignature(entry.runtime)))
-      .size <= 1;
-  const modelLines =
-    explicitScope === "global" &&
-    bundleGlobalEntries.length &&
-    globalPolicyConsistent
-      ? [
-          {
-            key: "global",
-            label: t("dashboard.modelScopeGlobal"),
-            text: policyText(bundleGlobalEntries[0]?.runtime),
-          },
-          ...entries
-            .filter(
-              (entry) => entry.runtime?.modelPolicySource === "profile_fixed",
-            )
-            .map((entry) => ({
-              key: entry.app,
-              label: SHARE_APP_LABELS[entry.app],
-              text: policyText(entry.runtime),
-            })),
-        ]
-      : entries.map((entry) => ({
-          key: entry.app,
-          label: SHARE_APP_LABELS[entry.app],
-          text: policyText(entry.runtime),
-        }));
+    ),
+  }));
   return (
     <div className="rounded-lg border bg-background p-3">
       <div className="flex items-start justify-between gap-3">
@@ -784,7 +746,7 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const runtimes = share?.appRuntimes;
   const currentProviders = React.useMemo(() => {
     if (!share) return [];
-    const entries = shareAccessApps(share).flatMap((app) => {
+    const entries = shareEnabledApps(share).flatMap((app) => {
       const providers = share.appProviders?.[app] || [];
       const boundProviderId = boundProviderIdForApp(share, app);
       const provider =
@@ -802,6 +764,9 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
       ) : (
         <div className="grid gap-2">
           {currentProviders.map((item) => {
+            const enabledApps = PROVIDER_APPS.map(({ key }) => key).filter(
+              (app): app is CoreShareApp => Boolean(item.providers[app]),
+            );
             return (
               <ProviderCard
                 key={item.key}
@@ -809,7 +774,7 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
                 appRuntimes={runtimes}
                 t={t}
                 locale={locale}
-                supportedApps={item.supportedApps}
+                supportedApps={enabledApps}
               />
             );
           })}
