@@ -3393,7 +3393,9 @@ impl AppStore {
                         ), 0)
                  FROM client_market_subscriptions s
                  WHERE s.host_id = ?1
-                 ORDER BY COALESCE(s.activated_at, s.created_at) DESC, s.installation_id DESC
+                 ORDER BY datetime(COALESCE(s.activated_at, s.created_at)) DESC,
+                          datetime(COALESCE(s.released_at, s.updated_at)) DESC,
+                          s.installation_id DESC
                  LIMIT ?2",
             )
             .map_err(|error| {

@@ -97,6 +97,7 @@ function HostRowImpl({
   const [historyLoading, setHistoryLoading] = React.useState(false);
   const [historyError, setHistoryError] = React.useState("");
   const [history, setHistory] = React.useState<ClientMarketHostUsageHistoryEntry[] | null>(null);
+  const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
 
   React.useEffect(() => {
     const locked = offerOpen || hostKeyOpen || cleanupOpen || confirmAction != null || busy;
@@ -244,6 +245,21 @@ function HostRowImpl({
     return new Date(parsed).toLocaleString(locale);
   };
 
+  const historyTime = (value?: string) => {
+    if (!value) return Number.NEGATIVE_INFINITY;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+  };
+
+  const sortedHistory = React.useMemo(() => {
+    if (!history?.length) return history;
+    return [...history].sort((left, right) => {
+      const byStart = historyTime(right.startedAt) - historyTime(left.startedAt);
+      if (byStart !== 0) return byStart;
+      return historyTime(right.endedAt) - historyTime(left.endedAt);
+    });
+  }, [history]);
+
   const formatHistoryCharges = (entry: ClientMarketHostUsageHistoryEntry) => {
     if (!entry.dailyRateMinor) {
       return locale.startsWith("zh") ? "免费" : "Free";
@@ -349,7 +365,20 @@ function HostRowImpl({
         className={`cursor-pointer border-b border-border/80 transition-colors hover:bg-muted/40 ${
           highlighted ? "bg-accent/[0.06] ring-2 ring-inset ring-accent/40" : ""
         }`}
-        onClick={() => setHistoryOpen((open) => !open)}
+        onPointerDown={(event) => {
+          pointerDownRef.current = { x: event.clientX, y: event.clientY };
+        }}
+        onClick={(event) => {
+          const start = pointerDownRef.current;
+          pointerDownRef.current = null;
+          if (start) {
+            const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y);
+            if (moved > 5) return;
+          }
+          const selection = window.getSelection();
+          if (selection && !selection.isCollapsed && selection.toString().trim()) return;
+          setHistoryOpen((open) => !open);
+        }}
         aria-expanded={historyOpen}
         title={t(historyOpen ? "clientMarket.usageHistory.collapse" : "clientMarket.usageHistory.expand")}
       >
@@ -624,7 +653,7 @@ function HostRowImpl({
                       </tr>
                     </thead>
                     <tbody>
-                      {history.map((entry) => (
+                      {sortedHistory.map((entry) => (
                         <tr key={`${entry.installationId}:${entry.startedAt}`} className="border-t border-border/50">
                           <td className="max-w-[12rem] truncate px-1.5 py-1.5" title={entry.clientOwnerEmail}>
                             {entry.clientOwnerEmail}
