@@ -495,6 +495,43 @@ fn reservation_has_active_create_job(
 /// the old installation is gone, the Client label is tombstoned, and the
 /// released subscription still names this owner. Takeover-retired names stay
 /// blocked because their subject installation is still live.
+///
+/// Init / `cc-switch-server` preflight has no Router session. A signed-in
+/// caller may only see the tombstone as available when they are the released
+/// owner. Unauthenticated init is allowed only when an in-flight create-job
+/// reservation already belongs to that owner. An `ownerEmail` query param is
+/// not enough on its own. Claim still re-checks owner identity.
+pub(crate) fn client_market_tombstone_available_for_reclaim(
+    conn: &Connection,
+    subdomain: &str,
+    session: Option<&crate::models::AuthSession>,
+    owner_email: Option<&str>,
+) -> Result<bool, AppError> {
+    if let Some(session) = session {
+        return client_market_owner_can_reclaim_tombstoned_label(
+            conn,
+            subdomain,
+            &session.email,
+            Some(&session.user_id),
+        );
+    }
+    let reservation = get_active_subdomain_reservation(conn, subdomain)?;
+    let Some(reservation_email) = reservation
+        .as_ref()
+        .and_then(|reservation| reservation.client_owner_email.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    if let Some(email) = owner_email.map(str::trim).filter(|value| !value.is_empty()) {
+        if normalize_market_email(email)? != normalize_market_email(reservation_email)? {
+            return Ok(false);
+        }
+    }
+    client_market_owner_can_reclaim_tombstoned_label(conn, subdomain, reservation_email, None)
+}
+
 pub(crate) fn client_market_owner_can_reclaim_tombstoned_label(
     conn: &Connection,
     subdomain: &str,
@@ -10408,6 +10445,7 @@ mod tests {
                 None,
                 Some("198.18.5.1"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -10496,10 +10534,30 @@ mod tests {
                 None,
                 Some("198.18.6.1"),
                 Some(&owner),
+                None,
             )
             .await
             .unwrap();
         assert!(owner_availability.available);
+        let owner_email_availability = store
+            .check_client_tunnel_subdomain_availability(
+                &config,
+                "released-client",
+                None,
+                Some("198.18.6.1"),
+                None,
+                Some("client@example.com"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !owner_email_availability.available,
+            "an unauthenticated ownerEmail query is not enough without a reservation"
+        );
+        assert_eq!(
+            owner_email_availability.reason.as_deref(),
+            Some("previously_claimed")
+        );
         let stranger_availability = store
             .check_client_tunnel_subdomain_availability(
                 &config,
@@ -10507,12 +10565,29 @@ mod tests {
                 None,
                 Some("198.18.6.1"),
                 Some(&stranger),
+                None,
             )
             .await
             .unwrap();
         assert!(!stranger_availability.available);
         assert_eq!(
             stranger_availability.reason.as_deref(),
+            Some("previously_claimed")
+        );
+        let anonymous_before_reserve = store
+            .check_client_tunnel_subdomain_availability(
+                &config,
+                "released-client",
+                None,
+                Some("198.18.6.1"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!anonymous_before_reserve.available);
+        assert_eq!(
+            anonymous_before_reserve.reason.as_deref(),
             Some("previously_claimed")
         );
 
@@ -10541,6 +10616,55 @@ mod tests {
             )
             .await
             .expect("original owner may reserve the released Client subdomain");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE subdomain_reservations
+                 SET host_id = ?1
+                 WHERE job_id = 'reclaim-job' AND installation_id IS NULL",
+                params![host.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE provisioning_jobs
+                 SET host_id = ?1, status = ?2, phase = ?3
+                 WHERE id = 'reclaim-job'",
+                params![host.id, JOB_STATUS_RUNNING, JOB_PHASE_LOCKED],
+            )
+            .unwrap();
+        }
+
+        let reserved_anonymous = store
+            .check_client_tunnel_subdomain_availability(
+                &config,
+                "released-client",
+                None,
+                Some("198.18.6.1"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            reserved_anonymous.available,
+            "init preflight has no session; an in-flight owner reservation must unlock the tombstone"
+        );
+        let reserved_stranger = store
+            .check_client_tunnel_subdomain_availability(
+                &config,
+                "released-client",
+                None,
+                Some("198.18.6.1"),
+                Some(&stranger),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!reserved_stranger.available);
+        assert_eq!(
+            reserved_stranger.reason.as_deref(),
+            Some("previously_claimed")
+        );
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);

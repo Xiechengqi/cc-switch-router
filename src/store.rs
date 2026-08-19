@@ -6283,6 +6283,7 @@ impl AppStore {
         installation_id: Option<&str>,
         source_ip: Option<&str>,
         session: Option<&AuthSession>,
+        owner_email: Option<&str>,
     ) -> Result<SubdomainAvailabilityResponse, AppError> {
         let subdomain = normalize_subdomain(subdomain)?;
         normalize_client_subdomain(&subdomain)
@@ -6320,17 +6321,12 @@ impl AppStore {
         if let Some(existing) =
             crate::public_hosts::get_by_label(&conn, &subdomain).map_err(map_public_host_error)?
         {
-            let reclaimable = match session {
-                Some(session) => {
-                    crate::client_market::client_market_owner_can_reclaim_tombstoned_label(
-                        &conn,
-                        &subdomain,
-                        &session.email,
-                        Some(&session.user_id),
-                    )?
-                }
-                None => false,
-            };
+            let reclaimable = crate::client_market::client_market_tombstone_available_for_reclaim(
+                &conn,
+                &subdomain,
+                session,
+                owner_email,
+            )?;
             if existing.kind == PublicHostKind::Client
                 && existing.lifecycle == crate::public_hosts::PublicHostLifecycle::Tombstoned
                 && reclaimable

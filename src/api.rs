@@ -1304,6 +1304,8 @@ struct SubdomainAvailabilityQuery {
     subdomain: String,
     #[serde(default)]
     installation_id: Option<String>,
+    #[serde(default)]
+    owner_email: Option<String>,
 }
 
 async fn check_client_tunnel_subdomain_availability(
@@ -1323,6 +1325,7 @@ async fn check_client_tunnel_subdomain_availability(
                 query.installation_id.as_deref(),
                 metadata.ip.as_deref(),
                 session.as_ref(),
+                query.owner_email.as_deref(),
             )
             .await?,
     ))
