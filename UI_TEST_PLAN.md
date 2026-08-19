@@ -64,7 +64,7 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 | 界面 | 匿名 | 普通 | 供给方 | 租客 | 管理员 |
 |---|:--:|:--:|:--:|:--:|:--:|
 | `/clients` 总览 + 地图 | ✅ 只读 | ✅ | ✅ | ✅ | ✅ |
-| `/markets` | ✅ 只读 | ✅ | ✅ | ✅ | ✅ 可编辑 |
+| `/markets` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` |
 | `/share-market` | ✅ 只读 catalog | ✅ 租用/挂售 | ✅ | ✅ | ✅ 无特权 |
 | `/account/share` | ❌ | ✅ 只读监控 | ✅ | ✅ | ✅ 无特权 |
 | `/account/market-readiness` | ❌ | ✅ 聚合摘要 | ✅ 供应商待办 | ✅ 聚合摘要 | ✅ 聚合摘要 |
@@ -99,7 +99,7 @@ location.reload();
 | 语言 | `cc_switch_router_locale_v1` |
 | 公告 | `..._announcement_dismiss_today_v1`, `..._dismiss_permanent_v1` |
 | Clients 页 | `..._client_status_v1`, `..._client_sort_v1`, `..._client_expanded_v2`, `..._client_regions_v2`, `..._client_region_v1` |
-| Markets 页 | `..._market_status_v2`, `..._market_sort_v1` |
+| 旧 `/markets` 兼容路径 | 无 active localStorage；只验证跳转不残留旧筛选状态 |
 | Client Market | `..._owner_scope_v2`, `..._status_filter_v2`, `..._sort_v2`, `..._region_filter_v1`, `..._payment_filter_v1` |
 | 添加主机 | `cc-switch.client-market.add-host.mode`, `...ssh-key-open` |
 | 新建 Client | `..._create_client_providers_v2`, `..._create_client_regions_v2` |
@@ -136,7 +136,7 @@ location.reload();
 | A-17 | 承 A-16 | 点「今日不再提示」 | 关闭;当天刷新不再弹;次日再弹 |
 | A-18 | 承 A-16 | 点「不再提示」 | 关闭;刷新不再弹 |
 | A-19 | 承 A-16 | 点弹窗 X | 关闭但**不写忽略状态**,刷新后仍弹 |
-| A-20 | 任意 | 逐个点 5 个导航 tab | 分别到 clients / markets / client-market / rentals / account,选中态正确 |
+| A-20 | 任意 | 逐个点导航 tab，并访问旧书签 `/markets` | 导航只出现 Clients / Share Market / Client Market / Account；旧 `/markets` 安全跳转到 `/share-market`，不出现旧 registry 控件 |
 | A-21 | 清空 `cc_switch_router_auth_v2`;拦截 Network | 同一标签页同时触发 AuthProvider 初始化和发送验证码 | `/v1/auth/devices/register` 只发送 1 次;后续 request-code 与 localStorage 使用同一 `authDeviceId` |
 | A-22 | 清空认证 localStorage;浏览器支持 Web Locks | 同时打开两个 Dashboard 标签页 | 两页最终持有相同完整 auth device 身份;总计只注册 1 个 auth device;任一页发码后均不覆盖身份 |
 | A-23 | 承 A-02;拦截 verify-code | 快速输入或粘贴完整 6 位验证码 | 只发送 1 次 verify-code;body 使用最新 6 位值和 request-code 时的 `authDeviceId` |
@@ -180,27 +180,17 @@ location.reload();
 
 ---
 
-## 6. Markets(M)
+## 6. 旧 Token Market 退役路径(L)
 
-覆盖 `markets-table.tsx`(含内联 `MarketEditDialog`、`MarketSharePriorityPanel`)
+旧 `/markets` registry 页面已删除，路由仅保留兼容跳转；旧 API/代理由 Router 返回 `410 Gone`。本节不把兼容跳转误报为旧 Market 功能回归。
 
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
-| M-01 | 有 market | 打开 `/markets` | 表格渲染 |
-| M-02 | 有 market | 点 4 个状态 tab | 按 全部/可用/异常/停用 过滤;持久化 |
-| M-03 | 有 market | 搜索 ID/名称/邮箱/子域名/URL | 命中过滤 |
-| M-04 | 有 market | 切换排序(问题/名称/容量/活跃/Share/更新) | 顺序变化;持久化 |
-| M-05 | 有 market | 点行 / 键盘 Enter / Space | 打开详情抽屉(键盘可达) |
-| M-06 | 有 market | 点行内外链 | 新标签打开 `publicBaseUrl` |
-| M-07 | 筛选无结果 | 观察 | 「清除筛选」链接可用 |
-| M-08 | 任意 | 点「安装 Market」 | 打开安装指引弹窗,含 GitHub releases 链接 |
-| M-09 | 抽屉内 | 切换 Claude/Codex/Gemini 优先级 tab | 拉取并展示对应 app 的 share 优先级 |
-| M-10 | `canManage` | 点 Edit | 打开编辑弹窗 |
-| M-11 | 承 M-10 | 勾选维护模式 + 填消息 → 保存 | 保存成功;消息框在未开启维护时 disabled |
-| M-12 | 承 M-10 | 勾选若干 share → 停用所选 | 对应 share 进入停用集合 |
-| M-13 | 承 M-10 | 点 全部启用 / 全部停用 | 批量生效 |
-| M-14 | 有阻塞状态 | 点单条 Release / 全部 Release | 逐条释放 |
-| M-15 | 非 `canManage` | 打开抽屉 | 无 Edit 按钮 |
+| L-01 | 任意 | 打开旧书签 `/markets` 或 `/markets/?tab=legacy` | 只跳转到 `/share-market/`，不请求旧 registry API、不显示旧 session/host 控件 |
+| L-02 | 任意 | `GET/POST /v1/markets*`、`/v1/market/*`、`/v1/admin/markets/*` | 统一 `410 Gone`，响应不包含 Market email、session 或 Provider credential |
+| L-03 | 任意 | `ANY /_market/proxy/*` | `410 Gone`，不落到 UI catch-all、Client tunnel 或 Share proxy |
+| L-04 | 任意 | 访问 `/share-market` | 只显示 Share listing/seat/准入/账务能力，不出现旧 Token Market 导航或价格选择器 |
+| L-05 | 有 Gateway fixture | 调用 `/v1/gateway/*` 与 `/_gateway/proxy/*` | 按 Ed25519 headers、原始 body hash、scope、nonce/replay 和 Gateway ID 验证；自报 owner email、Free 或 ShareTo 均不授权，在新 grant contract 前普通 Share inventory/proxy/headroom/feedback/observation 整体 fail-closed；缺真实外部平台时只记录 fixture/local 结果 |
 
 ---
 
@@ -210,9 +200,9 @@ location.reload();
 
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
-| SM-01 | 任意 | 打开 `/share-market` | 顶部顺序为 Token Market / Share Market / Client Market；空 catalog 正常显示 |
+| SM-01 | 任意 | 打开 `/share-market` | 顶部只显示 Share Market / Client Market；空 catalog 正常显示，不能出现旧 Token Market tab |
 | SM-02 | 未登录 | 点租用或添加 Share | 打开登录弹窗,不提交写请求 |
-| SM-03 | 已登录且拥有 active Share | 点添加 Share | 只列出未挂售 Share；下拉每项展示 Share 名称、subdomain、owner 邮箱和全部已绑定应用；可一次添加 1-20 个拼车位 |
+| SM-03 | 已登录且拥有 active 私有 Share | 点添加 Share | 只列出未挂售且未开启“公开免费使用”的 Share；下拉每项展示 Share 名称、subdomain、owner 邮箱和全部已绑定应用；可一次添加 1-20 个拼车位 |
 | SM-04 | 添加拼车位 | 保持价格模式为免费 | 默认固定服务期限 1 天；请求中日费率和币种均为空，`serviceDurationDays=1` |
 | SM-05 | 添加付费拼车位 | 切到付费后输入三位以上小数、经 API 提交非 USD 币种,或未配置 USD 收款资料/付款宽限 | 切到付费时默认无固定期限；UI 固定使用 USD；非法报价被前后端阻止 |
 | SM-06 | 有可用拼车位 | 可信买家租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；已有 direct grant 的用户不显示租用按钮 |
@@ -222,7 +212,7 @@ location.reload();
 | SM-10 | listing 有活跃租约 | 停止挂售 | 空闲座位关闭,活跃租约继续显示且可正常使用；「添加 Share」仍不可选该 Share |
 | SM-11 | 已释放的座位 | 删除座位 | 座位从 catalog 消失,历史订阅和账单仍保留 |
 | SM-12 | 窄屏 | 检查导航、弹窗和座位表 | 导航和表格可横向滚动；弹窗纵向滚动；文字和操作不重叠 |
-| SM-13 | 停止挂售且无活跃租约 | 点添加 Share | 该 Share 重新出现在候选列表；可新建 listing |
+| SM-13 | 停止挂售、无活跃租约且 Share 为私有 | 点添加 Share | 该 Share 重新出现在候选列表；可新建 listing |
 | SM-14 | 离线 Share 的可用座位 | 观察并直接调用租用接口 | 已登录用户不显示租用按钮；直接请求返回离线冲突,不创建订阅或账务合约 |
 | SM-15 | 租约非终态 | My rentals / owner 嵌套订阅 | 有 subdomain 时显示「打开 Share」并可跳转 |
 | SM-16 | 已登录买家不在 owner 白名单,Share 在线且座位可用 | 点「租用」 | 保留租用按钮；弹出中性授权引导而非红色英文错误，明确只有白名单用户可租用并显示当前登录邮箱；点主操作打开该 Share 对应的 Client 聊天室 |
@@ -233,6 +223,7 @@ location.reload();
 | SM-21 | 付费座位 | 查看确认框后确认 | 明确 12 小时健康时长免费、之后按健康时长累计、同供应商多 Share/Host 聚合出账；请求继续提交确认时的 `offerRevision` |
 | SM-22 | 打开确认框后 Share 下线或报价 revision 改变 | 点击确认 | 后端拒绝且确认框保留可理解的内联错误，不创建订阅、不直接展示红色英文 toast |
 | SM-23 | Token 不限额的现有座位 | 查看 All / Mine 表格 | 只显示“不限”，不再拼接“累计”周期；设置限额的座位显示数值与周期 |
+| SM-24 | Share 已开启“公开免费使用” | 点添加 Share，并直接调用创建 listing / 添加或重开 seat 接口 | Share 不出现在候选列表；绕过 UI 的写请求返回可理解的冲突，且不创建或恢复任何 listing/seat/subscription |
 
 ### 6.1.1 Share Market ↔ Server 联调(SM-E2E)
 
@@ -590,21 +581,23 @@ location.reload();
 | S-08 | `canManage` | 打开 Edit | 完整编辑表单 |
 | S-09 | 非 `canManage` | 打开 View | 只读视图,仅关闭按钮 |
 | S-10 | 编辑中 | 改任意字段 | 出现「重置」按钮;保存按钮由 disabled 变可用 |
-| S-11 | 编辑中 | for_sale 改为 Free | 二次确认(danger) |
+| S-11 | 默认私有 Share | 勾选「公开免费使用」并保存 | 只显示一个复选框及明确提示；保存后状态为公开免费，任意已登录 Router 用户可调用，匿名调用仍为 401 |
 | S-12 | 编辑中 | 点某邮箱「设为属主」 | 二次确认(danger)后转移所有权 |
 | S-13 | 编辑中 | 描述超 200 字 | 内联报错 + 字数计数;保存 disabled |
 | S-14 | 编辑中 | Token / 并发限额填 0 或负数 | 内联报错 |
 | S-15 | 编辑中 | 勾选「不限」 | 对应数字输入框 disabled |
-| S-16 | 编辑中 | 定价填 0 或 101 | 报错(合法范围 1–100) |
-| S-17 | 编辑中 | 观察售卖配置 | 只显示 Token Market 定价和访问范围,不出现旧 Share Market 类型或市场选择器 |
-| S-18 | 编辑中 | 市场访问模式选「全部市场」 | 已选市场 chip 区隐藏;可点「切换为指定」恢复 |
-| S-19 | 编辑中 | 添加/删除 shared-with 邮箱 tag | tag 增删;非法邮箱被拒 |
-| S-20 | 支持 user grants | 编辑单用户额度 | 按用户设置 token/并发/过期 |
+| S-16 | 编辑中 | 观察访问配置 | 不出现「是否出售」、Market access、官方价格百分比、授权邮箱文本框或旧 Token Market 选择器 |
+| S-17 | 私有 Share | 在「授权用户与配额」添加/删除用户 | 只能通过「添加授权用户」维护 ShareTo；非法/重复邮箱被拒，保存后 canonical `userGrants` 生效，旧 ACL 存储列保持空值且不能授权 |
+| S-18 | 已有活动 listing/subscription | 尝试勾选公开免费并保存 | 返回可理解的冲突，状态保持私有；释放全部 entitlement 后可保存成功 |
+| S-19 | 公开免费 Share | 给特定用户设置个人 Token/并发/过期 | 该用户受个人覆盖约束，其他已登录用户仍按公开默认访问；Share 总限制始终生效 |
+| S-20 | 有 `routerShareMarket` grant | 打开并编辑其他用户后保存 | Market grant 显示来源标记且不可编辑、批量选择或删除；保存后原样保留 |
 | S-21 | 编辑中 | 过期时间清空且未勾选「永久」 | 报错 |
 | S-22 | 点重置 | 观察 | 所有字段回到打开时的值,重置按钮消失 |
 | S-23 | 保存后客户端离线 | 观察 | 提示已入队,待客户端重连后生效 |
 | S-24 | 保存后客户端在线 | 观察 | 同步生效;`OperationVerification` 在 30 秒内给出「已观察到生效」toast |
 | S-25 | 保存被客户端拒绝 | 观察 share 卡片 | 显示拒绝态与错误 tooltip |
+| S-26 | 新建 Share 或 Provider 快速开启 | 保存并查看状态 | 默认私有，不因快速开启、无授权用户或旧 `Yes` 数据隐式公开 |
+| S-27 | 离线持久化迁移 fixture | 从旧存储分别准备 `forSale=Free` 与 `forSale=Yes`，执行 migration 后再加载 Contract v2 UI | 迁移后的旧 Free 为公开免费、旧 Yes 为私有；active wire 直接携带旧字段会被拒绝，UI 不显示出售/定价控件 |
 
 ### 11.3 Share 抽屉与卡片
 
@@ -744,7 +737,7 @@ location.reload();
 | D-02 | 承 D-01 | 点证据条目 | 可定位到健康时间线或相关详情 |
 | D-03 | 承 D-01 | 观察 share 列表 | 每行有 Edit 入口 |
 | D-04 | client 离线 | 打开抽屉 | 离线原因与持续时间可读 |
-| D-05 | 有 market | 打开 market 抽屉 | 诊断 + 挂牌 share + 优先级面板 |
+| D-05 | 任意 | 访问旧 `/markets` 抽屉链接或 `drawerKind=market` | 不打开旧 market 抽屉；安全跳转 `/share-market` 或回到 Clients，且不调用旧 priority API |
 | D-06 | 保存 share 配置后 | 观察 30 秒 | `OperationVerification` 区分「API 提交成功」与「Dashboard 已观察到生效」两个 toast |
 | D-07 | 配置被拒绝 | 观察 | 明确的拒绝 toast,而非静默 |
 | D-08 | 有可升级 client | 点升级 | 二次确认 → 进度可见 |
@@ -759,7 +752,7 @@ location.reload();
 |---|---|---|
 | G-01 | 全站 | 中英文各跑一遍主流程,无未翻译串、无中英混排 |
 | G-02 | 全站 | 1440 / 1024 / 768 / 375 四档宽度;**主机表 `min-w-[56rem]`,375px 下需横向滚动可用** |
-| G-03 | 全站 | 键盘 Tab 可达所有主操作;Markets 行支持 Enter/Space |
+| G-03 | 全站 | 键盘 Tab 可达所有主操作；旧 `/markets` 跳转后 Share/Client Market 操作可达 |
 | G-04 | 主机表 | 屏幕阅读器读出表格 caption;4 个批量按钮可区分 |
 | G-05 | 全站 | 所有破坏性操作均有二次确认(例外见下) |
 | G-06 | 全站 | 断网后各页面显示错误态而非白屏;恢复后可重试 |
@@ -809,9 +802,9 @@ location.reload();
 | `dashboard/live-map.tsx` | C-02~C-06 |
 | `dashboard/client-board.tsx` | C-07~C-16, C-22 |
 | `dashboard/share-card.tsx` | C-17~C-20 |
-| `dashboard/drawer-panels.tsx` | C-13, C-18, M-05, M-09 |
-| `dashboard/markets-table.tsx` | M-01~M-15 |
-| `dashboard/share-market-page.tsx` | SM-01~SM-16, SM-E2E-01~SM-E2E-07 |
+| `dashboard/drawer-panels.tsx` | C-13, C-18, D-05 |
+| `app/(dashboard)/markets/page.tsx` | L-01 |
+| `dashboard/share-market/*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10 |
 | `dashboard/account-share-page.tsx` | AS-01~AS-08 |
 | `dashboard/account-client-page.tsx` | 账户 Client 只读监控(镜像 AS) |
 | `dashboard/client-market-page.tsx` | H-01~H-18(归属/筛选/排序/分页), H-60~H-71(选择与批量), H-80~H-84(导入导出) |
@@ -864,7 +857,7 @@ location.reload();
 
 | 域 | 代表 API 函数 | 覆盖用例 |
 |---|---|---|
-| Admin(设置/版本/日志/公告/地图/通知/市场管理) | `getSettings*`、`saveSettings`、`updateMarket*` | X-02~X-08, X-10~X-13, X-17, X-19~X-24, M-10~M-14 |
+| Admin(设置/版本/日志/公告/地图/通知) | `getSettings*`、`saveSettings` | X-02~X-08, X-10~X-13, X-17, X-19~X-24 |
 | Client Market(主机/作业/报价/终端/子域名) | `getClientMarketHosts`、`createClientMarketQuote`、`commitClientMarketQuote` | H-20~H-29, H-43~H-48, H-80~H-84, T-01, Q-02, Q-06, Q-11, Q-12 |
 | Client 租用生命周期 | `getMyClientMarketRentals`、`releaseClientMarketRental`、`cleanupClientMarketProviderRental` | R-01~R-35, H-44~H-48 |
 | 市场准入与授信 | `getMarketAccessDashboard`、`updateMarketAccessPolicy`、`upsertMarketCounterparty`、`updateMarketCounterparty`、`updateMarketCounterpartyCredit`、`updateMarketPublicCredit` | MA-01~MA-15 |
@@ -876,8 +869,7 @@ location.reload();
 | Dashboard | `getDashboard`、`getMapDisplay` | C-01, C-22 |
 | Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
 | 用户 API Token | `getUserApiToken`、`resetUserApiToken` | A-10, A-11 |
-| Markets 优先级 | `getMarketSharePriority` | M-09 |
-| Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-16, SM-E2E-01~SM-E2E-07 |
+| Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10 |
 | 其他(regions / 公告读取) | `getRegions`、`getAnnouncement` | A-14, A-16 |
 
 认证相关在 `lib/auth.ts`(非 `api.ts`):`requestEmailCode` / `verifyEmailCode` / `refreshAccessToken` / `sessionStatus` / `logoutSession` / `ensureAuthDeviceIdentity` → 用例 A-02~A-06, A-12。
@@ -896,11 +888,11 @@ location.reload();
 
 | 轮次 | 环境 | 用例 | 约计 |
 |---|---|---|---|
-| 1. 匿名 | `DEV_AUTH_BYPASS=0`,不登录 | A-01, C-01~C-06, M-01~M-08, H-06, H-32, S-40, S-41, S-46, CH-02, N-01, X-01 | 25 分钟 |
+| 1. 匿名 | `DEV_AUTH_BYPASS=0`,不登录 | A-01, C-01~C-06, L-01~L-04, H-06, H-32, S-40, S-41, S-46, CH-02, N-01, X-01 | 25 分钟 |
 | 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, H-51, SM-16, R-01, R-02, C-07~C-23 | 60 分钟 |
 | 3. 供给方 | 名下有多状态主机 | H-03~H-05, H-07, H-10~H-18, H-20~H-29, H-40~H-50, H-60~H-84, T-01, T-04~T-19, T-30~T-36, Q-01~Q-14, D-10 | 120 分钟 |
 | 4. 租客 | 有租用中 Client | R-03~R-12, R-20~R-35, T-02, H-30, S-42~S-45, D-01~D-04 | 55 分钟 |
-| 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-38, N-02~N-14, M-09~M-15, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |
+| 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-38, N-02~N-14, L-01~L-05, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |
 | 6. 跨界面 | 任意角色 | G-01~G-12 | 30 分钟 |
 
 **冒烟子集**(每次提交前跑,约 15 分钟):

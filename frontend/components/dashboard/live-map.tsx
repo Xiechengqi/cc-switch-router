@@ -7,7 +7,7 @@ import { recordDashboardUxEvent } from "@/lib/api";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { MapCountryTooltip } from "@/components/dashboard/map-country-tooltip";
-import type { CountryBoard, CountryMapPoint, DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
+import type { CountryBoard, CountryMapPoint, DashboardResponse, MapPoint, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
 import { usePersistentState } from "@/lib/use-persistent-state";
@@ -15,8 +15,9 @@ import { CountryFlag } from "@/components/common/country-flag";
 import { StatsStrip } from "@/components/dashboard/stats-strip";
 
 type PlacedPoint = { x: number; y: number; xPct: number; yPct: number };
-type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketRequestLog, "createdAt">> & {
+type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt">> & {
   createdAt?: string | number;
+  status?: string;
   shareName?: string;
   userCountry?: string;
   userCountryIso3?: string;
@@ -110,16 +111,6 @@ function observedUsageBucketTotalTokens(log?: TickerMeta | null) {
   return hasObservedTickerUsage(log) ? usageBucketTotalTokens(log) : undefined;
 }
 
-function marketRequestTotalTokens(log: MarketRequestLog) {
-  if (!hasObservedTickerUsage(log)) return undefined;
-  const input = tokenCount(log.inputTokens);
-  const cacheRead = tokenCount(log.cacheReadTokens);
-  const canonicalInput = log.requestAgent.trim().toLowerCase() === "codex"
-    ? Math.max(0, input - cacheRead)
-    : input;
-  return canonicalInput + tokenCount(log.outputTokens) + cacheRead + tokenCount(log.cacheCreationTokens);
-}
-
 function eventTotalTokens(event: RecentRequestEvent) {
   if (!hasObservedTickerUsage(event)) return undefined;
   if (event.totalTokens != null) return tokenCount(event.totalTokens);
@@ -149,15 +140,6 @@ function formatTickerLatency(value?: number) {
   return `${text.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1")}s`;
 }
 
-function formatMarketFee(value?: string | number) {
-  if (value == null || value === "") return "";
-  const amount = Number(value);
-  if (!Number.isFinite(amount)) return "";
-  if (amount > 0 && amount < 0.0001) return `$${amount.toFixed(8)}`;
-  if (amount > 0 && amount < 0.01) return `$${amount.toFixed(6)}`;
-  return `$${amount.toFixed(amount >= 1 ? 2 : 4)}`;
-}
-
 function tickerDetail(meta?: TickerMeta) {
   const agent = meta?.requestAgent || "";
   const requested = meta?.requestedModel || meta?.requestModel || "";
@@ -177,8 +159,7 @@ function tickerDetail(meta?: TickerMeta) {
         ? `${compactTickerTokens(tokenTotal)}+ tokens`
         : "tokens …"
       : `${compactTickerTokens(tokenTotal)} token${tokenTotal === 1 ? "" : "s"}`;
-  const fee = formatMarketFee(meta?.usageAmountUsd);
-  return [meta?.userEmail || "", modelName, latency, tokens, fee].filter(Boolean).join(" · ");
+  return [meta?.userEmail || "", modelName, latency, tokens].filter(Boolean).join(" · ");
 }
 
 function resolveMapHeatCounts(
@@ -370,29 +351,24 @@ function resolveMapHoverIso3FromElement(target: Element | null, activityCounts: 
 }
 
 function buildRequestMeta(data: DashboardResponse | null) {
-  const marketMeta = new Map<string, MarketRequestLog>();
   const meta = new Map<string, TickerMeta>();
-  for (const log of data?.marketRequestLogs || []) {
-    marketMeta.set(log.requestId, log);
-  }
   for (const share of data?.tickerShares || []) {
     for (const log of share.recentRequests || []) {
-      const market = marketMeta.get(log.requestId);
-      const marketTotal = market ? marketRequestTotalTokens(market) : undefined;
-      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal ?? observedUsageBucketTotalTokens(log) });
+      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, totalTokens: observedUsageBucketTotalTokens(log) });
     }
   }
   for (const share of data?.shares || []) {
     for (const log of share.recentRequests || []) {
-      const market = marketMeta.get(log.requestId);
-      const marketTotal = market ? marketRequestTotalTokens(market) : undefined;
-      meta.set(log.requestId, { ...log, shareName: share.shareName || log.shareName, shareId: share.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal ?? observedUsageBucketTotalTokens(log) });
+      meta.set(log.requestId, { ...meta.get(log.requestId), ...log, shareName: share.shareName || log.shareName, shareId: share.shareId || log.shareId, totalTokens: observedUsageBucketTotalTokens(log) });
     }
   }
-  for (const [requestId, log] of marketMeta) {
-    const existing = meta.get(requestId);
-    const marketTotal = marketRequestTotalTokens(log);
-    meta.set(requestId, { ...(existing || {}), ...log, userEmail: log.userEmail || existing?.userEmail, totalTokens: marketTotal ?? existing?.totalTokens });
+  for (const event of data?.recentRequestEvents || []) {
+    const existing = meta.get(event.requestId);
+    meta.set(event.requestId, {
+      ...existing,
+      ...event,
+      totalTokens: event.totalTokens ?? existing?.totalTokens ?? eventTotalTokens(event),
+    });
   }
   return meta;
 }

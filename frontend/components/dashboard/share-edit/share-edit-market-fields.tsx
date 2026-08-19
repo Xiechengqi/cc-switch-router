@@ -1,17 +1,16 @@
 "use client";
 
-import { Checkbox, Input, ListBox, Select, TextArea } from "@heroui/react";
+import { Checkbox, TextArea } from "@heroui/react";
 import * as React from "react";
-import { isOfficialRuntime, marketLabel, runtimeModelSummary, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { isOfficialRuntime, runtimeModelSummary, type TFn } from "@/components/dashboard/share-dashboard-utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import type { DashboardMarket, ShareAppRuntimes, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { ShareAppRuntimes, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import {
-  applyRecommendedMarketDefaults,
   type ShareEditDraft,
 } from "./share-edit-draft";
-import { FieldGroup, MarketEmailChip } from "./share-edit-shared";
-import { forSaleOptionLabel, ShareEditSection } from "./share-edit-section";
+import { FieldGroup } from "./share-edit-shared";
+import { ShareEditSection } from "./share-edit-section";
 
 function providerHint(runtime?: ShareUpstreamProvider) {
   if (!runtime) return "";
@@ -26,168 +25,39 @@ function providerTitle(runtime?: ShareUpstreamProvider) {
 export type ShareEditSaleAccessFieldsProps = {
   t: TFn;
   draft: ShareEditDraft;
-  activeShareApps: CoreShareApp[];
-  tokenMarkets: DashboardMarket[];
-  marketSelectKey: number;
-  pricingInvalid: boolean;
-  onForSaleChange: (next: "Yes" | "No" | "Free") => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
-  onMarketPicked: (raw: string) => void;
 };
 
 export function ShareEditSaleAccessFields({
   t,
   draft,
-  activeShareApps,
-  tokenMarkets,
-  marketSelectKey,
-  pricingInvalid,
-  onForSaleChange,
   onDraftChange,
-  onMarketPicked,
 }: ShareEditSaleAccessFieldsProps) {
-  const { forSale, marketAccessMode, selectedMarketEmails, priceInputs } = draft;
-  const sharedPriceApp = activeShareApps[0];
-
-  const availableMarkets = React.useMemo(() => {
-    const blocked = new Set(selectedMarketEmails);
-    return tokenMarkets
-      .filter((market) => market.email && !blocked.has(market.email.toLowerCase()))
-      .sort((a, b) => marketLabel(a).localeCompare(marketLabel(b)));
-  }, [selectedMarketEmails, tokenMarkets]);
-
-  const removeMarketEmail = (email: string) => {
-    onDraftChange((current) => ({
-      ...current,
-      selectedMarketEmails: current.selectedMarketEmails.filter((value) => value !== email),
-    }));
-  };
-
   return (
-    <>
-      <div className={forSale === "Yes" ? "grid gap-3 sm:grid-cols-2" : "grid gap-3"}>
-        <FieldGroup label={t("dashboard.field.forSale")}>
-          <Select
-            selectedKey={forSale}
-            onSelectionChange={(key) => onForSaleChange(String(key || "No") as "Yes" | "No" | "Free")}
-          >
-            <Select.Trigger>
-              <Select.Value>{forSaleOptionLabel(forSale, t)}</Select.Value>
-              <Select.Indicator />
-            </Select.Trigger>
-            <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
-              <ListBox>
-                {(["No", "Yes", "Free"] as const).map((item) => (
-                  <ListBox.Item key={item} id={item}>
-                    {forSaleOptionLabel(item, t)}
-                  </ListBox.Item>
-                ))}
-              </ListBox>
-            </Select.Popover>
-          </Select>
-        </FieldGroup>
-
-        {forSale === "Yes" ? (
-          <FieldGroup label={t("dashboard.field.marketAccess")}>
-            <Select
-              key={marketSelectKey}
-              selectedKey={null}
-              onSelectionChange={(key) => onMarketPicked(String(key || ""))}
-            >
-              <Select.Trigger>
-                <Select.Value>
-                  {marketAccessMode === "all" ? t("dashboard.allMarkets") : t("dashboard.addMarket")}
-                </Select.Value>
-                <Select.Indicator />
-              </Select.Trigger>
-              <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
-                <ListBox>
-                  <ListBox.Item id="__all__">{t("dashboard.allMarkets")}</ListBox.Item>
-                  {availableMarkets.map((market) => (
-                    <ListBox.Item key={market.email} id={market.email.toLowerCase()}>
-                      {marketLabel(market)}
-                      <span className="ml-1 text-muted-foreground">· {market.email}</span>
-                    </ListBox.Item>
-                  ))}
-                </ListBox>
-              </Select.Popover>
-            </Select>
-          </FieldGroup>
-        ) : null}
-      </div>
-
-      {forSale === "Yes" && marketAccessMode === "selected" ? (
-        <FieldGroup label={t("dashboard.field.selectedMarkets")} hint={t("dashboard.hint.selectedMarkets")}>
-          {selectedMarketEmails.length ? (
-            <div className="flex flex-wrap gap-1.5">
-              {selectedMarketEmails.map((email) => {
-                const meta = tokenMarkets.find((market) => (market.email || "").toLowerCase() === email);
-                const label = meta ? marketLabel(meta) : email;
-                return <MarketEmailChip key={email} label={label} onRemove={() => removeMarketEmail(email)} />;
-              })}
-            </div>
-          ) : (
-            <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              {t("dashboard.noAuthorizedMarkets")}
-            </div>
-          )}
-        </FieldGroup>
+    <FieldGroup
+      label={t("dashboard.field.freeAccess")}
+      hint={t("dashboard.hint.freeAccess")}
+    >
+      <Checkbox
+        isSelected={draft.freeAccess}
+        onChange={(freeAccess: boolean) =>
+          onDraftChange((current) => ({
+            ...current,
+            freeAccess,
+          }))
+        }
+      >
+        <Checkbox.Control>
+          <Checkbox.Indicator />
+        </Checkbox.Control>
+        <Checkbox.Content>
+          <span className="text-sm">{t("dashboard.freeAccessLabel")}</span>
+        </Checkbox.Content>
+      </Checkbox>
+      {draft.freeAccess ? (
+        <p className="text-xs text-amber-700">{t("dashboard.hint.freeAccessUserOverrides")}</p>
       ) : null}
-
-      {forSale === "Yes" && marketAccessMode === "all" ? (
-        <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">
-          {t("dashboard.allMarketsSelected")}
-          <button
-            type="button"
-            className="ml-3 text-[11px] underline decoration-dotted underline-offset-2 hover:text-primary/80"
-            onClick={() =>
-              onDraftChange((current) =>
-                applyRecommendedMarketDefaults(
-                  { ...current, marketAccessMode: "selected", selectedMarketEmails: [] },
-                  tokenMarkets,
-                ),
-              )
-            }
-          >
-            {t("dashboard.switchToSelected")}
-          </button>
-        </div>
-      ) : null}
-
-      {forSale === "Yes" ? (
-        <div className="grid gap-1.5 text-sm">
-          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-            <span className="mono-label text-muted-foreground">{t("dashboard.field.modelPricing")}</span>
-            <span className="text-xs text-muted-foreground">{t("dashboard.hint.modelPricing")}</span>
-          </div>
-          <div className="grid max-w-sm gap-1">
-            <span className="mono-label text-muted-foreground">
-              {activeShareApps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}
-            </span>
-            <Input
-              type="number"
-              min={1}
-              max={100}
-              step={1}
-              value={sharedPriceApp ? priceInputs[sharedPriceApp] : ""}
-              disabled={!sharedPriceApp}
-              placeholder={sharedPriceApp ? t("common.unset") : t("dashboard.noCurrentNode")}
-              onChange={(event) => {
-                const value = event.target.value;
-                onDraftChange((current) => ({
-                  ...current,
-                  priceInputs: {
-                    ...current.priceInputs,
-                    ...Object.fromEntries(activeShareApps.map((app) => [app, value])),
-                  },
-                }));
-              }}
-            />
-          </div>
-          {pricingInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
-        </div>
-      ) : null}
-    </>
+    </FieldGroup>
   );
 }
 

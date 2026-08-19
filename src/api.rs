@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -13,7 +13,7 @@ use axum::routing::{MethodRouter, any, delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
 
@@ -33,6 +33,7 @@ use crate::admin::{
     },
 };
 use crate::client_meta::extract_client_metadata;
+use crate::config::TelegramBotSettings;
 use crate::error::AppError;
 use crate::models::{
     AccountUsageResponse, AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate,
@@ -42,29 +43,22 @@ use crate::models::{
     ClientChatReadResponse, ClientChatRoomListResponse, ClientChatRoomLookupRequest,
     ClientChatRoomResponse, ClientChatVisitImportRequest, ClientChatVisitImportResponse,
     ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
-    ClientWebRequestEmailCodeRequest, ClientWebVerifyEmailCodeRequest,
-    DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
-    DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
-    GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
+    ClientWebRequestEmailCodeRequest, ClientWebVerifyEmailCodeRequest, DashboardPresenceRequest,
+    DashboardPresenceResponse, DashboardResponse, DashboardTickerShare, DashboardUxEventRequest,
+    DashboardUxEventResponse, GatewayRegistryRecord, GatewayRequestObservationBatch,
+    GatewayShareView, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
     HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
     InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
     InstallationSetupCompletedResponse, InstallationUpgradeTaskReportPayload,
     InstallationUpgradeTaskReportRequest, InstallationUpgradeTaskReportResponse, IssueLeaseRequest,
-    IssueLeaseResponse, MapDisplaySettings, MapDisplaySettingsUpdate,
-    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
-    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
-    MarketNotificationEmailLogView, MarketNotificationEmailRequest,
-    MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
-    MarketShareRuntimeStateReleaseRequest, MarketShareRuntimeStateReleaseResponse,
-    MarketShareRuntimeStateSyncRequest, MarketShareRuntimeStateSyncResponse, MarketShareView,
-    MarketsResponse, NotificationSettingsResponse, PostClientChatMessageRequest,
-    ProviderUsageResponse, PublicMapPointsResponse, PublicNetworkStatsResponse,
-    RefreshSessionRequest, RegisterAuthDeviceRequest, RegisterAuthDeviceResponse,
-    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
-    RegisterInstallationResponse, RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse,
-    ReportInstallationStatusRequest, ReportInstallationStatusResponse, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser,
-    ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
+    IssueLeaseResponse, MapDisplaySettings, MapDisplaySettingsUpdate, NotificationSettingsResponse,
+    PostClientChatMessageRequest, ProviderUsageResponse, PublicMapPointsResponse,
+    PublicNetworkStatsResponse, RefreshSessionRequest, RegisterAuthDeviceRequest,
+    RegisterAuthDeviceResponse, RegisterGatewayRequest, RegisterGatewayResponse,
+    RegisterInstallationRequest, RegisterInstallationResponse, RenewLeaseRequest,
+    RenewLeaseResponse, ReportInstallationStatusRequest, ReportInstallationStatusResponse,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse,
+    ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptorBatchSyncResponse,
     ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
     ShareHeartbeatRequest, SharePendingEditsRequest, SharePruneRequest,
@@ -80,10 +74,7 @@ use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
     route_reconnect_grace, validate_notification_cleanup_window,
 };
-use crate::proxy::{
-    ReleasedShareRequest, RouteAvailability, gateway_proxy_handler, market_proxy_handler,
-    proxy_handler,
-};
+use crate::proxy::{ReleasedShareRequest, RouteAvailability, gateway_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
@@ -99,10 +90,7 @@ fn public_cors_layer() -> CorsLayer {
         .allow_headers(Any)
 }
 
-async fn apply_market_share_route_availability(
-    state: &ServerState,
-    shares: &mut [MarketShareView],
-) {
+async fn apply_share_route_availability(state: &ServerState, shares: &mut [GatewayShareView]) {
     let reconnect_grace = {
         let dynamic = state.dynamic.read().await;
         route_reconnect_grace(&dynamic.client_notifications)
@@ -256,17 +244,12 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::market_billing::router())
         .merge(crate::client_logs::router())
         .merge(crate::server_logs::router())
+        .merge(retired_token_market_routes())
         .route("/", any(root_handler))
         .route("/install-client.sh", get(install_client_script))
         .route("/favicon.ico", get(favicon))
         .route("/v1/dashboard", get(dashboard))
         .route("/v1/map-display", get(map_display_get))
-        .route("/v1/markets", get(markets))
-        .route("/v1/markets/register", post(register_market))
-        .route("/v1/market/shares", get(market_shares))
-        .route("/v1/market/shares/headroom", post(market_shares_headroom))
-        .route("/v1/market/shares/feedback", post(market_shares_feedback))
-        .route("/v1/market/share-states", post(market_share_states))
         .route("/v1/gateways/register", post(register_gateway))
         .route("/v1/gateway/shares", get(gateway_shares))
         .route("/v1/gateway/shares/headroom", post(gateway_shares_headroom))
@@ -275,39 +258,6 @@ pub fn router(state: ServerState) -> Router {
             "/v1/gateway/request-logs/batch",
             post(batch_sync_gateway_request_logs),
         )
-        .route(
-            "/v1/admin/markets/:market_email/linked-shares",
-            get(admin_market_linked_shares),
-        )
-        .route(
-            "/v1/markets/:market_email/share-priority",
-            get(public_market_share_priority),
-        )
-        .route(
-            "/v1/admin/markets/:market_email/disabled-shares",
-            patch(admin_update_market_disabled_shares),
-        )
-        .route(
-            "/v1/admin/markets/:market_email/maintenance",
-            patch(admin_update_market_maintenance),
-        )
-        .route(
-            "/v1/admin/markets/:market_email/share-states/release",
-            post(admin_release_market_share_state),
-        )
-        .route(
-            "/v1/market/request-logs/batch",
-            post(batch_sync_market_request_logs),
-        )
-        .route(
-            "/v1/market/notifications/email",
-            post(send_market_notification_email),
-        )
-        .route(
-            "/v1/market/notifications/emails",
-            get(list_market_notification_emails),
-        )
-        .route("/v1/markets/tunnel/lease", post(issue_market_lease))
         .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/dashboard/ux-events", post(dashboard_ux_event))
         .route(
@@ -574,7 +524,6 @@ pub fn router(state: ServerState) -> Router {
             "/v1/admin/alerting/deliveries/:delivery_id/retry",
             post(admin_alerting_delivery_retry),
         )
-        .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
         .route(
             "/_gateway/proxy/:share_id/*path",
             any(gateway_proxy_handler),
@@ -618,6 +567,31 @@ async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// Retired Token Market routes fail closed with an explicit migration
+/// response. They must never fall through to the generic proxy/UI handler,
+/// which could otherwise expose a Client tunnel.
+fn retired_token_market_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/v1/markets", any(retired_capacity_endpoint))
+        .route("/v1/markets/*path", any(retired_capacity_endpoint))
+        .route("/v1/market", any(retired_capacity_endpoint))
+        .route("/v1/market/*path", any(retired_capacity_endpoint))
+        .route("/v1/admin/markets", any(retired_capacity_endpoint))
+        .route("/v1/admin/markets/*path", any(retired_capacity_endpoint))
+        .route("/_market/proxy", any(retired_capacity_endpoint))
+        .route("/_market/proxy/*path", any(retired_capacity_endpoint))
+}
+
+/// Explicitly retire the pre-Gateway capacity API.  Returning `410 Gone`
+/// makes stale clients fail closed and gives operators a deterministic signal
+/// to migrate to `/v1/gateway/*` or the Share/Client Market APIs.
+async fn retired_capacity_endpoint() -> StatusCode {
+    StatusCode::GONE
+}
+
 async fn install_client_script() -> impl IntoResponse {
     (
         [
@@ -659,71 +633,7 @@ fn database_health_response(
     )
 }
 
-async fn markets(State(state): State<ServerState>) -> Result<Json<MarketsResponse>, AppError> {
-    Ok(Json(MarketsResponse {
-        markets: state.store.list_public_markets().await?,
-    }))
-}
-
-async fn register_market(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<RegisterMarketRequest>,
-) -> Result<Json<crate::models::PublicMarketConfig>, AppError> {
-    let email = require_session_email(&state, &headers).await?;
-    Ok(Json(state.store.register_market(&email, input).await?))
-}
-
-async fn market_shares(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<MarketShareView>>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:shares:read").await?;
-    if market.market_kind != "usage" {
-        return Err(AppError::Forbidden(
-            "market:shares API is only available to usage markets".into(),
-        ));
-    }
-    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
-    let inflight_by_share = state.proxy.inflight_by_share().await;
-    let mut shares = state
-        .store
-        .list_market_shares(
-            &market.email,
-            "main",
-            &active_subdomains,
-            &inflight_by_share,
-        )
-        .await?;
-    // Overlay per-owner penalty from the in-memory override store. Done at the
-    // edge so the store layer stays unaware of the runtime feedback channel.
-    for share in &mut shares {
-        if let Some(email) = share.owner_email.as_deref() {
-            if let Some(penalty) = state.scheduling_overrides.get(email) {
-                share.signals.owner_penalty =
-                    (share.signals.owner_penalty * penalty).clamp(0.05, 1.0);
-            }
-        }
-    }
-    apply_market_share_route_availability(&state, &mut shares).await;
-    Ok(Json(shares))
-}
-
-/// Per-request real-time headroom probe. The market normally consumes the
-/// 30s-stale snapshot embedded in `MarketShareView`, but right before
-/// scheduling a request it can POST a small batch of candidate share_ids to
-/// learn their live `inflight` counts. This avoids over-packing a saturated
-/// share while still keeping the steady-state cost low.
-async fn market_shares_headroom(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<ShareHeadroomRequest>,
-) -> Result<Json<ShareHeadroomResponse>, AppError> {
-    let _market = authenticate_market(&state, &headers, "market:shares:read").await?;
-    market_shares_headroom_impl(&state, input).await
-}
-
-async fn market_shares_headroom_impl(
+async fn share_headroom_impl(
     state: &ServerState,
     input: ShareHeadroomRequest,
 ) -> Result<Json<ShareHeadroomResponse>, AppError> {
@@ -765,35 +675,10 @@ async fn market_shares_headroom_impl(
     }))
 }
 
-/// 429/rate-limit feedback from a market. Because the same owner_email
+/// 429/rate-limit feedback from a capacity consumer. Because the same owner_email
 /// typically backs all shares with shared upstream credentials, the penalty
 /// is applied to *every* share of that owner, not just the offending one.
 /// The override decays via TTL (default 30m).
-async fn market_shares_feedback(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<ShareFeedbackRequest>,
-) -> Result<Json<ShareFeedbackResponse>, AppError> {
-    let _market = authenticate_market(&state, &headers, "market:shares:read").await?;
-    apply_share_feedback(&state, input, "market").await
-}
-
-async fn market_share_states(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<MarketShareRuntimeStateSyncRequest>,
-) -> Result<Json<MarketShareRuntimeStateSyncResponse>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:share_states:write").await?;
-    let synced = state
-        .store
-        .sync_market_share_runtime_states(&market.email, input.replace, input.states)
-        .await?;
-    Ok(Json(MarketShareRuntimeStateSyncResponse {
-        ok: true,
-        synced,
-    }))
-}
-
 async fn apply_share_feedback(
     state: &ServerState,
     input: ShareFeedbackRequest,
@@ -854,7 +739,7 @@ async fn register_gateway(
 async fn gateway_shares(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<MarketShareView>>, AppError> {
+) -> Result<Json<Vec<GatewayShareView>>, AppError> {
     let gateway = authenticate_gateway(
         &state,
         &headers,
@@ -870,22 +755,22 @@ async fn gateway_shares(
         .list_gateway_shares(&gateway, "main", &active_subdomains, &inflight_by_share)
         .await?;
     for share in &mut shares {
-        if let Some(email) = share.owner_email.as_deref()
+        if let Some(email) = share.scheduling_owner_email.as_deref()
             && let Some(penalty) = state.scheduling_overrides.get(email)
         {
             share.signals.owner_penalty = (share.signals.owner_penalty * penalty).clamp(0.05, 1.0);
         }
     }
-    apply_market_share_route_availability(&state, &mut shares).await;
+    apply_share_route_availability(&state, &mut shares).await;
     Ok(Json(shares))
 }
 
 async fn gateway_shares_headroom(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<ShareHeadroomRequest>,
+    body: Bytes,
 ) -> Result<Json<ShareHeadroomResponse>, AppError> {
-    let body_hash = json_body_sha256_hex(&input)?;
+    let body_hash = sha256_hex(&body);
     let gateway = authenticate_gateway(
         &state,
         &headers,
@@ -894,16 +779,17 @@ async fn gateway_shares_headroom(
         &body_hash,
     )
     .await?;
-    drop(gateway);
-    market_shares_headroom_impl(&state, input).await
+    let input: ShareHeadroomRequest = parse_signed_gateway_json(&body)?;
+    require_gateway_share_access(&state, &gateway, input.share_ids.iter()).await?;
+    share_headroom_impl(&state, input).await
 }
 
 async fn gateway_shares_feedback(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<ShareFeedbackRequest>,
+    body: Bytes,
 ) -> Result<Json<ShareFeedbackResponse>, AppError> {
-    let body_hash = json_body_sha256_hex(&input)?;
+    let body_hash = sha256_hex(&body);
     let gateway = authenticate_gateway(
         &state,
         &headers,
@@ -912,16 +798,46 @@ async fn gateway_shares_feedback(
         &body_hash,
     )
     .await?;
-    drop(gateway);
+    let input: ShareFeedbackRequest = parse_signed_gateway_json(&body)?;
+    require_gateway_share_access(&state, &gateway, std::iter::once(&input.share_id)).await?;
     apply_share_feedback(&state, input, "gateway").await
+}
+
+async fn require_gateway_share_access<'a>(
+    state: &ServerState,
+    gateway: &GatewayRegistryRecord,
+    share_ids: impl IntoIterator<Item = &'a String>,
+) -> Result<(), AppError> {
+    let requested = share_ids.into_iter().collect::<HashSet<_>>();
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
+    let inflight_by_share = state.proxy.inflight_by_share().await;
+    let authorized = state
+        .store
+        .list_gateway_shares(gateway, "main", &active_subdomains, &inflight_by_share)
+        .await?
+        .into_iter()
+        .map(|share| share.share_id)
+        .collect::<HashSet<_>>();
+    if requested
+        .into_iter()
+        .any(|share_id| !authorized.contains(share_id))
+    {
+        return Err(AppError::Forbidden(
+            "Share is not authorized for this Gateway".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn batch_sync_gateway_request_logs(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<MarketRequestLogBatchSyncRequest>,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let body_hash = json_body_sha256_hex(&input)?;
+    let body_hash = sha256_hex(&body);
     let gateway = authenticate_gateway(
         &state,
         &headers,
@@ -930,278 +846,22 @@ async fn batch_sync_gateway_request_logs(
         &body_hash,
     )
     .await?;
+    let input: GatewayRequestObservationBatch = parse_signed_gateway_json(&body)?;
+    require_gateway_share_access(
+        &state,
+        &gateway,
+        input.logs.iter().filter_map(|log| log.share_id.as_ref()),
+    )
+    .await?;
+    let metric_logs = input.logs.clone();
     let count = state
         .store
         .batch_sync_gateway_request_logs(&gateway, input)
         .await?;
-    Ok(Json(serde_json::json!({ "ok": true, "synced": count })))
-}
-
-async fn admin_market_linked_shares(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(market_email): Path<String>,
-) -> Result<Json<Vec<MarketShareView>>, AppError> {
-    let current_user_email = require_session_email(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
-    let mut shares = state
-        .store
-        .list_manageable_market_shares(
-            &market_email,
-            &current_user_email,
-            is_admin,
-            &state.proxy.active_subdomains().await.into_iter().collect(),
-            &state.proxy.inflight_by_share().await,
-        )
-        .await?;
-    apply_market_share_route_availability(&state, &mut shares).await;
-    Ok(Json(shares))
-}
-
-async fn public_market_share_priority(
-    State(state): State<ServerState>,
-    Path(market_email): Path<String>,
-    Query(query): Query<PublicMarketSharePriorityQuery>,
-) -> Result<Json<Vec<MarketShareView>>, AppError> {
-    let mut shares = state
-        .store
-        .list_public_market_share_priority(
-            &market_email,
-            query.app.as_deref(),
-            &state.proxy.active_subdomains().await.into_iter().collect(),
-            &state.proxy.inflight_by_share().await,
-        )
-        .await?;
-    apply_market_share_route_availability(&state, &mut shares).await;
-    Ok(Json(shares))
-}
-
-#[derive(Debug, Deserialize)]
-struct PublicMarketSharePriorityQuery {
-    app: Option<String>,
-}
-
-async fn admin_update_market_disabled_shares(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(market_email): Path<String>,
-    Json(input): Json<MarketDisabledSharesUpdateRequest>,
-) -> Result<Json<MarketDisabledSharesUpdateResponse>, AppError> {
-    let current_user_email = require_session_email(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
-    let response = state
-        .store
-        .update_market_disabled_shares(&market_email, &current_user_email, is_admin, input)
-        .await?;
-    let metadata = extract_client_metadata(&headers, addr);
-    let payload = serde_json::json!({
-        "marketEmail": market_email,
-        "disabledShareIds": response.disabled_share_ids.clone(),
-    });
-    let _ = state
-        .store
-        .record_admin_audit(
-            Some(&current_user_email),
-            "market.disabled_shares.update",
-            Some(&payload),
-            metadata.ip.as_deref(),
-        )
-        .await;
-    Ok(Json(response))
-}
-
-async fn admin_update_market_maintenance(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(market_email): Path<String>,
-    Json(input): Json<MarketMaintenanceUpdateRequest>,
-) -> Result<Json<MarketMaintenanceUpdateResponse>, AppError> {
-    let current_user_email = require_session_email(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
-    let response = state
-        .store
-        .update_market_maintenance(&market_email, &current_user_email, is_admin, input)
-        .await?;
-    let metadata = extract_client_metadata(&headers, addr);
-    let payload = serde_json::json!({
-        "marketEmail": market_email,
-        "maintenanceEnabled": response.maintenance_enabled,
-    });
-    let _ = state
-        .store
-        .record_admin_audit(
-            Some(&current_user_email),
-            "market.maintenance.update",
-            Some(&payload),
-            metadata.ip.as_deref(),
-        )
-        .await;
-    Ok(Json(response))
-}
-
-async fn admin_release_market_share_state(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(market_email): Path<String>,
-    Json(input): Json<MarketShareRuntimeStateReleaseRequest>,
-) -> Result<Json<MarketShareRuntimeStateReleaseResponse>, AppError> {
-    let current_user_email = require_session_email(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
-    let market = state
-        .store
-        .ensure_market_manager(&market_email, &current_user_email, is_admin)
-        .await?;
-    let token = extract_bearer_token(&headers)
-        .ok_or_else(|| AppError::Unauthorized("missing router session bearer token".into()))?;
-    let route = state
-        .proxy
-        .backend_for_host(
-            &format!("{}.{}", market.subdomain, state.config.tunnel_domain),
-            &state.config.tunnel_domain,
-        )
-        .await
-        .ok_or_else(|| AppError::Conflict("market is offline".into()))?;
-    let url = format!(
-        "http://{}/market-api/router/share-states/release",
-        route.route_target()
-    );
-    let response = state
-        .proxy_http
-        .post(&url)
-        .bearer_auth(token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|err| AppError::Internal(format!("release market share state failed: {err}")))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| AppError::Internal(format!("read market release response failed: {err}")))?;
-    if !status.is_success() {
-        let message = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("message")
-                    .and_then(|message| message.as_str())
-                    .or_else(|| {
-                        value
-                            .get("error")
-                            .and_then(|error| error.get("message"))
-                            .and_then(|message| message.as_str())
-                    })
-                    .map(ToOwned::to_owned)
-            })
-            .unwrap_or(text);
-        return Err(AppError::BadRequest(format!(
-            "market release rejected: {message}"
-        )));
-    }
-    let response: MarketShareRuntimeStateReleaseResponse =
-        serde_json::from_str(&text).map_err(|err| {
-            AppError::Internal(format!("parse market release response failed: {err}"))
-        })?;
-    let metadata = extract_client_metadata(&headers, addr);
-    let payload = serde_json::json!({
-        "marketEmail": market_email,
-        "release": input,
-        "released": response.released,
-        "synced": response.synced,
-    });
-    let _ = state
-        .store
-        .record_admin_audit(
-            Some(&current_user_email),
-            "market.share_state.release",
-            Some(&payload),
-            metadata.ip.as_deref(),
-        )
-        .await;
-    Ok(Json(response))
-}
-
-async fn batch_sync_market_request_logs(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(mut input): Json<MarketRequestLogBatchSyncRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:request_logs:write").await?;
-    let snapshot = state.recent_traffic.snapshot().await;
-    enrich_market_request_logs_with_live_country(&mut input.logs, &snapshot);
-    let metric_logs = input.logs.clone();
-    let count = state
-        .store
-        .batch_sync_market_request_logs(&market, input)
-        .await?;
     state
         .metrics
-        .record_market_request_logs(&market.email, &metric_logs);
+        .record_gateway_request_observations(&gateway.id, &metric_logs);
     Ok(Json(serde_json::json!({ "ok": true, "synced": count })))
-}
-
-async fn issue_market_lease(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<IssueLeaseResponse>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:proxy:use").await?;
-    let market_email = market.email.clone();
-    let market_subdomain = market.subdomain.clone();
-    let mut response = match state
-        .store
-        .issue_market_lease(&state.config, &state.proxy, &market)
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            tracing::warn!(
-                market_email = %market_email,
-                requested_subdomain = %market_subdomain,
-                error = %err,
-                "market tunnel lease rejected"
-            );
-            return Err(err);
-        }
-    };
-    response.ssh_host_fingerprint = state.ssh_host_fingerprint.clone();
-    tracing::info!(
-        market_email = %market_email,
-        subdomain = %response.subdomain,
-        connection_id = %response.connection_id,
-        ssh_addr = %response.ssh_addr,
-        "market tunnel lease issued"
-    );
-    Ok(Json(response))
-}
-
-async fn send_market_notification_email(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<MarketNotificationEmailRequest>,
-) -> Result<Json<MarketNotificationEmailResponse>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:email:notify").await?;
-    Ok(Json(
-        state
-            .store
-            .send_market_notification_email(&state.config, state.resend.as_deref(), &market, input)
-            .await?,
-    ))
-}
-
-async fn list_market_notification_emails(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<MarketNotificationEmailLogView>>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:email:notify").await?;
-    Ok(Json(
-        state
-            .store
-            .list_market_notification_emails(&market.email)
-            .await?,
-    ))
 }
 
 async fn register_installation(
@@ -1888,7 +1548,7 @@ async fn dashboard(
         confirmed_request_events(&snapshot, &response, &global_ticker_logs);
     response.user_country_counts = confirmed_country_counts;
     response.recent_request_events = confirmed_events;
-    apply_dashboard_request_log_visibility(&mut response, viewer_email.as_deref(), viewer_is_admin);
+    apply_dashboard_request_log_visibility(&mut response, viewer_is_admin);
     Ok(Json(response))
 }
 
@@ -2160,11 +1820,7 @@ fn confirmed_request_events(
     (events, snapshot.country_counts.clone())
 }
 
-fn apply_dashboard_request_log_visibility(
-    response: &mut DashboardResponse,
-    viewer_email: Option<&str>,
-    viewer_is_admin: bool,
-) {
+fn apply_dashboard_request_log_visibility(response: &mut DashboardResponse, viewer_is_admin: bool) {
     let share_log_access = response
         .shares
         .iter()
@@ -2192,45 +1848,11 @@ fn apply_dashboard_request_log_visibility(
             remove_share_request_session_ids(&mut share.recent_requests);
         }
     }
-
-    let managed_market_emails = response
-        .markets
-        .iter()
-        .filter(|market| viewer_is_admin || market.can_manage)
-        .map(|market| market.email.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    for market in &mut response.markets {
-        let can_view_all =
-            viewer_is_admin || managed_market_emails.contains(&market.email.to_ascii_lowercase());
-        if !can_view_all {
-            market
-                .recent_requests
-                .retain(|log| emails_match(log.user_email.as_deref(), viewer_email));
-        }
-    }
-
-    for log in &mut response.market_request_logs {
-        let can_view_all = viewer_is_admin
-            || managed_market_emails.contains(&log.market_email.to_ascii_lowercase());
-        if !can_view_all {
-            if !emails_match(log.user_email.as_deref(), viewer_email) {
-                log.user_email = None;
-            }
-            log.api_key_prefix = None;
-        }
-    }
 }
 
 fn remove_share_request_session_ids(logs: &mut [ShareRequestLogEntry]) {
     for log in logs {
         log.session_id = None;
-    }
-}
-
-fn emails_match(left: Option<&str>, right: Option<&str>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
-        _ => false,
     }
 }
 
@@ -2310,28 +1932,6 @@ fn live_request_context_by_request_id(
             )
         })
         .collect()
-}
-
-fn enrich_market_request_logs_with_live_country(
-    logs: &mut [crate::models::MarketRequestLogEntry],
-    snapshot: &RecentTrafficSnapshot,
-) {
-    let context_by_request_id = live_request_context_by_request_id(snapshot);
-    for log in logs {
-        if let Some((user_country, user_country_iso3, user_email)) =
-            context_by_request_id.get(&log.request_id)
-        {
-            if log.user_country.is_none() {
-                log.user_country = user_country.clone();
-            }
-            if log.user_country_iso3.is_none() {
-                log.user_country_iso3 = user_country_iso3.clone();
-            }
-            if let Some(user_email) = user_email.as_ref() {
-                log.user_email = Some(user_email.clone());
-            }
-        }
-    }
 }
 
 fn enrich_share_ticker_logs_with_live_country(
@@ -2491,9 +2091,6 @@ fn persisted_ticker_request_events(
             .unwrap_or(&fallback);
         events.push(share_log_to_ticker_event(share, log));
     }
-    for log in &response.market_request_logs {
-        events.push(market_log_to_ticker_event(log));
-    }
     events
 }
 
@@ -2550,69 +2147,11 @@ fn share_log_to_ticker_event(
     }
 }
 
-fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequestEvent {
-    let usage_state = if log.status == "streaming" {
-        "pending"
-    } else {
-        "observed"
-    };
-    let usage_observed = usage_state == "observed";
-    RecentRequestEvent {
-        request_id: log.request_id.clone(),
-        share_id: log.share_id.clone().unwrap_or_default(),
-        share_name: log.share_subdomain.clone(),
-        share_subdomain: log.share_subdomain.clone(),
-        user_country: log.user_country.clone(),
-        user_country_iso3: log.user_country_iso3.clone(),
-        user_email: log.user_email.clone(),
-        input_tokens: usage_observed.then_some(log.input_tokens),
-        output_tokens: usage_observed.then_some(log.output_tokens),
-        cache_read_tokens: usage_observed.then_some(log.cache_read_tokens),
-        cache_creation_tokens: usage_observed.then_some(log.cache_creation_tokens),
-        total_tokens: usage_observed.then(|| market_log_total_tokens(log)),
-        usage_state: Some(usage_state.to_string()),
-        stream_status: Some(log.status.clone()),
-        usage_revision: Some(0),
-        request_agent: (!log.request_agent.is_empty()).then(|| log.request_agent.clone()),
-        requested_model: (!log.requested_model.is_empty()).then(|| log.requested_model.clone()),
-        actual_model: (!log.actual_model.is_empty()).then(|| log.actual_model.clone()),
-        model: log.model.clone().filter(|value| !value.trim().is_empty()),
-        latency_ms: log.latency_ms.filter(|value| *value > 0),
-        status_code: log.status_code.filter(|value| *value > 0),
-        started_at: parse_dashboard_log_time(&log.created_at),
-        is_inflight: false,
-        is_health_check: false,
-        health_status: None,
-        health_app_type: None,
-        health_model: None,
-    }
-}
-
 fn share_log_total_tokens(log: &ShareRequestLogEntry) -> u64 {
     u64::from(log.input_tokens)
         + u64::from(log.output_tokens)
         + u64::from(log.cache_read_tokens)
         + u64::from(log.cache_creation_tokens)
-}
-
-fn market_log_total_tokens(log: &DashboardMarketRequestLogView) -> u64 {
-    let input_tokens = u64::from(log.input_tokens);
-    let cache_read_tokens = u64::from(log.cache_read_tokens);
-    let uncached_input_tokens = if log.request_agent.trim().eq_ignore_ascii_case("codex") {
-        input_tokens.saturating_sub(cache_read_tokens)
-    } else {
-        input_tokens
-    };
-    uncached_input_tokens
-        + u64::from(log.output_tokens)
-        + cache_read_tokens
-        + u64::from(log.cache_creation_tokens)
-}
-
-fn parse_dashboard_log_time(value: &str) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now())
 }
 
 async fn public_map_points(
@@ -2752,7 +2291,8 @@ async fn get_my_notification_settings(
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
     let mut response = state.store.get_notification_settings(&email).await?;
-    response.telegram_bot_configured = state.dynamic.read().await.telegram_bot.is_operational();
+    let settings = state.dynamic.read().await.telegram_bot.clone();
+    align_notification_runtime_response(&mut response, &settings);
     Ok(Json(response))
 }
 
@@ -2766,8 +2306,77 @@ async fn update_my_notification_settings(
         .store
         .update_notification_settings(&email, patch)
         .await?;
-    response.telegram_bot_configured = state.dynamic.read().await.telegram_bot.is_operational();
+    let settings = state.dynamic.read().await.telegram_bot.clone();
+    align_notification_runtime_response(&mut response, &settings);
     Ok(Json(response))
+}
+
+/// The notification settings row is read from SQLite while the active Bot
+/// configuration is read from the hot-reloaded settings snapshot. During a
+/// token/mode change those two observations can briefly straddle the
+/// reconcile boundary. Hide the old identity and diagnostics until the
+/// runtime row carries the new fingerprint instead of showing a stale outage
+/// as if it belonged to the newly selected Bot.
+fn align_notification_runtime_response(
+    response: &mut NotificationSettingsResponse,
+    settings: &TelegramBotSettings,
+) {
+    let expected_fingerprint = settings.token().map(|token| {
+        crate::telegram::bind::telegram_config_fingerprint(
+            token,
+            settings.mode.as_str(),
+            settings.webhook_secret.as_deref(),
+        )
+    });
+    response.telegram_bot_configured = settings.is_operational();
+    if !settings.is_operational() {
+        response.telegram_bot_status = "disabled".into();
+        response.telegram_bot_transport_status = "unknown".into();
+        response.telegram_bot_username = None;
+        response.telegram_bot_failure_code = None;
+        response.telegram_bot_failure_hint = None;
+        response.telegram_bot_failure_details = None;
+        response.telegram_bot_last_failure_at = None;
+        for channel in &mut response.channels {
+            if channel.channel == crate::notification_channels::TELEGRAM_CHANNEL {
+                channel.available = false;
+            }
+        }
+        return;
+    }
+    if response.telegram_bot_runtime_fingerprint.as_deref() == expected_fingerprint.as_deref() {
+        // `mark_telegram_bot_reconciling` fences the new fingerprint before
+        // the remote getMe call completes, while the old identity is retained
+        // internally so a successful CAS can invalidate stale bindings. Do
+        // not expose that retained username until the new identity is ready.
+        if response.telegram_bot_status != "ready" {
+            response.telegram_bot_username = None;
+            for channel in &mut response.channels {
+                if channel.channel == crate::notification_channels::TELEGRAM_CHANNEL {
+                    channel.available = false;
+                }
+            }
+        }
+        return;
+    }
+
+    response.telegram_bot_status = if settings.is_operational() {
+        "reconciling"
+    } else {
+        "disabled"
+    }
+    .into();
+    response.telegram_bot_transport_status = "unknown".into();
+    response.telegram_bot_username = None;
+    response.telegram_bot_failure_code = None;
+    response.telegram_bot_failure_hint = None;
+    response.telegram_bot_failure_details = None;
+    response.telegram_bot_last_failure_at = None;
+    for channel in &mut response.channels {
+        if channel.channel == crate::notification_channels::TELEGRAM_CHANNEL {
+            channel.available = false;
+        }
+    }
 }
 
 /// Mint a single-use `t.me` deep link. The token is a bearer credential for
@@ -2789,11 +2398,7 @@ async fn create_my_telegram_bind_link(
     Ok(Json(
         state
             .store
-            .create_telegram_bind_link(
-                &email,
-                settings.bind_token_ttl_secs,
-                metadata.ip.as_deref(),
-            )
+            .create_telegram_bind_link(&email, settings.bind_token_ttl_secs, metadata.ip.as_deref())
             .await?,
     ))
 }
@@ -2804,7 +2409,8 @@ async fn unbind_my_telegram_chat(
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
     let mut response = state.store.unbind_telegram(&email).await?;
-    response.telegram_bot_configured = state.dynamic.read().await.telegram_bot.is_operational();
+    let settings = state.dynamic.read().await.telegram_bot.clone();
+    align_notification_runtime_response(&mut response, &settings);
     Ok(Json(response))
 }
 
@@ -3057,7 +2663,6 @@ async fn root_handler(
         if !route.is_client_web()
             && matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
-            && !is_market_host(&state, &host).await
         {
             if let Some(response) = ui_response_for_request_path(req.uri().path()) {
                 return response;
@@ -3090,7 +2695,6 @@ async fn ui_or_proxy_handler(
     if should_proxy_host(&state, request_host(&req)).await {
         if matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
-            && !is_market_host(&state, &request_host(&req)).await
         {
             if let Some(response) = ui_response_for_request_path(req.uri().path()) {
                 return response;
@@ -3107,16 +2711,6 @@ async fn ui_or_proxy_handler(
         }
     }
     proxy_handler(State(state), ConnectInfo(peer), req).await
-}
-
-/// True if the request's Host is cataloged as a Market. Used to skip the
-/// router's bundled Share UI so the Market's own web app reaches the user.
-async fn is_market_host(state: &ServerState, host: &str) -> bool {
-    let Some(subdomain) = crate::proxy::subdomain_for_host(host, &state.config.tunnel_domain)
-    else {
-        return false;
-    };
-    state.store.is_market_subdomain(&subdomain).await
 }
 
 fn is_router_share_ui_path(path: &str) -> bool {
@@ -3218,6 +2812,44 @@ mod tests {
     }
 
     #[test]
+    fn gateway_signature_body_hash_binds_exact_wire_bytes() {
+        let compact = br#"{"shareIds":["share-1"]}"#;
+        let spaced = br#"{ "shareIds": ["share-1"] }"#;
+
+        assert_ne!(sha256_hex(compact), sha256_hex(spaced));
+    }
+
+    #[test]
+    fn gateway_observation_json_rejects_legacy_downstream_identity() {
+        let minimal = br#"{
+            "logs": [{
+                "requestId": "req_gateway_minimal",
+                "requestAgent": "codex",
+                "requestedModel": "gpt-5",
+                "actualModel": "gpt-5",
+                "actualModelSource": "official",
+                "status": "success",
+                "createdAt": "2026-08-18T00:00:00Z"
+            }]
+        }"#;
+        assert!(parse_signed_gateway_json::<GatewayRequestObservationBatch>(minimal).is_ok());
+
+        let legacy = br#"{
+            "logs": [{
+                "requestId": "req_gateway_legacy_identity",
+                "userEmail": "downstream@example.com",
+                "requestAgent": "codex",
+                "requestedModel": "gpt-5",
+                "actualModel": "gpt-5",
+                "actualModelSource": "official",
+                "status": "success",
+                "createdAt": "2026-08-18T00:00:00Z"
+            }]
+        }"#;
+        assert!(parse_signed_gateway_json::<GatewayRequestObservationBatch>(legacy).is_err());
+    }
+
+    #[test]
     fn share_edit_event_stream_requests_initial_resync() {
         assert_eq!(
             initial_share_edit_stream_events(),
@@ -3263,6 +2895,43 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retired_token_market_routes_construct_and_fail_closed() {
+        let app: Router = retired_token_market_routes();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        for (method, path) in [
+            (reqwest::Method::GET, "/v1/markets"),
+            (reqwest::Method::POST, "/v1/markets/register"),
+            (reqwest::Method::GET, "/v1/market/shares"),
+            (
+                reqwest::Method::PATCH,
+                "/v1/admin/markets/legacy@example.com/maintenance",
+            ),
+            (reqwest::Method::POST, "/_market/proxy/share-1/v1/messages"),
+        ] {
+            let response = client
+                .request(method, format!("http://{address}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GONE, "legacy path {path}");
+        }
+
+        let response = client
+            .get(format!("http://{address}/v1/gateway/shares"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        server.abort();
     }
 
     #[tokio::test]
@@ -3568,7 +3237,6 @@ mod tests {
             map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
-            markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),
                 share_name: "Share".into(),
@@ -3579,7 +3247,6 @@ mod tests {
             country_boards: HashMap::new(),
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
-            market_request_logs: Vec::new(),
         };
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
@@ -3595,30 +3262,6 @@ mod tests {
         assert_eq!(event.request_agent.as_deref(), Some("codex"));
         assert_eq!(event.latency_ms, Some(14_600));
         assert_eq!(event.total_tokens, Some(86_000));
-    }
-
-    #[test]
-    fn market_log_ticker_event_uses_canonical_total_and_preserves_email() {
-        let mut log = market_log("req-market-usage", "codex");
-        log.user_email = Some("market-user@example.com".into());
-        log.input_tokens = 100;
-        log.output_tokens = 20;
-        log.cache_read_tokens = 40;
-        log.cache_creation_tokens = 5;
-        let event = market_log_to_ticker_event(&log);
-
-        assert_eq!(event.user_email.as_deref(), Some("market-user@example.com"));
-        assert_eq!(event.input_tokens, Some(100));
-        assert_eq!(event.output_tokens, Some(20));
-        assert_eq!(event.cache_read_tokens, Some(40));
-        assert_eq!(event.cache_creation_tokens, Some(5));
-        assert_eq!(event.total_tokens, Some(125));
-
-        log.input_tokens = 10;
-        assert_eq!(market_log_total_tokens(&log), 65);
-        log.input_tokens = 100;
-        log.request_agent = "claude".into();
-        assert_eq!(market_log_total_tokens(&log), 165);
     }
 
     #[test]
@@ -3677,67 +3320,6 @@ mod tests {
             ticker_shares[0].recent_requests[0].user_country.as_deref(),
             Some("JP")
         );
-
-        let mut market_logs = vec![market_sync_log("req-email-override", "codex")];
-        market_logs[0].user_country = Some("JP".into());
-        market_logs[0].user_country_iso3 = Some("JPN".into());
-        market_logs[0].user_email = Some("stale@example.com".into());
-        enrich_market_request_logs_with_live_country(&mut market_logs, &snapshot);
-        assert_eq!(
-            market_logs[0].user_email.as_deref(),
-            Some("actual@example.com")
-        );
-        assert_eq!(market_logs[0].user_country.as_deref(), Some("JP"));
-    }
-
-    #[test]
-    fn duplicate_share_and_market_events_keep_complete_email_and_usage() {
-        let mut share_log = share_log("req-duplicate", 1);
-        share_log.user_email = Some("share-user@example.com".into());
-        share_log.input_tokens = 10;
-        share_log.output_tokens = 20;
-        share_log.cache_read_tokens = 3;
-        share_log.cache_creation_tokens = 4;
-        let global_share_logs = vec![share_log.clone()];
-        let mut duplicate_market_log = market_log("req-duplicate", "codex");
-        duplicate_market_log.share_id = None;
-        duplicate_market_log.share_subdomain = None;
-        let mut response = dashboard_response(
-            vec![ticker_share(vec![share_log])],
-            vec![duplicate_market_log],
-        );
-        let snapshot = RecentTrafficSnapshot {
-            country_counts: HashMap::new(),
-            events: Vec::new(),
-            recent_events: Vec::new(),
-        };
-
-        let (events, _) = confirmed_request_events(&snapshot, &response, &global_share_logs);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].share_id, "share-1");
-        assert_eq!(events[0].share_name.as_deref(), Some("Share"));
-        assert_eq!(events[0].share_subdomain.as_deref(), Some("share-sub"));
-        assert_eq!(
-            events[0].user_email.as_deref(),
-            Some("share-user@example.com")
-        );
-        assert_eq!(events[0].input_tokens, Some(10));
-        assert_eq!(events[0].output_tokens, Some(20));
-        assert_eq!(events[0].cache_read_tokens, Some(3));
-        assert_eq!(events[0].cache_creation_tokens, Some(4));
-        assert_eq!(events[0].total_tokens, Some(37));
-
-        response.market_request_logs[0].user_email = Some("market-user@example.com".into());
-        response.market_request_logs[0].input_tokens = 100;
-        response.market_request_logs[0].output_tokens = 20;
-        response.market_request_logs[0].cache_read_tokens = 40;
-        response.market_request_logs[0].cache_creation_tokens = 5;
-        let (events, _) = confirmed_request_events(&snapshot, &response, &global_share_logs);
-        assert_eq!(events[0].input_tokens, Some(100));
-        assert_eq!(events[0].output_tokens, Some(20));
-        assert_eq!(events[0].cache_read_tokens, Some(40));
-        assert_eq!(events[0].cache_creation_tokens, Some(5));
-        assert_eq!(events[0].total_tokens, Some(125));
     }
 
     #[test]
@@ -3748,7 +3330,7 @@ mod tests {
             health.is_health_check = true;
             requests.push(health);
         }
-        let response = dashboard_response(vec![ticker_share(requests.clone())], Vec::new());
+        let response = dashboard_response(vec![ticker_share(requests.clone())]);
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
             events: Vec::new(),
@@ -3760,82 +3342,6 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].request_id, "req-user");
         assert!(!events[0].is_health_check);
-    }
-
-    #[test]
-    fn confirmed_request_events_accepts_market_request_logs() {
-        let event = RecentRequestEvent {
-            request_id: "req_market_confirmed".into(),
-            share_id: "share-1".into(),
-            share_name: Some("Share".into()),
-            share_subdomain: Some("share-sub".into()),
-            user_country: Some("US".into()),
-            user_country_iso3: Some("USA".into()),
-            user_email: Some("user@example.com".into()),
-            started_at: Utc::now(),
-            is_inflight: true,
-            ..Default::default()
-        };
-        let snapshot = RecentTrafficSnapshot {
-            country_counts: HashMap::from([("USA".to_string(), 1)]),
-            events: vec![event.clone()],
-            recent_events: vec![event],
-        };
-        let response = DashboardResponse {
-            generated_at: Utc::now(),
-            stats: crate::models::DashboardStats {
-                clients: 0,
-                active_shares: 0,
-                total_active_requests: 0,
-            },
-            map: crate::models::DashboardMap {
-                server: None,
-                countries: Vec::new(),
-            },
-            map_display: MapDisplaySettings::default(),
-            clients: Vec::new(),
-            shares: Vec::new(),
-            markets: Vec::new(),
-            ticker_shares: Vec::new(),
-            country_counts: HashMap::new(),
-            country_boards: HashMap::new(),
-            user_country_counts: HashMap::new(),
-            recent_request_events: Vec::new(),
-            market_request_logs: vec![crate::models::DashboardMarketRequestLogView {
-                request_id: "req_market_confirmed".into(),
-                market_id: "market-1".into(),
-                market_email: "market@example.com".into(),
-                market_subdomain: "market".into(),
-                user_email: None,
-                api_key_prefix: None,
-                router_id: None,
-                share_id: Some("share-1".into()),
-                share_subdomain: Some("share-sub".into()),
-                model: Some("gpt-5".into()),
-                request_agent: "codex".into(),
-                requested_model: "gpt-5".into(),
-                actual_model: "gpt-5".into(),
-                actual_model_source: "official".into(),
-                status: "streaming".into(),
-                status_code: Some(200),
-                error_message: None,
-                latency_ms: Some(1),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                usage_amount_usd: None,
-                created_at: Utc::now().to_rfc3339(),
-                settled_at: None,
-                user_country: None,
-                user_country_iso3: None,
-            }],
-        };
-
-        let (events, country_counts) = confirmed_request_events(&snapshot, &response, &[]);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].request_id, "req_market_confirmed");
-        assert_eq!(country_counts.get("USA"), Some(&1));
     }
 
     #[test]
@@ -3854,7 +3360,6 @@ mod tests {
             map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
-            markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),
                 share_name: "Share".into(),
@@ -3867,7 +3372,6 @@ mod tests {
             country_boards: HashMap::new(),
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
-            market_request_logs: Vec::new(),
         };
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
@@ -3910,7 +3414,6 @@ mod tests {
             map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
-            markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),
                 share_name: "Share".into(),
@@ -3921,7 +3424,6 @@ mod tests {
             country_boards: HashMap::new(),
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
-            market_request_logs: Vec::new(),
         };
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
@@ -3969,7 +3471,6 @@ mod tests {
             map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
-            markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),
                 share_name: "Persisted Share".into(),
@@ -3980,7 +3481,6 @@ mod tests {
             country_boards: HashMap::new(),
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
-            market_request_logs: Vec::new(),
         };
 
         let (events, country_counts) =
@@ -4023,7 +3523,6 @@ mod tests {
             map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
-            markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),
                 share_name: "Share".into(),
@@ -4034,7 +3533,6 @@ mod tests {
             country_boards: HashMap::new(),
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
-            market_request_logs: Vec::new(),
         };
 
         let (events, _) =
@@ -4104,73 +3602,6 @@ mod tests {
         }
     }
 
-    fn market_log(
-        request_id: &str,
-        request_agent: &str,
-    ) -> crate::models::DashboardMarketRequestLogView {
-        crate::models::DashboardMarketRequestLogView {
-            request_id: request_id.into(),
-            market_id: "market-1".into(),
-            market_email: "market@example.com".into(),
-            market_subdomain: "market".into(),
-            user_email: None,
-            api_key_prefix: None,
-            router_id: None,
-            share_id: Some("share-1".into()),
-            share_subdomain: Some("share-sub".into()),
-            model: Some("gpt-5".into()),
-            request_agent: request_agent.into(),
-            requested_model: "gpt-5".into(),
-            actual_model: "gpt-5".into(),
-            actual_model_source: "official".into(),
-            status: "settled".into(),
-            status_code: Some(200),
-            error_message: None,
-            latency_ms: Some(10),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            usage_amount_usd: None,
-            created_at: Utc::now().to_rfc3339(),
-            settled_at: Some(Utc::now().to_rfc3339()),
-            user_country: None,
-            user_country_iso3: None,
-        }
-    }
-
-    fn market_sync_log(
-        request_id: &str,
-        request_agent: &str,
-    ) -> crate::models::MarketRequestLogEntry {
-        crate::models::MarketRequestLogEntry {
-            request_id: request_id.into(),
-            user_email: None,
-            api_key_prefix: None,
-            router_id: None,
-            share_id: Some("share-1".into()),
-            share_subdomain: Some("share-sub".into()),
-            model: Some("gpt-5".into()),
-            request_agent: request_agent.into(),
-            requested_model: "gpt-5".into(),
-            actual_model: "gpt-5".into(),
-            actual_model_source: "official".into(),
-            status: "settled".into(),
-            status_code: Some(200),
-            error_message: None,
-            latency_ms: Some(10),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            usage_amount_usd: None,
-            created_at: Utc::now().to_rfc3339(),
-            settled_at: Some(Utc::now().to_rfc3339()),
-            user_country: None,
-            user_country_iso3: None,
-        }
-    }
-
     fn live_event(
         request_id: &str,
         user_email: Option<&str>,
@@ -4193,7 +3624,6 @@ mod tests {
 
     fn dashboard_response(
         ticker_shares: Vec<crate::models::DashboardTickerShare>,
-        market_request_logs: Vec<crate::models::DashboardMarketRequestLogView>,
     ) -> DashboardResponse {
         DashboardResponse {
             generated_at: Utc::now(),
@@ -4209,13 +3639,11 @@ mod tests {
             map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
-            markets: Vec::new(),
             ticker_shares,
             country_counts: HashMap::new(),
             country_boards: HashMap::new(),
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
-            market_request_logs,
         }
     }
 
@@ -4228,20 +3656,10 @@ mod tests {
         foreign_share_log.user_email = Some("foreign@example.com".into());
         foreign_share_log.session_id = Some("foreign-session".into());
 
-        let mut own_market_log = market_log("req-market-own", "codex");
-        own_market_log.user_email = Some("VIEWER@example.com".into());
-        own_market_log.api_key_prefix = Some("own-prefix".into());
-        let mut foreign_market_log = market_log("req-market-foreign", "codex");
-        foreign_market_log.user_email = Some("foreign@example.com".into());
-        foreign_market_log.api_key_prefix = Some("foreign-prefix".into());
-
-        let mut response = dashboard_response(
-            vec![ticker_share(vec![
-                own_share_log.clone(),
-                foreign_share_log.clone(),
-            ])],
-            vec![own_market_log, foreign_market_log],
-        );
+        let mut response = dashboard_response(vec![ticker_share(vec![
+            own_share_log.clone(),
+            foreign_share_log.clone(),
+        ])]);
         response.recent_request_events = vec![
             RecentRequestEvent {
                 request_id: "req-own".into(),
@@ -4257,7 +3675,7 @@ mod tests {
             },
         ];
 
-        apply_dashboard_request_log_visibility(&mut response, None, false);
+        apply_dashboard_request_log_visibility(&mut response, false);
 
         let ticker_logs = &response.ticker_shares[0].recent_requests;
         assert_eq!(ticker_logs.len(), 2);
@@ -4271,10 +3689,6 @@ mod tests {
             Some("foreign@example.com")
         );
         assert!(ticker_logs[1].session_id.is_none());
-        assert!(response.market_request_logs[0].user_email.is_none());
-        assert!(response.market_request_logs[0].api_key_prefix.is_none());
-        assert!(response.market_request_logs[1].user_email.is_none());
-        assert!(response.market_request_logs[1].api_key_prefix.is_none());
         assert_eq!(
             response.recent_request_events[0].user_email.as_deref(),
             Some("viewer@example.com")
@@ -4300,7 +3714,7 @@ mod tests {
         let mut log = share_log("req-admin", 1);
         log.user_email = Some("buyer@example.com".into());
         log.session_id = Some("buyer-session".into());
-        let mut response = dashboard_response(vec![ticker_share(vec![log])], Vec::new());
+        let mut response = dashboard_response(vec![ticker_share(vec![log])]);
         response.recent_request_events = vec![RecentRequestEvent {
             request_id: "req-admin".into(),
             share_id: "share-1".into(),
@@ -4308,7 +3722,7 @@ mod tests {
             ..Default::default()
         }];
 
-        apply_dashboard_request_log_visibility(&mut response, None, true);
+        apply_dashboard_request_log_visibility(&mut response, true);
 
         assert_eq!(
             response.ticker_shares[0].recent_requests[0]
@@ -4532,7 +3946,7 @@ mod tests {
         let share = ShareForTest {
             subdomain: "share-sub".into(),
             owner_email: "owner@example.com".into(),
-            shared_with_emails: Vec::new(),
+            user_grants: Default::default(),
             bindings: std::collections::BTreeMap::from([("claude".into(), "cursor-1".into())]),
             app_providers: crate::models::ShareAppProviders {
                 claude: vec![crate::models::ShareAppProvider {
@@ -4544,7 +3958,6 @@ mod tests {
                     is_current: true,
                     enabled: true,
                     codex_image_generation_enabled: false,
-                    for_sale_official_price_percent: None,
                     account_email: None,
                     api_url: None,
                     quota: None,
@@ -4563,7 +3976,7 @@ mod tests {
         let share = ShareForTest {
             subdomain: "share-sub".into(),
             owner_email: "owner@example.com".into(),
-            shared_with_emails: Vec::new(),
+            user_grants: Default::default(),
             bindings: std::collections::BTreeMap::from([("codex".into(), "provider-1".into())]),
             app_providers: crate::models::ShareAppProviders {
                 codex: vec![crate::models::ShareAppProvider {
@@ -4575,7 +3988,6 @@ mod tests {
                     is_current: true,
                     enabled: true,
                     codex_image_generation_enabled: true,
-                    for_sale_official_price_percent: None,
                     account_email: None,
                     api_url: None,
                     quota: None,
@@ -4594,7 +4006,7 @@ mod tests {
         let share = ShareForTest {
             subdomain: "share-sub".into(),
             owner_email: "owner@example.com".into(),
-            shared_with_emails: Vec::new(),
+            user_grants: Default::default(),
             bindings: std::collections::BTreeMap::from([("codex".into(), "provider-1".into())]),
             app_providers: crate::models::ShareAppProviders {
                 codex: vec![crate::models::ShareAppProvider {
@@ -4606,7 +4018,6 @@ mod tests {
                     is_current: false,
                     enabled: true,
                     codex_image_generation_enabled: true,
-                    for_sale_official_price_percent: None,
                     account_email: None,
                     api_url: None,
                     quota: None,
@@ -5128,19 +4539,6 @@ fn cookie_domain_allowed(tunnel_domain: &str) -> bool {
     value.contains('.')
 }
 
-async fn authenticate_market(
-    state: &ServerState,
-    headers: &HeaderMap,
-    required_scope: &str,
-) -> Result<crate::models::MarketRegistryRecord, AppError> {
-    let token = extract_bearer_token(headers)
-        .ok_or_else(|| AppError::Unauthorized("missing market session bearer token".into()))?;
-    state
-        .store
-        .authenticate_market_session(token, required_scope)
-        .await
-}
-
 async fn authenticate_gateway(
     state: &ServerState,
     headers: &HeaderMap,
@@ -5177,10 +4575,9 @@ fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Ap
         .ok_or_else(|| AppError::Unauthorized(format!("missing {name} header")))
 }
 
-fn json_body_sha256_hex<T: Serialize>(value: &T) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|e| AppError::Internal(format!("serialize signed gateway body failed: {e}")))?;
-    Ok(sha256_hex(&bytes))
+fn parse_signed_gateway_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, AppError> {
+    serde_json::from_slice(body)
+        .map_err(|error| AppError::BadRequest(format!("invalid signed gateway JSON body: {error}")))
 }
 
 fn empty_body_sha256_hex() -> String {
@@ -6799,12 +6196,8 @@ async fn admin_user_notification_channels(
     let session = require_admin_session(&state, &headers).await?;
     let settings = state.dynamic.read().await.telegram_bot.clone();
     Ok(Json(
-        crate::user_notification_health::channel_states(
-            &state.store,
-            &settings,
-            &session.email,
-        )
-        .await?,
+        crate::user_notification_health::channel_states(&state.store, &settings, &session.email)
+            .await?,
     ))
 }
 
@@ -7354,10 +6747,7 @@ async fn refresh_share_usage(
 
     let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
     let is_owner = share.owner_email.eq_ignore_ascii_case(&current_user_email);
-    let is_shared_with = share
-        .shared_with_emails
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(&current_user_email));
+    let is_shared_with = share.has_active_shareto(&current_user_email);
 
     if !is_admin && !is_owner && !is_shared_with {
         return Err(AppError::Forbidden(
@@ -7615,10 +7005,7 @@ async fn test_share_connection(
 
     let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
     let is_owner = share.owner_email.eq_ignore_ascii_case(&current_user_email);
-    let is_shared_with = share
-        .shared_with_emails
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(&current_user_email));
+    let is_shared_with = share.has_active_shareto(&current_user_email);
 
     if !is_admin && !is_owner && !is_shared_with {
         return Err(AppError::Forbidden(
@@ -7763,8 +7150,8 @@ async fn test_share_connection(
                         share_id = %share_id,
                         app = %app,
                         share_model_health_deleted = recovery.share_model_health_deleted,
-                        market_model_failures_deleted = recovery.market_model_failures_deleted,
-                        market_runtime_states_deleted = recovery.market_runtime_states_deleted,
+                        gateway_model_failures_deleted = recovery.gateway_model_failures_deleted,
+                        gateway_runtime_states_deleted = recovery.gateway_runtime_states_deleted,
                         "test-connection recovered share app scheduling state"
                     );
                     Some(recovery)

@@ -1,8 +1,6 @@
 import { authFetch } from "@/lib/auth";
 import type {
   DashboardResponse,
-  MarketShare,
-  ShareSessionLoad,
   ClearMetricsResponse,
   SettingsSnapshot,
   SettingsValidationResponse,
@@ -231,7 +229,7 @@ export async function updateAnnouncement(update: AnnouncementSettingsUpdate) {
 export type DashboardUxEvent = {
   eventType: string;
   source?: string;
-  targetType?: "request" | "client" | "share" | "market" | "country";
+  targetType?: "request" | "client" | "share" | "country";
   stepCount?: number;
   elapsedMs?: number;
   keyboard?: boolean;
@@ -296,12 +294,12 @@ export async function getMyNotificationSettings() {
   );
 }
 
-export async function updateMyNotificationSettings(enabledChannels: string[]) {
+export async function updateMyNotificationSettings(channel: string) {
   return parseJson<NotificationSettings>(
     await authFetch("/v1/me/notifications", {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ enabledChannels }),
+      body: JSON.stringify({ channel }),
     }),
   );
 }
@@ -344,76 +342,6 @@ export async function updateMyUsageCardSettings(patch: UpdateUsageCardSettingsRe
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
-    }),
-  );
-}
-
-export async function getMarketLinkedShares(marketEmail: string) {
-  return parseJson<MarketShare[]>(
-    await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/linked-shares`, {
-      cache: "no-store",
-    }),
-  );
-}
-
-export async function getMarketSharePriority(marketEmail: string, app?: string) {
-  const query = app ? `?${new URLSearchParams({ app }).toString()}` : "";
-  return parseJson<MarketShare[]>(
-    await fetch(`/v1/markets/${encodeURIComponent(marketEmail)}/share-priority${query}`, {
-      cache: "no-store",
-    }),
-  );
-}
-
-export async function getMarketShareSessionLoads(publicBaseUrl: string, app?: string) {
-  const base = publicBaseUrl.trim().replace(/\/+$/, "");
-  if (!base) return [] as ShareSessionLoad[];
-  const query = app ? `?${new URLSearchParams({ app }).toString()}` : "";
-  return parseJson<ShareSessionLoad[]>(
-    await fetch(`${base}/v1/public/share-session-loads${query}`, {
-      cache: "no-store",
-    }),
-  );
-}
-
-export async function updateMarketDisabledShares(marketEmail: string, disabledShareIds: string[]) {
-  return parseJson<{ ok: boolean; disabledShareIds: string[] }>(
-    await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/disabled-shares`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ disabledShareIds }),
-    }),
-  );
-}
-
-export async function updateMarketMaintenance(
-  marketEmail: string,
-  input: { maintenanceEnabled: boolean; maintenanceMessage?: string | null },
-) {
-  return parseJson<{ ok: boolean; maintenanceEnabled: boolean; maintenanceMessage?: string }>(
-    await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/maintenance`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
-    }),
-  );
-}
-
-export async function releaseMarketShareState(
-  marketEmail: string,
-  input: {
-    routerId: string;
-    shareId: string;
-    kind: string;
-    appType?: string;
-    modelId?: string;
-  },
-) {
-  return parseJson<{ ok: boolean; released: number; synced: number }>(
-    await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/share-states/release`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
     }),
   );
 }

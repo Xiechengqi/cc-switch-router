@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use chrono::Utc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -155,6 +156,9 @@ impl AlertingService {
                         success.provider_message_id.clone(),
                         Some(success.http_status),
                         None,
+                        None,
+                        None,
+                        None,
                         tested_at,
                     )
                     .await?;
@@ -173,10 +177,32 @@ impl AlertingService {
                         None,
                         failure.http_status,
                         Some(failure.message.clone()),
+                        Some(failure.failure_code.clone()),
+                        Some(failure.failure_hint.clone()),
+                        failure.failure_details.clone(),
                         tested_at,
                     )
                     .await?;
-                Err(AppError::Internal(failure.message))
+                Err(AppError::Coded {
+                    status: if failure.http_status.is_some_and(|status| status == 401) {
+                        StatusCode::UNAUTHORIZED
+                    } else if failure.http_status.is_some_and(|status| status == 429) {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
+                    code: "ALERT_CHANNEL_TEST_FAILED",
+                    message: failure.failure_hint.clone(),
+                    details: serde_json::json!({
+                        "channel": channel,
+                        "httpStatus": failure.http_status,
+                        "retryable": failure.retryable,
+                        "failureCode": failure.failure_code,
+                        "failureHint": failure.failure_hint,
+                        "diagnostics": failure.failure_details,
+                        "technicalError": failure.message,
+                    }),
+                })
             }
         }
     }
@@ -226,8 +252,10 @@ impl AlertingService {
             .map(|channel| {
                 let enabled = channel_enabled(settings, channel);
                 let configured = channel_configured(settings, channel);
-                let (last_attempt_at, last_success_at, last_error) =
-                    activity.get(channel).cloned().unwrap_or((None, None, None));
+                let channel_activity = activity.get(channel).cloned().unwrap_or_default();
+                let last_attempt_at = channel_activity.last_attempt_at;
+                let last_success_at = channel_activity.last_success_at;
+                let last_error = channel_activity.last_error.clone();
                 let status = if !settings.enabled || !enabled {
                     "disabled"
                 } else if !configured {
@@ -251,6 +279,9 @@ impl AlertingService {
                     last_attempt_at,
                     last_success_at,
                     last_error,
+                    failure_code: channel_activity.failure_code,
+                    failure_hint: channel_activity.failure_hint,
+                    failure_details: channel_activity.failure_details,
                 }
             })
             .collect())
@@ -344,6 +375,9 @@ impl AlertingService {
                 Err(failure) if failure.retryable && delivery.attempts < MAX_DELIVERY_ATTEMPTS => {
                     AlertDeliveryResult::Retry {
                         error: failure.message,
+                        failure_code: Some(failure.failure_code),
+                        failure_hint: Some(failure.failure_hint),
+                        failure_details: failure.failure_details,
                         next_attempt_at: failure.retry_at.unwrap_or_else(|| {
                             Utc::now()
                                 .timestamp()
@@ -354,6 +388,9 @@ impl AlertingService {
                 }
                 Err(failure) => AlertDeliveryResult::DeadLetter {
                     error: failure.message,
+                    failure_code: Some(failure.failure_code),
+                    failure_hint: Some(failure.failure_hint),
+                    failure_details: failure.failure_details,
                     http_status: failure.http_status,
                 },
             };

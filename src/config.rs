@@ -590,7 +590,6 @@ impl TelegramBotSettings {
             .map(str::trim)
             .filter(|token| !token.is_empty())
     }
-
 }
 
 impl fmt::Debug for TelegramBotSettings {

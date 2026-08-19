@@ -22,6 +22,9 @@ pub struct ChannelSendFailure {
     pub retry_at: Option<i64>,
     pub http_status: Option<u16>,
     pub message: String,
+    pub failure_code: String,
+    pub failure_hint: String,
+    pub failure_details: Option<serde_json::Value>,
 }
 
 impl From<TelegramFailure> for ChannelSendFailure {
@@ -31,6 +34,11 @@ impl From<TelegramFailure> for ChannelSendFailure {
             retry_at: failure.retry_at,
             http_status: failure.http_status,
             message: failure.message,
+            failure_code: failure.code.as_str().into(),
+            failure_hint: failure.hint,
+            failure_details: failure
+                .diagnostics
+                .and_then(|value| serde_json::to_value(value).ok()),
         }
     }
 }
@@ -48,6 +56,9 @@ pub async fn send(
             retry_at: None,
             http_status: None,
             message: format!("unsupported alert channel: {other}"),
+            failure_code: "configuration".into(),
+            failure_hint: "The selected alert channel is not supported.".into(),
+            failure_details: None,
         }),
     }
 }
@@ -69,14 +80,25 @@ async fn send_telegram(
         settings.telegram_chat_id.as_deref(),
         "Telegram chat id is not configured",
     )?;
-    let success =
-        telegram::send_message(http, token, chat_id, settings.telegram_topic_id, text).await?;
+    // Operator alert bodies are composed from admin-configured templates, so
+    // they go out verbatim: interpreting them as markup would let a stray
+    // angle bracket in a hostname fail the whole alert.
+    let success = telegram::send_message(
+        http,
+        token,
+        chat_id,
+        settings.telegram_topic_id,
+        text,
+        telegram::TelegramParseMode::Plain,
+    )
+    .await?;
     Ok(ChannelSendSuccess {
         provider_message_id: success.provider_message_id,
         http_status: success.http_status,
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn required<'a>(value: Option<&'a str>, message: &str) -> Result<&'a str, ChannelSendFailure> {
     value
         .map(str::trim)
@@ -86,6 +108,9 @@ fn required<'a>(value: Option<&'a str>, message: &str) -> Result<&'a str, Channe
             retry_at: None,
             http_status: None,
             message: message.into(),
+            failure_code: "configuration".into(),
+            failure_hint: "Complete the alert channel configuration before testing.".into(),
+            failure_details: None,
         })
 }
 

@@ -262,6 +262,7 @@ pub struct OwnedShareView {
     pub supported_apps: Vec<String>,
     pub share_status: String,
     pub already_listed: bool,
+    pub free_access: bool,
     pub supported_user_token_periods: Vec<ShareTokenPeriod>,
 }
 
@@ -2573,6 +2574,7 @@ impl AppStore {
                             WHERE sub.share_id = s.share_id
                               AND sub.status NOT IN ('released', 'grant_failed')
                         ) THEN 1 ELSE 0 END,
+                        COALESCE(s.free_access, 0),
                         COALESCE(s.supported_user_token_periods_json, '[]')
                  FROM shares s
                  WHERE lower(s.owner_email) = lower(?1)
@@ -2583,7 +2585,7 @@ impl AppStore {
             .query_map(params![session.email], |row| {
                 let app_type: String = row.get(2)?;
                 let bindings_json: String = row.get(5)?;
-                let periods_json: String = row.get(8)?;
+                let periods_json: String = row.get(9)?;
                 Ok(OwnedShareView {
                     share_id: row.get(0)?,
                     share_name: row.get(1)?,
@@ -2593,6 +2595,7 @@ impl AppStore {
                     supported_apps: supported_share_apps(&bindings_json, &app_type),
                     share_status: row.get(6)?,
                     already_listed: row.get::<_, i64>(7)? != 0,
+                    free_access: row.get::<_, i64>(8)? != 0,
                     supported_user_token_periods: serde_json::from_str(&periods_json)
                         .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]),
                 })
@@ -3100,6 +3103,35 @@ fn close_reclaimable_stale_listings_tx(
     Ok(())
 }
 
+fn ensure_no_pending_free_access_edit_tx(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<(), AppError> {
+    let patch_json = conn
+        .query_row(
+            "SELECT patch_json FROM share_edit_requests
+             WHERE share_id = ?1 AND status = 'pending' AND retired_at IS NULL
+             ORDER BY revision DESC LIMIT 1",
+            params![share_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db("read pending Share access edit"))?;
+    let Some(patch_json) = patch_json else {
+        return Ok(());
+    };
+    let patch: ShareSettingsPatch = serde_json::from_str(&patch_json).map_err(|error| {
+        AppError::Internal(format!("decode pending Share edit failed: {error}"))
+    })?;
+    let enables_free_access = patch.free_access.unwrap_or(false);
+    if enables_free_access {
+        return Err(AppError::Conflict(
+            "wait for the pending public free access edit before listing this Share".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl AppStore {
     pub async fn share_market_create_listing(
         &self,
@@ -3125,11 +3157,11 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(map_db("begin Share Market listing"))?;
-        let share: Option<(String, String, String, String, String)> = tx
+        let share: Option<(String, String, String, String, bool)> = tx
             .query_row(
                 "SELECT owner_email, share_status,
                         COALESCE(supported_user_token_periods_json, '[]'), installation_id,
-                        for_sale
+                        COALESCE(free_access, 0)
                  FROM shares WHERE share_id = ?1",
                 params![share_id],
                 |row| {
@@ -3138,13 +3170,13 @@ impl AppStore {
                         row.get(1)?,
                         row.get(2)?,
                         row.get(3)?,
-                        row.get(4)?,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
             .optional()
             .map_err(map_db("read listing Share"))?;
-        let Some((owner_email, share_status, periods_json, installation_id, for_sale)) = share
+        let Some((owner_email, share_status, periods_json, installation_id, free_access)) = share
         else {
             return Err(AppError::NotFound("Share not found".into()));
         };
@@ -3158,11 +3190,12 @@ impl AppStore {
                 "Share must be active before it can be listed".into(),
             ));
         }
-        if for_sale == "Yes" {
+        if free_access {
             return Err(AppError::Conflict(
-                "disable federated Share sale before listing it in Share Market".into(),
+                "disable public free access before listing the Share in Share Market".into(),
             ));
         }
+        ensure_no_pending_free_access_edit_tx(&tx, share_id)?;
         let supported: Vec<ShareTokenPeriod> = serde_json::from_str(&periods_json)
             .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]);
         if seats
@@ -3270,21 +3303,12 @@ impl AppStore {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(map_db("begin add Share seat"))?;
-        let owner: Option<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )> = tx
+        let owner: Option<(String, String, String, String, String, String, String, bool)> = tx
             .query_row(
                 "SELECT listing.owner_user_id, listing.owner_email, s.owner_email,
                         s.share_status,
                         COALESCE(s.supported_user_token_periods_json, '[]'), listing.share_id,
-                        listing.status, s.for_sale
+                        listing.status, COALESCE(s.free_access, 0)
                  FROM share_market_listings listing
                  JOIN shares s ON s.share_id = listing.share_id
                  WHERE listing.id = ?1",
@@ -3298,7 +3322,7 @@ impl AppStore {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
-                        row.get(7)?,
+                        row.get::<_, i64>(7)? != 0,
                     ))
                 },
             )
@@ -3312,7 +3336,7 @@ impl AppStore {
             periods_json,
             share_id,
             listing_status,
-            for_sale,
+            free_access,
         )) = owner
         else {
             return Err(AppError::NotFound("listing not found".into()));
@@ -3328,11 +3352,12 @@ impl AppStore {
                 "listing Share is no longer active or owned by this account".into(),
             ));
         }
-        if for_sale == "Yes" {
+        if free_access {
             return Err(AppError::Conflict(
-                "disable federated Share sale before adding or reopening Share Market seats".into(),
+                "disable public free access before adding or reopening Share Market seats".into(),
             ));
         }
+        ensure_no_pending_free_access_edit_tx(&tx, &share_id)?;
         let count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM share_market_seats
@@ -6603,21 +6628,20 @@ fn apply_control_grant_effect(
     policy: Option<&ShareUserPolicy>,
     now: &str,
 ) -> Result<(), AppError> {
-    let row: Option<(String, String)> = conn
+    let grants_json: Option<String> = conn
         .query_row(
-            "SELECT COALESCE(user_grants_json, '{}'), COALESCE(shared_with_emails_json, '[]')
+            "SELECT COALESCE(user_grants_json, '{}')
              FROM shares WHERE share_id = ?1",
             params![share_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()
         .map_err(map_db("read Share grants for control effect"))?;
-    let Some((grants_json, shared_json)) = row else {
+    let Some(grants_json) = grants_json else {
         return Ok(());
     };
-    let mut grants: BTreeMap<String, ShareUserGrant> =
-        serde_json::from_str(&grants_json).unwrap_or_default();
-    let mut shared: Vec<String> = serde_json::from_str(&shared_json).unwrap_or_default();
+    let mut grants: BTreeMap<String, ShareUserGrant> = serde_json::from_str(&grants_json)
+        .map_err(|error| AppError::Internal(format!("stored Share grants are invalid: {error}")))?;
     let email = email.trim().to_ascii_lowercase();
     if email.is_empty() {
         return Ok(());
@@ -6631,6 +6655,13 @@ fn apply_control_grant_effect(
                 ));
             };
             let previous = grants.get(&email).cloned();
+            let usage_rebase = previous
+                .as_ref()
+                .and_then(|grant| grant.usage_rebase.clone())
+                .filter(|rebase| {
+                    rebase.period == policy.token_period
+                        && rebase.anchor_at_ms == policy.token_period_anchor_at_ms
+                });
             grants.insert(
                 email.clone(),
                 ShareUserGrant {
@@ -6642,6 +6673,7 @@ fn apply_control_grant_effect(
                         .as_ref()
                         .map(|grant| grant.usage.clone())
                         .unwrap_or_default(),
+                    usage_rebase,
                     created_at_ms: previous
                         .as_ref()
                         .map(|grant| grant.created_at_ms)
@@ -6658,12 +6690,6 @@ fn apply_control_grant_effect(
                     entitlement_id: Some(entitlement_id.to_string()),
                 },
             );
-            if !shared
-                .iter()
-                .any(|value| value.eq_ignore_ascii_case(&email))
-            {
-                shared.push(email);
-            }
         }
         "revoke" => {
             let target_email = grants
@@ -6680,7 +6706,6 @@ fn apply_control_grant_effect(
                 grant.revoked_at_ms = Some(now_ms);
                 grant.revision = grant.revision.saturating_add(1).max(1);
             }
-            shared.retain(|value| !value.eq_ignore_ascii_case(&target_email));
         }
         _ => return Ok(()),
     }
@@ -6689,16 +6714,11 @@ fn apply_control_grant_effect(
             "encode Share grants after control effect failed: {error}"
         ))
     })?;
-    let shared_json = serde_json::to_string(&shared).map_err(|error| {
-        AppError::Internal(format!(
-            "encode Share ACL after control effect failed: {error}"
-        ))
-    })?;
     conn.execute(
         "UPDATE shares
-         SET user_grants_json = ?2, shared_with_emails_json = ?3, updated_at = ?4
+         SET user_grants_json = ?2, shared_with_emails_json = '[]', updated_at = ?3
          WHERE share_id = ?1",
-        params![share_id, grants_json, shared_json, now],
+        params![share_id, grants_json, now],
     )
     .map_err(map_db("persist Share control grant effect"))?;
     Ok(())
@@ -7273,6 +7293,7 @@ mod tests {
             active: true,
             policy: ShareUserPolicy::default(),
             usage: Default::default(),
+            usage_rebase: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             revoked_at_ms: None,
@@ -8274,6 +8295,73 @@ mod tests {
         assert_eq!(shares[0].subdomain, "share-options-route");
         assert_eq!(shares[0].owner_email, owner.email);
         assert_eq!(shares[0].supported_apps, vec!["claude", "gemini"]);
+        assert!(!shares[0].free_access);
+    }
+
+    #[tokio::test]
+    async fn owned_share_options_expose_free_access_for_listing_candidate_filtering() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-free-options", "owner-free-options@example.com");
+        insert_share(
+            &store,
+            "share-free-options",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET free_access = 1 WHERE share_id = ?1",
+                params!["share-free-options"],
+            )
+            .expect("make Share public free");
+
+        let shares = store
+            .share_market_owned_shares(&owner)
+            .await
+            .expect("list owned Share options");
+        assert_eq!(shares.len(), 1);
+        assert!(shares[0].free_access);
+    }
+
+    #[tokio::test]
+    async fn pending_free_access_edit_blocks_share_market_listing_race() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-pending-free", "owner-pending-free@example.com");
+        insert_share(
+            &store,
+            "share-pending-free",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        store
+            .create_share_settings_edit(
+                "share-pending-free",
+                &owner.email,
+                ShareSettingsPatch {
+                    free_access: Some(true),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("queue public free access edit");
+
+        let error = store
+            .share_market_create_listing(
+                &owner,
+                CreateListingRequest {
+                    share_id: "share-pending-free".to_string(),
+                    seats: vec![free_seat()],
+                },
+            )
+            .await
+            .expect_err("pending Free edit must block listing");
+        assert!(matches!(error, AppError::Conflict(_)));
+        assert!(error.to_string().contains("pending public free access"));
     }
 
     #[tokio::test]
@@ -11563,6 +11651,7 @@ mod tests {
                             active: true,
                             policy: ShareUserPolicy::default(),
                             usage: Default::default(),
+                            usage_rebase: None,
                             created_at_ms: 1,
                             updated_at_ms: 1,
                             revoked_at_ms: None,
@@ -11857,7 +11946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn federated_sale_blocks_share_market_listing_and_reopen() {
+    async fn public_free_access_blocks_share_market_listing_and_reopen() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-federated", "owner-federated@example.com");
         insert_share(
@@ -11877,10 +11966,10 @@ mod tests {
                 &Utc::now().to_rfc3339(),
             );
             conn.execute(
-                "UPDATE shares SET for_sale = 'Yes' WHERE share_id = 'share-federated'",
+                "UPDATE shares SET free_access = 1 WHERE share_id = 'share-federated'",
                 [],
             )
-            .expect("enable federated sale");
+            .expect("enable public free access");
         }
         assert!(matches!(
             store
@@ -11900,10 +11989,10 @@ mod tests {
             .lock()
             .await
             .execute(
-                "UPDATE shares SET for_sale = 'No' WHERE share_id = 'share-federated'",
+                "UPDATE shares SET free_access = 0 WHERE share_id = 'share-federated'",
                 [],
             )
-            .expect("disable federated sale");
+            .expect("disable public free access");
         let (listing_id, _) = create_listing(&store, &owner, "share-federated", free_seat()).await;
         store
             .share_market_close_listing(&owner, &listing_id)
@@ -11914,10 +12003,10 @@ mod tests {
             .lock()
             .await
             .execute(
-                "UPDATE shares SET for_sale = 'Yes' WHERE share_id = 'share-federated'",
+                "UPDATE shares SET free_access = 1 WHERE share_id = 'share-federated'",
                 [],
             )
-            .expect("re-enable federated sale");
+            .expect("re-enable public free access");
         assert!(matches!(
             store
                 .share_market_add_seat(&owner, &listing_id, free_seat())

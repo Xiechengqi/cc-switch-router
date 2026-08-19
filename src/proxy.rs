@@ -35,7 +35,6 @@ use crate::store::{
     ShareForTest, image_result_path,
 };
 
-const MARKET_REQUEST_ID_HEADER: &str = "x-cc-switch-market-request-id";
 const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
 const CLIENT_WEB_USER_EMAIL_HEADER: &str = "x-cc-switch-web-user-email";
 const CLIENT_WEB_ROLE_HEADER: &str = "x-cc-switch-web-role";
@@ -53,7 +52,6 @@ const ROUTE_RECONNECT_MAX_WAITERS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteKind {
     Share,
-    Market,
     ClientWeb,
 }
 
@@ -929,7 +927,6 @@ struct ProxyResponseLifecycle {
     share: Option<ShareConcurrencyPermit>,
     _free_share_ip: Option<KeyedConcurrencyPermit>,
     _image: Option<KeyedConcurrencyPermit>,
-    _market: Option<KeyedConcurrencyPermit>,
     _recent_traffic: Option<RecentTrafficGuard>,
     _share_llm_metrics: Option<ShareLlmProxyMetricsGuard>,
     _metrics: Option<MetricsPermit>,
@@ -982,7 +979,7 @@ impl Drop for ShareLlmProxyMetricsGuard {
             timestamp: chrono::Utc::now().timestamp(),
             request_id: Some(self.request_id.clone()),
             route_type: "direct".into(),
-            market_email: None,
+            gateway_id: None,
             share_id: Some(self.share_id.clone()),
             subdomain: Some(self.subdomain.clone()),
             app_type: self.app_type.clone(),
@@ -1088,6 +1085,14 @@ fn llm_error_kind(status: StatusCode, headers: &HeaderMap) -> Option<String> {
 }
 
 impl KeyedConcurrencyLimiter {
+    #[cfg(test)]
+    async fn snapshot(&self) -> HashMap<String, usize> {
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Increment the in-flight counter for this key. Returns `None` when a
     /// non-negative `parallel_limit` has been reached (caller should reject the
     /// request). A negative `parallel_limit` means unlimited — we still track
@@ -1120,13 +1125,6 @@ impl KeyedConcurrencyLimiter {
             },
         })
     }
-
-    async fn snapshot(&self) -> HashMap<String, usize> {
-        self.counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
 }
 
 #[derive(Debug, Default)]
@@ -1137,11 +1135,6 @@ pub struct ProxyRegistry {
     share_requests: Arc<ShareRequestRegistry>,
     free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
     image_limiter: Arc<KeyedConcurrencyLimiter>,
-    /// Tracks requests that actually traversed the market proxy path, keyed by
-    /// lowercased market email. A request that hits a Share subdomain directly
-    /// is not counted against the linked market. This stays separate from the
-    /// Share request registry, which owns Share admission and lifecycle state.
-    market_limiter: Arc<KeyedConcurrencyLimiter>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1166,7 +1159,10 @@ impl ProxyRegistry {
         let route_kind = if share_id.is_some() {
             RouteKind::Share
         } else {
-            RouteKind::Market
+            // `set_route` is retained for compatibility with older local
+            // callers; a route without a Share descriptor is a client-web
+            // route, never a retired Market route.
+            RouteKind::ClientWeb
         };
         self.set_route_with_kind(
             subdomain,
@@ -1431,24 +1427,6 @@ impl ProxyRegistry {
                 route.connection_id() == Some(connection_id) && route.rotation_id() == rotation_id
             })
             .cloned()
-    }
-
-    pub(crate) async fn next_generation(&self, subdomain: &str) -> u64 {
-        self.routes
-            .read()
-            .await
-            .get(subdomain)
-            .map(|slot| {
-                slot.active
-                    .iter()
-                    .map(|route| route.generation)
-                    .chain(slot.candidates.keys().copied())
-                    .chain(slot.draining.keys().copied())
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1)
-            })
-            .unwrap_or(1)
     }
 
     pub(crate) async fn active_generation(&self, subdomain: &str) -> u64 {
@@ -1892,13 +1870,6 @@ impl ProxyRegistry {
             .force_release_matching(request_id, share_id, reason)
     }
 
-    /// Snapshot of in-flight request counts per market email (lowercased).
-    /// Only requests that came through the market proxy handler are counted —
-    /// direct share-subdomain traffic is not.
-    pub async fn inflight_by_market_email(&self) -> HashMap<String, usize> {
-        self.market_limiter.snapshot().await
-    }
-
     pub(crate) async fn has_cached_health_probe_failure(&self, subdomain: &str) -> bool {
         let now = Instant::now();
         let mut failures = self.health_probe_failures.lock().await;
@@ -1933,19 +1904,6 @@ impl ProxyRegistry {
                 std::mem::forget(permit);
             }
         }
-    }
-
-    /// Acquire a tracking-only permit for a market-routed request. We pass an
-    /// unlimited parallel cap (`-1`) because the rate gate is applied at the
-    /// share level; this permit exists purely to drive the dashboard's
-    /// PARALLEL aggregate.
-    async fn acquire_market_permit(&self, market_email: &str) -> KeyedConcurrencyPermit {
-        let key = market_email.to_ascii_lowercase();
-        // Unlimited cap means try_acquire never returns None.
-        self.market_limiter
-            .try_acquire(&key, -1)
-            .await
-            .expect("unlimited market permit cannot be denied")
     }
 
     async fn try_acquire_share_permit(
@@ -2008,516 +1966,6 @@ fn shutdown_logical_route(route: Option<LogicalRoute>) {
             shutdown.shutdown();
         }
     }
-}
-
-pub async fn market_proxy_handler(
-    State(state): State<ServerState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    req: Request,
-) -> Response {
-    let (parts, body) = req.into_parts();
-    let method = parts.method.clone();
-    let host = parts
-        .headers
-        .get("host")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let path = parts.uri.path().to_string();
-    if path.starts_with("/_ctl/") || path == "/_ctl" {
-        return simple_response(StatusCode::NOT_FOUND, "not-found");
-    }
-    let query = parts
-        .uri
-        .query()
-        .map(|query| format!("?{query}"))
-        .unwrap_or_default();
-    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
-    let user_ip = client_metadata
-        .ip
-        .clone()
-        .unwrap_or_else(|| peer.ip().to_string());
-    let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
-    let user_asn = trusted_asn_header(&parts.headers, peer);
-    let user_agent = header_str(&parts.headers, "user-agent");
-
-    let Some(token) = bearer_token(&parts.headers) else {
-        return simple_response(StatusCode::UNAUTHORIZED, "missing-market-bearer-token");
-    };
-    let market = match state
-        .store
-        .authenticate_market_session(token, "market:proxy:use")
-        .await
-    {
-        Ok(market) => market,
-        Err(err) => {
-            warn!(
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                error = %err,
-                "market proxy authentication failed"
-            );
-            return simple_response(StatusCode::UNAUTHORIZED, "invalid-market-session");
-        }
-    };
-    let market_email = market.email.trim().to_ascii_lowercase();
-    let market_subdomain = market.subdomain.clone();
-
-    if subdomain_for_host(&host, &state.config.tunnel_domain).as_deref()
-        != Some(market_subdomain.as_str())
-    {
-        warn!(
-            method = %method,
-            host = %host,
-            expected_subdomain = %market_subdomain,
-            path = %path,
-            client_ip = %user_ip,
-            client_country = %user_country,
-            client_asn = %user_asn,
-            user_agent = %user_agent,
-            "market proxy rejected: host does not match authenticated market"
-        );
-        return simple_response(StatusCode::FORBIDDEN, "market-host-mismatch");
-    }
-
-    let Some(rest) = path.strip_prefix("/_market/proxy/") else {
-        return simple_response(StatusCode::NOT_FOUND, "invalid-market-proxy-path");
-    };
-    let (share_id, forwarded_path) = match rest.split_once('/') {
-        Some((share_id, forwarded_path)) if !share_id.is_empty() => {
-            (share_id.to_string(), format!("/{forwarded_path}"))
-        }
-        _ if !rest.is_empty() => (rest.to_string(), "/".to_string()),
-        _ => return simple_response(StatusCode::NOT_FOUND, "missing-share-id"),
-    };
-    let path_and_query = format!("{forwarded_path}{query}");
-    let Some(request_app) = infer_share_request_app(&path_and_query) else {
-        return simple_response(StatusCode::BAD_REQUEST, "unsupported-share-api-path");
-    };
-    let admission_request_id = header_str(&parts.headers, MARKET_REQUEST_ID_HEADER)
-        .split_whitespace()
-        .next()
-        .filter(|value| is_valid_market_request_id(value))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
-    let inflight_by_share = state.proxy.inflight_by_share().await;
-    let authorized = match state
-        .store
-        .list_market_shares_for_app(
-            &market_email,
-            "main",
-            &active_subdomains,
-            &inflight_by_share,
-            &request_app,
-        )
-        .await
-    {
-        Ok(shares) => {
-            let Some(share) = shares.into_iter().find(|share| share.share_id == share_id) else {
-                return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-market");
-            };
-            if share.disabled_by_market {
-                return simple_response(StatusCode::FORBIDDEN, "share-disabled-by-market");
-            }
-            true
-        }
-        Err(err) => {
-            warn!(error = %err, "market proxy share authorization lookup failed");
-            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-lookup-failed");
-        }
-    };
-    if !authorized {
-        return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-market");
-    }
-
-    let Some((route, route_inflight_guard)) = state.proxy.route_for_share_request(&share_id).await
-    else {
-        return simple_response(StatusCode::NOT_FOUND, "share-offline");
-    };
-    let backend = route.backend.clone();
-    let target = format!("http://{backend}{path_and_query}");
-
-    let metrics_permit = state.metrics.proxy_request_started();
-    let mut builder = state.proxy_http.request(method.clone(), target);
-    let connection_listed_headers = connection_listed_header_names(&parts.headers);
-    for (name, value) in &parts.headers {
-        let n = name.as_str();
-        if n.eq_ignore_ascii_case("host")
-            || is_sensitive_upstream_credential_header(n)
-            || n.eq_ignore_ascii_case(MARKET_REQUEST_ID_HEADER)
-            || is_internal_share_context_header(n)
-            || is_hop_by_hop_header(n)
-            || connection_listed_headers.contains(n)
-        {
-            continue;
-        }
-        builder = builder.header(name, value);
-    }
-    builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
-    builder = builder.header(SHARE_DATA_SOURCE_HEADER, "market");
-
-    let log_share_id = mask_token(&share_id);
-    let live_request_id = Some(admission_request_id);
-    if let Some(ref request_id) = live_request_id {
-        builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
-    }
-    let body = match read_proxy_request_body(
-        body,
-        proxy_request_body_limit(&path_and_query, &state.config.proxy_stream),
-        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
-    )
-    .await
-    {
-        Ok(body) => body,
-        Err(ProxyRequestBodyReadError::Timeout) => {
-            state.metrics.record_proxy_request_body_timeout();
-            warn!(path = %path_and_query, "market proxy request body timed out");
-            return simple_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
-        }
-        Err(ProxyRequestBodyReadError::Rejected(error)) => {
-            warn!(error = %error, path = %path_and_query, "market proxy request body rejected");
-            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
-        }
-    };
-    let share_permit = match state
-        .proxy
-        .try_acquire_share_permit(
-            live_request_id
-                .as_deref()
-                .expect("market Share requests always have a request id"),
-            &share_id,
-            Some(&request_app),
-            route.parallel_limit,
-            Some(market_email.as_str()),
-        )
-        .await
-    {
-        Ok(permit) => permit,
-        Err(exceeded) => {
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path_and_query,
-                share_id = %share_id,
-                parallel_limit = route.parallel_limit,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                "market proxy rejected: share concurrency limit exceeded"
-            );
-            record_llm_admission_rejection(
-                &state,
-                &route,
-                live_request_id
-                    .as_deref()
-                    .expect("market Share requests always have a request id"),
-                &request_app,
-                "market",
-                Some(&market_email),
-            );
-            return llm_concurrency_response(
-                &request_app,
-                "cc_switch_share_concurrency_limit_exceeded",
-                "share",
-                exceeded.current,
-                exceeded.limit,
-                live_request_id
-                    .as_deref()
-                    .expect("market Share requests always have a request id"),
-                format!(
-                    "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
-                    exceeded.current, exceeded.limit
-                ),
-            );
-        }
-    };
-    let free_share_ip_permit = if route.is_free_share && state.config.free_share_ip_limit_enabled()
-    {
-        match state
-            .proxy
-            .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
-            .await
-        {
-            Ok(permit) => Some(permit),
-            Err(exceeded) => {
-                let request_id = live_request_id
-                    .as_deref()
-                    .expect("market Share requests always have a request id");
-                record_llm_admission_rejection(
-                    &state,
-                    &route,
-                    request_id,
-                    &request_app,
-                    "market",
-                    Some(&market_email),
-                );
-                return llm_concurrency_response(
-                    &request_app,
-                    "cc_switch_free_share_ip_concurrency_limit_exceeded",
-                    "free_share_ip",
-                    exceeded.current,
-                    exceeded.limit,
-                    request_id,
-                    format!(
-                        "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
-                        exceeded.current, exceeded.limit
-                    ),
-                );
-            }
-        }
-    } else {
-        None
-    };
-    if let Some(permit) = free_share_ip_permit.as_ref() {
-        share_permit.register_keyed_permit(permit);
-    }
-    let market_permit = state.proxy.acquire_market_permit(&market_email).await;
-    share_permit.register_keyed_permit(&market_permit);
-    let share_cancellation = share_permit.cancellation_token();
-    if route.is_share() || route.is_client_web() {
-        let installation_id = route.installation_id().unwrap_or_default();
-        let Some(control_secret_result) = await_share_request_or_cancel(
-            &share_cancellation,
-            state.store.installation_control_secret(installation_id),
-        )
-        .await
-        else {
-            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
-        };
-        let control_secret = match control_secret_result {
-            Ok(Some(secret)) if !secret.trim().is_empty() => secret,
-            Ok(_) => {
-                return simple_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ingress-control-secret-missing",
-                );
-            }
-            Err(error) => {
-                warn!(
-                    installation_id,
-                    error = %error,
-                    "proxy ingress context secret lookup failed"
-                );
-                return simple_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ingress-control-secret-lookup-failed",
-                );
-            }
-        };
-        let route_id = route
-            .share_id()
-            .map(|share_id| format!("share:{share_id}"))
-            .unwrap_or_else(|| format!("client:{installation_id}"));
-        let signed_path_and_query = match outbound_request_path_and_query(&builder) {
-            Ok(path_and_query) => path_and_query,
-            Err(error) => {
-                warn!(%error, "proxy ingress outbound request binding failed");
-                return simple_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ingress-context-signing-failed",
-                );
-            }
-        };
-        let ingress_body_limit =
-            proxy_request_body_limit(&signed_path_and_query, &state.config.proxy_stream);
-        let signed = match crate::ingress_context::sign(
-            crate::ingress_context::IngressContext {
-                protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
-                router_id: state
-                    .config
-                    .tunnel_domain
-                    .trim_end_matches('.')
-                    .to_ascii_lowercase(),
-                route_id,
-                installation_id: installation_id.to_string(),
-                target_lane_id: installation_id.to_string(),
-                public_host: format!("{}.{}", route.subdomain, state.config.tunnel_domain),
-                share_id: route.share_id.clone(),
-                request_id: live_request_id
-                    .clone()
-                    .expect("market Share requests always have a request id"),
-                user_email: Some(market_email.clone()),
-                user_role: None,
-                user_country: client_metadata.country_code.clone(),
-                method: method.as_str().to_string(),
-                path_and_query: signed_path_and_query,
-                body_sha256: crate::ingress_context::body_sha256_hex(&body),
-                signature_version: crate::ingress_context::SIGNATURE_VERSION,
-                issued_at_ms: chrono::Utc::now().timestamp_millis(),
-            },
-            &control_secret,
-        ) {
-            Ok(signed) => signed,
-            Err(error) => {
-                warn!(error, "proxy ingress context signing failed");
-                return simple_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ingress-context-signing-failed",
-                );
-            }
-        };
-        builder = builder
-            .header(
-                crate::ingress_context::INGRESS_CONTEXT_HEADER,
-                signed.encoded_context,
-            )
-            .header(
-                crate::ingress_context::INGRESS_SIGNATURE_HEADER,
-                signed.signature,
-            )
-            .header(
-                crate::ingress_context::INGRESS_BODY_LIMIT_HEADER,
-                ingress_body_limit.to_string(),
-            );
-    }
-    builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
-    if await_share_request_or_cancel(
-        &share_cancellation,
-        state.recent_traffic.record_with_id(
-            live_request_id
-                .clone()
-                .expect("market Share requests always have a request id"),
-            share_id.clone(),
-            route.share_name.clone(),
-            Some(route.subdomain.clone()),
-            client_metadata.country_code.clone(),
-            Some(market_email.clone()),
-        ),
-    )
-    .await
-    .is_none()
-    {
-        return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
-    }
-    let mut recent_traffic_guard = live_request_id
-        .as_ref()
-        .map(|id| RecentTrafficGuard::new(state.recent_traffic.clone(), id.clone()));
-
-    let upstream = match send_proxy_upstream_request(
-        builder.body(reqwest::Body::from(body)),
-        Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs),
-        Some(share_permit.cancellation_token()),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(ProxyUpstreamRequestError::ResponseHeaderTimeout) => {
-            if let Some(guard) = recent_traffic_guard.as_mut() {
-                guard.set_status(StatusCode::GATEWAY_TIMEOUT);
-            }
-            if share_permit.release_registry_lease() {
-                state.metrics.record_proxy_response_header_timeout();
-                warn!(method = %method, host = %host, path = %path_and_query, backend = %backend, share_id = %log_share_id, "market proxy upstream response headers timed out");
-            }
-            return simple_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream-response-header-timeout",
-            );
-        }
-        Err(ProxyUpstreamRequestError::Cancelled) => {
-            if let Some(guard) = recent_traffic_guard.as_mut() {
-                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
-            }
-            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-request-cancelled");
-        }
-        Err(ProxyUpstreamRequestError::Request(err)) => {
-            if let Some(guard) = recent_traffic_guard.as_mut() {
-                guard.set_status(StatusCode::SERVICE_UNAVAILABLE);
-            }
-            state.metrics.record_proxy_upstream_error(false);
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path_and_query,
-                backend = %backend,
-                share_id = %log_share_id,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                error = %err,
-                "market proxy upstream request failed"
-            );
-            return simple_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &format!("connection-lost: {err}"),
-            );
-        }
-    };
-
-    share_permit.mark_response_headers_received();
-    let status = upstream.status();
-    if let Some(guard) = recent_traffic_guard.as_mut() {
-        guard.set_status(status);
-    }
-    let response_headers = upstream.headers().clone();
-    if let Some(response) =
-        ingress_rejection_response(&state, status, &response_headers, &route, &path_and_query)
-    {
-        state.metrics.record_proxy_status(response.status());
-        return response;
-    }
-    state.metrics.record_proxy_status(status);
-    if llm_error_kind(status, &response_headers).as_deref() == Some("concurrency_limited") {
-        record_llm_admission_rejection(
-            &state,
-            &route,
-            live_request_id
-                .as_deref()
-                .expect("market Share requests always have a request id"),
-            &request_app,
-            "market",
-            Some(&market_email),
-        );
-    }
-    let is_event_stream = is_event_stream_response(&response_headers);
-    let body_stream = proxy_response_body_stream(
-        upstream.bytes_stream(),
-        is_event_stream
-            .then(|| ProxyStreamProtocol::from_path(&path_and_query))
-            .flatten(),
-        is_event_stream,
-        ProxyResponseTimeouts::from(&state.config.proxy_stream),
-        state.metrics.clone(),
-        ProxyResponseLifecycle {
-            _route: Some(route_inflight_guard),
-            share: Some(share_permit),
-            _free_share_ip: free_share_ip_permit,
-            _market: Some(market_permit),
-            _recent_traffic: recent_traffic_guard,
-            _metrics: Some(metrics_permit),
-            ..Default::default()
-        },
-    );
-    let body = Body::from_stream(body_stream);
-
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    response.headers_mut().clear();
-    copy_upstream_response_headers(&response_headers, response.headers_mut());
-    if is_event_stream {
-        response.headers_mut().remove(header::CONTENT_LENGTH);
-    }
-    info!(
-        method = %method,
-        host = %host,
-        path = %path_and_query,
-        share_id = %share_id,
-        backend = %backend,
-        status = %status.as_u16(),
-        share_id = %log_share_id,
-        client_ip = %user_ip,
-        client_country = %user_country,
-        client_asn = %user_asn,
-        user_agent = %user_agent,
-        "market proxy request completed"
-    );
-    response
 }
 
 pub async fn gateway_proxy_handler(
@@ -2676,7 +2124,7 @@ pub async fn gateway_proxy_handler(
                 &admission_request_id,
                 &request_app,
                 "gateway",
-                None,
+                Some(gateway.id.as_str()),
             );
             return llm_concurrency_response(
                 &request_app,
@@ -2707,7 +2155,7 @@ pub async fn gateway_proxy_handler(
                     &admission_request_id,
                     &request_app,
                     "gateway",
-                    None,
+                    Some(gateway.id.as_str()),
                 );
                 return llm_concurrency_response(
                     &request_app,
@@ -2857,7 +2305,7 @@ pub async fn gateway_proxy_handler(
             &live_request_id,
             &request_app,
             "gateway",
-            None,
+            Some(gateway.id.as_str()),
         );
     }
     let is_event_stream = is_event_stream_response(&response_headers);
@@ -5660,13 +5108,13 @@ fn record_llm_admission_rejection(
     request_id: &str,
     app_type: &str,
     route_type: &str,
-    market_email: Option<&str>,
+    gateway_id: Option<&str>,
 ) {
     state.metrics.record_llm_request(LlmRequestMetric {
         timestamp: chrono::Utc::now().timestamp(),
         request_id: Some(request_id.to_string()),
         route_type: route_type.to_string(),
-        market_email: market_email.map(str::to_string),
+        gateway_id: gateway_id.map(str::to_string),
         share_id: route.share_id.clone(),
         subdomain: Some(route.subdomain.clone()),
         app_type: Some(app_type.to_string()),
@@ -6597,6 +6045,66 @@ mod tests {
             timestamp_ms,
             signature,
         }
+    }
+
+    #[tokio::test]
+    async fn public_free_share_route_still_requires_router_api_token() {
+        let config = proxy_test_config("free-share-missing-token");
+        let proxy = Arc::new(ProxyRegistry::default());
+        proxy
+            .set_route(
+                "share-free".into(),
+                "127.0.0.1:1".into(),
+                None,
+                Some("share-free".into()),
+                Some("Free Share".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let state = proxy_test_state(&config, proxy);
+        state
+            .store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO shares (
+                    share_id, capacity_pool_id, installation_id, share_name,
+                    app_type, token_limit, parallel_limit, tokens_used,
+                    requests_count, share_status, created_at, expires_at,
+                    updated_at, free_access, share_access_policy_version
+                 ) VALUES (
+                    'share-free', 'pool-free', 'installation-free', 'Free Share',
+                    'claude', -1, -1, 0,
+                    0, 'active', '2026-01-01T00:00:00Z', '2099-12-31T23:59:59Z',
+                    '2026-01-01T00:00:00Z', 1, 1
+                 )",
+                [],
+            )
+            .expect("mark Share public free");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("host", "share-free.router.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"test","messages":[]}"#))
+            .unwrap();
+
+        let response = proxy_handler(
+            State(state),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345)),
+            request,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read rejection body");
+        assert_eq!(&body[..], b"missing-router-api-token");
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[tokio::test]
@@ -9143,14 +8651,6 @@ fn mask_token(token: &str) -> String {
         return "*".repeat(token.len());
     }
     format!("{}...{}", &token[..4], &token[token.len() - 4..])
-}
-
-fn is_valid_market_request_id(value: &str) -> bool {
-    (8..=80).contains(&value.len())
-        && value.starts_with("req_")
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 pub(crate) fn subdomain_for_host(host: &str, tunnel_domain: &str) -> Option<String> {

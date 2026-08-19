@@ -15,6 +15,7 @@ use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 use crate::notification_channels::NotificationChannelId;
 use crate::store::AppStore;
+use crate::telegram::TelegramParseMode;
 
 const DELIVERY_INTERVAL_SECS: u64 = 5;
 const PRESENCE_RECONCILE_INTERVAL_SECS: u64 = 20;
@@ -168,6 +169,10 @@ pub struct TelegramNotificationContext {
     pub enabled: bool,
     pub recipient_hourly_limit: i64,
     pub global_hourly_limit: i64,
+    /// Fingerprint of the exact Bot configuration used for this delivery
+    /// cycle. It lets the worker fence health updates when settings are
+    /// changed while a send is in flight.
+    pub config_fingerprint: Option<String>,
 }
 
 impl Default for TelegramNotificationContext {
@@ -182,6 +187,13 @@ impl TelegramNotificationContext {
             enabled: settings.is_operational(),
             recipient_hourly_limit: settings.recipient_hourly_limit.max(0),
             global_hourly_limit: settings.global_hourly_limit.max(0),
+            config_fingerprint: settings.token().map(|token| {
+                crate::telegram::bind::telegram_config_fingerprint(
+                    token,
+                    settings.mode.as_str(),
+                    settings.webhook_secret.as_deref(),
+                )
+            }),
         }
     }
 }
@@ -280,6 +292,10 @@ pub struct ClientNotificationBatch {
     pub subject: String,
     pub html: String,
     pub text: String,
+    /// How Telegram must read `text`. Frozen with the delivery: a row written
+    /// before rich formatting shipped is still plain text and must go out that
+    /// way, whatever the renderer produces today.
+    pub parse_mode: TelegramParseMode,
     pub idempotency_key: String,
     pub attempts: u32,
 }
@@ -399,6 +415,28 @@ pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
         error: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, AppError>;
+
+    /// Background delivery is also a transport health signal in webhook
+    /// mode, where there is no successful polling request to clear a failure.
+    /// Test doubles can keep the default no-op behavior; the durable store
+    /// persists the fenced runtime update.
+    async fn mark_telegram_transport_failure(
+        &self,
+        _config_fingerprint: &str,
+        _failure_code: Option<&str>,
+        _failure_hint: Option<&str>,
+        _failure_message: &str,
+        _failure_details: Option<&serde_json::Value>,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn mark_telegram_delivery_healthy(
+        &self,
+        _config_fingerprint: &str,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -446,10 +484,8 @@ impl ClientNotificationStore for AppStore {
         worker_id: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        AppStore::start_client_notification_attempt(
-            self, batch_id, attempt_id, worker_id, now,
-        )
-        .await
+        AppStore::start_client_notification_attempt(self, batch_id, attempt_id, worker_id, now)
+            .await
     }
 
     async fn mark_client_notification_batch_sent(
@@ -516,7 +552,12 @@ impl ClientNotificationStore for AppStore {
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         AppStore::mark_client_notification_batch_blocked_config(
-            self, batch_id, worker_id, reason_code, reason, now,
+            self,
+            batch_id,
+            worker_id,
+            reason_code,
+            reason,
+            now,
         )
         .await
     }
@@ -533,6 +574,33 @@ impl ClientNotificationStore for AppStore {
             self, batch_id, worker_id, chat_id, error, now,
         )
         .await
+    }
+
+    async fn mark_telegram_transport_failure(
+        &self,
+        config_fingerprint: &str,
+        failure_code: Option<&str>,
+        failure_hint: Option<&str>,
+        failure_message: &str,
+        failure_details: Option<&serde_json::Value>,
+    ) -> Result<(), AppError> {
+        let details = failure_details.and_then(|value| serde_json::to_string(value).ok());
+        self.mark_telegram_bot_transport_failure_metadata(
+            config_fingerprint,
+            failure_code,
+            failure_hint,
+            failure_message,
+            details.as_deref(),
+        )
+        .await
+    }
+
+    async fn mark_telegram_delivery_healthy(
+        &self,
+        config_fingerprint: &str,
+    ) -> Result<(), AppError> {
+        self.mark_telegram_bot_delivery_healthy(config_fingerprint)
+            .await
     }
 }
 
@@ -555,15 +623,9 @@ enum TransportSendFailure {
 trait NotificationTransport: Send + Sync {
     fn channel(&self) -> &'static str;
 
-    fn validate(
-        &self,
-        batch: &ClientNotificationBatch,
-    ) -> Result<(), TransportValidationFailure>;
+    fn validate(&self, batch: &ClientNotificationBatch) -> Result<(), TransportValidationFailure>;
 
-    async fn send(
-        &self,
-        batch: &ClientNotificationBatch,
-    ) -> Result<String, TransportSendFailure>;
+    async fn send(&self, batch: &ClientNotificationBatch) -> Result<String, TransportSendFailure>;
 }
 
 struct EmailNotificationTransport<'a> {
@@ -577,10 +639,7 @@ impl NotificationTransport for EmailNotificationTransport<'_> {
         "email"
     }
 
-    fn validate(
-        &self,
-        batch: &ClientNotificationBatch,
-    ) -> Result<(), TransportValidationFailure> {
+    fn validate(&self, batch: &ClientNotificationBatch) -> Result<(), TransportValidationFailure> {
         if self.api_key.is_none_or(|key| key.trim().is_empty()) {
             return Err(TransportValidationFailure::BlockedConfig {
                 reason_code: "email_provider_unavailable",
@@ -595,10 +654,7 @@ impl NotificationTransport for EmailNotificationTransport<'_> {
         Ok(())
     }
 
-    async fn send(
-        &self,
-        batch: &ClientNotificationBatch,
-    ) -> Result<String, TransportSendFailure> {
+    async fn send(&self, batch: &ClientNotificationBatch) -> Result<String, TransportSendFailure> {
         send_resend_email(
             self.http,
             self.api_key.expect("validated email API key"),
@@ -620,10 +676,7 @@ impl NotificationTransport for TelegramNotificationTransport<'_> {
         "telegram"
     }
 
-    fn validate(
-        &self,
-        batch: &ClientNotificationBatch,
-    ) -> Result<(), TransportValidationFailure> {
+    fn validate(&self, batch: &ClientNotificationBatch) -> Result<(), TransportValidationFailure> {
         if self.token.is_none_or(|token| token.trim().is_empty()) {
             return Err(TransportValidationFailure::BlockedConfig {
                 reason_code: "telegram_bot_unavailable",
@@ -647,29 +700,51 @@ impl NotificationTransport for TelegramNotificationTransport<'_> {
         Ok(())
     }
 
-    async fn send(
-        &self,
-        batch: &ClientNotificationBatch,
-    ) -> Result<String, TransportSendFailure> {
-        match crate::telegram::send_message(
+    async fn send(&self, batch: &ClientNotificationBatch) -> Result<String, TransportSendFailure> {
+        let token = self.token.expect("validated Telegram token");
+        let chat_id = batch
+            .channel_target
+            .as_deref()
+            .expect("validated Telegram chat id");
+        let sent = crate::telegram::send_message(
             self.http,
-            self.token.expect("validated Telegram token"),
-            batch
-                .channel_target
-                .as_deref()
-                .expect("validated Telegram chat id"),
+            token,
+            chat_id,
             None,
             &batch.text,
+            batch.parse_mode,
         )
-        .await
-        {
+        .await;
+        // Formatting is a nicety; arrival is not. If Telegram rejects our
+        // markup, the same notification goes out once more as plain text
+        // rather than retrying an unparseable body until it dead-letters.
+        let sent = match sent {
+            Err(failure) if batch.parse_mode.is_html() && failure.parse_error => {
+                warn!(
+                    delivery = %batch.id,
+                    error = %failure.message,
+                    "Telegram rejected formatted notification; resending as plain text"
+                );
+                crate::telegram::send_message(
+                    self.http,
+                    token,
+                    chat_id,
+                    None,
+                    &crate::telegram::strip_html(&batch.text),
+                    TelegramParseMode::Plain,
+                )
+                .await
+            }
+            other => other,
+        };
+        match sent {
             Ok(success) => Ok(success.provider_message_id.unwrap_or_default()),
-            Err(failure) if failure.chat_unreachable => Err(
-                TransportSendFailure::EndpointUnreachable(failure.message),
-            ),
-            Err(failure) => Err(TransportSendFailure::Delivery(
-                telegram_delivery_failure(failure),
-            )),
+            Err(failure) if failure.chat_unreachable => {
+                Err(TransportSendFailure::EndpointUnreachable(failure.message))
+            }
+            Err(failure) => Err(TransportSendFailure::Delivery(telegram_delivery_failure(
+                failure,
+            ))),
         }
     }
 }
@@ -680,17 +755,18 @@ struct NotificationChannelRegistry<'a> {
 
 impl<'a> NotificationChannelRegistry<'a> {
     fn new(
-        http: &'a reqwest::Client,
+        email_http: &'a reqwest::Client,
+        telegram_http: &'a reqwest::Client,
         resend_api_key: Option<&'a str>,
         telegram_bot_token: Option<&'a str>,
     ) -> Self {
         let transports: Vec<Box<dyn NotificationTransport + 'a>> = vec![
             Box::new(EmailNotificationTransport {
-                http,
+                http: email_http,
                 api_key: resend_api_key,
             }),
             Box::new(TelegramNotificationTransport {
-                http,
+                http: telegram_http,
                 token: telegram_bot_token,
             }),
         ];
@@ -713,11 +789,18 @@ pub async fn run_client_notification_service(
     config: Config,
     presence_grace: Duration,
 ) -> anyhow::Result<()> {
-    let http = reqwest::Client::builder()
-        .user_agent("cc-switch-router/0.1 client-notifications")
+    // Keep the Telegram IPv4-only path separate from email. The former is
+    // intentional for the Bot API's known DNS/IPv6 failure mode; forcing the
+    // same local address on Resend would unnecessarily constrain future
+    // notification providers.
+    let email_http = reqwest::Client::builder()
+        .user_agent("cc-switch-router/0.1 client-notifications-email")
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build()?;
+    let telegram_http = crate::telegram::build_send_http_client(
+        "cc-switch-router/0.1 client-notifications-telegram",
+    )?;
     let worker_id = format!("router-{}", Uuid::new_v4());
     let mut template = NotificationTemplateContext::from_config(&config);
     let mut interval = tokio::time::interval(Duration::from_secs(DELIVERY_INTERVAL_SECS));
@@ -748,16 +831,21 @@ pub async fn run_client_notification_service(
         let telegram_ready = match store.telegram_bot_runtime().await {
             Ok(runtime) => {
                 runtime.ready()
-                    && telegram_fingerprint.as_deref()
-                        == runtime.config_fingerprint.as_deref()
+                    && runtime.transport_status != "degraded"
+                    && telegram_fingerprint.as_deref() == runtime.config_fingerprint.as_deref()
             }
             Err(error) => {
                 warn!(error = %error, "read Telegram runtime readiness failed");
                 false
             }
         };
-        template.telegram.enabled &= telegram_ready;
-        let telegram_token = telegram_ready.then(|| telegram_bot.token()).flatten();
+        // Recompute this every tick. Using `&=` would make one transient
+        // outage permanently disable Telegram deliveries for the lifetime of
+        // the worker, even after the transport becomes healthy again.
+        template.telegram.enabled = telegram_bot.is_operational() && telegram_ready;
+        let telegram_token = (telegram_bot.is_operational() && telegram_ready)
+            .then(|| telegram_bot.token())
+            .flatten();
         let (policy, policy_warning) = ClientNotificationPolicy::for_runtime(&settings, &config);
         if policy_warning != last_policy_warning {
             if let Some(message) = policy_warning.as_deref() {
@@ -771,7 +859,8 @@ pub async fn run_client_notification_service(
             &template,
             config.resend_api_key.as_deref(),
             telegram_token,
-            &http,
+            &email_http,
+            &telegram_http,
             &worker_id,
             should_reconcile_presence(tick_index, started_at.elapsed(), presence_grace),
         )
@@ -789,7 +878,8 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
     template: &NotificationTemplateContext,
     resend_api_key: Option<&str>,
     telegram_bot_token: Option<&str>,
-    http: &reqwest::Client,
+    email_http: &reqwest::Client,
+    telegram_http: &reqwest::Client,
     worker_id: &str,
     reconcile_presence: bool,
 ) -> Result<(), AppError> {
@@ -831,8 +921,12 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
         );
     }
 
-    let registry =
-        NotificationChannelRegistry::new(http, resend_api_key, telegram_bot_token);
+    let registry = NotificationChannelRegistry::new(
+        email_http,
+        telegram_http,
+        resend_api_key,
+        telegram_bot_token,
+    );
     for _ in 0..MAX_BATCHES_PER_CYCLE {
         let claim_now = Utc::now();
         let batch = match store
@@ -897,12 +991,7 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
             }
         }
         store
-            .start_client_notification_attempt(
-                &batch.id,
-                &batch.attempt_id,
-                worker_id,
-                Utc::now(),
-            )
+            .start_client_notification_attempt(&batch.id, &batch.attempt_id, worker_id, Utc::now())
             .await?;
         match transport.send(&batch).await {
             Ok(provider_message_id) => {
@@ -914,6 +1003,22 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
                         Utc::now(),
                     )
                     .await?;
+                if batch.channel.is_telegram() {
+                    if let Some(config_fingerprint) =
+                        template.telegram.config_fingerprint.as_deref()
+                    {
+                        if let Err(error) = store
+                            .mark_telegram_delivery_healthy(config_fingerprint)
+                            .await
+                        {
+                            warn!(
+                                batch_id = %batch.id,
+                                error = %error,
+                                "persist Telegram notification transport recovery failed"
+                            );
+                        }
+                    }
+                }
                 info!(batch_id = %batch.id, channel = %batch.channel, provider_message_id, "client notification sent");
             }
             Err(TransportSendFailure::EndpointUnreachable(message)) => {
@@ -931,6 +1036,31 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
                 warn!(batch_id = %batch.id, unbound = unbound.is_some(), error, "notification endpoint invalidated after permanent failure");
             }
             Err(TransportSendFailure::Delivery(failure)) => {
+                if batch.channel.is_telegram() {
+                    if let Some(config_fingerprint) =
+                        template.telegram.config_fingerprint.as_deref()
+                    {
+                        let failure_code = failure.failure_code.clone();
+                        let failure_hint = failure.failure_hint.clone();
+                        let failure_details = failure.failure_details.clone();
+                        if let Err(error) = store
+                            .mark_telegram_transport_failure(
+                                config_fingerprint,
+                                failure_code.as_deref(),
+                                failure_hint.as_deref(),
+                                &failure.message,
+                                failure_details.as_ref(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                batch_id = %batch.id,
+                                error = %error,
+                                "persist Telegram notification transport failure failed"
+                            );
+                        }
+                    }
+                }
                 record_delivery_failure(store, &batch, worker_id, failure).await?;
             }
         }
@@ -947,6 +1077,11 @@ fn telegram_delivery_failure(failure: crate::telegram::TelegramFailure) -> Deliv
             .retry_at
             .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0)),
         message: failure.message,
+        failure_code: Some(failure.code.as_str().into()),
+        failure_hint: Some(failure.hint),
+        failure_details: failure
+            .diagnostics
+            .and_then(|value| serde_json::to_value(value).ok()),
     }
 }
 
@@ -956,7 +1091,12 @@ async fn record_delivery_failure<S: ClientNotificationStore>(
     worker_id: &str,
     failure: DeliveryFailure,
 ) -> Result<(), AppError> {
-    let error = sanitize_delivery_error(&failure.message);
+    // Keep the durable delivery history actionable even though the generic
+    // outbox schema predates structured Telegram diagnostics. The runtime
+    // row stores the structured fields; this compact rendering ensures an
+    // operator inspecting an individual delivery still sees the stable code
+    // and remediation hint instead of only a reqwest timeout string.
+    let error = sanitize_delivery_error(&delivery_failure_display_message(&failure));
     if failure.retryable && batch.attempts < MAX_DELIVERY_ATTEMPTS {
         let next_attempt_at = failure.retry_at.unwrap_or_else(|| {
             Utc::now() + chrono::Duration::seconds(retry_delay_secs(batch.attempts, &batch.id))
@@ -997,6 +1137,22 @@ async fn record_delivery_failure<S: ClientNotificationStore>(
     Ok(())
 }
 
+fn delivery_failure_display_message(failure: &DeliveryFailure) -> String {
+    match (
+        failure.failure_code.as_deref(),
+        failure.failure_hint.as_deref(),
+    ) {
+        (Some(code), Some(hint)) if !code.trim().is_empty() && !hint.trim().is_empty() => {
+            format!("{hint} [{code}]: {}", failure.message)
+        }
+        (Some(code), _) if !code.trim().is_empty() => {
+            format!("[{code}]: {}", failure.message)
+        }
+        (_, Some(hint)) if !hint.trim().is_empty() => format!("{hint}: {}", failure.message),
+        _ => failure.message.clone(),
+    }
+}
+
 fn presence_reconcile_due(tick_index: u64) -> bool {
     let ticks_per_reconcile = (PRESENCE_RECONCILE_INTERVAL_SECS / DELIVERY_INTERVAL_SECS).max(1);
     tick_index % ticks_per_reconcile == 0
@@ -1034,6 +1190,9 @@ pub(crate) struct DeliveryFailure {
     pub retryable: bool,
     pub retry_at: Option<DateTime<Utc>>,
     pub message: String,
+    pub failure_code: Option<String>,
+    pub failure_hint: Option<String>,
+    pub failure_details: Option<serde_json::Value>,
 }
 
 async fn send_resend_email(
@@ -1099,6 +1258,9 @@ async fn send_resend_frozen_email_to(
             retryable: error.is_timeout() || error.is_connect() || error.is_request(),
             retry_at: None,
             message: format!("Resend request failed: {error}"),
+            failure_code: None,
+            failure_hint: None,
+            failure_details: None,
         })?;
 
     let status = response.status();
@@ -1113,6 +1275,9 @@ async fn send_resend_frozen_email_to(
         retryable: true,
         retry_at: None,
         message: format!("read Resend response failed after HTTP {status}: {error}"),
+        failure_code: None,
+        failure_hint: None,
+        failure_details: None,
     })?;
 
     if status.is_success() {
@@ -1121,6 +1286,9 @@ async fn send_resend_frozen_email_to(
                 retryable: true,
                 retry_at: None,
                 message: format!("parse successful Resend response failed: {error}"),
+                failure_code: None,
+                failure_hint: None,
+                failure_details: None,
             })?;
         return value
             .get("id")
@@ -1131,6 +1299,9 @@ async fn send_resend_frozen_email_to(
                 retryable: true,
                 retry_at: None,
                 message: "successful Resend response omitted message id".to_string(),
+                failure_code: None,
+                failure_hint: None,
+                failure_details: None,
             });
     }
 
@@ -1163,6 +1334,9 @@ async fn send_resend_frozen_email_to(
         retryable,
         retry_at,
         message: sanitize_delivery_error(&message),
+        failure_code: None,
+        failure_hint: None,
+        failure_details: None,
     })
 }
 
@@ -1217,10 +1391,19 @@ fn valid_telegram_batch(batch: &ClientNotificationBatch) -> bool {
         .is_some_and(|chat_id| {
             !chat_id.is_empty() && chat_id.len() <= 32 && chat_id.parse::<i64>().is_ok()
         });
+    // The Bot API measures the message after entity parsing, so tags are free.
+    // Counting raw characters would reject a well-formed HTML digest whose
+    // rendered text is comfortably inside the limit.
+    let visible_chars = if batch.parse_mode.is_html() {
+        crate::telegram::strip_html(&batch.text).chars().count()
+    } else {
+        batch.text.chars().count()
+    };
     chat_id_ok
         && is_basic_email(&batch.recipient)
         && !batch.text.trim().is_empty()
-        && batch.text.chars().count() <= crate::telegram::MAX_MESSAGE_CHARS
+        && visible_chars <= crate::telegram::MAX_MESSAGE_CHARS
+        && crate::telegram::is_sendable(&batch.text, batch.parse_mode)
         && (1..=256).contains(&batch.idempotency_key.len())
         && !contains_header_controls(&batch.idempotency_key)
 }
@@ -1447,11 +1630,72 @@ pub(crate) fn sanitize_delivery_error(value: &str) -> String {
     truncate_error(&mask_email_like_tokens(value))
 }
 
+/// What a notification means, at a glance.
+///
+/// Email carries meaning through layout and a whole document; a chat message
+/// gets one line before the reader decides whether to care. Emoji are the only
+/// colour Telegram offers, so severity is what picks the badge — a red circle
+/// on an outage, green on a completed registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationSeverity {
+    /// Something the owner runs is down.
+    Critical,
+    /// Several things went wrong together.
+    Incident,
+    /// Worth reading, nothing is broken.
+    Notice,
+    /// Something finished successfully.
+    Success,
+    /// Diagnostics and channel tests.
+    Info,
+}
+
+impl NotificationSeverity {
+    /// The badge that opens the message. Red for outages is the whole point of
+    /// the request this exists for.
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::Critical => "🔴",
+            Self::Incident => "🚨",
+            Self::Notice => "🟠",
+            Self::Success => "🟢",
+            Self::Info => "🔵",
+        }
+    }
+}
+
+/// A Telegram-ready body and the mode it must be sent in.
+///
+/// The two are one value because they are only correct together: sending an
+/// HTML body as plain text leaks tags, and sending plain text as HTML turns a
+/// stray `<` into a 400 for the whole message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramMessage {
+    pub text: String,
+    pub parse_mode: TelegramParseMode,
+}
+
+impl TelegramMessage {
+    /// Build a message already cut to Telegram's limit. Trimming here rather
+    /// than at send time keeps the frozen outbox row and the wire identical,
+    /// so what an operator reads in the deliveries view is what was sent.
+    pub fn html(text: impl Into<String>) -> Self {
+        Self {
+            text: crate::telegram::truncate_html(&text.into(), crate::telegram::MAX_MESSAGE_CHARS),
+            parse_mode: TelegramParseMode::Html,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedNotificationEmail {
     pub subject: String,
     pub html: String,
     pub text: String,
+    /// The same notification written for a chat window instead of an inbox.
+    /// Rendered from the same source as the email so the two can never say
+    /// different things.
+    pub telegram: TelegramMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -1528,7 +1772,8 @@ pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotifi
     } else {
         "Open Router dashboard"
     };
-    let (html, text) = render_email_document(EmailDocument {
+    let (html, text, telegram) = render_email_document(EmailDocument {
+        severity: NotificationSeverity::Success,
         title: "Client registration completed",
         preheader: "A Client completed trusted registration and is ready to use.",
         introduction: "A Client owned by this email address completed trusted registration with the Router.",
@@ -1541,11 +1786,13 @@ pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotifi
         ),
         extra_html: "",
         extra_text: "",
+        extra_telegram: "",
     });
     RenderedNotificationEmail {
         subject,
         html,
         text,
+        telegram,
     }
 }
 
@@ -1558,7 +1805,8 @@ pub fn render_registration_overflow_email(
         ("Window start", display_value(Some(&data.window_start))),
         ("Window end", display_value(Some(&data.window_end))),
     ];
-    let (html, text) = render_email_document(EmailDocument {
+    let (html, text, telegram) = render_email_document(EmailDocument {
+        severity: NotificationSeverity::Notice,
         title: "Client registration summary",
         preheader: "Multiple Clients completed trusted registration.",
         introduction: "Registration volume exceeded the individual notification lane, so the Router combined the activity into this summary.",
@@ -1569,11 +1817,13 @@ pub fn render_registration_overflow_email(
         note: None,
         extra_html: "",
         extra_text: "",
+        extra_telegram: "",
     });
     RenderedNotificationEmail {
         subject,
         html,
         text,
+        telegram,
     }
 }
 
@@ -1595,7 +1845,8 @@ pub fn render_offline_email(data: &OfflineEmailData) -> RenderedNotificationEmai
             display_value(Some(&data.offline_since)),
         ),
     ];
-    let (html, text) = render_email_document(EmailDocument {
+    let (html, text, telegram) = render_email_document(EmailDocument {
+        severity: NotificationSeverity::Critical,
         title: "Client offline",
         preheader: "The Router confirmed that a Client is offline.",
         introduction: "The Router stopped receiving authenticated heartbeats from this Client for the configured confirmation window.",
@@ -1608,11 +1859,13 @@ pub fn render_offline_email(data: &OfflineEmailData) -> RenderedNotificationEmai
         ),
         extra_html: "",
         extra_text: "",
+        extra_telegram: "",
     });
     RenderedNotificationEmail {
         subject,
         html,
         text,
+        telegram,
     }
 }
 
@@ -1687,6 +1940,33 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         "<h2 style=\"font-size:16px;line-height:24px;margin:24px 0 8px;color:#172033\">Affected Clients</h2><ul style=\"margin:0;padding-left:20px;color:#334155\">{clients_html}</ul>"
     );
     let extra_text = format!("Affected Clients:\n{clients_text}");
+    let mut clients_telegram = data
+        .clients
+        .iter()
+        .take(MAX_DIGEST_CLIENTS)
+        .map(|client| {
+            let id = crate::telegram::escape_html(&short_installation_id(&client.installation_id));
+            let url = client.client_url.as_deref().map_or_else(
+                || "\n   <i>Client URL not available</i>".to_string(),
+                |url| format!("\n   {}", crate::telegram::escape_html(url)),
+            );
+            let hint = client
+                .password_hint
+                .as_deref()
+                .map_or_else(String::new, |hint| {
+                    format!(
+                        "\n   Web password hint: <code>{}</code>",
+                        crate::telegram::escape_html(hint)
+                    )
+                });
+            format!("• <b>{id}</b>{url}{hint}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if remaining > 0 {
+        clients_telegram.push_str(&format!("\n• +{remaining} more"));
+    }
+    let extra_telegram = format!("<b>Affected Clients</b>\n{clients_telegram}");
     let introduction = format!(
         "The Router grouped {} related Client {} into one notification.",
         data.clients.len(),
@@ -1696,7 +1976,12 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         .clients
         .iter()
         .any(|client| client.password_hint.is_some());
-    let (html, text) = render_email_document(EmailDocument {
+    let (html, text, telegram) = render_email_document(EmailDocument {
+        severity: if data.incident {
+            NotificationSeverity::Incident
+        } else {
+            NotificationSeverity::Notice
+        },
         title: prefix,
         preheader: &format!(
             "{} Client {} require review.",
@@ -1713,15 +1998,18 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         ),
         extra_html: &extra_html,
         extra_text: &extra_text,
+        extra_telegram: &extra_telegram,
     });
     RenderedNotificationEmail {
         subject,
         html,
         text,
+        telegram,
     }
 }
 
 struct EmailDocument<'a> {
+    severity: NotificationSeverity,
     title: &'a str,
     preheader: &'a str,
     introduction: &'a str,
@@ -1732,9 +2020,12 @@ struct EmailDocument<'a> {
     note: Option<&'a str>,
     extra_html: &'a str,
     extra_text: &'a str,
+    /// Telegram markup for the same content as `extra_html`. Empty means the
+    /// section does not exist, not that it should be derived from the email.
+    extra_telegram: &'a str,
 }
 
-fn render_email_document(document: EmailDocument<'_>) -> (String, String) {
+fn render_email_document(document: EmailDocument<'_>) -> (String, String, TelegramMessage) {
     let rows_html = document
         .rows
         .iter()
@@ -1793,57 +2084,74 @@ fn render_email_document(document: EmailDocument<'_>) -> (String, String) {
     )
     .trim()
     .to_string();
-    (html, text)
+    (html, text, render_telegram_document(&document))
 }
 
-/// First line of every plain-text email body. Telegram strips it: the chat
-/// already shows who is talking.
-const EMAIL_TEXT_BRAND_LINE: &str = "CC-Switch Router";
-/// Last line of every plain-text email body. It explains *email* addressing,
-/// which is meaningless in a chat the user bound themselves.
-const EMAIL_TEXT_FOOTER: &str = "This transactional email was sent because this address is the currently verified Owner of the affected Client.";
-
-/// Render the Telegram counterpart of an already-rendered notification.
+/// Render the chat-window form of a notification.
 ///
-/// Deliberately derived from the email's plain-text alternative rather than
-/// written from scratch: one notification must not be able to say two
-/// different things depending on where it lands. What changes is the framing —
-/// the brand header and the RFC footer come off, the subject becomes the title
-/// line, and the footer is replaced by a link to the page where the user can
-/// change or drop the channel (the chat's own opt-out path).
-///
-/// Telegram is asked for plain text (no `parse_mode`), so nothing here needs
-/// escaping — a client hostname containing `_` or `*` stays literal.
-pub fn render_telegram_message(
-    rendered: &RenderedNotificationEmail,
-    dashboard_url: &str,
-) -> String {
-    let mut body = String::new();
-    for line in rendered.text.lines() {
-        let line = line.trim_end();
-        if line == EMAIL_TEXT_BRAND_LINE || line == EMAIL_TEXT_FOOTER {
-            continue;
+/// Built from the same [`EmailDocument`] as the email rather than parsed back
+/// out of the email's plain-text body: one notification must not be able to
+/// say two different things depending on where it lands. What changes is the
+/// framing. The brand header goes — the chat already shows who is talking.
+/// The RFC footer goes — it explains email addressing to someone reading a
+/// chat they bound themselves. In their place: a severity badge, a bold title,
+/// label/value pairs that survive a narrow phone screen, and a link back to
+/// the page where this channel can be changed or dropped.
+fn render_telegram_document(document: &EmailDocument<'_>) -> TelegramMessage {
+    let escape = crate::telegram::escape_html;
+    let mut message = format!(
+        "{badge} <b>{title}</b>\n\n{introduction}",
+        badge = document.severity.badge(),
+        title = escape(&document.title.to_uppercase()),
+        introduction = escape(document.introduction),
+    );
+    if !document.rows.is_empty() {
+        message.push_str("\n");
+        for (label, value) in document.rows {
+            message.push_str(&format!(
+                "\n<b>{}</b>  {}",
+                escape(label),
+                render_telegram_value(value)
+            ));
         }
-        if line.is_empty() && body.ends_with("\n\n") {
-            continue;
-        }
-        body.push_str(line);
-        body.push('\n');
+    }
+    if !document.extra_telegram.trim().is_empty() {
+        message.push_str("\n\n");
+        message.push_str(document.extra_telegram.trim());
+    }
+    if let Some(note) = document.note {
+        message.push_str(&format!("\n\n⚠️ <i>{}</i>", escape(note)));
     }
     let settings_url = format!(
         "{}/account/notifications",
-        dashboard_url.trim_end_matches('/')
+        document.dashboard_url.trim_end_matches('/')
     );
-    let message = format!(
-        "{subject}\n\n{body}\n管理通知渠道 / Manage notifications: {settings_url}",
-        subject = rendered.subject.trim(),
-        body = body.trim(),
-    );
-    message
-        .chars()
-        .take(crate::telegram::MAX_MESSAGE_CHARS)
-        .collect()
+    message.push_str(&format!(
+        "\n\n➡️ <a href=\"{action_url}\">{action_label}</a>\n⚙️ <a href=\"{settings_url}\">管理通知渠道 / Manage notifications</a>",
+        action_url = escape(document.action_url),
+        action_label = escape(document.action_label),
+        settings_url = escape(&settings_url),
+    ));
+    TelegramMessage::html(message)
 }
+
+/// Values are monospaced so identifiers and timestamps stay scannable in a
+/// chat's proportional font — except URLs, which are left bare so Telegram
+/// linkifies them and the user can tap through.
+fn render_telegram_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        crate::telegram::escape_html(trimmed)
+    } else {
+        format!("<code>{}</code>", crate::telegram::escape_html(trimmed))
+    }
+}
+
+/// First line of every plain-text email body.
+const EMAIL_TEXT_BRAND_LINE: &str = "CC-Switch Router";
+/// Last line of every plain-text email body. It explains *email* addressing,
+/// which is why the Telegram rendering has its own footer instead.
+const EMAIL_TEXT_FOOTER: &str = "This transactional email was sent because this address is the currently verified Owner of the affected Client.";
 
 fn short_installation_id(value: &str) -> String {
     value.chars().take(8).collect()
@@ -2093,6 +2401,7 @@ mod tests {
             text: "offline".into(),
             idempotency_key: "client-notification/b1".into(),
             attempts: 1,
+            parse_mode: crate::telegram::TelegramParseMode::Plain,
         }
     }
 
@@ -2113,6 +2422,7 @@ mod tests {
             text: "Client offline\n\nClient: abcdef12".into(),
             idempotency_key: "client-notification/t1:telegram".into(),
             attempts: 1,
+            parse_mode: crate::telegram::TelegramParseMode::Html,
         }
     }
 
@@ -2147,6 +2457,7 @@ mod tests {
             delivery_config_fingerprint: "test".into(),
             telegram: TelegramNotificationContext::default(),
         };
+        let http = reqwest::Client::new();
 
         run_notification_cycle(
             &store,
@@ -2154,7 +2465,8 @@ mod tests {
             &template,
             None,
             None,
-            &reqwest::Client::new(),
+            &http,
+            &http,
             "cycle-worker",
             false,
         )
@@ -2200,6 +2512,7 @@ mod tests {
             delivery_config_fingerprint: "test".into(),
             telegram: TelegramNotificationContext::default(),
         };
+        let http = reqwest::Client::new();
 
         run_notification_cycle(
             &store,
@@ -2207,7 +2520,8 @@ mod tests {
             &template,
             Some("resend-key"),
             Some("bot-token"),
-            &reqwest::Client::new(),
+            &http,
+            &http,
             "cycle-worker",
             false,
         )
@@ -2247,6 +2561,7 @@ mod tests {
             delivery_config_fingerprint: "test".into(),
             telegram: TelegramNotificationContext::default(),
         };
+        let http = reqwest::Client::new();
 
         run_notification_cycle(
             &store,
@@ -2254,7 +2569,8 @@ mod tests {
             &template,
             Some("resend-key"),
             None,
-            &reqwest::Client::new(),
+            &http,
+            &http,
             "cycle-worker",
             false,
         )
@@ -2305,11 +2621,15 @@ mod tests {
     fn telegram_delivery_failures_keep_their_retry_classification() {
         let retry_at = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
         let mapped = telegram_delivery_failure(crate::telegram::TelegramFailure {
+            code: crate::telegram::TelegramFailureCode::RateLimited,
             retryable: true,
             retry_at: Some(retry_at.timestamp()),
             http_status: Some(429),
             message: "Telegram sendMessage returned HTTP 429".into(),
+            hint: "retry later".into(),
+            diagnostics: None,
             chat_unreachable: false,
+            parse_error: false,
         });
         assert!(mapped.retryable);
         assert_eq!(mapped.retry_at, Some(retry_at));
@@ -2322,68 +2642,118 @@ mod tests {
     }
 
     #[test]
-    fn telegram_message_reframes_the_email_without_changing_it() {
-        let rendered = RenderedNotificationEmail {
-            subject: "Client offline".into(),
-            html: "<p>ignored</p>".into(),
-            text: format!(
-                "{EMAIL_TEXT_BRAND_LINE}
+    fn an_offline_telegram_message_leads_with_red_and_is_valid_html() {
+        let email = render_offline_email(&OfflineEmailData {
+            installation_id: "12345678-secret-rest".into(),
+            tunnel_subdomain: Some("client<script>".into()),
+            owner_email: Some("owner@example.com".into()),
+            version: Some("1.2.3".into()),
+            client_url: Some("https://client.example.com/".into()),
+            last_heartbeat_at: "2026-07-15T12:00:00Z".into(),
+            offline_since: "2026-07-15T12:03:00Z".into(),
+            dashboard_url: "https://router.example.com".into(),
+        });
+        let message = &email.telegram;
 
-Client offline
-
-Client: abcdef12
-
-
-
-Open the dashboard: https://router.example.com
-
-{EMAIL_TEXT_FOOTER}
-"
-            ),
-        };
-
-        let message = render_telegram_message(&rendered, "https://router.example.com/");
-
-        assert!(message.starts_with(
-            "Client offline
-
-"
-        ));
-        assert!(!message.contains(EMAIL_TEXT_BRAND_LINE));
+        assert!(message.parse_mode.is_html());
         assert!(
-            !message.contains(EMAIL_TEXT_FOOTER),
-            "the RFC footer is meaningless in a chat"
+            message
+                .text
+                .starts_with(NotificationSeverity::Critical.badge()),
+            "an offline alert has to read as red at a glance: {}",
+            message.text
         );
-        assert!(message.contains("Client: abcdef12"));
+        assert!(message.text.contains("<b>CLIENT OFFLINE</b>"));
+        // The email chrome has no place in a chat.
+        assert!(!message.text.contains(EMAIL_TEXT_BRAND_LINE));
+        assert!(!message.text.contains(EMAIL_TEXT_FOOTER));
+        // Values stay escaped and the short id rule still holds.
+        assert!(message.text.contains("client&lt;script&gt;"));
+        assert!(!message.text.contains("12345678-secret-rest"));
+        assert!(message.text.contains("<code>12345678</code>"));
+        // URLs are left bare so Telegram linkifies them.
         assert!(
-            !message.contains(
-                "
-
-
-"
-            ),
-            "blank runs are collapsed"
+            message
+                .text
+                .contains("\n<b>Client URL</b>  https://client.example.com/")
         );
-        assert!(message.ends_with(
-            "管理通知渠道 / Manage notifications: https://router.example.com/account/notifications"
+        assert!(message.text.ends_with(
+            "<a href=\"https://router.example.com/account/notifications\">管理通知渠道 / Manage notifications</a>"
         ));
-        assert!(message.chars().count() <= crate::telegram::MAX_MESSAGE_CHARS);
+        assert!(
+            crate::telegram::is_sendable(&message.text, message.parse_mode),
+            "unbalanced markup would be rejected by the Bot API"
+        );
     }
 
     #[test]
-    fn telegram_message_is_truncated_to_what_the_bot_api_accepts() {
-        let rendered = RenderedNotificationEmail {
-            subject: "Client offline".into(),
-            html: String::new(),
-            text: "line
-"
-            .repeat(4_000),
-        };
-        let message = render_telegram_message(&rendered, "https://router.example.com");
-        assert_eq!(
-            message.chars().count(),
-            crate::telegram::MAX_MESSAGE_CHARS,
-            "a runaway digest must still be sendable"
+    fn severity_badges_separate_the_lanes() {
+        let registration = render_registration_email(&RegistrationEmailData {
+            installation_id: "abcdef12-rest".into(),
+            platform: "linux".into(),
+            version: Some("1.2.3".into()),
+            country_code: Some("SG".into()),
+            setup_completed_at: "2026-07-15T12:00:00Z".into(),
+            owner_email: Some("owner@example.com".into()),
+            client_url: Some("https://client.example.com/".into()),
+            password_hint: Some("hint".into()),
+            dashboard_url: "https://router.example.com".into(),
+        });
+        assert!(
+            registration
+                .telegram
+                .text
+                .starts_with(NotificationSeverity::Success.badge())
+        );
+
+        let incident = render_digest_email(&DigestEmailData {
+            event_label: "offline clients".into(),
+            incident: true,
+            clients: vec![DigestEmailClient {
+                installation_id: "client-0001".into(),
+                client_url: Some("https://client-0001.example.com/".into()),
+                password_hint: None,
+            }],
+            occurred_at: "2026-07-15T12:00:00Z".into(),
+            dashboard_url: "https://router.example.com".into(),
+        });
+        assert!(
+            incident
+                .telegram
+                .text
+                .starts_with(NotificationSeverity::Incident.badge())
+        );
+    }
+
+    #[test]
+    fn a_runaway_digest_stays_sendable_without_splitting_a_tag() {
+        let email = render_digest_email(&DigestEmailData {
+            event_label: "offline clients".into(),
+            incident: true,
+            clients: (0..MAX_DIGEST_CLIENTS)
+                .map(|index| DigestEmailClient {
+                    installation_id: format!("client-{index:04}"),
+                    client_url: Some(format!(
+                        "https://client-{index:04}.{}.example.com/",
+                        "padding".repeat(12)
+                    )),
+                    password_hint: Some("hint".repeat(16)),
+                })
+                .collect(),
+            occurred_at: "2026-07-15T12:00:00Z".into(),
+            dashboard_url: "https://router.example.com".into(),
+        });
+        let message = &email.telegram;
+        // The Bot API counts the message *after* entity parsing, which is what
+        // the renderer budgets against — tags themselves are free.
+        assert!(
+            crate::telegram::strip_html(&message.text).chars().count()
+                <= crate::telegram::MAX_MESSAGE_CHARS
+        );
+        assert!(
+            crate::telegram::is_sendable(&message.text, message.parse_mode),
+            "truncation must never leave a dangling tag: {}",
+            &message.text[message.text.len().saturating_sub(200)..]
         );
     }
 
@@ -2399,6 +2769,9 @@ Open the dashboard: https://router.example.com
                 retryable: true,
                 retry_at: None,
                 message: "recipient ops@example.com; sender noreply@example.com".into(),
+                failure_code: None,
+                failure_hint: None,
+                failure_details: None,
             },
         )
         .await
@@ -2414,6 +2787,9 @@ Open the dashboard: https://router.example.com
                 retryable: true,
                 retry_at: None,
                 message: "contact audit@vendor.test about owner@example.com".into(),
+                failure_code: None,
+                failure_hint: None,
+                failure_details: None,
             },
         )
         .await

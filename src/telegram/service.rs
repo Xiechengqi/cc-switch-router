@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::Value;
@@ -13,15 +13,18 @@ use crate::config::{Config, TelegramBotMode};
 use crate::db::{OptionalExtension, TransactionBehavior, params};
 use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
+use crate::notification_channels::{EMAIL_CHANNEL, NotificationChannelId};
+use crate::notifications::{NotificationSeverity as Sev, TelegramMessage};
 use crate::store::AppStore;
 use crate::telegram::bind::{BindOutcome, telegram_config_fingerprint};
-use crate::telegram::{self, TelegramFailure};
+use crate::telegram::{self, TelegramFailure, escape_html};
 
 pub const WEBHOOK_PATH: &str = "/v1/integrations/telegram/webhook";
 pub const WEBHOOK_SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 
 const POLL_TIMEOUT_SECS: u16 = 25;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const WEBHOOK_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_BACKOFF: Duration = Duration::from_secs(10);
 const FATAL_BACKOFF: Duration = Duration::from_secs(60);
 const INBOUND_CLAIM_LEASE_SECS: i64 = 60;
@@ -90,7 +93,11 @@ fn failed_binds() -> &'static Mutex<FailedBindTracker> {
 }
 
 pub fn public_base_url(config: &Config) -> String {
-    let scheme = if config.use_localhost { "http" } else { "https" };
+    let scheme = if config.use_localhost {
+        "http"
+    } else {
+        "https"
+    };
     format!("{scheme}://{}", config.tunnel_domain.trim_end_matches('/'))
 }
 
@@ -111,6 +118,7 @@ pub async fn run_telegram_bot_service(
     let send_http = telegram::build_send_http_client("cc-switch-router/0.1 telegram-replies")?;
     let worker_id = format!("telegram-inbound-{}", Uuid::new_v4());
     let mut applied: Option<AppliedConfig> = None;
+    let mut last_webhook_health_check = Instant::now();
 
     loop {
         let settings = dynamic.read().await.telegram_bot.clone();
@@ -130,11 +138,8 @@ pub async fn run_telegram_bot_service(
         };
         let mode = settings.mode;
         let webhook_secret = settings.webhook_secret.clone();
-        let fingerprint = telegram_config_fingerprint(
-            &token,
-            mode.as_str(),
-            webhook_secret.as_deref(),
-        );
+        let fingerprint =
+            telegram_config_fingerprint(&token, mode.as_str(), webhook_secret.as_deref());
         let desired = DesiredConfig {
             token,
             mode,
@@ -153,23 +158,23 @@ pub async fn run_telegram_bot_service(
                 tokio::time::sleep(ERROR_BACKOFF).await;
                 continue;
             }
+            let desired_fingerprint = desired.fingerprint.clone();
             match reconcile(&store, &update_http, &dynamic, &config, desired).await {
-                Ok(next) => applied = Some(next),
+                Ok(next) => {
+                    last_webhook_health_check = Instant::now();
+                    applied = Some(next);
+                }
                 Err(failure) => {
-                    let fingerprint = settings
-                        .token()
-                        .map(|token| {
-                            telegram_config_fingerprint(
-                                token,
-                                settings.mode.as_str(),
-                                settings.webhook_secret.as_deref(),
-                            )
-                        })
-                        .unwrap_or_default();
                     let _ = store
-                        .mark_telegram_bot_error(&fingerprint, &failure.message)
+                        .mark_telegram_bot_error(&desired_fingerprint, &failure)
                         .await;
-                    tracing::warn!(error = %failure.message, "telegram bot setup failed; retrying");
+                    tracing::warn!(
+                        code = failure.code.as_str(),
+                        hint = %failure.hint,
+                        diagnostics = ?failure.diagnostics,
+                        error = %failure.message,
+                        "telegram bot setup failed; retrying"
+                    );
                     tokio::time::sleep(if failure.retryable {
                         ERROR_BACKOFF
                     } else {
@@ -189,6 +194,7 @@ pub async fn run_telegram_bot_service(
             &send_http,
             &current.desired.token,
             &current.bot_id,
+            &current.desired.fingerprint,
             &config,
             &worker_id,
         )
@@ -198,6 +204,70 @@ pub async fn run_telegram_bot_service(
         }
 
         if current.desired.mode == TelegramBotMode::Webhook {
+            if last_webhook_health_check.elapsed() >= WEBHOOK_HEALTH_INTERVAL {
+                last_webhook_health_check = Instant::now();
+                match telegram::get_me(&send_http, &current.desired.token).await {
+                    Ok(identity) if identity.id.to_string() == current.bot_id => {
+                        if let Err(error) = store
+                            .mark_telegram_bot_transport_healthy(&current.desired.fingerprint)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "persist Telegram webhook transport recovery failed"
+                            );
+                        }
+                    }
+                    Ok(identity) => {
+                        tracing::warn!(
+                            previous_bot_id = %current.bot_id,
+                            detected_bot_id = identity.id,
+                            "Telegram webhook Bot identity changed; reconciling"
+                        );
+                        applied = None;
+                    }
+                    Err(failure) if failure.code == telegram::TelegramFailureCode::InvalidToken => {
+                        if let Err(error) = store
+                            .mark_telegram_bot_error(&current.desired.fingerprint, &failure)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "persist Telegram webhook token failure failed"
+                            );
+                        }
+                        tracing::warn!(
+                            code = failure.code.as_str(),
+                            hint = %failure.hint,
+                            diagnostics = ?failure.diagnostics,
+                            error = %failure.message,
+                            "Telegram webhook health check failed"
+                        );
+                        applied = None;
+                    }
+                    Err(failure) => {
+                        if let Err(error) = store
+                            .mark_telegram_bot_transport_failure(
+                                &current.desired.fingerprint,
+                                &failure,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "persist Telegram webhook transport failure failed"
+                            );
+                        }
+                        tracing::warn!(
+                            code = failure.code.as_str(),
+                            hint = %failure.hint,
+                            diagnostics = ?failure.diagnostics,
+                            error = %failure.message,
+                            "Telegram webhook health check failed"
+                        );
+                    }
+                }
+            }
             tokio::time::sleep(IDLE_POLL_INTERVAL).await;
             continue;
         }
@@ -220,6 +290,12 @@ pub async fn run_telegram_bot_service(
         {
             Ok(updates) => {
                 if let Err(error) = store
+                    .mark_telegram_bot_transport_healthy(&current.desired.fingerprint)
+                    .await
+                {
+                    tracing::warn!(error = %error, "persist Telegram transport recovery failed");
+                }
+                if let Err(error) = store
                     .persist_telegram_updates(&current.bot_id, &updates)
                     .await
                 {
@@ -228,13 +304,47 @@ pub async fn run_telegram_bot_service(
                 }
             }
             Err(failure) if failure.http_status == Some(409) => {
+                if let Err(error) = store
+                    .mark_telegram_bot_transport_failure(&current.desired.fingerprint, &failure)
+                    .await
+                {
+                    tracing::warn!(error = %error, "persist Telegram polling conflict failed");
+                }
                 tracing::error!(
+                    code = failure.code.as_str(),
+                    hint = %failure.hint,
+                    diagnostics = ?failure.diagnostics,
+                    error = %failure.message,
                     "telegram getUpdates conflict: another process or webhook consumes this bot"
                 );
                 tokio::time::sleep(FATAL_BACKOFF).await;
             }
             Err(failure) => {
-                tracing::warn!(error = %failure.message, "telegram getUpdates failed");
+                if failure.code == telegram::TelegramFailureCode::InvalidToken {
+                    // A 401 is definitive rather than a transient transport
+                    // outage. Drop the applied identity so the next loop
+                    // re-runs getMe and exposes the token error as setup
+                    // readiness instead of advertising a usable Bot.
+                    if let Err(error) = store
+                        .mark_telegram_bot_error(&current.desired.fingerprint, &failure)
+                        .await
+                    {
+                        tracing::warn!(error = %error, "persist Telegram token failure failed");
+                    }
+                    applied = None;
+                } else if let Err(error) = store
+                    .mark_telegram_bot_transport_failure(&current.desired.fingerprint, &failure)
+                    .await
+                {
+                    tracing::warn!(error = %error, "persist Telegram transport failure failed");
+                }
+                tracing::warn!(
+                    code = failure.code.as_str(),
+                    hint = %failure.hint,
+                    diagnostics = ?failure.diagnostics,
+                    error = %failure.message,
+                    "telegram getUpdates failed"
+                );
                 tokio::time::sleep(ERROR_BACKOFF).await;
             }
         }
@@ -266,7 +376,12 @@ async fn reconcile(
     }
     let bot_id = identity.id.to_string();
     store
-        .apply_telegram_bot_identity(&bot_id, &identity.username, &desired.fingerprint)
+        .apply_telegram_bot_identity_fenced(
+            &bot_id,
+            &identity.username,
+            &desired.fingerprint,
+            Some(&desired.fingerprint),
+        )
         .await
         .map_err(|error| TelegramFailure::config(error.to_string()))?;
     let _ = dynamic;
@@ -279,10 +394,7 @@ async fn reconcile(
     if identity.can_read_all_group_messages {
         tracing::warn!(bot = %identity.username, "Telegram bot group privacy mode is disabled");
     }
-    Ok(AppliedConfig {
-        desired,
-        bot_id,
-    })
+    Ok(AppliedConfig { desired, bot_id })
 }
 
 pub async fn handle_webhook_update(
@@ -301,8 +413,14 @@ pub async fn handle_webhook_update(
     if expected.trim().is_empty() || !constant_time_eq(expected.trim(), provided.trim()) {
         return Err(AppError::Unauthorized("invalid webhook secret".into()));
     }
+    let token = settings.token().unwrap_or_default();
+    let fingerprint = telegram_config_fingerprint(
+        token,
+        settings.mode.as_str(),
+        settings.webhook_secret.as_deref(),
+    );
     let runtime = store.telegram_bot_runtime().await?;
-    if !runtime.ready() {
+    if !runtime.ready() || runtime.config_fingerprint.as_deref() != Some(fingerprint.as_str()) {
         return Err(AppError::ServiceUnavailable(
             "Telegram bot is reconciling".into(),
         ));
@@ -318,7 +436,9 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
     }
     left.bytes()
         .zip(right.bytes())
-        .fold(0u8, |accumulator, (left, right)| accumulator | (left ^ right))
+        .fold(0u8, |accumulator, (left, right)| {
+            accumulator | (left ^ right)
+        })
         == 0
 }
 
@@ -511,6 +631,7 @@ async fn process_inbound_updates(
     http: &reqwest::Client,
     token: &str,
     bot_id: &str,
+    config_fingerprint: &str,
     config: &Config,
     worker_id: &str,
 ) -> Result<(), AppError> {
@@ -521,7 +642,17 @@ async fn process_inbound_updates(
         else {
             break;
         };
-        match handle_update(store, http, token, bot_id, config, &update.payload).await {
+        match handle_update(
+            store,
+            http,
+            token,
+            bot_id,
+            config_fingerprint,
+            config,
+            &update.payload,
+        )
+        .await
+        {
             Ok(()) => {
                 store
                     .finish_telegram_inbound_update(
@@ -622,6 +753,7 @@ async fn handle_update(
     http: &reqwest::Client,
     token: &str,
     bot_id: &str,
+    config_fingerprint: &str,
     config: &Config,
     update: &Value,
 ) -> Result<(), AppError> {
@@ -631,7 +763,7 @@ async fn handle_update(
     if message.chat_type != "private" {
         return Ok(());
     }
-    let reply = match parse_command(&message.text) {
+    let reply: TelegramMessage = match parse_command(&message.text) {
         Some((command, argument)) => match command.as_str() {
             "start" if !argument.is_empty() => {
                 handle_bind(store, bot_id, &message, &argument, config).await?
@@ -646,13 +778,59 @@ async fn handle_update(
         }
         _ => return Ok(()),
     };
-    match telegram::send_message(http, token, &message.chat_id, None, &reply).await {
-        Ok(_) => Ok(()),
+    match telegram::send_message(
+        http,
+        token,
+        &message.chat_id,
+        None,
+        &reply.text,
+        reply.parse_mode,
+    )
+    .await
+    {
+        Ok(_) => {
+            // Webhook mode has no successful getUpdates cycle to clear a
+            // previously recorded transport outage. A successful reply is a
+            // direct health signal for the same Bot API transport.
+            if let Err(error) = store
+                .mark_telegram_bot_delivery_healthy(config_fingerprint)
+                .await
+            {
+                tracing::warn!(error = %error, "persist Telegram reply transport recovery failed");
+            }
+            Ok(())
+        }
         Err(failure) if failure.chat_unreachable => {
             let _ = store.unbind_telegram_chat(&message.chat_id).await;
             Ok(())
         }
-        Err(failure) => Err(AppError::Internal(failure.message)),
+        Err(failure) => {
+            let runtime_update = if failure.code == telegram::TelegramFailureCode::InvalidToken {
+                store
+                    .mark_telegram_bot_error(config_fingerprint, &failure)
+                    .await
+            } else {
+                store
+                    .mark_telegram_bot_transport_failure(config_fingerprint, &failure)
+                    .await
+            };
+            if let Err(error) = runtime_update {
+                tracing::warn!(error = %error, "persist Telegram reply transport failure failed");
+            }
+            tracing::warn!(
+                code = failure.code.as_str(),
+                hint = %failure.hint,
+                diagnostics = ?failure.diagnostics,
+                error = %failure.message,
+                "Telegram reply failed"
+            );
+            Err(AppError::Internal(format!(
+                "Telegram reply failed [{}]: {}; technical error: {}",
+                failure.code.as_str(),
+                failure.hint,
+                failure.message
+            )))
+        }
     }
 }
 
@@ -662,9 +840,12 @@ async fn handle_bind(
     message: &IncomingMessage,
     payload: &str,
     config: &Config,
-) -> Result<String, AppError> {
+) -> Result<TelegramMessage, AppError> {
     if failed_binds().lock().await.is_throttled(&message.chat_id) {
-        return Ok("尝试次数过多，请稍后再试。\nToo many attempts. Please try again later.".into());
+        return Ok(TelegramMessage::html(format!(
+            "{notice} <b>请稍后再试 / Too many attempts</b>\n\n尝试次数过多，请稍后再试。\nPlease try again later.",
+            notice = Sev::Notice.badge(),
+        )));
     }
     let outcome = store
         .consume_telegram_bind_token(
@@ -677,60 +858,83 @@ async fn handle_bind(
     Ok(match outcome {
         BindOutcome::Bound {
             email,
-            enabled_channels,
+            delivery_channel,
         } => {
             failed_binds().lock().await.clear(&message.chat_id);
-            format!(
-                "绑定成功：{email}\n通知渠道：{}\nManage notifications: {}",
-                enabled_channels.join(" + "),
-                account_settings_url(config)
-            )
+            TelegramMessage::html(format!(
+                "{success} <b>绑定成功 / Linked</b>\n\n<b>账号 / Account</b>  <code>{email}</code>\n<b>投递渠道 / Delivery</b>  <code>{channel}</code>\n\n<i>通知已切换到此对话，可随时在账户页改回邮件。\nNotifications now arrive here; switch back to email any time.</i>\n\n⚙️ <a href=\"{settings}\">管理通知渠道 / Manage notifications</a>",
+                email = escape_html(&email),
+                channel = escape_html(&delivery_channel),
+                success = Sev::Success.badge(),
+                settings = escape_html(&account_settings_url(config)),
+            ))
         }
-        BindOutcome::AlreadyBound { email } => format!(
-            "此对话已绑定到 {email}。\nThis chat is already bound to {email}."
-        ),
-        BindOutcome::ChatTakenByAnotherAccount => {
-            "此 Telegram 对话已绑定到另一个 Router 账号。\nThis chat belongs to another Router account.".into()
-        }
+        BindOutcome::AlreadyBound { email } => TelegramMessage::html(format!(
+            "{info} <b>已绑定 / Already linked</b>\n\n此对话已绑定到 <code>{email}</code>。\nThis chat is already bound to <code>{email}</code>.",
+            info = Sev::Info.badge(),
+            email = escape_html(&email),
+        )),
+        BindOutcome::ChatTakenByAnotherAccount => TelegramMessage::html(format!(
+            "{notice} <b>无法绑定 / Cannot link</b>\n\n此 Telegram 对话已绑定到另一个 Router 账号。\nThis chat belongs to another Router account.",
+            notice = Sev::Notice.badge(),
+        )),
         BindOutcome::InvalidToken => {
             failed_binds().lock().await.record_failure(&message.chat_id);
-            format!(
-                "绑定链接无效或已过期，请重新生成：{}\nThe binding link is invalid or expired.",
-                account_settings_url(config)
-            )
+            TelegramMessage::html(format!(
+                "{critical} <b>链接无效 / Invalid link</b>\n\n绑定链接无效或已过期，请重新生成。\nThe binding link is invalid or expired.\n\n⚙️ <a href=\"{settings}\">重新生成 / Generate a new link</a>",
+                critical = Sev::Critical.badge(),
+                settings = escape_html(&account_settings_url(config)),
+            ))
         }
     })
 }
 
-async fn handle_status(store: &AppStore, message: &IncomingMessage) -> Result<String, AppError> {
+async fn handle_status(
+    store: &AppStore,
+    message: &IncomingMessage,
+) -> Result<TelegramMessage, AppError> {
     let Some(targets) = store.telegram_binding_for_chat(&message.chat_id).await? else {
-        return Ok("此对话尚未绑定任何 Router 账号。\nThis chat is not bound.".into());
+        return Ok(not_bound_reply());
     };
-    Ok(format!(
-        "已绑定账号：{}\n通知渠道：{}",
-        targets.email,
-        targets
-            .enabled_channels()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(" + ")
+    let channel = targets
+        .selected_channel()
+        .map(NotificationChannelId::as_str)
+        .unwrap_or(EMAIL_CHANNEL);
+    Ok(TelegramMessage::html(format!(
+        "{info} <b>绑定状态 / Status</b>\n\n<b>账号 / Account</b>  <code>{email}</code>\n<b>投递渠道 / Delivery</b>  <code>{channel}</code>",
+        info = Sev::Info.badge(),
+        email = escape_html(&targets.email),
+        channel = escape_html(channel),
+    )))
+}
+
+async fn handle_unbind(
+    store: &AppStore,
+    message: &IncomingMessage,
+) -> Result<TelegramMessage, AppError> {
+    Ok(match store.unbind_telegram_chat(&message.chat_id).await? {
+        Some(email) => TelegramMessage::html(format!(
+            "{notice} <b>已解绑 / Unlinked</b>\n\n<code>{email}</code> 的通知已回到邮件渠道。\nNotifications for <code>{email}</code> fall back to email.",
+            notice = Sev::Notice.badge(),
+            email = escape_html(&email),
+        )),
+        None => not_bound_reply(),
+    })
+}
+
+fn not_bound_reply() -> TelegramMessage {
+    TelegramMessage::html(format!(
+        "{info} <b>未绑定 / Not linked</b>\n\n此对话尚未绑定任何 Router 账号。\nThis chat is not bound to a Router account.",
+        info = Sev::Info.badge(),
     ))
 }
 
-async fn handle_unbind(store: &AppStore, message: &IncomingMessage) -> Result<String, AppError> {
-    Ok(match store.unbind_telegram_chat(&message.chat_id).await? {
-        Some(email) => format!(
-            "已解绑 {email}，未送达通知将回到邮件渠道。\nUnbound; pending notifications fall back to email."
-        ),
-        None => "此对话尚未绑定任何 Router 账号。\nThis chat is not bound.".into(),
-    })
-}
-
-fn help_text(config: &Config) -> String {
-    format!(
-        "CC-Switch Router 通知机器人\n\n在账户页绑定 Telegram：{}\n\n/status 查看状态\n/unbind 解除绑定",
-        account_settings_url(config)
-    )
+fn help_text(config: &Config) -> TelegramMessage {
+    TelegramMessage::html(format!(
+        "{info} <b>CC-Switch Router 通知机器人</b>\n\n在账户页绑定 Telegram，通知就会送到这个对话。\nLink this chat on the account page and notifications arrive here.\n\n<b>/status</b>  查看状态 / show status\n<b>/unbind</b>  解除绑定 / unlink\n\n⚙️ <a href=\"{settings}\">账户通知设置 / Notification settings</a>",
+        info = Sev::Info.badge(),
+        settings = escape_html(&account_settings_url(config)),
+    ))
 }
 
 #[cfg(test)]

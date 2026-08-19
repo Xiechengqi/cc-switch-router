@@ -14,7 +14,15 @@ use super::models::{
     AlertOverviewCounts, AlertTransition, OperatorAlertSignal, severity_rank,
 };
 
-pub type AlertChannelActivity = (Option<i64>, Option<i64>, Option<String>);
+#[derive(Debug, Clone, Default)]
+pub struct AlertChannelActivity {
+    pub last_attempt_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_hint: Option<String>,
+    pub failure_details: Option<serde_json::Value>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AlertStore {
@@ -661,40 +669,73 @@ impl AlertStore {
                 .map_err(|error| {
                     AppError::Internal(format!("begin alert delivery finish failed: {error}"))
                 })?;
-            let (status, provider_message_id, next_attempt_at, last_error, http_status) =
-                match &result {
-                    AlertDeliveryResult::Sent {
-                        provider_message_id,
-                        http_status,
-                    } => (
-                        "sent",
-                        provider_message_id.clone(),
-                        None,
-                        None,
-                        *http_status,
-                    ),
-                    AlertDeliveryResult::Retry {
-                        error,
-                        next_attempt_at,
-                        http_status,
-                    } => (
-                        "retry",
-                        None,
-                        Some(*next_attempt_at),
-                        Some(error.clone()),
-                        *http_status,
-                    ),
-                    AlertDeliveryResult::DeadLetter { error, http_status } => {
-                        ("dead_letter", None, None, Some(error.clone()), *http_status)
-                    }
-                    AlertDeliveryResult::Suppressed { reason } => (
-                        "suppressed_disabled",
-                        None,
-                        None,
-                        Some(reason.clone()),
-                        None,
-                    ),
-                };
+            let (
+                status,
+                provider_message_id,
+                next_attempt_at,
+                last_error,
+                failure_code,
+                failure_hint,
+                failure_details,
+                http_status,
+            ) = match &result {
+                AlertDeliveryResult::Sent {
+                    provider_message_id,
+                    http_status,
+                } => (
+                    "sent",
+                    provider_message_id.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    *http_status,
+                ),
+                AlertDeliveryResult::Retry {
+                    error,
+                    failure_code,
+                    failure_hint,
+                    failure_details,
+                    next_attempt_at,
+                    http_status,
+                } => (
+                    "retry",
+                    None,
+                    Some(*next_attempt_at),
+                    Some(error.clone()),
+                    failure_code.clone(),
+                    failure_hint.clone(),
+                    failure_details.clone(),
+                    *http_status,
+                ),
+                AlertDeliveryResult::DeadLetter {
+                    error,
+                    failure_code,
+                    failure_hint,
+                    failure_details,
+                    http_status,
+                } => (
+                    "dead_letter",
+                    None,
+                    None,
+                    Some(error.clone()),
+                    failure_code.clone(),
+                    failure_hint.clone(),
+                    failure_details.clone(),
+                    *http_status,
+                ),
+                AlertDeliveryResult::Suppressed { reason } => (
+                    "suppressed_disabled",
+                    None,
+                    None,
+                    Some(reason.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            };
             let updated = tx
                 .execute(
                     "UPDATE alert_deliveries
@@ -725,8 +766,9 @@ impl AlertStore {
             tx.execute(
                 "INSERT INTO alert_delivery_attempts (
                     id, delivery_id, attempt_number, status, http_status,
-                    provider_message_id, error_message, attempted_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    provider_message_id, error_message, failure_code, failure_hint,
+                    failure_details_json, attempted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     Uuid::new_v4().to_string(),
                     delivery.id,
@@ -735,6 +777,9 @@ impl AlertStore {
                     http_status,
                     provider_message_id,
                     last_error,
+                    failure_code,
+                    failure_hint,
+                    failure_details.and_then(|value| serde_json::to_string(&value).ok()),
                     now
                 ],
             )
@@ -841,11 +886,15 @@ impl AlertStore {
             let conn = store.open()?;
             let mut statement = conn
                 .prepare(
-                    "SELECT channel, attempted_at, success_at, error_message
+                    "SELECT channel, attempted_at, success_at, error_message,
+                            failure_code, failure_hint, failure_details_json
                      FROM (
                          SELECT d.channel AS channel, a.attempted_at AS attempted_at,
                                 CASE WHEN a.status = 'sent' THEN a.attempted_at END AS success_at,
                                 CASE WHEN a.status = 'sent' THEN NULL ELSE a.error_message END AS error_message,
+                                CASE WHEN a.status = 'sent' THEN NULL ELSE a.failure_code END AS failure_code,
+                                CASE WHEN a.status = 'sent' THEN NULL ELSE a.failure_hint END AS failure_hint,
+                                CASE WHEN a.status = 'sent' THEN NULL ELSE a.failure_details_json END AS failure_details_json,
                                 a.id AS activity_id
                          FROM alert_delivery_attempts a
                          INNER JOIN alert_deliveries d ON d.id = a.delivery_id
@@ -853,6 +902,9 @@ impl AlertStore {
                          SELECT channel, tested_at,
                                 CASE WHEN status = 'success' THEN tested_at END,
                                 CASE WHEN status = 'success' THEN NULL ELSE error_message END,
+                                CASE WHEN status = 'success' THEN NULL ELSE failure_code END,
+                                CASE WHEN status = 'success' THEN NULL ELSE failure_hint END,
+                                CASE WHEN status = 'success' THEN NULL ELSE failure_details_json END,
                                 id
                          FROM alert_channel_checks
                      )
@@ -868,6 +920,9 @@ impl AlertStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 })
                 .map_err(|error| {
@@ -875,15 +930,32 @@ impl AlertStore {
                 })?;
             let mut activity: HashMap<String, AlertChannelActivity> = HashMap::new();
             for row in rows {
-                let (channel, attempted_at, success_at, error_message) = row.map_err(|error| {
+                let (
+                    channel,
+                    attempted_at,
+                    success_at,
+                    error_message,
+                    failure_code,
+                    failure_hint,
+                    failure_details_json,
+                ) = row.map_err(|error| {
                     AppError::Internal(format!("read alert channel activity failed: {error}"))
                 })?;
-                let entry = activity.entry(channel).or_insert((None, None, None));
-                entry.0 = Some(attempted_at);
+                let entry = activity.entry(channel).or_default();
+                entry.last_attempt_at = Some(attempted_at);
                 if let Some(success_at) = success_at {
-                    entry.1 = Some(entry.1.map_or(success_at, |current| current.max(success_at)));
+                    entry.last_success_at = Some(
+                        entry
+                            .last_success_at
+                            .map_or(success_at, |current| current.max(success_at)),
+                    );
                 }
-                entry.2 = error_message;
+                entry.last_error = error_message;
+                entry.failure_code = failure_code;
+                entry.failure_hint = failure_hint;
+                entry.failure_details = failure_details_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok());
             }
             Ok(activity)
         })
@@ -891,6 +963,7 @@ impl AlertStore {
         .map_err(|error| AppError::Internal(format!("alert channel task failed: {error}")))?
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_channel_test(
         &self,
         channel: String,
@@ -898,6 +971,9 @@ impl AlertStore {
         provider_message_id: Option<String>,
         http_status: Option<u16>,
         error_message: Option<String>,
+        failure_code: Option<String>,
+        failure_hint: Option<String>,
+        failure_details: Option<serde_json::Value>,
         tested_at: i64,
     ) -> Result<(), AppError> {
         let store = self.clone();
@@ -906,8 +982,9 @@ impl AlertStore {
             conn.execute(
                 "INSERT INTO alert_channel_checks (
                     id, channel, status, http_status, provider_message_id,
-                    error_message, tested_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    error_message, failure_code, failure_hint, failure_details_json,
+                    tested_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     Uuid::new_v4().to_string(),
                     channel,
@@ -915,6 +992,9 @@ impl AlertStore {
                     http_status.map(i64::from),
                     provider_message_id,
                     error_message,
+                    failure_code,
+                    failure_hint,
+                    failure_details.and_then(|value| serde_json::to_string(&value).ok()),
                     tested_at,
                 ],
             )
@@ -970,11 +1050,17 @@ pub enum AlertDeliveryResult {
     },
     Retry {
         error: String,
+        failure_code: Option<String>,
+        failure_hint: Option<String>,
+        failure_details: Option<serde_json::Value>,
         next_attempt_at: i64,
         http_status: Option<u16>,
     },
     DeadLetter {
         error: String,
+        failure_code: Option<String>,
+        failure_hint: Option<String>,
+        failure_details: Option<serde_json::Value>,
         http_status: Option<u16>,
     },
     Suppressed {
@@ -1069,6 +1155,9 @@ fn init_alert_db(conn: &Connection) -> Result<(), AppError> {
             http_status INTEGER,
             provider_message_id TEXT,
             error_message TEXT,
+            failure_code TEXT,
+            failure_hint TEXT,
+            failure_details_json TEXT,
             attempted_at INTEGER NOT NULL,
             FOREIGN KEY (delivery_id) REFERENCES alert_deliveries(id) ON DELETE CASCADE
         );
@@ -1088,6 +1177,9 @@ fn init_alert_db(conn: &Connection) -> Result<(), AppError> {
             http_status INTEGER,
             provider_message_id TEXT,
             error_message TEXT,
+            failure_code TEXT,
+            failure_hint TEXT,
+            failure_details_json TEXT,
             tested_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_alert_channel_checks_channel_time
@@ -1106,6 +1198,58 @@ fn init_alert_db(conn: &Connection) -> Result<(), AppError> {
         ",
     )
     .map_err(|error| AppError::Internal(format!("init alert database failed: {error}")))?;
+    for (table, column, definition) in [
+        ("alert_delivery_attempts", "failure_code", "TEXT"),
+        ("alert_delivery_attempts", "failure_hint", "TEXT"),
+        ("alert_delivery_attempts", "failure_details_json", "TEXT"),
+        ("alert_channel_checks", "failure_code", "TEXT"),
+        ("alert_channel_checks", "failure_hint", "TEXT"),
+        ("alert_channel_checks", "failure_details_json", "TEXT"),
+    ] {
+        ensure_alert_column(conn, table, column, definition)?;
+    }
+    Ok(())
+}
+
+fn ensure_alert_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), AppError> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| {
+            AppError::Internal(format!("inspect alert table {table} failed: {error}"))
+        })?;
+    let mut rows = statement.query([]).map_err(|error| {
+        AppError::Internal(format!("read alert table {table} columns failed: {error}"))
+    })?;
+    let mut exists = false;
+    while let Some(row) = rows.next().map_err(|error| {
+        AppError::Internal(format!(
+            "iterate alert table {table} columns failed: {error}"
+        ))
+    })? {
+        if row.get::<_, String>(1).map_err(|error| {
+            AppError::Internal(format!("read alert table {table} column failed: {error}"))
+        })? == column
+        {
+            exists = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(statement);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("add alert table {table}.{column} failed: {error}"))
+        })?;
+    }
     Ok(())
 }
 
@@ -1740,6 +1884,52 @@ mod tests {
         )))
     }
 
+    #[test]
+    fn init_alert_db_adds_diagnostic_columns_to_an_existing_database() {
+        let conn = Connection::open_in_memory().expect("open alert test database");
+        conn.execute_batch(
+            "CREATE TABLE alert_delivery_attempts (
+                id TEXT PRIMARY KEY,
+                delivery_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                http_status INTEGER,
+                provider_message_id TEXT,
+                error_message TEXT,
+                attempted_at INTEGER NOT NULL
+             );
+             CREATE TABLE alert_channel_checks (
+                id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                status TEXT NOT NULL,
+                http_status INTEGER,
+                provider_message_id TEXT,
+                error_message TEXT,
+                tested_at INTEGER NOT NULL
+             );",
+        )
+        .expect("seed legacy alert tables");
+
+        init_alert_db(&conn).expect("upgrade alert tables");
+        for (table, column) in [
+            ("alert_delivery_attempts", "failure_code"),
+            ("alert_delivery_attempts", "failure_hint"),
+            ("alert_delivery_attempts", "failure_details_json"),
+            ("alert_channel_checks", "failure_code"),
+            ("alert_channel_checks", "failure_hint"),
+            ("alert_channel_checks", "failure_details_json"),
+        ] {
+            let present = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    params![column],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("inspect upgraded alert column");
+            assert_eq!(present, 1, "missing {table}.{column}");
+        }
+    }
+
     fn condition() -> AlertCondition {
         AlertCondition {
             fingerprint: "fd_pressure:router:router".into(),
@@ -1919,6 +2109,9 @@ mod tests {
                 current,
                 AlertDeliveryResult::Retry {
                     error: "temporary".into(),
+                    failure_code: Some("api_timeout".into()),
+                    failure_hint: Some("retry later".into()),
+                    failure_details: None,
                     next_attempt_at: 130,
                     http_status: Some(503),
                 },
@@ -1941,14 +2134,29 @@ mod tests {
                 None,
                 Some(409),
                 Some("temporary provider failure".into()),
+                Some("api_endpoint_unreachable".into()),
+                Some("check DNS".into()),
+                Some(serde_json::json!({"resolvedAddresses": ["192.0.2.1"]})),
                 100,
             )
             .await
             .unwrap();
         let failed = store.channel_activity().await.unwrap();
+        let failed_activity = failed.get("secondary").expect("failed activity");
+        assert_eq!(failed_activity.last_attempt_at, Some(100));
+        assert_eq!(failed_activity.last_success_at, None);
         assert_eq!(
-            failed.get("secondary"),
-            Some(&(Some(100), None, Some("temporary provider failure".into())))
+            failed_activity.last_error.as_deref(),
+            Some("temporary provider failure")
+        );
+        assert_eq!(
+            failed_activity.failure_code.as_deref(),
+            Some("api_endpoint_unreachable")
+        );
+        assert_eq!(failed_activity.failure_hint.as_deref(), Some("check DNS"));
+        assert_eq!(
+            failed_activity.failure_details,
+            Some(serde_json::json!({"resolvedAddresses": ["192.0.2.1"]}))
         );
 
         store
@@ -1958,15 +2166,19 @@ mod tests {
                 Some("message-one".into()),
                 Some(200),
                 None,
+                None,
+                None,
+                None,
                 110,
             )
             .await
             .unwrap();
         let recovered = store.channel_activity().await.unwrap();
-        assert_eq!(
-            recovered.get("secondary"),
-            Some(&(Some(110), Some(110), None))
-        );
+        let recovered_activity = recovered.get("secondary").expect("recovered activity");
+        assert_eq!(recovered_activity.last_attempt_at, Some(110));
+        assert_eq!(recovered_activity.last_success_at, Some(110));
+        assert_eq!(recovered_activity.last_error, None);
+        assert_eq!(recovered_activity.failure_code, None);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # cc-switch-router
 
-TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域名与反向隧道,并在其上承载额度共享市场、主机供给市场与多区域 Router 联邦。
+TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域名与反向隧道，并在 Client + Router 边界内承载 Share Market、Client Market 与多区域 Router 联邦。旧独立 Token Market 不再是运行时依赖；未来外部容量平台只能通过中性的、签名的 Gateway 入口接入。
 
 | Region | 24h usage |
 | --- | --- |
@@ -70,18 +70,18 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
 | `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner | 从在线 Client 拉取脱敏进程日志；Client owner 最多 100 行，匿名、非 owner 用户和非 owner 管理员最多 10 行 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
-| `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
+| `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` | 退役 | 无 | 统一返回 `410 Gone`；不会创建旧 Market session、host 或 proxy |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
 | `/v1/market-access/*` | 12 | 用户 Session / scoped API Token | `dashboard`、`inbox-summary`、`policies`、`counterparties/batch`、准入申请批准/拒绝/取消、买家授信与公共额度 |
 | `/v1/market-billing/*` | 11 | 公开 `config` / 用户 Session | `config`、`dashboard`、`supplier-profiles`、`accounts/:id/settle`、`request-settlement`、`accounts/:id/invoices`、付款声明/确认/拒绝与争议 |
-| `/v1/gateway/*`、`/v1/gateways/*` | 5 | HMAC 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/feedback`、`request-logs/batch` |
+| `/v1/gateway/*`、`/v1/gateways/*` | 5 | Ed25519 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/headroom`、`shares/feedback`、`request-logs/batch`；签名绑定原始 body，owner email、Free 与 ShareTo 均不授权，新 grant contract 前普通 Share 整体 fail-closed |
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
 | `/v1/account/*` | 2 | Session | `payment-profile`、`payment-assets/:id` |
 | `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 13 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link` |
-| 其余单例 | 约 16 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`integrations/telegram/webhook`、`_market/proxy/*`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
+| 其余单例 | 约 16 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`integrations/telegram/webhook`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
 
 ## 管理设置与运维
 
@@ -228,7 +228,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT` | `30` | 单邮箱每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT` | `20` | 单 IP 每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_AUTH_SOURCE_HOURLY_LIMIT` | `10` | 单认证来源每小时最大发送次数 |
-| `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `for_sale = Free` share 共用的单真实用户 IP 并发上限;设为 `0` 可关闭 |
+| `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `free_access = 1` 的公开免费 Share 共用的单真实用户 IP 并发上限；v1 `forSale=Free` 只在 migration 20 的持久化迁移边界识别，不属于 active contract；设为 `0` 可关闭 |
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
@@ -291,13 +291,17 @@ Client 生命周期通知使用持久化 outbox、稳定幂等键和离线 episo
 
 ### 用户通知渠道（邮件 / Telegram）
 
-用户通知在「账户 → 通知设置」页通过独立开关启用邮件和 Telegram，至少保留一个渠道。偏好按渠道逐行保存在 `user_notification_channels`，每行带目标、Bot 身份和单调递增的 revision；投递前会再次校验该 revision，因此解绑、换绑或关闭渠道会使尚未发送的旧目标失效。渠道偏好是账号级全局设置，不按 Client 或事件类型分别配置。
+用户通知在「账户 → 通知设置」页从邮件和 Telegram 中二选一：一次只有一个投递渠道，不会同时发两份。偏好按渠道逐行保存在 `user_notification_channels`，每行带目标、Bot 身份和单调递增的 revision，并由 `user_id` 上的部分唯一索引保证同一账号最多只有一行处于选中状态；投递前会再次校验该 revision，因此解绑、换绑或切换渠道会使尚未发送的旧目标失效。Telegram 只有在 Bot 就绪且当前账号已完成绑定时才可选中，邮件始终可选。渠道偏好是账号级全局设置，不按 Client 或事件类型分别配置。
 
-绑定流程：点击「绑定 Telegram」时 Router 生成 128 位一次性 token（只存 SHA-256），并使用已经由 Telegram `getMe` 验证的 Bot username 在新标签页打开 `https://t.me/<username>?start=<token>`。用户点 Start 后，polling 或 webhook 会先把 update 持久化到 `telegram_inbound_updates`，后台处理器再消费 `/start <token>` 并写入 Telegram 渠道行。前端轮询 `GET /v1/me/notifications`，直到 `verifiedAt` 变化；弹窗被拦截时会展示可复制的深链与 `/start <token>` 命令。token 默认 900 秒过期且一次性消费，已撤销记录仍保留到清理期以防反复换链接绕过签发限额；同一个 Bot 下一个 chat 最多绑定一个账号。绑定会启用 Telegram 但不会关闭邮件，用户随后可独立调整两个开关。解绑会确保邮件回落，取消尚未开始的 Telegram 投递；已经进入外部 provider 调用的发送可能完成。
+绑定流程：点击「绑定 Telegram」时 Router 生成 128 位一次性 token（只存 SHA-256），并使用已经由 Telegram `getMe` 验证的 Bot username 在新标签页打开 `https://t.me/<username>?start=<token>`。用户点 Start 后，polling 或 webhook 会先把 update 持久化到 `telegram_inbound_updates`，后台处理器再消费 `/start <token>` 并写入 Telegram 渠道行。前端轮询 `GET /v1/me/notifications`，直到 `verifiedAt` 变化；弹窗被拦截时会展示可复制的深链与 `/start <token>` 命令。token 默认 900 秒过期且一次性消费，已撤销记录仍保留到清理期以防反复换链接绕过签发限额；同一个 Bot 下一个 chat 最多绑定一个账号。绑定成功会把投递渠道自动切到 Telegram，用户随后可随时切回邮件。解绑会切回邮件，取消尚未开始的 Telegram 投递；已经进入外部 provider 调用的发送可能完成。切换渠道不会丢消息：旧渠道尚未发出的投递被取消后，其事件会重新排队到新选中的渠道。
 
 Router owner 的配置只有三步：向 `@BotFather` 申请一个 Bot、把 token 填入 `CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN`、打开 `CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED`。Settings 只校验 BotFather token 的本地结构并立即持久化，不依赖 Telegram 当时是否可达；后台服务随后调用 `getMe` 验证身份、写入 runtime 状态并在网络故障时自动重试。Bot ID 与 username 不接受人工配置。相同 Bot ID 的 token 轮换保留现有绑定，不同 Bot ID 会使旧绑定失效并启用邮件回落。以上键可在 Settings 热更新。默认 polling 不要求入站可达性；webhook 需要公网域名和 `CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET`，回调路径 `POST /v1/integrations/telegram/webhook` 已从 IP 黑名单中豁免。两种模式使用相同的持久化 inbox 和幂等 update key，poll cursor 与一批 updates 在同一事务提交，处理失败不会跳过 update。该 Bot 与运维告警 Telegram 渠道相互独立：前者面向终端用户并按账号扇出，后者是面向单一运维会话的告警 adapter；两者可以复用 token，但配置项和状态不共享。
 
-投递语义：同一事件按所有已启用渠道生成独立的 `notification_deliveries`，共享事件关联但各自冻结载荷、重试和结束状态。小时额度统计真实 started attempt 与仍有效的 reservation，不在 outbox 生成时预占；因此 Telegram 不会消耗或阻塞 Resend 额度。Telegram 暂时不可用时自动回落邮件；注册通知固定只走邮件，因为其正文包含首次登录口令提示。Bot 明确报告 chat 不可达时，当前 attempt 失败、仅匹配当前 Bot/目标的绑定被置为 invalid，并且原事件只重新排队一次邮件回落。Operations 中的投递历史只展示渠道、脱敏目标、结构化失败类型和阻断原因，不返回 Bot token 或原始 chat id。
+投递语义：同一事件只在当前选中的渠道上生成一条 `notification_deliveries`，冻结载荷、重试和结束状态。小时额度统计真实 started attempt 与仍有效的 reservation，不在 outbox 生成时预占；因此 Telegram 不会消耗或阻塞 Resend 额度。Telegram 暂时不可用时自动回落邮件；注册通知固定只走邮件，因为其正文包含首次登录口令提示。Bot 明确报告 chat 不可达时，当前 attempt 失败、仅匹配当前 Bot/目标的绑定被置为 invalid，并且原事件只重新排队一次邮件回落。Operations 中的投递历史只展示渠道、脱敏目标、结构化失败类型和阻断原因，不返回 Bot token 或原始 chat id。
+
+Telegram 消息使用独立于邮件的排版：`parse_mode=HTML`，按严重级别加彩色徽标（离线 🔴、事故 🚨、提醒 🟠、成功 🟢、信息 🔵），字段以 `<b>` 标签加 `<code>` 值呈现，URL 保留裸链以便 Telegram 自动识别，末尾附操作链接与通知设置入口。冻结的 Telegram 载荷带 `payload_version`（2 = HTML），升级前入队的纯文本消息仍按纯文本发送；截断按标签边界进行，投递前还会校验标签闭合，若 Telegram 仍判定解析失败则自动降级为纯文本重发一次，保证告警不会因排版而丢失。
+
+Telegram 连接失败会被分类为 DNS 解析失败、地址不可达、超时、TLS、Token 无效或 polling 冲突等稳定错误码。Router 会短暂缓存同一主机的 DNS/IPv4 TCP 探测结果，并在 Settings、账户通知、Metrics 和测试 API 展示可操作提示及脱敏技术详情；当 DNS 返回不可达地址时会明确建议检查主机 DNS（可尝试 `8.8.8.8` 或 `1.1.1.1`），而不是只显示底层 HTTP 传输异常。Polling 会用 `getUpdates`，Webhook 会每分钟用 `getMe` 做低频健康探测；成功请求会清除诊断缓存并重新入队临时阻断的 Telegram 通知，避免修复网络后继续展示旧结果或丢失待发送消息。
 
 ### LLM 性能指标
 
@@ -361,7 +365,7 @@ curl http://127.0.0.1/v1/healthz
 dashboard 当前行为:
 
 - 未登录时 share 表格中的 API key 默认脱敏
-- owner 或 `shared_with_emails` 中的邮箱登录后,可看到对应 share 的 API key 明文
+- owner 或活动 canonical `role=shareto` grant 中的邮箱登录后,可看到对应 share 的 API key 明文
 - 页脚 `PAGE ONLINE` 右侧在 free plan 且 Resend 返回 `x-resend-daily-quota` 时,会显示 `RESEND USAGE xx%`
 - Resend 用量由服务端每 10 分钟主动请求一次并缓存;若响应头不存在,则页脚只显示 `PAGE ONLINE`
 
@@ -401,7 +405,7 @@ listener。示例 unit 将 stdout/stderr 交给 journald,由系统日志策略�
 - 设备私钥由 `cc-switch-server` 以本地文件方式保存(`server.json` 内的 `router.identity`),未接入系统安全存储
 - share 用量同步为「事件驱动最终一致」,由 `cc-switch-server` 在创建、状态变更、用量变更、删除时异步上报
 - `cc-switch-server` 端 share 同步已做短延迟批量聚合,降低高频请求噪音
-- share owner / `shared_with_emails` ACL 以 `cc-switch-server` 推送为准,`cc-switch-router` 负责持久化、鉴权和 dashboard 脱敏控制
+- Share owner / `userGrants` 以 `cc-switch-server` 的 Contract v2 descriptor 为准，`cc-switch-router` 负责持久化、鉴权和 dashboard 脱敏控制；frozen schema 中的旧 ACL 列只写空值且不参与读取
 
 **运行与清理**
 

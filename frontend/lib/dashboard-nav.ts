@@ -1,5 +1,4 @@
 export const DASHBOARD_CLIENTS_PATH = "/clients/";
-export const DASHBOARD_MARKETS_PATH = "/markets/";
 export const DASHBOARD_SHARE_MARKET_PATH = "/share-market/";
 export const DASHBOARD_CLIENT_MARKET_PATH = "/client-market/";
 export const DASHBOARD_ACCOUNT_PATH = "/account/";
@@ -18,7 +17,6 @@ export const DASHBOARD_ACCOUNT_RENTALS_PATH = "/account/rentals/";
 
 export type DashboardRoute =
   | typeof DASHBOARD_CLIENTS_PATH
-  | typeof DASHBOARD_MARKETS_PATH
   | typeof DASHBOARD_SHARE_MARKET_PATH
   | typeof DASHBOARD_CLIENT_MARKET_PATH
   | typeof DASHBOARD_ACCOUNT_PATH
@@ -33,7 +31,7 @@ export type DashboardRoute =
   | typeof DASHBOARD_ACCOUNT_SHARE_PATH
   | typeof DASHBOARD_ACCOUNT_CLIENT_PATH
   | typeof DASHBOARD_ACCOUNT_RENTALS_PATH;
-export type DashboardShellActive = "clients" | "markets" | "share-market" | "client-market" | "account" | "settings" | "operations" | "metrics";
+export type DashboardShellActive = "clients" | "share-market" | "client-market" | "account" | "settings" | "operations" | "metrics";
 
 export function normalizeDashboardPath(pathname: string): DashboardRoute | null {
   if (pathname.startsWith("/account/rentals")) return DASHBOARD_ACCOUNT_RENTALS_PATH;
@@ -50,22 +48,24 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account")) return DASHBOARD_ACCOUNT_PATH;
   if (pathname.startsWith("/client-market")) return DASHBOARD_CLIENT_MARKET_PATH;
   if (pathname.startsWith("/share-market")) return DASHBOARD_SHARE_MARKET_PATH;
-  if (pathname.startsWith("/markets")) return DASHBOARD_MARKETS_PATH;
+  // Keep old Token Market bookmarks safe, but land them on the built-in
+  // Share Market rather than exposing a retired registry state.
+  if (pathname.startsWith("/markets")) return DASHBOARD_SHARE_MARKET_PATH;
   if (pathname.startsWith("/clients")) return DASHBOARD_CLIENTS_PATH;
   return null;
 }
 
-export function dashboardRouteForDrawer(kind: "client" | "share" | "market"): DashboardRoute {
-  return kind === "market" ? DASHBOARD_MARKETS_PATH : DASHBOARD_CLIENTS_PATH;
+export function dashboardRouteForDrawer(kind: "client" | "share"): DashboardRoute {
+  return DASHBOARD_CLIENTS_PATH;
 }
 
-export function dashboardRouteForFocus(kind: "request" | "client" | "share" | "market" | "country"): DashboardRoute {
-  return kind === "market" ? DASHBOARD_MARKETS_PATH : DASHBOARD_CLIENTS_PATH;
+export function dashboardRouteForFocus(kind: "request" | "client" | "share" | "country"): DashboardRoute {
+  return DASHBOARD_CLIENTS_PATH;
 }
 
 export function defaultDashboardRouteFromSearch(search: string): DashboardRoute {
   const drawerKind = new URLSearchParams(search).get("drawerKind");
-  if (drawerKind === "market") return DASHBOARD_MARKETS_PATH;
+  if (drawerKind === "market") return DASHBOARD_SHARE_MARKET_PATH;
   return DASHBOARD_CLIENTS_PATH;
 }
 
@@ -80,7 +80,7 @@ export function pathnameForDashboardShell(pathname: string): DashboardShellActiv
   if (pathname.startsWith("/account")) return "account";
   if (pathname.startsWith("/client-market")) return "client-market";
   if (pathname.startsWith("/share-market")) return "share-market";
-  if (pathname.startsWith("/markets")) return "markets";
+  if (pathname.startsWith("/markets")) return "share-market";
   if (pathname.startsWith("/clients")) return "clients";
   if (pathname.startsWith("/metrics")) return "metrics";
   if (pathname.startsWith("/operations")) return "operations";
@@ -90,10 +90,6 @@ export function pathnameForDashboardShell(pathname: string): DashboardShellActiv
 
 export function isClientsRoute(pathname: string) {
   return pathname.startsWith("/clients");
-}
-
-export function isMarketsRoute(pathname: string) {
-  return pathname.startsWith("/markets");
 }
 
 export function isClientMarketRoute(pathname: string) {

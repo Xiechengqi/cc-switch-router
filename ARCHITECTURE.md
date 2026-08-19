@@ -33,7 +33,7 @@
 
 ## 1. 系统定位
 
-cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-server` 实例提供公网可达性,并在此之上承载三层市场。
+cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-server` 实例提供公网可达性，并在 Client + Router 边界内承载 Router 自有的 Share Market、Client Market 与中性的 Gateway 容量适配。旧独立 Token Market 不再是 Router 的运行时角色。
 
 单进程同时承载三个职责:
 
@@ -60,31 +60,11 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
 
 ---
 
-## 2. 三个交易面
+## 2. Client + Router 的能力边界
 
-三个交易面共用同一套隧道与 Share descriptor 内核。Token Market 保持按 Token 用量结算；Share Market 与 Client Market 商品形态不同,但共用统一供应商准入、买家授信与账户级后付费账务。
+两类内建市场共用同一套隧道、Share descriptor、准入和账户级后付费账务；它们都不依赖旧 `router_markets` 注册或 bearer session：
 
-### ① Token Market —— 按量 Token 交易
-
-卖方拥有 Claude / Codex 等订阅,在自己机器上运行 Server,通过 Router 获得公网子域名。外部 Token Market 以 `marketKind=usage` 注册,买方按请求消耗 Token；流量经 Router 路由至卖方 Server,由卖方凭据完成真正的上游调用。
-
-定价按**官方价百分比**、分 app 独立设置:
-
-```rust
-for_sale_official_price_percent_by_app: BTreeMap<String, u16>
-```
-
-配套机制:
-
-- `token_limit` / `parallel_limit` —— 一个多 app Share 共享额度与并发上限;多个独立 URL 若使用同一 `capacityPoolId`,Market 调度也只计算一次物理容量与故障转移槽位
-- `share_request_logs`、`llm_request_metrics` —— 逐请求计量(模型、Token 数、延迟、估算成本)
-- `share_model_health_state` —— 滚动健康度,支撑 Share 间自动 failover
-- `free_share_ip_parallel_limit` —— 免费档按真实用户 IP 限并发
-- Server Provider Bundle 的有效模型策略随 Share descriptor 同步。Router 按 `bundleId` 合并 Client/Share 侧边栏供应商；全局策略只合并展示一次，按 App 独立策略逐 App 展示，Profile 固定策略始终作为只读例外单列。
-
-> **关键性质:Router 不持有上游凭证。** `ShareUpstreamProvider` 绑定在卖方 Server 侧,凭据始终留在卖方机器上。Router 只做路由、计量、鉴权和脱敏,不是凭证托管方。
-
-### ② Share Market —— 固定拼车位租用
+### ① Share Market —— 固定拼车位租用
 
 Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,候选项同时展示 subdomain、owner 和已绑定应用，并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制、每日价格和服务期限。
 
@@ -101,14 +81,21 @@ Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 
 - 租用后,Router 才通过 pending Share edit 在 Server 上创建 `routerShareMarket` 管理的 `shareto` entitlement。普通 Share 编辑不能修改或删除这类 entitlement。
 - Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
 - **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
+- 普通 Share 的 `freeAccess` 是独立的公开免费策略：默认私有，开启后任意持有效 Router 用户 API Token 的已登录用户可调用，匿名仍拒绝。它与 Share Market listing/subscription 严格互斥；候选列表排除 Free Share，业务事务和数据库 trigger 双向阻止“公开免费 + 活跃市场 entitlement”，尚未应用的“开启 Free”控制面编辑也会阻止新建或重新打开 listing。
 
 市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `service_duration_days`，Subscription 另存从租用成功时计算的绝对 `expires_at`，`activated_at` 只记录授权实际生效时间。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
 
 账户 UI 以 `/account/market-readiness` 作为供应商运营摘要，聚合收款资料、待准入数量、账务待办与四项准入策略；实际写操作仍分别归属收款信息、市场准入和市场账务页面。账务页以待处理、应付、应收、历史和管理员争议分区，不引入独立的前端账务状态。
 
+Share 的 token/并发限制、请求 usage、用户 `usageRebase` 重基线、模型健康和容量池是 Share/Router 运行时能力，不等于外部 Token Market 的用户账本。普通 Share 的旧官方价格比例已退役；Share Market 报价只属于 listing/seat。Router 只保存本地 Share/seat entitlement、脱敏 observation 和服务账务；未来外部平台的下游用户、API key、token 售价、余额与 token settlement 必须留在平台自身。用户周期重基线由 Server 保存并通过 descriptor 下发，Router 不拥有编辑权。
+
+### ② 中性 Gateway 容量适配
+
+`/v1/gateways/register`、`/v1/gateway/*` 与 `/_gateway/proxy/*` 是未来跨 Router 容量消费者的基础入口。Gateway 使用 Ed25519 公钥、timestamp、nonce、原始 body SHA-256 和 scope；当前 self-reported owner email 仅用于本地审计，绝不参与授权。完整 tenant/seat/grant contract 尚未形成，而旧 `forSale=Yes + marketAccessMode=all` 已退役，因此当前 Gateway Share inventory/proxy 对普通 Share 整体 fail-closed。它是**适配层**而不是第三个交易面，也不能被描述为已完成的 Token Market。
+
 ### ③ Client Market —— 主机供给
 
-Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs:27`)登录,安装依赖并部署 Server,使其成为 Token/Share 交易面的供给节点。
+Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs:27`)登录,安装依赖并部署 Server,使其成为 Client + Router 容量与 Share 服务的供给节点。
 
 主机状态机(`router_ssh_hosts.status`):
 
@@ -134,12 +121,15 @@ idle ──► locked ──► allocated ──► draining ──► idle
 
 ### Router 联邦 —— 横向扩展
 
-其他 Router 与 Gateway 以带 scope 的合作方身份接入,消费 Token Market 的 Share 挂牌数据。内建 Share Market 不通过该联邦注册或分发:
+未来外部容量消费者将以 Gateway 身份按 Router 分别注册，并通过版本化 grant 读取该 Router 的 Share capacity、查询已授权 headroom、反馈已授权 Share 的运行状态或使用签名 proxy。当前 grant contract 尚未形成，普通 Share 可见集为空并整体 fail-closed。observation 只允许保存 Gateway principal、已授权 Share/model、状态、延迟、token 数和地域；不保存下游用户/API key、USD 价格、余额或 settlement。Gateway 不跨 Router 共享 Router-local session。
 
-| 表 | 主体 | 认证 |
+| 表/入口 | 主体 | 认证/状态 |
 |---|---|---|
-| `router_markets` | 市场合作方 | bearer token |
-| `router_gateways` | 网关合作方 | HMAC 签名(`x-cc-gateway-*` 头 + body SHA-256) |
+| `router_gateways` / `/v1/gateways/register` | 单个 Router 上的 Gateway 公钥身份 | 公开基础注册；当前 owner email 为本地审计字段 |
+| `/v1/gateway/*`、`/_gateway/proxy/*` | Gateway capacity adapter | Ed25519 signed headers (`x-cc-gateway-*`)、timestamp、nonce、body SHA-256、scope |
+| `gateway_request_observations` / `capacity_request_observations` | 中性 observation 写入与兼容读取面 | 仅 Gateway source；不含旧 Market identity、价格或 settlement |
+
+旧 `router_markets`、Market host/session/proxy 和 `/_market/proxy/*` 已从 active path 退役。Migration 19 创建并校验临时不可写 archive；migration 21 在再次校验后物理删除全部旧 live/archive 表，只保留不含身份的聚合 retirement receipt。
 
 ---
 
@@ -220,7 +210,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 
 ## 5. 数据层
 
-业务库与 metrics 库分离。业务库当前有 110 张业务表,另有 1 张 `schema_migrations` 元数据表。
+业务库与 metrics 库分离。最终 schema 当前有 116 张非 SQLite 内部表（包含 `schema_migrations`）；数量由 fresh-schema 测试固定。
 
 **数据库模式**:
 
@@ -241,11 +231,11 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 | 域 | 代表表 |
 |---|---|
 | 身份与隧道 | `installations`、`leases`、`tunnel_route_heads`、`shares`、`installation_client_tunnels` |
-| 计量 | `share_request_logs`、`market_request_logs`、`llm_request_metrics`、`image_generation_*` |
+| 计量 | `share_request_logs`、`gateway_request_observations`、`capacity_request_observations`、`llm_request_metrics`、`image_generation_*` |
 | 健康 | `share_health_checks`、`installation_health_checks`、`share_model_health_state` |
 | 统一市场账务 | `supplier_billing_profiles`、`market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines`、`market_payment_*`、`market_billing_*`、`market_credit_restrictions` |
 | 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`account_payment_*` |
-| 联邦与市场 | `router_markets`、`router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions` |
+| 联邦与市场 | `router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions`；旧 registry/live/archive 表均已由 migration 21 物理删除 |
 | 通知 | `installation_notification_state`、`client_notification_events`、`client_notification_runtime`、`notification_deliveries`、`notification_delivery_items`、`notification_delivery_attempts`、`user_notification_channels`、`telegram_bot_runtime`、`telegram_bind_tokens`、`telegram_inbound_updates`、`telegram_poll_cursors` |
 | 运维告警信号 | `operator_alert_signal_outbox` |
 | 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
@@ -259,7 +249,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 - **Consumer**：`user_email` 跨 share 的调用量 → `GET /v1/me/usage/consumer`
 - **用量卡片设置**：`GET/PATCH /v1/me/usage-card`；公开统计默认开启，卡片身份直接使用账号邮箱，公开 URL 使用稳定的用户 UUID
 - **公开 SVG**：`GET /v1/public/embed/global.svg`（全站）、`GET /v1/public/embed/usage/:user_id`（可关闭的个人卡片）；默认 `24h`、浅色主题
-- 数据来自现有 `share_request_logs` / `market_request_logs` 短窗口聚合（24h / 7d / 30d），见 `usage_account.rs` / `embed_usage.rs`
+- 数据来自现有 `share_request_logs` / Gateway-only `capacity_request_observations` 短窗口聚合（24h / 7d / 30d）；migration 21 只把能关联已知 Share 且具备用户身份的旧 observation 最小化迁入 `share_request_logs`，原 `market_request_logs` 与 archive 已物理删除
 
 ### 已知限制
 

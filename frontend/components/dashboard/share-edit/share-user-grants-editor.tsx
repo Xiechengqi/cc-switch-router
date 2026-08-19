@@ -8,11 +8,11 @@ import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import type {
   ShareTokenPeriod,
   ShareUserGrant,
+  ShareUserGrantMap,
   ShareUserPolicy,
 } from "@/lib/types";
 import { routerShareMarketManagedEmails } from "@/lib/share-settings";
 import { formatDateTime, formatNumber } from "@/lib/utils";
-import type { PriceApp, ShareEditDraft } from "./share-edit-draft";
 import { applyShareUserPolicyBatch } from "./share-user-policy-batch";
 
 type GrantDraft = {
@@ -81,21 +81,19 @@ function validEmail(value: string) {
 }
 
 export function ShareUserGrantsEditor({
-  draft,
-  activeShareApps,
+  value,
   ownerEmail,
   defaultPolicy,
   supportedPeriods,
   t,
-  onDraftChange,
+  onChange,
 }: {
-  draft: ShareEditDraft;
-  activeShareApps: PriceApp[];
+  value: ShareUserGrantMap;
   ownerEmail: string;
   defaultPolicy: ShareUserPolicy;
   supportedPeriods?: ShareTokenPeriod[];
   t: TFn;
-  onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
+  onChange: (value: ShareUserGrantMap) => void;
 }) {
   const normalizedOwner = ownerEmail.trim().toLowerCase();
   const [editingEmail, setEditingEmail] = React.useState<string | null>(null);
@@ -119,20 +117,17 @@ export function ShareUserGrantsEditor({
     supported.has(period.key),
   );
   const periodLabel = Object.fromEntries(periods.map((period) => [period.key, period.label]));
-  const tokenMarketEmails = new Set(draft.selectedMarketEmails);
-  const shareMarketManagedEmails = routerShareMarketManagedEmails(draft.userGrants);
-  const protectedEmails = new Set([
-    ...tokenMarketEmails,
-    ...shareMarketManagedEmails,
-  ]);
+  const shareMarketManagedEmails = routerShareMarketManagedEmails(value);
+  const protectedEmails = shareMarketManagedEmails;
   const visibleEmails = new Set([
     normalizedOwner,
-    ...Object.values(draft.shareToEmailsByApp).flat(),
-    ...protectedEmails,
+    ...Object.values(value)
+      .filter((grant) => grant.active !== false)
+      .map((grant) => grant.email),
   ]);
   const grants = Array.from(visibleEmails)
     .filter(Boolean)
-    .map((email) => draft.userGrants[email] ?? ({
+    .map((email) => value[email] ?? ({
       email,
       role: email === normalizedOwner ? "owner" : "shareto",
       active: true,
@@ -186,23 +181,7 @@ export function ShareUserGrantsEditor({
     setBatchDraft(makeBatchDraft(firstSelected.policy));
   };
 
-  const applyGrants = (userGrants: ShareEditDraft["userGrants"]) => {
-    const emails = Object.values(userGrants)
-      .filter((grant) => grant.active !== false && grant.role === "shareto")
-      .filter((grant) => !tokenMarketEmails.has(grant.email))
-      .map((grant) => grant.email)
-      .sort();
-    onDraftChange((current) => ({
-      ...current,
-      userGrants,
-      shareToEmailsByApp: Object.fromEntries(
-        (["claude", "codex", "gemini"] as const).map((app) => [
-          app,
-          activeShareApps.includes(app) ? emails : current.shareToEmailsByApp[app],
-        ]),
-      ) as ShareEditDraft["shareToEmailsByApp"],
-    }));
-  };
+  const applyGrants = (userGrants: ShareUserGrantMap) => onChange(userGrants);
 
   const save = () => {
     if (!grantDraft) return;
@@ -231,7 +210,7 @@ export function ShareUserGrantsEditor({
       setError(t("dashboard.userLimit.duplicateEmail"));
       return;
     }
-    if (!editingEmail && draft.userGrants[email]?.active !== false && draft.userGrants[email]) {
+    if (!editingEmail && value[email]?.active !== false && value[email]) {
       setError(t("dashboard.userLimit.duplicateEmail"));
       return;
     }
@@ -248,7 +227,7 @@ export function ShareUserGrantsEditor({
       setError(t("dashboard.userLimit.invalidPolicy"));
       return;
     }
-    const previous = draft.userGrants[editingEmail || email];
+    const previous = value[editingEmail || email];
     const next: ShareUserGrant = {
       ...previous,
       email,
@@ -262,7 +241,7 @@ export function ShareUserGrantsEditor({
         expiresAt,
       },
     };
-    const userGrants = { ...draft.userGrants };
+    const userGrants = { ...value };
     if (editingEmail && editingEmail !== email) delete userGrants[editingEmail];
     userGrants[email] = next;
     applyGrants(userGrants);
@@ -307,7 +286,7 @@ export function ShareUserGrantsEditor({
       return;
     }
 
-    const batchSourceGrants = { ...draft.userGrants };
+    const batchSourceGrants = { ...value };
     for (const grant of grants) {
       batchSourceGrants[grant.email] ??= grant;
     }
@@ -451,7 +430,7 @@ export function ShareUserGrantsEditor({
                     ) : null}
                     {grant.role !== "owner" && !protectedEmails.has(grant.email) ? (
                       <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} onClick={() => {
-                        const userGrants = { ...draft.userGrants };
+                        const userGrants = { ...value };
                         delete userGrants[grant.email];
                         applyGrants(userGrants);
                       }}>

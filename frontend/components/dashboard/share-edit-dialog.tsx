@@ -3,36 +3,32 @@
 import { Loader2, RotateCcw, Save } from "lucide-react";
 import { Alert, Button, Modal } from "@heroui/react";
 import * as React from "react";
-import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareEditReadView } from "@/components/dashboard/share-edit/share-edit-read-view";
 import { ShareEditFormBody, useShareEditForm } from "@/components/dashboard/share-edit/share-edit-form";
 import { ShareEditStatusBanner } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { shareProviderSupportedApps, SHARE_APP_LABELS } from "@/lib/share-app";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import type { DashboardMarket, ShareView } from "@/lib/types";
+import type { ShareView } from "@/lib/types";
 
 export { FieldGroup } from "@/components/dashboard/share-edit/share-edit-shared";
 
 export function ShareEditDialog({
   share,
-  markets,
   onClose,
   onSaved,
 }: {
   share: ShareView | null;
-  markets: DashboardMarket[];
   onClose: () => void;
   onSaved: (result: { appliedSynchronously: boolean }) => Promise<void>;
 }) {
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
-  const form = useShareEditForm({ share, markets, t, onSaved, onClose });
+  const form = useShareEditForm({ share, t, onSaved, onClose });
   const boundApps = share ? shareProviderSupportedApps(share) : [];
 
   return (
-    <>
-      <Modal.Backdrop
+    <Modal.Backdrop
         isOpen={!!share}
         onOpenChange={(open) => !open && !form?.busy && onClose()}
       >
@@ -65,7 +61,7 @@ export function ShareEditDialog({
               </Modal.Header>
               <Modal.Body className="min-h-0 flex-1 overflow-y-auto !px-6 !py-5 !text-slate-900">
                 {readOnly && share ? (
-                  <ShareEditReadView share={share} markets={markets} t={t} />
+                  <ShareEditReadView share={share} t={t} />
                 ) : share && form ? (
                   <div className="grid gap-7">
                     <ShareEditStatusBanner share={share} t={t} />
@@ -117,35 +113,6 @@ export function ShareEditDialog({
               </Modal.Footer>
             </Modal.Dialog>
           </Modal.Container>
-      </Modal.Backdrop>
-
-      {form ? (
-        <>
-          <ConfirmAlertDialog
-            open={form.confirmFreeOpen}
-            title={t("dashboard.confirmFreeTitle")}
-            description={t("dashboard.confirmFreeDesc")}
-            confirmLabel={t("dashboard.confirmFree")}
-            cancelLabel={t("common.cancel")}
-            tone="danger"
-            onConfirm={form.confirmFree}
-            onOpenChange={(open) => !open && form.setConfirmFreeOpen(false)}
-          />
-          <ConfirmAlertDialog
-            open={Boolean(form.transferTargetEmail)}
-            title={t("dashboard.transferOwnerTitle")}
-            description={t("dashboard.transferOwnerDesc", {
-              target: form.transferTargetEmail || "-",
-              owner: share?.ownerEmail || "-",
-            })}
-            confirmLabel={t("dashboard.transferOwnerConfirm")}
-            cancelLabel={t("common.cancel")}
-            tone="danger"
-            onConfirm={form.transferOwner}
-            onOpenChange={(open) => !open && form.setTransferTargetEmail("")}
-          />
-        </>
-      ) : null}
-    </>
+    </Modal.Backdrop>
   );
 }

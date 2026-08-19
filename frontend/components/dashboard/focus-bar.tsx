@@ -5,7 +5,7 @@ import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 
 export function FocusBar() {
-  const { target, label, relatedClientIds, relatedShareIds, relatedMarketIds, clearFocus } = useDashboardFocus();
+  const { target, label, relatedClientIds, relatedShareIds, clearFocus } = useDashboardFocus();
   const { t } = useLocaleText();
   if (!target) return null;
   return (
@@ -13,7 +13,7 @@ export function FocusBar() {
       <div className="min-w-0 truncate">
         <span className="text-muted-foreground">{t("dashboard.viewing")}: </span>
         <strong className="text-foreground">{t(`dashboard.focus.${target.kind}` as const)} “{label}”</strong>
-        <span className="ml-2 text-muted-foreground">· {relatedClientIds.size} Clients · {relatedShareIds.size} Shares · {relatedMarketIds.size} Markets</span>
+        <span className="ml-2 text-muted-foreground">· {relatedClientIds.size} Clients · {relatedShareIds.size} Shares</span>
       </div>
       <button type="button" onClick={clearFocus} className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-muted-foreground hover:bg-white hover:text-foreground" aria-label={t("dashboard.clearFocus")}>
         <X className="h-3.5 w-3.5" />{t("dashboard.clearFocus")}

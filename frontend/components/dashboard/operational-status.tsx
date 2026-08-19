@@ -3,7 +3,7 @@
 import * as React from "react";
 import { AlertTriangle, CheckCircle2, CircleOff, Clock3, PauseCircle, RefreshCw } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { DashboardClient, DashboardMarket, OperationalReason, OperationalState, OperationalSummary, ShareView } from "@/lib/types";
+import type { DashboardClient, OperationalReason, OperationalState, OperationalSummary, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 
 export function shareIsEnabled(share: ShareView) {
@@ -104,20 +104,6 @@ export function clientOperationalSummary(client: DashboardClient, _shares: Share
   return { state: "online", additionalReasonCount: 0 };
 }
 
-export function marketOperationalSummary(market: DashboardMarket): OperationalSummary {
-  if (market.operationalSummary) return market.operationalSummary;
-  const status = String(market.status || "").trim().toLowerCase();
-  if (status === "disabled") return { state: "disabled", primaryReason: { code: "manually_disabled", severity: "info", entityType: "market", entityId: market.id }, additionalReasonCount: 0 };
-  if (market.maintenanceEnabled) return { state: "maintenance", primaryReason: { code: "maintenance_enabled", severity: "info", entityType: "market", entityId: market.id }, additionalReasonCount: 0 };
-  if (market.routeState === "reconnecting") return { state: "reconnecting", primaryReason: { code: "route_reconnecting", severity: "info", entityType: "market", entityId: market.id, startedAt: market.routeStateSince }, additionalReasonCount: 0 };
-  if (!market.online || status === "offline") return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "market", entityId: market.id, startedAt: market.offlineSince }, additionalReasonCount: 0 };
-  if (market.onlineShareCount === 0) return { state: "degraded", primaryReason: { code: "no_online_shares", severity: "critical", entityType: "market", entityId: market.id, currentValue: "0", threshold: String(Math.max(1, market.shareCount)) }, additionalReasonCount: 0 };
-  if (market.parallelCapacity > 0 && market.activeRequests / market.parallelCapacity >= 0.9) {
-    return { state: "degraded", primaryReason: { code: market.activeRequests >= market.parallelCapacity ? "parallel_capacity_full" : "parallel_capacity_warning", severity: market.activeRequests >= market.parallelCapacity ? "critical" : "warning", entityType: "market", entityId: market.id, currentValue: String(market.activeRequests), threshold: String(market.parallelCapacity) }, additionalReasonCount: 0 };
-  }
-  return { state: "available", additionalReasonCount: 0 };
-}
-
 export function operationalStateRank(state: OperationalState) {
   return state === "offline" ? 0 : state === "degraded" ? 1 : state === "reconnecting" ? 2 : state === "maintenance" ? 3 : state === "online" || state === "available" ? 4 : 5;
 }
@@ -184,10 +170,10 @@ export function operationalReasonLabel(reason: OperationalReason | undefined, t:
   }
 }
 
-export function operationalImpactLabel(kind: "client" | "share" | "market", reason: OperationalReason | undefined, t: ReturnType<typeof useLocaleText>["t"]) {
+export function operationalImpactLabel(kind: "client" | "share", reason: OperationalReason | undefined, t: ReturnType<typeof useLocaleText>["t"]) {
   if (!reason) return t("dashboard.impact.none");
   if (reason.code === "route_reconnecting") return t("dashboard.impact.routeReconnecting");
-  if (reason.code === "route_offline" || reason.code === "no_online_shares") return kind === "market" ? t("dashboard.impact.marketOffline") : t("dashboard.impact.routeOffline");
+  if (reason.code === "route_offline" || reason.code === "no_online_shares") return t("dashboard.impact.routeOffline");
   if (reason.code === "parallel_capacity_full") return t("dashboard.impact.capacityFull");
   if (reason.code === "provider_unavailable") return t("dashboard.impact.providerUnavailable");
   if (reason.code === "maintenance_enabled" || reason.code === "manually_disabled") return t("dashboard.impact.disabled");
@@ -253,7 +239,7 @@ export function OperationalDiagnosis({
   removalAt,
 }: {
   summary: OperationalSummary;
-  kind: "client" | "share" | "market";
+  kind: "client" | "share";
   removalAt?: string;
 }) {
   const { locale, t } = useLocaleText();

@@ -11,23 +11,22 @@ import {
   normalizeDashboardPath,
 } from "@/lib/dashboard-nav";
 
-export type DashboardFocusKind = "request" | "client" | "share" | "market" | "country";
-export type DashboardFocusSource = "map" | "client-board" | "market-table" | "drawer" | "activity";
+export type DashboardFocusKind = "request" | "client" | "share" | "country";
+export type DashboardFocusSource = "map" | "client-board" | "drawer" | "activity";
 export type DashboardFocusTarget = { kind: DashboardFocusKind; id: string; source: DashboardFocusSource };
 
 type DashboardFocusValue = {
   target: DashboardFocusTarget | null;
   relatedClientIds: ReadonlySet<string>;
   relatedShareIds: ReadonlySet<string>;
-  relatedMarketIds: ReadonlySet<string>;
   label: string;
-  drawerTarget: { kind: "client" | "share" | "market"; id: string } | null;
+  drawerTarget: { kind: "client" | "share"; id: string } | null;
   setFocus: (target: DashboardFocusTarget) => void;
   clearFocus: () => void;
-  openDrawer: (kind: "client" | "share" | "market", id: string) => void;
+  openDrawer: (kind: "client" | "share", id: string) => void;
   closeDrawer: () => void;
   isFocused: (kind: DashboardFocusKind, id: string) => boolean;
-  isRelated: (kind: Exclude<DashboardFocusKind, "request">, id: string) => boolean;
+  isRelated: (kind: Exclude<DashboardFocusKind, "request" | "country">, id: string) => boolean;
 };
 
 const DashboardFocusContext = React.createContext<DashboardFocusValue | null>(null);
@@ -37,11 +36,11 @@ function targetFromUrl(): DashboardFocusTarget | null {
   const params = new URLSearchParams(window.location.search);
   const kind = params.get("focusKind") as DashboardFocusKind | null;
   const id = params.get("focusId") || "";
-  if (!id || !kind || !["request", "client", "share", "market", "country"].includes(kind)) return null;
+  if (!id || !kind || !["request", "client", "share", "country"].includes(kind)) return null;
   return { kind, id, source: "activity" };
 }
 
-function syncDrawerToUrl(target: { kind: "client" | "share" | "market"; id: string } | null, pathname: string) {
+function syncDrawerToUrl(target: { kind: "client" | "share"; id: string } | null, pathname: string) {
   const route = normalizeDashboardPath(pathname) || dashboardRouteForDrawer(target?.kind || "client");
   const url = new URL(window.location.href);
   url.pathname = route;
@@ -72,42 +71,39 @@ function syncFocusToUrl(target: DashboardFocusTarget | null, pathname: string) {
 function drawerFromUrl() {
   if (typeof window === "undefined") return null;
   const params = new URLSearchParams(window.location.search);
-  const kind = params.get("drawerKind") as "client" | "share" | "market" | null;
+  const kind = params.get("drawerKind") as "client" | "share" | null;
   const id = params.get("drawerId") || "";
-  return kind && id && ["client", "share", "market"].includes(kind) ? { kind, id } : null;
+  return kind && id && ["client", "share"].includes(kind) ? { kind, id } : null;
 }
 
 function requestRelations(data: DashboardResponse, requestId: string) {
   const event = data.recentRequestEvents?.find((item) => item.requestId === requestId);
-  const marketLog = data.marketRequestLogs?.find((item) => item.requestId === requestId);
   return {
-    shareId: event?.shareId || marketLog?.shareId,
-    marketId: marketLog?.marketId,
+    shareId: event?.shareId,
   };
 }
 
 function focusExists(data: DashboardResponse, target: DashboardFocusTarget) {
   if (target.kind === "client") return data.clients.some((client) => client.installation.id === target.id);
   if (target.kind === "share") return (data.shares || []).some((share) => share.shareId === target.id);
-  if (target.kind === "market") return (data.markets || []).some((market) => market.id === target.id);
   if (target.kind === "country") {
     return Boolean(
       data.countryBoards?.[target.id]
         || data.map?.countries?.some((country) => country.countryCodeIso3 === target.id),
     );
   }
-  return Boolean(data.recentRequestEvents?.some((event) => event.requestId === target.id) || data.marketRequestLogs?.some((log) => log.requestId === target.id));
+  return Boolean(data.recentRequestEvents?.some((event) => event.requestId === target.id));
 }
 
 export function DashboardFocusProvider({ data, children }: { data: DashboardResponse | null; children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname() || "/clients/";
   const [target, setTarget] = React.useState<DashboardFocusTarget | null>(null);
-  const [drawerTarget, setDrawerTarget] = React.useState<{ kind: "client" | "share" | "market"; id: string } | null>(null);
+  const [drawerTarget, setDrawerTarget] = React.useState<{ kind: "client" | "share"; id: string } | null>(null);
   const restoredRef = React.useRef(false);
 
   const navigateForDrawer = React.useCallback(
-    (kind: "client" | "share" | "market", id: string) => {
+    (kind: "client" | "share", id: string) => {
       const route = dashboardRouteForDrawer(kind);
       const params = new URLSearchParams(window.location.search);
       params.set("drawerKind", kind);
@@ -167,7 +163,7 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     void recordDashboardUxEvent({ eventType: "dashboard_focus_clear" });
   }, [navigateForFocus]);
   const openDrawer = React.useCallback(
-    (kind: "client" | "share" | "market", id: string) => {
+    (kind: "client" | "share", id: string) => {
       const next = { kind, id };
       setDrawerTarget(next);
       navigateForDrawer(kind, id);
@@ -207,8 +203,7 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
   const relations = React.useMemo(() => {
     const clients = new Set<string>();
     const shares = new Set<string>();
-    const markets = new Set<string>();
-    if (!data || !target) return { clients, shares, markets };
+    if (!data || !target) return { clients, shares };
 
     let focusShareId: string | undefined;
     if (target.kind === "client") {
@@ -217,9 +212,6 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     } else if (target.kind === "share") {
       focusShareId = target.id;
       shares.add(target.id);
-    } else if (target.kind === "market") {
-      markets.add(target.id);
-      data.markets?.find((market) => market.id === target.id)?.linkedShares?.forEach((share) => shares.add(share.shareId));
     } else if (target.kind === "country") {
       const board = data.countryBoards?.[target.id];
       board?.clientIds.forEach((clientId) => clients.add(clientId));
@@ -233,21 +225,13 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     } else {
       const request = requestRelations(data, target.id);
       focusShareId = request.shareId;
-      if (request.marketId) markets.add(request.marketId);
     }
 
     if (focusShareId) shares.add(focusShareId);
     for (const client of data.clients) {
       if ((client.shareIds || []).some((shareId) => shares.has(shareId))) clients.add(client.installation.id);
     }
-    for (const share of data.shares || []) {
-      if (!shares.has(share.shareId)) continue;
-      for (const market of share.marketLinks || []) markets.add(market.id);
-    }
-    for (const market of data.markets || []) {
-      if (market.linkedShares?.some((share) => shares.has(share.shareId))) markets.add(market.id);
-    }
-    return { clients, shares, markets };
+    return { clients, shares };
   }, [data, target]);
 
   const label = React.useMemo(() => {
@@ -259,10 +243,6 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     if (target.kind === "share") {
       const share = data.shares?.find((item) => item.shareId === target.id);
       return share?.subdomain || share?.shareId || target.id;
-    }
-    if (target.kind === "market") {
-      const market = data.markets?.find((item) => item.id === target.id);
-      return market?.displayName || market?.subdomain || target.id;
     }
     if (target.kind === "country") {
       return data.countryBoards?.[target.id]?.countryName
@@ -276,7 +256,6 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     target,
     relatedClientIds: relations.clients,
     relatedShareIds: relations.shares,
-    relatedMarketIds: relations.markets,
     label,
     drawerTarget,
     setFocus,
@@ -284,8 +263,8 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     openDrawer,
     closeDrawer,
     isFocused: (kind, id) => target?.kind === kind && target.id === id,
-    isRelated: (kind, id) => kind === "client" ? relations.clients.has(id) : kind === "share" ? relations.shares.has(id) : relations.markets.has(id),
-  }), [clearFocus, closeDrawer, drawerTarget, label, openDrawer, relations.clients, relations.markets, relations.shares, setFocus, target]);
+    isRelated: (kind, id) => kind === "client" ? relations.clients.has(id) : relations.shares.has(id),
+  }), [clearFocus, closeDrawer, drawerTarget, label, openDrawer, relations.clients, relations.shares, setFocus, target]);
 
   return <DashboardFocusContext.Provider value={value}>{children}</DashboardFocusContext.Provider>;
 }

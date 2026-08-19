@@ -31,7 +31,6 @@ export function ClientsPage() {
       <ClientBoard
         clients={data?.clients || []}
         shares={data?.shares || []}
-        markets={data?.markets || []}
         onChanged={refresh}
       />
     </main>

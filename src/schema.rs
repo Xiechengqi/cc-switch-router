@@ -1,6 +1,7 @@
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+use crate::db::types::Value;
 use crate::db::{Connection, TransactionBehavior, params};
 use crate::error::AppError;
 
@@ -61,6 +62,26 @@ const MIGRATIONS: &[(i64, &str)] = &[
         16,
         include_str!("../schema/0016_user_notification_channel_checks.sql"),
     ),
+    (
+        17,
+        include_str!("../schema/0017_telegram_failure_diagnostics.sql"),
+    ),
+    (
+        18,
+        include_str!("../schema/0018_single_delivery_channel.sql"),
+    ),
+    (
+        19,
+        include_str!("../schema/0019_retire_legacy_token_market.sql"),
+    ),
+    (
+        20,
+        include_str!("../schema/0020_share_free_access_policy.sql"),
+    ),
+    (
+        21,
+        include_str!("../schema/0021_physically_retire_legacy_token_market.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -69,14 +90,21 @@ pub fn apply(conn: &Connection) -> Result<(), AppError> {
         install_baseline(conn, &migration_checksum(BASELINE_SQL))?;
     }
     let applied_versions = validate_migration_history(conn)?;
-    apply_pending_migrations(conn, applied_versions)
+    apply_pending_migrations(conn, applied_versions)?;
+    Ok(())
 }
 
 pub fn check_compatibility(conn: &Connection) -> Result<(), AppError> {
     if !has_migration_table(conn)? {
         return reject_nonempty_unmanaged_database(conn);
     }
-    validate_migration_history(conn).map(|_| ())
+    let applied_versions = validate_migration_history(conn)?;
+    if applied_versions >= LEGACY_TOKEN_MARKET_RETIREMENT_VERSION as usize
+        && applied_versions < LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION as usize
+    {
+        validate_legacy_token_market_archive(conn)?;
+    }
+    Ok(())
 }
 
 fn has_migration_table(conn: &Connection) -> Result<bool, AppError> {
@@ -152,11 +180,18 @@ fn apply_pending_migrations(conn: &Connection, applied_versions: usize) -> Resul
                     "begin database migration {version} failed: {error}"
                 ))
             })?;
+        if version == LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION {
+            validate_legacy_token_market_archive(&transaction)?;
+        }
         transaction.execute_batch(sql).map_err(|error| {
             AppError::Internal(format!(
                 "apply database migration {version} failed: {error}"
             ))
         })?;
+        if version == 19 {
+            populate_legacy_token_market_archive_checksums(&transaction)?;
+            ensure_legacy_token_market_archive_is_read_only(&transaction)?;
+        }
         transaction
             .execute(
                 "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
@@ -174,6 +209,331 @@ fn apply_pending_migrations(conn: &Connection, applied_versions: usize) -> Resul
         })?;
     }
     Ok(())
+}
+
+const LEGACY_TOKEN_MARKET_RETIREMENT_VERSION: i64 = 19;
+const LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION: i64 = 21;
+const LEGACY_TOKEN_MARKET_ARCHIVES: &[(&str, &str)] = &[
+    ("router_markets", "legacy_token_market_router_markets"),
+    (
+        "public_hosts(kind=market)",
+        "legacy_token_market_public_hosts",
+    ),
+    (
+        "market_notification_emails",
+        "legacy_token_market_notification_emails",
+    ),
+    ("market_request_logs", "legacy_token_market_request_logs"),
+    (
+        "market_disabled_shares",
+        "legacy_token_market_disabled_shares",
+    ),
+    (
+        "market_share_model_failure_state",
+        "legacy_token_market_share_model_failure_state",
+    ),
+    (
+        "market_share_runtime_states",
+        "legacy_token_market_share_runtime_states",
+    ),
+];
+const LEGACY_TOKEN_MARKET_READ_ONLY_TABLES: &[(&str, &str, bool)] = &[
+    (
+        "router_markets",
+        "legacy_token_market_router_markets_read_only",
+        true,
+    ),
+    (
+        "market_notification_emails",
+        "legacy_token_market_notification_emails_read_only",
+        true,
+    ),
+    (
+        "market_request_logs",
+        "legacy_token_market_request_logs_read_only",
+        true,
+    ),
+    (
+        "market_disabled_shares",
+        "legacy_token_market_disabled_shares_read_only",
+        true,
+    ),
+    (
+        "market_share_model_failure_state",
+        "legacy_token_market_model_failure_read_only",
+        true,
+    ),
+    (
+        "market_share_runtime_states",
+        "legacy_token_market_runtime_states_read_only",
+        true,
+    ),
+    (
+        "legacy_token_market_router_markets",
+        "legacy_token_market_archive_router_markets_read_only",
+        false,
+    ),
+    (
+        "legacy_token_market_public_hosts",
+        "legacy_token_market_archive_public_hosts_read_only",
+        false,
+    ),
+    (
+        "legacy_token_market_notification_emails",
+        "legacy_token_market_archive_notification_emails_read_only",
+        false,
+    ),
+    (
+        "legacy_token_market_request_logs",
+        "legacy_token_market_archive_request_logs_read_only",
+        false,
+    ),
+    (
+        "legacy_token_market_disabled_shares",
+        "legacy_token_market_archive_disabled_shares_read_only",
+        false,
+    ),
+    (
+        "legacy_token_market_share_model_failure_state",
+        "legacy_token_market_archive_model_failure_read_only",
+        false,
+    ),
+    (
+        "legacy_token_market_share_runtime_states",
+        "legacy_token_market_archive_runtime_states_read_only",
+        false,
+    ),
+    (
+        "legacy_token_market_archive_manifest",
+        "legacy_token_market_archive_manifest_read_only",
+        true,
+    ),
+];
+
+/// Fill the migration manifest with a deterministic SHA-256 over the archived
+/// source columns.  SQLite does not provide a portable SHA-256 function, so we
+/// compute it in the Rust migration transaction.  The synthetic `archived_at`
+/// column is intentionally excluded: timestamps must not change the checksum.
+fn populate_legacy_token_market_archive_checksums(conn: &Connection) -> Result<(), AppError> {
+    for (_, archive_table) in LEGACY_TOKEN_MARKET_ARCHIVES {
+        let (row_count, checksum) = legacy_token_market_archive_fingerprint(conn, archive_table)?;
+        let expected_count = conn
+            .query_row(
+                "SELECT row_count FROM legacy_token_market_archive_manifest WHERE archive_table = ?1",
+                params![archive_table],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read legacy Token Market archive manifest for {archive_table} failed: {error}"
+                ))
+            })?;
+        if expected_count != row_count {
+            return Err(AppError::Internal(format!(
+                "legacy Token Market archive row count mismatch for {archive_table}: manifest {expected_count}, observed {row_count}"
+            )));
+        }
+        conn.execute(
+            "UPDATE legacy_token_market_archive_manifest
+                SET checksum = ?1,
+                    notes = CASE
+                        WHEN instr(COALESCE(notes, ''), 'checksum=sha256-v1') = 0
+                        THEN COALESCE(notes, '') || '; checksum=sha256-v1'
+                        ELSE notes
+                    END
+              WHERE archive_table = ?2",
+            params![checksum, archive_table],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "write legacy Token Market archive checksum for {archive_table} failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn ensure_legacy_token_market_archive_is_read_only(conn: &Connection) -> Result<(), AppError> {
+    for (table, trigger_base, insert_has_suffix) in LEGACY_TOKEN_MARKET_READ_ONLY_TABLES {
+        for (operation, suffix) in [
+            ("INSERT", "insert"),
+            ("UPDATE", "update"),
+            ("DELETE", "delete"),
+        ] {
+            let trigger_name = if operation == "INSERT" && !*insert_has_suffix {
+                (*trigger_base).to_string()
+            } else {
+                format!("{trigger_base}_{suffix}")
+            };
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS \"{trigger_name}\"
+                     BEFORE {operation} ON \"{table}\"
+                     BEGIN SELECT RAISE(ABORT, 'legacy Token Market archive is read-only'); END;"
+            ))
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "lock legacy Token Market table {table} failed: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_legacy_token_market_archive(conn: &Connection) -> Result<(), AppError> {
+    let manifest_rows = conn
+        .query_row(
+            "SELECT COUNT(*) FROM legacy_token_market_archive_manifest",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "count legacy Token Market archive manifest failed: {error}"
+            ))
+        })?;
+    if manifest_rows != LEGACY_TOKEN_MARKET_ARCHIVES.len() as i64 {
+        return Err(AppError::Internal(format!(
+            "legacy Token Market archive manifest row count mismatch: expected {}, found {manifest_rows}",
+            LEGACY_TOKEN_MARKET_ARCHIVES.len()
+        )));
+    }
+
+    for (source_table, archive_table) in LEGACY_TOKEN_MARKET_ARCHIVES {
+        let manifest = conn
+            .query_row(
+                "SELECT source_table, row_count, checksum, notes
+                   FROM legacy_token_market_archive_manifest
+                  WHERE archive_table = ?1",
+                params![archive_table],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read legacy Token Market archive manifest for {archive_table} failed: {error}"
+                ))
+            })?;
+        let (observed_count, observed_checksum) =
+            legacy_token_market_archive_fingerprint(conn, archive_table)?;
+        if manifest.0 != *source_table
+            || manifest.1 != observed_count
+            || manifest.2 != observed_checksum
+            || !manifest
+                .3
+                .as_deref()
+                .is_some_and(|notes| notes.contains("checksum=sha256-v1"))
+        {
+            return Err(AppError::Internal(format!(
+                "legacy Token Market archive verification failed for {archive_table}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn legacy_token_market_archive_fingerprint(
+    conn: &Connection,
+    archive_table: &str,
+) -> Result<(i64, String), AppError> {
+    let quoted_table = format!("\"{}\"", archive_table.replace('"', "\"\""));
+    let column_count = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{}')",
+                archive_table.replace('\'', "''")
+            ),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "inspect legacy Token Market archive {archive_table} failed: {error}"
+            ))
+        })?;
+    if column_count < 1 {
+        return Err(AppError::Internal(format!(
+            "legacy Token Market archive {archive_table} has no source columns"
+        )));
+    }
+    let source_column_count = usize::try_from(column_count - 1).map_err(|_| {
+        AppError::Internal(format!(
+            "invalid legacy Token Market archive column count for {archive_table}"
+        ))
+    })?;
+    let mut statement = conn
+        .prepare(&format!("SELECT * FROM {quoted_table}"))
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "prepare legacy Token Market archive {archive_table} failed: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            let mut encoded = Vec::new();
+            for index in 0..source_column_count {
+                let value: Value = row.get(index)?;
+                append_archive_value(&mut encoded, &value);
+            }
+            Ok(encoded)
+        })
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read legacy Token Market archive {archive_table} failed: {error}"
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "decode legacy Token Market archive {archive_table} failed: {error}"
+            ))
+        })?;
+    let row_count = i64::try_from(rows.len()).map_err(|_| {
+        AppError::Internal(format!(
+            "legacy Token Market archive {archive_table} row count overflow"
+        ))
+    })?;
+    let mut rows = rows;
+    rows.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"cc-switch-router:legacy-token-market-archive:v1\0");
+    hasher.update(archive_table.as_bytes());
+    hasher.update([0]);
+    for encoded in rows {
+        hasher.update((encoded.len() as u64).to_le_bytes());
+        hasher.update(&encoded);
+    }
+    Ok((row_count, hex::encode(hasher.finalize())))
+}
+
+fn append_archive_value(buffer: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Null => buffer.push(0),
+        Value::Integer(number) => {
+            buffer.push(1);
+            buffer.extend_from_slice(&number.to_le_bytes());
+        }
+        Value::Real(number) => {
+            buffer.push(2);
+            buffer.extend_from_slice(&number.to_bits().to_le_bytes());
+        }
+        Value::Text(text) => {
+            buffer.push(3);
+            buffer.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            buffer.extend_from_slice(text.as_bytes());
+        }
+        Value::Blob(bytes) => {
+            buffer.push(4);
+            buffer.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            buffer.extend_from_slice(bytes);
+        }
+    }
 }
 
 fn reject_nonempty_unmanaged_database(conn: &Connection) -> Result<(), AppError> {
@@ -249,7 +609,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 117);
+        assert_eq!(table_count, 116);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -295,7 +655,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 16);
+        assert_eq!(versions.len(), 21);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -312,6 +672,11 @@ mod tests {
         assert_eq!(versions[13], (14, migration_checksum(MIGRATIONS[12].1)));
         assert_eq!(versions[14], (15, migration_checksum(MIGRATIONS[13].1)));
         assert_eq!(versions[15], (16, migration_checksum(MIGRATIONS[14].1)));
+        assert_eq!(versions[16], (17, migration_checksum(MIGRATIONS[15].1)));
+        assert_eq!(versions[17], (18, migration_checksum(MIGRATIONS[16].1)));
+        assert_eq!(versions[18], (19, migration_checksum(MIGRATIONS[17].1)));
+        assert_eq!(versions[19], (20, migration_checksum(MIGRATIONS[18].1)));
+        assert_eq!(versions[20], (21, migration_checksum(MIGRATIONS[19].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -458,7 +823,85 @@ mod tests {
                        'admin@example.com', 'now')",
             [],
         );
-        assert!(invalid.is_err(), "channel checks must carry a SHA-256 fingerprint");
+        assert!(
+            invalid.is_err(),
+            "channel checks must carry a SHA-256 fingerprint"
+        );
+    }
+
+    #[test]
+    fn migration_17_installs_telegram_failure_diagnostics() {
+        let conn = memory_connection();
+        apply(&conn).expect("install final schema");
+        for (table, columns) in [
+            (
+                "telegram_bot_runtime",
+                [
+                    "transport_status",
+                    "last_failure_code",
+                    "last_failure_hint",
+                    "last_failure_details_json",
+                    "last_failure_at",
+                ]
+                .as_slice(),
+            ),
+            (
+                "user_notification_channel_checks",
+                ["failure_code", "failure_hint", "failure_details_json"].as_slice(),
+            ),
+        ] {
+            for column in columns {
+                let exists = conn
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
+                        ),
+                        params![column],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("inspect Telegram diagnostic column");
+                assert_eq!(exists, 1, "missing {table}.{column}");
+            }
+        }
+    }
+
+    /// Delivery is single-select: the schema, not just the write path, refuses
+    /// to leave a user with two selected channels.
+    #[test]
+    fn migration_18_enforces_a_single_selected_channel_per_user() {
+        let conn = memory_connection();
+        apply(&conn).expect("install final schema");
+        conn.execute_batch(
+            "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+             VALUES ('user-single', 'single@example.com', 'now', 'now');
+             INSERT INTO user_notification_channels
+                (user_id, channel, enabled, state, target, revision, created_at, updated_at)
+             VALUES ('user-single', 'email', 1, 'ready', 'single@example.com', 1, 'now', 'now');",
+        )
+        .expect("seed the default email selection");
+
+        let conflict = conn
+            .execute(
+                "INSERT INTO user_notification_channels
+                    (user_id, channel, enabled, state, target, provider_identity,
+                     revision, created_at, updated_at)
+                 VALUES ('user-single', 'telegram', 1, 'ready', '4242', 'bot-1', 1, 'now', 'now')",
+                [],
+            )
+            .expect_err("two selected channels must be impossible");
+        assert!(conflict.to_string().contains("UNIQUE constraint failed"));
+
+        // Deselecting first is always allowed, and an unselected row does not
+        // participate in the constraint at all.
+        conn.execute_batch(
+            "UPDATE user_notification_channels SET enabled = 0
+              WHERE user_id = 'user-single' AND channel = 'email';
+             INSERT INTO user_notification_channels
+                (user_id, channel, enabled, state, target, provider_identity,
+                 revision, created_at, updated_at)
+             VALUES ('user-single', 'telegram', 1, 'ready', '4242', 'bot-1', 1, 'now', 'now');",
+        )
+        .expect("switching the selection stays possible");
     }
 
     #[test]
@@ -559,5 +1002,436 @@ mod tests {
             )
             .expect("count market credit indexes");
         assert_eq!(index_count, 2);
+    }
+
+    fn install_schema_through(conn: &Connection, version: i64) {
+        assert!((1..=19).contains(&version));
+        install_baseline(conn, &migration_checksum(BASELINE_SQL)).expect("install baseline");
+        for (migration_version, sql) in MIGRATIONS.iter().copied().take((version - 1) as usize) {
+            conn.execute_batch(sql)
+                .unwrap_or_else(|error| panic!("apply migration {migration_version}: {error}"));
+            conn.execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at)
+                 VALUES (?1, ?2, 'test')",
+                params![migration_version, migration_checksum(sql)],
+            )
+            .unwrap_or_else(|error| panic!("record migration {migration_version}: {error}"));
+        }
+    }
+
+    #[test]
+    fn migration_20_canonicalizes_free_access_and_enforces_market_exclusion() {
+        let conn = memory_connection();
+        // Seed at v18 so `apply` runs the v19 archive finalizer before v20.
+        // The raw test helper intentionally does not execute Rust post-hooks.
+        install_schema_through(&conn, 18);
+        conn.execute_batch(
+            "INSERT INTO shares
+                (share_id, capacity_pool_id, installation_id, share_name, owner_email,
+                 for_sale, app_type, token_limit, parallel_limit, tokens_used,
+                 requests_count, share_status, created_at, expires_at, updated_at)
+             VALUES
+                ('share-free', 'pool-free', 'installation-free', 'Free', 'owner@example.com',
+                 'Free', 'codex', -1, -1, 0, 0, 'active', 'now', '2099-01-01T00:00:00Z', 'now'),
+                ('share-listed', 'pool-listed', 'installation-listed', 'Listed', 'owner@example.com',
+                 'Free', 'codex', -1, -1, 0, 0, 'active', 'now', '2099-01-01T00:00:00Z', 'now'),
+                ('share-subscribed', 'pool-subscribed', 'installation-subscribed', 'Subscribed', 'owner@example.com',
+                 'Free', 'codex', -1, -1, 0, 0, 'active', 'now', '2099-01-01T00:00:00Z', 'now'),
+                ('share-yes', 'pool-yes', 'installation-yes', 'Legacy yes', 'owner@example.com',
+                 'Yes', 'codex', -1, -1, 0, 0, 'active', 'now', '2099-01-01T00:00:00Z', 'now');
+             INSERT INTO share_market_listings
+                (id, share_id, installation_id, owner_user_id, owner_email, status,
+                 deleted_at, created_at, updated_at)
+             VALUES
+                ('listing-existing', 'share-listed', 'installation-listed', 'owner-user',
+                 'owner@example.com', 'active', NULL, 'now', 'now'),
+                ('listing-subscribed', 'share-subscribed', 'installation-subscribed', 'owner-user',
+                 'owner@example.com', 'closed', NULL, 'now', 'now');
+             INSERT INTO share_market_seats
+                (id, listing_id, position, status, token_period_json, offer_revision,
+                 created_at, updated_at)
+             VALUES ('seat-subscribed', 'listing-subscribed', 1, 'occupied', '{}', 1,
+                     'now', 'now');
+             INSERT INTO share_market_subscriptions
+                (id, seat_id, listing_id, share_id, installation_id, entitlement_id,
+                 owner_user_id, owner_email, renter_user_id, renter_email, status,
+                 token_period_json, offer_revision, created_at, updated_at)
+             VALUES ('subscription-active', 'seat-subscribed', 'listing-subscribed',
+                     'share-subscribed', 'installation-subscribed', 'entitlement-active',
+                     'owner-user', 'owner@example.com', 'renter-active',
+                     'renter@example.com', 'active', '{}', 1, 'now', 'now');",
+        )
+        .expect("seed access-policy migration");
+
+        apply(&conn).expect("apply access-policy migration");
+
+        let policies = conn
+            .prepare(
+                "SELECT share_id, free_access, share_access_policy_version, for_sale
+                   FROM shares ORDER BY share_id",
+            )
+            .expect("prepare migrated policies")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .expect("query migrated policies")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migrated policies");
+        assert_eq!(
+            policies,
+            vec![
+                ("share-free".into(), 1, 1, "No".into()),
+                ("share-listed".into(), 0, 1, "No".into()),
+                ("share-subscribed".into(), 0, 1, "No".into()),
+                ("share-yes".into(), 0, 1, "No".into()),
+            ]
+        );
+
+        assert!(
+            conn.execute(
+                "UPDATE shares SET free_access = 1 WHERE share_id = 'share-listed'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE shares SET free_access = 1 WHERE share_id = 'share-subscribed'",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO share_market_listings
+                    (id, share_id, installation_id, owner_user_id, owner_email, status,
+                     deleted_at, created_at, updated_at)
+                 VALUES ('listing-free', 'share-free', 'installation-free', 'owner-user',
+                         'owner@example.com', 'active', NULL, 'now', 'now')",
+                [],
+            )
+            .is_err()
+        );
+
+        conn.execute_batch(
+            "INSERT INTO share_market_listings
+                (id, share_id, installation_id, owner_user_id, owner_email, status,
+                 deleted_at, created_at, updated_at)
+             VALUES ('listing-closed', 'share-free', 'installation-free', 'owner-user',
+                     'owner@example.com', 'closed', NULL, 'now', 'now');
+             INSERT INTO share_market_seats
+                (id, listing_id, position, status, token_period_json, offer_revision,
+                 created_at, updated_at)
+             VALUES ('seat-released', 'listing-closed', 1, 'available', '{}', 1, 'now', 'now');
+             INSERT INTO share_market_subscriptions
+                (id, seat_id, listing_id, share_id, installation_id, entitlement_id,
+                 owner_user_id, owner_email, renter_user_id, renter_email, status,
+                 token_period_json, offer_revision, created_at, updated_at)
+             VALUES ('subscription-released', 'seat-released', 'listing-closed', 'share-free',
+                     'installation-free', 'entitlement-released', 'owner-user',
+                     'owner@example.com', 'renter-user', 'renter@example.com', 'released',
+                     '{}', 1, 'now', 'now');",
+        )
+        .expect("seed inactive market rows for public free Share");
+        assert!(
+            conn.execute(
+                "UPDATE share_market_listings SET status = 'active' WHERE id = 'listing-closed'",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE share_market_subscriptions SET status = 'active'
+                  WHERE id = 'subscription-released'",
+                [],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_19_archive_is_verified_before_21_physical_retirement() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 18);
+        conn.execute_batch(
+            "INSERT INTO router_markets
+                (id, display_name, email, subdomain, public_base_url,
+                 created_at, updated_at, last_seen_at)
+             VALUES ('legacy-market', 'Legacy Market', 'legacy@example.com', 'legacy',
+                     'https://legacy.example.com', 'now', 'now', 'now');
+             INSERT INTO public_hosts
+                (label, route_id, kind, subject_id, target_lane_id, lifecycle,
+                 revision, created_at, updated_at)
+             VALUES ('legacy-market-host', 'market:legacy', 'market', 'legacy-market',
+                     'legacy-market', 'active', 1, 'now', 'now');
+             INSERT INTO market_notification_emails
+                (id, market_email, kind, to_email, locale, payload_json, status, created_at)
+             VALUES ('legacy-mail', 'legacy@example.com', 'topup_paid', 'buyer@example.com',
+                     'en', '{}', 'sent', 'now');
+             INSERT INTO market_request_logs
+                (request_id, market_id, market_email, market_subdomain, status,
+                 created_at, synced_at)
+             VALUES ('req_legacy_archive', 'legacy-market', 'legacy@example.com', 'legacy',
+                     'settled', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO market_disabled_shares
+                (market_email, share_id, disabled_by_email, created_at, updated_at)
+             VALUES ('legacy@example.com', 'share-legacy', 'legacy@example.com', 'now', 'now');
+             INSERT INTO market_share_model_failure_state
+                (market_email, share_id, app_type, requested_model, last_status,
+                 last_checked_at, updated_at)
+             VALUES ('legacy@example.com', 'share-legacy', 'codex', 'gpt-5', 'failed', 1, 1);
+             INSERT INTO market_share_runtime_states
+                (market_email, share_id, scope, kind, created_at, updated_at)
+             VALUES ('legacy@example.com', 'share-legacy', 'share', 'cooldown', 'now', 'now');",
+        )
+        .expect("seed legacy Token Market rows");
+
+        apply(&conn).expect("apply archive and physical retirement migrations");
+
+        for table in [
+            "router_markets",
+            "market_notification_emails",
+            "market_request_logs",
+            "market_disabled_shares",
+            "market_share_model_failure_state",
+            "market_share_runtime_states",
+            "legacy_token_market_archive_manifest",
+            "legacy_token_market_router_markets",
+            "legacy_token_market_public_hosts",
+            "legacy_token_market_notification_emails",
+            "legacy_token_market_request_logs",
+            "legacy_token_market_disabled_shares",
+            "legacy_token_market_share_model_failure_state",
+            "legacy_token_market_share_runtime_states",
+        ] {
+            let table_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("inspect retired table {table}: {error}"));
+            assert_eq!(table_count, 0, "retired table still exists: {table}");
+        }
+
+        let live_market_hosts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM public_hosts WHERE kind = 'market'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count live market hosts");
+        assert_eq!(live_market_hosts, 0);
+        let live_host_kind_rejected = conn.execute(
+            "INSERT INTO public_hosts
+                (label, route_id, kind, subject_id, target_lane_id, lifecycle,
+                 revision, created_at, updated_at)
+             VALUES ('new-market-host', 'market:new', 'market', 'new-market',
+                     'new-market', 'active', 1, 'now', 'now')",
+            [],
+        );
+        assert!(live_host_kind_rejected.is_err());
+
+        let legacy_observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM capacity_request_observations
+                 WHERE request_id = 'req_legacy_archive'
+                    OR source_kind = 'legacy_token_market'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retired observations");
+        assert_eq!(legacy_observations, 0);
+
+        conn.execute(
+            "INSERT INTO gateway_request_observations (
+                request_id, gateway_id, request_agent, requested_model,
+                actual_model, actual_model_source, status, created_at, observed_at
+             ) VALUES ('req_gateway_identity', 'gateway-identity', 'codex',
+                       'gpt-5', 'gpt-5', 'official', 'success', 'now', 'now')",
+            [],
+        )
+        .expect("insert Gateway observation fixture");
+        let projected_identity: (Option<String>, Option<String>, String) = conn
+            .query_row(
+                "SELECT gateway_id, user_email, source_kind
+                   FROM capacity_request_observations
+                  WHERE request_id = 'req_gateway_identity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read Gateway compatibility view");
+        assert_eq!(
+            projected_identity,
+            (Some("gateway-identity".into()), None, "gateway".into())
+        );
+
+        let before: (i64, i64, String) = conn
+            .query_row(
+                "SELECT source_rows, retained_rows, retired_at
+                   FROM data_retirement_audit
+                  WHERE component = 'router-local-capacity-market-v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read retirement receipt");
+        assert_eq!(before.0, 1);
+        assert_eq!(before.1, 0);
+
+        apply(&conn).expect("repeat retirement migration");
+        let after: (i64, i64, String) = conn
+            .query_row(
+                "SELECT source_rows, retained_rows, retired_at
+                   FROM data_retirement_audit
+                  WHERE component = 'router-local-capacity-market-v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read repeated retirement receipt");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn migration_21_retains_only_identified_share_users() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 18);
+        conn.execute_batch(
+            "INSERT INTO shares (
+                 share_id, capacity_pool_id, installation_id, share_name, owner_email,
+                 app_type, token_limit, parallel_limit, tokens_used, requests_count,
+                 share_status, created_at, expires_at, user_grants_json, updated_at
+             ) VALUES (
+                 'share-known', 'pool-known', 'installation-known', 'Known Share',
+                 'owner@example.com', 'codex', -1, 3, 0, 0, 'active', 'now',
+                 '9999-12-31T23:59:59Z',
+                 '{\"grant@example.com\":{\"email\":\"grant@example.com\",\"role\":\"shareto\",\"active\":false}}',
+                 'now'
+             );
+             INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+             VALUES ('known-user', 'known@example.com', 'active', 'now', 'now');
+             INSERT INTO market_request_logs (
+                 request_id, market_id, market_email, market_subdomain, user_email,
+                 share_id, model, request_agent, status, created_at, synced_at
+             ) VALUES
+                 ('req-owner', 'legacy-market', 'legacy@example.com', 'legacy',
+                  'owner@example.com', 'share-known', 'gpt-5', 'codex', 'settled',
+                  '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                 ('req-grant', 'legacy-market', 'legacy@example.com', 'legacy',
+                  'grant@example.com', 'share-known', 'gpt-5', 'codex', 'settled',
+                  '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z'),
+                 ('req-known', 'legacy-market', 'legacy@example.com', 'legacy',
+                  'known@example.com', 'share-known', 'gpt-5', 'codex', 'settled',
+                  '2026-01-01T00:00:02Z', '2026-01-01T00:00:02Z'),
+                 ('req-unknown', 'legacy-market', 'legacy@example.com', 'legacy',
+                  'unknown@example.com', 'share-known', 'gpt-5', 'codex', 'settled',
+                  '2026-01-01T00:00:03Z', '2026-01-01T00:00:03Z');",
+        )
+        .expect("seed identified and unidentified legacy observations");
+
+        apply(&conn).expect("apply identification-aware retirement migration");
+
+        let retained: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT request_id, user_email
+                   FROM share_request_logs
+                  ORDER BY request_id",
+            )
+            .expect("prepare retained Share observations")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query retained Share observations")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read retained Share observations");
+        assert_eq!(
+            retained,
+            vec![
+                (
+                    "req-grant".to_string(),
+                    Some("grant@example.com".to_string())
+                ),
+                (
+                    "req-known".to_string(),
+                    Some("known@example.com".to_string())
+                ),
+                (
+                    "req-owner".to_string(),
+                    Some("owner@example.com".to_string())
+                ),
+            ]
+        );
+
+        let receipt: (i64, i64) = conn
+            .query_row(
+                "SELECT source_rows, retained_rows
+                   FROM data_retirement_audit
+                  WHERE component = 'router-local-capacity-market-v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read identification-aware retirement receipt");
+        assert_eq!(receipt, (4, 3));
+    }
+
+    #[test]
+    fn migration_21_rejects_a_tampered_migration_19_archive() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 18);
+        conn.execute_batch(
+            "INSERT INTO router_markets
+                (id, display_name, email, subdomain, public_base_url,
+                 created_at, updated_at, last_seen_at)
+             VALUES ('legacy-market', 'Legacy Market', 'legacy@example.com', 'legacy',
+                     'https://legacy.example.com', 'now', 'now', 'now');",
+        )
+        .expect("seed legacy Token Market row");
+
+        let (version, migration_19) = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|(version, _)| *version == LEGACY_TOKEN_MARKET_RETIREMENT_VERSION)
+            .expect("migration 19 exists");
+        conn.execute_batch(migration_19)
+            .expect("apply migration 19 SQL");
+        populate_legacy_token_market_archive_checksums(&conn)
+            .expect("finalize migration 19 archive checksums");
+        ensure_legacy_token_market_archive_is_read_only(&conn).expect("lock migration 19 archive");
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at)
+             VALUES (?1, ?2, 'test')",
+            params![version, migration_checksum(migration_19)],
+        )
+        .expect("record migration 19");
+        check_compatibility(&conn).expect("untampered migration 19 archive is compatible");
+
+        conn.execute_batch(
+            "DROP TRIGGER legacy_token_market_archive_router_markets_read_only_update;
+             UPDATE legacy_token_market_router_markets SET display_name = 'tampered';",
+        )
+        .expect("simulate an operator bypassing an archive trigger");
+        let error = apply(&conn).expect_err("migration 21 must reject a corrupted archive");
+        assert!(error.to_string().contains("archive verification failed"));
+
+        let migration_21_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                params![LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION],
+                |row| row.get(0),
+            )
+            .expect("inspect migration 21 history");
+        assert_eq!(migration_21_rows, 0);
+        let archived_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM legacy_token_market_router_markets",
+                [],
+                |row| row.get(0),
+            )
+            .expect("archive remains available after rejected retirement");
+        assert_eq!(archived_rows, 1);
     }
 }

@@ -16,7 +16,6 @@ import type { AppLocale } from "@/lib/i18n";
 import type {
   DashboardClient,
   ImageGenerationRequestLog,
-  MarketRequestLog,
   ShareAppProvider,
   ShareAppRuntimes,
   ShareModelHealthCheck,
@@ -44,7 +43,6 @@ import {
   boundProviderIdForApp,
   cacheHitRate,
   clientPlatformLabel,
-  configuredUpstreamPercent,
   CORE_SHARE_APPS,
   expiryTitle,
   formatAgeDaysOrHours,
@@ -174,54 +172,16 @@ export function UsageBar({
   );
 }
 
-export function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
+export function FreeAccessCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
-  const value =
-    share.forSale === "Free"
-      ? t("dashboard.free")
-      : share.forSale === "Yes"
-        ? t("dashboard.yes")
-        : t("dashboard.no");
-  const pricingLines =
-    share.forSale === "Yes"
-      ? [
-          ["Claude", configuredUpstreamPercent(share.appRuntimes, "claude")],
-          ["Codex", configuredUpstreamPercent(share.appRuntimes, "codex")],
-          ["Gemini", configuredUpstreamPercent(share.appRuntimes, "gemini")],
-        ].filter(([, percent]) => !!percent)
-      : [];
-  const marketLines =
-    share.forSale === "Yes"
-      ? [
-          t("dashboard.tokenMarket"),
-          ...(share.marketAccessMode === "all"
-            ? [t("dashboard.allMarkets")]
-            : (share.marketLinks || [])
-                .map((market) => market.subdomain || market.email)
-                .filter(Boolean)),
-        ]
-      : [];
+  const freeAccess = share.freeAccess;
   return (
     <div className="grid min-w-32 gap-1.5">
-      <Chip size="sm" variant={value === "No" ? "tertiary" : "soft"}>
-        {value}
+      <Chip size="sm" variant={freeAccess ? "soft" : "tertiary"}>
+        {freeAccess
+          ? t("dashboard.freeAccessEnabled")
+          : t("dashboard.freeAccessDisabled")}
       </Chip>
-      {pricingLines.length ? (
-        <div className="grid gap-0.5 font-mono text-[11px] text-muted-foreground">
-          {pricingLines.map(([label, percent]) => (
-            <div key={label}>
-              {label} {percent}
-            </div>
-          ))}
-        </div>
-      ) : null}
-      {marketLines.length ? (
-        <div className="grid gap-0.5 font-mono text-[11px] text-muted-foreground">
-          {marketLines.map((line) => (
-            <div key={line}>{line}</div>
-          ))}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -374,22 +334,20 @@ export function ShareStatusCell({
     : String(share.parallelLimit || 0);
   const averageLatency = averageRecentLatencyMs(share.recentRequests);
   const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
-  const saleValue =
-    share.forSale === "Free"
-      ? t("dashboard.free")
-      : share.forSale === "Yes"
-        ? t("dashboard.tokenMarket")
-        : t("dashboard.no");
-  const saleVariant: "soft" | "tertiary" =
-    share.forSale === "No" ? "tertiary" : "soft";
-  const saleRow = (
+  const freeAccess = share.freeAccess;
+  const accessValue = freeAccess
+    ? t("dashboard.freeAccessEnabled")
+    : t("dashboard.freeAccessDisabled");
+  const accessVariant: "soft" | "tertiary" =
+    freeAccess ? "soft" : "tertiary";
+  const accessRow = (
     <div className={rowClass}>
       <span className="mono-label text-muted-foreground">
-        {t("dashboard.forSale")}
+        {t("dashboard.field.freeAccess")}
       </span>
       <div className="flex min-w-0 flex-wrap items-center gap-1">
-        <Chip size="sm" variant={saleVariant}>
-          {saleValue}
+        <Chip size="sm" variant={accessVariant}>
+          {accessValue}
         </Chip>
       </div>
     </div>
@@ -412,7 +370,7 @@ export function ShareStatusCell({
   return (
     <div className="grid min-w-0 gap-2 text-sm">
       {routeStatus}
-      {saleRow}
+      {accessRow}
       <div className={rowClass}>
         <span className="mono-label text-muted-foreground">
           {t("dashboard.usage")}
@@ -488,10 +446,10 @@ export function shareSupportLabel(share: ShareView) {
     .join(" / ");
 }
 
-export function shareSaleLabel(share: ShareView, t: TFn) {
-  if (share.forSale === "Free") return t("dashboard.free");
-  if (share.forSale === "Yes") return t("dashboard.forSale");
-  return t("dashboard.no");
+export function shareAccessLabel(share: ShareView, t: TFn) {
+  return share.freeAccess
+    ? t("dashboard.freeAccessEnabled")
+    : t("dashboard.freeAccessDisabled");
 }
 
 export function ShareSummaryItem({
@@ -520,7 +478,7 @@ export function ShareSummaryItem({
           {owner}
         </span>
         <span>{support || t("dashboard.noProviders")}</span>
-        <span>{shareSaleLabel(share, t)}</span>
+        <span>{shareAccessLabel(share, t)}</span>
       </div>
     </li>
   );
@@ -595,66 +553,25 @@ export function ClientLinkedSharesPanel({
   );
 }
 
-export function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
+export function ShareAccess({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <EmptyBlock>{t("dashboard.noShare")}</EmptyBlock>;
-  if (share.forSale === "Free")
+  if (share.freeAccess)
     return <EmptyBlock>{t("dashboard.publicFreeShare")}</EmptyBlock>;
-  if (share.forSale !== "Yes")
-    return <EmptyBlock>{t("dashboard.notForSale")}</EmptyBlock>;
-  if (share.marketAccessMode === "all")
-    return <EmptyBlock>{t("dashboard.authorizedAllMarkets")}</EmptyBlock>;
-  const links = share.marketLinks || [];
-  const unknown = share.unknownMarketEmails || [];
+  const emails = Array.from(
+    new Set(
+      Object.values(share.userGrants || {})
+        .filter((grant) => grant.active !== false && grant.role === "shareto")
+        .map((grant) => grant.email),
+    ),
+  ).filter(Boolean);
+  if (!emails.length) {
+    return <EmptyBlock>{t("dashboard.freeAccessDisabled")}</EmptyBlock>;
+  }
   return (
     <div className="grid gap-2">
-      <Chip size="sm" variant="tertiary">
-        {t("dashboard.tokenMarket")}
-      </Chip>
-      {links.map((market) => {
-        const reconnecting = market.routeState === "reconnecting";
-        return (
-          <Card
-            key={market.id || market.email}
-            className="rounded-lg border p-0 shadow-none"
-          >
-            <Card.Content className="flex-row items-center justify-between gap-3 p-3">
-              <div className="min-w-0">
-                <div className="truncate font-medium">
-                  {market.publicBaseUrl || market.email || "-"}
-                </div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {market.email || "-"}
-                </div>
-              </div>
-              <Chip
-                color={
-                  market.online
-                    ? "success"
-                    : reconnecting
-                      ? "accent"
-                      : "default"
-                }
-                size="sm"
-                variant={market.online || reconnecting ? "soft" : "tertiary"}
-              >
-                {market.online
-                  ? t("common.online")
-                  : reconnecting
-                    ? t("dashboard.reconnecting")
-                    : t("common.offline")}
-              </Chip>
-            </Card.Content>
-          </Card>
-        );
-      })}
-      {unknown.map((email) => (
-        <EmptyBlock key={email}>
-          {t("dashboard.unknownMarket")}: {email}
-        </EmptyBlock>
-      ))}
-      {!links.length && !unknown.length && share.marketAccessMode !== "all" ? (
-        <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>
-      ) : null}
+      <div className="flex flex-wrap gap-1.5">
+        {emails.map((email) => <Chip key={email} size="sm" variant="soft">{email}</Chip>)}
+      </div>
     </div>
   );
 }
@@ -840,9 +757,6 @@ export function ProviderCard({
       <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
         {meta ? <div className="break-words">{meta}</div> : null}
         {endpoint ? <div className="break-words">{endpoint}</div> : null}
-        {provider.forSaleOfficialPricePercent ? (
-          <div>{provider.forSaleOfficialPricePercent}%</div>
-        ) : null}
         <div className="break-words">{accountLevel}</div>
         <div className="break-words">{accountIdentity}</div>
       </div>
@@ -1257,7 +1171,7 @@ export function ShareUsageTable({
   const roleLabel = (role: string) => {
     if (role === "owner") return t("dashboard.usageEmail.role.owner");
     if (role === "shareto") return t("dashboard.usageEmail.role.shareto");
-    if (role === "market") return t("dashboard.usageEmail.role.market");
+    if (role === "gateway") return t("dashboard.usageEmail.role.gateway");
     if (role === "deprecated") return t("dashboard.usageEmail.role.deprecated");
     return role || "-";
   };
@@ -2132,11 +2046,7 @@ export function ShareModelHealthChecks({
   );
 }
 
-export function TokenGrid({
-  log,
-}: {
-  log: ShareRequestLog | MarketRequestLog;
-}) {
+export function TokenGrid({ log }: { log: ShareRequestLog }) {
   const { t } = useLocaleText();
   const usageObserved = hasObservedShareUsage(log);
   const usageState = log.usageState || "observed";

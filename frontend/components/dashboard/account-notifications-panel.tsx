@@ -1,12 +1,13 @@
 "use client";
 
 import * as React from "react";
-import { Button, Switch } from "@heroui/react";
-import { Bell, ExternalLink, Loader2, Mail, Send, Unlink } from "lucide-react";
+import { Button } from "@heroui/react";
+import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, Send, Unlink } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  ApiError,
   createTelegramBindLink,
   getMyNotificationSettings,
   unbindMyTelegramChat,
@@ -64,11 +65,11 @@ export function AccountNotificationsPanel() {
     try {
       setSettings(await getMyNotificationSettings());
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatTelegramError(err, t));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   React.useEffect(() => {
     if (!authed) return;
@@ -77,7 +78,11 @@ export function AccountNotificationsPanel() {
 
   React.useEffect(() => {
     const status = settings?.telegramBotStatus;
-    if (!authed || !settings?.telegramBotConfigured || status === "ready") return;
+    const transportStatus = settings?.telegramBotTransportStatus;
+    const transportDegraded = transportStatus === "degraded";
+    if (!authed || !settings?.telegramBotConfigured || (status === "ready" && !transportDegraded)) {
+      return;
+    }
     let active = true;
     let refreshing = false;
     const refresh = () => {
@@ -94,13 +99,20 @@ export function AccountNotificationsPanel() {
     };
     const timer = window.setInterval(
       refresh,
-      status === "error" ? BOT_ERROR_STATUS_POLL_INTERVAL_MS : BOT_STATUS_POLL_INTERVAL_MS,
+      status === "error" || transportDegraded
+        ? BOT_ERROR_STATUS_POLL_INTERVAL_MS
+        : BOT_STATUS_POLL_INTERVAL_MS,
     );
     return () => {
       active = false;
       window.clearInterval(timer);
     };
-  }, [authed, settings?.telegramBotConfigured, settings?.telegramBotStatus]);
+  }, [
+    authed,
+    settings?.telegramBotConfigured,
+    settings?.telegramBotStatus,
+    settings?.telegramBotTransportStatus,
+  ]);
 
   // The binding is completed in Telegram, not here: the only way this page
   // learns about it is by asking again until the chat shows up.
@@ -137,18 +149,16 @@ export function AccountNotificationsPanel() {
     };
   }, [bindBaselineVerifiedAt, waitingForBind]);
 
-  const toggleChannel = async (channel: string, enabled: boolean) => {
-    if (!settings || busy) return;
-    const next = new Set(settings.enabledChannels);
-    if (enabled) next.add(channel);
-    else next.delete(channel);
-    if (next.size === 0) return;
+  // One channel at a time: picking a destination replaces the previous one
+  // rather than adding to it, which is exactly what the API models.
+  const selectChannel = async (channel: string) => {
+    if (!settings || busy || settings.deliveryChannel === channel) return;
     setBusy(true);
     setError("");
     try {
-      setSettings(await updateMyNotificationSettings([...next].sort()));
+      setSettings(await updateMyNotificationSettings(channel));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatTelegramError(err, t));
     } finally {
       setBusy(false);
     }
@@ -170,7 +180,7 @@ export function AccountNotificationsPanel() {
     } catch (err) {
       tab?.close();
       setBindBaselineVerifiedAt(undefined);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatTelegramError(err, t));
     } finally {
       setBusy(false);
     }
@@ -186,7 +196,7 @@ export function AccountNotificationsPanel() {
       setBindBaselineVerifiedAt(undefined);
       setUnbindOpen(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatTelegramError(err, t));
     } finally {
       setBusy(false);
     }
@@ -217,13 +227,19 @@ export function AccountNotificationsPanel() {
   const telegram = channelSettings(settings, "telegram");
   const botStatus = settings?.telegramBotStatus ?? "disabled";
   const botConfigured = settings?.telegramBotConfigured === true;
+  const botTransportDegraded = settings?.telegramBotTransportStatus === "degraded";
   const botReady = botConfigured
     && botStatus === "ready"
+    && !botTransportDegraded
     && telegram?.available === true
     && !!settings?.telegramBotUsername;
   const botReconciling = botConfigured && (botStatus === "reconciling" || botStatus === "disabled");
-  const botError = botStatus === "error";
+  const botError = botStatus === "error" || botTransportDegraded;
   const bound = telegram?.state === "ready";
+  const selectedChannel = settings?.deliveryChannel ?? "email";
+  // The backend silently delivers to email when the selection cannot carry the
+  // alert. Say so, instead of showing a Telegram selection that is not running.
+  const fallbackActive = selectedChannel === "telegram" && telegram?.available !== true;
   const botHint = botReady
     ? t("account.notifications.telegramHint")
     : botReconciling
@@ -264,34 +280,91 @@ export function AccountNotificationsPanel() {
             {t("account.notifications.channelHint")}
           </p>
         </div>
-        <div className="divide-y rounded-lg border border-border bg-card">
+        <div
+          role="radiogroup"
+          aria-label={t("account.notifications.channelTitle")}
+          aria-busy={busy}
+          className="grid gap-2"
+        >
           {CHANNEL_OPTIONS.map((option) => {
             const Icon = option.icon;
             const channel = channelSettings(settings, option.value);
-            const active = !!channel?.enabled;
-            const onlyEnabled = active && settings?.enabledChannels.length === 1;
-            const cannotEnable = !active && (!channel?.available || channel.state !== "ready");
-            const disabled = busy || onlyEnabled || cannotEnable;
+            const selected = selectedChannel === option.value;
+            // Email is always a valid destination; Telegram needs a live bot
+            // and a bound chat before it can carry anything.
+            const usable = option.value === "email"
+              || (channel?.state === "ready" && channel?.available === true);
+            const reason = usable
+              ? ""
+              : channel?.state === "ready"
+                ? t("account.notifications.channel.botUnavailable")
+                : t("account.notifications.channel.needsBinding");
+            // Not disabled while busy: `selectChannel` already ignores the
+            // change, and disabling the focused radio mid-request would drop
+            // keyboard focus out of the group.
+            const disabled = !usable && !selected;
             return (
-              <div
+              <label
                 key={option.value}
-                className="flex min-h-16 items-center gap-3 px-3 py-3 sm:px-4"
+                className={cn(
+                  "group relative flex min-h-16 cursor-pointer items-center gap-3 rounded-xl border px-3 py-3 transition-all duration-200 sm:px-4",
+                  selected
+                    ? "border-accent bg-accent/5 shadow-[0_4px_14px_rgba(0,82,255,0.15)]"
+                    : "border-border bg-card hover:border-accent/30 hover:shadow-md",
+                  disabled && !selected && "cursor-not-allowed opacity-60 hover:border-border hover:shadow-none",
+                  "focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2",
+                )}
               >
-                <Icon className={cn("h-4 w-4 shrink-0", active ? "text-sky-600" : "text-muted-foreground")} aria-hidden />
+                <input
+                  type="radio"
+                  name="notification-delivery-channel"
+                  className="sr-only"
+                  value={option.value}
+                  checked={selected}
+                  disabled={disabled}
+                  onChange={() => void selectChannel(option.value)}
+                />
+                <span
+                  className={cn(
+                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-all duration-200",
+                    selected
+                      ? "bg-gradient-to-br from-accent to-[rgb(var(--router-accent-secondary))] text-white"
+                      : "bg-muted text-muted-foreground",
+                  )}
+                  aria-hidden
+                >
+                  <Icon className="h-4 w-4" />
+                </span>
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-medium text-foreground">{t(option.labelKey)}</div>
-                  <div className="text-xs leading-relaxed text-muted-foreground">{t(option.hintKey)}</div>
+                  <div className="text-xs leading-relaxed text-muted-foreground">
+                    {reason && !selected ? reason : t(option.hintKey)}
+                  </div>
                 </div>
-                <Switch
-                  aria-label={t(option.labelKey)}
-                  isSelected={active}
-                  isDisabled={disabled}
-                  onChange={(selected: boolean) => void toggleChannel(option.value, selected)}
-                />
-              </div>
+                {selected ? (
+                  <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-accent px-2.5 py-1 text-xs font-medium text-white">
+                    <Check className="h-3 w-3" aria-hidden />
+                    {t("account.notifications.channel.selected")}
+                  </span>
+                ) : (
+                  <span
+                    className={cn(
+                      "h-4 w-4 shrink-0 rounded-full border-2 transition-colors duration-200",
+                      disabled ? "border-border" : "border-muted-foreground/40 group-hover:border-accent",
+                    )}
+                    aria-hidden
+                  />
+                )}
+              </label>
             );
           })}
         </div>
+        {fallbackActive ? (
+          <p className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs text-amber-950">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+            {t("account.notifications.channel.fallbackNotice")}
+          </p>
+        ) : null}
         <p className="text-xs text-muted-foreground">
           {t("account.notifications.emailTarget")}
           <span className="ml-1 font-mono text-foreground">{settings?.email}</span>
@@ -348,6 +421,13 @@ export function AccountNotificationsPanel() {
             </span>
           </div>
         </div>
+
+        {(settings?.telegramBotFailureCode
+          || settings?.telegramBotFailureHint
+          || settings?.telegramBotFailureDetails
+          || settings?.telegramBotTransportStatus === "degraded") ? (
+          <AccountTelegramDiagnostic settings={settings} />
+        ) : null}
 
         {bound ? (
           <div className="grid gap-2 text-sm">
@@ -436,4 +516,62 @@ function channelSettings(
   channel: string,
 ): NotificationChannelSettings | undefined {
   return settings?.channels.find((entry) => entry.channel === channel);
+}
+
+function AccountTelegramDiagnostic({ settings }: { settings: NotificationSettings }) {
+  const { t } = useLocaleText();
+  const code = settings.telegramBotFailureCode?.trim();
+  const key = code
+    ? `settings.alertChannels.diagnostic.${code}`
+    : "settings.alertChannels.diagnostic.legacy";
+  const translated = t(key as Parameters<typeof t>[0]);
+  const hint = translated === key
+    ? settings.telegramBotFailureHint || t("settings.alertChannels.diagnostic.legacy")
+    : translated;
+  const details = settings.telegramBotFailureDetails;
+  const resolved = formatDiagnosticAddresses(details?.resolvedAddresses);
+  const reachable = formatDiagnosticAddresses(details?.reachableAddresses);
+  const dnsError = typeof details?.dnsError === "string" ? details.dnsError : "";
+  const technicalError = typeof details?.technicalError === "string" ? details.technicalError : "";
+  return (
+    <div className="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs text-amber-950">
+      <p className="font-medium">{t("settings.alertChannels.diagnostic.title")}</p>
+      <p className="mt-1 leading-5">{hint}</p>
+      {resolved || reachable || dnsError || technicalError ? (
+        <details className="mt-2 text-amber-900/80">
+          <summary className="cursor-pointer select-none font-medium">
+            {t("settings.alertChannels.diagnostic.details")}
+          </summary>
+          <div className="mt-1 grid gap-1 break-words font-mono text-[11px]">
+            {resolved ? <span>{t("settings.alertChannels.diagnostic.resolved", { addresses: resolved })}</span> : null}
+            {reachable ? <span>{t("settings.alertChannels.diagnostic.reachable", { addresses: reachable })}</span> : null}
+            {dnsError ? <span>{t("settings.alertChannels.diagnostic.dnsError", { error: dnsError })}</span> : null}
+            {technicalError ? <span>{technicalError}</span> : null}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function formatDiagnosticAddresses(value: unknown) {
+  if (!Array.isArray(value)) return "";
+  return value.filter((item): item is string => typeof item === "string").join(", ");
+}
+
+function formatTelegramError(error: unknown, translate: ReturnType<typeof useLocaleText>["t"]) {
+  if (error instanceof ApiError) {
+    const code = error.details?.failureCode;
+    if (typeof code === "string") {
+      const key = `settings.alertChannels.diagnostic.${code}` as Parameters<typeof translate>[0];
+      const translated = translate(key);
+      if (translated !== key) return translated;
+    }
+    const hint = error.details?.failureHint;
+    if (typeof hint === "string" && hint.trim()) return hint;
+    if (error.code === "USER_NOTIFICATION_BOT_NOT_READY") {
+      return translate("account.notifications.telegramUnavailable");
+    }
+  }
+  return error instanceof Error ? error.message : String(error);
 }

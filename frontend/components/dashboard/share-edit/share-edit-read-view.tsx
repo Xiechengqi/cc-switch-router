@@ -7,7 +7,6 @@ import {
   isOfficialRuntime,
   isUnlimitedParallelLimit,
   isUnlimitedTokenLimit,
-  marketLabel,
   runtimeModelSummary,
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
@@ -15,7 +14,6 @@ import { getShareUserLimitStatus } from "@/lib/api";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { shareProviderSupportedApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
-  DashboardMarket,
   ShareAppRuntimes,
   ShareUpstreamProvider,
   ShareUserGrant,
@@ -24,8 +22,6 @@ import type {
 } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 import {
-  forSaleOptionLabel,
-  ReadOnlyChipList,
   ReadOnlyField,
   ShareEditSection,
 } from "./share-edit-section";
@@ -54,33 +50,15 @@ function providerHint(runtime?: ShareUpstreamProvider) {
 
 export function ShareEditReadView({
   share,
-  markets,
   t,
 }: {
   share: ShareView;
-  markets: DashboardMarket[];
   t: TFn;
 }) {
   const boundApps = shareProviderSupportedApps(share);
   const shareApp = resolveShareCoreApp(share) ?? boundApps[0];
-  const tokenMarkets = markets;
 
-  const forSale = (share.forSale as "Yes" | "No" | "Free") || "No";
-  const marketAccessMode = (share.marketAccessMode as "selected" | "all") || "selected";
-  const marketLinks = share.marketLinks || [];
-
-  const selectedTokenMarketLabels = React.useMemo(() => {
-    if (forSale !== "Yes" || marketAccessMode !== "selected") return [];
-    return marketLinks
-      .map((link) => (link.email || "").toLowerCase())
-      .filter(Boolean)
-      .map((email) => {
-        const meta = tokenMarkets.find((market) => (market.email || "").toLowerCase() === email);
-        return meta ? marketLabel(meta) : email;
-      });
-  }, [forSale, marketAccessMode, marketLinks, tokenMarkets]);
-
-  const pricingPercent = shareApp ? share.forSaleOfficialPricePercentByApp?.[shareApp] : undefined;
+  const freeAccess = share.freeAccess;
 
   const tokenLimit = share.tokenLimit;
   const parallelLimit = share.parallelLimit;
@@ -118,19 +96,6 @@ export function ShareEditReadView({
       cancelled = true;
     };
   }, [share.shareId, shareApp]);
-
-  const marketAccessDisplay = React.useMemo(() => {
-    if (forSale === "Free") return t("dashboard.publicFreeShare");
-    if (forSale !== "Yes") return t("dashboard.notForSale");
-    if (marketAccessMode === "all") return t("dashboard.allMarkets");
-    if (selectedTokenMarketLabels.length) return null;
-    return t("dashboard.noAuthorizedMarkets");
-  }, [
-    forSale,
-    marketAccessMode,
-    selectedTokenMarketLabels.length,
-    t,
-  ]);
 
   return (
     <div className="grid gap-6">
@@ -180,29 +145,10 @@ export function ShareEditReadView({
       {shareApp ? (
         <>
           <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <ReadOnlyField label={t("dashboard.field.forSale")} value={forSaleOptionLabel(forSale, t)} />
-              {forSale === "Yes" ? (
-                <ReadOnlyField
-                  label={t("dashboard.field.marketAccess")}
-                  value={
-                    marketAccessDisplay ?? (
-                      <ReadOnlyChipList items={selectedTokenMarketLabels} />
-                    )
-                  }
-                />
-              ) : null}
-              {forSale === "Yes" ? (
-                <ReadOnlyField
-                  label={t("dashboard.field.modelPricing")}
-                  value={
-                    typeof pricingPercent === "number" && pricingPercent > 0
-                      ? `${pricingPercent}%`
-                      : t("common.unset")
-                  }
-                />
-              ) : null}
-            </div>
+            <ReadOnlyField
+              label={t("dashboard.field.freeAccess")}
+              value={freeAccess ? t("dashboard.freeAccessEnabled") : t("dashboard.freeAccessDisabled")}
+            />
             <div className="grid gap-3 sm:grid-cols-3">
               <ReadOnlyField
                 label={t("dashboard.field.tokenLimit")}

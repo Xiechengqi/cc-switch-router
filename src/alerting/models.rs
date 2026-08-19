@@ -122,6 +122,9 @@ pub struct AlertChannelState {
     pub last_attempt_at: Option<i64>,
     pub last_success_at: Option<i64>,
     pub last_error: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_hint: Option<String>,
+    pub failure_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

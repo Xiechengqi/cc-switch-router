@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, Toast } from "@heroui/react";
-import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, ServerCog, Settings, Share2, Store, UserRound } from "lucide-react";
+import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, ServerCog, Settings, Share2, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -16,7 +16,6 @@ import {
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
   DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_CLIENTS_PATH,
-  DASHBOARD_MARKETS_PATH,
   DASHBOARD_SHARE_MARKET_PATH,
   DASHBOARD_CLIENT_MARKET_PATH,
   type DashboardShellActive,
@@ -154,7 +153,7 @@ function DashboardNav({
   authed,
   pendingAccessRequests,
 }: {
-  active: "clients" | "markets" | "share-market" | "client-market" | "account";
+  active: "clients" | "share-market" | "client-market" | "account";
   authed: boolean;
   pendingAccessRequests: number;
 }) {
@@ -167,13 +166,10 @@ function DashboardNav({
         ? "client-market"
         : active === "share-market" || pathname.startsWith("/share-market")
           ? "share-market"
-          : active === "markets" || pathname.startsWith("/markets")
-            ? "markets"
-            : "clients";
+          : "clients";
 
   const items = [
     { id: "clients" as const, href: DASHBOARD_CLIENTS_PATH, icon: Monitor, label: t("nav.clientsTab") },
-    { id: "markets" as const, href: DASHBOARD_MARKETS_PATH, icon: Store, label: t("nav.marketsTab") },
     {
       id: "share-market" as const,
       href: DASHBOARD_SHARE_MARKET_PATH,
@@ -245,7 +241,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const authed = !!session?.authenticated;
   const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
-  const showDashboardNav = active === "clients" || active === "markets" || active === "share-market" || active === "client-market" || active === "account";
+  const showDashboardNav = active === "clients" || active === "share-market" || active === "client-market" || active === "account";
 
   React.useEffect(() => {
     if (!authed || active === "account") {
@@ -394,7 +390,7 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const { t } = useLocaleText();
-  const dashboardDataEnabled = active === "clients" || active === "markets";
+  const dashboardDataEnabled = active === "clients";
   return (
     <DashboardDataProvider enabled={dashboardDataEnabled}>
       <a

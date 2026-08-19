@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::error::AppError;
@@ -80,11 +79,8 @@ impl NotificationTargets {
         }
     }
 
-    pub fn enabled_channels(&self) -> BTreeSet<String> {
-        self.targets
-            .iter()
-            .map(|target| target.channel.as_str().to_string())
-            .collect()
+    pub fn selected_channel(&self) -> Option<&NotificationChannelId> {
+        self.targets.first().map(|target| &target.channel)
     }
 
     pub fn target(&self, channel: &NotificationChannelId) -> Option<&NotificationTarget> {
@@ -93,46 +89,47 @@ impl NotificationTargets {
             .find(|target| &target.channel == channel)
     }
 
+    /// Resolve the single channel a notification is delivered on.
+    ///
+    /// The selected channel is honoured whenever it can actually carry the
+    /// notification. When it cannot — the bot is down, or the lane refuses
+    /// Telegram — the account email is used instead: a selection is a
+    /// preference, not a reason to drop an alert on the floor.
     pub fn delivery_targets(
         &self,
         telegram_available: bool,
         telegram_allowed: bool,
     ) -> Vec<NotificationTarget> {
-        let mut targets = self
-            .targets
-            .iter()
-            .filter(|target| {
-                if target.channel.is_telegram() {
-                    telegram_available && telegram_allowed
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            targets.push(NotificationTarget {
+        let selected = self.targets.iter().find(|target| {
+            if target.channel.is_telegram() {
+                telegram_available && telegram_allowed
+            } else {
+                true
+            }
+        });
+        match selected {
+            Some(target) => vec![target.clone()],
+            None => vec![NotificationTarget {
                 channel: NotificationChannelId::email(),
                 address: self.email.clone(),
                 revision: 0,
                 provider_identity: None,
-            });
+            }],
         }
-        targets.sort_by_key(|target| !target.channel.is_email());
-        targets
     }
 }
 
-pub fn normalize_enabled_channels(values: &[String]) -> Result<BTreeSet<String>, AppError> {
-    if values.is_empty() {
-        return Err(AppError::BadRequest(
-            "at least one notification channel must be enabled".into(),
-        ));
+/// Parse the channel a user selected. Unlike the delivery-time resolution
+/// above, this is a strict contract check: an unknown or malformed id is a bad
+/// request, never a silent fallback to email.
+pub fn parse_delivery_channel(value: &str) -> Result<NotificationChannelId, AppError> {
+    let channel = NotificationChannelId::parse(value)?;
+    if !channel.is_email() && !channel.is_telegram() {
+        return Err(AppError::BadRequest(format!(
+            "unsupported notification channel: {channel}"
+        )));
     }
-    values
-        .iter()
-        .map(|value| NotificationChannelId::parse(value).map(|channel| channel.to_string()))
-        .collect()
+    Ok(channel)
 }
 
 #[cfg(test)]
@@ -157,6 +154,19 @@ mod tests {
     }
 
     #[test]
+    fn only_shipped_channels_can_be_selected() {
+        assert!(
+            parse_delivery_channel(" Telegram ")
+                .expect("telegram")
+                .is_telegram()
+        );
+        assert!(parse_delivery_channel("EMAIL").expect("email").is_email());
+        // Storable, but not something a user can be switched onto yet.
+        assert!(parse_delivery_channel("matrix_v2").is_err());
+        assert!(parse_delivery_channel("").is_err());
+    }
+
+    #[test]
     fn unavailable_targets_fall_back_to_account_email() {
         let targets = NotificationTargets {
             email: "owner@example.com".into(),
@@ -168,6 +178,44 @@ mod tests {
             }],
         };
         let resolved = targets.delivery_targets(false, true);
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].channel.is_email());
+        assert_eq!(resolved[0].address, "owner@example.com");
+        assert_eq!(
+            resolved[0].revision, 0,
+            "a fallback delivery must not claim the Telegram row's revision"
+        );
+    }
+
+    #[test]
+    fn a_usable_selection_is_the_only_delivery_target() {
+        let targets = NotificationTargets {
+            email: "owner@example.com".into(),
+            targets: vec![NotificationTarget {
+                channel: NotificationChannelId::telegram(),
+                address: "42".into(),
+                revision: 3,
+                provider_identity: Some("7".into()),
+            }],
+        };
+        let resolved = targets.delivery_targets(true, true);
+        assert_eq!(resolved.len(), 1, "one notification, one destination");
+        assert!(resolved[0].channel.is_telegram());
+        assert_eq!(resolved[0].revision, 3);
+    }
+
+    #[test]
+    fn a_lane_that_refuses_telegram_still_reaches_the_owner() {
+        let targets = NotificationTargets {
+            email: "owner@example.com".into(),
+            targets: vec![NotificationTarget {
+                channel: NotificationChannelId::telegram(),
+                address: "42".into(),
+                revision: 3,
+                provider_identity: Some("7".into()),
+            }],
+        };
+        let resolved = targets.delivery_targets(true, false);
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].channel.is_email());
     }

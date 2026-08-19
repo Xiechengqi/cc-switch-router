@@ -2,13 +2,13 @@
 
 import { toast } from "@heroui/react";
 import * as React from "react";
-import { marketOperationalSummary, shareOperationalSummary } from "@/components/dashboard/operational-status";
+import { shareOperationalSummary } from "@/components/dashboard/operational-status";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DashboardResponse, OperationalState } from "@/lib/types";
 import { recordDashboardUxEvent } from "@/lib/api";
 
 type VerificationTarget = {
-  kind: "share" | "market";
+  kind: "share";
   id: string;
   submittedAt: number;
   baselineSnapshot?: string;
@@ -69,18 +69,7 @@ export function OperationVerificationProvider({ data, children }: { data: Dashbo
         void recordDashboardUxEvent({ eventType: "operation_verified", targetType: item.kind, elapsedMs: now - item.submittedAt });
         continue;
       }
-      const market = data.markets?.find((candidate) => candidate.id === item.id);
-      if (!market) {
-        remaining.push(item);
-        continue;
-      }
-      const summary = marketOperationalSummary(market);
-      if (item.expectedState && summary.state !== item.expectedState) {
-        remaining.push(item);
-        continue;
-      }
-      toast.success(t("dashboard.operationObserved"));
-      void recordDashboardUxEvent({ eventType: "operation_verified", targetType: item.kind, elapsedMs: now - item.submittedAt });
+      remaining.push(item);
     }
     if (remaining.length !== pending.length) setPending(remaining);
   }, [data, pending, t]);

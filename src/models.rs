@@ -3,13 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 
-fn default_share_for_sale() -> String {
-    "No".to_string()
-}
-
-fn default_market_access_mode() -> String {
-    "selected".to_string()
-}
+pub const SHARE_CONTRACT_VERSION: u16 = 2;
 
 pub fn default_share_parallel_limit() -> i64 {
     -1
@@ -359,15 +353,12 @@ pub struct UserShareView {
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
     pub role: String,
     pub can_invoke: bool,
     pub can_manage: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub for_sale: String,
-    pub market_access_mode: String,
+    pub free_access: bool,
     pub subdomain: String,
     pub tunnel_url: String,
     pub app_type: String,
@@ -783,20 +774,19 @@ pub struct ShareRequestLogBatchSyncRequest {
     pub logs: Vec<ShareRequestLogEntry>,
 }
 
+/// Minimal, redacted request observation payload used by signed Gateway
+/// clients. Downstream user identity, API keys, pricing, and settlement stay
+/// outside Router; the registered Gateway is the observation principal.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketRequestLogBatchSyncRequest {
-    pub logs: Vec<MarketRequestLogEntry>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayRequestObservationBatch {
+    pub logs: Vec<GatewayRequestObservation>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketRequestLogEntry {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayRequestObservation {
     pub request_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -824,56 +814,7 @@ pub struct MarketRequestLogEntry {
     pub cache_read_tokens: u32,
     #[serde(default)]
     pub cache_creation_tokens: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage_amount_usd: Option<String>,
     pub created_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settled_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_country: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_country_iso3: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DashboardMarketRequestLogView {
-    pub request_id: String,
-    pub market_id: String,
-    pub market_email: String,
-    pub market_subdomain: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_prefix: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub router_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub share_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub share_subdomain: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    pub request_agent: String,
-    pub requested_model: String,
-    pub actual_model: String,
-    pub actual_model_source: String,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latency_ms: Option<u64>,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub cache_read_tokens: u32,
-    pub cache_creation_tokens: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage_amount_usd: Option<String>,
-    pub created_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settled_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_country: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -909,17 +850,7 @@ pub struct ShareSettingsPatch {
     )]
     pub description: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub market_access_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shared_with_emails: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access_by_app: Option<BTreeMap<String, ShareAppAccess>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_settings: Option<BTreeMap<String, ShareAppSettings>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale_official_price_percent_by_app: Option<BTreeMap<String, u16>>,
+    pub free_access: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,6 +988,36 @@ pub struct ShareUserUsage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageRebase {
+    pub period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_starts_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_ends_at_ms: Option<i64>,
+    pub target_tokens: u64,
+    #[serde(default)]
+    pub observed_tokens_at_rebase: u64,
+    #[serde(default)]
+    pub observed_requests_at_rebase: u64,
+    #[serde(default)]
+    pub usage_watermark: u64,
+    pub applied_at_ms: i64,
+    #[serde(default)]
+    pub source: ShareUsageRebaseSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareUsageRebaseSource {
+    #[default]
+    Manual,
+    ProviderReset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareAnchoredUsageBucket {
     pub period: ShareTokenPeriod,
     pub anchor_at_ms: i64,
@@ -1079,6 +1040,8 @@ pub struct ShareUserGrant {
     pub policy: ShareUserPolicy,
     #[serde(default)]
     pub usage: ShareUserUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_rebase: Option<ShareUserUsageRebase>,
     #[serde(default)]
     pub created_at_ms: u128,
     #[serde(default)]
@@ -1610,18 +1573,37 @@ pub struct NotificationChannelSettingsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct NotificationSettingsResponse {
     pub email: String,
-    pub enabled_channels: Vec<String>,
+    /// The one channel every notification for this account is delivered on.
+    /// Channels the account cannot currently use never appear here; the
+    /// per-channel `channels` entries carry why.
+    pub delivery_channel: String,
     pub channels: Vec<NotificationChannelSettingsResponse>,
+    /// Internal fence used by the API layer to avoid presenting diagnostics
+    /// captured for an older Telegram configuration while a new one is
+    /// reconciling. This is deliberately not part of the JSON contract.
+    #[serde(skip)]
+    pub(crate) telegram_bot_runtime_fingerprint: Option<String>,
     pub telegram_bot_configured: bool,
     pub telegram_bot_status: String,
+    pub telegram_bot_transport_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telegram_bot_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_bot_failure_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_bot_failure_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_bot_failure_details: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_bot_last_failure_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateNotificationSettingsRequest {
-    pub enabled_channels: Vec<String>,
+    /// Selecting a channel deselects whatever was selected before — delivery is
+    /// never fanned out to more than one place.
+    pub channel: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1725,50 +1707,6 @@ pub struct PublicNetworkStatsResponse {
     pub active_clients: usize,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketsResponse {
-    pub markets: Vec<PublicMarketConfig>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicMarketConfig {
-    pub id: String,
-    pub display_name: String,
-    pub email: String,
-    pub subdomain: String,
-    pub public_base_url: String,
-    pub market_kind: String,
-    pub status: String,
-    #[serde(default)]
-    pub maintenance_enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maintenance_message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing_summary: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MarketRegistryRecord {
-    pub id: String,
-    pub display_name: String,
-    pub email: String,
-    pub subdomain: String,
-    pub public_base_url: String,
-    pub market_kind: String,
-    pub scopes: Vec<String>,
-    pub status: String,
-    pub maintenance_enabled: bool,
-    pub maintenance_message: Option<String>,
-}
-
-impl MarketRegistryRecord {
-    pub fn has_scope(&self, scope: &str) -> bool {
-        self.status.eq_ignore_ascii_case("active") && self.scopes.iter().any(|value| value == scope)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct GatewayRegistryRecord {
     pub id: String,
@@ -1785,19 +1723,6 @@ impl GatewayRegistryRecord {
     pub fn has_scope(&self, scope: &str) -> bool {
         self.status.eq_ignore_ascii_case("active") && self.scopes.iter().any(|value| value == scope)
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterMarketRequest {
-    pub subdomain: String,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    pub public_base_url: String,
-    #[serde(default)]
-    pub market_kind: Option<String>,
-    #[serde(default)]
-    pub pricing_summary: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1824,71 +1749,28 @@ pub struct RegisterGatewayResponse {
     pub last_seen_at: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketNotificationEmailRequest {
-    pub kind: String,
-    pub to: String,
-    #[serde(default)]
-    pub locale: Option<String>,
-    #[serde(default)]
-    pub data: serde_json::Value,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MarketNotificationEmailResponse {
-    pub ok: bool,
-    pub message_id: String,
-    pub kind: String,
-    pub to: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketNotificationEmailLogView {
-    pub id: String,
-    pub market_email: String,
-    pub kind: String,
-    pub to_email: String,
-    pub locale: String,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_message_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketShareAppView {
+pub struct GatewayShareAppView {
     pub app: String,
     pub supported: bool,
     pub visible: bool,
-    pub for_sale: String,
-    pub market_access_mode: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MarketShareView {
+pub struct GatewayShareView {
     pub router_id: String,
     pub share_id: String,
     pub capacity_pool_id: String,
     pub subdomain: String,
     pub installation_id: String,
     pub share_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installation_owner_email: Option<String>,
+    /// Internal grouping key for owner-scoped scheduling feedback. Gateway
+    /// inventory must not expose Share or installation owner identities.
+    #[serde(skip)]
+    pub(crate) scheduling_owner_email: Option<String>,
     pub app_type: String,
-    pub for_sale: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
     pub share_status: String,
     pub online: bool,
     pub route_state: String,
@@ -1904,14 +1786,14 @@ pub struct MarketShareView {
     pub observed_minutes_24h: usize,
     pub observation_coverage_24h: f64,
     pub last_seen_at: String,
-    /// RFC3339 timestamp from `shares.created_at`. Used by markets as a
-    /// freshness/seniority input for diversification profiles.
+    /// RFC3339 timestamp from `shares.created_at`. Used by capacity consumers
+    /// as a freshness/seniority input for diversification profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share_created_at: Option<String>,
     #[serde(default)]
-    pub disabled_by_market: bool,
+    pub disabled_by_gateway: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub market_disabled_at: Option<String>,
+    pub gateway_disabled_at: Option<String>,
     #[serde(default)]
     pub support: ShareSupport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1921,20 +1803,78 @@ pub struct MarketShareView {
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
     #[serde(default)]
-    pub app_availability: MarketAppAvailability,
+    pub app_availability: CapacityAppAvailability,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub market_apps: BTreeMap<String, MarketShareAppView>,
+    #[serde(rename = "capacityApps")]
+    pub capacity_apps: BTreeMap<String, GatewayShareAppView>,
     #[serde(default)]
-    pub market_states: Vec<MarketShareRuntimeStateView>,
-    /// Router-computed scheduling signals. Markets sort using these directly
+    #[serde(rename = "capacityStates")]
+    pub capacity_states: Vec<GatewayShareRuntimeStateView>,
+    /// Router-computed scheduling signals. Capacity gateways sort using these directly
     /// (no recomputation) and then layer their profile preferences on top.
     #[serde(default)]
     pub signals: ShareSignals,
 }
 
-/// Router-computed scheduling signals shipped to markets in every
-/// `/v1/market/shares` response. All values are normalized so a higher number
-/// is preferred. `samples_10m` is included so the market can decide whether
+#[cfg(test)]
+mod gateway_share_view_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_share_wire_omits_internal_owner_identity() {
+        let view = GatewayShareView {
+            router_id: "router.example".into(),
+            share_id: "share-1".into(),
+            capacity_pool_id: "pool-1".into(),
+            subdomain: "share-one".into(),
+            installation_id: "installation-1".into(),
+            share_name: "share-opaque-1".into(),
+            scheduling_owner_email: Some("owner@example.com".into()),
+            app_type: "codex".into(),
+            share_status: "active".into(),
+            online: true,
+            route_state: "active".into(),
+            route_state_since: None,
+            active_requests: 0,
+            token_limit: -1,
+            tokens_used: 0,
+            requests_count: 0,
+            parallel_limit: -1,
+            expires_at: "2099-12-31T23:59:59Z".into(),
+            online_rate_24h: 1.0,
+            observed_minutes_24h: 1,
+            observation_coverage_24h: 1.0,
+            last_seen_at: "2026-08-18T00:00:00Z".into(),
+            share_created_at: None,
+            disabled_by_gateway: false,
+            gateway_disabled_at: None,
+            support: ShareSupport::default(),
+            upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
+            model_health: ShareModelHealthSummary::default(),
+            app_availability: CapacityAppAvailability::default(),
+            capacity_apps: BTreeMap::new(),
+            capacity_states: Vec::new(),
+            signals: ShareSignals::neutral(),
+        };
+
+        let json = serde_json::to_value(&view).expect("serialize Gateway Share view");
+        assert_eq!(
+            view.scheduling_owner_email.as_deref(),
+            Some("owner@example.com")
+        );
+        assert!(json.get("ownerEmail").is_none());
+        assert!(json.get("installationOwnerEmail").is_none());
+        assert_eq!(
+            json.get("shareId").and_then(|value| value.as_str()),
+            Some("share-1")
+        );
+    }
+}
+
+/// Router-computed scheduling signals shipped to capacity gateways in every
+/// `/v1/gateway/shares` response. All values are normalized so a higher number
+/// is preferred. `samples_10m` is included so the consumer can decide whether
 /// to trust the short-window stability signal (e.g. for diversification).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1968,37 +1908,6 @@ impl ShareSignals {
             owner_penalty: 1.0,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketDisabledSharesUpdateRequest {
-    #[serde(default)]
-    pub disabled_share_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketDisabledSharesUpdateResponse {
-    pub ok: bool,
-    pub disabled_share_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketMaintenanceUpdateRequest {
-    pub maintenance_enabled: bool,
-    #[serde(default)]
-    pub maintenance_message: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketMaintenanceUpdateResponse {
-    pub ok: bool,
-    pub maintenance_enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maintenance_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2178,8 +2087,6 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale_official_price_percent: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_level: Option<String>,
@@ -2216,7 +2123,6 @@ impl Default for ShareUpstreamProvider {
             app: String::new(),
             provider_name: None,
             provider_type: None,
-            for_sale_official_price_percent: None,
             account_email: None,
             subscription_level: None,
             subscription_expires_at: None,
@@ -2255,8 +2161,6 @@ pub struct ShareAppProvider {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub codex_image_generation_enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale_official_price_percent: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2300,7 +2204,6 @@ impl Default for ShareAppProvider {
             is_current: false,
             enabled: false,
             codex_image_generation_enabled: false,
-            for_sale_official_price_percent: None,
             account_email: None,
             subscription_level: None,
             subscription_expires_at: None,
@@ -2401,27 +2304,18 @@ pub struct ShareRuntimeSnapshotResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareDescriptor {
+    pub contract_version: u16,
     pub share_id: String,
     pub capacity_pool_id: String,
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub access_by_app: BTreeMap<String, ShareAppAccess>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub app_settings: BTreeMap<String, ShareAppSettings>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default = "default_share_for_sale")]
-    pub for_sale: String,
+    #[serde(default)]
+    pub free_access: bool,
     pub subdomain: String,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2481,45 +2375,6 @@ fn is_zero_revision(value: &u64) -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ShareAppAccess {
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ShareAppSettings {
-    #[serde(default = "default_share_for_sale")]
-    pub for_sale: String,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
-    #[serde(default)]
-    pub token_limit: i64,
-    #[serde(default = "default_share_parallel_limit")]
-    pub parallel_limit: i64,
-    #[serde(default)]
-    pub expires_at: String,
-}
-
-impl Default for ShareAppSettings {
-    fn default() -> Self {
-        Self {
-            for_sale: default_share_for_sale(),
-            market_access_mode: default_market_access_mode(),
-            shared_with_emails: Vec::new(),
-            token_limit: -1,
-            parallel_limit: default_share_parallel_limit(),
-            expires_at: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2622,8 +2477,6 @@ pub struct DashboardResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<ShareView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub markets: Vec<DashboardMarketView>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ticker_shares: Vec<DashboardTickerShare>,
     /// Active-client count keyed by ISO 3166-1 alpha-3. Drives the SVG country heatmap
     /// directly (the bundled `world-map.svg` uses alpha-3 as its CSS class names).
@@ -2641,8 +2494,6 @@ pub struct DashboardResponse {
     /// `request_id` and animates a one-shot burst arc per new event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_request_events: Vec<crate::recent_traffic::RecentRequestEvent>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub market_request_logs: Vec<DashboardMarketRequestLogView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3024,93 +2875,9 @@ pub struct DashboardClientTunnelView {
     pub route_state_since: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DashboardMarketView {
-    pub id: String,
-    pub display_name: String,
-    pub email: String,
-    pub subdomain: String,
-    pub public_base_url: String,
-    pub market_kind: String,
-    pub status: String,
-    pub online: bool,
-    pub route_state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_state_since: Option<String>,
-    #[serde(default)]
-    pub can_manage: bool,
-    #[serde(default)]
-    pub maintenance_enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maintenance_message: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    pub last_seen_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offline_since: Option<String>,
-    pub share_count: usize,
-    pub online_share_count: usize,
-    pub active_requests: usize,
-    pub parallel_capacity: i64,
-    /// Rolled-up "any linked share was healthy this minute" probe count over
-    /// the last 24h, capped at 1440. Drives the ONLINE % and tooltip.
-    pub online_minutes_24h: usize,
-    pub online_rate_24h: f64,
-    pub observed_minutes_24h: usize,
-    pub observation_coverage_24h: f64,
-    pub usage_tokens: u64,
-    pub usage_amount_usd: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing_summary: Option<serde_json::Value>,
-    /// Recent health probe trail aggregated from linked shares for the
-    /// dashboard's STATUS dots. Each minute is healthy when any enabled linked
-    /// share was healthy in that minute.
-    #[serde(default)]
-    pub health_checks: Vec<HealthCheckEntry>,
-    #[serde(default)]
-    pub health_timeline: Vec<HealthTimelineBucket>,
-    #[serde(default)]
-    pub linked_shares: Vec<MarketLinkedShareView>,
-    #[serde(default)]
-    pub recent_requests: Vec<DashboardMarketRequestLogView>,
-    pub operational_summary: OperationalSummary,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketLinkedShareView {
-    pub share_id: String,
-    pub share_name: String,
-    pub subdomain: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_email: Option<String>,
-    pub app_type: String,
-    pub online: bool,
-    pub route_state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_state_since: Option<String>,
-    pub active_requests: usize,
-    pub parallel_limit: i64,
-    pub online_rate_24h: f64,
-    pub observed_minutes_24h: usize,
-    pub observation_coverage_24h: f64,
-    #[serde(default)]
-    pub disabled_by_market: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub market_disabled_at: Option<String>,
-    pub support: ShareSupport,
-    #[serde(default)]
-    pub app_runtimes: ShareAppRuntimes,
-    #[serde(default)]
-    pub app_availability: MarketAppAvailability,
-    #[serde(default)]
-    pub market_states: Vec<MarketShareRuntimeStateView>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MarketShareRuntimeStateView {
+pub struct GatewayShareRuntimeStateView {
     pub share_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_id: Option<String>,
@@ -3131,82 +2898,22 @@ pub struct MarketShareRuntimeStateView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     pub updated_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketShareRuntimeStateSyncRequest {
-    #[serde(default)]
-    pub replace: bool,
-    #[serde(default)]
-    pub states: Vec<MarketShareRuntimeStateInput>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketShareRuntimeStateInput {
-    pub share_id: String,
-    #[serde(default)]
-    pub router_id: Option<String>,
-    pub scope: String,
-    pub kind: String,
-    #[serde(default)]
-    pub app_type: Option<String>,
-    #[serde(default)]
-    pub model_id: Option<String>,
-    #[serde(default)]
-    pub model_name: Option<String>,
-    #[serde(default)]
-    pub reason_kind: Option<String>,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub failure_count: Option<i64>,
-    #[serde(default)]
-    pub expires_at: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketShareRuntimeStateSyncResponse {
-    pub ok: bool,
-    pub synced: usize,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketShareRuntimeStateReleaseRequest {
-    pub router_id: String,
-    pub share_id: String,
-    pub kind: String,
-    #[serde(default)]
-    pub app_type: Option<String>,
-    #[serde(default)]
-    pub model_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketShareRuntimeStateReleaseResponse {
-    pub ok: bool,
-    pub released: usize,
-    pub synced: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MarketAppAvailability {
+pub struct CapacityAppAvailability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude: Option<MarketAppAvailabilityEntry>,
+    pub claude: Option<CapacityAppAvailabilityEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex: Option<MarketAppAvailabilityEntry>,
+    pub codex: Option<CapacityAppAvailabilityEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gemini: Option<MarketAppAvailabilityEntry>,
+    pub gemini: Option<CapacityAppAvailabilityEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MarketAppAvailabilityEntry {
+pub struct CapacityAppAvailabilityEntry {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -3222,22 +2929,6 @@ pub struct MarketAppAvailabilityEntry {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MarketLinkView {
-    pub id: String,
-    pub display_name: String,
-    pub email: String,
-    pub subdomain: String,
-    pub public_base_url: String,
-    pub market_kind: String,
-    pub status: String,
-    pub online: bool,
-    pub route_state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_state_since: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ShareView {
     pub router_id: String,
     pub share_id: String,
@@ -3245,23 +2936,9 @@ pub struct ShareView {
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub access_by_app: BTreeMap<String, ShareAppAccess>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub app_settings: BTreeMap<String, ShareAppSettings>,
-    #[serde(default)]
-    pub market_links: Vec<MarketLinkView>,
-    #[serde(default)]
-    pub unknown_market_emails: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub for_sale: String,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
+    pub free_access: bool,
     pub subdomain: String,
     pub can_view_secret: bool,
     pub can_manage: bool,

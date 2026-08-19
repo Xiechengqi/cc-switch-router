@@ -1,5 +1,5 @@
 import { parseJson } from "@/lib/api";
-import type { MarketsResponse, ShareApiAuthResponse, ShareApiContextResponse, ShareApiShareResponse, ShareSettingsPatch, ShareEditView } from "@/lib/types";
+import type { ShareApiAuthResponse, ShareApiContextResponse, ShareApiShareResponse, ShareSettingsPatch, ShareEditView } from "@/lib/types";
 
 const TOKEN_KEY = "cc_switch_share_api_token_v1";
 const EMAIL_KEY = "cc_switch_share_api_email_v1";
@@ -83,8 +83,4 @@ export async function updateSharePageSettings(patch: ShareSettingsPatch) {
       body: JSON.stringify({ patch }),
     }),
   );
-}
-
-export async function getPublicMarkets() {
-  return parseJson<MarketsResponse>(await fetch("/v1/markets", { cache: "no-store" }));
 }

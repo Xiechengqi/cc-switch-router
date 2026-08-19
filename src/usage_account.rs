@@ -158,7 +158,7 @@ fn normalize_usage_email(value: &str) -> Result<String, AppError> {
     Ok(email)
 }
 
-fn market_input_tokens_expr(alias: &str) -> String {
+fn observation_input_tokens_expr(alias: &str) -> String {
     let prefix = if alias.is_empty() {
         String::new()
     } else {
@@ -177,13 +177,13 @@ fn market_input_tokens_expr(alias: &str) -> String {
     )
 }
 
-fn market_total_tokens_expr(alias: &str) -> String {
+fn observation_total_tokens_expr(alias: &str) -> String {
     let prefix = if alias.is_empty() {
         String::new()
     } else {
         format!("{alias}.")
     };
-    let input_expr = market_input_tokens_expr(alias);
+    let input_expr = observation_input_tokens_expr(alias);
     format!(
         "({input_expr}
           + COALESCE({prefix}output_tokens, 0)
@@ -203,7 +203,7 @@ fn share_model_expr(alias: &str) -> String {
     )
 }
 
-fn market_model_expr(alias: &str) -> String {
+fn observation_model_expr(alias: &str) -> String {
     let prefix = if alias.is_empty() {
         String::new()
     } else {
@@ -418,7 +418,7 @@ fn query_consumer_events(
 ) -> Result<Vec<UsageEvent>, AppError> {
     let start_ts = window.start_at.timestamp();
     let start_rfc3339 = window.start_at.to_rfc3339();
-    let market_bucket_expr = if window.bucket_granularity == "hour" {
+    let observation_bucket_expr = if window.bucket_granularity == "hour" {
         "strftime('%Y-%m-%dT%H:00:00Z', ml.created_at)"
     } else {
         "date(ml.created_at)"
@@ -428,12 +428,12 @@ fn query_consumer_events(
     } else {
         "date(sl.created_at, 'unixepoch')"
     };
-    let market_input = market_input_tokens_expr("ml");
-    let market_total = market_total_tokens_expr("ml");
-    let market_model = market_model_expr("ml");
+    let observation_input = observation_input_tokens_expr("ml");
+    let observation_total = observation_total_tokens_expr("ml");
+    let observation_model = observation_model_expr("ml");
     let share_model = share_model_expr("sl");
 
-    let (market_email_filter, share_email_filter, start_placeholder) = if email.is_some() {
+    let (observation_email_filter, share_email_filter, start_placeholder) = if email.is_some() {
         (
             "AND lower(trim(ml.user_email)) = lower(trim(?1))",
             "AND lower(trim(sl.user_email)) = lower(trim(?1))",
@@ -447,23 +447,23 @@ fn query_consumer_events(
         )
     };
 
-    let market_sql = format!(
+    let observation_sql = format!(
         "SELECT COALESCE(ml.share_id, ''),
                 COALESCE(NULLIF(trim(s.share_name), ''), COALESCE(ml.share_subdomain, ''), ''),
-                {market_model} AS usage_model,
-                {market_bucket_expr} AS usage_bucket,
-                COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN {market_input} ELSE COALESCE(sl.input_tokens, 0) END), 0),
-                COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
-                COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
-                COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
-         FROM market_request_logs ml
+                {observation_model} AS usage_model,
+                {observation_bucket_expr} AS usage_bucket,
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN {observation_input} ELSE COALESCE(sl.input_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
+         FROM capacity_request_observations ml
          LEFT JOIN shares s ON s.share_id = ml.share_id
          LEFT JOIN share_request_logs sl
            ON sl.request_id = ml.request_id
           AND sl.share_id = ml.share_id
           AND sl.is_health_check = 0
          WHERE ml.created_at >= {start_placeholder}
-           {market_email_filter}
+           {observation_email_filter}
          GROUP BY COALESCE(ml.share_id, ''), usage_model, usage_bucket,
                   COALESCE(NULLIF(trim(s.share_name), ''), COALESCE(ml.share_subdomain, ''), '')"
     );
@@ -483,11 +483,9 @@ fn query_consumer_events(
            {share_email_filter}
            AND NOT EXISTS (
                 SELECT 1
-                FROM market_request_logs ml
+                FROM capacity_request_observations ml
                 WHERE ml.request_id = sl.request_id
                   AND COALESCE(ml.share_id, '') = sl.share_id
-                  AND ml.user_email IS NOT NULL
-                  AND trim(ml.user_email) != ''
            )
          GROUP BY COALESCE(sl.share_id, ''), usage_model, usage_bucket,
                   COALESCE(NULLIF(trim(sl.share_name), ''), '')"
@@ -496,19 +494,19 @@ fn query_consumer_events(
     let mut events = Vec::new();
 
     {
-        let mut stmt = conn.prepare(&market_sql).map_err(|e| {
-            AppError::Internal(format!("prepare consumer market usage failed: {e}"))
+        let mut stmt = conn.prepare(&observation_sql).map_err(|e| {
+            AppError::Internal(format!("prepare consumer observation usage failed: {e}"))
         })?;
         let mapped = if let Some(email) = email {
             stmt.query_map(params![email, start_rfc3339], map_usage_event_row)
         } else {
             stmt.query_map(params![start_rfc3339], map_usage_event_row)
         }
-        .map_err(|e| AppError::Internal(format!("query consumer market usage failed: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("query consumer observation usage failed: {e}")))?;
         for row in mapped {
-            events.push(
-                row.map_err(|e| AppError::Internal(format!("read market usage row failed: {e}")))?,
-            );
+            events.push(row.map_err(|e| {
+                AppError::Internal(format!("read observation usage row failed: {e}"))
+            })?);
         }
     }
 
@@ -658,26 +656,26 @@ impl AppStore {
         let start_rfc3339 = window.start_at.to_rfc3339();
         let conn = self.conn.lock().await;
 
-        let market_input = market_input_tokens_expr("ml");
-        let market_total = market_total_tokens_expr("ml");
-        let market_model = market_model_expr("ml");
+        let observation_input = observation_input_tokens_expr("ml");
+        let observation_total = observation_total_tokens_expr("ml");
+        let observation_model = observation_model_expr("ml");
         let share_model = share_model_expr("sl");
 
         // (installation_id, share_id, share_name, model, caller_email, tokens...)
         type ProvRow = (String, String, String, String, String, u64, u64, u64, u64);
         let mut rows: Vec<ProvRow> = Vec::new();
 
-        let market_sql = format!(
+        let observation_sql = format!(
             "SELECT COALESCE(s.installation_id, ''),
                     COALESCE(ml.share_id, ''),
                     COALESCE(NULLIF(trim(s.share_name), ''), COALESCE(ml.share_subdomain, ''), ''),
-                    {market_model} AS usage_model,
+                    {observation_model} AS usage_model,
                     COALESCE(lower(trim(ml.user_email)), ''),
-                    COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN {market_input} ELSE COALESCE(sl.input_tokens, 0) END), 0),
-                    COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
-                    COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
-                    COALESCE(SUM(CASE WHEN ({market_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
-             FROM market_request_logs ml
+                    COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN {observation_input} ELSE COALESCE(sl.input_tokens, 0) END), 0),
+                    COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
+                    COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
+                    COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
+             FROM capacity_request_observations ml
              INNER JOIN shares s
                ON s.share_id = ml.share_id
               AND lower(trim(s.owner_email)) = lower(trim(?1))
@@ -691,8 +689,8 @@ impl AppStore {
                       COALESCE(NULLIF(trim(s.share_name), ''), COALESCE(ml.share_subdomain, ''), '')"
         );
         {
-            let mut stmt = conn.prepare(&market_sql).map_err(|e| {
-                AppError::Internal(format!("prepare provider market usage failed: {e}"))
+            let mut stmt = conn.prepare(&observation_sql).map_err(|e| {
+                AppError::Internal(format!("prepare provider observation usage failed: {e}"))
             })?;
             let mapped = stmt
                 .query_map(params![email, start_rfc3339], |row| {
@@ -709,11 +707,11 @@ impl AppStore {
                     ))
                 })
                 .map_err(|e| {
-                    AppError::Internal(format!("query provider market usage failed: {e}"))
+                    AppError::Internal(format!("query provider observation usage failed: {e}"))
                 })?;
             for row in mapped {
                 rows.push(row.map_err(|e| {
-                    AppError::Internal(format!("read provider market row failed: {e}"))
+                    AppError::Internal(format!("read provider observation row failed: {e}"))
                 })?);
             }
         }
@@ -736,7 +734,7 @@ impl AppStore {
                AND sl.is_health_check = 0
                AND NOT EXISTS (
                     SELECT 1
-                    FROM market_request_logs ml
+                    FROM capacity_request_observations ml
                     WHERE ml.request_id = sl.request_id
                       AND COALESCE(ml.share_id, '') = sl.share_id
                )
@@ -1142,9 +1140,9 @@ mod tests {
             conn.execute(
                 "INSERT INTO shares (
                     share_id, capacity_pool_id, installation_id, share_name,
-                    shared_with_emails_json, for_sale, app_type, token_limit,
+                    app_type, token_limit,
                     tokens_used, requests_count, share_status, created_at, expires_at, updated_at
-                 ) VALUES (?1, ?1, ?2, ?1, '[]', 'No', 'proxy', 1000, 0, 0,
+                 ) VALUES (?1, ?1, ?2, ?1, 'proxy', 1000, 0, 0,
                            'active', ?3, ?4, ?3)",
                 params![
                     format!("share-{installation_id}"),

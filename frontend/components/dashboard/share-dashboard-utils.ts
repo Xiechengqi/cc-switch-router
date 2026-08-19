@@ -5,9 +5,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { AppLocale, MessageKey } from "@/lib/i18n";
 import type {
   DashboardClient,
-  DashboardMarket,
   HealthCheckEntry,
-  MarketRequestLog,
   ModelHealthSummary,
   ShareAppProvider,
   ShareAppRuntimes,
@@ -406,13 +404,13 @@ export function tokenCount(value?: string | number | null) {
 }
 
 export function hasObservedShareUsage(
-  log?: Partial<ShareRequestLog | MarketRequestLog>,
+  log?: Partial<ShareRequestLog>,
 ) {
   return !log?.usageState || log.usageState === "observed";
 }
 
 export function usageBucketTotalTokens(
-  log?: Partial<ShareRequestLog | MarketRequestLog>,
+  log?: Partial<ShareRequestLog>,
 ) {
   if (!hasObservedShareUsage(log)) return 0;
   return (
@@ -424,7 +422,7 @@ export function usageBucketTotalTokens(
 }
 
 export function cacheHitRate(
-  log?: Partial<ShareRequestLog | MarketRequestLog>,
+  log?: Partial<ShareRequestLog>,
 ) {
   if (!hasObservedShareUsage(log)) return 0;
   const input = tokenCount(log?.inputTokens);
@@ -438,25 +436,10 @@ export function formatPercent(value: number) {
   return `${percent.toFixed(percent >= 10 ? 0 : 1).replace(/\.0$/, "")}%`;
 }
 
-export function formatOfficialPriceMultiplier(
-  value: string | number | null | undefined,
-  label: string,
-  t: TFn,
-) {
-  if (typeof value === "string" && value.trim().toLowerCase() === "mixed") {
-    return `${t("dashboard.mixed")} x ${label}`;
-  }
-  const percent = Number(value);
-  if (!Number.isFinite(percent) || percent <= 0) return `- x ${label}`;
-  const multiplier = percent / 100;
-  const text = multiplier >= 1 ? multiplier.toFixed(2) : multiplier.toFixed(3);
-  return `${text.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")} x ${label}`;
-}
-
 export function requestModelRoute(
-  log?: Partial<ShareRequestLog | MarketRequestLog>,
+  log?: Partial<ShareRequestLog>,
 ) {
-  const record = (log || {}) as Partial<ShareRequestLog & MarketRequestLog>;
+  const record = (log || {}) as Partial<ShareRequestLog>;
   const agent = record.requestAgent || "";
   const requested = record.requestedModel || record.requestModel || "";
   const actual = record.actualModel || record.model || "";
@@ -509,23 +492,6 @@ export function sortClients(clients: DashboardClient[]) {
   });
 }
 
-export function sortMarkets(markets: DashboardMarket[]) {
-  // 同上：按注册时间升序，避免 online 抖动改变行序。
-  return [...markets].sort(
-    (a, b) =>
-      (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) ||
-      (a.publicBaseUrl || a.email || a.id).localeCompare(
-        b.publicBaseUrl || b.email || b.id,
-      ),
-  );
-}
-
-export function marketLabel(
-  market: Pick<DashboardMarket, "publicBaseUrl" | "email" | "subdomain">,
-) {
-  return market.publicBaseUrl || market.email || market.subdomain;
-}
-
 export type TFn = ReturnType<typeof useLocaleText>["t"];
 export const drawerDialogClassName =
   "router-drawer-light light !w-[min(760px,calc(100vw-16px))] !max-w-[calc(100vw-16px)] !bg-white !text-slate-900 " +
@@ -560,22 +526,6 @@ export function HealthDots({ entries = [] }: { entries?: HealthCheckEntry[] }) {
       }),
     ),
   );
-}
-
-export function upstreamPercent(
-  apps?: ShareAppRuntimes,
-  key?: keyof ShareAppRuntimes,
-) {
-  const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
-  return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : "-";
-}
-
-export function configuredUpstreamPercent(
-  apps?: ShareAppRuntimes,
-  key?: keyof ShareAppRuntimes,
-) {
-  const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
-  return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : null;
 }
 
 export function isOfficialMarker(value?: string) {
@@ -1013,7 +963,6 @@ export function shareAppProviderRuntime(
     app: provider.app,
     providerType: provider.providerType,
     accountEmail: provider.accountEmail,
-    forSaleOfficialPricePercent: provider.forSaleOfficialPricePercent,
     apiUrl: provider.apiUrl,
     quota: provider.quota,
     models: provider.models,
@@ -1380,32 +1329,10 @@ export function modelHealthTitle(
 
 export type CoreShareApp = "claude" | "codex" | "gemini";
 
-export function shareAppSettings(share: ShareView, app: CoreShareApp) {
-  const access = share.accessByApp?.[app];
-  return {
-    forSale: share.appSettings?.[app]?.forSale ?? share.forSale,
-    marketAccessMode:
-      share.appSettings?.[app]?.marketAccessMode ??
-      access?.marketAccessMode ??
-      share.marketAccessMode,
-    sharedWithEmails:
-      share.appSettings?.[app]?.sharedWithEmails ??
-      access?.sharedWithEmails ??
-      share.sharedWithEmails ??
-      [],
-    tokenLimit: share.appSettings?.[app]?.tokenLimit ?? share.tokenLimit,
-    parallelLimit:
-      share.appSettings?.[app]?.parallelLimit ?? share.parallelLimit,
-    expiresAt: share.appSettings?.[app]?.expiresAt || share.expiresAt,
-  };
-}
-
 export function shareAppExists(share: ShareView, app: CoreShareApp) {
   return Boolean(
     share.bindings?.[app] ||
     share.support?.[app] ||
-    share.appSettings?.[app] ||
-    share.accessByApp?.[app] ||
     share.appRuntimes?.[app] ||
     share.modelHealth?.[app]?.length ||
     share.appType === app,

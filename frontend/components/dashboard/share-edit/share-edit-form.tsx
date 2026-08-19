@@ -11,19 +11,17 @@ import {
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
 import { resolveShareCoreApp, shareProviderSupportedApps } from "@/lib/share-app";
-import type { DashboardMarket, ShareAccessByApp, ShareView } from "@/lib/types";
+import type { ShareView } from "@/lib/types";
 import { updateShareSettings } from "@/lib/api";
 import {
-  applyRecommendedMarketDefaults,
   buildShareEditDraft,
   buildShareEditPatch,
-  normalizedUniqueEmails,
   shareEditPatchFingerprint,
   type PriceApp,
   type ShareEditDraft,
 } from "./share-edit-draft";
 import { ShareEditMarketFields, ShareEditSaleAccessFields } from "./share-edit-market-fields";
-import { EmailTagsField, FieldGroup } from "./share-edit-shared";
+import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
 
@@ -34,45 +32,31 @@ export type ShareEditFormApi = {
   busy: boolean;
   error: string;
   notice: string;
-  confirmFreeOpen: boolean;
-  transferTargetEmail: string;
   descriptionLength: number;
   descriptionInvalid: boolean;
   tokenInvalid: boolean;
   parallelInvalid: boolean;
   expiryInvalid: boolean;
-  pricingInvalid: boolean;
   appApiInvalid: boolean;
   formInvalid: boolean;
   isDirty: boolean;
-  marketSelectKey: number;
-  tokenMarkets: DashboardMarket[];
-  transferableShareEmails: string[];
   setError: (value: string) => void;
   setNotice: (value: string) => void;
-  setConfirmFreeOpen: (value: boolean) => void;
-  setTransferTargetEmail: (value: string) => void;
-  handleForSaleChange: (next: "Yes" | "No" | "Free") => void;
   onDescriptionChange: (value: string) => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
-  onMarketPicked: (raw: string) => void;
   handleTokenUnlimited: (checked: boolean) => void;
   handleParallelUnlimited: (checked: boolean) => void;
   resetDraft: () => void;
   save: () => Promise<void>;
-  transferOwner: () => Promise<void>;
-  confirmFree: () => void;
 };
 
 export function useShareEditForm({
   share,
-  markets,
   t,
   onSaved,
   onClose,
 }: {
   share: ShareView | null;
-  markets: DashboardMarket[];
   t: TFn;
   onSaved: (result: { appliedSynchronously: boolean }) => Promise<void>;
   onClose: () => void;
@@ -83,22 +67,11 @@ export function useShareEditForm({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [notice, setNotice] = React.useState("");
-  const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
-  const [transferTargetEmail, setTransferTargetEmail] = React.useState("");
-  const [marketSelectKey, setMarketSelectKey] = React.useState(0);
 
   const editShare = baseShare || share;
   const activeShareApps = React.useMemo(() => shareProviderSupportedApps(editShare), [editShare]);
   const shareApp = activeShareApps[0] ?? resolveShareCoreApp(editShare);
-  const tokenMarkets = markets;
-  const publicMarketEmails = React.useMemo(
-    () => new Set(markets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
-    [markets],
-  );
-  const applyDraft = React.useCallback((next: ShareEditDraft, recommend = false) => {
-    setDraft(recommend ? applyRecommendedMarketDefaults(next, tokenMarkets) : next);
-    setMarketSelectKey((current) => current + 1);
-  }, [tokenMarkets]);
+  const applyDraft = React.useCallback((next: ShareEditDraft) => setDraft(next), []);
 
   React.useEffect(() => {
     if (!share) {
@@ -108,72 +81,27 @@ export function useShareEditForm({
       return;
     }
     if (baseShare?.shareId === share.shareId) return;
-    const initial = buildShareEditDraft(share, publicMarketEmails);
+    const initial = buildShareEditDraft(share);
     setBaseShare(share);
     setBaseDraft(initial);
     applyDraft(initial);
     setError("");
     setNotice("");
-    setConfirmFreeOpen(false);
-    setTransferTargetEmail("");
-  }, [applyDraft, baseShare?.shareId, publicMarketEmails, share]);
-
-  React.useEffect(() => {
-    if (!share || !draft || !baseDraft || baseShare?.shareId !== share.shareId) return;
-    if (JSON.stringify(draft) !== JSON.stringify(baseDraft)) return;
-    if (!tokenMarkets.length) return;
-    const recommended = applyRecommendedMarketDefaults(draft, tokenMarkets);
-    if (JSON.stringify(recommended) === JSON.stringify(draft)) return;
-    setDraft(recommended);
-  }, [baseDraft, baseShare?.shareId, draft, share, tokenMarkets]);
+  }, [applyDraft, baseShare?.shareId, share]);
 
   const onDraftChange = React.useCallback(
     (updater: (current: ShareEditDraft) => ShareEditDraft) => {
       setDraft((current) => {
         if (!current) return current;
-        return applyRecommendedMarketDefaults(updater(current), tokenMarkets);
+        return updater(current);
       });
     },
-    [tokenMarkets],
+    [],
   );
 
   const onDescriptionChange = React.useCallback((value: string) => {
     setDraft((current) => (current ? { ...current, description: value } : current));
   }, []);
-
-  const handleForSaleChange = React.useCallback(
-    (next: "Yes" | "No" | "Free") => {
-      if (!draft) return;
-      if (next === "Free" && draft.forSale !== "Free") {
-        setConfirmFreeOpen(true);
-        return;
-      }
-      onDraftChange((current) => {
-        const updated = {
-          ...current,
-          forSale: next,
-          priceInputs:
-            next === "Yes"
-              ? current.priceInputs
-              : { claude: "", codex: "", gemini: "" },
-        };
-        if (next === "Yes") {
-          return applyRecommendedMarketDefaults(updated, tokenMarkets);
-        }
-        return updated;
-      });
-    },
-    [draft, onDraftChange, tokenMarkets],
-  );
-
-  const confirmFree = React.useCallback(() => {
-    onDraftChange((current) => ({
-      ...current,
-      forSale: "Free",
-      priceInputs: { claude: "", codex: "", gemini: "" },
-    }));
-    setConfirmFreeOpen(false);
-  }, [onDraftChange]);
 
   const handleTokenUnlimited = React.useCallback((checked: boolean) => {
     onDraftChange((current) => {
@@ -217,38 +145,6 @@ export function useShareEditForm({
     });
   }, [onDraftChange]);
 
-  const onMarketPicked = React.useCallback(
-    (raw: string) => {
-      if (!raw || !draft) return;
-      if (raw === "__all__") {
-        onDraftChange((current) => ({
-          ...current,
-          marketAccessMode: "all",
-          selectedMarketEmails: [],
-        }));
-        setMarketSelectKey((current) => current + 1);
-        return;
-      }
-      const normalized = raw.toLowerCase();
-      onDraftChange((current) => ({
-        ...current,
-        marketAccessMode: "selected",
-        selectedMarketEmails: Array.from(new Set([...current.selectedMarketEmails, normalized])).sort(),
-      }));
-      setMarketSelectKey((current) => current + 1);
-    },
-    [draft, onDraftChange],
-  );
-
-  const transferableShareEmails = React.useMemo(() => {
-    if (!draft) return [];
-    return normalizedUniqueEmails(
-      Object.values(draft.shareToEmailsByApp)
-        .flat()
-        .filter((email) => !publicMarketEmails.has(email)),
-    );
-  }, [draft, publicMarketEmails]);
-
   if (!share || !draft || !baseDraft) return null;
 
   const descriptionLength = draft.description.trim().length;
@@ -259,24 +155,15 @@ export function useShareEditForm({
   const parallelInvalid =
     !draft.parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed <= 0);
   const expiryInvalid = !draft.expiresPermanent && !draft.expiresAtInput.trim();
-  const pricingInvalid =
-    draft.forSale === "Yes" &&
-    activeShareApps.some((app) => {
-      const raw = draft.priceInputs[app];
-      if (!raw) return false;
-      return !/^(?:[1-9]|[1-9][0-9]|100)$/.test(raw);
-    });
   const appApiInvalid = !activeShareApps.some((app) => draft.enabledApps[app]);
   const formInvalid =
     descriptionInvalid ||
     tokenInvalid ||
     parallelInvalid ||
-    expiryInvalid ||
-    pricingInvalid ||
-    appApiInvalid;
+    expiryInvalid || appApiInvalid;
 
-  const currentPatch = buildShareEditPatch(draft, editShare!, activeShareApps, publicMarketEmails);
-  const basePatch = buildShareEditPatch(baseDraft, editShare!, activeShareApps, publicMarketEmails);
+  const currentPatch = buildShareEditPatch(draft, editShare!, activeShareApps);
+  const basePatch = buildShareEditPatch(baseDraft, editShare!, activeShareApps);
   const isDirty = shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
 
   const resetDraft = () => {
@@ -284,8 +171,6 @@ export function useShareEditForm({
     applyDraft(baseDraft);
     setError("");
     setNotice("");
-    setConfirmFreeOpen(false);
-    setTransferTargetEmail("");
   };
 
   const save = async () => {
@@ -314,55 +199,6 @@ export function useShareEditForm({
     }
   };
 
-  const transferOwner = async () => {
-    if (!share || busy || !transferTargetEmail) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const targetEmail = transferTargetEmail.toLowerCase();
-      const effectiveMarketAccessMode = draft.marketAccessMode;
-      const accessByApp: ShareAccessByApp = {};
-      for (const app of activeShareApps) {
-        const shareToEmails = (draft.shareToEmailsByApp[app] ?? []).filter(
-          (email) => !publicMarketEmails.has(email),
-        );
-        const saleEmails =
-          draft.forSale === "Yes" && effectiveMarketAccessMode === "selected"
-            ? draft.selectedMarketEmails
-            : [];
-        accessByApp[app] = {
-          sharedWithEmails: normalizedUniqueEmails([
-            ...shareToEmails.filter((email) => email !== targetEmail),
-            share.ownerEmail || "",
-            ...saleEmails,
-          ]),
-          marketAccessMode: effectiveMarketAccessMode,
-        };
-      }
-      const nextShared = normalizedUniqueEmails(
-        Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
-      );
-      const res = await updateShareSettings(share.shareId, {
-        ownerEmail: targetEmail,
-        sharedWithEmails: nextShared,
-        accessByApp,
-        marketAccessMode: effectiveMarketAccessMode,
-      }, share.configRevision);
-      await onSaved({ appliedSynchronously: res.appliedSynchronously });
-      setTransferTargetEmail("");
-      if (res.appliedSynchronously) {
-        onClose();
-      } else {
-        setNotice(t("dashboard.shareEditQueued"));
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return {
     draft,
     shareApp,
@@ -370,32 +206,20 @@ export function useShareEditForm({
     busy,
     error,
     notice,
-    confirmFreeOpen,
-    transferTargetEmail,
     descriptionLength,
     descriptionInvalid,
     tokenInvalid,
     parallelInvalid,
     expiryInvalid,
-    pricingInvalid,
     appApiInvalid,
     formInvalid,
     isDirty,
-    marketSelectKey,
-    tokenMarkets,
-    transferableShareEmails,
     setError,
     setNotice,
-    setConfirmFreeOpen,
-    setTransferTargetEmail,
-    handleForSaleChange,
     onDescriptionChange,
     onDraftChange,
-    onMarketPicked,
     resetDraft,
     save,
-    transferOwner,
-    confirmFree,
     handleTokenUnlimited,
     handleParallelUnlimited,
   };
@@ -446,37 +270,8 @@ export function ShareEditFormBody({
         <ShareEditSaleAccessFields
           t={t}
           draft={draft}
-          activeShareApps={activeShareApps}
-          tokenMarkets={form.tokenMarkets}
-          marketSelectKey={form.marketSelectKey}
-          pricingInvalid={form.pricingInvalid}
-          onForSaleChange={form.handleForSaleChange}
           onDraftChange={form.onDraftChange}
-          onMarketPicked={form.onMarketPicked}
         />
-
-        {!draft.userGrantsSupported ? (
-          <FieldGroup label={t("dashboard.field.sharedWith")} hint={t("dashboard.hint.sharedWith")}>
-            <EmailTagsField
-              value={draft.shareToEmailsByApp[shareApp] ?? []}
-              placeholder="friend@example.com, teammate@example.com"
-              onChange={(emails) =>
-                form.onDraftChange((current) => ({
-                  ...current,
-                  shareToEmailsByApp: Object.fromEntries(
-                    (["claude", "codex", "gemini"] as const).map((app) => [
-                      app,
-                      activeShareApps.includes(app) ? emails : current.shareToEmailsByApp[app],
-                    ]),
-                  ) as ShareEditDraft["shareToEmailsByApp"],
-                }))
-              }
-              onPromote={(email) => form.setTransferTargetEmail(email)}
-              promotableEmails={form.transferableShareEmails}
-              promoteLabel={t("dashboard.setAsOwner")}
-            />
-          </FieldGroup>
-        ) : null}
 
         <div className="grid gap-3 md:grid-cols-3">
           <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={form.tokenInvalid}>
@@ -576,17 +371,16 @@ export function ShareEditFormBody({
           </FieldGroup>
         </div>
 
-        {draft.userGrantsSupported ? (
-          <ShareUserGrantsEditor
-            draft={draft}
-            activeShareApps={activeShareApps}
-            ownerEmail={share.ownerEmail || ""}
-            defaultPolicy={defaultUserPolicy}
-            supportedPeriods={share.supportedUserTokenPeriods}
-            t={t}
-            onDraftChange={form.onDraftChange}
-          />
-        ) : null}
+        <ShareUserGrantsEditor
+          value={draft.userGrants}
+          ownerEmail={share.ownerEmail || ""}
+          defaultPolicy={defaultUserPolicy}
+          supportedPeriods={share.supportedUserTokenPeriods}
+          t={t}
+          onChange={(userGrants) =>
+            form.onDraftChange((current) => ({ ...current, userGrants }))
+          }
+        />
       </ShareEditSection>
     </>
   );

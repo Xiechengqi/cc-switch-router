@@ -3,31 +3,22 @@
 import * as React from "react";
 import { Alert, Button, Checkbox, Chip, Input, TextArea } from "@heroui/react";
 import { KeyRound, Loader2, LogOut, Save } from "lucide-react";
-import { getPublicMarkets, getShareApiAuth, getShareContext, getSharePageShare, updateSharePageSettings, readShareApiCredentials, writeShareApiCredentials, clearShareApiCredentials, ShareApiError } from "@/lib/share-api";
-import type { PublicMarket, ShareAccessByApp, ShareApiAuthResponse, ShareApiContextResponse, ShareView } from "@/lib/types";
+import { useLocaleText } from "@/components/i18n/locale-provider";
+import { ShareUserGrantsEditor } from "@/components/dashboard/share-edit/share-user-grants-editor";
+import { getShareApiAuth, getShareContext, getSharePageShare, updateSharePageSettings, readShareApiCredentials, writeShareApiCredentials, clearShareApiCredentials, ShareApiError } from "@/lib/share-api";
+import type { ShareApiAuthResponse, ShareApiContextResponse, ShareView } from "@/lib/types";
 import {
   buildShareSettingsPatch,
   draftFromShare,
   fromDateTimeLocal,
-  normalizeEmailList,
   PERMANENT_EXPIRES_AT_ISO,
-  routerShareMarketManagedEmails,
   toDateTimeLocal,
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
   validateShareSettingsDraft,
   type ShareSettingsDraft,
 } from "@/lib/share-settings";
-import { resolveShareCoreApp, shareAccessApps, shareEnabledApps, SHARE_APP_LABELS } from "@/lib/share-app";
 import { compactTokens, formatDateTime } from "@/lib/utils";
-import { CompactSelect } from "@/components/common/compact-select";
-
-const PRICE_APPS = [
-  { key: "claude" as const, label: SHARE_APP_LABELS.claude },
-  { key: "codex" as const, label: SHARE_APP_LABELS.codex },
-  { key: "gemini" as const, label: SHARE_APP_LABELS.gemini },
-];
-type ShareAppKey = (typeof PRICE_APPS)[number]["key"];
 
 function statusTone(online: boolean) {
   return online ? "success" : "default";
@@ -35,36 +26,6 @@ function statusTone(online: boolean) {
 
 function tokenLabel(value: number) {
   return value < 0 ? "∞" : compactTokens(value);
-}
-
-function accessByAppFromShare(share: ShareView): ShareAccessByApp {
-  if (share.accessByApp && Object.keys(share.accessByApp).length > 0) return share.accessByApp;
-  const result: ShareAccessByApp = {};
-  for (const app of shareAccessApps(share)) {
-    result[app] = {
-      sharedWithEmails: share.sharedWithEmails || [],
-      marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
-    };
-  }
-  return result;
-}
-
-function editableSharedTextByApp(share: ShareView): Record<ShareAppKey, string> {
-  const access = accessByAppFromShare(share);
-  const managedEmails = routerShareMarketManagedEmails(share.userGrants);
-  const editableEmails = (app: ShareAppKey) =>
-    (access[app]?.sharedWithEmails || [])
-      .filter((email) => !managedEmails.has(email.trim().toLowerCase()))
-      .join(", ");
-  return {
-    claude: editableEmails("claude"),
-    codex: editableEmails("codex"),
-    gemini: editableEmails("gemini"),
-  };
-}
-
-function marketLabel(market: PublicMarket) {
-  return market.publicBaseUrl || market.email || market.subdomain;
 }
 
 function AuthPanel({
@@ -154,19 +115,15 @@ function AuthPanel({
 
 function ShareSettingsForm({
   share,
-  markets,
   editable,
   onSaved,
 }: {
   share: ShareView;
-  markets: PublicMarket[];
   editable: boolean;
   onSaved: () => Promise<void>;
 }) {
+  const { t } = useLocaleText();
   const [draft, setDraft] = React.useState<ShareSettingsDraft>(() => draftFromShare(share));
-  const [sharedTextByApp, setSharedTextByApp] = React.useState<Record<ShareAppKey, string>>(
-    () => editableSharedTextByApp(share),
-  );
   const [expiryPermanent, setExpiryPermanent] = React.useState(() => draft.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(draft.expiresAt).getUTCFullYear() >= 2099);
   const [expiryLocal, setExpiryLocal] = React.useState(() => toDateTimeLocal(draft.expiresAt));
   const [tokenUnlimited, setTokenUnlimited] = React.useState(draft.tokenLimit === UNLIMITED_TOKEN_LIMIT);
@@ -174,38 +131,10 @@ function ShareSettingsForm({
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState("");
   const [error, setError] = React.useState("");
-  const shareApp = resolveShareCoreApp(share);
-  const accessibleApps = shareEnabledApps(share);
-  const tokenMarkets = markets;
-  const publicMarketEmails = React.useMemo(
-    () => new Set(markets.map((market) => market.email.toLowerCase()).filter(Boolean)),
-    [markets],
-  );
-  const tokenMarketEmails = React.useMemo(
-    () => new Set(tokenMarkets.map((market) => market.email.toLowerCase()).filter(Boolean)),
-    [tokenMarkets],
-  );
-  const routerManagedEmails = React.useMemo(
-    () => routerShareMarketManagedEmails(share.userGrants),
-    [share.userGrants],
-  );
-  const managedAccessByApp = React.useMemo(() => {
-    const access = accessByAppFromShare(share);
-    const result: Partial<Record<ShareAppKey, string[]>> = {};
-    for (const app of accessibleApps) {
-      result[app] = normalizeEmailList(
-        (access[app]?.sharedWithEmails || []).filter((email) =>
-          routerManagedEmails.has(email.trim().toLowerCase()),
-        ),
-      );
-    }
-    return result;
-  }, [accessibleApps, routerManagedEmails, share]);
 
   React.useEffect(() => {
     const next = draftFromShare(share);
     setDraft(next);
-    setSharedTextByApp(editableSharedTextByApp(share));
     setExpiryPermanent(next.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(next.expiresAt).getUTCFullYear() >= 2099);
     setExpiryLocal(toDateTimeLocal(next.expiresAt));
     setTokenUnlimited(next.tokenLimit === UNLIMITED_TOKEN_LIMIT);
@@ -214,53 +143,28 @@ function ShareSettingsForm({
 
   const effectiveDraft = React.useMemo<ShareSettingsDraft>(() => {
     const expiresAt = expiryPermanent ? PERMANENT_EXPIRES_AT_ISO : fromDateTimeLocal(expiryLocal);
-    const rawEmailsByApp: Record<ShareAppKey, string[]> = {
-      claude: normalizeEmailList(sharedTextByApp.claude || ""),
-      codex: normalizeEmailList(sharedTextByApp.codex || ""),
-      gemini: normalizeEmailList(sharedTextByApp.gemini || ""),
-    };
-    const selectedTokenEmails = new Set(
-      Object.values(rawEmailsByApp)
-        .flat()
-        .filter((email) => tokenMarketEmails.has(email)),
-    );
-    const effectiveMarketAccessMode = draft.marketAccessMode;
-    const accessByApp: ShareAccessByApp = {};
-    for (const app of accessibleApps) {
-      const nonMarketEmails = rawEmailsByApp[app].filter((email) => !publicMarketEmails.has(email));
-      const marketEmails =
-        draft.forSale === "Yes" && effectiveMarketAccessMode === "selected"
-          ? Array.from(selectedTokenEmails)
-          : [];
-      accessByApp[app] = {
-        sharedWithEmails: normalizeEmailList([
-          ...(managedAccessByApp[app] || []),
-          ...nonMarketEmails,
-          ...marketEmails,
-        ]),
-        marketAccessMode: effectiveMarketAccessMode,
-      };
-    }
-    const sharedWithEmails = normalizeEmailList(
-      Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
-    );
     return {
       ...draft,
-      marketAccessMode: effectiveMarketAccessMode,
-      sharedWithEmails,
-      accessByApp,
       tokenLimit: tokenUnlimited ? UNLIMITED_TOKEN_LIMIT : draft.tokenLimit,
       parallelLimit: parallelUnlimited ? UNLIMITED_PARALLEL_LIMIT : draft.parallelLimit,
       expiresAt,
-      pricing: draft.pricing,
     };
-  }, [accessibleApps, draft, expiryLocal, expiryPermanent, managedAccessByApp, parallelUnlimited, publicMarketEmails, sharedTextByApp, tokenMarketEmails, tokenUnlimited]);
-  const selectedTokenMarketEmails = new Set(
-    Object.values(effectiveDraft.accessByApp).flatMap((access) =>
-      (access?.sharedWithEmails ?? []).filter((email) => tokenMarketEmails.has(email.toLowerCase())).map((email) => email.toLowerCase()),
-    ),
-  );
+  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenUnlimited]);
   const validationErrors = validateShareSettingsDraft(effectiveDraft);
+  const defaultUserPolicy = {
+    parallelLimit:
+      effectiveDraft.parallelLimit === UNLIMITED_PARALLEL_LIMIT
+        ? undefined
+        : effectiveDraft.parallelLimit,
+    tokenLimit:
+      effectiveDraft.tokenLimit === UNLIMITED_TOKEN_LIMIT
+        ? undefined
+        : effectiveDraft.tokenLimit,
+    tokenPeriod: "lifetime" as const,
+    expiresAt: expiryPermanent
+      ? undefined
+      : new Date(effectiveDraft.expiresAt).getTime(),
+  };
 
   const save = async () => {
     if (!editable || busy || validationErrors.length) return;
@@ -268,7 +172,7 @@ function ShareSettingsForm({
     setError("");
     setNotice("");
     try {
-      const result = await updateSharePageSettings(buildShareSettingsPatch(effectiveDraft));
+      const result = await updateSharePageSettings(buildShareSettingsPatch(effectiveDraft, share));
       setNotice(result.appliedSynchronously ? "Settings applied." : "Settings queued; waiting for cc-switch-server to sync.");
       await onSaved();
     } catch (err) {
@@ -276,20 +180,6 @@ function ShareSettingsForm({
     } finally {
       setBusy(false);
     }
-  };
-
-  const setMarketEmailForAllApps = (email: string, checked: boolean) => {
-    const normalized = email.toLowerCase();
-    setSharedTextByApp((current) => {
-      const result = { ...current };
-      for (const app of accessibleApps) {
-        const appEmails = new Set(normalizeEmailList(current[app] || ""));
-        if (checked) appEmails.add(normalized);
-        else appEmails.delete(normalized);
-        result[app] = Array.from(appEmails).sort().join(", ");
-      }
-      return result;
-    });
   };
 
   return (
@@ -316,63 +206,21 @@ function ShareSettingsForm({
           <Input value={share.subdomain} disabled />
         </label>
 
-        <label className="grid gap-1 text-sm">
-          <span className="font-medium text-foreground">For sale</span>
-          <CompactSelect value={draft.forSale} disabled={!editable} onChange={(value) => setDraft((current) => ({ ...current, forSale: value as "Yes" | "No" | "Free" }))} options={[{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }, { value: "Free", label: "Free" }]} ariaLabel="For sale" triggerClassName="min-h-10 text-sm" />
-        </label>
-
-        <label className="grid gap-1 text-sm">
-          <span className="font-medium text-foreground">Market access</span>
-          <CompactSelect value={draft.marketAccessMode} disabled={!editable || draft.forSale !== "Yes"} onChange={(value) => setDraft((current) => ({ ...current, marketAccessMode: value as "selected" | "all" }))} options={[{ value: "selected", label: "Selected markets" }, { value: "all", label: "All markets" }]} ariaLabel="Market access" triggerClassName="min-h-10 text-sm" />
-        </label>
-      </div>
-
-      {draft.forSale === "Yes" && draft.marketAccessMode === "selected" ? (
-        <div className="grid gap-2">
-          <div className="text-sm font-medium text-foreground">Authorized Token Markets</div>
-          <div className="flex flex-wrap gap-2">
-            {tokenMarkets.map((market) => {
-              const checked = selectedTokenMarketEmails.has(market.email.toLowerCase());
-              return (
-                <label key={market.id} className="inline-flex items-center gap-2 rounded-full border border-border px-3 py-1.5 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    disabled={!editable}
-                    onChange={(event) => setMarketEmailForAllApps(market.email, event.target.checked)}
-                  />
-                  {marketLabel(market)}
-                </label>
-              );
-            })}
-          </div>
+        <div className="grid gap-2 rounded-lg border border-border px-3 py-2 text-sm lg:col-span-2">
+          <Checkbox
+            isSelected={draft.freeAccess}
+            isDisabled={!editable}
+            onChange={(freeAccess: boolean) =>
+              setDraft((current) => ({ ...current, freeAccess }))
+            }
+          >
+            <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+            <Checkbox.Content>Public free access</Checkbox.Content>
+          </Checkbox>
+          <p className="text-xs text-muted-foreground">
+            Disabled is private. When enabled, any signed-in Router user may invoke this Share; individual grants below override quotas.
+          </p>
         </div>
-      ) : null}
-
-      <div className="grid gap-2">
-        <span className="text-sm font-medium text-foreground">Shared with emails</span>
-        {shareApp ? (
-          <label className="grid gap-1 text-sm">
-            <Input
-              value={sharedTextByApp[shareApp] || ""}
-              disabled={!editable}
-              placeholder="friend@example.com, teammate@example.com"
-              onChange={(event) =>
-                setSharedTextByApp((current) => ({ ...current, [shareApp]: event.target.value }))
-              }
-            />
-          </label>
-        ) : null}
-        {shareApp && managedAccessByApp[shareApp]?.length ? (
-          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <span>Managed by Share Market:</span>
-            {managedAccessByApp[shareApp]?.map((email) => (
-              <Chip key={email} color="accent" size="sm" variant="soft">
-                {email}
-              </Chip>
-            ))}
-          </div>
-        ) : null}
       </div>
 
       <div className="grid gap-4 lg:grid-cols-3">
@@ -422,31 +270,31 @@ function ShareSettingsForm({
         </label>
       </div>
 
-      {draft.forSale === "Yes" && shareApp ? (
-      <div className="grid gap-3">
-        <div className="text-sm font-medium text-foreground">Model pricing percent</div>
-        <label className="grid max-w-xs gap-1 text-sm">
-          <span className="text-xs text-muted-foreground">{SHARE_APP_LABELS[shareApp]}</span>
-          <Input
-            type="number"
-            min={1}
-            max={100}
-            value={draft.pricing[shareApp] == null ? "" : String(draft.pricing[shareApp])}
-            placeholder={share.support?.[shareApp] ? "Unset" : "No node"}
-            disabled={!editable || !share.support?.[shareApp]}
-            onChange={(event) => {
-              const raw = event.target.value;
-              setDraft((current) => {
-                const pricing = { ...current.pricing };
-                if (!raw.trim()) delete pricing[shareApp];
-                else pricing[shareApp] = Number.parseInt(raw, 10) || 0;
-                return { ...current, pricing };
-              });
-            }}
-          />
-        </label>
-      </div>
-      ) : null}
+      {editable ? (
+        <ShareUserGrantsEditor
+          value={draft.userGrants}
+          ownerEmail={share.ownerEmail || ""}
+          defaultPolicy={defaultUserPolicy}
+          supportedPeriods={share.supportedUserTokenPeriods}
+          t={t}
+          onChange={(userGrants) =>
+            setDraft((current) => ({ ...current, userGrants }))
+          }
+        />
+      ) : (
+        <div className="grid gap-2">
+          <span className="text-sm font-medium text-foreground">Authorized users and quotas</span>
+          <div className="flex flex-wrap gap-2">
+            {Object.values(draft.userGrants)
+              .filter((grant) => grant.active !== false)
+              .map((grant) => (
+                <Chip key={grant.email} size="sm" variant="soft">
+                  {grant.email}
+                </Chip>
+              ))}
+          </div>
+        </div>
+      )}
 
       {editable ? (
         <div className="flex justify-end">
@@ -464,7 +312,6 @@ export function SharePage() {
   const [context, setContext] = React.useState<ShareApiContextResponse | null>(null);
   const [share, setShare] = React.useState<ShareView | null>(null);
   const [auth, setAuth] = React.useState<ShareApiAuthResponse | null>(null);
-  const [markets, setMarkets] = React.useState<PublicMarket[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [currentHost, setCurrentHost] = React.useState("");
@@ -475,19 +322,14 @@ export function SharePage() {
     try {
       const shareContext = await getShareContext();
       setContext(shareContext);
-      const [shareResponse, marketsResponse] = await Promise.all([
-        getSharePageShare(),
-        getPublicMarkets().catch(() => ({ markets: [] })),
-      ]);
+      const shareResponse = await getSharePageShare();
       setShare(shareResponse.share);
       setAuth(shareResponse.auth);
-      setMarkets(marketsResponse.markets || []);
       setError("");
     } catch (err) {
       if (err instanceof ShareApiError && (err.status === 401 || err.status === 403)) {
         setShare(null);
         setAuth({ authenticated: false, canManage: false });
-        setMarkets([]);
         setError("");
       } else {
         setError(err instanceof Error ? err.message : String(err));
@@ -547,7 +389,7 @@ export function SharePage() {
                 <div className="mt-1 font-medium">{share.expiresAt ? formatDateTime(share.expiresAt) : "-"}</div>
               </div>
             </div>
-            <ShareSettingsForm share={share} markets={markets} editable={editable} onSaved={load} />
+            <ShareSettingsForm share={share} editable={editable} onSaved={load} />
           </section>
         ) : null}
       </div>

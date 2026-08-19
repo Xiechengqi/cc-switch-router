@@ -7,6 +7,7 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { alertChannelLabel } from "@/lib/alerting";
 import {
+  ApiError,
   getAlertingChannels,
   getUserNotificationChannels,
   testAlertingChannel,
@@ -107,7 +108,7 @@ export function AlertChannelsPanel({
                     ? t("settings.alertChannels.lastSuccess", { time: formatDateTime(item.lastSuccessAt * 1000) })
                     : t("settings.alertChannels.neverSucceeded")}
                 </p>
-                {item.lastError ? <p className="mt-1 break-words text-xs text-red-600">{item.lastError}</p> : null}
+                <ChannelDiagnostic state={item} />
               </div>
               <Button
                 variant="outline"
@@ -155,7 +156,7 @@ export function AlertChannelsPanel({
                     ? t("settings.alertChannels.lastSuccess", { time: formatDateTime(item.lastSuccessAt) })
                     : t("settings.alertChannels.neverSucceeded")}
                 </p>
-                {item.lastError ? <p className="mt-1 break-words text-xs text-red-600">{item.lastError}</p> : null}
+                <ChannelDiagnostic state={item} />
                 {item.runtimeReady && !item.testTargetAvailable ? (
                   <p className="mt-2 text-xs text-muted-foreground">
                     {t("settings.alertChannels.user.bindingRequired")}{" "}
@@ -198,7 +199,7 @@ export function AlertChannelsPanel({
       await testAlertingChannel(target);
       setSuccess(t("settings.alertChannels.operator.testSent"));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatChannelError(err, t));
     } finally {
       setBusy("");
       await load();
@@ -215,7 +216,7 @@ export function AlertChannelsPanel({
         target: channelValueLabel(target, result.targetLabel) || t("settings.alertChannels.user.privateTarget"),
       }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatChannelError(err, t));
     } finally {
       setBusy("");
       await load();
@@ -248,4 +249,67 @@ function channelValueLabel(channel: string, value?: string | null) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+type ChannelDiagnosticState = {
+  lastError?: string | null;
+  failureCode?: string | null;
+  failureHint?: string | null;
+  failureDetails?: Record<string, unknown> | null;
+};
+
+function ChannelDiagnostic({ state }: { state: ChannelDiagnosticState }) {
+  const { t } = useLocaleText();
+  if (!state.lastError && !state.failureCode && !state.failureHint) return null;
+  const code = state.failureCode?.trim();
+  const key = code
+    ? `settings.alertChannels.diagnostic.${code}`
+    : "settings.alertChannels.diagnostic.legacy";
+  const hint = t(key as Parameters<typeof t>[0]);
+  const details = state.failureDetails;
+  const resolved = formatDiagnosticAddresses(details?.resolvedAddresses);
+  const reachable = formatDiagnosticAddresses(details?.reachableAddresses);
+  const dnsError = typeof details?.dnsError === "string" ? details.dnsError : "";
+  const hasTechnicalDetails = !!state.lastError || !!resolved || !!reachable || !!dnsError;
+  return (
+    <div className="mt-2 rounded-md border border-amber-200 bg-amber-50/70 p-2.5 text-xs text-amber-950">
+      <p className="font-medium">{t("settings.alertChannels.diagnostic.title")}</p>
+      <p className="mt-1 leading-5">{hint === key ? state.failureHint || t("settings.alertChannels.diagnostic.legacy") : hint}</p>
+      {hasTechnicalDetails ? (
+        <details className="mt-2 text-amber-900/80">
+          <summary className="cursor-pointer select-none font-medium">
+            {t("settings.alertChannels.diagnostic.details")}
+          </summary>
+          <div className="mt-1 grid gap-1 break-words font-mono text-[11px]">
+            {resolved ? <span>{t("settings.alertChannels.diagnostic.resolved", { addresses: resolved })}</span> : null}
+            {reachable ? <span>{t("settings.alertChannels.diagnostic.reachable", { addresses: reachable })}</span> : null}
+            {dnsError ? <span>{t("settings.alertChannels.diagnostic.dnsError", { error: dnsError })}</span> : null}
+            {state.lastError ? <span>{state.lastError}</span> : null}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function formatDiagnosticAddresses(value: unknown) {
+  if (!Array.isArray(value)) return "";
+  return value.filter((item): item is string => typeof item === "string").join(", ");
+}
+
+function formatChannelError(error: unknown, translate: ReturnType<typeof useLocaleText>["t"]) {
+  if (error instanceof ApiError) {
+    const code = error.details?.failureCode;
+    if (typeof code === "string") {
+      const key = `settings.alertChannels.diagnostic.${code}` as Parameters<typeof translate>[0];
+      const translated = translate(key);
+      if (translated !== key) return translated;
+    }
+    const hint = error.details?.failureHint;
+    if (typeof hint === "string" && hint.trim()) return hint;
+    if (error.code === "USER_NOTIFICATION_BOT_NOT_READY") {
+      return translate("settings.alertChannels.user.runtimeUnavailable");
+    }
+  }
+  return errorMessage(error);
 }

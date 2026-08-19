@@ -35,12 +35,6 @@ export function ShareEditSection({
   );
 }
 
-export function forSaleOptionLabel(forSale: "Yes" | "No" | "Free", t: TFn) {
-  if (forSale === "Yes") return t("dashboard.yes");
-  if (forSale === "Free") return t("dashboard.free");
-  return t("dashboard.no");
-}
-
 export function shareEditPendingLabel(edit: ShareEditView, t: TFn) {
   if (edit.patch.managedGrant?.action === "upsert") {
     return t("dashboard.shareMarketGrantPending");

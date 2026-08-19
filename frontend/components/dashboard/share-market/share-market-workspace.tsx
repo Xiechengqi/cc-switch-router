@@ -85,7 +85,9 @@ export function ShareMarketWorkspace() {
         setCatalog(nextCatalog);
         setOwnedListings(nextOwned.listings);
         setSubscriptions(nextSubscriptions.subscriptions);
-        setCanCreateListing(nextOwnedShares.some((share) => !share.alreadyListed && share.shareStatus === "active"));
+        setCanCreateListing(nextOwnedShares.some(
+          (share) => !share.alreadyListed && !share.freeAccess && share.shareStatus === "active",
+        ));
       } else {
         const nextCatalog = await publicRequest;
         if (controller.signal.aborted) return;

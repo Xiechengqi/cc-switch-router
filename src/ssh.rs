@@ -570,18 +570,19 @@ impl server::Handler for ClientHandler {
         *port = bound_port as u32;
         let backend = format!("{host}:{port}");
         let share_id = lease.share.as_ref().map(|s| s.share_id.clone());
-        let is_free_share = lease
-            .share
-            .as_ref()
-            .map(|s| s.for_sale == "Free")
-            .unwrap_or(false);
+        let is_free_share = lease.share.as_ref().map(|s| s.free_access).unwrap_or(false);
         let parallel_limit = lease.share.as_ref().map(|s| s.parallel_limit).unwrap_or(-1);
         let route_kind = if lease.tunnel_type == "client-web-http" {
             RouteKind::ClientWeb
         } else if share_id.is_some() {
             RouteKind::Share
         } else {
-            RouteKind::Market
+            warn!(
+                subdomain = %lease.subdomain,
+                connection_id = %lease.connection_id,
+                "rejecting tunnel without a Client or Share route"
+            );
+            return Ok(false);
         };
         let (route_shutdown, shutdown_rx) = RouteShutdown::new();
         self.proxy
@@ -655,21 +656,6 @@ impl server::Handler for ClientHandler {
             }
         });
         self.forward = Some(ForwardHandle::new(route_shutdown));
-        if lease.tunnel_type == "market-http"
-            && let Err(error) = self
-                .proxy
-                .promote_candidate(
-                    &lease.subdomain,
-                    &lease.connection_id,
-                    &lease.rotation_id,
-                    lease.generation,
-                    lease.expected_generation,
-                )
-                .await
-        {
-            self.shutdown_forward();
-            return Err(anyhow::anyhow!(error));
-        }
         info!(
             "registered backend candidate for subdomain={} connection_id={} generation={} backend={}",
             lease.subdomain, lease.connection_id, lease.generation, backend

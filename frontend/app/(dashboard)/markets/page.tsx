@@ -1,5 +1,7 @@
-import { MarketsPage } from "@/components/dashboard/markets-page";
+import { redirect } from "next/navigation";
 
 export default function Page() {
-  return <MarketsPage />;
+  // The former Token Market registry is retired. Keep the URL as a safe
+  // compatibility redirect so bookmarks cannot expose a stale control plane.
+  redirect("/share-market/");
 }

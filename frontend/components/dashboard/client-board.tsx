@@ -29,13 +29,13 @@ import {
   clientTotalTokensLabel,
   clientTotalTokensUsed,
   ShareEditDialog,
-  ShareMarkets,
+  ShareAccess,
   ShareModelHealthChecks,
   ShareProvidersPanel,
   shareApiParts,
   sortClients,
 } from "@/components/dashboard/data-tables";
-import type { ClientMarketRental, DashboardClient, DashboardMarket, ShareView } from "@/lib/types";
+import type { ClientMarketRental, DashboardClient, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { getMyClientMarketRentals, recordDashboardUxEvent } from "@/lib/api";
@@ -545,12 +545,10 @@ function Metric({ label, value, title, tone = "default", preserveValue = false }
 export function ClientBoard({
   clients,
   shares,
-  markets,
   onChanged,
 }: {
   clients: DashboardClient[];
   shares: ShareView[];
-  markets: DashboardMarket[];
   onChanged?: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
@@ -1063,8 +1061,8 @@ export function ClientBoard({
                 {selectedShare ? (
                   <div className="grid gap-5">
                     <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
-                    <DrawerSection label={t("dashboard.markets")}>
-                      <ShareMarkets share={selectedShare} t={t} />
+                    <DrawerSection label={t("shareMarket.title")}>
+                      <ShareAccess share={selectedShare} t={t} />
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.providers")}>
                       <ShareProvidersPanel share={selectedShare} />
@@ -1079,7 +1077,7 @@ export function ClientBoard({
           </Drawer.Content>
       </Drawer.Backdrop>
 
-      <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
+      <ShareEditDialog share={editingShare} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
       <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} onCreated={() => void refreshRentalsAndDashboard()} />
       <ClientSubdomainTakeoverDialog

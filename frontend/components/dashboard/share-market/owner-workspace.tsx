@@ -281,7 +281,9 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
     setError("");
     getShareMarketOwnedShares()
       .then((items) => {
-        const eligible = items.filter((item) => !item.alreadyListed && item.shareStatus === "active");
+        const eligible = items.filter(
+          (item) => !item.alreadyListed && !item.freeAccess && item.shareStatus === "active",
+        );
         setShares(eligible);
         setShareId(eligible[0]?.shareId || "");
         setSeats([emptySeat(eligible[0]?.supportedUserTokenPeriods)]);

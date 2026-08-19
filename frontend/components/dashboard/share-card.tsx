@@ -25,7 +25,6 @@ import {
   recentSharePerformance,
   resolveShareAppRuntime,
   shareDisplayTitle,
-  shareAppSettings,
   shareExpiryProgress,
   expiryTitle,
   type CoreShareApp,
@@ -99,7 +98,6 @@ export const ShareCard = React.memo(function ShareCard({
   const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
   const apps = shareEnabledApps(share);
   const app = resolveShareCoreApp(share);
-  const settings = app ? shareAppSettings(share, app) : null;
   const appRequests =
     apps.length === 1 && app
       ? (share.recentRequests || []).filter((request) =>
@@ -107,8 +105,8 @@ export const ShareCard = React.memo(function ShareCard({
         )
       : share.recentRequests || [];
   const tokensUsed = share.tokensUsed || 0;
-  const tokenLimit = settings?.tokenLimit ?? share.tokenLimit;
-  const parallelLimit = settings?.parallelLimit ?? share.parallelLimit;
+  const tokenLimit = share.tokenLimit;
+  const parallelLimit = share.parallelLimit;
   const activeRequests =
     apps.length === 1 && app
       ? (share.activeRequestsByApp?.[app] ?? 0)

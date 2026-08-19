@@ -349,7 +349,9 @@ pub struct LlmRequestMetric {
     pub timestamp: i64,
     pub request_id: Option<String>,
     pub route_type: String,
-    pub market_email: Option<String>,
+    /// Stable external capacity principal. External capacity writers use the
+    /// registered Gateway ID; retired email-bound identities are not stored.
+    pub gateway_id: Option<String>,
     pub share_id: Option<String>,
     pub subdomain: Option<String>,
     pub app_type: Option<String>,

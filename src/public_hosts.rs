@@ -2,9 +2,7 @@ use crate::db::{Connection, OptionalExtension, params};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::namespace::{
-    PublicHostKind, normalize_client_subdomain, normalize_market_slug, parse_share_label,
-};
+use crate::namespace::{PublicHostKind, normalize_client_subdomain, parse_share_label};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicHostLifecycle {
@@ -436,9 +434,6 @@ fn validate_claim(input: &NewPublicHost<'_>) -> Result<(), PublicHostCatalogErro
         PublicHostKind::Share => {
             parse_share_label(&label).map_err(PublicHostCatalogError::Invalid)?;
         }
-        PublicHostKind::Market => {
-            normalize_market_slug(&label).map_err(PublicHostCatalogError::Invalid)?;
-        }
     }
     Ok(())
 }
@@ -455,7 +450,6 @@ fn map_record(row: &crate::db::Row<'_>) -> crate::db::Result<PublicHostRecord> {
     let kind = match row.get::<_, String>(2)?.as_str() {
         "client" => PublicHostKind::Client,
         "share" => PublicHostKind::Share,
-        "market" => PublicHostKind::Market,
         value => {
             return Err(crate::db::Error::FromSqlConversionFailure(
                 2,
@@ -500,7 +494,6 @@ fn kind_str(kind: PublicHostKind) -> &'static str {
     match kind {
         PublicHostKind::Client => "client",
         PublicHostKind::Share => "share",
-        PublicHostKind::Market => "market",
     }
 }
 

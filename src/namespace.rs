@@ -9,7 +9,6 @@ const RESERVED_LABELS: &[&str] = &["admin", "api", "cdn-cgi", "router", "www"];
 pub enum PublicHostKind {
     Client,
     Share,
-    Market,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,10 +24,6 @@ pub fn normalize_client_subdomain(value: &str) -> Result<String, &'static str> {
 
 pub fn normalize_share_slug(value: &str) -> Result<String, &'static str> {
     normalize_public_slug(value, "share slug")
-}
-
-pub fn normalize_market_slug(value: &str) -> Result<String, &'static str> {
-    normalize_public_slug(value, "market slug")
 }
 
 pub fn build_share_label(share_slug: &str, client_subdomain: &str) -> Result<String, &'static str> {
@@ -62,7 +57,7 @@ fn normalize_public_slug(value: &str, kind: &'static str) -> Result<String, &'st
         return Err(match kind {
             "client subdomain" => "client subdomain must be 6-30 characters",
             "share slug" => "share slug must be 6-30 characters",
-            _ => "market slug must be 6-30 characters",
+            _ => "public slug must be 6-30 characters",
         });
     }
     if value.contains("--") {

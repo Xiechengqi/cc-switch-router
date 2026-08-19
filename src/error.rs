@@ -118,13 +118,20 @@ impl IntoResponse for AppError {
                 "request failed with server error"
             );
         }
+        // `Coded` errors are explicitly opted in by a handler and carry a
+        // sanitized, machine-readable user-facing contract. Keep that
+        // contract even when the selected status is 5xx (for example, a
+        // temporarily unreachable notification provider). Uncoded internal
+        // errors continue to be collapsed to a generic message and error ID.
         let (code, details) = match &self {
-            _ if server_error => (database_unavailable.then_some("DATABASE_UNAVAILABLE"), None),
             AppError::Coded { code, details, .. } => (Some(*code), Some(details.clone())),
+            _ if server_error => (database_unavailable.then_some("DATABASE_UNAVAILABLE"), None),
             _ => (None, None),
         };
         let body = ErrorBody {
-            message: if database_unavailable {
+            message: if let AppError::Coded { message, .. } = &self {
+                message.clone()
+            } else if database_unavailable {
                 "database unavailable".into()
             } else if status == StatusCode::SERVICE_UNAVAILABLE {
                 "service unavailable".into()
@@ -226,5 +233,36 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
         assert!(!String::from_utf8_lossy(&body).contains("secret table name"));
+    }
+
+    #[tokio::test]
+    async fn coded_provider_error_preserves_safe_details_on_5xx() {
+        let response = AppError::Coded {
+            status: StatusCode::BAD_GATEWAY,
+            code: "ALERT_CHANNEL_TEST_FAILED",
+            message: "check DNS and retry".into(),
+            details: serde_json::json!({
+                "failureCode": "api_endpoint_unreachable",
+                "diagnostics": {"resolvedAddresses": ["192.0.2.1"]}
+            }),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read coded provider error");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("decode coded provider error");
+        assert_eq!(payload["message"], "check DNS and retry");
+        assert_eq!(payload["code"], "ALERT_CHANNEL_TEST_FAILED");
+        assert_eq!(
+            payload["details"]["failureCode"],
+            "api_endpoint_unreachable"
+        );
+        assert_eq!(
+            payload["details"]["diagnostics"]["resolvedAddresses"][0],
+            "192.0.2.1"
+        );
     }
 }

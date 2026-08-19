@@ -331,9 +331,50 @@ function ChannelRow({ channel }: { channel: AlertChannelState }) {
       <p className="mt-2 text-xs text-muted-foreground">
         {channel.lastSuccessAt ? formatDateTime(channel.lastSuccessAt * 1000) : t("metrics.alerts.neverDelivered")}
       </p>
-      {channel.lastError ? <p className="mt-1 break-words text-xs text-red-600">{channel.lastError}</p> : null}
+      <ChannelDiagnostic channel={channel} />
     </div>
   );
+}
+
+function ChannelDiagnostic({ channel }: { channel: AlertChannelState }) {
+  const { t } = useLocaleText();
+  if (!channel.lastError && !channel.failureCode && !channel.failureHint) return null;
+  const code = channel.failureCode?.trim();
+  const key = code
+    ? `settings.alertChannels.diagnostic.${code}`
+    : "settings.alertChannels.diagnostic.legacy";
+  const translated = t(key as MessageKey);
+  const hint = translated === key
+    ? channel.failureHint || t("settings.alertChannels.diagnostic.legacy")
+    : translated;
+  const details = channel.failureDetails;
+  const resolved = formatDiagnosticAddresses(details?.resolvedAddresses);
+  const reachable = formatDiagnosticAddresses(details?.reachableAddresses);
+  const dnsError = typeof details?.dnsError === "string" ? details.dnsError : "";
+  return (
+    <div className="mt-2 rounded-md border border-amber-200 bg-amber-50/70 p-2 text-xs text-amber-950">
+      <p className="font-medium">{t("settings.alertChannels.diagnostic.title")}</p>
+      <p className="mt-1 leading-5">{hint}</p>
+      {channel.lastError || resolved || reachable || dnsError ? (
+        <details className="mt-1 text-amber-900/80">
+          <summary className="cursor-pointer select-none font-medium">
+            {t("settings.alertChannels.diagnostic.details")}
+          </summary>
+          <div className="mt-1 grid gap-1 break-words font-mono text-[11px]">
+            {resolved ? <span>{t("settings.alertChannels.diagnostic.resolved", { addresses: resolved })}</span> : null}
+            {reachable ? <span>{t("settings.alertChannels.diagnostic.reachable", { addresses: reachable })}</span> : null}
+            {dnsError ? <span>{t("settings.alertChannels.diagnostic.dnsError", { error: dnsError })}</span> : null}
+            {channel.lastError ? <span>{channel.lastError}</span> : null}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function formatDiagnosticAddresses(value: unknown) {
+  if (!Array.isArray(value)) return "";
+  return value.filter((item): item is string => typeof item === "string").join(", ");
 }
 
 function IncidentRow({

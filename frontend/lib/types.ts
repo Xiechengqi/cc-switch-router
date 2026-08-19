@@ -64,13 +64,11 @@ export type DashboardResponse = {
   clients: DashboardClient[];
   /** 全量 share 列表；ClientBoard 按 installation 分组为横向卡片。 */
   shares?: ShareView[];
-  markets?: DashboardMarket[];
   tickerShares?: DashboardTickerShare[];
   countryCounts?: Record<string, number>;
   countryBoards?: Record<string, CountryBoard>;
   userCountryCounts?: Record<string, number>;
   recentRequestEvents?: RecentRequestEvent[];
-  marketRequestLogs?: MarketRequestLog[];
 };
 
 export type MapPoint = {
@@ -172,7 +170,7 @@ export type OperationalReason = {
   code: OperationalReasonCode | string;
   severity: "info" | "warning" | "critical" | string;
   startedAt?: string;
-  entityType?: "client" | "share" | "market" | "provider" | string;
+  entityType?: "client" | "share" | "provider" | string;
   entityId?: string;
   currentValue?: string;
   threshold?: string;
@@ -340,15 +338,8 @@ export type ShareView = {
   capacityPoolId: string;
   shareName: string;
   ownerEmail?: string;
-  sharedWithEmails?: string[];
-  accessByApp?: ShareAccessByApp;
-  appSettings?: ShareAppSettingsByApp;
-  marketLinks?: ShareMarketLink[];
-  unknownMarketEmails?: string[];
   description?: string;
-  forSale: string;
-  marketAccessMode: string;
-  forSaleOfficialPricePercentByApp?: Record<string, number>;
+  freeAccess: boolean;
   subdomain: string;
   canViewSecret?: boolean;
   canManage?: boolean;
@@ -396,37 +387,10 @@ export type ShareView = {
   previousResponseCacheEnabled?: boolean;
 };
 
-export type ShareAppAccess = {
-  sharedWithEmails: string[];
-  marketAccessMode: "selected" | "all";
-};
-
-export type ShareAccessByApp = Partial<
-  Record<"claude" | "codex" | "gemini", ShareAppAccess>
->;
-
-export type ShareAppSettings = {
-  forSale?: "Yes" | "No" | "Free";
-  marketAccessMode?: "selected" | "all";
-  sharedWithEmails?: string[];
-  tokenLimit?: number;
-  parallelLimit?: number;
-  expiresAt?: string;
-};
-
-export type ShareAppSettingsByApp = Partial<
-  Record<"claude" | "codex" | "gemini", ShareAppSettings>
->;
-
 export type ShareSettingsPatch = {
   ownerEmail?: string;
   description?: string | null;
-  forSale?: "Yes" | "No" | "Free";
-  marketAccessMode?: "selected" | "all";
-  sharedWithEmails?: string[];
-  accessByApp?: ShareAccessByApp;
-  appSettings?: ShareAppSettingsByApp;
-  forSaleOfficialPricePercentByApp?: Record<string, number>;
+  freeAccess?: boolean;
   tokenLimit?: number;
   parallelLimit?: number;
   expiresAt?: string;
@@ -511,11 +475,17 @@ export type NotificationChannelSettings = {
 /** GET/PATCH /v1/me/notifications */
 export type NotificationSettings = {
   email: string;
-  enabledChannels: string[];
+  /** The single channel notifications are delivered on. */
+  deliveryChannel: string;
   channels: NotificationChannelSettings[];
   telegramBotConfigured: boolean;
   telegramBotStatus: "disabled" | "reconciling" | "ready" | "error" | string;
+  telegramBotTransportStatus?: string;
   telegramBotUsername?: string;
+  telegramBotFailureCode?: string;
+  telegramBotFailureHint?: string;
+  telegramBotFailureDetails?: Record<string, unknown>;
+  telegramBotLastFailureAt?: string;
 };
 
 /** POST /v1/me/notifications/telegram/bind-link — single use, short lived. */
@@ -591,154 +561,6 @@ export type UsageCardSettingsResponse = {
 
 export type UpdateUsageCardSettingsRequest = {
   publicStatsEnabled: boolean;
-};
-
-export type ShareMarketLink = {
-  id: string;
-  displayName: string;
-  email: string;
-  subdomain: string;
-  publicBaseUrl: string;
-  marketKind?: string;
-  status: string;
-  online: boolean;
-  routeState: RouteState;
-  routeStateSince?: string;
-};
-
-export type DashboardMarket = {
-  id: string;
-  displayName: string;
-  email: string;
-  subdomain: string;
-  publicBaseUrl: string;
-  marketKind?: string;
-  status: string;
-  online: boolean;
-  routeState: RouteState;
-  routeStateSince?: string;
-  canManage?: boolean;
-  maintenanceEnabled?: boolean;
-  maintenanceMessage?: string;
-  createdAt: string;
-  updatedAt: string;
-  lastSeenAt: string;
-  offlineSince?: string;
-  shareCount: number;
-  onlineShareCount: number;
-  activeRequests: number;
-  parallelCapacity: number;
-  onlineMinutes24h?: number;
-  onlineRate24h: number;
-  observedMinutes24h?: number;
-  observationCoverage24h?: number;
-  usageTokens: number;
-  usageAmountUsd: string;
-  pricingSummary?: Record<string, string | number | null>;
-  healthChecks?: HealthCheckEntry[];
-  healthTimeline?: HealthTimelineBucket[];
-  linkedShares?: Array<{
-    shareId: string;
-    shareName: string;
-    subdomain: string;
-    ownerEmail?: string;
-    appType: string;
-    online: boolean;
-    routeState: RouteState;
-    routeStateSince?: string;
-    activeRequests: number;
-    parallelLimit: number;
-    onlineRate24h: number;
-    observedMinutes24h?: number;
-    observationCoverage24h?: number;
-    disabledByMarket?: boolean;
-    marketDisabledAt?: string;
-    support?: ShareSupport;
-    appRuntimes?: ShareAppRuntimes;
-    appAvailability?: MarketAppAvailability;
-    marketStates?: MarketShareRuntimeState[];
-  }>;
-  recentRequests?: MarketRequestLog[];
-  operationalSummary?: OperationalSummary;
-};
-
-export type MarketShare = {
-  routerId: string;
-  shareId: string;
-  subdomain: string;
-  installationId: string;
-  shareName: string;
-  ownerEmail?: string;
-  installationOwnerEmail?: string;
-  appType: string;
-  forSale: string;
-  marketAccessMode: string;
-  shareStatus: string;
-  online: boolean;
-  routeState: RouteState;
-  routeStateSince?: string;
-  activeRequests: number;
-  parallelLimit: number;
-  onlineRate24h: number;
-  observedMinutes24h?: number;
-  observationCoverage24h?: number;
-  lastSeenAt: string;
-  shareCreatedAt?: string;
-  disabledByMarket?: boolean;
-  marketDisabledAt?: string;
-  support?: ShareSupport;
-  appAvailability?: MarketAppAvailability;
-  appRuntimes?: ShareAppRuntimes;
-  modelHealth?: ShareModelHealthSummary;
-  marketStates?: MarketShareRuntimeState[];
-  signals?: ShareSignals;
-  sessionLoad?: number;
-};
-
-export type ShareSessionLoad = {
-  routerId: string;
-  shareId: string;
-  sessionLoad: number;
-};
-
-export type ShareSignals = {
-  quotaHealth?: number;
-  stability?: number;
-  headroom?: number;
-  samples10m?: number;
-  ownerPenalty?: number;
-};
-
-export type MarketShareRuntimeState = {
-  shareId: string;
-  routerId?: string;
-  scope: string;
-  kind: string;
-  appType?: string;
-  modelId?: string;
-  modelName?: string;
-  reasonKind?: string;
-  reason?: string;
-  failureCount?: number;
-  expiresAt?: string;
-  updatedAt: string;
-};
-
-export type PublicMarket = {
-  id: string;
-  displayName: string;
-  email: string;
-  subdomain: string;
-  publicBaseUrl: string;
-  marketKind?: string;
-  status: string;
-  maintenanceEnabled?: boolean;
-  maintenanceMessage?: string;
-  pricingSummary?: unknown;
-};
-
-export type MarketsResponse = {
-  markets: PublicMarket[];
 };
 
 export type ShareRequestLog = {
@@ -819,7 +641,7 @@ export type ShareUsageDailyBucket = {
 
 export type ShareUsageEmailRow = {
   email: string;
-  role: "owner" | "shareto" | "market" | "deprecated" | string;
+  role: "owner" | "shareto" | "gateway" | "deprecated" | string;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -880,40 +702,6 @@ export type DashboardTickerShare = {
   recentRequests: ShareRequestLog[];
 };
 
-export type MarketRequestLog = {
-  requestId: string;
-  marketId: string;
-  marketEmail: string;
-  marketSubdomain: string;
-  userEmail?: string;
-  apiKeyPrefix?: string;
-  routerId?: string;
-  shareId?: string;
-  shareSubdomain?: string;
-  model?: string;
-  requestAgent: string;
-  requestedModel: string;
-  actualModel: string;
-  actualModelSource?: string;
-  usageState?:
-    "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
-  streamStatus?: string;
-  usageRevision?: number;
-  status: string;
-  statusCode?: number;
-  errorMessage?: string;
-  latencyMs?: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens?: number;
-  cacheCreationTokens?: number;
-  userCountry?: string;
-  userCountryIso3?: string;
-  usageAmountUsd?: string;
-  createdAt: string;
-  settledAt?: string;
-};
-
 export type RecentRequestEvent = {
   requestId: string;
   shareId?: string;
@@ -954,21 +742,6 @@ export type ShareSupport = {
   gemini?: boolean;
 };
 
-export type MarketAppAvailability = {
-  claude?: MarketAppAvailabilityEntry;
-  codex?: MarketAppAvailabilityEntry;
-  gemini?: MarketAppAvailabilityEntry;
-};
-
-export type MarketAppAvailabilityEntry = {
-  status: "available" | "degraded" | "unavailable" | "unknown" | string;
-  reason?: string;
-  requestedModel?: string;
-  actualModel?: string;
-  lastCheckedAt?: number;
-  recentResults?: string[];
-};
-
 export type ModelHealthSummary = {
   appType: string;
   requestedModel: string;
@@ -1006,7 +779,6 @@ export type ShareUpstreamProvider = {
   providerType?: string;
   accountEmail?: string;
   subscriptionLevel?: string;
-  forSaleOfficialPricePercent?: number;
   apiUrl?: string;
   quota?: {
     status?: string;
@@ -1049,7 +821,6 @@ export type ShareAppProvider = {
   isCurrent?: boolean;
   enabled?: boolean;
   codexImageGenerationEnabled?: boolean;
-  forSaleOfficialPricePercent?: number;
   accountEmail?: string;
   apiUrl?: string;
   quota?: ShareUpstreamProvider["quota"];
@@ -1324,6 +1095,9 @@ export type AlertChannelState = {
   lastAttemptAt?: number | null;
   lastSuccessAt?: number | null;
   lastError?: string | null;
+  failureCode?: string | null;
+  failureHint?: string | null;
+  failureDetails?: Record<string, unknown> | null;
 };
 
 export type AlertChannelTestResponse = {
@@ -1340,11 +1114,16 @@ export type UserNotificationChannelState = {
   status:
     "disabled" | "misconfigured" | "reconciling" | "ready" | "healthy" | "degraded" | string;
   runtimeReady: boolean;
+  transportStatus?: string;
   providerLabel?: string | null;
   runtimeVerifiedAt?: string | null;
   lastAttemptAt?: string | null;
   lastSuccessAt?: string | null;
   lastError?: string | null;
+  failureCode?: string | null;
+  failureHint?: string | null;
+  failureDetails?: Record<string, unknown> | null;
+  lastFailureAt?: string | null;
   testTargetAvailable: boolean;
   testTargetLabel?: string | null;
   bindingVerifiedAt?: string | null;
@@ -2512,5 +2291,6 @@ export type ShareMarketOwnedShare = {
   supportedApps: string[];
   shareStatus: string;
   alreadyListed: boolean;
+  freeAccess: boolean;
   supportedUserTokenPeriods: ShareTokenPeriod[];
 };

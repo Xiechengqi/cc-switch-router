@@ -2,21 +2,22 @@
 
 use chrono::{DateTime, Duration, Utc};
 use rand::RngCore;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::AppError;
 use crate::models::{
-    NotificationChannelSettingsResponse, NotificationSettingsResponse,
-    TelegramBindLinkResponse, UpdateNotificationSettingsRequest,
+    NotificationChannelSettingsResponse, NotificationSettingsResponse, TelegramBindLinkResponse,
+    UpdateNotificationSettingsRequest,
 };
 use crate::notification_channels::{
     EMAIL_CHANNEL, NotificationChannelId, NotificationTarget, NotificationTargets,
-    TELEGRAM_CHANNEL, normalize_enabled_channels,
+    TELEGRAM_CHANNEL, parse_delivery_channel,
 };
 use crate::store::AppStore;
-use crate::telegram::BIND_TOKEN_BYTES;
+use crate::telegram::{BIND_TOKEN_BYTES, TelegramFailure};
 
 const MAX_BIND_LINKS_PER_HOUR: i64 = 10;
 const MAX_BIND_LINKS_PER_IP_PER_HOUR: i64 = 30;
@@ -25,9 +26,13 @@ const MAX_BIND_LINKS_PER_IP_PER_HOUR: i64 = 30;
 pub enum BindOutcome {
     Bound {
         email: String,
-        enabled_channels: Vec<String>,
+        /// The channel the account now delivers on. Binding selects Telegram,
+        /// so this is what the confirmation reply reports back to the chat.
+        delivery_channel: String,
     },
-    AlreadyBound { email: String },
+    AlreadyBound {
+        email: String,
+    },
     InvalidToken,
     ChatTakenByAnotherAccount,
 }
@@ -35,11 +40,16 @@ pub enum BindOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramBotRuntime {
     pub readiness: String,
+    pub transport_status: String,
     pub bot_id: Option<String>,
     pub username: Option<String>,
     pub config_fingerprint: Option<String>,
     pub generation: i64,
     pub last_error: Option<String>,
+    pub last_failure_code: Option<String>,
+    pub last_failure_hint: Option<String>,
+    pub last_failure_details: Option<Value>,
+    pub last_failure_at: Option<String>,
     pub verified_at: Option<String>,
 }
 
@@ -81,7 +91,9 @@ pub fn hash_bind_token(token: &str) -> String {
 pub fn normalize_bind_token(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.len() != BIND_TOKEN_BYTES * 2
-        || !trimmed.chars().all(|character| character.is_ascii_hexdigit())
+        || !trimmed
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
     {
         return None;
     }
@@ -125,9 +137,7 @@ fn ensure_user_id(conn: &Connection, email: &str) -> Result<String, AppError> {
              VALUES (?1, ?2, 'active', ?3, ?3)",
             params![id, email, now],
         )
-        .map_err(|error| {
-            AppError::Internal(format!("insert notification user failed: {error}"))
-        })?;
+        .map_err(|error| AppError::Internal(format!("insert notification user failed: {error}")))?;
         id
     };
     ensure_email_channel(conn, &user_id, email, &now)?;
@@ -161,10 +171,14 @@ fn ensure_email_channel(
 fn read_bot_runtime(conn: &Connection) -> Result<TelegramBotRuntime, AppError> {
     conn.query_row(
         "SELECT readiness, bot_id, username, config_fingerprint, generation,
-                last_error, verified_at
+                last_error, verified_at, transport_status, last_failure_code,
+                last_failure_hint, last_failure_details_json, last_failure_at
          FROM telegram_bot_runtime WHERE id = 1",
         [],
         |row| {
+            let details = row
+                .get::<_, Option<String>>(10)?
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok());
             Ok(TelegramBotRuntime {
                 readiness: row.get(0)?,
                 bot_id: row.get(1)?,
@@ -173,6 +187,13 @@ fn read_bot_runtime(conn: &Connection) -> Result<TelegramBotRuntime, AppError> {
                 generation: row.get(4)?,
                 last_error: row.get(5)?,
                 verified_at: row.get(6)?,
+                transport_status: row
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| "unknown".into()),
+                last_failure_code: row.get(8)?,
+                last_failure_hint: row.get(9)?,
+                last_failure_details: details,
+                last_failure_at: row.get(11)?,
             })
         },
     )
@@ -205,9 +226,20 @@ fn read_user_channels(conn: &Connection, user_id: &str) -> Result<Vec<UserChanne
         .map_err(|error| {
             AppError::Internal(format!("query notification channels failed: {error}"))
         })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
-        AppError::Internal(format!("read notification channels failed: {error}"))
-    })
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::Internal(format!("read notification channels failed: {error}")))
+}
+
+/// The one channel this account delivers on.
+///
+/// A user with no usable selection still has to be told something, and email is
+/// the channel every account is guaranteed to have — the same fallback the
+/// delivery path applies.
+fn selected_channel(rows: &[UserChannelRow]) -> String {
+    rows.iter()
+        .find(|row| row.enabled && row.state == "ready")
+        .map(|row| row.channel.clone())
+        .unwrap_or_else(|| EMAIL_CHANNEL.into())
 }
 
 fn settings_response(
@@ -229,25 +261,69 @@ fn settings_response(
     channels.push(NotificationChannelSettingsResponse {
         channel: TELEGRAM_CHANNEL.into(),
         enabled: telegram_row.is_some_and(|row| row.enabled),
-        available: runtime.ready(),
+        available: runtime.ready() && runtime.transport_status != "degraded",
         state: telegram_row
             .map(|row| row.state.clone())
             .unwrap_or_else(|| "unbound".into()),
         target_label: telegram_row.and_then(|row| row.target_label.clone()),
         verified_at: telegram_row.and_then(|row| row.verified_at.clone()),
     });
-    let enabled_channels = rows
-        .iter()
-        .filter(|row| row.enabled && row.state == "ready")
-        .map(|row| row.channel.clone())
-        .collect();
     NotificationSettingsResponse {
         email: email.to_string(),
-        enabled_channels,
+        delivery_channel: selected_channel(rows),
         channels,
-        telegram_bot_configured: false,
+        telegram_bot_runtime_fingerprint: runtime.config_fingerprint.clone(),
+        telegram_bot_configured: runtime.readiness != "disabled"
+            && runtime.config_fingerprint.is_some(),
         telegram_bot_status: runtime.readiness.clone(),
+        telegram_bot_transport_status: runtime.transport_status.clone(),
         telegram_bot_username: runtime.username.clone(),
+        telegram_bot_failure_code: runtime.last_failure_code.clone(),
+        telegram_bot_failure_hint: runtime.last_failure_hint.clone(),
+        telegram_bot_failure_details: telegram_failure_details(runtime),
+        telegram_bot_last_failure_at: runtime.last_failure_at.clone(),
+    }
+}
+
+fn telegram_failure_details(runtime: &TelegramBotRuntime) -> Option<Value> {
+    let mut details = runtime
+        .last_failure_details
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(error) = runtime.last_error.as_deref() {
+        details.insert("technicalError".into(), Value::String(error.into()));
+    }
+    (!details.is_empty()).then_some(Value::Object(details))
+}
+
+fn telegram_bot_not_ready_error(runtime: &TelegramBotRuntime) -> AppError {
+    let mut details = serde_json::json!({
+        "channel": TELEGRAM_CHANNEL,
+        "status": runtime.readiness,
+        "transportStatus": runtime.transport_status,
+    });
+    if let Some(code) = runtime.last_failure_code.as_deref() {
+        details["failureCode"] = Value::String(code.into());
+    }
+    if let Some(hint) = runtime.last_failure_hint.as_deref() {
+        details["failureHint"] = Value::String(hint.into());
+    }
+    if let Some(error) = runtime.last_error.as_deref() {
+        details["technicalError"] = Value::String(error.into());
+    }
+    if let Some(diagnostics) = runtime.last_failure_details.clone() {
+        details["diagnostics"] = diagnostics;
+    }
+    AppError::Coded {
+        status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        code: "USER_NOTIFICATION_BOT_NOT_READY",
+        message: runtime
+            .last_failure_hint
+            .clone()
+            .unwrap_or_else(|| "the Telegram bot is not ready".into()),
+        details,
     }
 }
 
@@ -282,12 +358,16 @@ fn release_delivery_events_for_retry(
         let mut statement = conn
             .prepare("SELECT event_id FROM notification_delivery_items WHERE batch_id = ?1")
             .map_err(|error| {
-                AppError::Internal(format!("prepare notification fallback events failed: {error}"))
+                AppError::Internal(format!(
+                    "prepare notification fallback events failed: {error}"
+                ))
             })?;
         let rows = statement
             .query_map(params![delivery_id], |row| row.get::<_, String>(0))
             .map_err(|error| {
-                AppError::Internal(format!("query notification fallback events failed: {error}"))
+                AppError::Internal(format!(
+                    "query notification fallback events failed: {error}"
+                ))
             })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
             AppError::Internal(format!("read notification fallback events failed: {error}"))
@@ -298,7 +378,9 @@ fn release_delivery_events_for_retry(
         params![delivery_id],
     )
     .map_err(|error| {
-        AppError::Internal(format!("release notification fallback items failed: {error}"))
+        AppError::Internal(format!(
+            "release notification fallback items failed: {error}"
+        ))
     })?;
     for event_id in event_ids {
         let delivered_or_active = conn
@@ -325,7 +407,9 @@ fn release_delivery_events_for_retry(
                 params![event_id, now],
             )
             .map_err(|error| {
-                AppError::Internal(format!("requeue notification fallback event failed: {error}"))
+                AppError::Internal(format!(
+                    "requeue notification fallback event failed: {error}"
+                ))
             })?;
         }
     }
@@ -354,15 +438,21 @@ fn cancel_channel_deliveries(
                    )",
             )
             .map_err(|error| {
-                AppError::Internal(format!("prepare channel delivery cancellation failed: {error}"))
+                AppError::Internal(format!(
+                    "prepare channel delivery cancellation failed: {error}"
+                ))
             })?;
         let rows = statement
             .query_map(params![email, channel], |row| row.get::<_, String>(0))
             .map_err(|error| {
-                AppError::Internal(format!("query channel delivery cancellation failed: {error}"))
+                AppError::Internal(format!(
+                    "query channel delivery cancellation failed: {error}"
+                ))
             })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
-            AppError::Internal(format!("read channel delivery cancellation failed: {error}"))
+            AppError::Internal(format!(
+                "read channel delivery cancellation failed: {error}"
+            ))
         })?
     };
     for delivery_id in delivery_ids {
@@ -375,7 +465,9 @@ fn cancel_channel_deliveries(
             params![delivery_id, reason, now],
         )
         .map_err(|error| {
-            AppError::Internal(format!("cancel channel notification delivery failed: {error}"))
+            AppError::Internal(format!(
+                "cancel channel notification delivery failed: {error}"
+            ))
         })?;
         conn.execute(
             "UPDATE notification_delivery_attempts
@@ -384,9 +476,120 @@ fn cancel_channel_deliveries(
             params![delivery_id, now, reason],
         )
         .map_err(|error| {
-            AppError::Internal(format!("cancel channel delivery reservation failed: {error}"))
+            AppError::Internal(format!(
+                "cancel channel delivery reservation failed: {error}"
+            ))
         })?;
         release_delivery_events_for_retry(conn, &delivery_id, now)?;
+    }
+    Ok(())
+}
+
+fn resume_telegram_deliveries_for_fingerprint(
+    conn: &Connection,
+    config_fingerprint: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE notification_deliveries
+         SET status = 'retry', next_attempt_at = ?2, error_message = NULL,
+             failure_kind = NULL, blocked_reason_code = NULL,
+             claim_owner = NULL, claim_expires_at = NULL, updated_at = ?2
+         WHERE channel = 'telegram' AND status = 'blocked_config'
+           AND blocked_reason_code = 'telegram_bot_unavailable'
+           AND provider_identity = (
+               SELECT bot_id FROM telegram_bot_runtime
+               WHERE id = 1 AND config_fingerprint = ?1
+                 AND readiness = 'ready' AND transport_status = 'healthy'
+           )",
+        params![config_fingerprint, now],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "resume Telegram deliveries after recovery failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Drop every selection except `keep`, and report what was dropped.
+///
+/// Returns the channels that were actually deselected, so the caller can cancel
+/// what they still had queued. Each of them takes a revision bump: that is the
+/// signal the delivery worker reads to decide a frozen delivery is stale.
+fn deselect_other_channels(
+    conn: &Connection,
+    user_id: &str,
+    keep: &str,
+    now: &str,
+) -> Result<Vec<String>, AppError> {
+    let deselected = {
+        let mut statement = conn
+            .prepare(
+                "SELECT channel FROM user_notification_channels
+                 WHERE user_id = ?1 AND enabled = 1 AND channel <> ?2",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare channel deselection failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![user_id, keep], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                AppError::Internal(format!("query channel deselection failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read channel deselection failed: {error}"))
+        })?
+    };
+    if deselected.is_empty() {
+        return Ok(deselected);
+    }
+    conn.execute(
+        "UPDATE user_notification_channels
+         SET enabled = 0, revision = revision + 1, updated_at = ?3
+         WHERE user_id = ?1 AND enabled = 1 AND channel <> ?2",
+        params![user_id, keep, now],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("deselect notification channels failed: {error}"))
+    })?;
+    Ok(deselected)
+}
+
+/// Point an account at exactly one delivery channel.
+///
+/// Deselection has to land before selection, and not for tidiness: the schema
+/// permits a single selected row per user and SQLite checks that at the end of
+/// every statement, so selecting first would fail on the constraint. Anything
+/// the old channel still had queued is cancelled, which releases its events
+/// back onto the newly selected channel instead of dropping them.
+fn select_delivery_channel(
+    conn: &Connection,
+    user_id: &str,
+    email: &str,
+    channel: &str,
+    now: &str,
+    reason: &str,
+) -> Result<(), AppError> {
+    for deselected in deselect_other_channels(conn, user_id, channel, now)? {
+        cancel_channel_deliveries(conn, email, &deselected, now, reason)?;
+    }
+    let selected = conn
+        .execute(
+            "UPDATE user_notification_channels
+             SET enabled = 1,
+                 revision = revision + CASE WHEN enabled = 0 THEN 1 ELSE 0 END,
+                 updated_at = ?3
+             WHERE user_id = ?1 AND channel = ?2",
+            params![user_id, channel, now],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("select notification channel failed: {error}"))
+        })?;
+    if selected == 0 {
+        return Err(AppError::BadRequest(format!(
+            "notification channel is not configured: {channel}"
+        )));
     }
     Ok(())
 }
@@ -398,16 +601,14 @@ fn enable_email_fallback(
     now: &str,
 ) -> Result<(), AppError> {
     ensure_email_channel(conn, user_id, email, now)?;
-    conn.execute(
-        "UPDATE user_notification_channels
-         SET enabled = 1,
-             revision = revision + CASE WHEN enabled = 0 THEN 1 ELSE 0 END,
-             updated_at = ?2
-         WHERE user_id = ?1 AND channel = 'email'",
-        params![user_id, now],
+    select_delivery_channel(
+        conn,
+        user_id,
+        email,
+        EMAIL_CHANNEL,
+        now,
+        "notification delivery fell back to email",
     )
-    .map_err(|error| AppError::Internal(format!("enable email fallback failed: {error}")))?;
-    Ok(())
 }
 
 impl AppStore {
@@ -429,88 +630,56 @@ impl AppStore {
         patch: UpdateNotificationSettingsRequest,
     ) -> Result<NotificationSettingsResponse, AppError> {
         let email = normalize_email(email)?;
-        let requested = normalize_enabled_channels(&patch.enabled_channels)?;
-        if requested
-            .iter()
-            .any(|channel| channel != EMAIL_CHANNEL && channel != TELEGRAM_CHANNEL)
-        {
-            return Err(AppError::BadRequest(
-                "unsupported notification channel".into(),
-            ));
-        }
+        let channel = parse_delivery_channel(&patch.channel)?;
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
-                AppError::Internal(format!("begin notification settings update failed: {error}"))
+                AppError::Internal(format!(
+                    "begin notification settings update failed: {error}"
+                ))
             })?;
         let user_id = ensure_user_id(&tx, &email)?;
         let runtime = read_bot_runtime(&tx)?;
         let now = Utc::now().to_rfc3339();
-        if requested.contains(TELEGRAM_CHANNEL) {
+        // Telegram is only selectable while it can actually deliver. Email is
+        // always selectable — it is the channel the account is defined by, so
+        // materialise its row rather than rejecting an account that has never
+        // had one written.
+        if channel.is_email() {
+            ensure_email_channel(&tx, &user_id, &email, &now)?;
+        }
+        if channel.is_telegram() {
+            if !runtime.ready() || runtime.transport_status == "degraded" {
+                return Err(telegram_bot_not_ready_error(&runtime));
+            }
             let telegram = read_user_channels(&tx, &user_id)?
                 .into_iter()
                 .find(|row| row.channel == TELEGRAM_CHANNEL);
-            if !runtime.ready()
-                || telegram.as_ref().is_none_or(|row| {
-                    row.state != "ready"
-                        || row.target.is_none()
-                        || row.provider_identity != runtime.bot_id
-                })
-            {
-                return Err(AppError::BadRequest(
-                    "bind a Telegram account to the active bot before enabling this channel".into(),
+            if telegram.as_ref().is_none_or(|row| {
+                row.state != "ready"
+                    || row.target.is_none()
+                    || row.provider_identity != runtime.bot_id
+            }) {
+                return Err(AppError::coded_conflict(
+                    "USER_NOTIFICATION_TELEGRAM_BINDING_REQUIRED",
+                    "bind a Telegram account to the active bot before selecting this channel",
+                    serde_json::json!({ "channel": TELEGRAM_CHANNEL }),
                 ));
             }
         }
-        for channel in [EMAIL_CHANNEL, TELEGRAM_CHANNEL] {
-            let enabled = requested.contains(channel);
-            let current = tx
-                .query_row(
-                    "SELECT enabled FROM user_notification_channels
-                     WHERE user_id = ?1 AND channel = ?2",
-                    params![user_id, channel],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| {
-                    AppError::Internal(format!("read channel preference failed: {error}"))
-                })?
-                .unwrap_or(0)
-                != 0;
-            if channel == TELEGRAM_CHANNEL && current != enabled {
-                tx.execute(
-                    "UPDATE user_notification_channels
-                     SET enabled = ?3, revision = revision + 1, updated_at = ?4
-                     WHERE user_id = ?1 AND channel = ?2",
-                    params![user_id, channel, i64::from(enabled), now],
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!("update Telegram preference failed: {error}"))
-                })?;
-            } else if channel == EMAIL_CHANNEL && current != enabled {
-                tx.execute(
-                    "UPDATE user_notification_channels
-                     SET enabled = ?3, revision = revision + 1, updated_at = ?4
-                     WHERE user_id = ?1 AND channel = ?2",
-                    params![user_id, channel, i64::from(enabled), now],
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!("update email preference failed: {error}"))
-                })?;
-            }
-            if current && !enabled {
-                cancel_channel_deliveries(
-                    &tx,
-                    &email,
-                    channel,
-                    &now,
-                    "notification channel disabled by user",
-                )?;
-            }
-        }
+        select_delivery_channel(
+            &tx,
+            &user_id,
+            &email,
+            channel.as_str(),
+            &now,
+            "notification delivery channel switched by user",
+        )?;
         tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit notification settings update failed: {error}"))
+            AppError::Internal(format!(
+                "commit notification settings update failed: {error}"
+            ))
         })?;
         drop(conn);
         self.get_notification_settings(&email).await
@@ -534,10 +703,8 @@ impl AppStore {
                 AppError::Internal(format!("begin Telegram bind-link issue failed: {error}"))
             })?;
         let runtime = read_bot_runtime(&tx)?;
-        if !runtime.ready() {
-            return Err(AppError::ServiceUnavailable(
-                "the Telegram bot is not ready".into(),
-            ));
+        if !runtime.ready() || runtime.transport_status == "degraded" {
+            return Err(telegram_bot_not_ready_error(&runtime));
         }
         let bot_id = runtime.bot_id.as_deref().unwrap_or_default();
         let bot_username = runtime.username.as_deref().unwrap_or_default();
@@ -632,9 +799,7 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                AppError::Internal(format!("begin Telegram bind failed: {error}"))
-            })?;
+            .map_err(|error| AppError::Internal(format!("begin Telegram bind failed: {error}")))?;
         let record = tx
             .query_row(
                 "SELECT user_id, email_normalized, bot_id, expires_at, revoked_at,
@@ -657,8 +822,15 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("query Telegram bind token failed: {error}"))
             })?;
-        let Some((user_id, email, token_bot_id, expires_at, revoked_at, consumed_at, consumed_chat)) =
-            record
+        let Some((
+            user_id,
+            email,
+            token_bot_id,
+            expires_at,
+            revoked_at,
+            consumed_at,
+            consumed_chat,
+        )) = record
         else {
             return Ok(BindOutcome::InvalidToken);
         };
@@ -694,6 +866,19 @@ impl AppStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.trim_start_matches('@').to_string());
+        // Binding is the selection. A user who has just proved they own a chat
+        // wants alerts there, so the account switches over instead of waiting
+        // for a second visit to the settings page — and whatever email had
+        // queued is cancelled and re-fanned onto Telegram rather than lost.
+        for deselected in deselect_other_channels(&tx, &user_id, TELEGRAM_CHANNEL, &now_text)? {
+            cancel_channel_deliveries(
+                &tx,
+                &email,
+                &deselected,
+                &now_text,
+                "notification delivery moved to Telegram on bind",
+            )?;
+        }
         tx.execute(
             "INSERT INTO user_notification_channels (
                 user_id, channel, enabled, state, target, target_label, provider_identity,
@@ -715,19 +900,16 @@ impl AppStore {
              WHERE token_hash = ?3",
             params![now_text, chat_id, token_hash],
         )
-        .map_err(|error| AppError::Internal(format!("consume Telegram bind token failed: {error}")))?;
-        revoke_active_bind_tokens(&tx, Some(&user_id), &now_text)?;
-        let enabled_channels = read_user_channels(&tx, &user_id)?
-            .into_iter()
-            .filter(|row| row.enabled && row.state == "ready")
-            .map(|row| row.channel)
-            .collect();
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit Telegram bind failed: {error}"))
+        .map_err(|error| {
+            AppError::Internal(format!("consume Telegram bind token failed: {error}"))
         })?;
+        revoke_active_bind_tokens(&tx, Some(&user_id), &now_text)?;
+        let delivery_channel = selected_channel(&read_user_channels(&tx, &user_id)?);
+        tx.commit()
+            .map_err(|error| AppError::Internal(format!("commit Telegram bind failed: {error}")))?;
         Ok(BindOutcome::Bound {
             email,
-            enabled_channels,
+            delivery_channel,
         })
     }
 
@@ -739,10 +921,13 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| AppError::Internal(format!("begin Telegram unbind failed: {error}")))?;
+            .map_err(|error| {
+                AppError::Internal(format!("begin Telegram unbind failed: {error}"))
+            })?;
         let user_id = ensure_user_id(&tx, &email)?;
         let now = Utc::now().to_rfc3339();
-        enable_email_fallback(&tx, &user_id, &email, &now)?;
+        // Release Telegram before claiming email: only one channel may be
+        // selected at a time, so the order here is the constraint's order.
         tx.execute(
             "UPDATE user_notification_channels
              SET enabled = 0, state = 'unbound', target = NULL, target_label = NULL,
@@ -760,6 +945,7 @@ impl AppStore {
             &now,
             "Telegram channel unbound by user",
         )?;
+        enable_email_fallback(&tx, &user_id, &email, &now)?;
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit Telegram unbind failed: {error}"))
         })?;
@@ -827,7 +1013,9 @@ impl AppStore {
             )
             .optional()
             .map_err(|error| {
-                AppError::Internal(format!("query unreachable Telegram delivery failed: {error}"))
+                AppError::Internal(format!(
+                    "query unreachable Telegram delivery failed: {error}"
+                ))
             })?
             .ok_or_else(|| {
                 AppError::Conflict(
@@ -860,18 +1048,21 @@ impl AppStore {
             _ => None,
         };
         let now_text = now.to_rfc3339();
-        let changed = tx.execute(
-            "UPDATE notification_deliveries
+        let changed = tx
+            .execute(
+                "UPDATE notification_deliveries
              SET status = 'dead_letter', failure_kind = 'endpoint_unreachable',
                  error_message = ?3, blocked_reason_code = NULL,
                  next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
                  updated_at = ?4
              WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
-            params![delivery_id, worker_id, error_message, now_text],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("finish unreachable Telegram delivery failed: {error}"))
-        })?;
+                params![delivery_id, worker_id, error_message, now_text],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "finish unreachable Telegram delivery failed: {error}"
+                ))
+            })?;
         if changed != 1 {
             return Err(AppError::Conflict(
                 "Telegram delivery claim is no longer owned by this worker".into(),
@@ -884,11 +1075,12 @@ impl AppStore {
             params![delivery_id, now_text, error_message],
         )
         .map_err(|error| {
-            AppError::Internal(format!("finish unreachable Telegram attempt failed: {error}"))
+            AppError::Internal(format!(
+                "finish unreachable Telegram attempt failed: {error}"
+            ))
         })?;
         release_delivery_events_for_retry(&tx, delivery_id, &now_text)?;
         if let Some((user_id, email)) = binding.as_ref() {
-            enable_email_fallback(&tx, user_id, email, &now_text)?;
             tx.execute(
                 "UPDATE user_notification_channels
                  SET enabled = 0, state = 'invalid', target = NULL, target_label = NULL,
@@ -908,6 +1100,7 @@ impl AppStore {
                 &now_text,
                 "Telegram endpoint became unreachable",
             )?;
+            enable_email_fallback(&tx, user_id, email, &now_text)?;
         }
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit Telegram fallback failed: {error}"))
@@ -982,12 +1175,28 @@ impl AppStore {
         if previous_fingerprint.as_deref() != Some(config_fingerprint) {
             revoke_active_bind_tokens(&tx, None, &now)?;
         }
-        tx.execute(
-            "UPDATE telegram_bot_runtime
-             SET readiness = 'reconciling', config_fingerprint = ?1,
-                 last_error = NULL, updated_at = ?2 WHERE id = 1",
-            params![config_fingerprint, now],
-        )
+        if previous_fingerprint.as_deref() != Some(config_fingerprint) {
+            tx.execute(
+                "UPDATE telegram_bot_runtime
+                 SET readiness = 'reconciling', config_fingerprint = ?1,
+                     transport_status = 'unknown', last_error = NULL,
+                     last_failure_code = NULL, last_failure_hint = NULL,
+                     last_failure_details_json = NULL, last_failure_at = NULL,
+                     updated_at = ?2 WHERE id = 1",
+                params![config_fingerprint, now],
+            )
+        } else {
+            // Keep the last actionable failure visible while a retry for the
+            // same configuration is in flight. Clearing it here made a
+            // transient DNS outage flicker between a useful diagnosis and a
+            // generic "reconciling" state every retry interval.
+            tx.execute(
+                "UPDATE telegram_bot_runtime
+                 SET readiness = CASE WHEN readiness = 'error' THEN 'error' ELSE 'reconciling' END,
+                     updated_at = ?1 WHERE id = 1",
+                params![now],
+            )
+        }
         .map_err(|error| {
             AppError::Internal(format!("mark Telegram bot reconciling failed: {error}"))
         })?;
@@ -1023,9 +1232,7 @@ impl AppStore {
             let rows = statement
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|error| {
-                    AppError::Internal(format!(
-                        "query Telegram disabled fallback failed: {error}"
-                    ))
+                    AppError::Internal(format!("query Telegram disabled fallback failed: {error}"))
                 })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
                 AppError::Internal(format!("read Telegram disabled fallback failed: {error}"))
@@ -1042,7 +1249,11 @@ impl AppStore {
         }
         tx.execute(
             "UPDATE telegram_bot_runtime
-             SET readiness = 'disabled', last_error = NULL, updated_at = ?1 WHERE id = 1",
+             SET readiness = 'disabled', transport_status = 'unknown',
+                 config_fingerprint = NULL,
+                 last_error = NULL, last_failure_code = NULL,
+                 last_failure_hint = NULL, last_failure_details_json = NULL,
+                 last_failure_at = NULL, updated_at = ?1 WHERE id = 1",
             params![now],
         )
         .map_err(|error| {
@@ -1057,17 +1268,150 @@ impl AppStore {
     pub async fn mark_telegram_bot_error(
         &self,
         config_fingerprint: &str,
-        error: &str,
+        failure: &TelegramFailure,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let details = failure
+            .diagnostics
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok());
         conn.execute(
             "UPDATE telegram_bot_runtime
-             SET readiness = 'error', config_fingerprint = ?1, last_error = ?2,
-                 updated_at = ?3 WHERE id = 1",
-            params![config_fingerprint, error, Utc::now().to_rfc3339()],
+             SET readiness = 'error', transport_status = 'degraded',
+                 config_fingerprint = ?1, last_error = ?2,
+                 last_failure_code = ?3, last_failure_hint = ?4,
+                 last_failure_details_json = ?5, last_failure_at = ?6,
+                 updated_at = ?6
+             WHERE id = 1 AND config_fingerprint = ?1",
+            params![
+                config_fingerprint,
+                failure.message,
+                failure.code.as_str(),
+                failure.hint,
+                details,
+                now,
+            ],
         )
         .map_err(|database_error| {
             AppError::Internal(format!("mark Telegram bot error failed: {database_error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn mark_telegram_bot_transport_failure(
+        &self,
+        config_fingerprint: &str,
+        failure: &TelegramFailure,
+    ) -> Result<(), AppError> {
+        let details = failure
+            .diagnostics
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok());
+        self.mark_telegram_bot_transport_failure_metadata(
+            config_fingerprint,
+            Some(failure.code.as_str()),
+            Some(&failure.hint),
+            &failure.message,
+            details.as_deref(),
+        )
+        .await
+    }
+
+    pub async fn mark_telegram_bot_transport_failure_metadata(
+        &self,
+        config_fingerprint: &str,
+        failure_code: Option<&str>,
+        failure_hint: Option<&str>,
+        failure_message: &str,
+        failure_details_json: Option<&str>,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE telegram_bot_runtime
+             SET transport_status = 'degraded', last_error = ?1,
+                 last_failure_code = ?2, last_failure_hint = ?3,
+                 last_failure_details_json = ?4, last_failure_at = ?5,
+                 updated_at = ?5
+             WHERE id = 1 AND config_fingerprint = ?6",
+            params![
+                failure_message,
+                failure_code,
+                failure_hint,
+                failure_details_json,
+                now,
+                config_fingerprint,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("mark Telegram transport failure failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn mark_telegram_bot_transport_healthy(
+        &self,
+        config_fingerprint: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin Telegram transport recovery failed: {error}"))
+            })?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE telegram_bot_runtime
+             SET transport_status = 'healthy', last_error = NULL,
+                 last_failure_code = NULL, last_failure_hint = NULL,
+                 last_failure_details_json = NULL, last_failure_at = NULL,
+                 updated_at = ?1
+             WHERE id = 1 AND config_fingerprint = ?2",
+            params![now, config_fingerprint],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("mark Telegram transport healthy failed: {error}"))
+        })?;
+        resume_telegram_deliveries_for_fingerprint(&tx, config_fingerprint, &now)?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit Telegram transport recovery failed: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// A successful `sendMessage` proves the Bot API transport works, but it
+    /// does not prove that this process owns the polling lease. Keep a
+    /// recorded `polling_conflict` until a subsequent `getUpdates` succeeds.
+    pub async fn mark_telegram_bot_delivery_healthy(
+        &self,
+        config_fingerprint: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin Telegram delivery recovery failed: {error}"))
+            })?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE telegram_bot_runtime
+             SET transport_status = 'healthy', last_error = NULL,
+                 last_failure_code = NULL, last_failure_hint = NULL,
+                 last_failure_details_json = NULL, last_failure_at = NULL,
+                 updated_at = ?1
+             WHERE id = 1 AND config_fingerprint = ?2
+               AND COALESCE(last_failure_code, '') <> 'polling_conflict'",
+            params![now, config_fingerprint],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("mark Telegram delivery healthy failed: {error}"))
+        })?;
+        resume_telegram_deliveries_for_fingerprint(&tx, config_fingerprint, &now)?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit Telegram delivery recovery failed: {error}"))
         })?;
         Ok(())
     }
@@ -1078,6 +1422,22 @@ impl AppStore {
         username: &str,
         config_fingerprint: &str,
     ) -> Result<TelegramIdentityApplied, AppError> {
+        self.apply_telegram_bot_identity_fenced(bot_id, username, config_fingerprint, None)
+            .await
+    }
+
+    /// Apply a verified identity only if the runtime row still belongs to the
+    /// reconcile attempt that performed the verification. The unfenced public
+    /// wrapper above remains useful for explicit bootstrap/administrative
+    /// rotation; the background service always supplies the expected
+    /// fingerprint.
+    pub async fn apply_telegram_bot_identity_fenced(
+        &self,
+        bot_id: &str,
+        username: &str,
+        config_fingerprint: &str,
+        expected_fingerprint: Option<&str>,
+    ) -> Result<TelegramIdentityApplied, AppError> {
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1085,6 +1445,14 @@ impl AppStore {
                 AppError::Internal(format!("begin Telegram identity apply failed: {error}"))
             })?;
         let previous = read_bot_runtime(&tx)?;
+        if let Some(expected) = expected_fingerprint
+            && (previous.config_fingerprint.as_deref() != Some(expected)
+                || !matches!(previous.readiness.as_str(), "reconciling" | "error"))
+        {
+            return Err(AppError::Conflict(
+                "Telegram configuration changed while identity was being verified".into(),
+            ));
+        }
         let identity_changed = previous
             .bot_id
             .as_deref()
@@ -1117,16 +1485,6 @@ impl AppStore {
                     AppError::Internal(format!("read old Telegram bindings failed: {error}"))
                 })?
             };
-            for (user_id, email) in &bindings {
-                enable_email_fallback(&tx, user_id, email, &now)?;
-                cancel_channel_deliveries(
-                    &tx,
-                    email,
-                    TELEGRAM_CHANNEL,
-                    &now,
-                    "Telegram bot identity changed",
-                )?;
-            }
             tx.execute(
                 "UPDATE user_notification_channels
                  SET enabled = 0, state = 'invalid', target = NULL, target_label = NULL,
@@ -1138,6 +1496,18 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("invalidate old Telegram bindings failed: {error}"))
             })?;
+            // Only once every stale binding is released can these accounts
+            // claim email — a user may hold one selected channel, no more.
+            for (user_id, email) in &bindings {
+                cancel_channel_deliveries(
+                    &tx,
+                    email,
+                    TELEGRAM_CHANNEL,
+                    &now,
+                    "Telegram bot identity changed",
+                )?;
+                enable_email_fallback(&tx, user_id, email, &now)?;
+            }
             if let Some(previous_bot_id) = previous.bot_id.as_deref() {
                 tx.execute(
                     "UPDATE telegram_inbound_updates
@@ -1157,16 +1527,47 @@ impl AppStore {
         };
         let generation = previous.generation
             + i64::from(identity_changed || config_changed || previous.readiness != "ready");
-        tx.execute(
-            "UPDATE telegram_bot_runtime
+        // `reconcile` fences an in-flight identity check by first moving the
+        // row to `reconciling` with the desired fingerprint.  Keep that
+        // compare-and-swap strict so a stale HTTP response cannot publish an
+        // older bot identity.  Direct callers (including the initial runtime
+        // bootstrap and administrative tests) may apply an identity while
+        // the row is already stable; in that case there is no in-flight
+        // reconcile to fence.
+        let updated = tx
+            .execute(
+                "UPDATE telegram_bot_runtime
              SET readiness = 'ready', bot_id = ?1, username = ?2,
-                 config_fingerprint = ?3, generation = ?4, last_error = NULL,
-                 verified_at = ?5, updated_at = ?5 WHERE id = 1",
-            params![bot_id, username, config_fingerprint, generation, now],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("persist Telegram bot identity failed: {error}"))
-        })?;
+                 config_fingerprint = ?3, generation = ?4,
+                 transport_status = 'healthy', last_error = NULL,
+                 last_failure_code = NULL, last_failure_hint = NULL,
+                 last_failure_details_json = NULL, last_failure_at = NULL,
+                 verified_at = ?5, updated_at = ?5
+                 WHERE id = 1
+                   AND (
+                       ?6 IS NULL
+                       OR (
+                           config_fingerprint = ?6
+                           AND readiness IN ('reconciling', 'error')
+                       )
+                   )",
+                params![
+                    bot_id,
+                    username,
+                    config_fingerprint,
+                    generation,
+                    now,
+                    expected_fingerprint,
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("persist Telegram bot identity failed: {error}"))
+            })?;
+        if updated != 1 {
+            return Err(AppError::Conflict(
+                "Telegram configuration changed while identity was being verified".into(),
+            ));
+        }
         tx.execute(
             "UPDATE notification_deliveries
              SET status = 'retry', next_attempt_at = ?2, error_message = NULL,
@@ -1236,7 +1637,11 @@ pub fn notification_targets_tx(
     }))
 }
 
-pub fn telegram_config_fingerprint(token: &str, mode: &str, webhook_secret: Option<&str>) -> String {
+pub fn telegram_config_fingerprint(
+    token: &str,
+    mode: &str,
+    webhook_secret: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.trim().as_bytes());
     hasher.update([0]);
@@ -1248,8 +1653,6 @@ pub fn telegram_config_fingerprint(token: &str, mode: &str, webhook_secret: Opti
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
 
     #[test]
@@ -1277,16 +1680,108 @@ mod tests {
     }
 
     #[test]
-    fn enabled_channel_input_is_a_set() {
-        let channels = normalize_enabled_channels(&[
-            "telegram".into(),
-            "email".into(),
-            "telegram".into(),
-        ])
-        .expect("channels");
+    fn runtime_failure_details_include_safe_technical_error() {
+        let runtime = TelegramBotRuntime {
+            readiness: "error".into(),
+            transport_status: "degraded".into(),
+            bot_id: None,
+            username: None,
+            config_fingerprint: Some("fingerprint".into()),
+            generation: 1,
+            last_error: Some("request failed; cause: timeout".into()),
+            last_failure_code: Some("api_timeout".into()),
+            last_failure_hint: Some("check DNS".into()),
+            last_failure_details: Some(serde_json::json!({
+                "host": "api.telegram.org",
+                "resolvedAddresses": ["192.0.2.1"],
+            })),
+            last_failure_at: Some("2026-01-01T00:00:00Z".into()),
+            verified_at: None,
+        };
+        let details = telegram_failure_details(&runtime).expect("diagnostic details");
+        assert_eq!(details["technicalError"], "request failed; cause: timeout");
+        assert_eq!(details["resolvedAddresses"][0], "192.0.2.1");
+    }
+
+    #[test]
+    fn degraded_transport_is_not_advertised_as_an_available_channel() {
+        let runtime = TelegramBotRuntime {
+            readiness: "ready".into(),
+            transport_status: "degraded".into(),
+            bot_id: Some("123".into()),
+            username: Some("router_bot".into()),
+            config_fingerprint: Some("fingerprint".into()),
+            generation: 1,
+            last_error: Some("request failed".into()),
+            last_failure_code: Some("api_endpoint_unreachable".into()),
+            last_failure_hint: Some("check DNS".into()),
+            last_failure_details: None,
+            last_failure_at: Some("2026-01-01T00:00:00Z".into()),
+            verified_at: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let response = settings_response("owner@example.com", &[], &runtime);
+        let telegram = response
+            .channels
+            .iter()
+            .find(|channel| channel.channel == TELEGRAM_CHANNEL)
+            .expect("Telegram channel");
+        assert!(!telegram.available);
+        assert_eq!(response.telegram_bot_transport_status, "degraded");
+    }
+
+    #[test]
+    fn only_one_channel_is_ever_reported_as_the_delivery_channel() {
+        let runtime = TelegramBotRuntime {
+            readiness: "ready".into(),
+            transport_status: "healthy".into(),
+            bot_id: Some("123".into()),
+            username: Some("router_bot".into()),
+            config_fingerprint: Some("fingerprint".into()),
+            generation: 1,
+            last_error: None,
+            last_failure_code: None,
+            last_failure_hint: None,
+            last_failure_details: None,
+            last_failure_at: Some("2026-01-01T00:00:00Z".into()),
+            verified_at: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let rows = vec![
+            channel_row(EMAIL_CHANNEL, false, "ready"),
+            channel_row(TELEGRAM_CHANNEL, true, "ready"),
+        ];
+        let response = settings_response("owner@example.com", &rows, &runtime);
+        assert_eq!(response.delivery_channel, TELEGRAM_CHANNEL);
         assert_eq!(
-            channels,
-            BTreeSet::from([EMAIL_CHANNEL.into(), TELEGRAM_CHANNEL.into()])
+            response
+                .channels
+                .iter()
+                .filter(|channel| channel.enabled)
+                .count(),
+            1
         );
+    }
+
+    #[test]
+    fn an_account_with_nothing_selected_still_reports_email() {
+        assert_eq!(selected_channel(&[]), EMAIL_CHANNEL);
+        // A bot that went away leaves the row selected but not ready; email is
+        // where those notifications actually land, so that is what we report.
+        assert_eq!(
+            selected_channel(&[channel_row(TELEGRAM_CHANNEL, true, "invalid")]),
+            EMAIL_CHANNEL
+        );
+    }
+
+    fn channel_row(channel: &str, enabled: bool, state: &str) -> UserChannelRow {
+        UserChannelRow {
+            channel: channel.into(),
+            enabled,
+            state: state.into(),
+            target: Some("target".into()),
+            target_label: None,
+            provider_identity: None,
+            revision: 1,
+            verified_at: None,
+        }
     }
 }

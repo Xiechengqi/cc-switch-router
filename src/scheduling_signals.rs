@@ -1,13 +1,13 @@
-//! Router-side scheduling signal computation for market consumers.
+//! Router-side scheduling signal computation for signed capacity consumers.
 //!
-//! The market sorts shares using a base score that combines three signals:
+//! A Gateway can sort shares using a base score that combines three signals:
 //! [`QuotaHealth`], [`Stability`], and [`Headroom`]. The router owns ground
 //! truth for all three (upstream quota fields, health-check history, live
-//! concurrency counters) so it computes them once per `/v1/market/shares`
-//! response. The market then applies its profile-specific sort on top.
+//! concurrency counters) so it computes them once per `/v1/gateway/shares`
+//! response. The consumer then applies its own scheduling policy on top.
 //!
 //! [`OverrideStore`] holds per-owner penalty multipliers seeded by 429
-//! feedback from markets, so a transient upstream rate-limit decays without
+//! feedback from Gateways, so a transient upstream rate-limit decays without
 //! requiring a DB write.
 //!
 //! See `docs/scheduling/router-signals.md` (TBD) for the full design.
@@ -48,7 +48,7 @@ const OVERRIDE_DEFAULT_TTL: Duration = Duration::from_secs(30 * 60);
 /// per minute is expected.
 ///
 /// Currently only exercised via unit tests; the production path computes
-/// each signal individually inside `list_market_shares` for SQL-row locality.
+/// each signal individually while listing capacity shares for SQL-row locality.
 #[allow(dead_code)]
 pub fn compute_share_signals(
     quota: Option<&ShareUpstreamQuota>,
@@ -159,8 +159,8 @@ fn tier_ttl_secs(resets_at: Option<&str>, now: DateTime<Utc>) -> Option<i64> {
 /// In-memory store of per-owner penalty multipliers (range `(0.0, 1.0]`).
 /// A value of `1.0` means "no penalty". Lower values down-rank the share.
 ///
-/// Markets push 429/rate_limited feedback via
-/// `POST /v1/market/shares/feedback`; the router scopes the penalty to the
+/// Gateways push 429/rate_limited feedback via
+/// `POST /v1/gateway/shares/feedback`; the router scopes the penalty to the
 /// owner email (shared upstream credentials → shared rate limit) and expires
 /// it after `OVERRIDE_DEFAULT_TTL` unless renewed.
 #[derive(Debug, Default)]
@@ -232,7 +232,7 @@ impl OverrideStore {
     }
 }
 
-/// Request body for `POST /v1/market/shares/feedback`.
+/// Request body for `POST /v1/gateway/shares/feedback`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareFeedbackRequest {
@@ -267,7 +267,7 @@ pub struct ShareFeedbackResponse {
     pub expires_in_secs: u64,
 }
 
-/// Request body for `POST /v1/market/shares/headroom`.
+/// Request body for `POST /v1/gateway/shares/headroom`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareHeadroomRequest {

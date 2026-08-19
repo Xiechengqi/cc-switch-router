@@ -2,7 +2,7 @@
 
 本文档记录 `cc-switch-router`(以下简称 Router)与 `cc-switch-server`(以下简称 Server)之间的接口契约。
 
-Server 是唯一可以注册为 **Client installation**、建立隧道并出现在 Client 监控中的程序。Dashboard 浏览器和 Market 服务使用独立的 **auth device** 身份,不会创建 Client。
+Server 是唯一可以注册为 **Client installation**、建立隧道并出现在 Client 监控中的程序。Dashboard 浏览器和公开 Share Web 使用独立的 **auth device** 身份,不会创建 Client。Router 内建 Share/Client Market 与未来外部容量平台通过独立的 Gateway 身份接入；它们不是 Client installation。
 
 本文所有断言均标注 Router 侧源码位置(`file:line`),便于与实现对账。
 
@@ -53,7 +53,7 @@ Server 首次启动时生成 Ed25519 密钥对,公钥随注册请求上送。请
 
 `POST /v1/auth/devices/register`
 
-Dashboard、公开 Share Web 和 Market 服务生成独立 Ed25519 密钥对并注册 auth device。请求字段为:
+Dashboard 和公开 Share Web 生成独立 Ed25519 密钥对并注册 auth device。请求字段为:
 `protocolEpoch`、`publicKey`、`kind`、`platform`、`appVersion`、`instanceNonce`、`timestampMs`、`signature`;`kind` 只允许 `browser` 或 `service`。
 
 **签名规范串**:
@@ -99,6 +99,60 @@ Dashboard 浏览器通过 `POST /v1/auth/devices/register` 建立 `kind=browser`
 
 Client Web 邮箱登录使用 `/v1/client-web/auth/email/request-code` 和 `/v1/client-web/auth/email/verify-code`,由 Server 使用自己的 installation 私钥签名,因此 challenge 来源是 `client_installation`。Session 创建后只由 access/refresh token 标识；refresh 请求只提交 `refreshToken`,不会把 Session 生命周期绑到来源记录是否仍存在。
 
+### 2.3 Gateway（中性容量接入身份）
+
+Gateway 不是 Client，也不是旧 Token Market 注册。它是一个外部容量消费者在**单个 Router**上的 Ed25519 公钥身份。当前注册接口仍是公开的基础注册；`ownerEmail` 是调用方自报、未验证的本地审计元数据，不参与 Share 可见性、proxy、headroom、feedback 或 observation 授权，也不会创建下游用户、API key、余额或 token 账本：
+
+`POST /v1/gateways/register`
+
+请求字段：`ownerEmail`、`displayName`、`publicKey`（Ed25519 公钥，标准 base64），以及可选的 `publicBaseUrl`、`appVersion`。同一公钥重复注册会更新该 Gateway 的显示信息并复用 `gatewayId`；当前默认授予固定 scope，撤销、轮换和 tenant 绑定尚未形成版本化外部 contract。由于还没有中性的 tenant/seat grant，且旧 `forSale=Yes + marketAccessMode=all` 已退役，Gateway 当前看不到任何普通 Share；inventory、proxy、headroom、feedback 和 observation 都必须 fail-closed，不能用自报邮箱、`freeAccess` 或 email ShareTo 绕过。
+
+除注册外，Gateway 请求必须携带以下 headers：
+
+| Header | 说明 |
+|---|---|
+| `x-cc-gateway-id` | Router 返回的 Gateway ID |
+| `x-cc-gateway-timestamp-ms` | Unix 毫秒时间戳 |
+| `x-cc-gateway-nonce` | 单次随机 nonce；Router 记录并拒绝重复值 |
+| `x-cc-gateway-signature` | Ed25519 签名，标准 base64 |
+
+当前签名规范串**准确为**（不含 HTTP method、path 或 protocol epoch）：
+
+```
+{gateway_id}\n{action}\n{body_sha256_hex}\n{timestamp_ms}\n{nonce}
+```
+
+`body_sha256_hex` 是实际请求体原始字节的 SHA-256 小写十六进制；无 body 的 GET 使用空字节串 hash；JSON 请求使用 Router/调用方序列化后的实际字节。Router 当前接受约 ±60 秒时间偏差，nonce 保留约 10 分钟。控制平面 `control_secret` 的 HMAC 规范（第 7 节）与 Gateway Ed25519 签名互不相同。
+
+当前保留的 Gateway 端点：
+
+| 方法 | 路径 | 必需 scope / action | 说明 |
+|---|---|---|---|
+| `GET` | `/v1/gateway/shares` | `gateway:shares:read` / `gateway:shares:read` | 返回本 Router 可见的 Share capacity 与脱敏运行信号；wire 使用 opaque `shareName`，不包含 Share/installation owner 或 Provider account email |
+| `POST` | `/v1/gateway/shares/headroom` | `gateway:shares:read` / `gateway:shares:headroom` | 只查询该 Gateway 当前可见 Share 的并发余量；混入越权 ID 整批拒绝 |
+| `POST` | `/v1/gateway/shares/feedback` | `gateway:feedback:write` / `gateway:shares:feedback` | 只对该 Gateway 当前可见的 Share 上报限流/配额反馈 |
+| `POST` | `/v1/gateway/request-logs/batch` | `gateway:request_logs:write` / `gateway:request_logs:batch` | 幂等写入脱敏 Gateway observation（最多 500 条/批）；带 Share ID 的记录必须属于当前可见集 |
+| `ANY` | `/_gateway/proxy/:share_id/*path` | `gateway:proxy:use` / `gateway:proxy` | 经过 Share ACL、App 路径和并发检查后转发 |
+
+Gateway observation 的 active payload 只接收 request ID、Router/Share/model、请求 agent、状态/HTTP 状态、错误、延迟、token 数、时间与地域。它使用 `deny_unknown_fields`，明确拒绝旧 `userEmail`、`apiKeyPrefix`、`usageAmountUsd`、`settledAt` 以及尚未定义的 `tenantId`/`consumerRef`；`settled` 也不是合法 active 状态。Router 的 metrics 只投影 `gateway_id`，不写 USD cost 或 legacy `market_email`；兼容观测视图也只保留专属 `gateway_id` 列，Gateway 行的 `user_email` 固定为 `NULL`，因此不会进入用户用量或配额身份聚合。
+
+Gateway inventory wire 不序列化 Share owner email、installation owner email、Provider account email 或 Provider API URL。`shareName` 是由 Share ID 派生的稳定 opaque label，不是 Server 的 owner-derived display name；Owner email 仅可作为 Router 进程内的 owner-scope feedback 分组键，不得成为外部 inventory 字段。这条边界必须在未来启用 tenant/seat grant 时继续保持。
+
+Gateway proxy 的当前签名只绑定 Gateway ID、固定 action、原始 body hash、时间戳和 nonce；method/path/share ID 未进入签名域，后续版本必须在 contract review 中决定是否补强。Router 不为 Gateway 伪造终端用户邮箱，因此非免费 Share 的最终用户授权仍由未来平台/新 contract 解决；当前不能宣称跨 Router Token Market 已可用。
+
+### 2.4 旧 Token Market 路径
+
+以下旧注册、bearer、Market host、通知和代理路径均已退役，Router 对已知及其子路径统一返回 `410 Gone`，不会回落到 UI 或 Client tunnel：
+
+```text
+/v1/markets*
+/v1/market/*
+/v1/admin/markets/*
+/_market/proxy/*
+```
+
+它们只在 frozen baseline、migration 19/21、显式 `410` 和负向退休测试中出现；migration 21 完成后不存在可查询的旧 archive。Share Market、Client Market、`/v1/market-access/*` 与 `/v1/market-billing/*` 是 Router 内建能力，名称中的 market 不表示旧 Token Market。
+
 ---
 
 ## 4. Lease:一次性 SSH 凭证
@@ -123,10 +177,11 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 - `capacityPoolId` 是非空匿名标识。同一 Router 下复用相同物理账号或 API key 的不同 Share URL 使用同一值,用于容量与故障域去重；该值在凭据源不变期间稳定，账号绑定或 API key 改变时必须重新派生并同步。
 - `bindings` 必须包含 1 到 3 个不同 app 的 `{ app: providerId }` 绑定,app 仅允许 `claude`、`codex`、`gemini`;顶层 `appType` / `providerId` 必须对应其中一个绑定。
-- `support` 表示当前对外开启的 App API。关闭某个 API 不会删除对应 binding；至少保留一个已绑定 app 为开启。未开启的 app 不接受直连、Market 和 Gateway 请求。
-- `appRuntimes`、`appProviders`、`appSettings` 和分 app 价格只可声明已绑定 app。多 app Share 的远程 ACL、限额、到期时间、描述、子域名和价格百分比必须一致。
+- `support` 表示当前对外开启的 App API。关闭某个 API 不会删除对应 binding；至少保留一个已绑定 app 为开启。未开启的 app 不接受直连、Share Market 或 Gateway 请求。
+- `appRuntimes`、`appProviders` 与 `appAvailability` 只可声明已绑定 app。访问策略由 Share 级 `freeAccess` 与 `userGrants` 统一定义；Contract v2 不包含分 app ACL、`appSettings` 或普通 Share 价格字段。
+- `userGrants[].usage` 是当前周期的 Server 派生快照；可选的 `usageRebase` 是 Server-owned 的官方额度重置基线。Router 必须原样 round-trip 该字段并使用 descriptor 中的有效 usage 做限制判断，不能通过普通设置补丁伪造或修改基线。
 - `upstreamProvider`、`appRuntimes` 和 `appProviders` 中的 Provider 投影携带有效 `modelPolicy`，并用 `modelPolicyScope=global|per_app` 与 `modelPolicySource=bundle_global|app_independent|profile_fixed` 明确控制来源。`global` 只统一 Bundle 中可配置的 Surface；Profile 固定策略可不同且必须标记为 `profile_fixed`。这些字段属于静态 descriptor 指纹，单独切换 scope 也必须提升投影并同步 Router。
-- 调用 app 只由 URL 协议路径判定,客户端提供的 app header 不参与授权。未绑定 app 的直连、Market 和 Gateway 请求均被拒绝。
+- 调用 app 只由 URL 协议路径判定,客户端提供的 app header 不参与授权。未绑定 app 的直连、Share Market 和 Gateway 请求均被拒绝。
 
 已连接的 Server 使用签名续期 API 在**原 SSH 连接上**续期,不按 lease TTL 周期重建连接。
 
@@ -149,7 +204,7 @@ SSH 侧约束(`src/ssh.rs`):
 - 只放行 `tcpip_forward` / `cancel_tcpip_forward`
 - lease 的 `generation` 必须**严格大于**当前活跃世代,否则候选被判定为陈旧而拒绝(`src/proxy.rs:695`)
 
-Router 在收到 `tcpip_forward` 后绑定本地 TCP 监听(`0.0.0.0`/`::` 归一化为 `127.0.0.1`),注册为候选路由。`market-http` 类型直接提升为活跃;client-web 与 share 隧道需经 `activate` 显式提升。
+Router 在收到 `tcpip_forward` 后绑定本地 TCP 监听(`0.0.0.0`/`::` 归一化为 `127.0.0.1`),注册为候选路由。Client-web 与 Share 隧道需经 `activate` 显式提升；旧 `market-http` lease 会被拒绝，不再创建候选路由。
 
 SSH 断连或 `cancel_tcpip_forward` 时,`ForwardHandle::shutdown` 移除该世代并中止监听任务。
 
@@ -166,7 +221,7 @@ SSH 断连或 `cancel_tcpip_forward` 时,`ForwardHandle::shutdown` 移除该世�
 | 用途 | Server 属主自己的管理端点 | 对外提供的额度共享端点 |
 | 数量 | 每 installation 一条 | 每个启用的 share 一条 |
 
-`market-http` 是第三种类型,由 Router 侧市场组件使用(`src/store.rs:5932`),不由 Server 申请。
+当前只有 Client-web 与 Share 两种 tunnel type。旧 `market-http` 属于已退役 Token Market 集成，Router 在 lease/SSH 层 fail closed；Client 不应申请或识别该值。
 
 子域名格式与保留字规则见 `src/namespace.rs`:分隔符固定为 `--`,slug 为 6–30 位小写字母数字连字符、必须以字母开头、不得含连续 `--`,组合后须满足 DNS 63 字节限制。保留标签:`admin`、`api`、`cdn-cgi`、`router`、`www`。
 
@@ -217,6 +272,8 @@ Server 要求:
 2. pending-edit 应用路径接受 managed grant,写入/移除 `routerShareMarket` grant。
 3. 普通用户编辑不得修改或删除 `manager=routerShareMarket` 的 grant。
 4. edit-ack(`POST /v1/shares/edit-ack`)成功后,Router 将订阅从 `grant_pending` 推进到 `active_free` 或 `active_postpaid`,或完成 revoke 后释放座位。
+
+用户“已消耗 Token / 周期起点”重基线只由 Server Provider 编辑入口提交 `userUsageEdits`；Router Share Market grant 仍只读。重基线变化会带来新的 descriptor generation，普通请求 usage 计数不会触发同步风暴。
 
 浏览器侧 HTTP 契约(用户 Session):
 
@@ -397,7 +454,7 @@ Server 的本地上限默认取 Router 允许的最大档位,使 Router settings
 ### 9.1 推理身份与本地并发错误
 
 - Direct Share 使用 Router API Token 解析出的规范化邮箱作为 `IngressContext.userEmail`。
-- Market 使用已认证 Market Session 的规范化邮箱作为 `IngressContext.userEmail`。不得只在 Router 做授权后向 Server 签发空用户身份。
+- Gateway 请求不会伪造终端用户邮箱；Router 仅注入 `dataSource=gateway`、Share/route/request identity 和可信地域字段。不得把 Gateway owner email 当成终端用户身份，也不得只在 Router 做授权后向 Server 签发空用户身份。
 - Gateway 不伪造终端用户邮箱。非免费 Share 缺少 `userEmail` 时由 Server fail closed,返回 `cc_switch_user_identity_required`；`/_share-router/*` 健康探测不进入 Share 用户授权与并发校验。
 - Router 必须剥离调用方提供的 `x-user-email` / `x-user-country*` 等旧身份头；Server 推理上下文只接受签名上下文重新注入的 `x-cc-switch-user-*` 头。
 - Email grant 的 `parallelLimit` 由 Server 统一执行,并在同一 Share 下跨 Claude、Codex、Gemini Surface 共用。Router 的 email inflight 仅用于观测,不得成为第二套授权或限额权威。

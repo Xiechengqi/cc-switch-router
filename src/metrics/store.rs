@@ -482,7 +482,7 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
             timestamp INTEGER NOT NULL,
             request_id TEXT,
             route_type TEXT NOT NULL,
-            market_email TEXT,
+            gateway_id TEXT,
             share_id TEXT,
             subdomain TEXT,
             app_type TEXT,
@@ -509,7 +509,6 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
         );
         CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_ts ON llm_request_metrics(timestamp);
         CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_share_ts ON llm_request_metrics(share_id, timestamp);
-        CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_market_ts ON llm_request_metrics(market_email, timestamp);
         CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_model_ts ON llm_request_metrics(actual_model, timestamp);
         DELETE FROM llm_request_metrics
         WHERE request_id IS NOT NULL
@@ -533,6 +532,106 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
         ",
     )
     .map_err(|err| AppError::Internal(format!("init metrics db failed: {err}")))?;
+    // Metrics databases predate the Gateway principal. Add it before the
+    // one-time table rebuild so retained direct rows survive old databases.
+    let columns = conn
+        .prepare("PRAGMA table_info(llm_request_metrics)")
+        .map_err(|err| AppError::Internal(format!("inspect metrics columns failed: {err}")))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| AppError::Internal(format!("read metrics columns failed: {err}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| AppError::Internal(format!("collect metrics columns failed: {err}")))?;
+    if !columns.iter().any(|name| name == "gateway_id") {
+        conn.execute(
+            "ALTER TABLE llm_request_metrics ADD COLUMN gateway_id TEXT",
+            [],
+        )
+        .map_err(|err| AppError::Internal(format!("add gateway metrics column failed: {err}")))?;
+    }
+    if columns.iter().any(|name| name == "market_email") {
+        retire_legacy_llm_request_metrics(conn)?;
+    } else {
+        conn.execute(
+            "DELETE FROM llm_request_metrics WHERE route_type = 'legacy-token-market'",
+            [],
+        )
+        .map_err(|err| AppError::Internal(format!("retire legacy metrics rows failed: {err}")))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_ts
+             ON llm_request_metrics(timestamp);
+         CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_share_ts
+             ON llm_request_metrics(share_id, timestamp);
+         CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_gateway_ts
+             ON llm_request_metrics(gateway_id, timestamp);
+         CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_model_ts
+             ON llm_request_metrics(actual_model, timestamp);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_request_metrics_request_id
+             ON llm_request_metrics(request_id);",
+    )
+    .map_err(|err| AppError::Internal(format!("index canonical metrics table failed: {err}")))?;
+    Ok(())
+}
+
+fn retire_legacy_llm_request_metrics(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP TRIGGER IF EXISTS llm_request_metrics_legacy_market_email_read_only_insert;
+         DROP TRIGGER IF EXISTS llm_request_metrics_legacy_market_email_read_only_update;
+         DROP INDEX IF EXISTS idx_llm_request_metrics_market_ts;
+         DROP TABLE IF EXISTS llm_request_metrics_without_legacy_market;
+         CREATE TABLE llm_request_metrics_without_legacy_market (
+             timestamp INTEGER NOT NULL,
+             request_id TEXT,
+             route_type TEXT NOT NULL,
+             gateway_id TEXT,
+             share_id TEXT,
+             subdomain TEXT,
+             app_type TEXT,
+             provider TEXT,
+             requested_model TEXT,
+             actual_model TEXT,
+             status TEXT NOT NULL,
+             error_kind TEXT,
+             http_status INTEGER,
+             latency_ms INTEGER,
+             ttft_ms INTEGER,
+             stream_started INTEGER NOT NULL DEFAULT 0,
+             stream_completed INTEGER NOT NULL DEFAULT 0,
+             usage_state TEXT,
+             stream_status TEXT,
+             usage_revision INTEGER NOT NULL DEFAULT 0,
+             input_tokens INTEGER,
+             output_tokens INTEGER,
+             total_tokens INTEGER,
+             cache_read_tokens INTEGER,
+             cache_write_tokens INTEGER,
+             reasoning_tokens INTEGER,
+             estimated_cost_usd REAL
+         );
+         INSERT INTO llm_request_metrics_without_legacy_market (
+             timestamp, request_id, route_type, gateway_id, share_id, subdomain,
+             app_type, provider, requested_model, actual_model, status, error_kind,
+             http_status, latency_ms, ttft_ms, stream_started, stream_completed,
+             usage_state, stream_status, usage_revision, input_tokens, output_tokens,
+             total_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+             estimated_cost_usd
+         )
+         SELECT timestamp, request_id, route_type, gateway_id, share_id, subdomain,
+                app_type, provider, requested_model, actual_model, status, error_kind,
+                http_status, latency_ms, ttft_ms, stream_started, stream_completed,
+                usage_state, stream_status, usage_revision, input_tokens, output_tokens,
+                total_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                estimated_cost_usd
+           FROM llm_request_metrics
+          WHERE market_email IS NULL
+            AND route_type != 'legacy-token-market';
+         DROP TABLE llm_request_metrics;
+         ALTER TABLE llm_request_metrics_without_legacy_market
+             RENAME TO llm_request_metrics;
+         COMMIT;",
+    )
+    .map_err(|err| AppError::Internal(format!("physically retire legacy metrics failed: {err}")))?;
     Ok(())
 }
 
@@ -684,7 +783,7 @@ fn insert_client_metrics(
 fn insert_llm_request_metric(conn: &Connection, metric: &LlmRequestMetric) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO llm_request_metrics (
-            timestamp, request_id, route_type, market_email, share_id, subdomain,
+            timestamp, request_id, route_type, gateway_id, share_id, subdomain,
             app_type, provider, requested_model, actual_model, status, error_kind,
             http_status, latency_ms, ttft_ms, stream_started, stream_completed,
             usage_state, stream_status, usage_revision,
@@ -694,7 +793,7 @@ fn insert_llm_request_metric(conn: &Connection, metric: &LlmRequestMetric) -> Re
         ON CONFLICT(request_id) DO UPDATE SET
             timestamp = CASE WHEN excluded.usage_revision >= llm_request_metrics.usage_revision THEN excluded.timestamp ELSE llm_request_metrics.timestamp END,
             route_type = CASE WHEN excluded.usage_revision >= llm_request_metrics.usage_revision THEN excluded.route_type ELSE llm_request_metrics.route_type END,
-            market_email = COALESCE(llm_request_metrics.market_email, excluded.market_email),
+            gateway_id = COALESCE(llm_request_metrics.gateway_id, excluded.gateway_id),
             share_id = COALESCE(llm_request_metrics.share_id, excluded.share_id),
             subdomain = COALESCE(llm_request_metrics.subdomain, excluded.subdomain),
             app_type = CASE WHEN excluded.usage_revision >= llm_request_metrics.usage_revision THEN COALESCE(excluded.app_type, llm_request_metrics.app_type) ELSE llm_request_metrics.app_type END,
@@ -730,7 +829,7 @@ fn insert_llm_request_metric(conn: &Connection, metric: &LlmRequestMetric) -> Re
             metric.timestamp,
             metric.request_id,
             metric.route_type,
-            metric.market_email,
+            metric.gateway_id,
             metric.share_id,
             metric.subdomain,
             metric.app_type,
@@ -1510,7 +1609,7 @@ fn load_llm_top(
         "share" | "shares" | "share-performance" => {
             "COALESCE(NULLIF(subdomain, ''), share_id, '-')"
         }
-        "market" | "markets" => "COALESCE(market_email, '-')",
+        "gateway" | "gateways" => "COALESCE(gateway_id, '-')",
         _ => "COALESCE(NULLIF(actual_model, ''), requested_model, '-')",
     };
     let order_expr = match by {
@@ -1785,6 +1884,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_market_email_metrics_identity_is_physically_removed() {
+        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        init_metrics_db(&conn).expect("init metrics db");
+
+        let columns = conn
+            .prepare("PRAGMA table_info(llm_request_metrics)")
+            .expect("inspect canonical metrics columns")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query canonical metrics columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read canonical metrics columns");
+        assert!(!columns.iter().any(|column| column == "market_email"));
+
+        let error = conn
+            .execute(
+                "INSERT INTO llm_request_metrics (
+                    timestamp, request_id, route_type, market_email, status
+                 ) VALUES (900, 'legacy-write', 'legacy-token-market',
+                           'market@example.com', 'success')",
+                [],
+            )
+            .expect_err("retired Market identity column must not exist");
+        assert!(error.to_string().contains("market_email"));
+
+        insert_llm_request_metric(&conn, &llm_metric("gateway-write", ""))
+            .expect("active metrics writer should remain available");
+        let active_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM llm_request_metrics WHERE request_id = 'gateway-write'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read active metric");
+        assert_eq!(active_rows, 1);
+    }
+
+    #[test]
     fn router_metrics_persist_all_ssh_forwarding_counters() {
         let conn = Connection::open_in_memory().expect("open in-memory metrics db");
         init_metrics_db(&conn).expect("init metrics db");
@@ -2001,8 +2137,8 @@ mod tests {
     }
 
     #[test]
-    fn share_terminal_and_market_context_merge_independently_of_arrival_order() {
-        for market_first in [true, false] {
+    fn share_terminal_and_gateway_context_merge_independently_of_arrival_order() {
+        for gateway_first in [true, false] {
             let conn = Connection::open_in_memory().expect("open in-memory metrics db");
             init_metrics_db(&conn).expect("init metrics db");
 
@@ -2023,21 +2159,21 @@ mod tests {
             terminal.actual_model = Some("actual-model".into());
             terminal.output_tokens = Some(40);
 
-            let mut market = terminal.clone();
-            market.timestamp = 901;
-            market.route_type = "market".into();
-            market.market_email = Some("market@example.com".into());
-            market.subdomain = Some("share-subdomain".into());
-            market.stream_started = false;
-            market.stream_completed = false;
-            market.ttft_ms = None;
-            market.stream_status = Some("settled".into());
-            market.usage_revision = 0;
+            let mut gateway = terminal.clone();
+            gateway.timestamp = 901;
+            gateway.route_type = "gateway".into();
+            gateway.gateway_id = Some("gateway-fixture".into());
+            gateway.subdomain = Some("share-subdomain".into());
+            gateway.stream_started = false;
+            gateway.stream_completed = true;
+            gateway.ttft_ms = None;
+            gateway.stream_status = Some("success".into());
+            gateway.usage_revision = 0;
 
-            let ordered = if market_first {
-                [&market, &terminal]
+            let ordered = if gateway_first {
+                [&gateway, &terminal]
             } else {
-                [&terminal, &market]
+                [&terminal, &gateway]
             };
             for metric in ordered {
                 insert_llm_request_metric(&conn, metric).expect("merge cross-source metric");
@@ -2055,7 +2191,7 @@ mod tests {
                 i64,
             ) = conn
                 .query_row(
-                    "SELECT route_type, market_email, subdomain, status, stream_completed,
+                    "SELECT route_type, gateway_id, subdomain, status, stream_completed,
                             usage_state, stream_status, usage_revision, output_tokens
                        FROM llm_request_metrics WHERE request_id = 'cross-source'",
                     [],
@@ -2078,7 +2214,7 @@ mod tests {
                 stored,
                 (
                     "direct".into(),
-                    "market@example.com".into(),
+                    "gateway-fixture".into(),
                     "share-subdomain".into(),
                     "success".into(),
                     1,
@@ -2087,7 +2223,7 @@ mod tests {
                     2,
                     40,
                 ),
-                "market_first={market_first}"
+                "gateway_first={gateway_first}"
             );
         }
     }
@@ -2121,7 +2257,7 @@ mod tests {
             timestamp: 900,
             request_id: Some(request_id.to_string()),
             route_type: "direct".into(),
-            market_email: None,
+            gateway_id: None,
             share_id: Some("share-1".into()),
             subdomain: Some("share-1".into()),
             app_type: Some("codex".into()),

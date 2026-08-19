@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use crate::clock_health::{ClockHealthService, ClockHealthStatus};
 use crate::config::{Config, MetricsConfig};
 use crate::error::AppError;
-use crate::models::{MarketRequestLogEntry, ShareRequestLogEntry};
+use crate::models::{GatewayRequestObservation, ShareRequestLogEntry};
 use crate::proxy::ProxyRegistry;
 use crate::store::AppStore;
 use crate::{alerting::AlertingService, alerting::models::AlertCondition};
@@ -575,18 +575,20 @@ impl MetricsRegistry {
         });
     }
 
-    pub fn record_market_request_logs(
+    pub fn record_gateway_request_observations(
         self: &Arc<Self>,
-        market_email: &str,
-        logs: &[MarketRequestLogEntry],
+        gateway_id: &str,
+        logs: &[GatewayRequestObservation],
     ) {
         for log in logs {
+            let stream_status = log.status.trim().to_ascii_lowercase();
+            let status = normalize_llm_status(&stream_status, log.status_code);
             self.record_llm_request(LlmRequestMetric {
                 timestamp: parse_rfc3339_timestamp(&log.created_at)
                     .unwrap_or_else(|| chrono::Utc::now().timestamp()),
                 request_id: Some(log.request_id.clone()),
-                route_type: "market".into(),
-                market_email: Some(market_email.to_string()),
+                route_type: "gateway".into(),
+                gateway_id: Some(gateway_id.to_string()),
                 share_id: log.share_id.clone(),
                 subdomain: log.share_subdomain.clone(),
                 app_type: Some(log.request_agent.clone()).filter(|value| !value.is_empty()),
@@ -594,15 +596,19 @@ impl MetricsRegistry {
                 requested_model: Some(log.requested_model.clone())
                     .filter(|value| !value.is_empty()),
                 actual_model: Some(log.actual_model.clone()).filter(|value| !value.is_empty()),
-                status: normalize_llm_status(&log.status, log.status_code),
-                error_kind: error_kind_from_status(&log.status, log.status_code),
+                status: status.clone(),
+                error_kind: error_kind_from_status(&stream_status, log.status_code),
                 http_status: log.status_code,
                 latency_ms: log.latency_ms,
                 ttft_ms: None,
                 stream_started: false,
-                stream_completed: log.status == "settled" || log.status == "success",
-                usage_state: Some("observed".into()),
-                stream_status: Some(log.status.clone()),
+                stream_completed: status == "success",
+                usage_state: Some(if status == "pending" {
+                    "pending".into()
+                } else {
+                    "observed".into()
+                }),
+                stream_status: Some(stream_status).filter(|value| !value.is_empty()),
                 usage_revision: 0,
                 input_tokens: Some(log.input_tokens as u64),
                 output_tokens: Some(log.output_tokens as u64),
@@ -615,10 +621,7 @@ impl MetricsRegistry {
                 cache_read_tokens: Some(log.cache_read_tokens as u64),
                 cache_write_tokens: Some(log.cache_creation_tokens as u64),
                 reasoning_tokens: None,
-                estimated_cost_usd: log
-                    .usage_amount_usd
-                    .as_deref()
-                    .and_then(|value| value.parse::<f64>().ok()),
+                estimated_cost_usd: None,
             });
         }
     }
@@ -658,7 +661,7 @@ impl MetricsRegistry {
                 timestamp: log.created_at,
                 request_id: Some(log.request_id.clone()),
                 route_type: "direct".into(),
-                market_email: None,
+                gateway_id: None,
                 share_id: Some(log.share_id.clone()),
                 subdomain: None,
                 app_type: Some(log.app_type.clone()).filter(|value| !value.is_empty()),
@@ -1206,7 +1209,15 @@ fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
 }
 
 fn normalize_llm_status(status: &str, status_code: Option<u16>) -> String {
-    if matches!(status, "settled" | "success") || status_code.is_some_and(|code| code < 400) {
+    let status = status.trim().to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "pending" | "in_progress" | "in-progress" | "processing"
+    ) {
+        "pending".into()
+    } else if matches!(status.as_str(), "success" | "completed")
+        || status_code.is_some_and(|code| code < 400)
+    {
         "success".into()
     } else {
         "error".into()
@@ -1256,7 +1267,7 @@ mod tests {
     use super::{
         AlertRouterBaselineState, ForwardBridgeMetricOutcome, ForwardChannelOpenMetricOutcome,
         MetricsRegistry, RouterMetricsStatus, build_alert_conditions, error_kind_from_status,
-        run_sample_sinks,
+        normalize_llm_status, run_sample_sinks,
     };
 
     #[test]
@@ -1368,6 +1379,13 @@ mod tests {
             error_kind_from_status("error", Some(409)).as_deref(),
             Some("upstream_error")
         );
+    }
+
+    #[test]
+    fn gateway_status_normalization_preserves_pending_observations() {
+        assert_eq!(normalize_llm_status("pending", Some(200)), "pending");
+        assert_eq!(normalize_llm_status("completed", None), "success");
+        assert_eq!(normalize_llm_status("failed", Some(500)), "error");
     }
 
     #[test]

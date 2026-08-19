@@ -27,8 +27,8 @@ mod market_billing;
 mod metrics;
 mod models;
 mod namespace;
-mod notifications;
 mod notification_channels;
+mod notifications;
 mod process_lock;
 mod provision_ssh;
 mod proxy;
@@ -46,8 +46,8 @@ mod ssh;
 mod startup_config;
 mod store;
 mod telegram;
-mod user_notification_health;
 mod usage_account;
+mod user_notification_health;
 
 use std::collections::HashSet;
 use std::env;
@@ -261,10 +261,6 @@ async fn main() -> Result<()> {
         .iter()
         .filter(|intent| intent.kind == RouteIntentKind::Client)
         .count();
-    let market_route_count = route_intents
-        .iter()
-        .filter(|intent| intent.kind == RouteIntentKind::Market)
-        .count();
     state
         .proxy
         .declare_known_routes(
@@ -277,7 +273,6 @@ async fn main() -> Result<()> {
         total = route_intents.len(),
         shares = share_route_count,
         clients = client_route_count,
-        markets = market_route_count,
         "restored known route intentions"
     );
     crate::client_market::reconcile_interrupted_jobs(state.clone()).await?;
