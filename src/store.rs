@@ -70,14 +70,15 @@ use crate::models::{
     SharePendingEditsPayload, SharePendingEditsRequest, SharePendingEditsResponse,
     SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
     ShareRequestLogFetchResponse, ShareRequestLogSyncAck, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
-    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest, ShareTokenPeriod,
-    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
-    ShareUsageEmailRow, ShareUserGrant, ShareUserLimitStatusResponse, ShareUserLimitStatusRow,
-    ShareUserPolicy, ShareView, SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease,
-    TunnelStateRequest, TunnelStateResponse, UpgradeInstallationStatusResponse,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareServiceReadiness,
+    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse,
+    ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant, ShareUserLimitStatusResponse,
+    ShareUserLimitStatusRow, ShareUserPolicy, ShareView, SubdomainAvailabilityResponse,
+    TunnelActivateRequest, TunnelLease, TunnelStateRequest, TunnelStateResponse,
+    UpgradeInstallationStatusResponse, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -312,7 +313,37 @@ fn representative_recent_latency(
     Some((median, latest_at))
 }
 
-fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> OperationalSummary {
+fn service_readiness_from_reasons(reasons: &[OperationalReason]) -> ShareServiceReadiness {
+    let blockers = reasons
+        .iter()
+        .filter(|reason| {
+            !matches!(
+                reason.code.as_str(),
+                "expires_soon" | "medium_latency" | "high_latency"
+            )
+        })
+        .map(|reason| {
+            let mut blocker = reason.clone();
+            // Edit details are manager-only. The readiness contract remains
+            // identical for every viewer without exposing a rejection message.
+            if matches!(blocker.code.as_str(), "edit_pending" | "edit_failed") {
+                blocker.current_value = None;
+            }
+            blocker
+        })
+        .collect::<Vec<_>>();
+    if blockers.is_empty() {
+        ShareServiceReadiness::ready()
+    } else {
+        ShareServiceReadiness::blocked(blockers)
+    }
+}
+
+fn share_operational_evaluation(
+    share: &ShareView,
+    authoritative_active_edit: Option<&ShareEditView>,
+    now: DateTime<Utc>,
+) -> (OperationalSummary, ShareServiceReadiness) {
     let status = share.share_status.trim().to_ascii_lowercase();
     if status != "active" {
         let (code, severity) = if status == "expired" {
@@ -320,37 +351,39 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
         } else {
             ("manually_disabled", "info")
         };
-        return operational_summary(
-            "disabled",
-            vec![operational_reason(
-                code,
-                severity,
-                (status == "expired").then(|| share.expires_at.clone()),
-                Some("share"),
-                Some(&share.share_id),
-                Some(status),
-                None,
-            )],
+        let reasons = vec![operational_reason(
+            code,
+            severity,
+            (status == "expired").then(|| share.expires_at.clone()),
+            Some("share"),
+            Some(&share.share_id),
+            Some(status),
+            None,
+        )];
+        return (
+            operational_summary("disabled", reasons.clone()),
+            ShareServiceReadiness::blocked(reasons),
         );
     }
 
     if share.route_state == "reconnecting" {
-        return operational_summary(
-            "reconnecting",
-            vec![operational_reason(
-                "route_reconnecting",
-                "info",
-                share.route_state_since.clone(),
-                Some("share"),
-                Some(&share.share_id),
-                None,
-                None,
-            )],
+        let reasons = vec![operational_reason(
+            "route_reconnecting",
+            "info",
+            share.route_state_since.clone(),
+            Some("share"),
+            Some(&share.share_id),
+            None,
+            None,
+        )];
+        return (
+            operational_summary("reconnecting", reasons.clone()),
+            ShareServiceReadiness::blocked(reasons),
         );
     }
 
     let mut reasons = Vec::new();
-    if share.route_state == "offline" {
+    if !share.is_online || share.route_state == "offline" {
         reasons.push(operational_reason(
             "route_offline",
             "critical",
@@ -361,7 +394,11 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
             None,
         ));
     }
-    if let Some(edit) = &share.active_edit {
+    if let Some(edit) = authoritative_active_edit.or(share.active_edit.as_ref()) {
+        let edit_details_are_visible = share
+            .active_edit
+            .as_ref()
+            .is_some_and(|visible_edit| visible_edit.id == edit.id);
         if edit.status == "rejected" {
             reasons.push(operational_reason(
                 "edit_failed",
@@ -369,7 +406,9 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
                 Some(edit.updated_at.to_rfc3339()),
                 Some("share"),
                 Some(&share.share_id),
-                edit.error_message.clone(),
+                edit_details_are_visible
+                    .then(|| edit.error_message.clone())
+                    .flatten(),
                 None,
             ));
         } else if edit.status == "pending" {
@@ -507,13 +546,15 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
         }
     }
 
-    if !share.is_online {
+    let service_readiness = service_readiness_from_reasons(&reasons);
+    let summary = if !share.is_online {
         operational_summary("offline", reasons)
     } else if reasons.is_empty() {
         OperationalSummary::healthy("online")
     } else {
         operational_summary("degraded", reasons)
-    }
+    };
+    (summary, service_readiness)
 }
 
 fn client_operational_summary(client: &DashboardClientView) -> OperationalSummary {
@@ -7070,7 +7111,7 @@ impl AppStore {
             .into_iter()
             .find(|(_, share)| share.share_id == share_id)
             .ok_or_else(|| AppError::NotFound("share not found".into()))?;
-        let active_edit = get_active_share_edit(&conn, share_id)?;
+        let active_edit = get_dashboard_active_share_edit(&conn, share_id)?;
         let can_manage = can_manage_share(&share, viewer_email);
         let can_edit_settings = can_manage
             && active_edit
@@ -7106,7 +7147,7 @@ impl AppStore {
             can_view_secret: false,
             can_manage,
             can_edit_settings,
-            active_edit: can_manage.then_some(active_edit).flatten(),
+            active_edit: can_manage.then(|| active_edit.clone()).flatten(),
             app_type: share.app_type,
             provider_id: share.provider_id,
             bindings: share.bindings,
@@ -7141,6 +7182,7 @@ impl AppStore {
             recent_model_health_checks: Vec::new(),
             model_health: ShareModelHealthSummary::default(),
             operational_summary: OperationalSummary::healthy("online"),
+            service_readiness: ShareServiceReadiness::ready(),
             user_grants: visible_user_grants,
             supported_user_token_periods: share.supported_user_token_periods,
             config_revision: share.config_revision,
@@ -7150,7 +7192,8 @@ impl AppStore {
             banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
             previous_response_cache_enabled: share.previous_response_cache_enabled,
         };
-        view.operational_summary = share_operational_summary(&view, Utc::now());
+        (view.operational_summary, view.service_readiness) =
+            share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
         Ok(view)
     }
 
@@ -7579,11 +7622,8 @@ impl AppStore {
                     .and_then(|map| map.get(&email))
                     .copied()
                     .unwrap_or(0);
-                let tokens_used = effective_share_user_tokens(
-                    &grant,
-                    window_start.as_ref(),
-                    logged_tokens,
-                );
+                let tokens_used =
+                    effective_share_user_tokens(&grant, window_start.as_ref(), logged_tokens);
                 let percent = grant
                     .policy
                     .token_limit
@@ -9833,7 +9873,7 @@ impl AppStore {
                     can_view_secret,
                     can_manage,
                     can_edit_settings,
-                    active_edit: can_manage.then_some(active_edit).flatten(),
+                    active_edit: can_manage.then(|| active_edit.clone()).flatten(),
                     provider_id: share.provider_id,
                     bindings: share.bindings,
                     token_limit: share.token_limit,
@@ -9869,6 +9909,7 @@ impl AppStore {
                     recent_model_health_checks,
                     model_health,
                     operational_summary: OperationalSummary::healthy("online"),
+                    service_readiness: ShareServiceReadiness::ready(),
                     user_grants: visible_user_grants,
                     supported_user_token_periods: share.supported_user_token_periods,
                     config_revision: share.config_revision,
@@ -9878,7 +9919,8 @@ impl AppStore {
                     banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
                     previous_response_cache_enabled: share.previous_response_cache_enabled,
                 };
-                view.operational_summary = share_operational_summary(&view, Utc::now());
+                (view.operational_summary, view.service_readiness) =
+                    share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
                 view
             })
             .collect::<Vec<_>>();
@@ -16522,10 +16564,7 @@ fn effective_share_user_tokens(
     observed_tokens.max(grant_usage_tokens(grant, window_start))
 }
 
-fn grant_usage_tokens(
-    grant: &ShareUserGrant,
-    window_start: Option<&DateTime<Utc>>,
-) -> u64 {
+fn grant_usage_tokens(grant: &ShareUserGrant, window_start: Option<&DateTime<Utc>>) -> u64 {
     let expected_start_ms = window_start.map(|start| start.timestamp_millis());
     match grant.policy.token_period {
         ShareTokenPeriod::Lifetime => (grant.usage.lifetime.started_at_ms == 0)
@@ -16801,6 +16840,27 @@ fn list_active_share_edits(conn: &Connection) -> Result<HashMap<String, ShareEdi
         result.entry(edit.share_id.clone()).or_insert(edit);
     }
     Ok(result)
+}
+
+fn get_dashboard_active_share_edit(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<Option<ShareEditView>, AppError> {
+    conn.query_row(
+        "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
+         FROM share_edit_requests
+         WHERE share_id = ?1 AND status IN ('pending', 'rejected') AND retired_at IS NULL
+           AND NOT (status = 'rejected' AND created_by_email = ?2)
+         ORDER BY revision DESC
+         LIMIT 1",
+        params![
+            share_id,
+            crate::share_market::SHARE_MARKET_CONTROL_ACTOR_EMAIL
+        ],
+        share_edit_from_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query dashboard active share edit failed: {e}")))
 }
 
 fn get_active_share_edit(
@@ -37438,6 +37498,15 @@ mod tests {
                 .state,
             "disabled"
         );
+        assert!(!snapshot.shares[0].service_readiness.ready);
+        assert_eq!(
+            snapshot.shares[0]
+                .service_readiness
+                .primary_blocker
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("manually_disabled")
+        );
         assert_eq!(snapshot.clients[0].operational_summary.state, "online");
 
         let _ = std::fs::remove_file(&config.database.path);
@@ -37485,7 +37554,222 @@ mod tests {
                 .map(|reason| reason.code.as_str()),
             Some("route_offline")
         );
+        assert!(!share.service_readiness.ready);
+        assert_eq!(
+            share
+                .service_readiness
+                .primary_blocker
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("route_offline")
+        );
         assert_eq!(snapshot.clients[0].operational_summary.state, "online");
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[test]
+    fn service_readiness_ignores_only_expiry_and_latency_advisories() {
+        let expires_soon = operational_reason(
+            "expires_soon",
+            "warning",
+            None,
+            Some("share"),
+            Some("share-1"),
+            None,
+            None,
+        );
+        let medium_latency = operational_reason(
+            "medium_latency",
+            "warning",
+            None,
+            Some("share"),
+            Some("share-1"),
+            Some(DASHBOARD_MEDIUM_LATENCY_MS.to_string()),
+            Some(DASHBOARD_MEDIUM_LATENCY_MS.to_string()),
+        );
+        let high_latency = operational_reason(
+            "high_latency",
+            "warning",
+            None,
+            Some("share"),
+            Some("share-1"),
+            Some(DASHBOARD_HIGH_LATENCY_MS.to_string()),
+            Some(DASHBOARD_HIGH_LATENCY_MS.to_string()),
+        );
+
+        let advisory_only =
+            service_readiness_from_reasons(&[expires_soon.clone(), medium_latency, high_latency]);
+        assert!(advisory_only.ready);
+        assert!(advisory_only.primary_blocker.is_none());
+
+        let provider_unavailable = operational_reason(
+            "provider_unavailable",
+            "critical",
+            None,
+            Some("provider"),
+            Some("provider-1"),
+            None,
+            None,
+        );
+        let mixed = service_readiness_from_reasons(&[expires_soon, provider_unavailable.clone()]);
+        assert!(!mixed.ready, "an advisory must not mask a later blocker");
+        assert_eq!(mixed.primary_blocker, Some(provider_unavailable));
+        assert_eq!(mixed.additional_blocker_count, 0);
+
+        let unknown = operational_reason(
+            "future_safety_condition",
+            "warning",
+            None,
+            Some("share"),
+            Some("share-1"),
+            None,
+            None,
+        );
+        assert!(
+            !service_readiness_from_reasons(&[unknown]).ready,
+            "new reasons must remain fail-closed until explicitly made advisory"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_service_readiness_distinguishes_advisories_from_blockers() {
+        let (store, config) = setup_store("dashboard-share-service-readiness").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-expiring", "expiring-sub", "active").await;
+        insert_share(&store, "inst-1", "share-latency", "latency-sub", "active").await;
+        insert_share(&store, "inst-1", "share-expired", "expired-sub", "active").await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-reconnecting",
+            "reconnecting-sub",
+            "active",
+        )
+        .await;
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET expires_at = ?2 WHERE share_id = ?1",
+                params![
+                    "share-latency",
+                    (Utc::now() + Duration::days(30)).to_rfc3339()
+                ],
+            )
+            .expect("move latency Share expiry outside warning window");
+            conn.execute(
+                "UPDATE shares SET expires_at = ?2 WHERE share_id = ?1",
+                params![
+                    "share-expired",
+                    (Utc::now() - Duration::minutes(1)).to_rfc3339()
+                ],
+            )
+            .expect("expire active Share");
+        }
+
+        let now = Utc::now().timestamp();
+        for index in 0..3 {
+            let mut log = test_share_request_log_entry(
+                &format!("req-latency-readiness-{index}"),
+                "share-latency",
+                now - index,
+            );
+            log.latency_ms = DASHBOARD_HIGH_LATENCY_MS + 1_000;
+            store
+                .record_share_health_request_log("inst-1", log)
+                .await
+                .expect("record high-latency request");
+        }
+
+        let proxy = ProxyRegistry::default();
+        for (subdomain, share_id) in [
+            ("expiring-sub", "share-expiring"),
+            ("latency-sub", "share-latency"),
+            ("expired-sub", "share-expired"),
+        ] {
+            proxy
+                .set_route(
+                    subdomain.into(),
+                    "http://127.0.0.1:1".into(),
+                    None,
+                    Some(share_id.into()),
+                    Some("Share".into()),
+                    false,
+                    -1,
+                    None,
+                )
+                .await;
+        }
+        proxy.declare_known_route("reconnecting-sub".into()).await;
+
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &proxy,
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+        let share = |share_id: &str| {
+            snapshot
+                .shares
+                .iter()
+                .find(|share| share.share_id == share_id)
+                .expect("Share view")
+        };
+
+        let expiring = share("share-expiring");
+        assert_eq!(expiring.operational_summary.state, "degraded");
+        assert_eq!(
+            expiring
+                .operational_summary
+                .primary_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("expires_soon")
+        );
+        assert!(expiring.service_readiness.ready);
+
+        let latency = share("share-latency");
+        assert_eq!(latency.operational_summary.state, "degraded");
+        assert_eq!(
+            latency
+                .operational_summary
+                .primary_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("high_latency")
+        );
+        assert!(latency.service_readiness.ready);
+
+        let expired = share("share-expired");
+        assert_eq!(expired.operational_summary.state, "degraded");
+        assert!(!expired.service_readiness.ready);
+        assert_eq!(
+            expired
+                .service_readiness
+                .primary_blocker
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("expired")
+        );
+
+        let reconnecting = share("share-reconnecting");
+        assert_eq!(reconnecting.operational_summary.state, "reconnecting");
+        assert!(!reconnecting.service_readiness.ready);
+        assert_eq!(
+            reconnecting
+                .service_readiness
+                .primary_blocker
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("route_reconnecting")
+        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -38016,6 +38300,131 @@ mod tests {
         assert_eq!(
             share.user_grants.keys().cloned().collect::<Vec<_>>(),
             vec!["shared@example.com"]
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn dashboard_service_readiness_is_viewer_independent_and_hides_edit_details() {
+        let (store, config) = setup_store("dashboard-readiness-viewer-independent").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
+        set_shareto_users(&store, "share-edit", &["shared@example.com"]).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET expires_at = ?2 WHERE share_id = ?1",
+                params!["share-edit", (Utc::now() + Duration::days(30)).to_rfc3339()],
+            )
+            .expect("move Share expiry outside warning window");
+        }
+        let edit = store
+            .create_share_settings_edit(
+                "share-edit",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("viewer-independent readiness".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create Share edit")
+            .edit;
+        store
+            .mark_share_edit_rejected(&edit.id, "manager-only rejection detail")
+            .await
+            .expect("reject Share edit");
+
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "edit-sub".into(),
+                "http://127.0.0.1:1".into(),
+                None,
+                Some("share-edit".into()),
+                Some("Share".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let owner_snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, Some("owner@example.com"))
+            .await
+            .expect("owner dashboard snapshot");
+        let shared_snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, Some("shared@example.com"))
+            .await
+            .expect("ShareTo dashboard snapshot");
+        let owner_share = owner_snapshot.shares.first().expect("owner Share view");
+        let shared_share = shared_snapshot.shares.first().expect("ShareTo Share view");
+
+        assert!(owner_share.active_edit.is_some());
+        assert!(shared_share.active_edit.is_none());
+        assert_eq!(
+            owner_share.service_readiness, shared_share.service_readiness,
+            "readiness must not depend on viewer permissions"
+        );
+        assert!(!owner_share.service_readiness.ready);
+        assert_eq!(
+            owner_share
+                .service_readiness
+                .primary_blocker
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("edit_failed")
+        );
+        assert_eq!(
+            owner_share
+                .operational_summary
+                .primary_reason
+                .as_ref()
+                .and_then(|reason| reason.current_value.as_deref()),
+            Some("manager-only rejection detail")
+        );
+        assert!(
+            shared_share
+                .operational_summary
+                .primary_reason
+                .as_ref()
+                .and_then(|reason| reason.current_value.as_deref())
+                .is_none(),
+            "the authority result must not reveal manager-only edit details"
+        );
+
+        let active_subdomains = HashSet::from(["edit-sub".to_string()]);
+        let owner_direct = store
+            .share_view_for_share_url(
+                "share-edit",
+                &active_subdomains,
+                &HashMap::new(),
+                Some("owner@example.com"),
+            )
+            .await
+            .expect("owner direct Share view");
+        let shared_direct = store
+            .share_view_for_share_url(
+                "share-edit",
+                &active_subdomains,
+                &HashMap::new(),
+                Some("shared@example.com"),
+            )
+            .await
+            .expect("ShareTo direct Share view");
+        assert!(owner_direct.active_edit.is_some());
+        assert!(shared_direct.active_edit.is_none());
+        assert_eq!(
+            owner_direct.service_readiness,
+            shared_direct.service_readiness
+        );
+        assert_eq!(
+            owner_direct.service_readiness, owner_share.service_readiness,
+            "dashboard and direct Share views must expose the same readiness"
         );
 
         let _ = std::fs::remove_file(&config.database.path);

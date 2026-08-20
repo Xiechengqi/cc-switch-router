@@ -183,6 +183,12 @@ export type OperationalSummary = {
   changedAt?: string;
 };
 
+export type ShareServiceReadiness = {
+  ready: boolean;
+  primaryBlocker?: OperationalReason;
+  additionalBlockerCount: number;
+};
+
 export type DashboardClient = {
   chatAvailable?: boolean;
   logCollectionEnabled?: boolean;
@@ -416,6 +422,8 @@ export type ShareView = {
   appProviders?: ShareAppProviders;
   modelHealth?: ShareModelHealthSummary;
   operationalSummary?: OperationalSummary;
+  /** 后端权威的服务就绪结果；缺失时兼容旧 Router 响应。 */
+  serviceReadiness?: ShareServiceReadiness;
   userGrants?: ShareUserGrantMap;
   supportedUserTokenPeriods?: ShareTokenPeriod[];
   configRevision?: number;

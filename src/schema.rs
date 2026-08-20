@@ -659,7 +659,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 21);
+        assert_eq!(versions.len(), 22);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -681,6 +681,7 @@ mod tests {
         assert_eq!(versions[18], (19, migration_checksum(MIGRATIONS[17].1)));
         assert_eq!(versions[19], (20, migration_checksum(MIGRATIONS[18].1)));
         assert_eq!(versions[20], (21, migration_checksum(MIGRATIONS[19].1)));
+        assert_eq!(versions[21], (22, migration_checksum(MIGRATIONS[20].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration

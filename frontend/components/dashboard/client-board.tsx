@@ -321,7 +321,7 @@ const ShareScroller = React.memo(function ShareScroller({
   const { t } = useLocaleText();
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
 
-  const { enabledCount, availableCount, reconnectingCount, degradedCount, offlineCount } = summarizeShareAvailability(shares);
+  const { enabledCount, availableCount, issueCount, degradedCount } = summarizeShareAvailability(shares);
   const disabledCount = shares.length - enabledCount;
 
   return (
@@ -331,10 +331,18 @@ const ShareScroller = React.memo(function ShareScroller({
           <span className="font-semibold text-foreground">{t("dashboard.shares")}</span>
           <span>{shares.length === totalCount ? shares.length : `${shares.length}/${totalCount}`}</span>
           <span aria-hidden>·</span>
-          <span className="text-emerald-700">{availableCount} {t("dashboard.available")}</span>
-          {reconnectingCount > 0 ? <span className="text-sky-700">{reconnectingCount} {t("dashboard.reconnecting")}</span> : null}
-          {degradedCount > 0 ? <span className="text-amber-700">{degradedCount} {t("dashboard.degraded")}</span> : null}
-          {offlineCount > 0 ? <span className="text-rose-700">{offlineCount} {t("common.offline")}</span> : null}
+          {enabledCount > 0 ? (
+            <>
+              <span className="text-emerald-700">{t("dashboard.service")}: {availableCount}/{enabledCount} {t("dashboard.available")}</span>
+              {issueCount > 0 ? <span className="text-rose-700">{issueCount} {t("dashboard.unavailable")}</span> : null}
+              <span aria-hidden>·</span>
+              <span className={degradedCount > 0 ? "text-amber-700" : undefined}>
+                {t("dashboard.operationalQuality")}: {degradedCount > 0 ? t("dashboard.warningCount", { count: degradedCount }) : t("dashboard.noWarnings")}
+              </span>
+            </>
+          ) : (
+            <span>{t("dashboard.noEnabledShares")}</span>
+          )}
           {disabledCount > 0 ? <span>{disabledCount} {t("common.disabled")}</span> : null}
         </div>
       </div>
@@ -385,15 +393,19 @@ function ClientCard({
   const summary = clientOperationalSummary(client, allShares);
   const state = summary.state;
   const shareAvailability = summarizeShareAvailability(allShares);
-  const { enabledCount: enabledShareCount, availableCount, issueCount, routeOnlineCount } = shareAvailability;
-  const enabledSharesTotal = enabledShareCount || allShares.length;
+  const { enabledCount: enabledShareCount, availableCount, issueCount, routeOnlineCount, degradedCount } = shareAvailability;
   const sharesMetricTitle = enabledShareCount
     ? t("dashboard.sharesAvailableDetail", {
         available: availableCount,
         total: enabledShareCount,
         routeOnline: routeOnlineCount,
+        warnings: degradedCount,
       })
-    : undefined;
+    : t("dashboard.noEnabledShares");
+  const sharesMetricValue = enabledShareCount
+    ? `${availableCount}/${enabledShareCount} ${t("dashboard.available")}`
+    : t("dashboard.noEnabledShares");
+  const sharesMetricTone = !enabledShareCount ? "default" : issueCount ? "danger" : degradedCount ? "warning" : "success";
   const subdomain = client.clientTunnel?.subdomain || "";
   const hasSubdomain = Boolean(subdomain.trim());
   const identity = hasSubdomain ? subdomain : client.installation.id;
@@ -509,7 +521,7 @@ function ClientCard({
             />
             <Metric label={t("dashboard.version")} value={versionLabel} title={client.installation.appVersion || versionLabel} preserveValue />
             <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
-            <Metric label={t("dashboard.shares")} value={`${availableCount}/${enabledSharesTotal} ${t("dashboard.available")}`} title={sharesMetricTitle} tone={issueCount ? "danger" : "default"} />
+            <Metric label={t("dashboard.shares")} value={sharesMetricValue} title={sharesMetricTitle} tone={sharesMetricTone} />
             <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
             {showRemoval ? (
               <Metric

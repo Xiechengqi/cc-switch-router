@@ -3,7 +3,7 @@
 import * as React from "react";
 import { AlertTriangle, CheckCircle2, CircleOff, Clock3, PauseCircle, RefreshCw } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { DashboardClient, OperationalReason, OperationalState, OperationalSummary, ShareView } from "@/lib/types";
+import type { DashboardClient, OperationalReason, OperationalState, OperationalSummary, ShareServiceReadiness, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 
 export function shareIsEnabled(share: ShareView) {
@@ -21,8 +21,8 @@ export function summarizeShareAvailability(shares: ShareView[]) {
   for (const share of enabledShares) {
     if (share.isOnline) routeOnlineCount += 1;
     const state = shareOperationalSummary(share).state;
-    if (state === "online") availableCount += 1;
-    else if (state === "reconnecting") reconnectingCount += 1;
+    if (shareServiceReadiness(share).ready) availableCount += 1;
+    if (state === "reconnecting") reconnectingCount += 1;
     else if (state === "degraded") degradedCount += 1;
     else if (state === "offline") offlineCount += 1;
   }
@@ -68,6 +68,16 @@ function fallbackShareSummary(share: ShareView): OperationalSummary {
 
 export function shareOperationalSummary(share: ShareView): OperationalSummary {
   return share.operationalSummary || fallbackShareSummary(share);
+}
+
+export function shareServiceReadiness(share: ShareView): ShareServiceReadiness {
+  if (share.serviceReadiness) return share.serviceReadiness;
+  const summary = shareOperationalSummary(share);
+  return {
+    ready: summary.state === "online",
+    primaryBlocker: summary.state === "online" ? undefined : summary.primaryReason,
+    additionalBlockerCount: summary.state === "online" ? 0 : summary.additionalReasonCount,
+  };
 }
 
 export function clientOperationalSummary(client: DashboardClient, _shares: ShareView[] = []): OperationalSummary {

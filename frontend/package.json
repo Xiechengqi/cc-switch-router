@@ -7,6 +7,7 @@
     "build": "next build",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
+    "test:operational-status": "tsx --test components/dashboard/operational-status.test.ts",
     "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check",
     "audit:settings-contract": "node ../scripts/audit/audit-settings-contract.mjs --check",
     "audit:market-billing-contract": "node ../scripts/audit/audit-market-billing-contract.mjs --check"
@@ -30,6 +31,7 @@
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "tailwindcss": "latest",
+    "tsx": "^4.20.5",
     "typescript": "latest"
   },
   "overrides": {

@@ -2583,6 +2583,39 @@ impl OperationalSummary {
     }
 }
 
+/// Whether an enabled Share can currently accept service traffic.
+///
+/// This is intentionally independent from `OperationalSummary`: advisory
+/// conditions can keep a Share service-ready while its operational state is
+/// degraded and continues to surface a warning in the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareServiceReadiness {
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_blocker: Option<OperationalReason>,
+    #[serde(default)]
+    pub additional_blocker_count: usize,
+}
+
+impl ShareServiceReadiness {
+    pub fn ready() -> Self {
+        Self {
+            ready: true,
+            primary_blocker: None,
+            additional_blocker_count: 0,
+        }
+    }
+
+    pub fn blocked(blockers: Vec<OperationalReason>) -> Self {
+        Self {
+            ready: false,
+            primary_blocker: blockers.first().cloned(),
+            additional_blocker_count: blockers.len().saturating_sub(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationalReason {
@@ -3049,6 +3082,7 @@ pub struct ShareView {
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
     pub operational_summary: OperationalSummary,
+    pub service_readiness: ShareServiceReadiness,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
