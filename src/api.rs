@@ -6788,11 +6788,9 @@ async fn refresh_share_usage(
 
     let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
     let is_owner = share.owner_email.eq_ignore_ascii_case(&current_user_email);
-    let is_shared_with = share.has_active_shareto(&current_user_email);
-
-    if !is_admin && !is_owner && !is_shared_with {
+    if !is_admin && !is_owner {
         return Err(AppError::Forbidden(
-            "only the share owner, invited users, or admins can refresh this share usage".into(),
+            "only the share owner or admins can refresh this share usage".into(),
         ));
     }
 

@@ -334,7 +334,6 @@ export function ShareEditFormBody({
         share={displayShare}
         activeShareApps={activeShareApps}
         draft={draft}
-        descriptionLength={form.descriptionLength}
         descriptionInvalid={form.descriptionInvalid}
         appApiInvalid={form.appApiInvalid}
         disabled={fieldsDisabled}

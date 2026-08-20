@@ -1,6 +1,6 @@
 "use client";
 
-import { Checkbox, TextArea } from "@heroui/react";
+import { Checkbox, Input } from "@heroui/react";
 import * as React from "react";
 import { isOfficialRuntime, runtimeModelSummary, type TFn } from "@/components/dashboard/share-dashboard-utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
@@ -12,14 +12,23 @@ import {
 import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 
+function looksLikeEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
 function providerHint(runtime?: ShareUpstreamProvider) {
   if (!runtime) return "";
   if (isOfficialRuntime(runtime)) return "Official";
-  return runtime.accountEmail || runtime.apiUrl || runtime.kind || "";
+  if (runtime.providerName?.trim()) return "";
+  const hint = String(runtime.apiUrl || runtime.kind || "").trim();
+  if (!hint || looksLikeEmail(hint)) return "";
+  return hint;
 }
 
 function providerTitle(runtime?: ShareUpstreamProvider) {
-  return runtime?.providerName || runtime?.kind || runtime?.providerType || "";
+  const title = String(runtime?.providerName || runtime?.kind || runtime?.providerType || "").trim();
+  if (!title || looksLikeEmail(title)) return "";
+  return title;
 }
 
 export type ShareEditSaleAccessFieldsProps = {
@@ -69,7 +78,6 @@ export type ShareEditMarketFieldsProps = {
   share: ShareView;
   activeShareApps: CoreShareApp[];
   draft: ShareEditDraft;
-  descriptionLength: number;
   descriptionInvalid: boolean;
   appApiInvalid: boolean;
   disabled?: boolean;
@@ -82,7 +90,6 @@ export function ShareEditMarketFields({
   share,
   activeShareApps,
   draft,
-  descriptionLength,
   descriptionInvalid,
   appApiInvalid,
   disabled,
@@ -91,28 +98,23 @@ export function ShareEditMarketFields({
 }: ShareEditMarketFieldsProps) {
   return (
     <>
-      <ShareEditSection title={t("dashboard.shareEdit.section.overview")}>
-        <FieldGroup
-          label={t("dashboard.field.description")}
-          hint={
-            <span>
-              {t("dashboard.hint.maxChars")}
-              <span className="ml-2 font-mono">{descriptionLength}/200</span>
-            </span>
-          }
-          invalid={descriptionInvalid}
-        >
-          <TextArea
-            value={draft.description}
-            maxLength={200}
-            disabled={disabled}
-            onChange={(event) => onDescriptionChange(event.target.value)}
-          />
-        </FieldGroup>
-      </ShareEditSection>
+      <div className="grid gap-1">
+        <Input
+          value={draft.description}
+          maxLength={200}
+          placeholder={t("dashboard.shareEdit.descriptionPlaceholder")}
+          disabled={disabled}
+          aria-invalid={descriptionInvalid}
+          aria-label={t("dashboard.field.description")}
+          onChange={(event) => onDescriptionChange(event.target.value)}
+        />
+        {descriptionInvalid ? (
+          <span className="text-xs text-red-600">{t("dashboard.hint.maxChars")}</span>
+        ) : null}
+      </div>
 
       <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
-        <div className="grid gap-2">
+        <div className="grid grid-cols-3 gap-2">
           {activeShareApps.map((app) => {
             const runtime = share.appRuntimes?.[app as keyof ShareAppRuntimes];
             const title = providerTitle(runtime);
@@ -124,7 +126,9 @@ export function ShareEditMarketFields({
             return (
               <Checkbox
                 key={app}
-                className="w-full items-start rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5"
+                className={`w-full items-start rounded-xl border-0 px-3 py-2.5 shadow-none ${
+                  enabled ? "bg-emerald-50 text-slate-900" : "bg-slate-50 text-slate-500"
+                }`}
                 isSelected={enabled}
                 isDisabled={disabled || lastEnabled}
                 aria-label={t("dashboard.shareEdit.appApiToggle", { app: SHARE_APP_LABELS[app] })}
@@ -144,14 +148,16 @@ export function ShareEditMarketFields({
                   <Checkbox.Indicator />
                 </Checkbox.Control>
                 <Checkbox.Content className="min-w-0 flex-1">
-                  <div className="flex min-w-0 items-start gap-3">
-                    <ShareAppLogo app={app} size={16} />
+                  <div className="flex min-w-0 items-start gap-2">
+                    <ShareAppLogo app={app} size={16} className={enabled ? undefined : "opacity-60"} />
                     <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                        <span className="text-sm font-medium text-slate-900">{SHARE_APP_LABELS[app]} API</span>
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <span className={`text-sm font-medium ${enabled ? "text-slate-900" : "text-slate-500"}`}>
+                          {SHARE_APP_LABELS[app]} API
+                        </span>
                         {title ? <span className="truncate text-xs text-slate-500">{title}</span> : null}
                       </div>
-                      <div className="mt-0.5 truncate text-[11px] text-slate-500">
+                      <div className={`mt-0.5 whitespace-normal break-all text-[11px] ${enabled ? "text-slate-500" : "text-slate-400"}`}>
                         {[hint, models].filter(Boolean).join(" · ") || t("dashboard.noCurrentNode")}
                       </div>
                     </div>
@@ -161,7 +167,7 @@ export function ShareEditMarketFields({
             );
           })}
           {appApiInvalid ? (
-            <span className="text-xs text-red-600">{t("dashboard.shareEdit.appApiRequired")}</span>
+            <span className="col-span-3 text-xs text-red-600">{t("dashboard.shareEdit.appApiRequired")}</span>
           ) : null}
         </div>
       </ShareEditSection>

@@ -7,8 +7,6 @@ import { ShareEditReadView } from "@/components/dashboard/share-edit/share-edit-
 import { ShareEditFormBody, useShareEditForm } from "@/components/dashboard/share-edit/share-edit-form";
 import { ShareEditStatusBanner } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { shareProviderSupportedApps, SHARE_APP_LABELS } from "@/lib/share-app";
-import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import type { ShareView } from "@/lib/types";
 
 export { FieldGroup } from "@/components/dashboard/share-edit/share-edit-shared";
@@ -26,7 +24,6 @@ export function ShareEditDialog({
   const form = useShareEditForm({ share, t, onSaved, onClose });
   const liveShare = form?.liveShare || share;
   const readOnly = !!liveShare && !liveShare.canManage;
-  const boundApps = liveShare ? shareProviderSupportedApps(liveShare) : [];
 
   return (
     <Modal.Backdrop
@@ -36,24 +33,11 @@ export function ShareEditDialog({
           <Modal.Container placement="center">
             <Modal.Dialog className="share-edit-surface light flex max-h-[min(90vh,calc(100vh-1.5rem))] w-[min(880px,calc(100vw-1.5rem))] max-w-none flex-col overflow-hidden !bg-white !text-slate-900">
               <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-              <Modal.Header className="border-b border-slate-200/80">
+              <Modal.Header className="border-0 shadow-none">
                 <div className="pr-8">
                   <Modal.Heading>{readOnly ? t("dashboard.shareViewSettings") : t("dashboard.shareEditSettings")}</Modal.Heading>
                   <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-600">
                     <span className="break-all font-medium text-slate-900">{liveShare?.subdomain || liveShare?.shareName}</span>
-                    {boundApps.length ? (
-                      <span className="inline-flex items-center gap-1.5">
-                        {boundApps.map((app) => (
-                          <span
-                            key={app}
-                            className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-700"
-                          >
-                            <ShareAppLogo app={app} size={12} />
-                            {SHARE_APP_LABELS[app]}
-                          </span>
-                        ))}
-                      </span>
-                    ) : null}
                   </div>
                   {liveShare?.ownerEmail ? (
                     <p className="mt-1 text-xs text-slate-500">{liveShare.ownerEmail}</p>
@@ -90,7 +74,7 @@ export function ShareEditDialog({
                   </div>
                 ) : null}
               </Modal.Body>
-              <Modal.Footer className="sticky bottom-0 shrink-0 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80">
+              <Modal.Footer className="sticky bottom-0 shrink-0 border-0 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80">
                 {readOnly ? (
                   <Button variant="outline" onClick={onClose} isDisabled={form?.busy}>
                     {t("common.close")}

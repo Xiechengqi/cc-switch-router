@@ -710,6 +710,11 @@ a {
   color: rgb(var(--router-foreground));
 }
 
+.share-edit-surface :is(.modal__header, .modal__footer, [data-slot="modal-header"], [data-slot="modal-footer"]) {
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
 .mono-label {
   font-family: var(--font-jetbrains), "JetBrains Mono", monospace;
   font-size: 0.72rem;

@@ -256,7 +256,7 @@ export function ShareConnectionTestRow({
 
   const running = testState === "running";
   const refreshing = refreshState === "running";
-  const canRefreshUsage = kind === "text";
+  const canRefreshUsage = kind === "text" && share.canManage;
 
   let disabledReason: string | null = null;
   if (!isBound) disabledReason = t("dashboard.connectDialog.test.notBound");
