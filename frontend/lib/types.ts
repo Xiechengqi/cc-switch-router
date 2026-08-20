@@ -316,12 +316,51 @@ export type ShareUserPolicy = {
   expiresAt?: number;
 };
 
+export type ShareUserUsageRebase = {
+  period: ShareTokenPeriod;
+  anchorAtMs?: number;
+  windowStartsAtMs?: number;
+  windowEndsAtMs?: number;
+  targetTokens: number;
+  observedTokensAtRebase: number;
+  observedRequestsAtRebase: number;
+  usageWatermark: number;
+  appliedAtMs: number;
+  appliedBy?: string;
+  source: "manual" | "providerReset";
+};
+
+export type ShareUserQuotaView = {
+  period: ShareTokenPeriod;
+  anchorAtMs?: number;
+  windowStartsAtMs?: number;
+  windowEndsAtMs?: number;
+  effectiveTokensUsed: number;
+  observedTokensUsed: number;
+  manualOffsetTokens: number;
+  observedRequestsCount: number;
+  rebaseApplies: boolean;
+};
+
+export type ShareUserUsageEdit = {
+  action: "set" | "clear";
+  targetTokens?: number;
+  expectedGrantRevision?: number;
+  period?: ShareTokenPeriod;
+  anchorAtMs?: number;
+  source?: "manual" | "providerReset";
+};
+
+export type ShareUserUsageEditMap = Record<string, ShareUserUsageEdit>;
+
 export type ShareUserGrant = {
   email: string;
   role: "owner" | "shareto";
   active: boolean;
   policy: ShareUserPolicy;
   usage?: Record<string, unknown>;
+  usageRebase?: ShareUserUsageRebase;
+  usageQuota?: ShareUserQuotaView;
   createdAtMs?: number;
   updatedAtMs?: number;
   revokedAtMs?: number;
@@ -401,6 +440,7 @@ export type ShareSettingsPatch = {
   previousResponseCacheEnabled?: boolean;
   support?: ShareSupport;
   userGrants?: ShareUserGrantMap;
+  userUsageEdits?: ShareUserUsageEditMap;
   managedGrant?: {
     operationId: string;
     entitlementId: string;

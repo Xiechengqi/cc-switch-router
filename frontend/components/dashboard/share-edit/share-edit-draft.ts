@@ -3,6 +3,7 @@ import type {
   ShareSettingsPatch,
   ShareUserGrantMap,
   ShareUserPolicy,
+  ShareUserUsageEditMap,
   ShareView,
 } from "@/lib/types";
 import { isRouterShareMarketManagedGrant } from "@/lib/share-settings";
@@ -38,6 +39,7 @@ export type ShareEditDraft = {
   expiresAtInput: string;
   expiresPermanent: boolean;
   userGrants: ShareUserGrantMap;
+  userUsageEdits: ShareUserUsageEditMap;
   enabledApps: Record<PriceApp, boolean>;
 };
 
@@ -96,6 +98,7 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
     expiresAtInput: permanent ? "" : toLocalDateTimeValue(share.expiresAt),
     expiresPermanent: permanent,
     userGrants,
+    userUsageEdits: {},
     enabledApps: {
       claude: activeShareApps.includes("claude") && (share.support ? share.support.claude !== false : true),
       codex: activeShareApps.includes("codex") && (share.support ? share.support.codex !== false : true),
@@ -140,6 +143,9 @@ export function buildShareEditPatch(draft: ShareEditDraft, share: ShareView, act
     support: { claude: Boolean(draft.enabledApps.claude), codex: Boolean(draft.enabledApps.codex), gemini: Boolean(draft.enabledApps.gemini) },
   };
   patch.userGrants = userGrants;
+  if (Object.keys(draft.userUsageEdits).length > 0) {
+    patch.userUsageEdits = draft.userUsageEdits;
+  }
   if (expiresIso) patch.expiresAt = expiresIso;
   return patch;
 }

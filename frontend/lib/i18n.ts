@@ -2578,6 +2578,17 @@ export const messages = {
     "dashboard.userLimit.duplicateEmail": "This user already exists.",
     "dashboard.userLimit.invalidPolicy":
       "Limits must be positive integers and expiration must be valid.",
+    "dashboard.userLimit.consumedTokens": "Consumed tokens (current period)",
+    "dashboard.userLimit.consumedHint":
+      "Effective {effective}; saving uses this as the baseline and continues adding new requests. Observed {observed}.",
+    "dashboard.userLimit.newConsumedHint":
+      "You can enter 0; leave blank to skip a manual baseline.",
+    "dashboard.userLimit.clearRebase": "Clear baseline",
+    "dashboard.userLimit.rebaseTarget": "Baseline {value}",
+    "dashboard.userLimit.consumedBelowObserved":
+      "Consumed tokens cannot be below the current observed value ({observed}).",
+    "dashboard.userLimit.invalidUsage":
+      "Consumed tokens must be an integer greater than or equal to 0.",
     "dashboard.userLimit.empty": "No user limit configuration.",
     "dashboard.userLimit.permanent": "Permanent",
     "dashboard.userLimit.parallel": "Parallel",
@@ -5152,6 +5163,15 @@ export const messages = {
     "dashboard.userLimit.duplicateEmail": "该用户已存在。",
     "dashboard.userLimit.invalidPolicy":
       "限制必须为正整数，且到期时间必须有效。",
+    "dashboard.userLimit.consumedTokens": "已消耗 Token（当前周期）",
+    "dashboard.userLimit.consumedHint":
+      "当前有效 {effective}；保存后以该值为基线，并继续累加新请求。当前观测值 {observed}。",
+    "dashboard.userLimit.newConsumedHint": "可填写 0；留空表示不创建手工重基线。",
+    "dashboard.userLimit.clearRebase": "清除重基线",
+    "dashboard.userLimit.rebaseTarget": "基线 {value}",
+    "dashboard.userLimit.consumedBelowObserved":
+      "已消耗 Token 不能低于当前观测值（{observed}）。",
+    "dashboard.userLimit.invalidUsage": "已消耗 Token 必须是大于等于 0 的整数。",
     "dashboard.userLimit.empty": "暂无用户限制配置。",
     "dashboard.userLimit.permanent": "永久",
     "dashboard.userLimit.parallel": "并发",

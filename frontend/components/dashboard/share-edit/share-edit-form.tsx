@@ -25,6 +25,23 @@ import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
 
+function shareUserGrantsFingerprint(share: ShareView | null) {
+  if (!share) return "";
+  return JSON.stringify(
+    Object.entries(share.userGrants || {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([email, grant]) => [
+        email,
+        grant.active,
+        grant.role,
+        grant.revision ?? 0,
+        grant.policy,
+        grant.usageQuota ?? null,
+        grant.usageRebase ?? null,
+      ]),
+  );
+}
+
 export type ShareEditFormApi = {
   liveShare: ShareView;
   draft: ShareEditDraft;
@@ -115,7 +132,8 @@ export function useShareEditForm({
       shareEditPatchFingerprint(
         buildShareEditPatch(currentBaseDraft ?? incoming, currentBaseShare, currentApps),
       );
-    if (sameRevision && sameFingerprint) {
+    const sameGrants = shareUserGrantsFingerprint(share) === shareUserGrantsFingerprint(currentBaseShare);
+    if (sameRevision && sameFingerprint && sameGrants) {
       setBaseShare(share);
       return;
     }
@@ -440,6 +458,10 @@ export function ShareEditFormBody({
           supportedPeriods={displayShare.supportedUserTokenPeriods}
           t={t}
           disabled={fieldsDisabled}
+          usageEdits={draft.userUsageEdits}
+          onUsageEditsChange={(userUsageEdits) =>
+            form.onDraftChange((current) => ({ ...current, userUsageEdits }))
+          }
           onChange={(userGrants) =>
             form.onDraftChange((current) => ({ ...current, userGrants }))
           }

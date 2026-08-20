@@ -95,7 +95,7 @@ export function ShareEditReadView({
     return () => {
       cancelled = true;
     };
-  }, [share.shareId, share.configRevision, shareApp]);
+  }, [share.shareId, share.configRevision, share.userGrants, shareApp]);
 
   const description = share.description?.trim() || "";
 

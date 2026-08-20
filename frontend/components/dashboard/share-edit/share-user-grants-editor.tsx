@@ -10,6 +10,7 @@ import type {
   ShareUserGrant,
   ShareUserGrantMap,
   ShareUserPolicy,
+  ShareUserUsageEditMap,
 } from "@/lib/types";
 import { routerShareMarketManagedEmails } from "@/lib/share-settings";
 import { formatDateTime, formatNumber } from "@/lib/utils";
@@ -22,9 +23,11 @@ type GrantDraft = {
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchor: string;
   expiresAt: string;
+  consumedTokens: string;
+  usageAction: "unchanged" | "set" | "clear";
 };
 
-type BatchGrantDraft = Omit<GrantDraft, "email"> & {
+type BatchGrantDraft = Omit<GrantDraft, "email" | "consumedTokens" | "usageAction"> & {
   applyParallelLimit: boolean;
   applyTokenLimit: boolean;
   applyExpiresAt: boolean;
@@ -59,7 +62,70 @@ function makeDraft(email: string, policy: ShareUserPolicy): GrantDraft {
     tokenPeriod: policy.tokenPeriod || "lifetime",
     tokenPeriodAnchor: toUtcDateTime(policy.tokenPeriodAnchorAtMs),
     expiresAt: toLocalDateTime(policy.expiresAt),
+    consumedTokens: "",
+    usageAction: "unchanged",
   };
+}
+
+function currentGrantTokens(grant: ShareUserGrant): number {
+  if (grant.usageQuota) return grant.usageQuota.effectiveTokensUsed;
+  const usage = grant.usage as
+    | {
+        day?: { tokensUsed?: number };
+        week?: { tokensUsed?: number };
+        calendarMonth?: { tokensUsed?: number };
+        anchored?: { period?: ShareTokenPeriod; tokensUsed?: number };
+        lifetime?: { tokensUsed?: number };
+      }
+    | undefined;
+  if (!usage) return 0;
+  switch (grant.policy.tokenPeriod) {
+    case "day":
+      return usage.day?.tokensUsed ?? 0;
+    case "week":
+      return usage.week?.tokensUsed ?? 0;
+    case "calendarMonth":
+      return usage.calendarMonth?.tokensUsed ?? 0;
+    case "sevenDays":
+    case "thirtyDays":
+      return usage.anchored?.period === grant.policy.tokenPeriod
+        ? usage.anchored.tokensUsed ?? 0
+        : 0;
+    case "lifetime":
+    default:
+      return usage.lifetime?.tokensUsed ?? 0;
+  }
+}
+
+function observedGrantTokens(grant: ShareUserGrant): number {
+  return grant.usageQuota?.observedTokensUsed ?? currentGrantTokens(grant);
+}
+
+function usageEditForGrant(
+  grant: ShareUserGrant,
+  usageEdits: ShareUserUsageEditMap,
+): Pick<GrantDraft, "consumedTokens" | "usageAction"> {
+  const edit = usageEdits[grant.email.trim().toLowerCase()];
+  if (edit?.action === "clear") {
+    return { consumedTokens: "", usageAction: "clear" };
+  }
+  if (edit?.action === "set") {
+    return {
+      consumedTokens: edit.targetTokens == null ? "" : String(edit.targetTokens),
+      usageAction: "set",
+    };
+  }
+  return {
+    consumedTokens: String(currentGrantTokens(grant)),
+    usageAction: "unchanged",
+  };
+}
+
+function displayedGrantTokens(grant: ShareUserGrant, usageEdits: ShareUserUsageEditMap): number {
+  const edit = usageEdits[grant.email.trim().toLowerCase()];
+  if (edit?.action === "set" && edit.targetTokens != null) return edit.targetTokens;
+  if (edit?.action === "clear") return observedGrantTokens(grant);
+  return currentGrantTokens(grant);
 }
 
 function makeBatchDraft(policy: ShareUserPolicy): BatchGrantDraft {
@@ -87,6 +153,8 @@ export function ShareUserGrantsEditor({
   supportedPeriods,
   t,
   disabled,
+  usageEdits = {},
+  onUsageEditsChange,
   onChange,
 }: {
   value: ShareUserGrantMap;
@@ -95,6 +163,8 @@ export function ShareUserGrantsEditor({
   supportedPeriods?: ShareTokenPeriod[];
   t: TFn;
   disabled?: boolean;
+  usageEdits?: ShareUserUsageEditMap;
+  onUsageEditsChange?: (value: ShareUserUsageEditMap) => void;
   onChange: (value: ShareUserGrantMap) => void;
 }) {
   const normalizedOwner = ownerEmail.trim().toLowerCase();
@@ -174,7 +244,10 @@ export function ShareUserGrantsEditor({
     if (grant.role === "owner" || shareMarketManagedEmails.has(grant.email)) return;
     setEditingEmail(grant.email);
     setError("");
-    setGrantDraft(makeDraft(grant.email, grant.policy));
+    setGrantDraft({
+      ...makeDraft(grant.email, grant.policy),
+      ...usageEditForGrant(grant, usageEdits),
+    });
   };
 
   const exitSelecting = () => {
@@ -240,6 +313,26 @@ export function ShareUserGrantsEditor({
       return;
     }
     const previous = value[editingEmail || email];
+    const consumedTokens = grantDraft.consumedTokens.trim()
+      ? Number(grantDraft.consumedTokens)
+      : undefined;
+    const observedTokens = previous ? observedGrantTokens(previous) : 0;
+    const usageInvalid =
+      grantDraft.usageAction === "set" &&
+      (consumedTokens == null ||
+        !Number.isSafeInteger(consumedTokens) ||
+        consumedTokens < 0 ||
+        consumedTokens < observedTokens);
+    if (usageInvalid) {
+      setError(
+        consumedTokens != null && consumedTokens < observedTokens
+          ? t("dashboard.userLimit.consumedBelowObserved", {
+              observed: formatNumber(observedTokens),
+            })
+          : t("dashboard.userLimit.invalidUsage"),
+      );
+      return;
+    }
     const next: ShareUserGrant = {
       ...previous,
       email,
@@ -253,10 +346,60 @@ export function ShareUserGrantsEditor({
         expiresAt,
       },
     };
+    if (grantDraft.usageAction === "set" && consumedTokens != null) {
+      const previousQuota = previous?.usageQuota;
+      next.usageQuota = {
+        period: grantDraft.tokenPeriod,
+        anchorAtMs: tokenPeriodAnchorAtMs,
+        windowStartsAtMs: previousQuota?.windowStartsAtMs,
+        windowEndsAtMs: previousQuota?.windowEndsAtMs,
+        effectiveTokensUsed: consumedTokens,
+        observedTokensUsed: observedTokens,
+        manualOffsetTokens: consumedTokens - observedTokens,
+        observedRequestsCount: previousQuota?.observedRequestsCount ?? 0,
+        rebaseApplies: true,
+      };
+    } else if (grantDraft.usageAction === "clear") {
+      const previousQuota = previous?.usageQuota;
+      next.usageRebase = undefined;
+      next.usageQuota = previousQuota
+        ? {
+            ...previousQuota,
+            effectiveTokensUsed: observedTokens,
+            observedTokensUsed: observedTokens,
+            manualOffsetTokens: 0,
+            rebaseApplies: false,
+          }
+        : undefined;
+    }
     const userGrants = { ...value };
     if (editingEmail && editingEmail !== email) delete userGrants[editingEmail];
     userGrants[email] = next;
     applyGrants(userGrants);
+    if (onUsageEditsChange) {
+      const nextEdits: ShareUserUsageEditMap = { ...usageEdits };
+      if (editingEmail && editingEmail !== email) delete nextEdits[editingEmail];
+      if (grantDraft.usageAction === "set" && consumedTokens != null) {
+        nextEdits[email] = {
+          action: "set",
+          targetTokens: consumedTokens,
+          expectedGrantRevision: previous?.revision,
+          period: grantDraft.tokenPeriod,
+          anchorAtMs: tokenPeriodAnchorAtMs,
+          source: usageEdits[editingEmail || email]?.source ?? "manual",
+        };
+      } else if (grantDraft.usageAction === "clear" && previous?.usageRebase) {
+        nextEdits[email] = {
+          action: "clear",
+          expectedGrantRevision: previous.revision,
+          period: grantDraft.tokenPeriod,
+          anchorAtMs: tokenPeriodAnchorAtMs,
+        };
+      } else if (grantDraft.usageAction === "unchanged") {
+        delete nextEdits[email];
+      }
+      onUsageEditsChange(nextEdits);
+    }
     setGrantDraft(null);
   };
 
@@ -319,6 +462,11 @@ export function ShareUserGrantsEditor({
         ? { expiresAt: { value: expiresAt } }
         : {}),
     }));
+    if (onUsageEditsChange && batchDraft.applyTokenLimit) {
+      const nextEdits = { ...usageEdits };
+      for (const email of selectedEditableEmails) delete nextEdits[email];
+      onUsageEditsChange(nextEdits);
+    }
     setSelectedEmails(new Set());
     setBatchDraft(null);
     setError("");
@@ -379,7 +527,7 @@ export function ShareUserGrantsEditor({
       </div>
 
       <div className="overflow-x-auto rounded-md border border-slate-200">
-        <table className={`w-full text-left text-sm ${selecting ? "min-w-[800px]" : "min-w-[720px]"}`}>
+        <table className={`w-full text-left text-sm ${selecting ? "min-w-[900px]" : "min-w-[840px]"}`}>
           <thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
             <tr>
               {selecting ? (
@@ -403,6 +551,7 @@ export function ShareUserGrantsEditor({
               <th className="px-3 py-2 font-medium">Email</th>
               <th className="px-3 py-2 font-medium">{t("dashboard.field.parallelLimit")}</th>
               <th className="px-3 py-2 font-medium">Token</th>
+              <th className="px-3 py-2 font-medium">{t("dashboard.userLimit.consumedTokens")}</th>
               <th className="px-3 py-2 font-medium">{t("dashboard.field.expiresAt")}</th>
               <th className="w-20 px-3 py-2" />
             </tr>
@@ -445,6 +594,16 @@ export function ShareUserGrantsEditor({
                 </td>
                 <td className="px-3 py-2">{limit(grant.policy.parallelLimit)}</td>
                 <td className="px-3 py-2">{limit(grant.policy.tokenLimit)} · {periodLabel[grant.policy.tokenPeriod]}</td>
+                <td className="px-3 py-2">
+                  <div className="font-mono text-xs">{formatNumber(displayedGrantTokens(grant, usageEdits))}</div>
+                  {grant.usageRebase ? (
+                    <div className="text-[11px] text-muted-foreground">
+                      {t("dashboard.userLimit.rebaseTarget", {
+                        value: formatNumber(grant.usageRebase.targetTokens),
+                      })}
+                    </div>
+                  ) : null}
+                </td>
                 <td className="px-3 py-2">{expiry(grant.policy.expiresAt)}</td>
                 <td className="px-3 py-2">
                   <div className="flex justify-end gap-1">
@@ -458,6 +617,11 @@ export function ShareUserGrantsEditor({
                         const userGrants = { ...value };
                         delete userGrants[grant.email];
                         applyGrants(userGrants);
+                        if (onUsageEditsChange) {
+                          const nextEdits = { ...usageEdits };
+                          delete nextEdits[grant.email];
+                          onUsageEditsChange(nextEdits);
+                        }
                       }}>
                         <Trash2 className="h-4 w-4 text-red-600" />
                       </Button>
@@ -493,6 +657,48 @@ export function ShareUserGrantsEditor({
                 <div className="grid gap-1.5">
                   <span className="mono-label text-muted-foreground">{t("dashboard.field.tokenLimit")}</span>
                   <Input type="number" min={1} placeholder={t("common.unlimited")} value={grantDraft?.tokenLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, tokenLimit: event.target.value })} />
+                </div>
+                <div className="grid gap-1.5 sm:col-span-2">
+                  <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.consumedTokens")}</span>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="number"
+                      min={0}
+                      step={1}
+                      placeholder="0"
+                      value={grantDraft?.consumedTokens || ""}
+                      onChange={(event) => grantDraft && setGrantDraft({
+                        ...grantDraft,
+                        consumedTokens: event.target.value,
+                        usageAction: "set",
+                      })}
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      isDisabled={
+                        !editingEmail ||
+                        (!value[editingEmail]?.usageRebase && usageEdits[editingEmail]?.action !== "set")
+                      }
+                      onClick={() => grantDraft && setGrantDraft({
+                        ...grantDraft,
+                        consumedTokens: "",
+                        usageAction: "clear",
+                      })}
+                    >
+                      {t("dashboard.userLimit.clearRebase")}
+                    </Button>
+                  </div>
+                  {editingEmail && value[editingEmail] ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("dashboard.userLimit.consumedHint", {
+                        effective: formatNumber(currentGrantTokens(value[editingEmail])),
+                        observed: formatNumber(observedGrantTokens(value[editingEmail])),
+                      })}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.newConsumedHint")}</p>
+                  )}
                 </div>
                 <div className="grid gap-1.5">
                   <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.period")}</span>

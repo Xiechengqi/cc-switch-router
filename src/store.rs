@@ -16460,6 +16460,23 @@ fn authoritative_share_user_tokens(
     grant: &ShareUserGrant,
     window_start: Option<&DateTime<Utc>>,
 ) -> u64 {
+    if let Some(quota) = grant.usage_quota {
+        return quota.effective_tokens_used;
+    }
+    if let Some(rebase) = grant.usage_rebase.as_ref() {
+        if rebase.rebase_window_matches(window_start) {
+            let observed = grant_usage_tokens(grant, window_start);
+            let extra = observed.saturating_sub(rebase.observed_tokens_at_rebase);
+            return rebase.target_tokens.saturating_add(extra);
+        }
+    }
+    grant_usage_tokens(grant, window_start)
+}
+
+fn grant_usage_tokens(
+    grant: &ShareUserGrant,
+    window_start: Option<&DateTime<Utc>>,
+) -> u64 {
     let expected_start_ms = window_start.map(|start| start.timestamp_millis());
     match grant.policy.token_period {
         ShareTokenPeriod::Lifetime => (grant.usage.lifetime.started_at_ms == 0)
@@ -16488,6 +16505,16 @@ fn authoritative_share_user_tokens(
             })
             .map(|bucket| bucket.tokens_used)
             .unwrap_or(0),
+    }
+}
+
+impl crate::models::ShareUserUsageRebase {
+    fn rebase_window_matches(&self, window_start: Option<&DateTime<Utc>>) -> bool {
+        match (self.window_starts_at_ms, window_start) {
+            (None, None) => true,
+            (Some(start_ms), Some(start)) => start_ms == start.timestamp_millis(),
+            _ => false,
+        }
     }
 }
 
@@ -16844,6 +16871,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.previous_response_cache_enabled.is_none()
         && patch.support.is_none()
         && patch.user_grants.is_none()
+        && patch.user_usage_edits.is_none()
         && patch.managed_grant.is_none()
 }
 
@@ -17045,6 +17073,9 @@ fn normalize_share_user_grants_preserving(
         grant.usage_rebase = existing
             .and_then(|map| map.get(&email))
             .and_then(|prev| prev.usage_rebase.clone());
+        grant.usage_quota = existing
+            .and_then(|map| map.get(&email))
+            .and_then(|prev| prev.usage_quota);
         grant.created_at_ms = existing
             .and_then(|map| map.get(&email))
             .map(|prev| prev.created_at_ms)
@@ -17174,6 +17205,7 @@ fn normalize_share_settings_patch(
         previous_response_cache_enabled: patch.previous_response_cache_enabled,
         support,
         user_grants,
+        user_usage_edits: patch.user_usage_edits,
         managed_grant: None,
     })
 }
@@ -24402,6 +24434,7 @@ mod tests {
                 ..Default::default()
             },
             usage_rebase: None,
+            usage_quota: None,
             created_at_ms: 10,
             updated_at_ms: 20,
             revoked_at_ms: None,

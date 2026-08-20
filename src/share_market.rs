@@ -6674,6 +6674,9 @@ fn apply_control_grant_effect(
                         .map(|grant| grant.usage.clone())
                         .unwrap_or_default(),
                     usage_rebase,
+                    usage_quota: previous
+                        .as_ref()
+                        .and_then(|grant| grant.usage_quota),
                     created_at_ms: previous
                         .as_ref()
                         .map(|grant| grant.created_at_ms)
@@ -7294,6 +7297,7 @@ mod tests {
             policy: ShareUserPolicy::default(),
             usage: Default::default(),
             usage_rebase: None,
+            usage_quota: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             revoked_at_ms: None,
@@ -11652,6 +11656,7 @@ mod tests {
                             policy: ShareUserPolicy::default(),
                             usage: Default::default(),
                             usage_rebase: None,
+                            usage_quota: None,
                             created_at_ms: 1,
                             updated_at_ms: 1,
                             revoked_at_ms: None,

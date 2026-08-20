@@ -872,6 +872,8 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
 }
 
@@ -1004,8 +1006,56 @@ pub struct ShareUserUsageRebase {
     #[serde(default)]
     pub usage_watermark: u64,
     pub applied_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_by: Option<String>,
     #[serde(default)]
     pub source: ShareUsageRebaseSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareUserUsageEditAction {
+    Set,
+    Clear,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUserUsageEdit {
+    pub action: ShareUserUsageEditAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_grant_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<ShareTokenPeriod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_at_ms: Option<i64>,
+    #[serde(default)]
+    pub source: ShareUsageRebaseSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserQuotaView {
+    #[serde(default)]
+    pub period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_starts_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_ends_at_ms: Option<i64>,
+    #[serde(default)]
+    pub effective_tokens_used: u64,
+    #[serde(default)]
+    pub observed_tokens_used: u64,
+    #[serde(default)]
+    pub manual_offset_tokens: i64,
+    #[serde(default)]
+    pub observed_requests_count: u64,
+    #[serde(default)]
+    pub rebase_applies: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1042,6 +1092,8 @@ pub struct ShareUserGrant {
     pub usage: ShareUserUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_rebase: Option<ShareUserUsageRebase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_quota: Option<ShareUserQuotaView>,
     #[serde(default)]
     pub created_at_ms: u128,
     #[serde(default)]
