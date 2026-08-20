@@ -457,6 +457,7 @@ export function ShareEditFormBody({
           supportedPeriods={displayShare.supportedUserTokenPeriods}
           t={t}
           disabled={fieldsDisabled}
+          shareId={displayShare.shareId}
           usageEdits={draft.userUsageEdits}
           onUsageEditsChange={(userUsageEdits) =>
             form.onDraftChange((current) => ({ ...current, userUsageEdits }))

@@ -277,6 +277,7 @@ function ShareSettingsForm({
           defaultPolicy={defaultUserPolicy}
           supportedPeriods={share.supportedUserTokenPeriods}
           t={t}
+          shareId={share.shareId}
           onChange={(userGrants) =>
             setDraft((current) => ({ ...current, userGrants }))
           }

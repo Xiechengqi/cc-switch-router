@@ -1009,6 +1009,7 @@ function grantsToLimitStatusRows(
   return grants.map((grant) => ({
     email: grant.email,
     role: grant.role,
+    manager: grant.manager,
     parallelLimit: grant.policy?.parallelLimit,
     tokenLimit: grant.policy?.tokenLimit,
     tokenPeriod: grant.policy?.tokenPeriod || "lifetime",
@@ -1018,17 +1019,46 @@ function grantsToLimitStatusRows(
   }));
 }
 
+type UserLimitRoleTag = "owner" | "shareto" | "sharemarket";
+
+function userLimitRoleTag(
+  row: ShareUserLimitStatusRow,
+  grant?: ShareUserGrant,
+): UserLimitRoleTag {
+  const manager = grant?.manager ?? row.manager;
+  if (manager === "routerShareMarket") return "sharemarket";
+  if ((grant?.role || row.role) === "owner") return "owner";
+  return "shareto";
+}
+
 export function ShareUserLimitsTable({
   rows,
   grants,
   t,
+  leading,
+  trailing,
+  renderEmailMeta,
 }: {
   rows?: ShareUserLimitStatusRow[];
   grants?: ShareUserGrant[];
   t: TFn;
+  leading?: {
+    header: React.ReactNode;
+    cell: (row: ShareUserLimitStatusRow) => React.ReactNode;
+  };
+  trailing?: {
+    header?: React.ReactNode;
+    cell: (row: ShareUserLimitStatusRow) => React.ReactNode;
+  };
+  renderEmailMeta?: (row: ShareUserLimitStatusRow) => React.ReactNode;
 }) {
   const unlimited = t("common.unlimited");
   const permanent = t("dashboard.userLimit.permanent");
+  const roleLabels: Record<UserLimitRoleTag, string> = {
+    owner: t("dashboard.usageEmail.role.owner"),
+    shareto: t("dashboard.usageEmail.role.shareto"),
+    sharemarket: t("dashboard.usageEmail.role.sharemarket"),
+  };
   const periodLabels: Record<ShareTokenPeriod, string> = {
     lifetime: t("dashboard.userLimit.periodLifetime"),
     day: t("dashboard.userLimit.periodDay"),
@@ -1037,10 +1067,26 @@ export function ShareUserLimitsTable({
     calendarMonth: t("dashboard.userLimit.periodMonth"),
     thirtyDays: t("dashboard.userLimit.periodThirtyDays"),
   };
-  const displayRows = React.useMemo(
-    () => (rows?.length ? rows : grantsToLimitStatusRows(grants || [])),
-    [rows, grants],
-  );
+  const grantByEmail = React.useMemo(() => {
+    const map = new Map<string, ShareUserGrant>();
+    for (const grant of grants || []) {
+      map.set(grant.email.trim().toLowerCase(), grant);
+    }
+    return map;
+  }, [grants]);
+  const displayRows = React.useMemo(() => {
+    const base = rows?.length ? rows : grantsToLimitStatusRows(grants || []);
+    if (!grantByEmail.size) return base;
+    return base.map((row) => {
+      const grant = grantByEmail.get(row.email.trim().toLowerCase());
+      if (!grant) return row;
+      return {
+        ...row,
+        role: grant.role || row.role,
+        manager: row.manager ?? grant.manager,
+      };
+    });
+  }, [rows, grants, grantByEmail]);
   const hasCountdown = displayRows.some((row) => Boolean(row.resetsAt));
   const [nowMs, setNowMs] = React.useState(() => Date.now());
 
@@ -1054,17 +1100,21 @@ export function ShareUserLimitsTable({
     <div className="overflow-hidden rounded-md border">
       <table className="w-full table-fixed border-collapse text-[11px]">
         <colgroup>
-          <col className="w-[34%]" />
-          <col className="w-[12%]" />
-          <col className="w-[34%]" />
-          <col className="w-[20%]" />
+          {leading ? <col className="w-10" /> : null}
+          <col className={trailing ? "w-[30%]" : "w-[34%]"} />
+          <col className={trailing ? "w-[10%]" : "w-[12%]"} />
+          <col className={trailing ? "w-[30%]" : "w-[34%]"} />
+          <col className={trailing ? "w-[16%]" : "w-[20%]"} />
+          {trailing ? <col className="w-[14%]" /> : null}
         </colgroup>
         <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
           <tr>
+            {leading ? <th className="px-1.5 py-2">{leading.header}</th> : null}
             <th className="px-1.5 py-2">{t("dashboard.usageEmail.email")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.parallel")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.token")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.reset")}</th>
+            {trailing ? <th className="px-1.5 py-2">{trailing.header}</th> : null}
           </tr>
         </thead>
         <tbody>
@@ -1075,18 +1125,26 @@ export function ShareUserLimitsTable({
             const limited = limit != null && !isUnlimited(limit);
             const pct = limited && limit > 0 ? (used / limit) * 100 : 0;
             const countdown = formatResetCountdown(row.resetsAt, nowMs);
+            const grant = grantByEmail.get(row.email.trim().toLowerCase());
+            const roleTag = userLimitRoleTag(row, grant);
             return (
               <tr key={`${row.role}:${row.email}`} className="border-t">
+                {leading ? (
+                  <td className="px-1.5 py-2 align-middle">{leading.cell(row)}</td>
+                ) : null}
                 <td className="px-1.5 py-2">
-                  <div className="flex min-w-0 items-center gap-1.5">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                     <span className="min-w-0 whitespace-normal break-all font-medium leading-4">
                       {row.email}
                     </span>
-                    {row.role === "owner" ? (
-                      <Chip size="sm" variant="tertiary" className="shrink-0">
-                        Owner
-                      </Chip>
-                    ) : null}
+                    <Chip
+                      size="sm"
+                      variant={roleTag === "sharemarket" ? "soft" : "tertiary"}
+                      className="shrink-0"
+                    >
+                      {roleLabels[roleTag]}
+                    </Chip>
+                    {renderEmailMeta?.(row)}
                   </div>
                 </td>
                 <td className="overflow-hidden px-1.5 py-2 font-mono">
@@ -1133,6 +1191,11 @@ export function ShareUserLimitsTable({
                     ? t("dashboard.userLimit.resetIn", { time: countdown })
                     : t("dashboard.userLimit.noReset")}
                 </td>
+                {trailing ? (
+                  <td className="overflow-hidden px-1.5 py-2 align-middle">
+                    {trailing.cell(row)}
+                  </td>
+                ) : null}
               </tr>
             );
           })}

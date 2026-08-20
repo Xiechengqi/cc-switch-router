@@ -4,16 +4,19 @@ import { Button, Checkbox, Input, ListBox, Modal, Select, Tooltip } from "@herou
 import { Info, Pencil, Plus, Trash2 } from "lucide-react";
 import * as React from "react";
 
+import { ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
+import { getShareUserLimitStatus } from "@/lib/api";
 import type {
   ShareTokenPeriod,
   ShareUserGrant,
   ShareUserGrantMap,
+  ShareUserLimitStatusRow,
   ShareUserPolicy,
   ShareUserUsageEditMap,
 } from "@/lib/types";
 import { routerShareMarketManagedEmails } from "@/lib/share-settings";
-import { formatDateTime, formatNumber } from "@/lib/utils";
+import { formatNumber } from "@/lib/utils";
 import { applyShareUserPolicyBatch } from "./share-user-policy-batch";
 
 type GrantDraft = {
@@ -129,6 +132,35 @@ function displayedGrantTokens(grant: ShareUserGrant, usageEdits: ShareUserUsageE
   return currentGrantTokens(grant);
 }
 
+function grantHasUsageOverride(grant: ShareUserGrant, usageEdits: ShareUserUsageEditMap) {
+  const edit = usageEdits[grant.email.trim().toLowerCase()];
+  return edit?.action === "set" || edit?.action === "clear";
+}
+
+function grantToLimitStatusRow(
+  grant: ShareUserGrant,
+  usageEdits: ShareUserUsageEditMap,
+  liveRow?: ShareUserLimitStatusRow,
+): ShareUserLimitStatusRow {
+  const period = grant.policy.tokenPeriod || "lifetime";
+  const livePeriodMatches = (liveRow?.tokenPeriod || "lifetime") === period;
+  return {
+    email: grant.email,
+    role: grant.role,
+    manager: grant.manager,
+    parallelLimit: grant.policy.parallelLimit,
+    tokenLimit: grant.policy.tokenLimit,
+    tokenPeriod: period,
+    tokenPeriodAnchorAtMs: grant.policy.tokenPeriodAnchorAtMs,
+    expiresAt: grant.policy.expiresAt,
+    tokensUsed: grantHasUsageOverride(grant, usageEdits) || !liveRow
+      ? displayedGrantTokens(grant, usageEdits)
+      : liveRow.tokensUsed || 0,
+    windowStartsAt: livePeriodMatches ? liveRow?.windowStartsAt : undefined,
+    resetsAt: livePeriodMatches ? liveRow?.resetsAt : undefined,
+  };
+}
+
 function makeBatchDraft(grant: ShareUserGrant, usageEdits: ShareUserUsageEditMap): BatchGrantDraft {
   const draft = makeDraft(grant.email, grant.policy);
   const usage = usageEditForGrant(grant, usageEdits);
@@ -158,6 +190,7 @@ export function ShareUserGrantsEditor({
   supportedPeriods,
   t,
   disabled,
+  shareId,
   usageEdits = {},
   onUsageEditsChange,
   onChange,
@@ -168,6 +201,7 @@ export function ShareUserGrantsEditor({
   supportedPeriods?: ShareTokenPeriod[];
   t: TFn;
   disabled?: boolean;
+  shareId?: string;
   usageEdits?: ShareUserUsageEditMap;
   onUsageEditsChange?: (value: ShareUserUsageEditMap) => void;
   onChange: (value: ShareUserGrantMap) => void;
@@ -179,6 +213,7 @@ export function ShareUserGrantsEditor({
   const [selectedEmails, setSelectedEmails] = React.useState<Set<string>>(new Set());
   const [batchDraft, setBatchDraft] = React.useState<BatchGrantDraft | null>(null);
   const [error, setError] = React.useState("");
+  const [liveRows, setLiveRows] = React.useState<ShareUserLimitStatusRow[] | null>(null);
   const supported = new Set<ShareTokenPeriod>(
     supportedPeriods?.length
       ? supportedPeriods
@@ -238,6 +273,52 @@ export function ShareUserGrantsEditor({
       return next;
     });
   }, [selectableEmailKey]);
+
+  React.useEffect(() => {
+    setLiveRows(null);
+  }, [shareId]);
+
+  React.useEffect(() => {
+    if (!shareId) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const data = await getShareUserLimitStatus(shareId);
+        if (cancelled) return;
+        setLiveRows(data.rows || []);
+      } catch {
+        if (!cancelled) setLiveRows((current) => current ?? []);
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [shareId]);
+
+  const liveRowByEmail = React.useMemo(() => {
+    const map = new Map<string, ShareUserLimitStatusRow>();
+    for (const row of liveRows || []) {
+      map.set(row.email.trim().toLowerCase(), row);
+    }
+    return map;
+  }, [liveRows]);
+
+  const displayRows = grants.map((grant) =>
+    grantToLimitStatusRow(
+      grant,
+      usageEdits,
+      liveRowByEmail.get(grant.email.trim().toLowerCase()),
+    ),
+  );
+
+  const grantByEmail = React.useMemo(() => {
+    const map = new Map<string, ShareUserGrant>();
+    for (const grant of grants) map.set(grant.email, grant);
+    return map;
+  }, [grants]);
 
   const openAdd = () => {
     setEditingEmail(null);
@@ -573,10 +654,16 @@ export function ShareUserGrantsEditor({
     setSelecting(false);
   };
 
-  const limit = (value?: number) =>
-    value == null ? t("common.unlimited") : formatNumber(value);
-  const expiry = (value?: number) =>
-    value == null ? t("dashboard.permanent") : formatDateTime(value);
+  const removeGrant = (grant: ShareUserGrant) => {
+    const userGrants = { ...value };
+    delete userGrants[grant.email];
+    applyGrants(userGrants);
+    if (onUsageEditsChange) {
+      const nextEdits = { ...usageEdits };
+      delete nextEdits[grant.email];
+      onUsageEditsChange(nextEdits);
+    }
+  };
 
   return (
     <div className="grid gap-3">
@@ -626,113 +713,91 @@ export function ShareUserGrantsEditor({
         </div>
       </div>
 
-      <div className="w-full overflow-hidden rounded-md border border-slate-200">
-        <table className="w-full table-fixed text-left text-sm">
-          <thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
-            <tr>
-              {selecting ? (
-                <th className="w-10 px-3 py-2">
-                  <Checkbox
-                    isSelected={allSelected}
-                    isIndeterminate={someSelected && !allSelected}
-                    isDisabled={!selectableEmails.length}
-                    onChange={(checked) =>
-                      setSelectedEmails(new Set(checked ? selectableEmails : []))
-                    }
-                    aria-label={t("dashboard.userLimit.selectAll")}
-                    className="shrink-0"
-                  >
-                    <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
-                      <Checkbox.Indicator />
-                    </Checkbox.Control>
-                  </Checkbox>
-                </th>
-              ) : null}
-              <th className="w-[28%] px-3 py-2 font-medium">Email</th>
-              <th className="w-[12%] px-3 py-2 font-medium">{t("dashboard.field.parallelLimit")}</th>
-              <th className="w-[18%] px-3 py-2 font-medium">Token</th>
-              <th className="w-[22%] px-3 py-2 font-medium">{t("dashboard.userLimit.consumedTokens")}</th>
-              <th className="w-[12%] px-3 py-2 font-medium">{t("dashboard.field.expiresAt")}</th>
-              <th className="w-20 px-3 py-2" />
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {grants.map((grant) => (
-              <tr key={grant.email}>
-                {selecting ? (
-                  <td className="w-10 px-3 py-2">
-                    <Checkbox
-                      isSelected={selectedEmails.has(grant.email)}
-                      isDisabled={protectedEmails.has(grant.email)}
-                      onChange={(checked) => {
-                        setSelectedEmails((current) => {
-                          const next = new Set(current);
-                          if (checked) next.add(grant.email);
-                          else next.delete(grant.email);
-                          return next;
-                        });
-                      }}
-                      aria-label={t("dashboard.userLimit.selectUser", { email: grant.email })}
-                      className="shrink-0"
+      {grants.length ? (
+        <ShareUserLimitsTable
+          rows={displayRows}
+          grants={grants}
+          t={t}
+          leading={selecting ? {
+            header: (
+              <Checkbox
+                isSelected={allSelected}
+                isIndeterminate={someSelected && !allSelected}
+                isDisabled={!selectableEmails.length}
+                onChange={(checked) =>
+                  setSelectedEmails(new Set(checked ? selectableEmails : []))
+                }
+                aria-label={t("dashboard.userLimit.selectAll")}
+                className="shrink-0"
+              >
+                <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
+                  <Checkbox.Indicator />
+                </Checkbox.Control>
+              </Checkbox>
+            ),
+            cell: (row) => {
+              const grant = grantByEmail.get(row.email);
+              if (!grant) return null;
+              return (
+                <Checkbox
+                  isSelected={selectedEmails.has(grant.email)}
+                  isDisabled={protectedEmails.has(grant.email)}
+                  onChange={(checked) => {
+                    setSelectedEmails((current) => {
+                      const next = new Set(current);
+                      if (checked) next.add(grant.email);
+                      else next.delete(grant.email);
+                      return next;
+                    });
+                  }}
+                  aria-label={t("dashboard.userLimit.selectUser", { email: grant.email })}
+                  className="shrink-0"
+                >
+                  <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
+                    <Checkbox.Indicator />
+                  </Checkbox.Control>
+                </Checkbox>
+              );
+            },
+          } : undefined}
+          trailing={{
+            header: t("common.edit"),
+            cell: (row) => {
+              const grant = grantByEmail.get(row.email);
+              if (!grant) return null;
+              const marketManaged = shareMarketManagedEmails.has(grant.email);
+              return (
+                <div className="flex items-center justify-end gap-1">
+                  {!marketManaged ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 min-w-0 px-1.5 text-[11px]"
+                      isDisabled={disabled}
+                      onClick={() => openEdit(grant)}
                     >
-                      <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
-                        <Checkbox.Indicator />
-                      </Checkbox.Control>
-                    </Checkbox>
-                  </td>
-                ) : null}
-                <td className="px-3 py-2 align-top">
-                  <div className="flex flex-wrap items-start gap-2">
-                    <span className="min-w-0 whitespace-normal break-all">{grant.email}</span>
-                    {grant.role === "owner" ? (
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">Owner</span>
-                    ) : null}
-                    {shareMarketManagedEmails.has(grant.email) ? (
-                      <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">Share Market</span>
-                    ) : null}
-                  </div>
-                </td>
-                <td className="px-3 py-2">{limit(grant.policy.parallelLimit)}</td>
-                <td className="px-3 py-2">{limit(grant.policy.tokenLimit)} · {periodLabel[grant.policy.tokenPeriod]}</td>
-                <td className="px-3 py-2 align-top">
-                  <div className="whitespace-normal break-all font-mono text-xs">{formatNumber(displayedGrantTokens(grant, usageEdits))}</div>
-                  {grant.usageRebase ? (
-                    <div className="text-[11px] text-muted-foreground">
-                      {t("dashboard.userLimit.rebaseTarget", {
-                        value: formatNumber(grant.usageRebase.targetTokens),
-                      })}
-                    </div>
+                      {t("common.edit")}
+                    </Button>
                   ) : null}
-                </td>
-                <td className="px-3 py-2">{expiry(grant.policy.expiresAt)}</td>
-                <td className="px-3 py-2">
-                  <div className="flex justify-end gap-1">
-                    {!shareMarketManagedEmails.has(grant.email) ? (
-                      <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} isDisabled={disabled} onClick={() => openEdit(grant)}>
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                    ) : null}
-                    {grant.role !== "owner" && !protectedEmails.has(grant.email) ? (
-                      <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={disabled} onClick={() => {
-                        const userGrants = { ...value };
-                        delete userGrants[grant.email];
-                        applyGrants(userGrants);
-                        if (onUsageEditsChange) {
-                          const nextEdits = { ...usageEdits };
-                          delete nextEdits[grant.email];
-                          onUsageEditsChange(nextEdits);
-                        }
-                      }}>
-                        <Trash2 className="h-4 w-4 text-red-600" />
-                      </Button>
-                    ) : null}
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+                  {grant.role !== "owner" && !protectedEmails.has(grant.email) ? (
+                    <Button
+                      isIconOnly
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 w-6 min-w-6"
+                      aria-label={t("common.delete")}
+                      isDisabled={disabled}
+                      onClick={() => removeGrant(grant)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5 text-red-600" />
+                    </Button>
+                  ) : null}
+                </div>
+              );
+            },
+          }}
+        />
+      ) : null}
 
       <Modal.Backdrop
         isOpen={!!grantDraft}

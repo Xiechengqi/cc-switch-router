@@ -711,6 +711,7 @@ export type ShareUsageByEmailResponse = {
 export type ShareUserLimitStatusRow = {
   email: string;
   role: string;
+  manager?: ShareUserGrant["manager"];
   parallelLimit?: number;
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
