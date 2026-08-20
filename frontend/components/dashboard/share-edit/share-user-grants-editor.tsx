@@ -761,22 +761,23 @@ export function ShareUserGrantsEditor({
             },
           } : undefined}
           trailing={{
-            header: t("common.edit"),
             cell: (row) => {
               const grant = grantByEmail.get(row.email);
               if (!grant) return null;
               const marketManaged = shareMarketManagedEmails.has(grant.email);
               return (
-                <div className="flex items-center justify-end gap-1">
+                <div className="flex items-center justify-center gap-0.5">
                   {!marketManaged ? (
                     <Button
+                      isIconOnly
                       size="sm"
                       variant="ghost"
-                      className="h-6 min-w-0 px-1.5 text-[11px]"
+                      className="h-6 w-6 min-w-6"
+                      aria-label={t("common.edit")}
                       isDisabled={disabled}
                       onClick={() => openEdit(grant)}
                     >
-                      {t("common.edit")}
+                      <Pencil className="h-3.5 w-3.5" />
                     </Button>
                   ) : null}
                   {grant.role !== "owner" && !protectedEmails.has(grant.email) ? (

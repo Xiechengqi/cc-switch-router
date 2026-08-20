@@ -1101,11 +1101,11 @@ export function ShareUserLimitsTable({
       <table className="w-full table-fixed border-collapse text-[11px]">
         <colgroup>
           {leading ? <col className="w-10" /> : null}
-          <col className={trailing ? "w-[30%]" : "w-[34%]"} />
-          <col className={trailing ? "w-[10%]" : "w-[12%]"} />
-          <col className={trailing ? "w-[30%]" : "w-[34%]"} />
-          <col className={trailing ? "w-[16%]" : "w-[20%]"} />
-          {trailing ? <col className="w-[14%]" /> : null}
+          <col className="w-[34%]" />
+          <col className="w-[12%]" />
+          <col className="w-[34%]" />
+          {trailing ? <col /> : <col className="w-[20%]" />}
+          {trailing ? <col className="w-16" /> : null}
         </colgroup>
         <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
           <tr>
@@ -1114,7 +1114,9 @@ export function ShareUserLimitsTable({
             <th className="px-1.5 py-2">{t("dashboard.userLimit.parallel")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.token")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.reset")}</th>
-            {trailing ? <th className="px-1.5 py-2">{trailing.header}</th> : null}
+            {trailing ? (
+              <th className="w-16 px-0 py-2 text-center">{trailing.header}</th>
+            ) : null}
           </tr>
         </thead>
         <tbody>
@@ -1192,7 +1194,7 @@ export function ShareUserLimitsTable({
                     : t("dashboard.userLimit.noReset")}
                 </td>
                 {trailing ? (
-                  <td className="overflow-hidden px-1.5 py-2 align-middle">
+                  <td className="w-16 overflow-hidden px-0 py-2 text-center align-middle">
                     {trailing.cell(row)}
                   </td>
                 ) : null}
