@@ -1,5 +1,7 @@
 # cc-switch-router
 
+官网 **[tokenswitch.org](https://tokenswitch.org)** · 系统文档 **[docs.tokenswitch.org](https://docs.tokenswitch.org)** · Client **[cc-switch-server](https://github.com/Xiechengqi/cc-switch-server)**
+
 TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域名与反向隧道，并在 Client + Router 边界内承载 Share Market、Client Market 与多区域 Router 联邦。旧独立 Token Market 不再是运行时依赖；未来外部容量平台只能通过中性的、签名的 Gateway 入口接入。
 
 | Region | 24h usage |
