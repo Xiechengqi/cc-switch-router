@@ -2,7 +2,7 @@
 
 import { cn } from "@/lib/utils";
 
-/** Normalize common non-ISO aliases to ISO 3166-1 alpha-2 for flag glyphs. */
+/** Normalize common non-ISO aliases to ISO 3166-1 alpha-2 for flag assets. */
 function normalizeIso2(code: string) {
   if (code === "UK") return "GB";
   return code;
@@ -21,10 +21,16 @@ function countryFlagEmoji(code?: string | null) {
   return String.fromCodePoint(...[...iso2].map((ch) => 127397 + ch.charCodeAt(0)));
 }
 
+/** Twemoji regional-indicator filename, e.g. TW → 1f1f9-1f1fc. */
+function twemojiFlagSlug(iso2: string) {
+  return [...iso2]
+    .map((ch) => (127397 + ch.charCodeAt(0)).toString(16))
+    .join("-");
+}
+
 /**
- * Renders a country/region flag as Twemoji's waving glyph.
- * Self-hosted TwemojiCountryFlags covers Windows/Linux gaps (Taiwan 🇹🇼
- * is the frequent miss). Apple/Segoe/Noto remain local fallbacks.
+ * Paints Twemoji's waving SVG so Chrome/Linux cannot substitute Noto's
+ * rectangular flags. A transparent emoji sits on top so copy still yields 🇹🇼.
  */
 export function CountryFlag({
   code,
@@ -39,14 +45,26 @@ export function CountryFlag({
   const flag = countryFlagEmoji(iso2);
   if (!iso2 || !flag) return null;
 
+  const label = title || iso2;
   return (
     <span
       role="img"
-      title={title || iso2}
-      aria-label={title || iso2}
-      className={cn("country-flag inline-block shrink-0 font-normal leading-none", className)}
+      title={label}
+      aria-label={label}
+      className={cn("country-flag", className)}
     >
-      {flag}
+      <img
+        src={`/flags/${twemojiFlagSlug(iso2)}.svg`}
+        width={16}
+        height={16}
+        alt=""
+        draggable={false}
+        decoding="async"
+        aria-hidden="true"
+      />
+      <span className="country-flag-copy" aria-hidden="true">
+        {flag}
+      </span>
     </span>
   );
 }

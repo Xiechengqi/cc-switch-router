@@ -2760,6 +2760,7 @@ fn is_router_share_ui_path(path: &str) -> bool {
         || path == "/install-client.sh"
         || path == "/router-logo.svg"
         || path == "/world-map.svg"
+        || path.starts_with("/flags/")
         || path.starts_with("/_next/")
 }
 
@@ -2806,15 +2807,12 @@ fn ui_response(path: &str) -> Option<Response> {
     } else {
         "public, max-age=2592000"
     };
-    let mut builder = Response::builder()
+    Response::builder()
         .header(header::CONTENT_TYPE, asset.content_type)
         .header(header::CACHE_CONTROL, cache_control)
-        .header("X-UI-Asset", asset.path);
-    // next/font preloads with crossorigin=anonymous; same-origin fonts still need CORS.
-    if asset.content_type.starts_with("font/") {
-        builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
-    }
-    builder.body(Body::from(asset.bytes)).ok()
+        .header("X-UI-Asset", asset.path)
+        .body(Body::from(asset.bytes))
+        .ok()
 }
 
 #[cfg(test)]
@@ -3140,8 +3138,8 @@ mod tests {
             "/install-client.sh",
             "/router-logo.svg",
             "/world-map.svg",
+            "/flags/1f1f9-1f1fc.svg",
             "/_next/static/chunks/app.js",
-            "/_next/static/media/TwemojiCountryFlags.woff2",
         ] {
             assert!(is_router_share_ui_path(path), "{path} should be router UI");
         }

@@ -139,21 +139,30 @@ body {
 }
 
 .country-flag {
-  font-family: var(
-    --font-country-flags,
-    "Apple Color Emoji",
-    "Segoe UI Emoji",
-    "Noto Color Emoji",
-    "Segoe UI Symbol",
-    sans-serif
-  );
-  font-style: normal;
-  font-weight: 400;
-  font-size: 16px;
-  line-height: 1;
+  position: relative;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  overflow: hidden;
   vertical-align: middle;
-  font-synthesis: none;
-  -webkit-font-smoothing: antialiased;
+  line-height: 0;
+}
+
+.country-flag img {
+  display: block;
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+
+.country-flag-copy {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  font-size: 16px;
+  line-height: 16px;
+  opacity: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
