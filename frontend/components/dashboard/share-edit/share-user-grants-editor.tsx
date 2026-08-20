@@ -171,7 +171,7 @@ export function ShareUserGrantsEditor({
   };
 
   const openEdit = (grant: ShareUserGrant) => {
-    if (shareMarketManagedEmails.has(grant.email)) return;
+    if (grant.role === "owner" || shareMarketManagedEmails.has(grant.email)) return;
     setEditingEmail(grant.email);
     setError("");
     setGrantDraft(makeDraft(grant.email, grant.policy));
@@ -448,7 +448,7 @@ export function ShareUserGrantsEditor({
                 <td className="px-3 py-2">{expiry(grant.policy.expiresAt)}</td>
                 <td className="px-3 py-2">
                   <div className="flex justify-end gap-1">
-                    {!shareMarketManagedEmails.has(grant.email) ? (
+                    {grant.role !== "owner" && !shareMarketManagedEmails.has(grant.email) ? (
                       <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} isDisabled={disabled} onClick={() => openEdit(grant)}>
                         <Pencil className="h-4 w-4" />
                       </Button>

@@ -97,17 +97,15 @@ export function ShareEditReadView({
     };
   }, [share.shareId, share.configRevision, shareApp]);
 
+  const description = share.description?.trim() || "";
+
   return (
     <div className="grid gap-6">
-      <ShareEditSection title={t("dashboard.shareEdit.section.overview")}>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <ReadOnlyField label={t("dashboard.field.ownerEmail")} value={share.ownerEmail || "—"} />
-          <ReadOnlyField
-            label={t("dashboard.field.description")}
-            value={share.description?.trim() ? share.description : "—"}
-          />
-        </div>
-      </ShareEditSection>
+      {description ? (
+        <ShareEditSection title={t("dashboard.shareEdit.section.overview")}>
+          <ReadOnlyField label={t("dashboard.field.description")} value={description} />
+        </ShareEditSection>
+      ) : null}
 
       <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
         <div className="grid gap-2">
@@ -145,10 +143,12 @@ export function ShareEditReadView({
       {shareApp ? (
         <>
           <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
-            <ReadOnlyField
-              label={t("dashboard.field.freeAccess")}
-              value={freeAccess ? t("dashboard.freeAccessEnabled") : t("dashboard.freeAccessDisabled")}
-            />
+            {freeAccess ? (
+              <ReadOnlyField
+                label={t("dashboard.field.freeAccess")}
+                value={t("dashboard.freeAccessEnabled")}
+              />
+            ) : null}
             <div className="grid gap-3 sm:grid-cols-3">
               <ReadOnlyField
                 label={t("dashboard.field.tokenLimit")}
