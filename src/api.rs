@@ -2806,12 +2806,15 @@ fn ui_response(path: &str) -> Option<Response> {
     } else {
         "public, max-age=2592000"
     };
-    Response::builder()
+    let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, asset.content_type)
         .header(header::CACHE_CONTROL, cache_control)
-        .header("X-UI-Asset", asset.path)
-        .body(Body::from(asset.bytes))
-        .ok()
+        .header("X-UI-Asset", asset.path);
+    // next/font preloads with crossorigin=anonymous; same-origin fonts still need CORS.
+    if asset.content_type.starts_with("font/") {
+        builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    }
+    builder.body(Body::from(asset.bytes)).ok()
 }
 
 #[cfg(test)]
@@ -3138,6 +3141,7 @@ mod tests {
             "/router-logo.svg",
             "/world-map.svg",
             "/_next/static/chunks/app.js",
+            "/_next/static/media/TwemojiCountryFlags.woff2",
         ] {
             assert!(is_router_share_ui_path(path), "{path} should be router UI");
         }

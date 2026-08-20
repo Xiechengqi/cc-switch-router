@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { countryFlagFont } from "@/app/fonts";
 import { AppProviders } from "@/components/providers/app-providers";
 import "./globals.css";
 
@@ -18,7 +19,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" className={countryFlagFont.variable}>
       <body>
         <AppProviders>{children}</AppProviders>
       </body>

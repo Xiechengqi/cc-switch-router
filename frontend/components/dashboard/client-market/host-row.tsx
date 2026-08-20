@@ -434,7 +434,7 @@ function HostRowImpl({
         <td className="max-w-[10rem] px-2 py-2 align-middle">
           {locationLabel || host.countryCode ? (
             <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-xs text-muted-foreground">
-              <CountryFlag code={host.countryCode} className="h-4 w-4 shrink-0" />
+              <CountryFlag code={host.countryCode} />
               {locationLabel ? (
                 <span className="truncate" title={locationLabel}>
                   {locationLabel}

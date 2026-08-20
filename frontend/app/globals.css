@@ -138,6 +138,24 @@ body {
   animation: router-activity-enter 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+.country-flag {
+  font-family: var(
+    --font-country-flags,
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
+    "Noto Color Emoji",
+    "Segoe UI Symbol",
+    sans-serif
+  );
+  font-style: normal;
+  font-weight: 400;
+  font-size: 16px;
+  line-height: 1;
+  vertical-align: middle;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
