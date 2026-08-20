@@ -855,26 +855,41 @@ export function ShareEmailUsagePanel({
     };
   }, [share.shareId, period, showUsage]);
 
+  const hasLimitRowsRef = React.useRef(false);
+
+  React.useEffect(() => {
+    hasLimitRowsRef.current = false;
+    setLimitRows(null);
+  }, [share.shareId]);
+
   React.useEffect(() => {
     if (!showLimits) return;
     let cancelled = false;
-    setLoading(true);
-    setError("");
-    getShareUserLimitStatus(share.shareId)
-      .then((data) => {
-        if (!cancelled) setLimitRows(data.rows || []);
-      })
-      .catch((err) => {
-        if (!cancelled) {
+    const load = async () => {
+      const silent = hasLimitRowsRef.current;
+      if (!silent) setLoading(true);
+      try {
+        const data = await getShareUserLimitStatus(share.shareId);
+        if (cancelled) return;
+        setLimitRows(data.rows || []);
+        setError("");
+        hasLimitRowsRef.current = true;
+      } catch (err) {
+        if (cancelled) return;
+        if (!silent) {
           setLimitRows(null);
           setError(err instanceof Error ? err.message : String(err));
+          hasLimitRowsRef.current = false;
         }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      } finally {
+        if (!cancelled && !silent) setLoading(false);
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 15_000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
   }, [share.shareId, showLimits]);
 
@@ -926,20 +941,21 @@ export function ShareEmailUsagePanel({
           ))}
         </div>
       </div>
-      {showLimits && loading ? (
+      {showLimits && (limitRows?.length || limitGrants.length) ? (
+        <ShareUserLimitsTable
+          rows={limitRows || undefined}
+          grants={limitGrants}
+          t={t}
+        />
+      ) : null}
+      {showLimits && !(limitRows?.length || limitGrants.length) && loading ? (
         <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock>
       ) : null}
-      {showLimits && error ? <EmptyBlock>{error}</EmptyBlock> : null}
-      {showLimits && !loading && !error ? (
-        limitRows?.length || limitGrants.length ? (
-          <ShareUserLimitsTable
-            rows={limitRows || undefined}
-            grants={limitGrants}
-            t={t}
-          />
-        ) : (
-          <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
-        )
+      {showLimits && !(limitRows?.length || limitGrants.length) && error ? (
+        <EmptyBlock>{error}</EmptyBlock>
+      ) : null}
+      {showLimits && !(limitRows?.length || limitGrants.length) && !loading && !error ? (
+        <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
       ) : null}
       {showUsage && loading ? (
         <EmptyBlock>{t("dashboard.usageEmail.loading")}</EmptyBlock>

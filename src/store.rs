@@ -7579,10 +7579,11 @@ impl AppStore {
                     .and_then(|map| map.get(&email))
                     .copied()
                     .unwrap_or(0);
-                let tokens_used = logged_tokens.max(authoritative_share_user_tokens(
+                let tokens_used = effective_share_user_tokens(
                     &grant,
                     window_start.as_ref(),
-                ));
+                    logged_tokens,
+                );
                 let percent = grant
                     .policy
                     .token_limit
@@ -16361,6 +16362,43 @@ mod token_period_window_tests {
     }
 
     #[test]
+    fn effective_usage_adds_new_observed_tokens_on_top_of_a_saved_baseline() {
+        let mut grant = ShareUserGrant {
+            email: "user@example.com".into(),
+            role: "shareto".into(),
+            active: true,
+            policy: ShareUserPolicy {
+                token_period: ShareTokenPeriod::Lifetime,
+                ..ShareUserPolicy::default()
+            },
+            ..ShareUserGrant::default()
+        };
+        grant.usage_rebase = Some(crate::models::ShareUserUsageRebase {
+            period: ShareTokenPeriod::Lifetime,
+            anchor_at_ms: None,
+            window_starts_at_ms: None,
+            window_ends_at_ms: None,
+            target_tokens: 10_000,
+            observed_tokens_at_rebase: 0,
+            observed_requests_at_rebase: 0,
+            usage_watermark: 0,
+            applied_at_ms: 1,
+            applied_by: None,
+            source: crate::models::ShareUsageRebaseSource::Manual,
+        });
+        grant.usage_quota = Some(crate::models::ShareUserQuotaView {
+            period: ShareTokenPeriod::Lifetime,
+            effective_tokens_used: 10_000,
+            observed_tokens_used: 0,
+            rebase_applies: true,
+            ..crate::models::ShareUserQuotaView::default()
+        });
+
+        assert_eq!(effective_share_user_tokens(&grant, None, 0), 10_000);
+        assert_eq!(effective_share_user_tokens(&grant, None, 500), 10_500);
+    }
+
+    #[test]
     fn batched_usage_keeps_distinct_anchor_windows_and_prefers_quota_tokens() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
@@ -16460,17 +16498,28 @@ fn authoritative_share_user_tokens(
     grant: &ShareUserGrant,
     window_start: Option<&DateTime<Utc>>,
 ) -> u64 {
-    if let Some(quota) = grant.usage_quota {
-        return quota.effective_tokens_used;
-    }
+    effective_share_user_tokens(grant, window_start, grant_usage_tokens(grant, window_start))
+}
+
+fn effective_share_user_tokens(
+    grant: &ShareUserGrant,
+    window_start: Option<&DateTime<Utc>>,
+    observed_tokens: u64,
+) -> u64 {
     if let Some(rebase) = grant.usage_rebase.as_ref() {
         if rebase.rebase_window_matches(window_start) {
-            let observed = grant_usage_tokens(grant, window_start);
-            let extra = observed.saturating_sub(rebase.observed_tokens_at_rebase);
+            let extra = observed_tokens.saturating_sub(rebase.observed_tokens_at_rebase);
             return rebase.target_tokens.saturating_add(extra);
         }
     }
-    grant_usage_tokens(grant, window_start)
+    if let Some(quota) = grant.usage_quota {
+        if quota.rebase_applies {
+            let extra = observed_tokens.saturating_sub(quota.observed_tokens_used);
+            return quota.effective_tokens_used.saturating_add(extra);
+        }
+        return observed_tokens.max(quota.effective_tokens_used);
+    }
+    observed_tokens.max(grant_usage_tokens(grant, window_start))
 }
 
 fn grant_usage_tokens(
@@ -25251,6 +25300,59 @@ mod tests {
         assert_eq!(status.rows[0].tokens_used, 500);
         assert_eq!(status.rows[1].email, "user@example.com");
         assert_eq!(status.rows[1].tokens_used, 70);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_user_limits_accumulate_new_logs_on_saved_consumed_baseline() {
+        let (store, config) = setup_store("share-user-limits-baseline").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-baseline", "baseline-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            let mut user = test_share_user_grant("user@example.com", "shareto", 20_000);
+            user.policy.token_period = ShareTokenPeriod::Lifetime;
+            user.usage.lifetime.tokens_used = 10_000;
+            user.usage_rebase = Some(crate::models::ShareUserUsageRebase {
+                period: ShareTokenPeriod::Lifetime,
+                anchor_at_ms: None,
+                window_starts_at_ms: None,
+                window_ends_at_ms: None,
+                target_tokens: 10_000,
+                observed_tokens_at_rebase: 0,
+                observed_requests_at_rebase: 0,
+                usage_watermark: 0,
+                applied_at_ms: 1,
+                applied_by: None,
+                source: crate::models::ShareUsageRebaseSource::Manual,
+            });
+            let grants = BTreeMap::from([(user.email.clone(), user)]);
+            conn.execute(
+                "UPDATE shares SET user_grants_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-baseline",
+                    serde_json::to_string(&grants).expect("serialize grants")
+                ],
+            )
+            .expect("set grants");
+            let mut log = test_share_request_log_entry(
+                "baseline-new",
+                "share-baseline",
+                Utc::now().timestamp(),
+            );
+            log.user_email = Some("user@example.com".into());
+            log.input_tokens = 400;
+            log.output_tokens = 100;
+            upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert usage log");
+        }
+
+        let status = store
+            .share_user_limit_status("share-baseline")
+            .await
+            .expect("limit status");
+        assert_eq!(status.rows[0].email, "user@example.com");
+        assert_eq!(status.rows[0].tokens_used, 10_500);
 
         let _ = std::fs::remove_file(&config.database.path);
     }

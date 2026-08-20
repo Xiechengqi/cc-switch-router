@@ -68,34 +68,51 @@ export function ShareEditReadView({
   const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[] | null>(null);
   const [limitLoading, setLimitLoading] = React.useState(false);
   const [limitError, setLimitError] = React.useState("");
+  const hasLimitRowsRef = React.useRef(false);
+
+  React.useEffect(() => {
+    hasLimitRowsRef.current = false;
+    setLimitRows(null);
+    setLimitError("");
+    setLimitLoading(false);
+  }, [share.shareId]);
 
   React.useEffect(() => {
     if (!shareApp) {
       setLimitRows(null);
       setLimitError("");
       setLimitLoading(false);
+      hasLimitRowsRef.current = false;
       return;
     }
     let cancelled = false;
-    setLimitLoading(true);
-    setLimitError("");
-    getShareUserLimitStatus(share.shareId)
-      .then((data) => {
-        if (!cancelled) setLimitRows(data.rows || []);
-      })
-      .catch((err) => {
-        if (!cancelled) {
+    const load = async () => {
+      const silent = hasLimitRowsRef.current;
+      if (!silent) setLimitLoading(true);
+      try {
+        const data = await getShareUserLimitStatus(share.shareId);
+        if (cancelled) return;
+        setLimitRows(data.rows || []);
+        setLimitError("");
+        hasLimitRowsRef.current = true;
+      } catch (err) {
+        if (cancelled) return;
+        if (!silent) {
           setLimitRows(null);
           setLimitError(err instanceof Error ? err.message : String(err));
+          hasLimitRowsRef.current = false;
         }
-      })
-      .finally(() => {
-        if (!cancelled) setLimitLoading(false);
-      });
+      } finally {
+        if (!cancelled && !silent) setLimitLoading(false);
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 15_000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
-  }, [share.shareId, share.configRevision, share.userGrants, shareApp]);
+  }, [share.shareId, share.configRevision, shareApp]);
 
   const description = share.description?.trim() || "";
 
@@ -165,12 +182,12 @@ export function ShareEditReadView({
             </div>
             <div className="grid gap-2 border-t border-slate-200 pt-3">
               <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
-              {limitLoading ? (
+              {limitRows?.length || limitGrants.length ? (
+                <ShareUserLimitsTable rows={limitRows || undefined} grants={limitGrants} t={t} />
+              ) : limitLoading ? (
                 <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock>
               ) : limitError ? (
                 <EmptyBlock>{limitError}</EmptyBlock>
-              ) : (limitRows?.length || limitGrants.length) ? (
-                <ShareUserLimitsTable rows={limitRows || undefined} grants={limitGrants} t={t} />
               ) : (
                 <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
               )}

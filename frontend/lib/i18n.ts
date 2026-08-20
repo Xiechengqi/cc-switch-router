@@ -2562,7 +2562,9 @@ export const messages = {
     "dashboard.userLimit.batchEditSelected": "Edit selected ({count})",
     "dashboard.userLimit.batchTitle": "Batch edit user limits",
     "dashboard.userLimit.batchHint":
-      "{count} users selected. Only checked parameters are overwritten; all other parameters stay unchanged. Blank limits mean unlimited, and a blank expiration means permanent.",
+      "{count} users selected. Checked parameters are applied to every selected user. Blank limits mean unlimited, and a blank expiration means permanent.",
+    "dashboard.userLimit.batchConsumedHint":
+      "When checked, this value is applied to every selected user. Leave it blank to skip a manual baseline.",
     "dashboard.userLimit.batchApply": "Apply to {count} users",
     "dashboard.userLimit.period": "Token period",
     "dashboard.userLimit.periodLifetime": "Lifetime",
@@ -5147,7 +5149,9 @@ export const messages = {
     "dashboard.userLimit.batchEditSelected": "编辑已选（{count}）",
     "dashboard.userLimit.batchTitle": "批量编辑用户限制",
     "dashboard.userLimit.batchHint":
-      "已选择 {count} 个用户。仅覆盖勾选的参数，其他参数保持不变；空限额表示无限，空到期时间表示永久。",
+      "已选择 {count} 个用户。勾选的参数会应用到所有已选用户；空限额表示无限，空到期时间表示永久。",
+    "dashboard.userLimit.batchConsumedHint":
+      "勾选后会把该值应用到所有已选用户。留空并保存表示不创建手工重基线。",
     "dashboard.userLimit.batchApply": "应用到 {count} 个用户",
     "dashboard.userLimit.period": "Token 周期",
     "dashboard.userLimit.periodLifetime": "累计",
