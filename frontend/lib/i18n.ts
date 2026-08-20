@@ -2529,6 +2529,14 @@ export const messages = {
     "dashboard.applyFailedFallback": "The previous apply failed",
     "dashboard.shareEditQueued":
       "Saved. The client is offline, so the change is queued and will take effect once it reconnects.",
+    "dashboard.shareEditApplied": "Saved. The change is in effect.",
+    "dashboard.shareSettings.invalidDescription":
+      "Description must be 200 characters or fewer.",
+    "dashboard.shareSettings.invalidToken":
+      "Token limit must be a positive integer or unlimited.",
+    "dashboard.shareSettings.invalidParallel":
+      "Parallel limit must be a positive integer or unlimited.",
+    "dashboard.shareSettings.invalidExpiry": "Expiration time is invalid.",
     "dashboard.shareEditLocked":
       "This share is applying another change. Wait for it to finish before editing.",
     "dashboard.shareEditRemoteChanged":
@@ -2553,6 +2561,13 @@ export const messages = {
     "dashboard.field.tokenLimit": "Token limit",
     "dashboard.field.parallelLimit": "Parallel limit",
     "dashboard.field.expiresAt": "Expires at",
+    "dashboard.shareCeiling.title": "Share-wide ceiling",
+    "dashboard.shareCeiling.hint":
+      "Applies to all users combined. Per-user quotas above cannot exceed this ceiling.",
+    "dashboard.shareCeiling.token": "Token {value}",
+    "dashboard.shareCeiling.parallel": "Parallel {value}",
+    "dashboard.shareCeiling.expires": "Expires {value}",
+    "dashboard.shareCeiling.edit": "Edit Share-wide ceiling",
     "dashboard.freeAccessLabel": "Allow any signed-in Router user to invoke this Share for free",
     "dashboard.freeAccessEnabled": "Enabled — public to signed-in Router users",
     "dashboard.freeAccessDisabled": "Disabled — private",
@@ -5126,6 +5141,11 @@ export const messages = {
     "dashboard.applyFailedFallback": "上一轮应用失败",
     "dashboard.shareEditQueued":
       "已保存。客户端当前离线，修改已入队，将在其重新连接后生效。",
+    "dashboard.shareEditApplied": "已保存，修改已生效。",
+    "dashboard.shareSettings.invalidDescription": "描述最多 200 字。",
+    "dashboard.shareSettings.invalidToken": "Token 限制必须是正整数，或设为不限。",
+    "dashboard.shareSettings.invalidParallel": "并发限制必须是正整数，或设为不限。",
+    "dashboard.shareSettings.invalidExpiry": "过期时间无效。",
     "dashboard.shareEditLocked": "该 Share 正在应用另一项修改，请等待完成后再编辑。",
     "dashboard.shareEditRemoteChanged":
       "Server 已更新该 Share。点重置加载最新配置，或继续保存以覆盖当前草稿。",
@@ -5148,6 +5168,13 @@ export const messages = {
     "dashboard.field.tokenLimit": "Token 限制",
     "dashboard.field.parallelLimit": "并发限制",
     "dashboard.field.expiresAt": "过期时间",
+    "dashboard.shareCeiling.title": "Share 总上限",
+    "dashboard.shareCeiling.hint":
+      "对所有用户合计生效。上方每人配额再松，也不能超过这层上限。",
+    "dashboard.shareCeiling.token": "Token {value}",
+    "dashboard.shareCeiling.parallel": "并发 {value}",
+    "dashboard.shareCeiling.expires": "过期 {value}",
+    "dashboard.shareCeiling.edit": "编辑 Share 总上限",
     "dashboard.freeAccessLabel": "允许任意已登录 Router 用户免费调用此 Share",
     "dashboard.freeAccessEnabled": "已开启——所有已登录 Router 用户可用",
     "dashboard.freeAccessDisabled": "未开启——私有",

@@ -13,6 +13,7 @@ import {
 import { resolveShareCoreApp, shareProviderSupportedApps } from "@/lib/share-app";
 import type { ShareView } from "@/lib/types";
 import { updateShareSettings } from "@/lib/api";
+import { formatDateTime } from "@/lib/utils";
 import {
   buildShareEditDraft,
   buildShareEditPatch,
@@ -21,6 +22,11 @@ import {
   type ShareEditDraft,
 } from "./share-edit-draft";
 import { ShareEditMarketFields, ShareEditSaleAccessFields } from "./share-edit-market-fields";
+import {
+  formatShareCeilingParallel,
+  formatShareCeilingToken,
+  ShareCeilingBar,
+} from "./share-ceiling-bar";
 import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
@@ -326,6 +332,12 @@ export function ShareEditFormBody({
       ? undefined
       : new Date(draft.expiresAtInput).getTime(),
   };
+  const tokenParsed = Number.parseInt(draft.tokenLimitInput, 10);
+  const parallelParsed = Number.parseInt(draft.parallelLimitInput, 10);
+  const ceilingInvalid = form.tokenInvalid || form.parallelInvalid || form.expiryInvalid;
+  const expiryDisplay = draft.expiresPermanent
+    ? t("dashboard.userLimit.permanent")
+    : formatDateTime(draft.expiresAtInput) || "—";
 
   return (
     <>
@@ -349,107 +361,6 @@ export function ShareEditFormBody({
           onDraftChange={form.onDraftChange}
         />
 
-        <div className="grid gap-3 md:grid-cols-3">
-          <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={form.tokenInvalid}>
-            <div className="grid gap-2">
-              <Input
-                type="number"
-                min={1}
-                step={1}
-                value={draft.tokenLimitInput}
-                disabled={fieldsDisabled || draft.tokenLimitUnlimited}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  form.onDraftChange((current) => {
-                    const parsed = Number.parseInt(value, 10);
-                    return {
-                      ...current,
-                      tokenLimitInput: value,
-                      lastFiniteTokenLimit:
-                        Number.isFinite(parsed) && parsed > 0 ? parsed : current.lastFiniteTokenLimit,
-                    };
-                  });
-                }}
-              />
-              <Checkbox
-                isSelected={draft.tokenLimitUnlimited}
-                isDisabled={fieldsDisabled}
-                onChange={(value: boolean) => form.handleTokenUnlimited(value)}
-              >
-                <Checkbox.Control>
-                  <Checkbox.Indicator />
-                </Checkbox.Control>
-                <Checkbox.Content>
-                  <span className="text-xs text-muted-foreground">{t("common.unlimited")}</span>
-                </Checkbox.Content>
-              </Checkbox>
-            </div>
-          </FieldGroup>
-
-          <FieldGroup label={t("dashboard.field.parallelLimit")} invalid={form.parallelInvalid}>
-            <div className="grid gap-2">
-              <Input
-                type="number"
-                min={1}
-                step={1}
-                value={draft.parallelLimitInput}
-                disabled={fieldsDisabled || draft.parallelLimitUnlimited}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  form.onDraftChange((current) => {
-                    const parsed = Number.parseInt(value, 10);
-                    return {
-                      ...current,
-                      parallelLimitInput: value,
-                      lastFiniteParallelLimit:
-                        Number.isFinite(parsed) && parsed > 0 ? parsed : current.lastFiniteParallelLimit,
-                    };
-                  });
-                }}
-              />
-              <Checkbox
-                isSelected={draft.parallelLimitUnlimited}
-                isDisabled={fieldsDisabled}
-                onChange={(value: boolean) => form.handleParallelUnlimited(value)}
-              >
-                <Checkbox.Control>
-                  <Checkbox.Indicator />
-                </Checkbox.Control>
-                <Checkbox.Content>
-                  <span className="text-xs text-muted-foreground">{t("common.unlimited")}</span>
-                </Checkbox.Content>
-              </Checkbox>
-            </div>
-          </FieldGroup>
-
-          <FieldGroup label={t("dashboard.field.expiresAt")} invalid={form.expiryInvalid}>
-            <div className="grid gap-2">
-              <Input
-                type="datetime-local"
-                value={draft.expiresAtInput}
-                disabled={fieldsDisabled || draft.expiresPermanent}
-                onChange={(event) =>
-                  form.onDraftChange((current) => ({ ...current, expiresAtInput: event.target.value }))
-                }
-              />
-              <Checkbox
-                isSelected={draft.expiresPermanent}
-                isDisabled={fieldsDisabled}
-                onChange={(value: boolean) =>
-                  form.onDraftChange((current) => ({ ...current, expiresPermanent: value }))
-                }
-              >
-                <Checkbox.Control>
-                  <Checkbox.Indicator />
-                </Checkbox.Control>
-                <Checkbox.Content>
-                  <span className="text-xs text-muted-foreground">{t("dashboard.permanent")}</span>
-                </Checkbox.Content>
-              </Checkbox>
-            </div>
-          </FieldGroup>
-        </div>
-
         <ShareUserGrantsEditor
           value={draft.userGrants}
           ownerEmail={displayShare.ownerEmail || ""}
@@ -466,6 +377,116 @@ export function ShareEditFormBody({
             form.onDraftChange((current) => ({ ...current, userGrants }))
           }
         />
+
+        <ShareCeilingBar
+          t={t}
+          tokenDisplay={formatShareCeilingToken(tokenParsed, draft.tokenLimitUnlimited, t)}
+          parallelDisplay={formatShareCeilingParallel(parallelParsed, draft.parallelLimitUnlimited, t)}
+          expiryDisplay={expiryDisplay}
+          editable={!fieldsDisabled}
+          invalid={ceilingInvalid}
+        >
+          <div className="grid gap-3 md:grid-cols-3">
+            <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={form.tokenInvalid}>
+              <div className="grid gap-2">
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={draft.tokenLimitInput}
+                  disabled={fieldsDisabled || draft.tokenLimitUnlimited}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    form.onDraftChange((current) => {
+                      const parsed = Number.parseInt(value, 10);
+                      return {
+                        ...current,
+                        tokenLimitInput: value,
+                        lastFiniteTokenLimit:
+                          Number.isFinite(parsed) && parsed > 0 ? parsed : current.lastFiniteTokenLimit,
+                      };
+                    });
+                  }}
+                />
+                <Checkbox
+                  isSelected={draft.tokenLimitUnlimited}
+                  isDisabled={fieldsDisabled}
+                  onChange={(value: boolean) => form.handleTokenUnlimited(value)}
+                >
+                  <Checkbox.Control>
+                    <Checkbox.Indicator />
+                  </Checkbox.Control>
+                  <Checkbox.Content>
+                    <span className="text-xs text-muted-foreground">{t("common.unlimited")}</span>
+                  </Checkbox.Content>
+                </Checkbox>
+              </div>
+            </FieldGroup>
+
+            <FieldGroup label={t("dashboard.field.parallelLimit")} invalid={form.parallelInvalid}>
+              <div className="grid gap-2">
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={draft.parallelLimitInput}
+                  disabled={fieldsDisabled || draft.parallelLimitUnlimited}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    form.onDraftChange((current) => {
+                      const parsed = Number.parseInt(value, 10);
+                      return {
+                        ...current,
+                        parallelLimitInput: value,
+                        lastFiniteParallelLimit:
+                          Number.isFinite(parsed) && parsed > 0 ? parsed : current.lastFiniteParallelLimit,
+                      };
+                    });
+                  }}
+                />
+                <Checkbox
+                  isSelected={draft.parallelLimitUnlimited}
+                  isDisabled={fieldsDisabled}
+                  onChange={(value: boolean) => form.handleParallelUnlimited(value)}
+                >
+                  <Checkbox.Control>
+                    <Checkbox.Indicator />
+                  </Checkbox.Control>
+                  <Checkbox.Content>
+                    <span className="text-xs text-muted-foreground">{t("common.unlimited")}</span>
+                  </Checkbox.Content>
+                </Checkbox>
+              </div>
+            </FieldGroup>
+
+            <FieldGroup label={t("dashboard.field.expiresAt")} invalid={form.expiryInvalid}>
+              <div className="grid gap-2">
+                <Input
+                  type="datetime-local"
+                  value={draft.expiresAtInput}
+                  disabled={fieldsDisabled || draft.expiresPermanent}
+                  onChange={(event) =>
+                    form.onDraftChange((current) => ({ ...current, expiresAtInput: event.target.value }))
+                  }
+                />
+                <Checkbox
+                  isSelected={draft.expiresPermanent}
+                  isDisabled={fieldsDisabled}
+                  onChange={(value: boolean) =>
+                    form.onDraftChange((current) => ({ ...current, expiresPermanent: value }))
+                  }
+                >
+                  <Checkbox.Control>
+                    <Checkbox.Indicator />
+                  </Checkbox.Control>
+                  <Checkbox.Content>
+                    <span className="text-xs text-muted-foreground">{t("dashboard.permanent")}</span>
+                  </Checkbox.Content>
+                </Checkbox>
+              </div>
+            </FieldGroup>
+          </div>
+        </ShareCeilingBar>
       </ShareEditSection>
     </>
   );

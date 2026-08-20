@@ -12,12 +12,19 @@ import {
   draftFromShare,
   fromDateTimeLocal,
   PERMANENT_EXPIRES_AT_ISO,
+  shareSettingsFieldErrors,
+  shareSettingsHasFieldErrors,
   toDateTimeLocal,
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
-  validateShareSettingsDraft,
   type ShareSettingsDraft,
 } from "@/lib/share-settings";
+import {
+  formatShareCeilingParallel,
+  formatShareCeilingToken,
+  ShareCeilingBar,
+} from "@/components/dashboard/share-edit/share-ceiling-bar";
+import { FieldGroup } from "@/components/dashboard/share-edit/share-edit-shared";
 import { compactTokens, formatDateTime } from "@/lib/utils";
 
 function statusTone(online: boolean) {
@@ -150,7 +157,19 @@ function ShareSettingsForm({
       expiresAt,
     };
   }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenUnlimited]);
-  const validationErrors = validateShareSettingsDraft(effectiveDraft);
+  const fieldErrors = shareSettingsFieldErrors(effectiveDraft);
+  const formInvalid = shareSettingsHasFieldErrors(fieldErrors);
+  const ceilingInvalid =
+    fieldErrors.tokenLimit || fieldErrors.parallelLimit || fieldErrors.expiresAt;
+  const firstValidationMessage = fieldErrors.description
+    ? t("dashboard.shareSettings.invalidDescription")
+    : fieldErrors.tokenLimit
+      ? t("dashboard.shareSettings.invalidToken")
+      : fieldErrors.parallelLimit
+        ? t("dashboard.shareSettings.invalidParallel")
+        : fieldErrors.expiresAt
+          ? t("dashboard.shareSettings.invalidExpiry")
+          : "";
   const defaultUserPolicy = {
     parallelLimit:
       effectiveDraft.parallelLimit === UNLIMITED_PARALLEL_LIMIT
@@ -167,13 +186,17 @@ function ShareSettingsForm({
   };
 
   const save = async () => {
-    if (!editable || busy || validationErrors.length) return;
+    if (!editable || busy || formInvalid) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
       const result = await updateSharePageSettings(buildShareSettingsPatch(effectiveDraft, share));
-      setNotice(result.appliedSynchronously ? "Settings applied." : "Settings queued; waiting for cc-switch-server to sync.");
+      setNotice(
+        result.appliedSynchronously
+          ? t("dashboard.shareEditApplied")
+          : t("dashboard.shareEditQueued"),
+      );
       await onSaved();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -186,8 +209,8 @@ function ShareSettingsForm({
     <div className="grid gap-4">
       {notice ? <Alert status="success" className="!text-slate-900">{notice}</Alert> : null}
       {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
-      {validationErrors.length ? (
-        <Alert status="warning" className="!text-slate-900">{validationErrors[0]}</Alert>
+      {firstValidationMessage ? (
+        <Alert status="warning" className="!text-slate-900">{firstValidationMessage}</Alert>
       ) : null}
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -223,53 +246,6 @@ function ShareSettingsForm({
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <label className="grid gap-1 text-sm">
-          <span className="font-medium text-foreground">Token limit</span>
-          <Input
-            type="number"
-            value={tokenUnlimited ? "" : String(draft.tokenLimit)}
-            placeholder="Unlimited"
-            disabled={!editable || tokenUnlimited}
-            onChange={(event) => setDraft((current) => ({ ...current, tokenLimit: Number.parseInt(event.target.value, 10) || 0 }))}
-          />
-          <Checkbox isSelected={tokenUnlimited} isDisabled={!editable} onChange={(value: boolean) => setTokenUnlimited(value)}>
-            <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-            <Checkbox.Content><span className="text-xs text-muted-foreground">Unlimited</span></Checkbox.Content>
-          </Checkbox>
-        </label>
-
-        <label className="grid gap-1 text-sm">
-          <span className="font-medium text-foreground">Parallel limit</span>
-          <Input
-            type="number"
-            min={1}
-            value={parallelUnlimited ? "" : String(draft.parallelLimit)}
-            placeholder="Unlimited"
-            disabled={!editable || parallelUnlimited}
-            onChange={(event) => setDraft((current) => ({ ...current, parallelLimit: Number.parseInt(event.target.value, 10) || 0 }))}
-          />
-          <Checkbox isSelected={parallelUnlimited} isDisabled={!editable} onChange={(value: boolean) => setParallelUnlimited(value)}>
-            <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-            <Checkbox.Content><span className="text-xs text-muted-foreground">Unlimited</span></Checkbox.Content>
-          </Checkbox>
-        </label>
-
-        <label className="grid gap-1 text-sm">
-          <span className="font-medium text-foreground">Expires at</span>
-          <Input
-            type="datetime-local"
-            value={expiryLocal}
-            disabled={!editable || expiryPermanent}
-            onChange={(event) => setExpiryLocal(event.target.value)}
-          />
-          <Checkbox isSelected={expiryPermanent} isDisabled={!editable} onChange={(value: boolean) => setExpiryPermanent(value)}>
-            <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-            <Checkbox.Content><span className="text-xs text-muted-foreground">Permanent</span></Checkbox.Content>
-          </Checkbox>
-        </label>
-      </div>
-
       {editable ? (
         <ShareUserGrantsEditor
           value={draft.userGrants}
@@ -284,7 +260,7 @@ function ShareSettingsForm({
         />
       ) : (
         <div className="grid gap-2">
-          <span className="text-sm font-medium text-foreground">Authorized users and quotas</span>
+          <span className="text-sm font-medium text-foreground">{t("dashboard.userLimit.title")}</span>
           <div className="flex flex-wrap gap-2">
             {Object.values(draft.userGrants)
               .filter((grant) => grant.active !== false)
@@ -297,9 +273,70 @@ function ShareSettingsForm({
         </div>
       )}
 
+      <ShareCeilingBar
+        t={t}
+        tokenDisplay={formatShareCeilingToken(effectiveDraft.tokenLimit, tokenUnlimited, t)}
+        parallelDisplay={formatShareCeilingParallel(effectiveDraft.parallelLimit, parallelUnlimited, t)}
+        expiryDisplay={
+          expiryPermanent
+            ? t("dashboard.userLimit.permanent")
+            : formatDateTime(effectiveDraft.expiresAt) || "—"
+        }
+        editable={editable}
+        invalid={ceilingInvalid}
+      >
+        <div className="grid gap-3 md:grid-cols-3">
+          <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={fieldErrors.tokenLimit}>
+            <div className="grid gap-2">
+              <Input
+                type="number"
+                value={tokenUnlimited ? "" : String(draft.tokenLimit)}
+                placeholder={t("common.unlimited")}
+                disabled={!editable || tokenUnlimited}
+                onChange={(event) => setDraft((current) => ({ ...current, tokenLimit: Number.parseInt(event.target.value, 10) || 0 }))}
+              />
+              <Checkbox isSelected={tokenUnlimited} isDisabled={!editable} onChange={(value: boolean) => setTokenUnlimited(value)}>
+                <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                <Checkbox.Content><span className="text-xs text-muted-foreground">{t("common.unlimited")}</span></Checkbox.Content>
+              </Checkbox>
+            </div>
+          </FieldGroup>
+          <FieldGroup label={t("dashboard.field.parallelLimit")} invalid={fieldErrors.parallelLimit}>
+            <div className="grid gap-2">
+              <Input
+                type="number"
+                min={1}
+                value={parallelUnlimited ? "" : String(draft.parallelLimit)}
+                placeholder={t("common.unlimited")}
+                disabled={!editable || parallelUnlimited}
+                onChange={(event) => setDraft((current) => ({ ...current, parallelLimit: Number.parseInt(event.target.value, 10) || 0 }))}
+              />
+              <Checkbox isSelected={parallelUnlimited} isDisabled={!editable} onChange={(value: boolean) => setParallelUnlimited(value)}>
+                <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                <Checkbox.Content><span className="text-xs text-muted-foreground">{t("common.unlimited")}</span></Checkbox.Content>
+              </Checkbox>
+            </div>
+          </FieldGroup>
+          <FieldGroup label={t("dashboard.field.expiresAt")} invalid={fieldErrors.expiresAt}>
+            <div className="grid gap-2">
+              <Input
+                type="datetime-local"
+                value={expiryLocal}
+                disabled={!editable || expiryPermanent}
+                onChange={(event) => setExpiryLocal(event.target.value)}
+              />
+              <Checkbox isSelected={expiryPermanent} isDisabled={!editable} onChange={(value: boolean) => setExpiryPermanent(value)}>
+                <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                <Checkbox.Content><span className="text-xs text-muted-foreground">{t("dashboard.permanent")}</span></Checkbox.Content>
+              </Checkbox>
+            </div>
+          </FieldGroup>
+        </div>
+      </ShareCeilingBar>
+
       {editable ? (
         <div className="flex justify-end">
-          <Button variant="primary" isDisabled={busy || validationErrors.length > 0} onClick={() => void save()}>
+          <Button variant="primary" isDisabled={busy || formInvalid} onClick={() => void save()}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             Save settings
           </Button>

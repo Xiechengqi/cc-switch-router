@@ -10,6 +10,11 @@ import {
   runtimeModelSummary,
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
+import {
+  formatShareCeilingParallel,
+  formatShareCeilingToken,
+  ShareCeilingBar,
+} from "./share-ceiling-bar";
 import { getShareUserLimitStatus } from "@/lib/api";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { shareProviderSupportedApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
@@ -25,12 +30,6 @@ import {
   ReadOnlyField,
   ShareEditSection,
 } from "./share-edit-section";
-
-function formatLimitDisplay(value: number | undefined | null, unlimited: boolean, t: TFn) {
-  if (unlimited) return t("common.unlimited");
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) return String(value);
-  return "—";
-}
 
 function activeUserLimitGrants(share: ShareView): ShareUserGrant[] {
   return Object.values(share.userGrants || {})
@@ -176,21 +175,7 @@ export function ShareEditReadView({
                 value={t("dashboard.freeAccessEnabled")}
               />
             ) : null}
-            <div className="grid gap-3 sm:grid-cols-3">
-              <ReadOnlyField
-                label={t("dashboard.field.tokenLimit")}
-                value={formatLimitDisplay(tokenLimit, tokenUnlimited, t)}
-              />
-              <ReadOnlyField
-                label={t("dashboard.field.parallelLimit")}
-                value={formatLimitDisplay(parallelLimit, parallelUnlimited, t)}
-              />
-              <ReadOnlyField
-                label={t("dashboard.field.expiresAt")}
-                value={expiryTitle(share.expiresAt) || formatDateTime(share.expiresAt) || "—"}
-              />
-            </div>
-            <div className="grid gap-2 pt-1">
+            <div className="grid gap-2">
               <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
               {limitRows?.length || limitGrants.length ? (
                 <ShareUserLimitsTable rows={limitRows || undefined} grants={limitGrants} t={t} />
@@ -202,6 +187,16 @@ export function ShareEditReadView({
                 <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
               )}
             </div>
+            <ShareCeilingBar
+              t={t}
+              tokenDisplay={formatShareCeilingToken(tokenLimit, tokenUnlimited, t)}
+              parallelDisplay={formatShareCeilingParallel(parallelLimit, parallelUnlimited, t)}
+              expiryDisplay={
+                expiryTitle(share.expiresAt) === "∞"
+                  ? t("dashboard.userLimit.permanent")
+                  : formatDateTime(share.expiresAt) || "—"
+              }
+            />
           </ShareEditSection>
         </>
       ) : (

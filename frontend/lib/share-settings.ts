@@ -131,19 +131,29 @@ function defaultUserPolicy(share: ShareView): ShareUserPolicy {
   };
 }
 
-export function validateShareSettingsDraft(draft: ShareSettingsDraft) {
-  const errors: string[] = [];
-  if (draft.description.length > 200) errors.push("Description must be 200 characters or fewer.");
-  if (draft.tokenLimit !== UNLIMITED_TOKEN_LIMIT && (!Number.isFinite(draft.tokenLimit) || draft.tokenLimit <= 0)) {
-    errors.push("Token limit must be positive or unlimited.");
-  }
-  if (
-    draft.parallelLimit !== UNLIMITED_PARALLEL_LIMIT &&
-    (!Number.isFinite(draft.parallelLimit) || draft.parallelLimit <= 0)
-  ) {
-    errors.push("Parallel limit must be positive or unlimited.");
-  }
+export type ShareSettingsFieldErrors = {
+  description: boolean;
+  tokenLimit: boolean;
+  parallelLimit: boolean;
+  expiresAt: boolean;
+};
+
+export function shareSettingsFieldErrors(
+  draft: ShareSettingsDraft,
+): ShareSettingsFieldErrors {
   const expires = new Date(draft.expiresAt).getTime();
-  if (!draft.expiresAt || !Number.isFinite(expires)) errors.push("Expiration time is invalid.");
-  return errors;
+  return {
+    description: draft.description.trim().length > 200,
+    tokenLimit:
+      draft.tokenLimit !== UNLIMITED_TOKEN_LIMIT &&
+      (!Number.isFinite(draft.tokenLimit) || draft.tokenLimit <= 0),
+    parallelLimit:
+      draft.parallelLimit !== UNLIMITED_PARALLEL_LIMIT &&
+      (!Number.isFinite(draft.parallelLimit) || draft.parallelLimit <= 0),
+    expiresAt: !draft.expiresAt || !Number.isFinite(expires),
+  };
+}
+
+export function shareSettingsHasFieldErrors(errors: ShareSettingsFieldErrors) {
+  return errors.description || errors.tokenLimit || errors.parallelLimit || errors.expiresAt;
 }
