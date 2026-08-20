@@ -825,6 +825,8 @@ export function ClientBoard({
     [takeoverSourcesFor, takeoverTarget],
   );
   const selectedShare = selectedShareId ? shareById.get(selectedShareId) || null : null;
+  const editingShareId = editingShare?.shareId || "";
+  const currentEditingShare = editingShareId ? shareById.get(editingShareId) || editingShare : null;
   const connectShareId = connectShare?.shareId || "";
   const currentConnectShare = connectShareId ? shareById.get(connectShareId) || null : null;
   const selectedClientUrl = clientTunnelDisplayUrl(selectedClient?.clientTunnel?.tunnelUrl);
@@ -1077,7 +1079,7 @@ export function ClientBoard({
           </Drawer.Content>
       </Drawer.Backdrop>
 
-      <ShareEditDialog share={editingShare} onClose={closeEditShare} onSaved={handleSaved} />
+      <ShareEditDialog share={currentEditingShare} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
       <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} onCreated={() => void refreshRentalsAndDashboard()} />
       <ClientSubdomainTakeoverDialog

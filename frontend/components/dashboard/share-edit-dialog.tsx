@@ -23,9 +23,10 @@ export function ShareEditDialog({
   onSaved: (result: { appliedSynchronously: boolean }) => Promise<void>;
 }) {
   const { t } = useLocaleText();
-  const readOnly = !!share && !share.canManage;
   const form = useShareEditForm({ share, t, onSaved, onClose });
-  const boundApps = share ? shareProviderSupportedApps(share) : [];
+  const liveShare = form?.liveShare || share;
+  const readOnly = !!liveShare && !liveShare.canManage;
+  const boundApps = liveShare ? shareProviderSupportedApps(liveShare) : [];
 
   return (
     <Modal.Backdrop
@@ -39,7 +40,7 @@ export function ShareEditDialog({
                 <div className="pr-8">
                   <Modal.Heading>{readOnly ? t("dashboard.shareViewSettings") : t("dashboard.shareEditSettings")}</Modal.Heading>
                   <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-600">
-                    <span className="break-all font-medium text-slate-900">{share?.subdomain || share?.shareName}</span>
+                    <span className="break-all font-medium text-slate-900">{liveShare?.subdomain || liveShare?.shareName}</span>
                     {boundApps.length ? (
                       <span className="inline-flex items-center gap-1.5">
                         {boundApps.map((app) => (
@@ -54,17 +55,27 @@ export function ShareEditDialog({
                       </span>
                     ) : null}
                   </div>
-                  {share?.ownerEmail ? (
-                    <p className="mt-1 text-xs text-slate-500">{share.ownerEmail}</p>
+                  {liveShare?.ownerEmail ? (
+                    <p className="mt-1 text-xs text-slate-500">{liveShare.ownerEmail}</p>
                   ) : null}
                 </div>
               </Modal.Header>
               <Modal.Body className="min-h-0 flex-1 overflow-y-auto !px-6 !py-5 !text-slate-900">
-                {readOnly && share ? (
-                  <ShareEditReadView share={share} t={t} />
-                ) : share && form ? (
+                {readOnly && liveShare ? (
+                  <ShareEditReadView share={liveShare} t={t} />
+                ) : liveShare && form ? (
                   <div className="grid gap-7">
-                    <ShareEditStatusBanner share={share} t={t} />
+                    <ShareEditStatusBanner share={liveShare} t={t} />
+                    {form.locked ? (
+                      <Alert status="warning" className="!text-slate-900">
+                        {t("dashboard.shareEditLocked")}
+                      </Alert>
+                    ) : null}
+                    {form.remoteRefreshPending ? (
+                      <Alert status="warning" className="!text-slate-900">
+                        {t("dashboard.shareEditRemoteChanged")}
+                      </Alert>
+                    ) : null}
                     {form.error ? (
                       <Alert status="danger" className="!text-slate-900">
                         {form.error}
@@ -75,7 +86,7 @@ export function ShareEditDialog({
                         {form.notice}
                       </Alert>
                     ) : null}
-                    <ShareEditFormBody share={share} t={t} form={form} />
+                    <ShareEditFormBody share={liveShare} t={t} form={form} />
                   </div>
                 ) : null}
               </Modal.Body>
@@ -86,7 +97,7 @@ export function ShareEditDialog({
                   </Button>
                 ) : form ? (
                   <div className="flex w-full flex-wrap items-center justify-end gap-2">
-                    {form.isDirty ? (
+                    {form.isDirty || form.remoteRefreshPending ? (
                       <Button
                         variant="ghost"
                         className="mr-auto text-muted-foreground"
@@ -103,7 +114,7 @@ export function ShareEditDialog({
                     <Button
                       variant="primary"
                       onClick={form.save}
-                      isDisabled={form.busy || form.formInvalid || !form.isDirty}
+                      isDisabled={form.busy || form.locked || form.formInvalid || !form.isDirty}
                     >
                       {form.busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                       {t("common.save")}

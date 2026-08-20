@@ -95,7 +95,7 @@ export function ShareEditReadView({
     return () => {
       cancelled = true;
     };
-  }, [share.shareId, shareApp]);
+  }, [share.shareId, share.configRevision, shareApp]);
 
   return (
     <div className="grid gap-6">

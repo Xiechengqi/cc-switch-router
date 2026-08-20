@@ -2523,6 +2523,10 @@ export const messages = {
     "dashboard.applyFailedFallback": "The previous apply failed",
     "dashboard.shareEditQueued":
       "Saved. The client is offline, so the change is queued and will take effect once it reconnects.",
+    "dashboard.shareEditLocked":
+      "This share is applying another change. Wait for it to finish before editing.",
+    "dashboard.shareEditRemoteChanged":
+      "The Server updated this share. Reset to load the latest settings, or save to overwrite with your draft.",
     "dashboard.shareViewSettings": "View share settings",
     "dashboard.openShareDrawer": "Open share details",
     "dashboard.shareEditSettings": "Edit share settings",
@@ -5095,6 +5099,9 @@ export const messages = {
     "dashboard.applyFailedFallback": "上一轮应用失败",
     "dashboard.shareEditQueued":
       "已保存。客户端当前离线，修改已入队，将在其重新连接后生效。",
+    "dashboard.shareEditLocked": "该 Share 正在应用另一项修改，请等待完成后再编辑。",
+    "dashboard.shareEditRemoteChanged":
+      "Server 已更新该 Share。点重置加载最新配置，或继续保存以覆盖当前草稿。",
     "dashboard.shareViewSettings": "查看 share 设置",
     "dashboard.openShareDrawer": "打开 share 详情",
     "dashboard.shareEditSettings": "编辑 share 设置",

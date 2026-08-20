@@ -86,6 +86,7 @@ export function ShareUserGrantsEditor({
   defaultPolicy,
   supportedPeriods,
   t,
+  disabled,
   onChange,
 }: {
   value: ShareUserGrantMap;
@@ -93,6 +94,7 @@ export function ShareUserGrantsEditor({
   defaultPolicy: ShareUserPolicy;
   supportedPeriods?: ShareTokenPeriod[];
   t: TFn;
+  disabled?: boolean;
   onChange: (value: ShareUserGrantMap) => void;
 }) {
   const normalizedOwner = ownerEmail.trim().toLowerCase();
@@ -358,6 +360,7 @@ export function ShareUserGrantsEditor({
             size="sm"
             variant="outline"
             isDisabled={
+              disabled ||
               selectableEmails.length === 0 ||
               (selecting && selectedEditableEmails.size === 0)
             }
@@ -368,7 +371,7 @@ export function ShareUserGrantsEditor({
               ? t("dashboard.userLimit.batchEditSelected", { count: selectedEditableEmails.size })
               : t("dashboard.userLimit.batchEdit")}
           </Button>
-          <Button size="sm" variant="outline" onClick={openAdd}>
+          <Button size="sm" variant="outline" isDisabled={disabled} onClick={openAdd}>
             <Plus className="h-4 w-4" />
             {t("dashboard.userLimit.add")}
           </Button>
@@ -446,12 +449,12 @@ export function ShareUserGrantsEditor({
                 <td className="px-3 py-2">
                   <div className="flex justify-end gap-1">
                     {!shareMarketManagedEmails.has(grant.email) ? (
-                      <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => openEdit(grant)}>
+                      <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} isDisabled={disabled} onClick={() => openEdit(grant)}>
                         <Pencil className="h-4 w-4" />
                       </Button>
                     ) : null}
                     {grant.role !== "owner" && !protectedEmails.has(grant.email) ? (
-                      <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} onClick={() => {
+                      <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={disabled} onClick={() => {
                         const userGrants = { ...value };
                         delete userGrants[grant.email];
                         applyGrants(userGrants);

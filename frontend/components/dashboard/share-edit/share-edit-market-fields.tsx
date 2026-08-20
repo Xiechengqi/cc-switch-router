@@ -25,12 +25,14 @@ function providerTitle(runtime?: ShareUpstreamProvider) {
 export type ShareEditSaleAccessFieldsProps = {
   t: TFn;
   draft: ShareEditDraft;
+  disabled?: boolean;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
 };
 
 export function ShareEditSaleAccessFields({
   t,
   draft,
+  disabled,
   onDraftChange,
 }: ShareEditSaleAccessFieldsProps) {
   return (
@@ -40,6 +42,7 @@ export function ShareEditSaleAccessFields({
     >
       <Checkbox
         isSelected={draft.freeAccess}
+        isDisabled={disabled}
         onChange={(freeAccess: boolean) =>
           onDraftChange((current) => ({
             ...current,
@@ -69,6 +72,7 @@ export type ShareEditMarketFieldsProps = {
   descriptionLength: number;
   descriptionInvalid: boolean;
   appApiInvalid: boolean;
+  disabled?: boolean;
   onDescriptionChange: (value: string) => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
 };
@@ -81,6 +85,7 @@ export function ShareEditMarketFields({
   descriptionLength,
   descriptionInvalid,
   appApiInvalid,
+  disabled,
   onDescriptionChange,
   onDraftChange,
 }: ShareEditMarketFieldsProps) {
@@ -100,6 +105,7 @@ export function ShareEditMarketFields({
           <TextArea
             value={draft.description}
             maxLength={200}
+            disabled={disabled}
             onChange={(event) => onDescriptionChange(event.target.value)}
           />
         </FieldGroup>
@@ -120,7 +126,7 @@ export function ShareEditMarketFields({
                 key={app}
                 className="w-full items-start rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5"
                 isSelected={enabled}
-                isDisabled={lastEnabled}
+                isDisabled={disabled || lastEnabled}
                 aria-label={t("dashboard.shareEdit.appApiToggle", { app: SHARE_APP_LABELS[app] })}
                 onChange={(value: boolean) => {
                   onDraftChange((current) => {

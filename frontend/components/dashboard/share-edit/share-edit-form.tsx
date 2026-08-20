@@ -26,10 +26,13 @@ import { ShareEditSection } from "./share-edit-section";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
 
 export type ShareEditFormApi = {
+  liveShare: ShareView;
   draft: ShareEditDraft;
   shareApp?: PriceApp;
   activeShareApps: PriceApp[];
   busy: boolean;
+  locked: boolean;
+  remoteRefreshPending: boolean;
   error: string;
   notice: string;
   descriptionLength: number;
@@ -67,27 +70,71 @@ export function useShareEditForm({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [notice, setNotice] = React.useState("");
+  const [remoteRefreshPending, setRemoteRefreshPending] = React.useState(false);
+  const draftRef = React.useRef<ShareEditDraft | null>(null);
+  const baseDraftRef = React.useRef<ShareEditDraft | null>(null);
+  const baseShareRef = React.useRef<ShareView | null>(null);
 
-  const editShare = baseShare || share;
-  const activeShareApps = React.useMemo(() => shareProviderSupportedApps(editShare), [editShare]);
-  const shareApp = activeShareApps[0] ?? resolveShareCoreApp(editShare);
+  const liveShare = share || baseShare;
+  const activeShareApps = React.useMemo(() => shareProviderSupportedApps(liveShare), [liveShare]);
+  const shareApp = activeShareApps[0] ?? resolveShareCoreApp(liveShare);
   const applyDraft = React.useCallback((next: ShareEditDraft) => setDraft(next), []);
+  const locked = Boolean(liveShare?.activeEdit?.status === "pending" || liveShare?.canEditSettings === false);
+  draftRef.current = draft;
+  baseDraftRef.current = baseDraft;
+  baseShareRef.current = baseShare;
 
   React.useEffect(() => {
     if (!share) {
       setBaseShare(null);
       setBaseDraft(null);
       setDraft(null);
+      setRemoteRefreshPending(false);
+      setError("");
+      setNotice("");
       return;
     }
-    if (baseShare?.shareId === share.shareId) return;
-    const initial = buildShareEditDraft(share);
-    setBaseShare(share);
-    setBaseDraft(initial);
-    applyDraft(initial);
-    setError("");
-    setNotice("");
-  }, [applyDraft, baseShare?.shareId, share]);
+    const incoming = buildShareEditDraft(share);
+    const currentBaseShare = baseShareRef.current;
+    const currentBaseDraft = baseDraftRef.current;
+    const currentDraft = draftRef.current;
+    if (!currentBaseShare || currentBaseShare.shareId !== share.shareId) {
+      setBaseShare(share);
+      setBaseDraft(incoming);
+      applyDraft(incoming);
+      setRemoteRefreshPending(false);
+      setError("");
+      setNotice("");
+      return;
+    }
+    const incomingApps = shareProviderSupportedApps(share);
+    const currentApps = shareProviderSupportedApps(currentBaseShare);
+    const sameRevision = (currentBaseShare.configRevision ?? 0) === (share.configRevision ?? 0);
+    const sameFingerprint =
+      shareEditPatchFingerprint(buildShareEditPatch(incoming, share, incomingApps)) ===
+      shareEditPatchFingerprint(
+        buildShareEditPatch(currentBaseDraft ?? incoming, currentBaseShare, currentApps),
+      );
+    if (sameRevision && sameFingerprint) {
+      setBaseShare(share);
+      return;
+    }
+    const dirty = Boolean(
+      currentDraft &&
+        currentBaseDraft &&
+        shareEditPatchFingerprint(buildShareEditPatch(currentDraft, currentBaseShare, currentApps)) !==
+          shareEditPatchFingerprint(buildShareEditPatch(currentBaseDraft, currentBaseShare, currentApps)),
+    );
+    if (!dirty) {
+      setBaseShare(share);
+      setBaseDraft(incoming);
+      applyDraft(incoming);
+      setRemoteRefreshPending(false);
+      setNotice("");
+      return;
+    }
+    setRemoteRefreshPending(true);
+  }, [applyDraft, share]);
 
   const onDraftChange = React.useCallback(
     (updater: (current: ShareEditDraft) => ShareEditDraft) => {
@@ -145,7 +192,7 @@ export function useShareEditForm({
     });
   }, [onDraftChange]);
 
-  if (!share || !draft || !baseDraft) return null;
+  if (!liveShare || !draft || !baseDraft) return null;
 
   const descriptionLength = draft.description.trim().length;
   const descriptionInvalid = descriptionLength > 200;
@@ -162,34 +209,39 @@ export function useShareEditForm({
     parallelInvalid ||
     expiryInvalid || appApiInvalid;
 
-  const currentPatch = buildShareEditPatch(draft, editShare!, activeShareApps);
-  const basePatch = buildShareEditPatch(baseDraft, editShare!, activeShareApps);
+  const currentPatch = buildShareEditPatch(draft, liveShare, activeShareApps);
+  const basePatch = buildShareEditPatch(baseDraft, liveShare, activeShareApps);
   const isDirty = shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
 
   const resetDraft = () => {
     if (!baseDraft || busy) return;
-    applyDraft(baseDraft);
+    const latest = share ? buildShareEditDraft(share) : baseDraft;
+    if (share) setBaseShare(share);
+    setBaseDraft(latest);
+    applyDraft(latest);
+    setRemoteRefreshPending(false);
     setError("");
     setNotice("");
   };
 
   const save = async () => {
-    if (!share || busy || formInvalid || !isDirty) return;
+    if (!liveShare || busy || locked || formInvalid || !isDirty) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
       const res = await updateShareSettings(
-        share.shareId,
+        liveShare.shareId,
         currentPatch,
-        share.configRevision,
+        liveShare.configRevision,
       );
       await onSaved({ appliedSynchronously: res.appliedSynchronously });
       if (res.appliedSynchronously) {
         onClose();
       } else {
         setBaseDraft(draft);
-        if (editShare) setBaseShare(editShare);
+        setBaseShare(liveShare);
+        setRemoteRefreshPending(false);
         setNotice(t("dashboard.shareEditQueued"));
       }
     } catch (err) {
@@ -200,10 +252,13 @@ export function useShareEditForm({
   };
 
   return {
+    liveShare,
     draft,
     shareApp,
     activeShareApps,
     busy,
+    locked,
+    remoteRefreshPending,
     error,
     notice,
     descriptionLength,
@@ -234,7 +289,9 @@ export function ShareEditFormBody({
   t: TFn;
   form: ShareEditFormApi;
 }) {
-  const { activeShareApps, draft, shareApp } = form;
+  const { activeShareApps, draft, shareApp, liveShare, locked } = form;
+  const fieldsDisabled = locked;
+  const displayShare = liveShare || share;
 
   if (!shareApp) {
     return <EmptyBlock>{t("dashboard.shareEditNoAppType")}</EmptyBlock>;
@@ -256,12 +313,13 @@ export function ShareEditFormBody({
     <>
       <ShareEditMarketFields
         t={t}
-        share={share}
+        share={displayShare}
         activeShareApps={activeShareApps}
         draft={draft}
         descriptionLength={form.descriptionLength}
         descriptionInvalid={form.descriptionInvalid}
         appApiInvalid={form.appApiInvalid}
+        disabled={fieldsDisabled}
         onDescriptionChange={form.onDescriptionChange}
         onDraftChange={form.onDraftChange}
       />
@@ -270,6 +328,7 @@ export function ShareEditFormBody({
         <ShareEditSaleAccessFields
           t={t}
           draft={draft}
+          disabled={fieldsDisabled}
           onDraftChange={form.onDraftChange}
         />
 
@@ -281,7 +340,7 @@ export function ShareEditFormBody({
                 min={1}
                 step={1}
                 value={draft.tokenLimitInput}
-                disabled={draft.tokenLimitUnlimited}
+                disabled={fieldsDisabled || draft.tokenLimitUnlimited}
                 onChange={(event) => {
                   const value = event.target.value;
                   form.onDraftChange((current) => {
@@ -297,6 +356,7 @@ export function ShareEditFormBody({
               />
               <Checkbox
                 isSelected={draft.tokenLimitUnlimited}
+                isDisabled={fieldsDisabled}
                 onChange={(value: boolean) => form.handleTokenUnlimited(value)}
               >
                 <Checkbox.Control>
@@ -316,7 +376,7 @@ export function ShareEditFormBody({
                 min={1}
                 step={1}
                 value={draft.parallelLimitInput}
-                disabled={draft.parallelLimitUnlimited}
+                disabled={fieldsDisabled || draft.parallelLimitUnlimited}
                 onChange={(event) => {
                   const value = event.target.value;
                   form.onDraftChange((current) => {
@@ -332,6 +392,7 @@ export function ShareEditFormBody({
               />
               <Checkbox
                 isSelected={draft.parallelLimitUnlimited}
+                isDisabled={fieldsDisabled}
                 onChange={(value: boolean) => form.handleParallelUnlimited(value)}
               >
                 <Checkbox.Control>
@@ -349,13 +410,14 @@ export function ShareEditFormBody({
               <Input
                 type="datetime-local"
                 value={draft.expiresAtInput}
-                disabled={draft.expiresPermanent}
+                disabled={fieldsDisabled || draft.expiresPermanent}
                 onChange={(event) =>
                   form.onDraftChange((current) => ({ ...current, expiresAtInput: event.target.value }))
                 }
               />
               <Checkbox
                 isSelected={draft.expiresPermanent}
+                isDisabled={fieldsDisabled}
                 onChange={(value: boolean) =>
                   form.onDraftChange((current) => ({ ...current, expiresPermanent: value }))
                 }
@@ -373,10 +435,11 @@ export function ShareEditFormBody({
 
         <ShareUserGrantsEditor
           value={draft.userGrants}
-          ownerEmail={share.ownerEmail || ""}
+          ownerEmail={displayShare.ownerEmail || ""}
           defaultPolicy={defaultUserPolicy}
-          supportedPeriods={share.supportedUserTokenPeriods}
+          supportedPeriods={displayShare.supportedUserTokenPeriods}
           t={t}
+          disabled={fieldsDisabled}
           onChange={(userGrants) =>
             form.onDraftChange((current) => ({ ...current, userGrants }))
           }
