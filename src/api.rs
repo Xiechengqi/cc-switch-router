@@ -178,6 +178,17 @@ struct AccountUsageQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PublicUsageQuery {
+    period: Option<String>,
+    /// Cap the returned model rows. Omitted or `0` returns every row, which is
+    /// what a cross-region aggregator needs: truncating each region before
+    /// summing silently drops that region's long tail, and the model rows stop
+    /// adding up to the total.
+    models: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EmbedUsageQuery {
     period: Option<String>,
     theme: Option<String>,
@@ -215,6 +226,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/healthz", get(health))
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/public/network-stats", get(public_network_stats))
+        .route("/v1/public/usage/global", get(public_usage_global))
         .route("/v1/public/embed/global.svg", get(embed_global_usage_svg))
         .route("/v1/public/embed/usage/:user_id", get(embed_user_usage_svg))
         .route("/v1/regions", get(regions))
@@ -2176,6 +2188,11 @@ async fn public_network_stats(
 const GLOBAL_USAGE_CARD_CACHE_CONTROL: &str =
     "public, max-age=0, s-maxage=60, stale-while-revalidate=300";
 const USER_USAGE_CARD_CACHE_CONTROL: &str = "no-store";
+/// Deliberately not the SVG card's header. The edge rewrites the card's
+/// `max-age` up to hours, which is fine for a badge and wrong for a figure the
+/// site refreshes every minute.
+const PUBLIC_USAGE_JSON_CACHE_CONTROL: &str =
+    "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
 
 fn svg_usage_response(svg: String, cache_control: &'static str) -> Response {
     Response::builder()
@@ -2199,6 +2216,25 @@ fn embed_render_options(
         query.compact.as_deref(),
         query.format.as_deref(),
     )
+}
+
+/// JSON twin of `/v1/public/embed/global.svg`. Same `usage_global` data and the
+/// same public exposure the card already carries, in a shape another service can
+/// sum across regions. Aggregate only: no email, no share, no account, no money.
+async fn public_usage_global(
+    State(state): State<ServerState>,
+    Query(query): Query<PublicUsageQuery>,
+) -> Result<Response, AppError> {
+    let period = query.period.as_deref().unwrap_or("24h");
+    let mut data = state.store.usage_global(period).await?;
+    if let Some(limit) = query.models.filter(|limit| *limit > 0) {
+        data.models.truncate(limit);
+    }
+    Ok((
+        [(header::CACHE_CONTROL, PUBLIC_USAGE_JSON_CACHE_CONTROL)],
+        Json(data),
+    )
+        .into_response())
 }
 
 async fn embed_global_usage_svg(

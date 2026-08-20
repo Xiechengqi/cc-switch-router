@@ -9,6 +9,8 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 | [hongkong](https://hktokenswitch.cc) | ![hongkong 24h](https://hktokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 | [usa](https://ustokenswitch.cc) | ![usa 24h](https://ustokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 
+同一份数据的 JSON 出口是 `GET /v1/public/usage/global?period=24h`（另有 `7d` / `30d`），给需要跨区域汇总的调用方使用 —— 例如官网把四个 Region 的 24h 用量相加并展开各模型。响应是纯聚合量：总量、输入/输出/缓存分项、逐模型明细、逐桶趋势、活跃 Share 与 Client 数，不含邮箱、Share、账号或金额。默认返回**全部**模型行；`?models=N` 才截断。跨区域汇总必须先合并再截断，否则每个 Region 的长尾模型会被静默丢掉，明细之和不再等于总量。
+
 - 架构与实现现状 → [ARCHITECTURE.md](ARCHITECTURE.md)
 - 与客户端的接口契约 → [PROTOCOL.md](PROTOCOL.md)
 - 手动 UI 回归清单 → [UI_TEST_PLAN.md](UI_TEST_PLAN.md)

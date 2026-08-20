@@ -249,6 +249,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 - **Consumer**：`user_email` 跨 share 的调用量 → `GET /v1/me/usage/consumer`
 - **用量卡片设置**：`GET/PATCH /v1/me/usage-card`；公开统计默认开启，卡片身份直接使用账号邮箱，公开 URL 使用稳定的用户 UUID
 - **公开 SVG**：`GET /v1/public/embed/global.svg`（全站）、`GET /v1/public/embed/usage/:user_id`（可关闭的个人卡片）；默认 `24h`、浅色主题
+- **公开 JSON**：`GET /v1/public/usage/global`（全站，与上面那张 SVG 同一份 `usage_global` 数据）；默认 `24h`，默认返回全部模型行，`?models=N` 才截断。没有对应的个人 JSON —— 逐用户数据只经 SVG 出口，受用量卡片开关约束
 - 数据来自现有 `share_request_logs` / Gateway-only `capacity_request_observations` 短窗口聚合（24h / 7d / 30d）；migration 21 只把能关联已知 Share 且具备用户身份的旧 observation 最小化迁入 `share_request_logs`，原 `market_request_logs` 与 archive 已物理删除
 
 ### 已知限制

@@ -25547,12 +25547,32 @@ mod tests {
         let global = store.usage_global("7d").await.expect("global usage");
         assert_eq!(global.total_tokens, 150);
         assert_eq!(global.models[0].model, "gpt-5");
-        assert!(
-            serde_json::to_value(&global)
-                .expect("serialize")
-                .get("cost")
-                .is_none()
-        );
+        let global_json = serde_json::to_value(&global).expect("serialize");
+        assert!(global_json.get("cost").is_none());
+
+        // `/v1/public/usage/global` serves this value to anonymous callers, so
+        // the payload has to stay aggregate. The caller email and the share are
+        // both present in the rows it was built from; neither may survive into
+        // the response, under any key.
+        let global_text = serde_json::to_string(&global_json).expect("serialize global usage");
+        for leaked in [
+            "caller@example.com",
+            "owner@example.com",
+            "share-account-usage",
+            "account-usage-sub",
+            "inst-account-usage",
+        ] {
+            assert!(
+                !global_text.contains(leaked),
+                "global usage payload leaked {leaked}"
+            );
+        }
+        for key in ["email", "userId", "shareId", "installationId", "callers"] {
+            assert!(
+                !global_text.contains(key),
+                "global usage payload exposes identity field {key}"
+            );
+        }
 
         let svg = crate::embed_usage::render_global_usage_svg(
             &global,

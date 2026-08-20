@@ -151,7 +151,14 @@ pub fn format_compact_number(value: u64) -> String {
             let scaled = value as f64 / threshold as f64;
             let precision = if scaled >= 100.0 { 0 } else { 1 };
             let text = format!("{scaled:.precision$}");
-            let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+            // Only a fractional part may be trimmed. Trimming unconditionally
+            // eats significant zeros once `precision` is 0, so 100M renders as
+            // "1M" and 460M as "46M".
+            let trimmed = if text.contains('.') {
+                text.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                text.as_str()
+            };
             return format!("{trimmed}{suffix}");
         }
     }
@@ -491,6 +498,12 @@ mod tests {
         assert_eq!(format_compact_number(999), "999");
         assert_eq!(format_compact_number(1_200), "1.2K");
         assert_eq!(format_compact_number(3_400_000), "3.4M");
+        assert_eq!(format_compact_number(1_000), "1K");
+        // Above the one-decimal cutoff the integer digits are all significant.
+        assert_eq!(format_compact_number(100_000_000), "100M");
+        assert_eq!(format_compact_number(460_000_000), "460M");
+        assert_eq!(format_compact_number(465_207_994), "465M");
+        assert_eq!(format_compact_number(1_500_000_000), "1.5B");
     }
 
     #[test]
