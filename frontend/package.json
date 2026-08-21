@@ -4,9 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "predev": "node scripts/raster-flags.mjs",
+    "prebuild": "node scripts/raster-flags.mjs",
     "build": "next build",
     "lint": "tsc --noEmit",
-    "flags:raster": "python3 scripts/raster-flags.py",
+    "flags:raster": "node scripts/raster-flags.mjs",
     "typecheck": "tsc --noEmit",
     "test:operational-status": "tsx --test components/dashboard/operational-status.test.ts",
     "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts",
@@ -28,6 +30,7 @@
     "tailwind-merge": "^3.3.1"
   },
   "devDependencies": {
+    "@resvg/resvg-wasm": "^2.6.2",
     "@tailwindcss/postcss": "latest",
     "@types/node": "latest",
     "@types/react": "latest",

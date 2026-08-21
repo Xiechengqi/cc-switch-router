@@ -4,7 +4,9 @@ License: CC-BY 4.0
 https://creativecommons.org/licenses/by/4.0/
 https://github.com/twitter/twemoji/tree/v14.0.2
 
+SVGs are fetched at build time from jsDelivr into frontend/.cache/flag-src:
+https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/
+
 `npm run flags:raster` clips these onto Twemoji's waving fabric
-(U+1F3F3, no pole), insets the fabric to Apple Color Emoji optical
-size (~88% of the em square, ~82% height), and writes PNG assets to
-frontend/public/flags/.
+(U+1F3F3, no pole), crops uniformly to Apple Color Emoji ribbon
+aspect (~1.42), and writes 32 / 64 / 96 PNGs to frontend/public/flags/.

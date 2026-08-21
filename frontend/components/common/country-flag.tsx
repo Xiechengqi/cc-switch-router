@@ -81,7 +81,8 @@ function prefersAppleFlagGlyphs() {
 
 /**
  * Apple hosts use Apple Color Emoji except TW (often a missing-glyph X).
- * Every other host, and TW everywhere, uses the same pre-rasterized PNG.
+ * Every other host, and TW everywhere, uses the same pre-rasterized PNG
+ * from `npm run flags:raster` (Twemoji faces, no pole, Apple ribbon crop).
  */
 export function CountryFlag({
   code,
@@ -118,9 +119,9 @@ export function CountryFlag({
         <>
           <img
             src={`/flags/${slug}.png`}
-            srcSet={`/flags/${slug}.png 1x, /flags/${slug}@2x.png 2x`}
-            width={20}
-            height={20}
+            srcSet={`/flags/${slug}.png 1x, /flags/${slug}@2x.png 2x, /flags/${slug}@3x.png 3x`}
+            width={32}
+            height={23}
             alt=""
             draggable={false}
             decoding="async"

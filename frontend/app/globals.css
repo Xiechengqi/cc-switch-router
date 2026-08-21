@@ -139,7 +139,7 @@ body {
 }
 
 .country-flag {
-  /* 1em box for both Apple glyphs and PNGs; PNG fabric is inset and shortened to Apple ribbon size. */
+  /* 1em box. PNG fabric is tight-cropped; optical Apple ribbon size is CSS padding. */
   position: relative;
   display: inline-block;
   width: 1em;
@@ -151,10 +151,12 @@ body {
 }
 
 .country-flag img {
+  position: absolute;
+  left: 0.06em;
+  top: 0.19em;
   display: block;
-  width: 1em;
-  height: 1em;
-  object-fit: contain;
+  width: 0.88em;
+  height: 0.62em;
 }
 
 .country-flag-copy {

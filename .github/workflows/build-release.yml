@@ -28,6 +28,12 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Cache Twemoji flag sources
+        uses: actions/cache@v4
+        with:
+          path: frontend/.cache/flag-src
+          key: twemoji-14.0.2-flag-src
+
       - name: Build frontend assets
         working-directory: frontend
         run: |

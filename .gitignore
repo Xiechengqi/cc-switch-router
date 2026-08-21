@@ -7,4 +7,7 @@
 /frontend/.next
 /frontend/node_modules
 /frontend/out
+/frontend/.cache
+/frontend/assets/flag-src/*.svg
+/frontend/public/flags/*.png
 /frontend/tsconfig.tsbuildinfo
