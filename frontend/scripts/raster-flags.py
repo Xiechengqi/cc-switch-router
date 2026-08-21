@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Clip Twemoji flag faces to Twemoji's waving fabric (no pole) and rasterize."""
+"""Clip Twemoji flag faces to Twemoji's waving fabric (no pole) and rasterize.
+
+Apple Color Emoji paints a waving flag inside ~88% of the em square. The PNG
+path uses the same 1em CSS box, so the fabric is inset here instead of
+tight-cropped; otherwise non-Apple (and TW on Apple) flags look larger.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +21,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "assets" / "flag-src"
 OUT_DIR = ROOT / "public" / "flags"
 SIZES = (("", 20), ("@2x", 40))
+
+# Twemoji U+1F3F3 fabric, original 36em canvas, pole omitted.
+CANVAS = 36.0
+FABRIC_X = 5.5
+FABRIC_Y = 1.5
+FABRIC_W = 28.5
+FABRIC_H = 24.5
+APPLE_OPTICAL = 0.88
 
 FABRIC = (
     "M32.415 3.09c-1.752-.799-3.615-1.187-5.698-1.187-2.518 0-5.02.57-7.438 1.122"
@@ -35,20 +48,30 @@ SPOT_CHECK = (
 )
 
 
+def fabric_frame() -> tuple[float, float, float, float]:
+    box = CANVAS * APPLE_OPTICAL
+    scale = min(box / FABRIC_W, box / FABRIC_H)
+    width = FABRIC_W * scale
+    height = FABRIC_H * scale
+    return ((CANVAS - width) / 2, (CANVAS - height) / 2, width, height)
+
+
 def waving_svg(name: str, face: str) -> str:
     inner_match = INNER_RE.search(face)
     if not inner_match:
         raise ValueError(f"no inner svg markup in {name}")
     inner = inner_match.group(1).strip()
     clip_id = f"w{name.replace('.svg', '').replace('-', '')}"
+    x, y, width, height = fabric_frame()
     return (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="5.5 1.5 28.5 24.5">'
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {CANVAS:g} {CANVAS:g}">'
+        f'<svg x="{x:.4f}" y="{y:.4f}" width="{width:.4f}" height="{height:.4f}" '
+        f'viewBox="{FABRIC_X:g} {FABRIC_Y:g} {FABRIC_W:g} {FABRIC_H:g}">'
         f'<defs><clipPath id="{clip_id}"><path d="{FABRIC}"/></clipPath></defs>'
         f'<g clip-path="url(#{clip_id})">'
         '<svg x="6" y="1.9" width="27" height="23.2" viewBox="0 5 36 26" preserveAspectRatio="xMidYMid slice">'
         f"{inner}"
-        "</svg></g>"
-        "</svg>"
+        "</svg></g></svg></svg>"
     )
 
 

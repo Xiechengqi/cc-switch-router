@@ -139,6 +139,7 @@ body {
 }
 
 .country-flag {
+  /* 1em box for both Apple glyphs and PNGs; PNG fabric is already inset to Apple optical size. */
   position: relative;
   display: inline-block;
   width: 1em;
@@ -147,14 +148,12 @@ body {
   overflow: visible;
   vertical-align: -0.15em;
   line-height: 0;
-  font-size: 16px;
 }
 
 .country-flag img {
   display: block;
-  width: 0.88em;
-  height: 0.88em;
-  margin: 0.06em auto 0;
+  width: 1em;
+  height: 1em;
   object-fit: contain;
 }
 
@@ -168,19 +167,19 @@ body {
 }
 
 .country-flag-native {
-  width: 0.88em;
-  height: 0.88em;
+  width: 1em;
+  height: 1em;
   line-height: 1;
 }
 
 .country-flag-glyph {
   display: block;
-  width: 0.88em;
-  height: 0.88em;
+  width: 1em;
+  height: 1em;
   font-family: "Apple Color Emoji", sans-serif;
   font-style: normal;
   font-weight: 400;
-  font-size: 0.88em;
+  font-size: 1em;
   line-height: 1;
 }
 

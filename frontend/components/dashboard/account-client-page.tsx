@@ -183,7 +183,7 @@ function MonitorCard({
     >
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         {host?.countryCode ? (
-          <CountryFlag code={host.countryCode} />
+          <CountryFlag className="text-sm" code={host.countryCode} />
         ) : null}
         <strong className="truncate text-sm">{title}</strong>
         <Chip size="sm" variant={anomalous ? "primary" : "tertiary"}>
