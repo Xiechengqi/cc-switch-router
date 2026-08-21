@@ -141,18 +141,18 @@ body {
 .country-flag {
   position: relative;
   display: inline-block;
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   flex-shrink: 0;
-  overflow: hidden;
+  overflow: visible;
   vertical-align: middle;
   line-height: 0;
 }
 
 .country-flag img {
   display: block;
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   object-fit: contain;
 }
 
@@ -160,8 +160,8 @@ body {
   position: absolute;
   inset: 0;
   overflow: hidden;
-  font-size: 16px;
-  line-height: 16px;
+  font-size: 20px;
+  line-height: 20px;
   opacity: 0;
 }
 

@@ -29,8 +29,9 @@ function twemojiFlagSlug(iso2: string) {
 }
 
 /**
- * Paints Twemoji's waving SVG so Chrome/Linux cannot substitute Noto's
- * rectangular flags. A transparent emoji sits on top so copy still yields 🇹🇼.
+ * Paints a pre-rasterized waving Twemoji PNG so desktop Chrome does not
+ * blur a live-scaled SVG. A transparent emoji sits on top so copy still
+ * yields 🇹🇼, including TW.
  */
 export function CountryFlag({
   code,
@@ -45,6 +46,7 @@ export function CountryFlag({
   const flag = countryFlagEmoji(iso2);
   if (!iso2 || !flag) return null;
 
+  const slug = twemojiFlagSlug(iso2);
   const label = title || iso2;
   return (
     <span
@@ -54,9 +56,10 @@ export function CountryFlag({
       className={cn("country-flag", className)}
     >
       <img
-        src={`/flags/${twemojiFlagSlug(iso2)}.svg`}
-        width={16}
-        height={16}
+        src={`/flags/${slug}.png`}
+        srcSet={`/flags/${slug}.png 1x, /flags/${slug}@2x.png 2x`}
+        width={20}
+        height={20}
         alt=""
         draggable={false}
         decoding="async"

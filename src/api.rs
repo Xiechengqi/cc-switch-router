@@ -3138,7 +3138,7 @@ mod tests {
             "/install-client.sh",
             "/router-logo.svg",
             "/world-map.svg",
-            "/flags/1f1f9-1f1fc.svg",
+            "/flags/1f1f9-1f1fc.png",
             "/_next/static/chunks/app.js",
         ] {
             assert!(is_router_share_ui_path(path), "{path} should be router UI");
