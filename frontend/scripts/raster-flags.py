@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compose Twemoji flag faces onto Twemoji's waving white-flag silhouette and rasterize."""
+"""Clip Twemoji flag faces to Twemoji's waving fabric (no pole) and rasterize."""
 
 from __future__ import annotations
 
@@ -25,10 +25,6 @@ FABRIC = (
     " 6.995-1.071 1.79 0 3.383.329 4.868 1.007.311.14.67.115.956-.069.287-.185"
     ".46-.502.46-.842V4c0-.392-.229-.748-.585-.91z"
 )
-POLE = (
-    '<path fill="#8899A6" d="M5 36c-1.104 0-2-.896-2-2V3c0-1.104.896-2 2-2s2 .896 2 2v31c0 1.104-.896 2-2 2z"/>'
-    '<path fill="#AAB8C2" d="M5 1c-1.105 0-2 .895-2 2v31c0 .276.224.5.5.5s.5-.224.5-.5V4.414C4 3.633 4.633 3 5.414 3H7c0-1.105-.895-2-2-2z"/>'
-)
 INNER_RE = re.compile(r"<svg[^>]*>(.*)</svg>\s*$", re.I | re.S)
 SPOT_CHECK = (
     "1f1e8-1f1f3",
@@ -46,13 +42,12 @@ def waving_svg(name: str, face: str) -> str:
     inner = inner_match.group(1).strip()
     clip_id = f"w{name.replace('.svg', '').replace('-', '')}"
     return (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="5.5 1.5 28.5 24.5">'
         f'<defs><clipPath id="{clip_id}"><path d="{FABRIC}"/></clipPath></defs>'
         f'<g clip-path="url(#{clip_id})">'
         '<svg x="6" y="1.9" width="27" height="23.2" viewBox="0 5 36 26" preserveAspectRatio="xMidYMid slice">'
         f"{inner}"
         "</svg></g>"
-        f"{POLE}"
         "</svg>"
     )
 

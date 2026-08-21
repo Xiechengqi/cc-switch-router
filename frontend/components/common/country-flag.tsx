@@ -29,9 +29,9 @@ function twemojiFlagSlug(iso2: string) {
 }
 
 /**
- * Paints a pre-rasterized waving Twemoji PNG so desktop Chrome does not
- * blur a live-scaled SVG. A transparent emoji sits on top so copy still
- * yields 🇹🇼, including TW.
+ * Paints a pre-rasterized waving Twemoji PNG (fabric only, no pole) so
+ * desktop Chrome does not blur a live-scaled SVG. A transparent emoji
+ * sits on top so copy still yields 🇹🇼, including TW.
  */
 export function CountryFlag({
   code,
