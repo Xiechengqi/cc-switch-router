@@ -32,6 +32,16 @@ function twemojiFlagSlug(iso2: string) {
 const CN_FLAG = countryFlagEmoji("CN");
 const US_FLAG = countryFlagEmoji("US");
 
+function isAppleHost() {
+  if (typeof navigator === "undefined") return false;
+  const platform = navigator.platform || "";
+  if (/^(Mac|iPhone|iPad|iPod)/i.test(platform)) return true;
+  const ua = navigator.userAgent || "";
+  if (/\b(iPhone|iPad|iPod)\b/.test(ua)) return true;
+  // iPadOS 13+ desktop UA still has Apple Color Emoji.
+  return /Macintosh/.test(ua) && typeof document !== "undefined" && "ontouchend" in document;
+}
+
 function canvasPaintsAppleFlag(flag: string): boolean {
   if (typeof document === "undefined") return false;
   const canvas = document.createElement("canvas");
@@ -59,7 +69,10 @@ let appleFlagsMemo: boolean | undefined;
 function prefersAppleFlagGlyphs() {
   if (appleFlagsMemo !== undefined) return appleFlagsMemo;
   try {
-    appleFlagsMemo = canvasPaintsAppleFlag(CN_FLAG) || canvasPaintsAppleFlag(US_FLAG);
+    // Noto/Segoe/Twemoji also paint colorful CN/US flags when Apple Color Emoji
+    // is missing, so canvas alone false-positives on Windows/Linux. Those
+    // fallbacks are smaller and often include a pole; TW is always PNG.
+    appleFlagsMemo = isAppleHost() && (canvasPaintsAppleFlag(CN_FLAG) || canvasPaintsAppleFlag(US_FLAG));
   } catch {
     appleFlagsMemo = false;
   }
@@ -67,8 +80,8 @@ function prefersAppleFlagGlyphs() {
 }
 
 /**
- * Apple platforms use Apple Color Emoji except TW (often a missing-glyph X).
- * Other platforms, and TW everywhere, use the pre-rasterized Twemoji PNG.
+ * Apple hosts use Apple Color Emoji except TW (often a missing-glyph X).
+ * Every other host, and TW everywhere, uses the same pre-rasterized PNG.
  */
 export function CountryFlag({
   code,
