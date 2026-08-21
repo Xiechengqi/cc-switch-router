@@ -6,5 +6,5 @@ https://github.com/twitter/twemoji/tree/v14.0.2
 
 `npm run flags:raster` clips these onto Twemoji's waving fabric
 (U+1F3F3, no pole), insets the fabric to Apple Color Emoji optical
-size (~88% of the em square), and writes PNG assets to
+size (~88% of the em square, ~82% height), and writes PNG assets to
 frontend/public/flags/.

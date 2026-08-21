@@ -1,6 +1,7 @@
 Twemoji 14.0.2 flag faces clipped to Twemoji's waving fabric
-(U+1F3F3, pole omitted), inset to ~88% of the em square to match
-Apple Color Emoji optical size, rasterized at 20px and 40px (@2x).
+(U+1F3F3, pole omitted), inset to ~88% of the em square and
+shortened vertically (~82% height) to match Apple Color Emoji's
+ribbon proportions, rasterized at 20px and 40px (@2x).
 Copyright Twitter, Inc and other contributors.
 License: CC-BY 4.0
 https://creativecommons.org/licenses/by/4.0/

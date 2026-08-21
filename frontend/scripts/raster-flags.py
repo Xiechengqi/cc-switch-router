@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Clip Twemoji flag faces to Twemoji's waving fabric (no pole) and rasterize.
 
-Apple Color Emoji paints a waving flag inside ~88% of the em square. The PNG
-path uses the same 1em CSS box, so the fabric is inset here instead of
-tight-cropped; otherwise non-Apple (and TW on Apple) flags look larger.
+Apple Color Emoji paints a waving flag inside ~88% of the em square, as a
+flatter ribbon than Twemoji's fabric. The PNG path uses the same 1em CSS box,
+so the fabric is inset and shortened vertically instead of tight-cropped.
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ FABRIC_Y = 1.5
 FABRIC_W = 28.5
 FABRIC_H = 24.5
 APPLE_OPTICAL = 0.88
+# Apple's ribbon is shorter than Twemoji's fabric (~1.16). 0.82 → ~1.41 aspect.
+VERTICAL_SLIM = 0.82
 
 FABRIC = (
     "M32.415 3.09c-1.752-.799-3.615-1.187-5.698-1.187-2.518 0-5.02.57-7.438 1.122"
@@ -52,7 +54,7 @@ def fabric_frame() -> tuple[float, float, float, float]:
     box = CANVAS * APPLE_OPTICAL
     scale = min(box / FABRIC_W, box / FABRIC_H)
     width = FABRIC_W * scale
-    height = FABRIC_H * scale
+    height = FABRIC_H * scale * VERTICAL_SLIM
     return ((CANVAS - width) / 2, (CANVAS - height) / 2, width, height)
 
 
@@ -66,7 +68,7 @@ def waving_svg(name: str, face: str) -> str:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {CANVAS:g} {CANVAS:g}">'
         f'<svg x="{x:.4f}" y="{y:.4f}" width="{width:.4f}" height="{height:.4f}" '
-        f'viewBox="{FABRIC_X:g} {FABRIC_Y:g} {FABRIC_W:g} {FABRIC_H:g}">'
+        f'viewBox="{FABRIC_X:g} {FABRIC_Y:g} {FABRIC_W:g} {FABRIC_H:g}" preserveAspectRatio="none">'
         f'<defs><clipPath id="{clip_id}"><path d="{FABRIC}"/></clipPath></defs>'
         f'<g clip-path="url(#{clip_id})">'
         '<svg x="6" y="1.9" width="27" height="23.2" viewBox="0 5 36 26" preserveAspectRatio="xMidYMid slice">'

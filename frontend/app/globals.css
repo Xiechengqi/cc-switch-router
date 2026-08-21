@@ -139,7 +139,7 @@ body {
 }
 
 .country-flag {
-  /* 1em box for both Apple glyphs and PNGs; PNG fabric is already inset to Apple optical size. */
+  /* 1em box for both Apple glyphs and PNGs; PNG fabric is inset and shortened to Apple ribbon size. */
   position: relative;
   display: inline-block;
   width: 1em;
