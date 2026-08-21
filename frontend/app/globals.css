@@ -168,17 +168,19 @@ body {
 }
 
 .country-flag-native {
-  width: auto;
-  height: 1em;
+  width: 0.88em;
+  height: 0.88em;
   line-height: 1;
 }
 
 .country-flag-glyph {
   display: block;
+  width: 0.88em;
+  height: 0.88em;
   font-family: "Apple Color Emoji", sans-serif;
   font-style: normal;
   font-weight: 400;
-  font-size: 1em;
+  font-size: 0.88em;
   line-height: 1;
 }
 
