@@ -29,9 +29,10 @@ function twemojiFlagSlug(iso2: string) {
     .join("-");
 }
 
-const TW_FLAG = countryFlagEmoji("TW");
+const CN_FLAG = countryFlagEmoji("CN");
+const US_FLAG = countryFlagEmoji("US");
 
-function canvasPaintsTaiwanFlag(): boolean {
+function canvasPaintsAppleFlag(flag: string): boolean {
   if (typeof document === "undefined") return false;
   const canvas = document.createElement("canvas");
   canvas.width = 32;
@@ -40,19 +41,17 @@ function canvasPaintsTaiwanFlag(): boolean {
   if (!ctx) return false;
   ctx.textBaseline = "top";
   ctx.font = '24px "Apple Color Emoji"';
-  ctx.fillText(TW_FLAG, 0, 0);
+  ctx.fillText(flag, 0, 0);
   const data = ctx.getImageData(0, 0, 32, 32).data;
-  let red = 0;
-  let blue = 0;
+  let colored = 0;
+  const hues = new Set<string>();
   for (let i = 0; i < data.length; i += 4) {
     if (data[i + 3] < 64) continue;
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    if (r > 140 && g < 90 && b < 90) red += 1;
-    if (b > 110 && b > r && b > g) blue += 1;
+    colored += 1;
+    hues.add(`${data[i] >> 5}-${data[i + 1] >> 5}-${data[i + 2] >> 5}`);
   }
-  return red > 8 && blue > 8;
+  // A real Apple waving flag is a filled, multi-hue glyph — not tofu / X.
+  return colored > 40 && hues.size >= 3;
 }
 
 let appleFlagsMemo: boolean | undefined;
@@ -60,7 +59,7 @@ let appleFlagsMemo: boolean | undefined;
 function prefersAppleFlagGlyphs() {
   if (appleFlagsMemo !== undefined) return appleFlagsMemo;
   try {
-    appleFlagsMemo = canvasPaintsTaiwanFlag();
+    appleFlagsMemo = canvasPaintsAppleFlag(CN_FLAG) || canvasPaintsAppleFlag(US_FLAG);
   } catch {
     appleFlagsMemo = false;
   }
@@ -68,8 +67,8 @@ function prefersAppleFlagGlyphs() {
 }
 
 /**
- * Apple Color Emoji draws waving flags, including TW. Other platforms get a
- * pre-rasterized Twemoji PNG so Chrome/Linux cannot substitute Noto rectangles.
+ * Apple platforms use Apple Color Emoji except TW (often a missing-glyph X).
+ * Other platforms, and TW everywhere, use the pre-rasterized Twemoji PNG.
  */
 export function CountryFlag({
   code,
@@ -82,11 +81,12 @@ export function CountryFlag({
 }) {
   const iso2 = countryFlagIso2(code);
   const flag = countryFlagEmoji(iso2);
+  const nativeExceptTw = iso2 !== "TW";
   const [useAppleGlyph, setUseAppleGlyph] = React.useState(false);
 
   React.useEffect(() => {
-    setUseAppleGlyph(prefersAppleFlagGlyphs());
-  }, []);
+    setUseAppleGlyph(nativeExceptTw && prefersAppleFlagGlyphs());
+  }, [nativeExceptTw]);
 
   if (!iso2 || !flag) return null;
 

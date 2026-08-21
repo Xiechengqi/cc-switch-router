@@ -152,8 +152,9 @@ body {
 
 .country-flag img {
   display: block;
-  width: 1em;
-  height: 1em;
+  width: 0.88em;
+  height: 0.88em;
+  margin: 0.06em auto 0;
   object-fit: contain;
 }
 
