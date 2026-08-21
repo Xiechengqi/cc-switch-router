@@ -392,7 +392,18 @@ function main() {
   for (const [relativePath, requiredMarkers] of [
     [
       "frontend/components/dashboard/share-market/buyer-catalog.tsx",
-      ["setRentTarget(item)", "shareMarket.rentConfirm.postpaid", "rentTarget.seat.offerRevision"],
+      [
+        "quoteShareMarketSeat(item.seat.id)",
+        "setRentTarget({ ...item, quote, idempotencyKey:",
+        "crypto.randomUUID()",
+        "rentShareMarketSeat(rentTarget.seat.id, rentTarget.quote.id, rentTarget.idempotencyKey)",
+        "rentTarget.quote.offer.parallelLimit",
+        "rentTarget.quote.offer.serviceDurationDays",
+        "rentTarget.quote.trialSecondsRemaining",
+        "shareMarket.rentConfirm.remainingTrial",
+        "shareMarket.rentConfirm.activationStart",
+        "shareMarket.rentConfirm.quoteExpiry",
+      ],
     ],
     [
       "frontend/components/dashboard/create-client-dialog.tsx",
@@ -408,12 +419,36 @@ function main() {
     ],
     [
       "frontend/lib/api.ts",
-      ["/v1/market-access/counterparties/batch", "/v1/market-access/inbox-summary"],
+      [
+        "/v1/market-access/counterparties/batch",
+        "/v1/market-access/inbox-summary",
+        "/v1/share-market/seats/${encodeURIComponent(seatId)}/quote",
+        "body: JSON.stringify({ quoteId, idempotencyKey })",
+      ],
     ],
   ]) {
     const source = fs.readFileSync(path.join(root, relativePath), "utf8");
     for (const marker of requiredMarkers) {
       if (!source.includes(marker)) errors.push(`${relativePath} is missing ${marker}`);
+    }
+  }
+
+  for (const required of [
+    "share_market_create_rent_quote",
+    "share_market_commit_rent_quote",
+    "trial_seconds_remaining_tx",
+    "request_fingerprint",
+    "mark_share_rent_quote_consumed",
+  ]) {
+    if (!shareSource.includes(required)) {
+      errors.push(`Share rent quote backend contract is missing ${required}`);
+    }
+  }
+
+  const rentQuoteType = extractTypeBlock(typeSource, "ShareMarketRentQuote");
+  for (const required of ["trialSecondsRemaining", "expiresAt", "offer"]) {
+    if (!rentQuoteType.includes(required)) {
+      errors.push(`ShareMarketRentQuote is missing ${required}`);
     }
   }
 
