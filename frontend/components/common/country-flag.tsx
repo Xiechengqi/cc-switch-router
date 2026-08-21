@@ -30,9 +30,8 @@ function twemojiFlagSlug(iso2: string) {
 }
 
 const TW_FLAG = countryFlagEmoji("TW");
-const REF_GLYPH = "\uFFFD";
 
-function canvasHasAppleFlags(): boolean {
+function canvasPaintsTaiwanFlag(): boolean {
   if (typeof document === "undefined") return false;
   const canvas = document.createElement("canvas");
   canvas.width = 32;
@@ -40,28 +39,20 @@ function canvasHasAppleFlags(): boolean {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) return false;
   ctx.textBaseline = "top";
-  ctx.font = "24px \"Apple Color Emoji\", sans-serif";
-  ctx.fillStyle = "#000";
+  ctx.font = '24px "Apple Color Emoji"';
   ctx.fillText(TW_FLAG, 0, 0);
-  const flag = ctx.getImageData(0, 0, 32, 32).data;
-  ctx.clearRect(0, 0, 32, 32);
-  ctx.fillText(REF_GLYPH, 0, 0);
-  const missing = ctx.getImageData(0, 0, 32, 32).data;
-  let colored = 0;
-  let same = 0;
-  for (let i = 0; i < flag.length; i += 4) {
-    if (flag[i + 3] > 16) {
-      colored += 1;
-      if (Math.abs(flag[i] - missing[i]) < 8
-        && Math.abs(flag[i + 1] - missing[i + 1]) < 8
-        && Math.abs(flag[i + 2] - missing[i + 2]) < 8
-        && Math.abs(flag[i + 3] - missing[i + 3]) < 8) {
-        same += 1;
-      }
-    }
+  const data = ctx.getImageData(0, 0, 32, 32).data;
+  let red = 0;
+  let blue = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 64) continue;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    if (r > 140 && g < 90 && b < 90) red += 1;
+    if (b > 110 && b > r && b > g) blue += 1;
   }
-  // Apple Color Emoji paints TW as a multi-color glyph, not tofu / replacement.
-  return colored > 24 && same / Math.max(colored, 1) < 0.85;
+  return red > 8 && blue > 8;
 }
 
 let appleFlagsMemo: boolean | undefined;
@@ -69,7 +60,7 @@ let appleFlagsMemo: boolean | undefined;
 function prefersAppleFlagGlyphs() {
   if (appleFlagsMemo !== undefined) return appleFlagsMemo;
   try {
-    appleFlagsMemo = canvasHasAppleFlags();
+    appleFlagsMemo = canvasPaintsTaiwanFlag();
   } catch {
     appleFlagsMemo = false;
   }
