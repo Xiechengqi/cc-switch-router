@@ -555,7 +555,7 @@ export function ShareMarketBuyerCatalog({
     setBusySeatId(rented.seat.id);
     setRentError("");
     try {
-      await rentShareMarketSeat(rented.seat.id, rented.seat.offerRevision);
+      await rentShareMarketSeat(rentTarget.seat.id, rentTarget.seat.offerRevision);
       setRentTarget(null);
       setSelected(rented);
       await onChanged();
