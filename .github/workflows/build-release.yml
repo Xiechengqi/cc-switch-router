@@ -38,6 +38,7 @@ jobs:
         working-directory: frontend
         run: |
           npm ci
+          npm run test:flags
           npm run audit:settings-i18n
           npm run audit:market-billing-contract
           npm run build

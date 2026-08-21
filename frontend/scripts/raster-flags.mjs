@@ -1,17 +1,21 @@
 #!/usr/bin/env node
 /**
- * Fetch Twemoji 14 flag faces from jsDelivr, clip them onto Twemoji's waving
- * fabric (no pole), crop uniformly to Apple Color Emoji ribbon aspect, and
- * rasterize 32 / 64 / 96 PNGs.
+ * Build self-hosted, Apple-like country-flag strikes from pinned Twemoji faces.
  *
- * Transparent padding lives in CSS, not in the pixels. Do not non-uniformly
- * stretch the fabric — stars and stripes stay geometric.
+ * Apple Color Emoji paints each flag inside a square em tile. The visible art
+ * occupies about 142 × 102 of a 160 × 160 tile. We keep that square canvas in
+ * the PNG so browsers do not have to position and shrink a tight crop at
+ * fractional CSS pixels. Compact and body variants are rasterized directly at
+ * their final 1x/2x/3x canvas sizes.
+ *
+ * The waving silhouette and lighting below are project-owned approximations;
+ * no Apple artwork or font data is distributed.
  */
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { initWasm, Resvg } from "@resvg/resvg-wasm";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -20,57 +24,118 @@ const SLUG_FILE = join(ROOT, "flag-slugs.txt");
 const CACHE_DIR = join(FRONTEND, ".cache", "flag-src");
 const LEGACY_SRC = join(FRONTEND, "assets", "flag-src");
 const OUT_DIR = join(FRONTEND, "public", "flags");
+const BUILD_MANIFEST = join(OUT_DIR, ".build.json");
 
 const TWEMOJI = "14.0.2";
 const CDN = `https://cdn.jsdelivr.net/gh/twitter/twemoji@${TWEMOJI}/assets/svg`;
+const DENSITIES = [1, 2, 3];
+const GENERATOR_VERSION = "apple-like-em-strikes-v1";
 
-const FABRIC_X = 5.5;
-const FABRIC_Y = 1.5;
-const FABRIC_W = 28.5;
-const FABRIC_H = 24.5;
-/** Apple ribbon ~0.88em × 0.62em. */
-const APPLE_ASPECT = 0.88 / 0.62;
-const CROP_H = FABRIC_W / APPLE_ASPECT;
-const CROP_Y = FABRIC_Y + (FABRIC_H - CROP_H) / 2;
-const CROP_X = FABRIC_X;
+export const FLAG_VARIANTS = Object.freeze({
+  compact: 12,
+  body: 14,
+});
 
-const FABRIC =
-  "M32.415 3.09c-1.752-.799-3.615-1.187-5.698-1.187-2.518 0-5.02.57-7.438 1.122" +
-  "-2.418.551-4.702 1.072-6.995 1.072-1.79 0-3.382-.329-4.868-1.006-.309-.142" +
-  "-.67-.115-.956.068C6.173 3.343 6 3.66 6 4v19c0 .392.229.747.585.91 1.752.799" +
-  " 3.616 1.187 5.698 1.187 2.518 0 5.02-.57 7.438-1.122 2.418-.551 4.702-1.071" +
-  " 6.995-1.071 1.79 0 3.383.329 4.868 1.007.311.14.67.115.956-.069.287-.185" +
-  ".46-.502.46-.842V4c0-.392-.229-.748-.585-.91z";
+/** Measured from 160px Apple flag reference tiles; used as geometry, not art. */
+export const APPLE_FLAG_GEOMETRY = Object.freeze({
+  canvas: 160,
+  x: 9,
+  y: 29,
+  width: 142,
+  height: 102,
+});
 
-const SIZES = [
-  ["", 32],
-  ["@2x", 64],
-  ["@3x", 96],
-];
+/**
+ * A custom three-fold ribbon whose painted bounds follow the measured Apple-
+ * like tile while retaining an independently drawn silhouette.
+ */
+export const FLAG_SILHOUETTE =
+  "M9 33C27 24 46 38 66 32C85 26 105 38 124 32C135 28 144 28 151 32" +
+  "V126C134 120 116 133 97 127C78 121 59 134 40 127C27 122 17 125 9 130Z";
+
 const INNER_RE = /<svg[^>]*>(.*)<\/svg>\s*$/is;
 const SPOT_CHECK = ["1f1e8-1f1f3", "1f1f9-1f1fc", "1f1fa-1f1f8", "1f1ef-1f1f5", "1f1e9-1f1ea"];
 const FETCH_CONCURRENCY = 8;
 const FORCE = process.argv.includes("--force") || process.env.FLAGS_RASTER_FORCE === "1";
 
-function pngSize(buf) {
+function outputName(slug, density) {
+  return `${slug}${density === 1 ? "" : `@${density}x`}.png`;
+}
+
+function outputPath(variant, slug, density) {
+  return join(OUT_DIR, variant, outputName(slug, density));
+}
+
+export function pngSize(buf) {
   if (buf.length < 24 || buf[0] !== 0x89 || buf[1] !== 0x50) {
     throw new Error("not a PNG");
   }
   return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
 }
 
-function wavingSvg(slug, face) {
+export function alphaBounds(pixels, width, height, threshold = 8) {
+  let left = width;
+  let top = height;
+  let right = -1;
+  let bottom = -1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (pixels[(y * width + x) * 4 + 3] <= threshold) continue;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x);
+      bottom = Math.max(bottom, y);
+    }
+  }
+  if (right < left || bottom < top) return undefined;
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left + 1,
+    height: bottom - top + 1,
+  };
+}
+
+/** Compose a flat Twemoji face into the custom ribbon and add restrained folds. */
+export function appleLikeFlagSvg(slug, face) {
   const match = INNER_RE.exec(face);
   if (!match) throw new Error(`no inner svg markup in ${slug}`);
   const inner = match[1].trim();
-  const clipId = `w${slug.replaceAll("-", "")}`;
+  const id = slug.replaceAll("-", "");
+  const clipId = `flag${id}`;
+  const sheenId = `sheen${id}`;
+  const foldId = `fold${id}`;
   return (
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${CROP_X} ${CROP_Y} ${FABRIC_W} ${CROP_H}">` +
-    `<defs><clipPath id="${clipId}"><path d="${FABRIC}"/></clipPath></defs>` +
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160">` +
+    `<defs>` +
+    `<clipPath id="${clipId}"><path d="${FLAG_SILHOUETTE}"/></clipPath>` +
+    `<linearGradient id="${sheenId}" x1="0" y1="29" x2="0" y2="128" gradientUnits="userSpaceOnUse">` +
+    `<stop offset="0" stop-color="#fff" stop-opacity=".16"/>` +
+    `<stop offset=".46" stop-color="#fff" stop-opacity="0"/>` +
+    `<stop offset="1" stop-color="#020617" stop-opacity=".17"/>` +
+    `</linearGradient>` +
+    `<linearGradient id="${foldId}" x1="9" y1="0" x2="151" y2="0" gradientUnits="userSpaceOnUse">` +
+    `<stop offset="0" stop-color="#fff" stop-opacity=".03"/>` +
+    `<stop offset=".22" stop-color="#fff" stop-opacity=".13"/>` +
+    `<stop offset=".40" stop-color="#020617" stop-opacity=".09"/>` +
+    `<stop offset=".58" stop-color="#fff" stop-opacity=".12"/>` +
+    `<stop offset=".78" stop-color="#020617" stop-opacity=".10"/>` +
+    `<stop offset="1" stop-color="#fff" stop-opacity=".05"/>` +
+    `</linearGradient>` +
+    `</defs>` +
+    `<path d="${FLAG_SILHOUETTE}" transform="translate(0 2)" fill="#020617" opacity=".28"/>` +
     `<g clip-path="url(#${clipId})">` +
-    `<svg x="6" y="1.9" width="27" height="23.2" viewBox="0 5 36 26" preserveAspectRatio="xMidYMid slice">` +
-    `${inner}` +
-    `</svg></g></svg>`
+    `<svg x="9" y="27" width="142" height="104" viewBox="0 5 36 26" preserveAspectRatio="none">` +
+    `${inner}</svg>` +
+    `<rect x="9" y="27" width="142" height="104" fill="url(#${sheenId})"/>` +
+    `<rect x="9" y="27" width="142" height="104" fill="url(#${foldId})"/>` +
+    `<path d="M10 42C29 34 47 47 67 41C86 35 105 47 125 41C136 37 144 37 151 40" ` +
+    `fill="none" stroke="#fff" stroke-opacity=".12" stroke-width="3"/>` +
+    `<path d="M9 120C27 114 46 126 66 120C85 114 105 126 124 120C136 116 144 116 151 119" ` +
+    `fill="none" stroke="#020617" stroke-opacity=".18" stroke-width="4"/>` +
+    `</g></svg>`
   );
 }
 
@@ -80,24 +145,30 @@ async function readSlugs() {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => /^1f1[0-9a-f]{2}-1f1[0-9a-f]{2}$/.test(line));
-  if (slugs.length < 200) {
-    throw new Error(`flag slug list looks short: ${slugs.length}`);
-  }
+  if (slugs.length < 200) throw new Error(`flag slug list looks short: ${slugs.length}`);
   return slugs;
 }
 
 function outputsComplete(slugs) {
   if (FORCE) return false;
-  const probe = join(OUT_DIR, `${SPOT_CHECK[0]}.png`);
-  if (!existsSync(probe)) return false;
   try {
-    if (pngSize(readFileSync(probe)).width !== SIZES[0][1]) return false;
+    const manifest = JSON.parse(readFileSync(BUILD_MANIFEST, "utf8"));
+    if (manifest.generatorVersion !== GENERATOR_VERSION || manifest.twemoji !== TWEMOJI) return false;
+    if (JSON.stringify(manifest.variants) !== JSON.stringify(FLAG_VARIANTS)) return false;
+    return Object.entries(FLAG_VARIANTS).every(([variant, cssPixels]) =>
+      slugs.every((slug) =>
+        DENSITIES.every((density) => {
+          const path = outputPath(variant, slug, density);
+          if (!existsSync(path)) return false;
+          const size = pngSize(readFileSync(path));
+          const expected = cssPixels * density;
+          return size.width === expected && size.height === expected;
+        }),
+      ),
+    );
   } catch {
     return false;
   }
-  return slugs.every((slug) =>
-    SIZES.every(([suffix]) => existsSync(join(OUT_DIR, `${slug}${suffix}.png`))),
-  );
 }
 
 async function fetchFace(slug) {
@@ -121,7 +192,7 @@ async function fetchFace(slug) {
       return text;
     } catch (err) {
       lastErr = err;
-      await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+      await new Promise((done) => setTimeout(done, 250 * attempt));
     }
   }
   throw lastErr;
@@ -130,71 +201,107 @@ async function fetchFace(slug) {
 async function mapPool(items, limit, worker) {
   const pending = [...items];
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (pending.length) {
-      const item = pending.shift();
-      await worker(item);
-    }
+    while (pending.length) await worker(pending.shift());
   });
   await Promise.all(runners);
 }
 
-async function main() {
+async function clearGeneratedPngs() {
+  if (!existsSync(OUT_DIR)) return;
+  for (const entry of await readdir(OUT_DIR, { withFileTypes: true })) {
+    const path = join(OUT_DIR, entry.name);
+    if (entry.isFile() && entry.name.endsWith(".png")) await rm(path);
+    if (entry.isDirectory() && Object.hasOwn(FLAG_VARIANTS, entry.name)) {
+      await rm(path, { recursive: true, force: true });
+    }
+  }
+}
+
+function assertRenderedGeometry(slug, variant, density, rendered) {
+  const bounds = alphaBounds(rendered.pixels, rendered.width, rendered.height, 64);
+  if (!bounds) throw new Error(`${slug}/${variant}@${density}x has no painted pixels`);
+  const widthRatio = bounds.width / rendered.width;
+  const heightRatio = bounds.height / rendered.height;
+  // Tiny 12px strikes quantize heavily; these bounds catch padding regressions
+  // without pretending a single device pixel can match the 160px master.
+  if (widthRatio < 0.79 || widthRatio > 1 || heightRatio < 0.56 || heightRatio > 0.75) {
+    throw new Error(
+      `${slug}/${variant}@${density}x ink ${widthRatio.toFixed(3)} × ${heightRatio.toFixed(3)} is outside the Apple-like tile`,
+    );
+  }
+}
+
+export async function main() {
   const slugs = await readSlugs();
   await mkdir(CACHE_DIR, { recursive: true });
   await mkdir(OUT_DIR, { recursive: true });
 
   if (outputsComplete(slugs)) {
-    console.log(`flags already rasterized (${slugs.length} × ${SIZES.length}); pass --force to rebuild`);
+    console.log(`flags already rasterized (${slugs.length} × ${Object.keys(FLAG_VARIANTS).length} variants × ${DENSITIES.length} densities)`);
     return 0;
   }
 
   const require = createRequire(import.meta.url);
-  const wasmPath = require.resolve("@resvg/resvg-wasm/index_bg.wasm");
-  await initWasm(await readFile(wasmPath));
+  await initWasm(await readFile(require.resolve("@resvg/resvg-wasm/index_bg.wasm")));
 
   const faces = new Map();
   await mapPool(slugs, FETCH_CONCURRENCY, async (slug) => {
     faces.set(slug, await fetchFace(slug));
   });
 
-  for (const stale of await readdir(OUT_DIR)) {
-    if (stale.endsWith(".png")) await rm(join(OUT_DIR, stale));
+  await clearGeneratedPngs();
+  for (const variant of Object.keys(FLAG_VARIANTS)) {
+    await mkdir(join(OUT_DIR, variant), { recursive: true });
   }
 
   for (const slug of slugs) {
-    const svg = wavingSvg(slug, faces.get(slug));
-    for (const [suffix, width] of SIZES) {
-      const resvg = new Resvg(svg, {
-        fitTo: { mode: "width", value: width },
-        font: { loadSystemFonts: false },
-      });
-      const png = Buffer.from(resvg.render().asPng());
-      await writeFile(join(OUT_DIR, `${slug}${suffix}.png`), png);
-    }
-  }
-
-  console.log(`rasterized ${slugs.length} flags × ${SIZES.length} sizes -> ${OUT_DIR}`);
-
-  for (const slug of SPOT_CHECK) {
-    for (const [suffix, width] of SIZES) {
-      const path = join(OUT_DIR, `${slug}${suffix}.png`);
-      const buf = await readFile(path);
-      if (buf.length < 64) throw new Error(`missing or empty ${path}`);
-      const { width: pxW, height: pxH } = pngSize(buf);
-      if (pxW !== width) throw new Error(`${path} width ${pxW} != ${width}`);
-      const aspect = pxW / pxH;
-      if (aspect < 1.35 || aspect > 1.5) {
-        throw new Error(`${path} aspect ${aspect.toFixed(3)} not ~1.42`);
+    const svg = appleLikeFlagSvg(slug, faces.get(slug));
+    for (const [variant, cssPixels] of Object.entries(FLAG_VARIANTS)) {
+      for (const density of DENSITIES) {
+        const pixels = cssPixels * density;
+        const rendered = new Resvg(svg, {
+          fitTo: { mode: "width", value: pixels },
+          font: { loadSystemFonts: false },
+        }).render();
+        assertRenderedGeometry(slug, variant, density, rendered);
+        await writeFile(outputPath(variant, slug, density), Buffer.from(rendered.asPng()));
       }
     }
   }
+
+  for (const slug of SPOT_CHECK) {
+    for (const [variant, cssPixels] of Object.entries(FLAG_VARIANTS)) {
+      for (const density of DENSITIES) {
+        const path = outputPath(variant, slug, density);
+        const buf = await readFile(path);
+        if (buf.length < 64) throw new Error(`missing or empty ${path}`);
+        const size = pngSize(buf);
+        const expected = cssPixels * density;
+        if (size.width !== expected || size.height !== expected) {
+          throw new Error(`${path} is ${size.width} × ${size.height}, expected ${expected} × ${expected}`);
+        }
+      }
+    }
+  }
+
+  await writeFile(
+    BUILD_MANIFEST,
+    `${JSON.stringify({ generatorVersion: GENERATOR_VERSION, twemoji: TWEMOJI, variants: FLAG_VARIANTS }, null, 2)}\n`,
+  );
+
+  console.log(
+    `rasterized ${slugs.length} flags × ${Object.keys(FLAG_VARIANTS).length} variants × ${DENSITIES.length} densities -> ${OUT_DIR}`,
+  );
   return 0;
 }
 
-main().then(
-  (code) => process.exit(code),
-  (err) => {
-    console.error(err instanceof Error ? err.stack || err.message : err);
-    process.exit(1);
-  },
-);
+const isEntryPoint = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+if (isEntryPoint) {
+  main().then(
+    (code) => process.exit(code),
+    (err) => {
+      console.error(err instanceof Error ? err.stack || err.message : err);
+      process.exit(1);
+    },
+  );
+}

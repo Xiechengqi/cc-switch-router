@@ -9,6 +9,7 @@
     "build": "next build",
     "lint": "tsc --noEmit",
     "flags:raster": "node scripts/raster-flags.mjs",
+    "test:flags": "node scripts/raster-flags.mjs && node --test scripts/raster-flags.test.mjs",
     "typecheck": "tsc --noEmit",
     "test:operational-status": "tsx --test components/dashboard/operational-status.test.ts",
     "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts",

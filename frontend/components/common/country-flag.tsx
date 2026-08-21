@@ -31,6 +31,9 @@ function twemojiFlagSlug(iso2: string) {
 
 const CN_FLAG = countryFlagEmoji("CN");
 const US_FLAG = countryFlagEmoji("US");
+const FLAG_CANVAS_PX = { compact: 12, body: 14 } as const;
+
+export type CountryFlagSize = keyof typeof FLAG_CANVAS_PX;
 
 function isAppleHost() {
   if (typeof navigator === "undefined") return false;
@@ -81,16 +84,18 @@ function prefersAppleFlagGlyphs() {
 
 /**
  * Apple hosts use Apple Color Emoji except TW (often a missing-glyph X).
- * Every other host, and TW everywhere, uses the same pre-rasterized PNG
- * from `npm run flags:raster` (Twemoji faces, no pole, Apple ribbon crop).
+ * Every other host, and TW everywhere, uses a size-specific, pre-rasterized
+ * Apple-like PNG from `npm run flags:raster`.
  */
 export function CountryFlag({
   code,
   className,
+  size = "body",
   title,
 }: {
   code?: string | null;
   className?: string;
+  size?: CountryFlagSize;
   title?: string;
 }) {
   const iso2 = countryFlagIso2(code);
@@ -106,22 +111,28 @@ export function CountryFlag({
 
   const slug = twemojiFlagSlug(iso2);
   const label = title || iso2;
+  const canvasPx = FLAG_CANVAS_PX[size];
   return (
     <span
       role="img"
       title={label}
       aria-label={label}
-      className={cn("country-flag", useAppleGlyph && "country-flag-native", className)}
+      className={cn(
+        "country-flag",
+        `country-flag--${size}`,
+        useAppleGlyph && "country-flag-native",
+        className,
+      )}
     >
       {useAppleGlyph ? (
         <span className="country-flag-glyph">{flag}</span>
       ) : (
         <>
           <img
-            src={`/flags/${slug}.png`}
-            srcSet={`/flags/${slug}.png 1x, /flags/${slug}@2x.png 2x, /flags/${slug}@3x.png 3x`}
-            width={32}
-            height={23}
+            src={`/flags/${size}/${slug}.png`}
+            srcSet={`/flags/${size}/${slug}.png 1x, /flags/${size}/${slug}@2x.png 2x, /flags/${size}/${slug}@3x.png 3x`}
+            width={canvasPx}
+            height={canvasPx}
             alt=""
             draggable={false}
             decoding="async"

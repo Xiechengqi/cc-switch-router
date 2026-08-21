@@ -138,8 +138,12 @@ body {
   animation: router-activity-enter 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* Hallmark · component: country flag · genre: modern-minimal · theme: existing router system
+ * states: non-interactive · contrast: supplied by sovereign flag artwork
+ * pre-emit critique: P5 H4 E5 S5 R5 V4
+ */
 .country-flag {
-  /* 1em box. PNG fabric is tight-cropped; optical Apple ribbon size is CSS padding. */
+  /* Apple glyphs and fallback strikes share one square em canvas. */
   position: relative;
   display: inline-block;
   width: 1em;
@@ -150,13 +154,21 @@ body {
   line-height: 0;
 }
 
+.country-flag.country-flag--compact {
+  font-size: 12px;
+}
+
+.country-flag.country-flag--body {
+  font-size: 14px;
+}
+
 .country-flag img {
   position: absolute;
-  left: 0.06em;
-  top: 0.19em;
+  inset: 0;
   display: block;
-  width: 0.88em;
-  height: 0.62em;
+  width: 1em;
+  height: 1em;
+  image-rendering: auto;
 }
 
 .country-flag-copy {

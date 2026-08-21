@@ -1,6 +1,10 @@
-Twemoji 14.0.2 regional-indicator flag faces, clipped to Twemoji's
-waving fabric (U+1F3F3, pole omitted) and cropped uniformly to Apple
-Color Emoji ribbon aspect (~1.42). Rasterized at 32 / 64 / 96 px.
+Twemoji 14.0.2 regional-indicator flag faces, mapped into a project-owned
+waving silhouette with restrained fold lighting. The square output tiles use
+Apple-like optical geometry without including Apple artwork or font data.
+
+Variants:
+- compact: 12 / 24 / 36 px
+- body: 14 / 28 / 42 px
 
 Sources are fetched at build time from jsDelivr:
 https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/
@@ -10,5 +14,5 @@ License: CC-BY 4.0
 https://creativecommons.org/licenses/by/4.0/
 https://github.com/twitter/twemoji/tree/v14.0.2
 
-Regenerate with `npm run flags:raster`. PNGs are build outputs and
-are not committed.
+Regenerate with `npm run flags:raster`. PNGs are build outputs and are not
+committed.

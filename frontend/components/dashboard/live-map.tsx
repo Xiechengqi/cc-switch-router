@@ -477,7 +477,7 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                 >
                   <span className="inline-flex h-4 shrink-0 select-text items-center font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt, locale)}</span>
                   <span className={`inline-flex h-4 shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
-                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] leading-4 text-slate-700"><strong className="font-semibold">{subdomain}</strong>{countryCode ? <> · <CountryFlag code={countryCode} title={countryCode} /></> : null} · {tickerDetail(mergedItem)}</span>
+                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] leading-4 text-slate-700"><strong className="font-semibold">{subdomain}</strong>{countryCode ? <> · <CountryFlag code={countryCode} size="compact" title={countryCode} /></> : null} · {tickerDetail(mergedItem)}</span>
                 </div>
               );
             })}

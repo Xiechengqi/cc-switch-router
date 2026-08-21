@@ -10,4 +10,6 @@
 /frontend/.cache
 /frontend/assets/flag-src/*.svg
 /frontend/public/flags/*.png
+/frontend/public/flags/**/*.png
+/frontend/public/flags/.build.json
 /frontend/tsconfig.tsbuildinfo

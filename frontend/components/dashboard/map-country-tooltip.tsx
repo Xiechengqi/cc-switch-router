@@ -32,7 +32,7 @@ export const MapCountryTooltip = React.forwardRef(function MapCountryTooltip(
       data-map-country-tooltip
     >
       <div className="flex items-center gap-1.5 truncate text-[12px] font-semibold text-foreground">
-        <CountryFlag code={board.countryCode} title={title} />
+        <CountryFlag code={board.countryCode} size="compact" title={title} />
         <span className="truncate">{title}</span>
       </div>
       <div className="mt-1 truncate text-[11px] text-muted-foreground">
