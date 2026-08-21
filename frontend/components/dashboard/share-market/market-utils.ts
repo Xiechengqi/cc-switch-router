@@ -55,6 +55,23 @@ export function activeSubscriptionForShare(
   );
 }
 
+export function isSeatIdle(seat: Pick<ShareMarketSeat, "status" | "readOnly">) {
+  return seat.status === "available" && !seat.readOnly;
+}
+
+export function listingIdleCount(listing: { seats: Array<Pick<ShareMarketSeat, "status" | "readOnly">> }) {
+  return listing.seats.filter(isSeatIdle).length;
+}
+
+export function listingLowestDailyRate(listing: {
+  seats: Array<Pick<ShareMarketSeat, "status" | "readOnly" | "dailyRateMinor" | "isFree">>;
+}) {
+  const idle = listing.seats.filter(isSeatIdle);
+  const seats = idle.length ? idle : listing.seats;
+  if (!seats.length) return Number.POSITIVE_INFINITY;
+  return Math.min(...seats.map((seat) => seat.dailyRateMinor ?? 0));
+}
+
 export function formatSeatPrice(
   seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor">,
   locale: string,

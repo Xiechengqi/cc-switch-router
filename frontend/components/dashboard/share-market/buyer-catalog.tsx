@@ -18,11 +18,13 @@ import {
   ShieldCheck,
   ShoppingCart,
   UserRound,
+  Users,
   X,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { CompactSelect } from "@/components/common/compact-select";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import {
@@ -42,7 +44,6 @@ import type {
   ShareMarketProviderFamily,
   ShareMarketSeat,
   ShareMarketSubscription,
-  ShareTokenPeriod,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
@@ -53,12 +54,19 @@ import {
   formatSeatPrice,
   formatTokenLimit,
   isCoreShareApp,
+  isSeatIdle,
+  listingIdleCount,
+  listingLowestDailyRate,
+  subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
-type SeatAction = "rent" | "approval" | "login" | "rented" | "selling" | "unavailable";
+type SeatAction = "rent" | "approval" | "login" | "rented" | "granting" | "selling" | "occupied" | "unavailable";
+type AvailabilityFilter = "all" | "idle";
+type CatalogSort = "idle" | "price" | "uptime";
 
-function familyRank(family: ShareMarketProviderFamily) {
+function familyRank(family: ShareMarketProviderFamily | "all") {
+  if (family === "all") return -1;
   const rank = PROVIDER_FAMILY_ORDER.indexOf(family);
   return rank < 0 ? PROVIDER_FAMILY_ORDER.length : rank;
 }
@@ -70,12 +78,49 @@ function seatAction(
   authed: boolean,
 ): SeatAction {
   if (listing.isOwner) return "selling";
-  if (activeSubscriptionForShare(subscriptions, listing.shareId)) return "rented";
+  const mine = activeSubscriptionForShare(subscriptions, listing.shareId);
+  if (mine) return mine.status === "grant_pending" ? "granting" : "rented";
+  if (!isSeatIdle(seat)) return seat.subscription ? "occupied" : "unavailable";
   if (!listing.shareOnline) return "unavailable";
   if (!authed) return "login";
   if (seat.canRent) return "rent";
   if (seat.rentPrerequisitesMet && !seat.eligibility.allowed) return "approval";
   return "unavailable";
+}
+
+function listingAction(
+  listing: ShareMarketListing,
+  subscriptions: ShareMarketSubscription[],
+  authed: boolean,
+): SeatAction {
+  if (listing.isOwner) return "selling";
+  const mine = activeSubscriptionForShare(subscriptions, listing.shareId);
+  if (mine) return mine.status === "grant_pending" ? "granting" : "rented";
+  const idle = listing.seats.filter(isSeatIdle);
+  if (!listing.shareOnline) return "unavailable";
+  if (!idle.length) return "occupied";
+  if (!authed) return "login";
+  if (idle.some((seat) => seat.canRent)) return "rent";
+  if (idle.some((seat) => seat.rentPrerequisitesMet && !seat.eligibility.allowed)) return "approval";
+  return "unavailable";
+}
+
+function firstActionableSeat(
+  listing: ShareMarketListing,
+  subscriptions: ShareMarketSubscription[],
+  authed: boolean,
+) {
+  const mine = activeSubscriptionForShare(subscriptions, listing.shareId);
+  if (mine) {
+    return listing.seats.find((seat) => seat.id === mine.seatId) || listing.seats[0];
+  }
+  const preferred = listing.seats
+    .filter(isSeatIdle)
+    .sort((left, right) => (left.dailyRateMinor ?? 0) - (right.dailyRateMinor ?? 0) || left.position - right.position);
+  return preferred.find((seat) => {
+    const action = seatAction(listing, seat, subscriptions, authed);
+    return action === "rent" || action === "approval" || action === "login";
+  }) || preferred[0] || listing.seats[0];
 }
 
 function AppLogos({ apps }: { apps: string[] }) {
@@ -103,7 +148,9 @@ function SeatActionButton({
     approval: { label: t("marketApproval.apply"), icon: Send, variant: "primary" as const },
     login: { label: t("nav.login"), icon: LogIn, variant: "primary" as const },
     rented: { label: t("shareMarket.catalog.rented"), icon: Check, variant: "outline" as const },
+    granting: { label: t("shareMarket.catalog.granting"), icon: Loader2, variant: "outline" as const },
     selling: { label: t("shareMarket.workspace.selling"), icon: Gauge, variant: "outline" as const },
+    occupied: { label: t("shareMarket.occupied"), icon: Users, variant: "outline" as const },
     unavailable: { label: t("shareMarket.unavailable"), icon: ShieldCheck, variant: "outline" as const },
   }[action];
   const Icon = config.icon;
@@ -111,10 +158,10 @@ function SeatActionButton({
     <Button
       size="sm"
       variant={config.variant}
-      isDisabled={busy || action === "unavailable"}
+      isDisabled={busy || action === "unavailable" || action === "occupied"}
       onClick={onAction}
     >
-      {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Icon className="h-4 w-4" />}
+      {busy || action === "granting" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Icon className="h-4 w-4" />}
       {config.label}
     </Button>
   );
@@ -156,52 +203,104 @@ function Metric({ label, value, title }: { label: string; value: string; title?:
   );
 }
 
-function SeatCardView({
-  item,
+function lowestIdlePrice(
+  listing: ShareMarketListing,
+  locale: string,
+  freeLabel: string,
+  dayLabel: string,
+) {
+  const idle = listing.seats.filter(isSeatIdle);
+  const seats = idle.length ? idle : listing.seats;
+  const cheapest = [...seats].sort((left, right) =>
+    (left.dailyRateMinor ?? 0) - (right.dailyRateMinor ?? 0) || left.position - right.position,
+  )[0];
+  return cheapest ? formatSeatPrice(cheapest, locale, freeLabel, dayLabel) : freeLabel;
+}
+
+function riderLabel(seat: ShareMarketSeat, t: ReturnType<typeof useLocaleText>["t"]) {
+  const email = seat.subscription?.renterEmail?.trim();
+  const statusKey = subscriptionStatusKey(seat.subscription?.status || "");
+  const status = statusKey ? t(statusKey) : "";
+  if (email && status && seat.subscription?.status !== "active_free" && seat.subscription?.status !== "active_postpaid") {
+    return `${email} · ${status}`;
+  }
+  if (email) return email;
+  if (status) return status;
+  if (seat.status === "occupied" || seat.status === "reserved" || seat.status === "revoking") {
+    return t("shareMarket.catalog.anonymousRider");
+  }
+  return t("shareMarket.available");
+}
+
+function ListingCardView({
+  listing,
   action,
   busy,
   trialHours,
+  focused,
   onDetails,
   onAction,
 }: {
-  item: SeatCard;
+  listing: ShareMarketListing;
   action: SeatAction;
   busy: boolean;
   trialHours: number;
+  focused?: boolean;
   onDetails: () => void;
   onAction: () => void;
 }) {
   const { locale, t } = useLocaleText();
-  const { listing, seat } = item;
   const performance = listing.performance;
   const reliability = listing.reliability;
+  const idleCount = listingIdleCount(listing);
+  const totalSeats = listing.seats.length;
+  const occupancy = idleCount
+    ? t("shareMarket.catalog.occupancy", { idle: idleCount, total: totalSeats })
+    : t("shareMarket.catalog.full");
   const subscriptionLevels = [...new Set(
     listing.appCapabilities
       .map((capability) => capability.subscriptionLevel?.trim())
       .filter((value): value is string => !!value),
   )];
-  const price = formatSeatPrice(
-    seat,
-    locale,
-    t("shareMarket.free"),
-    t("marketBilling.day"),
-  );
-  const service = seat.serviceDurationDays == null
-    ? t("shareMarket.serviceDuration.permanent")
-    : t("shareMarket.serviceDuration.daysValue", { count: seat.serviceDurationDays });
+  const familyNames = [...new Set([listing.providerFamily, ...listing.providerFamilies])]
+    .map((family) => t(PROVIDER_FAMILY_KEYS[family]));
+  const multiProvider = familyNames.length > 1;
+  const price = lowestIdlePrice(listing, locale, t("shareMarket.free"), t("marketBilling.day"));
+  const paidIdle = listing.seats.some((seat) => isSeatIdle(seat) && !seat.isFree);
   const ttft = performance.averageTtftMs == null ? "-" : `${(performance.averageTtftMs / 1_000).toFixed(2)}s`;
   const tps = performance.averageTps == null ? "-" : performance.averageTps.toFixed(1);
+  const footerHint = action === "approval"
+    ? t("shareMarket.catalog.approvalRequired")
+    : action === "rented" || action === "granting"
+      ? t("shareMarket.catalog.alreadyRenting")
+      : !listing.shareOnline
+        ? t("shareMarket.catalog.offlineHint")
+        : paidIdle
+          ? t("shareMarket.catalog.postpaidHint")
+          : t("shareMarket.free");
   return (
-    <article className="grid min-h-[23rem] min-w-0 grid-rows-[auto_auto_auto_1fr_auto] gap-3 rounded-md border border-slate-200 bg-white p-4 shadow-sm transition-colors hover:border-slate-300">
+    <article
+      id={`share-market-catalog-${listing.shareId}`}
+      className={cn(
+        "grid min-h-[23rem] min-w-0 scroll-mt-20 grid-rows-[auto_auto_auto_1fr_auto] gap-3 rounded-md border bg-white p-4 shadow-sm transition-colors hover:border-slate-300",
+        focused ? "border-accent ring-1 ring-accent/30" : "border-slate-200",
+        !listing.shareOnline && "opacity-80",
+      )}
+    >
       <header className="flex min-w-0 items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
             <strong className="truncate text-sm text-slate-900">
-              {t(PROVIDER_FAMILY_KEYS[listing.providerFamily])}
+              {listing.shareName}
             </strong>
             {subscriptionLevels.length ? (
               <span className="truncate text-xs text-slate-500" title={subscriptionLevels.join(" / ")}>
                 {subscriptionLevels.join(" / ")}
+              </span>
+            ) : null}
+            {multiProvider ? (
+              <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
+                {t("shareMarket.catalog.multiProviders")}
               </span>
             ) : null}
           </div>
@@ -219,49 +318,63 @@ function SeatCardView({
 
       <div className="min-w-0">
         <div className="flex items-baseline justify-between gap-3">
-          <strong className="text-xl font-semibold text-slate-950">{price}</strong>
-          <span className="shrink-0 text-xs text-slate-500">#{seat.position}</span>
+          <strong className="text-xl font-semibold text-slate-950">
+            {idleCount && listing.seats.length > 1 ? t("shareMarket.catalog.fromPrice", { price }) : price}
+          </strong>
+          <span className={cn("shrink-0 text-xs font-medium", idleCount ? "text-emerald-700" : "text-slate-500")}>
+            {occupancy}
+          </span>
         </div>
         <p className="mt-1 text-xs text-slate-500">
-          {seat.isFree ? service : `${t("shareMarket.catalog.trial", { hours: trialHours })} · ${service}`}
+          {paidIdle ? t("shareMarket.catalog.trial", { hours: trialHours }) : t("shareMarket.free")}
+          {" · "}
+          {familyNames.join(" / ")}
         </p>
       </div>
 
       <AppPolicies listing={listing} />
 
-      <dl className="grid content-start grid-cols-2 gap-x-4 gap-y-3 border-y border-slate-100 py-3 sm:grid-cols-3">
-        <Metric label={t("shareMarket.parallel")} value={seat.parallelLimit == null ? t("common.unlimited") : String(seat.parallelLimit)} />
-        <Metric
-          label={t("shareMarket.tokens")}
-          value={formatTokenLimit(
-            seat,
-            locale,
-            t("common.unlimited"),
-            (period: ShareTokenPeriod) => t(`shareMarket.period.${period}`),
+      <div className="grid content-start gap-3 border-y border-slate-100 py-3">
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
+          <Metric
+            label="TTFT / TPS"
+            value={`${ttft} / ${tps}`}
+            title={t("shareMarket.catalog.performanceSamples", {
+              ttft: performance.ttftSampleCount,
+              tps: performance.tpsSampleCount,
+            })}
+          />
+          <Metric label={t("shareMarket.catalog.uptime24h")} value={`${reliability.onlineRate24h.toFixed(1)}%`} />
+          <Metric label={t("shareMarket.owner")} value={listing.ownerEmail} />
+        </dl>
+        <div className="grid gap-1.5">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
+            {t("shareMarket.catalog.seatsAndRiders")}
+          </p>
+          {listing.seats.length ? listing.seats.map((seat) => {
+            const idle = isSeatIdle(seat);
+            return (
+              <div key={seat.id} className="flex min-w-0 items-center justify-between gap-3 text-xs">
+                <span className="shrink-0 font-medium text-slate-700">#{seat.position}</span>
+                <span className={cn("min-w-0 truncate", idle ? "text-emerald-700" : "text-slate-500")} title={riderLabel(seat, t)}>
+                  {idle ? t("shareMarket.available") : riderLabel(seat, t)}
+                </span>
+                <strong className="shrink-0 tabular-nums text-slate-800">
+                  {formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}
+                </strong>
+              </div>
+            );
+          }) : (
+            <p className="text-xs text-slate-500">{t("shareMarket.catalog.noRiders")}</p>
           )}
-        />
-        <Metric
-          label="TTFT / TPS"
-          value={`${ttft} / ${tps}`}
-          title={t("shareMarket.catalog.performanceSamples", {
-            ttft: performance.ttftSampleCount,
-            tps: performance.tpsSampleCount,
-          })}
-        />
-        <Metric label={t("shareMarket.catalog.uptime24h")} value={`${reliability.onlineRate24h.toFixed(1)}%`} />
-        <Metric label={t("shareMarket.catalog.coverage24h")} value={`${reliability.observationCoverage24h.toFixed(1)}%`} />
-        <Metric label={t("shareMarket.owner")} value={listing.ownerEmail} />
-      </dl>
+        </div>
+      </div>
 
       <footer className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
         <div className="flex min-w-0 items-center gap-2">
           <PaymentMethodIcons kinds={listing.paymentMethodKinds} />
-          <span className="truncate text-[11px] text-slate-500">
-            {action === "approval"
-              ? t("shareMarket.catalog.approvalRequired")
-              : seat.isFree
-                ? t("shareMarket.free")
-                : t("shareMarket.catalog.postpaid")}
+          <span className="truncate text-[11px] text-slate-500" title={footerHint}>
+            {footerHint}
           </span>
         </div>
         <div className="flex flex-wrap justify-end gap-2">
@@ -280,6 +393,7 @@ export function ShareMarketBuyerCatalog({
   catalog,
   subscriptions,
   authed,
+  focusedShareId,
   onChanged,
   onInteractionChange,
   onSwitchSelling,
@@ -287,6 +401,7 @@ export function ShareMarketBuyerCatalog({
   catalog: ShareMarketCatalog;
   subscriptions: ShareMarketSubscription[];
   authed: boolean;
+  focusedShareId?: string;
   onChanged: () => Promise<void> | void;
   onInteractionChange?: (active: boolean) => void;
   onSwitchSelling?: () => void;
@@ -296,37 +411,39 @@ export function ShareMarketBuyerCatalog({
   const chat = useClientChat();
   const [query, setQuery] = React.useState("");
   const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
+  const [availability, setAvailability] = React.useState<AvailabilityFilter>("all");
+  const [sort, setSort] = React.useState<CatalogSort>("idle");
   const [selected, setSelected] = React.useState<SeatCard | null>(null);
   const [rentTarget, setRentTarget] = React.useState<SeatCard | null>(null);
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
   const [busySeatId, setBusySeatId] = React.useState("");
   const [rentError, setRentError] = React.useState("");
-  const interactionActive = !!selected || !!rentTarget || !!accessTarget || !!busySeatId;
+  const focusedRef = React.useRef("");
+  const blockingInteraction = !!rentTarget || !!accessTarget || !!busySeatId;
 
   React.useEffect(() => {
-    onInteractionChange?.(interactionActive);
+    onInteractionChange?.(blockingInteraction);
     return () => onInteractionChange?.(false);
-  }, [interactionActive, onInteractionChange]);
+  }, [blockingInteraction, onInteractionChange]);
 
-  const cards = React.useMemo(() => {
+  const listings = React.useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
-    const rows = catalog.listings.flatMap((listing) =>
-      listing.seats.map((seat) => ({ listing, seat })),
-    );
-    return rows
-      .filter(({ listing }) =>
+    return catalog.listings
+      .filter((listing) =>
         family === "all"
         || listing.providerFamily === family
         || listing.providerFamilies.includes(family),
       )
-      .filter(({ listing, seat }) => {
+      .filter((listing) => availability !== "idle" || listingIdleCount(listing) > 0)
+      .filter((listing) => {
         if (!needle) return true;
         const text = [
           listing.shareName,
           listing.subdomain,
           listing.ownerEmail,
           listing.providerFamily,
-          seat.position,
+          ...listing.providerFamilies,
+          ...listing.seats.flatMap((seat) => [seat.position, seat.subscription?.renterEmail, seat.subscription?.status]),
           ...listing.supportedApps,
           ...listing.appCapabilities.flatMap((capability) => [
             capability.providerName,
@@ -338,24 +455,83 @@ export function ShareMarketBuyerCatalog({
         ].filter(Boolean).join(" ").toLocaleLowerCase();
         return text.includes(needle);
       })
-      .sort((left, right) =>
-        familyRank(left.listing.providerFamily) - familyRank(right.listing.providerFamily)
-        || Number(right.listing.shareOnline) - Number(left.listing.shareOnline)
-        || (left.seat.dailyRateMinor ?? 0) - (right.seat.dailyRateMinor ?? 0)
-        || left.listing.shareName.localeCompare(right.listing.shareName),
-      );
-  }, [catalog.listings, family, query]);
+      .sort((left, right) => {
+        const online = Number(right.shareOnline) - Number(left.shareOnline);
+        if (online) return online;
+        if (sort === "price") {
+          return listingLowestDailyRate(left) - listingLowestDailyRate(right)
+            || listingIdleCount(right) - listingIdleCount(left)
+            || left.shareName.localeCompare(right.shareName);
+        }
+        if (sort === "uptime") {
+          return right.reliability.onlineRate24h - left.reliability.onlineRate24h
+            || listingIdleCount(right) - listingIdleCount(left)
+            || left.shareName.localeCompare(right.shareName);
+        }
+        return listingIdleCount(right) - listingIdleCount(left)
+          || listingLowestDailyRate(left) - listingLowestDailyRate(right)
+          || left.shareName.localeCompare(right.shareName);
+      });
+  }, [availability, catalog.listings, family, query, sort]);
 
   const groups = React.useMemo(() => {
-    const map = new Map<ShareMarketProviderFamily, SeatCard[]>();
-    for (const card of cards) {
-      const groupFamily = family === "all" ? card.listing.providerFamily : family;
+    if (family === "all" && sort !== "idle") {
+      return [["all", listings] as const];
+    }
+    const map = new Map<ShareMarketProviderFamily, ShareMarketListing[]>();
+    for (const listing of listings) {
+      const groupFamily = family === "all" ? listing.providerFamily : family;
       const items = map.get(groupFamily) || [];
-      items.push(card);
+      items.push(listing);
       map.set(groupFamily, items);
     }
     return [...map.entries()].sort(([left], [right]) => familyRank(left) - familyRank(right));
-  }, [cards, family]);
+  }, [family, listings, sort]);
+
+  const idleByFamily = React.useMemo(() => {
+    const counts = new Map<ShareMarketProviderFamily | "all", number>();
+    let allIdle = 0;
+    for (const listing of catalog.listings) {
+      const idle = listingIdleCount(listing);
+      allIdle += idle;
+      for (const providerFamily of new Set([listing.providerFamily, ...listing.providerFamilies])) {
+        counts.set(providerFamily, (counts.get(providerFamily) || 0) + idle);
+      }
+    }
+    counts.set("all", allIdle);
+    return counts;
+  }, [catalog.listings]);
+
+  React.useEffect(() => {
+    if (!selected) return;
+    const listing = catalog.listings.find((item) => item.id === selected.listing.id);
+    if (!listing) {
+      setSelected(null);
+      return;
+    }
+    const seat = listing.seats.find((item) => item.id === selected.seat.id) || listing.seats[0];
+    if (!seat) {
+      setSelected(null);
+      return;
+    }
+    if (seat === selected.seat && listing === selected.listing) return;
+    setSelected({ listing, seat });
+  }, [catalog.listings, selected]);
+
+  React.useEffect(() => {
+    if (!focusedShareId || focusedRef.current === focusedShareId) return;
+    const listing = catalog.listings.find((item) => item.shareId === focusedShareId);
+    if (!listing) return;
+    focusedRef.current = focusedShareId;
+    setFamily("all");
+    setAvailability("all");
+    setQuery("");
+    const seat = firstActionableSeat(listing, subscriptions, authed) || listing.seats[0];
+    if (seat) setSelected({ listing, seat });
+    window.requestAnimationFrame(() => {
+      document.getElementById(`share-market-catalog-${focusedShareId}`)?.scrollIntoView({ block: "start" });
+    });
+  }, [authed, catalog.listings, focusedShareId, subscriptions]);
 
   const triggerAction = (item: SeatCard) => {
     const action = seatAction(item.listing, item.seat, subscriptions, authed);
@@ -366,8 +542,8 @@ export function ShareMarketBuyerCatalog({
       setRentTarget(item);
     } else if (action === "approval") {
       setAccessTarget({ ...item, eligibility: item.seat.eligibility });
-    } else if (action === "rented") {
-      window.location.href = `${DASHBOARD_ACCOUNT_SHARE_PATH}?tab=user`;
+    } else if (action === "rented" || action === "granting") {
+      setSelected(item);
     } else if (action === "selling") {
       onSwitchSelling?.();
     }
@@ -375,18 +551,19 @@ export function ShareMarketBuyerCatalog({
 
   const confirmRent = async () => {
     if (!rentTarget || busySeatId) return;
-    setBusySeatId(rentTarget.seat.id);
+    const rented = rentTarget;
+    setBusySeatId(rented.seat.id);
     setRentError("");
     try {
-      await rentShareMarketSeat(rentTarget.seat.id, rentTarget.seat.offerRevision);
+      await rentShareMarketSeat(rented.seat.id, rented.seat.offerRevision);
       setRentTarget(null);
-      setSelected(null);
+      setSelected(rented);
       await onChanged();
     } catch (reason) {
       const eligibility = marketEligibilityFromError(reason);
       if (eligibility) {
         setRentTarget(null);
-        setAccessTarget({ ...rentTarget, eligibility });
+        setAccessTarget({ ...rented, eligibility });
       } else {
         setRentError(reason instanceof Error ? reason.message : String(reason));
       }
@@ -398,9 +575,20 @@ export function ShareMarketBuyerCatalog({
   const selectedAction = selected
     ? seatAction(selected.listing, selected.seat, subscriptions, authed)
     : "unavailable";
+  const listingPrimaryAction = selected
+    ? listingAction(selected.listing, subscriptions, authed)
+    : "unavailable";
   const familyOptions = [
-    { value: "all", label: t("shareMarket.catalog.allFamilies") },
+    { value: "all" as const, label: t("shareMarket.catalog.allFamilies") },
     ...PROVIDER_FAMILY_ORDER.map((value) => ({ value, label: t(PROVIDER_FAMILY_KEYS[value]) })),
+  ].map((option) => ({
+    ...option,
+    description: t("shareMarket.catalog.idleSeats", { count: idleByFamily.get(option.value) || 0 }),
+  }));
+  const sortOptions = [
+    { value: "idle", label: t("shareMarket.catalog.sort.idle") },
+    { value: "price", label: t("shareMarket.catalog.sort.price") },
+    { value: "uptime", label: t("shareMarket.catalog.sort.uptime") },
   ];
 
   return (
@@ -426,8 +614,26 @@ export function ShareMarketBuyerCatalog({
           options={familyOptions}
           onChange={(value) => setFamily(value as ShareMarketProviderFamily | "all")}
           ariaLabel={t("shareMarket.catalog.familyFilter")}
-          className="w-full sm:w-48"
-          triggerClassName="h-10 w-full text-sm"
+          className="w-full sm:w-56"
+          triggerClassName="min-h-10 h-auto w-full py-1.5 text-sm"
+        />
+        <SegmentedControl
+          value={availability}
+          onChange={setAvailability}
+          ariaLabel={t("shareMarket.catalog.availabilityFilter")}
+          size="sm"
+          items={[
+            { id: "all", label: t("shareMarket.catalog.availability.all") },
+            { id: "idle", label: t("shareMarket.catalog.availability.idle") },
+          ]}
+        />
+        <CompactSelect
+          value={sort}
+          options={sortOptions}
+          onChange={(value) => setSort(value as CatalogSort)}
+          ariaLabel={t("shareMarket.catalog.sort")}
+          className="w-full sm:w-44"
+          triggerClassName="min-h-10 h-auto w-full py-1.5 text-sm"
         />
         {subscriptions.length ? (
           <Link
@@ -443,26 +649,39 @@ export function ShareMarketBuyerCatalog({
       {groups.map(([providerFamily, items]) => (
         <section key={providerFamily} className="grid min-w-0 gap-3">
           <div className="flex items-baseline justify-between border-b border-slate-200 pb-2">
-            <h2 className="text-sm font-semibold text-slate-900">{t(PROVIDER_FAMILY_KEYS[providerFamily])}</h2>
-            <span className="text-xs tabular-nums text-slate-400">{items.length}</span>
+            <h2 className="text-sm font-semibold text-slate-900">
+              {providerFamily === "all" ? t("shareMarket.catalog.allFamilies") : t(PROVIDER_FAMILY_KEYS[providerFamily])}
+            </h2>
+            <span className="text-xs tabular-nums text-slate-400">
+              {t("shareMarket.catalog.listingCount", { count: items.length })}
+              {" · "}
+              {t("shareMarket.catalog.idleSeats", { count: items.reduce((sum, listing) => sum + listingIdleCount(listing), 0) })}
+            </span>
           </div>
           <div className="grid min-w-0 gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {items.map((item) => (
-              <SeatCardView
-                key={item.seat.id}
-                item={item}
-                action={seatAction(item.listing, item.seat, subscriptions, authed)}
-                busy={busySeatId === item.seat.id}
-                trialHours={catalog.trialHours}
-                onDetails={() => setSelected(item)}
-                onAction={() => triggerAction(item)}
-              />
-            ))}
+            {items.map((listing) => {
+              const seat = firstActionableSeat(listing, subscriptions, authed);
+              return (
+                <ListingCardView
+                  key={listing.id}
+                  listing={listing}
+                  action={listingAction(listing, subscriptions, authed)}
+                  busy={busySeatId === seat?.id}
+                  trialHours={catalog.trialHours}
+                  focused={focusedShareId === listing.shareId}
+                  onDetails={() => setSelected({ listing, seat: seat || listing.seats[0] })}
+                  onAction={() => {
+                    const target = firstActionableSeat(listing, subscriptions, authed);
+                    if (target) triggerAction({ listing, seat: target });
+                  }}
+                />
+              );
+            })}
           </div>
         </section>
       ))}
 
-      {!cards.length ? (
+      {!listings.length ? (
         <div className="grid min-h-48 place-items-center border-y border-dashed border-slate-200 text-sm text-slate-500">
           {t("shareMarket.catalog.empty")}
         </div>
@@ -491,7 +710,12 @@ export function ShareMarketBuyerCatalog({
                         {selected.listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
                       </span>
                     </div>
-                    <p className="text-sm text-slate-600">{t("shareMarket.catalog.seatPosition", { position: selected.seat.position })}</p>
+                    <p className="text-sm text-slate-600">
+                      {t("shareMarket.catalog.occupancy", {
+                        idle: listingIdleCount(selected.listing),
+                        total: selected.listing.seats.length,
+                      })}
+                    </p>
                   </section>
 
                   <section className="grid gap-3 border-b border-slate-200 pb-4">
@@ -520,6 +744,9 @@ export function ShareMarketBuyerCatalog({
                       <Metric label={t("shareMarket.catalog.serviceTerm")} value={selected.seat.serviceDurationDays == null ? t("shareMarket.serviceDuration.permanent") : t("shareMarket.serviceDuration.daysValue", { count: selected.seat.serviceDurationDays })} />
                       <Metric label={t("shareMarket.catalog.billingStart")} value={selected.seat.isFree ? t("shareMarket.free") : t("shareMarket.catalog.afterTrial", { hours: catalog.trialHours })} />
                     </dl>
+                    {!selected.seat.isFree ? (
+                      <p className="text-xs leading-5 text-slate-500">{t("shareMarket.catalog.postpaidHint")}</p>
+                    ) : null}
                   </section>
 
                   <section className="grid gap-3 border-b border-slate-200 pb-4">
@@ -548,17 +775,29 @@ export function ShareMarketBuyerCatalog({
                     </Button>
                   </section>
 
-                  {selected.listing.seats.length > 1 ? (
-                    <section className="grid gap-2 border-t border-slate-200 pt-4">
-                      <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.otherSeats")}</h3>
-                      {selected.listing.seats.filter((seat) => seat.id !== selected.seat.id).map((seat) => (
-                        <button key={seat.id} type="button" className="flex items-center justify-between border-b border-slate-100 py-2 text-left text-sm last:border-0" onClick={() => setSelected({ listing: selected.listing, seat })}>
-                          <span>#{seat.position}</span>
+                  <section className="grid gap-2 border-t border-slate-200 pt-4">
+                    <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.seatsAndRiders")}</h3>
+                    {selected.listing.seats.map((seat) => {
+                      const idle = isSeatIdle(seat);
+                      return (
+                        <button
+                          key={seat.id}
+                          type="button"
+                          className={cn(
+                            "grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-slate-100 py-2 text-left text-sm last:border-0",
+                            selected.seat.id === seat.id && "bg-slate-50",
+                          )}
+                          onClick={() => setSelected({ listing: selected.listing, seat })}
+                        >
+                          <span className="font-medium">#{seat.position}</span>
+                          <span className={cn("min-w-0 truncate", idle ? "text-emerald-700" : "text-slate-500")} title={idle ? t("shareMarket.available") : riderLabel(seat, t)}>
+                            {idle ? t("shareMarket.available") : riderLabel(seat, t)}
+                          </span>
                           <strong>{formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</strong>
                         </button>
-                      ))}
-                    </section>
-                  ) : null}
+                      );
+                    })}
+                  </section>
                 </div>
               ) : null}
             </Drawer.Body>
@@ -566,9 +805,27 @@ export function ShareMarketBuyerCatalog({
               <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-3 border-t border-slate-200 bg-white px-5 py-4">
                 <div className="min-w-0">
                   <strong className="block truncate text-lg">{formatSeatPrice(selected.seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</strong>
-                  <span className="text-xs text-slate-500">#{selected.seat.position}</span>
+                  <span className="text-xs text-slate-500">
+                    {t("shareMarket.catalog.seatPosition", { position: selected.seat.position })}
+                    {" · "}
+                    {t("shareMarket.catalog.occupancy", {
+                      idle: listingIdleCount(selected.listing),
+                      total: selected.listing.seats.length,
+                    })}
+                  </span>
                 </div>
-                <SeatActionButton action={selectedAction} busy={busySeatId === selected.seat.id} onAction={() => triggerAction(selected)} />
+                <SeatActionButton
+                  action={isSeatIdle(selected.seat) ? selectedAction : listingPrimaryAction}
+                  busy={busySeatId === selected.seat.id}
+                  onAction={() => {
+                    if (isSeatIdle(selected.seat)) {
+                      triggerAction(selected);
+                      return;
+                    }
+                    const target = firstActionableSeat(selected.listing, subscriptions, authed);
+                    if (target) triggerAction({ listing: selected.listing, seat: target });
+                  }}
+                />
               </div>
             ) : null}
           </Drawer.Dialog>
@@ -587,6 +844,8 @@ export function ShareMarketBuyerCatalog({
                     <dd className="truncate font-medium">{rentTarget.listing.shareName} · #{rentTarget.seat.position}</dd>
                     <dt className="text-slate-500">{t("shareMarket.owner")}</dt>
                     <dd className="break-all">{rentTarget.listing.ownerEmail}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.seatsAndRiders")}</dt>
+                    <dd>{t("shareMarket.catalog.occupancy", { idle: listingIdleCount(rentTarget.listing), total: rentTarget.listing.seats.length })}</dd>
                     <dt className="text-slate-500">{t("shareMarket.dialog.amount")}</dt>
                     <dd className="font-medium">{formatSeatPrice(rentTarget.seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</dd>
                   </dl>

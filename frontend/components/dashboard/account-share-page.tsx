@@ -139,7 +139,7 @@ function SubscriptionCard({
         <Chip size="sm" variant={anomalous ? "primary" : "tertiary"}>{statusKey ? t(statusKey) : subscription.status}</Chip>
         <Chip size="sm" variant="tertiary">{subscription.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</Chip>
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-          {perspective === "user" ? t("account.share.provider", { owner: subscription.ownerEmail }) : t("account.share.renter", { email: subscription.renterEmail })}
+          {perspective === "user" ? t("account.share.provider", { owner: subscription.ownerEmail }) : t("account.share.renter", { email: subscription.renterEmail || "-" })}
         </span>
       </div>
       <dl className="grid gap-3 text-sm sm:grid-cols-2">

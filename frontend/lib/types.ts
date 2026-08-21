@@ -2209,7 +2209,7 @@ export type ShareMarketSubscription = {
   subdomain?: string;
   shareOnline?: boolean;
   ownerEmail: string;
-  renterEmail: string;
+  renterEmail?: string;
   status: string;
   dailyRateMinor?: number;
   currency?: "USD";

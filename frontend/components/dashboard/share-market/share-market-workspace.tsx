@@ -51,7 +51,7 @@ export function ShareMarketWorkspace() {
   const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
   const [canCreateListing, setCanCreateListing] = React.useState(false);
   const [addListingOpen, setAddListingOpen] = React.useState(false);
-  const [childInteractionActive, setChildInteractionActive] = React.useState(false);
+  const [pausePolling, setPausePolling] = React.useState(false);
   const [workspace, setWorkspaceState] = React.useState<Workspace>(() =>
     workspaceFromQuery(searchParams.get("view") || searchParams.get("tab")),
   );
@@ -116,7 +116,7 @@ export function ShareMarketWorkspace() {
   React.useEffect(() => {
     if (authLoading) return;
     const tick = () => {
-      if (document.visibilityState !== "visible" || addListingOpen || childInteractionActive) return;
+      if (document.visibilityState !== "visible" || addListingOpen || pausePolling) return;
       void load({ silent: true, skipIfBusy: true });
     };
     const timer = window.setInterval(tick, SHARE_MARKET_POLL_MS);
@@ -128,7 +128,7 @@ export function ShareMarketWorkspace() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [addListingOpen, authLoading, childInteractionActive, load]);
+  }, [addListingOpen, authLoading, load, pausePolling]);
 
   const hasSellingWorkspace = authed && ownedListings.some((listing) => listing.status === "active");
   const canOpenRequestedListing = authed
@@ -209,8 +209,9 @@ export function ShareMarketWorkspace() {
           catalog={catalog}
           subscriptions={subscriptions}
           authed={authed}
+          focusedShareId={workspace === "catalog" ? focusedShareId : undefined}
           onChanged={() => load({ silent: true })}
-          onInteractionChange={setChildInteractionActive}
+          onInteractionChange={setPausePolling}
           onSwitchSelling={hasSellingWorkspace ? () => setWorkspace("selling") : undefined}
         />
       ) : null}
@@ -220,7 +221,7 @@ export function ShareMarketWorkspace() {
           loading={loading}
           focusedShareId={focusedShareId}
           onChanged={() => load({ silent: true })}
-          onInteractionChange={setChildInteractionActive}
+          onInteractionChange={setPausePolling}
         />
       ) : null}
       <ShareMarketAddListingDialog
