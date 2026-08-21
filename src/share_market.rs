@@ -36,6 +36,7 @@ const CONTROL_DISPATCH_WAKE_RETRY_SECS: i64 = 30;
 const CONTROL_EDIT_TTL_SECS: i64 = 5 * 60;
 const CONTROL_RETRY_BASE_SECS: i64 = 15;
 const CONTROL_RETRY_MAX_SECS: i64 = 15 * 60;
+const RENT_QUOTE_TTL_SECS: i64 = 2 * 60;
 pub(crate) const SHARE_MARKET_CONTROL_ACTOR_EMAIL: &str = "share-market@router.internal";
 pub(crate) const SHARE_REVISION_CONFLICT_CODE: &str = "cc_switch_share_revision_conflict";
 
@@ -182,6 +183,8 @@ pub struct SeatView {
     pub can_rent: bool,
     pub rent_prerequisites_met: bool,
     pub seller_approval_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rent_block_reason: Option<String>,
     pub eligibility: crate::market_access::MarketEligibilityView,
     pub read_only: bool,
     pub can_delete: bool,
@@ -209,11 +212,17 @@ pub struct SubscriptionView {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub renter_email: String,
     pub status: String,
+    pub seat_position: i64,
+    pub parallel_limit: Option<u32>,
+    pub token_limit: Option<u64>,
+    pub token_period: ShareTokenPeriod,
     pub daily_rate_minor: Option<i64>,
     pub currency: Option<String>,
     pub service_duration_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     pub offer_revision: i64,
@@ -303,6 +312,49 @@ pub struct RentSeatRequest {
     pub offer_revision: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RentQuoteSnapshot {
+    pub seat_id: String,
+    pub listing_id: String,
+    pub share_id: String,
+    pub share_name: String,
+    pub owner_email: String,
+    pub seat_position: i64,
+    pub parallel_limit: Option<u32>,
+    pub token_limit: Option<u64>,
+    pub token_period: ShareTokenPeriod,
+    pub daily_rate_minor: Option<i64>,
+    pub currency: Option<String>,
+    pub service_duration_days: Option<u32>,
+    pub offer_revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RentQuoteView {
+    pub id: String,
+    pub status: String,
+    pub expires_at: String,
+    pub trial_seconds_remaining: i64,
+    pub offer: RentQuoteSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommitRentQuoteRequest {
+    pub quote_id: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitRentQuoteResponse {
+    pub ok: bool,
+    pub subscription_id: String,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ForceRevokeRequest {
@@ -385,6 +437,7 @@ pub fn router() -> Router<ServerState> {
             "/v1/share-market/seats/:id",
             patch(update_seat).delete(delete_seat),
         )
+        .route("/v1/share-market/seats/:id/quote", post(quote_seat))
         .route("/v1/share-market/seats/:id/rent", post(rent_seat))
         .route(
             "/v1/share-market/subscriptions/:id/release",
@@ -1650,6 +1703,10 @@ struct SubscriptionRecord {
     renter_user_id: String,
     renter_email: String,
     status: String,
+    seat_position: i64,
+    parallel_limit: Option<i64>,
+    token_limit: Option<i64>,
+    token_period_json: String,
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
     service_duration_days: Option<u32>,
@@ -1660,6 +1717,7 @@ struct SubscriptionRecord {
     has_active_control_work: bool,
     has_active_billing_contract: bool,
     activated_at: Option<String>,
+    service_started_at: Option<String>,
     expires_at: Option<String>,
     released_at: Option<String>,
     created_at: String,
@@ -1727,7 +1785,10 @@ fn subscription_record(
                     SELECT 1 FROM market_service_contracts contract
                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                       AND contract.status != 'terminated'
-                )
+                ),
+                COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
+                sub.parallel_limit, sub.token_limit, sub.token_period_json,
+                sub.service_started_at
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -1764,6 +1825,11 @@ fn subscription_record(
                 grant_attempts: row.get(25)?,
                 has_active_control_work: row.get::<_, i64>(26)? != 0,
                 has_active_billing_contract: row.get::<_, i64>(27)? != 0,
+                seat_position: row.get(28)?,
+                parallel_limit: row.get(29)?,
+                token_limit: row.get(30)?,
+                token_period_json: row.get(31)?,
+                service_started_at: row.get(32)?,
             })
         },
     )
@@ -1870,7 +1936,10 @@ fn catalog_subscription_records(
                     SELECT 1 FROM market_service_contracts contract
                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                       AND contract.status != 'terminated'
-                )
+                ),
+                COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
+                sub.parallel_limit, sub.token_limit, sub.token_period_json,
+                sub.service_started_at
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -1910,6 +1979,11 @@ fn catalog_subscription_records(
                         grant_attempts: row.get(25)?,
                         has_active_control_work: row.get::<_, i64>(26)? != 0,
                         has_active_billing_contract: row.get::<_, i64>(27)? != 0,
+                        seat_position: row.get(28)?,
+                        parallel_limit: row.get(29)?,
+                        token_limit: row.get(30)?,
+                        token_period_json: row.get(31)?,
+                        service_started_at: row.get(32)?,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -2329,6 +2403,7 @@ fn public_catalog_seat_visible(seat: &SeatView) -> bool {
 }
 
 fn redact_public_subscription(subscription: &mut SubscriptionView) {
+    subscription.renter_email.clear();
     subscription.contacts.clear();
     subscription.payment_method_kinds.clear();
     subscription.can_release = false;
@@ -2576,10 +2651,20 @@ fn subscription_view(
         owner_email: record.owner_email,
         renter_email: record.renter_email,
         status: record.status,
+        seat_position: record.seat_position,
+        parallel_limit: record
+            .parallel_limit
+            .and_then(|value| u32::try_from(value).ok()),
+        token_limit: record
+            .token_limit
+            .and_then(|value| u64::try_from(value).ok()),
+        token_period: serde_json::from_str(&record.token_period_json)
+            .unwrap_or(ShareTokenPeriod::Lifetime),
         daily_rate_minor: record.daily_rate_minor,
         currency: record.currency,
         service_duration_days: record.service_duration_days,
         activated_at: record.activated_at,
+        service_started_at: record.service_started_at,
         expires_at: record.expires_at,
         offer_revision: record.offer_revision,
         payment_method_kinds,
@@ -2873,6 +2958,29 @@ impl AppStore {
                 let seller_approval_required =
                     base_rent_prerequisites && eligibility.status == "access_required";
                 let can_rent = base_rent_prerequisites && eligibility.allowed;
+                let rent_block_reason = if can_rent {
+                    None
+                } else if is_owner {
+                    Some("owner".to_string())
+                } else if viewer_already_renting {
+                    Some("already_renting".to_string())
+                } else if viewer_has_direct_grant {
+                    Some("direct_access".to_string())
+                } else if viewer.is_none() {
+                    Some("login_required".to_string())
+                } else if status != "active" || share_status != "active" {
+                    Some("share_unavailable".to_string())
+                } else if !share_online {
+                    Some("share_offline".to_string())
+                } else if seat.status != SEAT_AVAILABLE || seat.retired_at.is_some() {
+                    Some("seat_unavailable".to_string())
+                } else if seller_approval_required {
+                    Some("approval_required".to_string())
+                } else if !eligibility.allowed {
+                    Some(eligibility.status.clone())
+                } else {
+                    Some("unavailable".to_string())
+                };
                 let read_only = seat.retired_at.is_some();
                 seats.push(SeatView {
                     id: seat.id,
@@ -2898,6 +3006,7 @@ impl AppStore {
                     can_rent,
                     rent_prerequisites_met: base_rent_prerequisites,
                     seller_approval_required,
+                    rent_block_reason,
                     eligibility,
                     read_only,
                     can_delete: delete_capability.can_delete,
@@ -4365,6 +4474,400 @@ fn has_terminal_revoke_operation_tx(
     .map_err(map_db("check terminal Share revoke"))
 }
 
+#[derive(Debug, Clone)]
+struct RentCommitMetadata {
+    quote_id: String,
+    idempotency_key: String,
+    request_fingerprint: String,
+}
+
+impl AppStore {
+    pub async fn share_market_create_rent_quote(
+        &self,
+        session: &AuthSession,
+        seat_id: &str,
+    ) -> Result<RentQuoteView, AppError> {
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let expires_at = (now_dt + Duration::seconds(RENT_QUOTE_TTL_SECS)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(map_db("begin Share rent quote"))?;
+        tx.execute(
+            "UPDATE share_market_rent_quotes
+             SET status = 'expired', updated_at = ?1
+             WHERE status = 'active' AND expires_at <= ?1",
+            params![now],
+        )
+        .map_err(map_db("expire Share rent quotes"))?;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            String,
+        )> = tx
+            .query_row(
+                "SELECT seat.listing_id, listing.share_id, COALESCE(share.share_name, listing.share_id),
+                        listing.owner_user_id, listing.owner_email, listing.status,
+                        seat.position, seat.offer_revision, seat.parallel_limit, seat.token_limit,
+                        seat.token_period_json, seat.daily_rate_minor, seat.currency,
+                        seat.service_duration_days, COALESCE(share.user_grants_json, '{}')
+                 FROM share_market_seats seat
+                 JOIN share_market_listings listing ON listing.id = seat.listing_id
+                 JOIN shares share ON share.share_id = listing.share_id
+                 WHERE seat.id = ?1 AND seat.status = 'available' AND seat.retired_at IS NULL
+                   AND share.share_status = 'active'
+                   AND lower(share.owner_email) = lower(listing.owner_email)",
+                params![seat_id],
+                |row| {
+                    Ok((
+                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                        row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                        row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Share seat quote"))?;
+        let Some((
+            listing_id,
+            share_id,
+            share_name,
+            owner_user_id,
+            owner_email,
+            listing_status,
+            seat_position,
+            offer_revision,
+            parallel_limit,
+            token_limit,
+            token_period_json,
+            daily_rate_minor,
+            currency,
+            service_duration_days,
+            grants_json,
+        )) = row
+        else {
+            return Err(AppError::coded_conflict(
+                "share_market_seat_unavailable",
+                "seat is no longer available",
+                serde_json::json!({ "reason": "seat_unavailable" }),
+            ));
+        };
+        if listing_status != "active" {
+            return Err(AppError::Conflict("listing is no longer active".into()));
+        }
+        if owner_user_id == session.user_id || owner_email.eq_ignore_ascii_case(&session.email) {
+            return Err(AppError::BadRequest(
+                "Share owner cannot rent their own seat".into(),
+            ));
+        }
+        let already_renting = tx
+            .query_row(
+                "SELECT 1 FROM share_market_subscriptions
+                 WHERE renter_user_id = ?1 AND share_id = ?2
+                   AND status NOT IN ('released', 'grant_failed') LIMIT 1",
+                params![session.user_id, share_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_db("check quoted Share rental"))?
+            .is_some();
+        if already_renting {
+            return Err(AppError::coded_conflict(
+                "share_market_already_renting",
+                "one account can rent only one seat on the same Share",
+                serde_json::json!({ "reason": "already_renting" }),
+            ));
+        }
+        let grants: BTreeMap<String, ShareUserGrant> =
+            serde_json::from_str(&grants_json).unwrap_or_default();
+        if grants
+            .get(&session.email.to_ascii_lowercase())
+            .is_some_and(|grant| grant.active)
+        {
+            return Err(AppError::coded_conflict(
+                "share_market_direct_access",
+                "this account already has direct Share access",
+                serde_json::json!({ "reason": "direct_access" }),
+            ));
+        }
+        crate::market_access::ensure_product_access_tx(
+            &tx,
+            &owner_user_id,
+            &session.user_id,
+            &session.email,
+            crate::market_access::PRODUCT_SHARE,
+            crate::market_access::pricing_kind_for_rate(daily_rate_minor),
+        )?;
+        let trial_seconds_remaining = if daily_rate_minor.is_some() {
+            let quote_currency = currency
+                .as_deref()
+                .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
+            crate::market_billing::ensure_credit_allowed_tx(
+                &tx,
+                &session.user_id,
+                &session.email,
+                &owner_user_id,
+                crate::market_access::PRODUCT_SHARE,
+                quote_currency,
+            )?;
+            crate::market_billing::trial_seconds_remaining_tx(
+                &tx,
+                &session.user_id,
+                &owner_user_id,
+                crate::market_access::PRODUCT_SHARE,
+                &share_id,
+                quote_currency,
+            )?
+        } else {
+            0
+        };
+        let snapshot = RentQuoteSnapshot {
+            seat_id: seat_id.to_string(),
+            listing_id: listing_id.clone(),
+            share_id: share_id.clone(),
+            share_name,
+            owner_email,
+            seat_position,
+            parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
+            token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
+            token_period: serde_json::from_str(&token_period_json)
+                .unwrap_or(ShareTokenPeriod::Lifetime),
+            daily_rate_minor,
+            currency,
+            service_duration_days: service_duration_days
+                .and_then(|value| u32::try_from(value).ok()),
+            offer_revision,
+        };
+        let quote_id = Uuid::new_v4().to_string();
+        let snapshot_json = serde_json::to_string(&snapshot).map_err(|error| {
+            AppError::Internal(format!("encode Share rent quote failed: {error}"))
+        })?;
+        tx.execute(
+            "UPDATE share_market_rent_quotes
+             SET status = 'expired', updated_at = ?3
+             WHERE renter_user_id = ?1 AND seat_id = ?2 AND status = 'active'",
+            params![session.user_id, seat_id, now],
+        )
+        .map_err(map_db("replace Share rent quote"))?;
+        tx.execute(
+            "INSERT INTO share_market_rent_quotes (
+                id, seat_id, listing_id, share_id, renter_user_id, renter_email,
+                offer_revision, snapshot_json, trial_seconds_remaining, status,
+                expires_at, consumed_subscription_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, NULL, ?11, ?11)",
+            params![
+                quote_id,
+                seat_id,
+                listing_id,
+                share_id,
+                session.user_id,
+                session.email,
+                offer_revision,
+                snapshot_json,
+                trial_seconds_remaining,
+                expires_at,
+                now,
+            ],
+        )
+        .map_err(map_db("insert Share rent quote"))?;
+        tx.commit().map_err(map_db("commit Share rent quote"))?;
+        Ok(RentQuoteView {
+            id: quote_id,
+            status: "active".into(),
+            expires_at,
+            trial_seconds_remaining,
+            offer: snapshot,
+        })
+    }
+
+    pub async fn share_market_commit_rent_quote(
+        &self,
+        session: &AuthSession,
+        seat_id: &str,
+        quote_id: &str,
+        idempotency_key: &str,
+    ) -> Result<CommitRentQuoteResponse, AppError> {
+        let quote_id = quote_id.trim();
+        let idempotency_key = idempotency_key.trim();
+        if quote_id.is_empty() {
+            return Err(AppError::BadRequest("quoteId is required".into()));
+        }
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(AppError::BadRequest(
+                "idempotencyKey must contain 1-128 non-control characters".into(),
+            ));
+        }
+        let fingerprint = format!("share-rent:{quote_id}:{seat_id}");
+        let existing = {
+            let conn = self.conn.lock().await;
+            conn.query_row(
+                "SELECT id, rent_quote_id, request_fingerprint
+                 FROM share_market_subscriptions
+                 WHERE renter_user_id = ?1 AND idempotency_key = ?2",
+                params![session.user_id, idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read idempotent Share rental"))?
+        };
+        if let Some((subscription_id, stored_quote_id, stored_fingerprint)) = existing {
+            if stored_quote_id.as_deref() != Some(quote_id)
+                || stored_fingerprint.as_deref() != Some(fingerprint.as_str())
+            {
+                return Err(AppError::Conflict(
+                    "idempotency key was already used for another Share rental".into(),
+                ));
+            }
+            self.mark_share_rent_quote_consumed(quote_id, &subscription_id, &session.user_id)
+                .await?;
+            return Ok(CommitRentQuoteResponse {
+                ok: true,
+                subscription_id,
+                replayed: true,
+            });
+        }
+        let (quoted_seat_id, offer_revision, status, expires_at, quote_user_id) = {
+            let conn = self.conn.lock().await;
+            conn.query_row(
+                "SELECT seat_id, offer_revision, status, expires_at, renter_user_id
+                 FROM share_market_rent_quotes WHERE id = ?1",
+                params![quote_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Share rent quote"))?
+            .ok_or_else(|| AppError::NotFound("Share rent quote not found".into()))?
+        };
+        if quote_user_id != session.user_id {
+            return Err(AppError::Forbidden(
+                "Share rent quote belongs to another account".into(),
+            ));
+        }
+        if quoted_seat_id != seat_id {
+            return Err(AppError::Conflict(
+                "Share rent quote belongs to another seat".into(),
+            ));
+        }
+        if status != "active" || parse_time(&expires_at)? <= Utc::now() {
+            return Err(AppError::Gone(
+                "Share rent quote expired; request a new quote".into(),
+            ));
+        }
+        let metadata = RentCommitMetadata {
+            quote_id: quote_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            request_fingerprint: fingerprint,
+        };
+        let subscription_id = match self
+            .share_market_rent_seat_with_metadata(
+                session,
+                seat_id,
+                RentSeatRequest { offer_revision },
+                Some(&metadata),
+            )
+            .await
+        {
+            Ok(subscription_id) => subscription_id,
+            Err(error) => {
+                let replay = {
+                    let conn = self.conn.lock().await;
+                    conn.query_row(
+                        "SELECT id FROM share_market_subscriptions
+                         WHERE renter_user_id = ?1 AND idempotency_key = ?2
+                           AND rent_quote_id = ?3 AND request_fingerprint = ?4",
+                        params![
+                            session.user_id,
+                            idempotency_key,
+                            quote_id,
+                            metadata.request_fingerprint
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(map_db("recover idempotent Share rental"))?
+                };
+                if let Some(subscription_id) = replay {
+                    self.mark_share_rent_quote_consumed(
+                        quote_id,
+                        &subscription_id,
+                        &session.user_id,
+                    )
+                    .await?;
+                    return Ok(CommitRentQuoteResponse {
+                        ok: true,
+                        subscription_id,
+                        replayed: true,
+                    });
+                }
+                return Err(error);
+            }
+        };
+        self.mark_share_rent_quote_consumed(quote_id, &subscription_id, &session.user_id)
+            .await?;
+        Ok(CommitRentQuoteResponse {
+            ok: true,
+            subscription_id,
+            replayed: false,
+        })
+    }
+
+    async fn mark_share_rent_quote_consumed(
+        &self,
+        quote_id: &str,
+        subscription_id: &str,
+        renter_user_id: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE share_market_rent_quotes
+             SET status = 'consumed', consumed_subscription_id = ?2, updated_at = ?4
+             WHERE id = ?1 AND renter_user_id = ?3
+               AND (status = 'active' OR consumed_subscription_id = ?2)",
+                params![quote_id, subscription_id, renter_user_id, now],
+            )
+            .map_err(map_db("consume Share rent quote"))?;
+        if changed == 0 {
+            return Err(AppError::Conflict(
+                "Share rent quote was consumed by another rental".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl AppStore {
     pub async fn share_market_rent_seat(
         &self,
@@ -4372,8 +4875,18 @@ impl AppStore {
         seat_id: &str,
         input: RentSeatRequest,
     ) -> Result<String, AppError> {
-        let now_dt = Utc::now();
-        let now = now_dt.to_rfc3339();
+        self.share_market_rent_seat_with_metadata(session, seat_id, input, None)
+            .await
+    }
+
+    async fn share_market_rent_seat_with_metadata(
+        &self,
+        session: &AuthSession,
+        seat_id: &str,
+        input: RentSeatRequest,
+        metadata: Option<&RentCommitMetadata>,
+    ) -> Result<String, AppError> {
+        let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction()
@@ -4537,15 +5050,13 @@ impl AppStore {
         };
         let token_period: ShareTokenPeriod = serde_json::from_str(&token_period_json)
             .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
-        let expires_at = service_duration_days.map(|days| now_dt + Duration::days(i64::from(days)));
         let policy = ShareUserPolicy {
             parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
             token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
             token_period,
-            token_period_anchor_at_ms: token_period_anchor_at_ms(token_period, now_dt),
-            expires_at: expires_at.map(|value| value.timestamp_millis()),
+            token_period_anchor_at_ms: None,
+            expires_at: None,
         };
-        let expires_at = expires_at.map(|value| value.to_rfc3339());
         let subscription_id = Uuid::new_v4().to_string();
         let entitlement_id = Uuid::new_v4().to_string();
         tx.execute(
@@ -4555,10 +5066,10 @@ impl AppStore {
                 parallel_limit, token_limit, token_period_json, daily_rate_minor, currency,
                 service_duration_days, offer_revision, release_reason,
                 activated_at, expires_at, created_at, updated_at, released_at,
-                free_usage_seconds
+                free_usage_seconds, rent_quote_id, idempotency_key, request_fingerprint
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'grant_pending',
                        ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                       NULL, NULL, ?18, ?19, ?19, NULL, ?20)",
+                       NULL, NULL, ?18, ?19, ?19, NULL, ?20, ?21, ?22, ?23)",
             params![
                 subscription_id,
                 seat_id,
@@ -4577,9 +5088,12 @@ impl AppStore {
                 currency,
                 service_duration_days.map(i64::from),
                 offer_revision,
-                expires_at,
+                Option::<String>::None,
                 now,
                 free_usage_seconds,
+                metadata.map(|value| value.quote_id.as_str()),
+                metadata.map(|value| value.idempotency_key.as_str()),
+                metadata.map(|value| value.request_fingerprint.as_str()),
             ],
         )
         .map_err(|error| {
@@ -4802,13 +5316,10 @@ impl AppStore {
     }
 }
 
-async fn rent_seat(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(seat_id): Path<String>,
-    Json(input): Json<RentSeatRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let session = require_session(&state, &headers).await?;
+async fn ensure_share_market_seat_online(
+    state: &ServerState,
+    seat_id: &str,
+) -> Result<(), AppError> {
     let subdomain = {
         let conn = state.store.conn.lock().await;
         conn.query_row(
@@ -4832,19 +5343,50 @@ async fn rent_seat(
             .iter()
             .any(|active| active.eq_ignore_ascii_case(&subdomain))
     {
-        return Err(AppError::Conflict(
-            "the Share is offline; retry after its owner restores service".into(),
+        return Err(AppError::coded_conflict(
+            "share_market_share_offline",
+            "the Share is offline; retry after its owner restores service",
+            serde_json::json!({ "reason": "share_offline" }),
         ));
     }
-    let subscription_id = state
+    Ok(())
+}
+
+async fn quote_seat(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(seat_id): Path<String>,
+) -> Result<Json<RentQuoteView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    ensure_share_market_seat_online(&state, &seat_id).await?;
+    Ok(Json(
+        state
+            .store
+            .share_market_create_rent_quote(&session, &seat_id)
+            .await?,
+    ))
+}
+
+async fn rent_seat(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(seat_id): Path<String>,
+    Json(input): Json<CommitRentQuoteRequest>,
+) -> Result<Json<CommitRentQuoteResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    ensure_share_market_seat_online(&state, &seat_id).await?;
+    let response = state
         .store
-        .share_market_rent_seat(&session, &seat_id, input)
+        .share_market_commit_rent_quote(&session, &seat_id, &input.quote_id, &input.idempotency_key)
         .await?;
-    run_once(&state).await?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "subscriptionId": subscription_id
-    })))
+    if let Err(error) = run_once(&state).await {
+        tracing::warn!(
+            subscription_id = %response.subscription_id,
+            error = %error,
+            "Share rental committed; immediate authorization advance failed"
+        );
+    }
+    Ok(Json(response))
 }
 
 async fn release_subscription(
@@ -4857,7 +5399,9 @@ async fn release_subscription(
         .store
         .share_market_request_release(&session, &subscription_id, false, false)
         .await?;
-    run_once(&state).await?;
+    if let Err(error) = run_once(&state).await {
+        tracing::warn!(%subscription_id, error = %error, "Share release committed; immediate revoke advance failed");
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -4872,7 +5416,9 @@ async fn force_revoke_subscription(
         .store
         .share_market_request_release(&session, &subscription_id, true, input.deny_future_access)
         .await?;
-    run_once(&state).await?;
+    if let Err(error) = run_once(&state).await {
+        tracing::warn!(%subscription_id, error = %error, "Share force-revoke committed; immediate revoke advance failed");
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -6200,7 +6746,7 @@ impl AppStore {
                 entitlement_id,
                 action,
                 email,
-                policy_json,
+                mut policy_json,
                 subscription_id,
             )) = operation
             else {
@@ -6258,6 +6804,63 @@ impl AppStore {
                 }
                 continue;
             };
+            if action == "upsert" {
+                let timing: Option<(Option<i64>, String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT service_duration_days, token_period_json, service_started_at
+                         FROM share_market_subscriptions
+                         WHERE id = ?1 AND status = 'grant_pending'",
+                        params![subscription_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(map_db("read initial Share grant timing"))?;
+                if let Some((service_duration_days, token_period_json, service_started_at)) = timing
+                    && service_started_at.is_none()
+                {
+                    let token_period: ShareTokenPeriod = serde_json::from_str(&token_period_json)
+                        .map_err(|_| {
+                        AppError::Internal("stored seat token period is invalid".into())
+                    })?;
+                    let expires_at = service_duration_days
+                        .map(|days| now_dt + Duration::days(days))
+                        .map(|value| value.to_rfc3339());
+                    let mut policy = policy_json
+                        .as_deref()
+                        .map(serde_json::from_str::<ShareUserPolicy>)
+                        .transpose()
+                        .map_err(|_| {
+                            AppError::Internal("stored Share grant policy is invalid".into())
+                        })?
+                        .ok_or_else(|| {
+                            AppError::Internal("Share grant policy is missing".into())
+                        })?;
+                    policy.token_period_anchor_at_ms =
+                        token_period_anchor_at_ms(token_period, now_dt);
+                    policy.expires_at = expires_at
+                        .as_deref()
+                        .map(parse_time)
+                        .transpose()?
+                        .map(|value| value.timestamp_millis());
+                    let encoded = serde_json::to_string(&policy).map_err(|error| {
+                        AppError::Internal(format!("encode Share grant policy failed: {error}"))
+                    })?;
+                    tx.execute(
+                        "UPDATE share_market_subscriptions
+                         SET service_started_at = ?2, expires_at = ?3, updated_at = ?2
+                         WHERE id = ?1 AND status = 'grant_pending' AND service_started_at IS NULL",
+                        params![subscription_id, now, expires_at],
+                    )
+                    .map_err(map_db("start Share service term"))?;
+                    tx.execute(
+                        "UPDATE share_control_operations SET policy_json = ?2, updated_at = ?3
+                         WHERE id = ?1 AND status = 'pending'",
+                        params![operation_id, encoded, now],
+                    )
+                    .map_err(map_db("freeze Share grant timing"))?;
+                    policy_json = Some(encoded);
+                }
+            }
             let policy = policy_json
                 .as_deref()
                 .map(serde_json::from_str::<ShareUserPolicy>)
@@ -6723,9 +7326,7 @@ fn apply_control_grant_effect(
                         .map(|grant| grant.usage.clone())
                         .unwrap_or_default(),
                     usage_rebase,
-                    usage_quota: previous
-                        .as_ref()
-                        .and_then(|grant| grant.usage_quota),
+                    usage_quota: previous.as_ref().and_then(|grant| grant.usage_quota),
                     created_at_ms: previous
                         .as_ref()
                         .map(|grant| grant.created_at_ms)
@@ -7953,7 +8554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_catalog_keeps_occupied_seats_and_renter_identity() {
+    async fn public_catalog_keeps_occupancy_without_renter_identity() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-public", "owner-public@example.com");
         let renter = session("renter-public", "renter-secret@example.com");
@@ -8024,10 +8625,114 @@ mod tests {
         assert!(idle.subscription.is_none());
         assert_ne!(rented.status, SEAT_AVAILABLE);
         let rented_subscription = rented.subscription.as_ref().expect("occupancy is visible");
-        assert_eq!(rented_subscription.renter_email, renter.email);
+        assert!(rented_subscription.renter_email.is_empty());
         let public_json = serde_json::to_string(&catalog).expect("encode public catalog");
-        assert!(public_json.contains("renter-secret@example.com"));
+        assert!(!public_json.contains("renter-secret@example.com"));
         assert!(!public_json.contains("mySubscriptions"));
+    }
+
+    #[tokio::test]
+    async fn rent_quote_reports_persisted_trial_balance() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-quote-trial", "owner-quote-trial@example.com");
+        let renter = session("renter-quote-trial", "renter-quote-trial@example.com");
+        configure_payment_profile(&store, &owner, "quote-trial-account", "quote-trial-profile")
+            .await;
+        insert_share(
+            &store,
+            "share-quote-trial",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) = create_listing(&store, &owner, "share-quote-trial", paid_seat()).await;
+        let expected_remaining = crate::market_billing::TRIAL_SECONDS - 7_200;
+        let now = Utc::now().to_rfc3339();
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO market_trial_ledgers (
+                    buyer_user_id, supplier_user_id, product_kind, service_ref, currency,
+                    allowance_seconds, consumed_seconds, created_at, updated_at
+                 ) VALUES (?1, ?2, 'share', ?3, 'USD', ?4, 7200, ?5, ?5)",
+                params![
+                    renter.user_id,
+                    owner.user_id,
+                    "share-quote-trial",
+                    crate::market_billing::TRIAL_SECONDS,
+                    now,
+                ],
+            )
+            .expect("seed persisted Share trial balance");
+
+        let quote = store
+            .share_market_create_rent_quote(&renter, &seat_id)
+            .await
+            .expect("quote paid Share seat");
+        assert_eq!(quote.trial_seconds_remaining, expected_remaining);
+        assert_eq!(quote.offer.seat_id, seat_id);
+        assert_eq!(quote.offer.daily_rate_minor, Some(1_200));
+    }
+
+    #[tokio::test]
+    async fn rent_quote_commit_binds_seat_expires_and_replays_idempotently() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-quote", "owner-quote@example.com");
+        let renter = session("renter-quote", "renter-quote@example.com");
+        for share_id in ["share-quote-a", "share-quote-b"] {
+            insert_share(&store, share_id, &owner.email, &[ShareTokenPeriod::Day]).await;
+        }
+        let (_, seat_a) = create_listing(&store, &owner, "share-quote-a", free_seat()).await;
+        let (_, seat_b) = create_listing(&store, &owner, "share-quote-b", free_seat()).await;
+        let quote_a = store
+            .share_market_create_rent_quote(&renter, &seat_a)
+            .await
+            .expect("quote first Share seat");
+
+        let wrong_seat = store
+            .share_market_commit_rent_quote(&renter, &seat_b, &quote_a.id, "quote-seat-mismatch")
+            .await
+            .expect_err("quote must remain bound to its seat");
+        assert!(matches!(wrong_seat, AppError::Conflict(_)));
+
+        let committed = store
+            .share_market_commit_rent_quote(&renter, &seat_a, &quote_a.id, "quote-replay")
+            .await
+            .expect("commit frozen Share quote");
+        assert!(!committed.replayed);
+        let replayed = store
+            .share_market_commit_rent_quote(&renter, &seat_a, &quote_a.id, "quote-replay")
+            .await
+            .expect("replay committed Share quote");
+        assert!(replayed.replayed);
+        assert_eq!(replayed.subscription_id, committed.subscription_id);
+
+        let quote_b = store
+            .share_market_create_rent_quote(&renter, &seat_b)
+            .await
+            .expect("quote second Share seat");
+        let reused_key = store
+            .share_market_commit_rent_quote(&renter, &seat_b, &quote_b.id, "quote-replay")
+            .await
+            .expect_err("idempotency key must not identify another quote");
+        assert!(matches!(reused_key, AppError::Conflict(_)));
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE share_market_rent_quotes SET expires_at = ?2 WHERE id = ?1",
+                params![quote_b.id, (Utc::now() - Duration::seconds(1)).to_rfc3339()],
+            )
+            .expect("expire second Share quote");
+        let expired = store
+            .share_market_commit_rent_quote(&renter, &seat_b, &quote_b.id, "quote-expired")
+            .await
+            .expect_err("expired quote must be rejected");
+        assert!(matches!(expired, AppError::Gone(_)));
     }
 
     #[tokio::test]
@@ -8095,10 +8800,12 @@ mod tests {
             .expect("public scope keeps the Share including occupied seats");
         assert_eq!(renter_share.seats.len(), 2);
         assert!(renter_share.seats.iter().all(|seat| !seat.can_rent));
-        assert!(renter_share
-            .seats
-            .iter()
-            .any(|seat| seat.subscription.is_some()));
+        assert!(
+            renter_share
+                .seats
+                .iter()
+                .any(|seat| seat.subscription.is_some())
+        );
         retain_public_catalog(&mut public);
         let mut public_share_ids = public
             .listings
@@ -8434,7 +9141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finite_subscription_expiring_before_grant_dispatch_is_never_activated() {
+    async fn finite_subscription_does_not_consume_service_term_before_grant_dispatch() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-pending-expiry", "owner-pending-expiry@example.com");
         let renter = session("renter-pending-expiry", "renter-pending-expiry@example.com");
@@ -8451,47 +9158,67 @@ mod tests {
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
             .expect("rent finite seat");
-        let expires_at: String = store
+        let pending_timing: (Option<String>, Option<String>) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT expires_at FROM share_market_subscriptions WHERE id = ?1",
+                "SELECT service_started_at, expires_at
+                 FROM share_market_subscriptions WHERE id = ?1",
                 params![subscription_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("read pending service expiry");
+            .expect("read pending service timing");
+        assert_eq!(pending_timing, (None, None));
 
+        let dispatched_at = Utc::now() + Duration::days(30);
         let dispatched = store
-            .share_market_reconcile_and_dispatch(parse_time(&expires_at).unwrap())
+            .share_market_reconcile_and_dispatch(dispatched_at)
             .await
-            .expect("expire pending service");
-        assert!(dispatched.is_empty());
+            .expect("dispatch delayed finite service");
+        assert_eq!(dispatched.len(), 1);
         assert_eq!(
             subscription_status(&store, &subscription_id).await,
-            SUB_RELEASED
+            SUB_GRANT_PENDING
         );
-        let state: (String, String, i64) = store
+        let state: (String, String, String, String, i64) = store
             .conn
             .lock()
             .await
             .query_row(
                 "SELECT seat.status, operation.status,
+                        subscription.service_started_at, subscription.expires_at,
                         (SELECT COUNT(*) FROM share_market_events
                          WHERE subscription_id = ?1 AND event_type = 'service_term_expired')
                  FROM share_market_seats seat
+                 JOIN share_market_subscriptions subscription ON subscription.id = ?1
                  JOIN share_control_operations operation
                    ON operation.subscription_id = ?1 AND operation.action = 'upsert'
                  WHERE seat.id = ?2",
                 params![subscription_id, seat_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
-            .expect("read expired pending service state");
-        assert_eq!(state, (SEAT_AVAILABLE.into(), "rejected".into(), 1));
+            .expect("read delayed finite service state");
+        assert_eq!(state.0, SEAT_RESERVED);
+        assert_eq!(state.1, "dispatched");
+        assert_eq!(parse_time(&state.2).unwrap(), dispatched_at);
+        assert_eq!(
+            parse_time(&state.3).unwrap(),
+            dispatched_at + Duration::days(1)
+        );
+        assert_eq!(state.4, 0);
     }
 
     #[tokio::test]
-    async fn finite_free_subscription_expires_once_from_rental_creation() {
+    async fn finite_free_subscription_expires_once_from_first_grant_dispatch() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-expiry", "owner-expiry@example.com");
         let renter = session("renter-expiry", "renter-expiry@example.com");
@@ -8510,21 +9237,22 @@ mod tests {
         let activated_at = Utc::now();
         activate_subscription(&store, &subscription_id, activated_at).await;
 
-        let (stored_activated_at, created_at, expires_at): (String, String, String) = store
+        let (stored_activated_at, service_started_at, expires_at): (String, String, String) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT activated_at, created_at, expires_at
+                "SELECT activated_at, service_started_at, expires_at
                  FROM share_market_subscriptions WHERE id = ?1",
                 params![subscription_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read service term");
         assert_eq!(parse_time(&stored_activated_at).unwrap(), activated_at);
-        let created_at = parse_time(&created_at).unwrap();
+        let service_started_at = parse_time(&service_started_at).unwrap();
         let expires_at = parse_time(&expires_at).unwrap();
-        assert_eq!(expires_at, created_at + Duration::days(1));
+        assert_eq!(service_started_at, activated_at);
+        assert_eq!(expires_at, service_started_at + Duration::days(1));
 
         store
             .share_market_reconcile_and_dispatch(expires_at)
@@ -8588,27 +9316,30 @@ mod tests {
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
             .expect("rent fixed paid seat");
-        let (expires_at, policy_json): (String, String) = store
+        let dispatched_at = Utc::now();
+        activate_subscription(&store, &subscription_id, dispatched_at).await;
+        let (service_started_at, expires_at, policy_json): (String, String, String) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT subscription.expires_at, operation.policy_json
+                "SELECT subscription.service_started_at, subscription.expires_at,
+                        operation.policy_json
                  FROM share_market_subscriptions subscription
                  JOIN share_control_operations operation
                    ON operation.subscription_id = subscription.id AND operation.action = 'upsert'
                  WHERE subscription.id = ?1",
                 params![subscription_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read fixed service policy");
+        assert_eq!(parse_time(&service_started_at).unwrap(), dispatched_at);
         let policy: ShareUserPolicy = serde_json::from_str(&policy_json).expect("decode policy");
         assert_eq!(
             policy.expires_at,
             Some(parse_time(&expires_at).unwrap().timestamp_millis())
         );
 
-        activate_subscription(&store, &subscription_id, Utc::now()).await;
         let expires_at = parse_time(&expires_at).unwrap();
         let contract_id: String = store
             .conn
@@ -8844,7 +9575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixed_token_period_is_anchored_to_the_rental_minute() {
+    async fn fixed_token_period_is_anchored_to_the_first_grant_dispatch_minute() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-anchor", "owner-anchor@example.com");
         let renter = session("renter-anchor", "renter-anchor@example.com");
@@ -8859,12 +9590,27 @@ mod tests {
         seat.token_period = ShareTokenPeriod::SevenDays;
         let (_, seat_id) = create_listing(&store, &owner, "share-anchor", seat).await;
 
-        let before = Utc::now().timestamp_millis();
         let subscription_id = store
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
             .expect("rent fixed-period seat");
-        let after = Utc::now().timestamp_millis();
+        let pending_policy_json: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT policy_json FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read pending fixed-period policy");
+        let pending_policy: ShareUserPolicy =
+            serde_json::from_str(&pending_policy_json).expect("decode pending policy");
+        assert!(pending_policy.token_period_anchor_at_ms.is_none());
+
+        let dispatched_at = Utc::now() + Duration::hours(3);
+        activate_subscription(&store, &subscription_id, dispatched_at).await;
         let policy_json: String = store
             .conn
             .lock()
@@ -8884,8 +9630,10 @@ mod tests {
 
         assert_eq!(policy.token_period, ShareTokenPeriod::SevenDays);
         assert_eq!(anchor % 60_000, 0);
-        assert!(anchor <= after);
-        assert!(anchor >= before - 60_000);
+        assert_eq!(
+            anchor,
+            dispatched_at.timestamp_millis().div_euclid(60_000) * 60_000
+        );
     }
 
     #[test]

@@ -1641,6 +1641,35 @@ fn ensure_trial_ledger_tx(
     .map_err(map_db("read persistent market trial balance"))
 }
 
+pub(crate) fn trial_seconds_remaining_tx(
+    tx: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    product_kind: &str,
+    service_ref: &str,
+    currency: &str,
+) -> Result<i64, AppError> {
+    let remaining = tx
+        .query_row(
+            "SELECT MAX(allowance_seconds - consumed_seconds, 0)
+             FROM market_trial_ledgers
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+               AND product_kind = ?3 AND service_ref = ?4 AND currency = ?5
+             LIMIT 1",
+            params![
+                buyer_user_id,
+                supplier_user_id,
+                product_kind,
+                service_ref,
+                currency,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_db("read market trial balance"))?;
+    Ok(remaining.unwrap_or(TRIAL_SECONDS).clamp(0, TRIAL_SECONDS))
+}
+
 fn free_usage_allowance_seconds(free_duration_days: u32) -> Result<i64, AppError> {
     i64::from(free_duration_days)
         .checked_mul(86_400)

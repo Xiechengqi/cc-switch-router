@@ -158,12 +158,14 @@ export function clientMarketMineHref(installationId?: string) {
   return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
 }
 
-export type ShareMarketWorkspaceParam = "catalog" | "selling";
+export type ShareMarketWorkspaceParam = "catalog" | "rentals" | "selling";
 
 /** Deep-link into Share Market, optionally selecting a workspace and focusing a share. */
 export function shareMarketHref(options?: { workspace?: ShareMarketWorkspaceParam; shareId?: string }) {
   const params = new URLSearchParams();
-  if (options?.workspace === "selling") params.set("view", "selling");
+  if (options?.workspace && options.workspace !== "catalog") {
+    params.set("view", options.workspace);
+  }
   if (options?.shareId) params.set("focus", options.shareId);
   return buildDashboardHref(DASHBOARD_SHARE_MARKET_PATH, params);
 }

@@ -2211,11 +2211,16 @@ export type ShareMarketSubscription = {
   ownerEmail: string;
   renterEmail?: string;
   status: string;
+  seatPosition: number;
+  parallelLimit?: number;
+  tokenLimit?: number;
+  tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
   currency?: "USD";
   serviceDurationDays?: number;
   offerRevision: number;
   activatedAt?: string;
+  serviceStartedAt?: string;
   expiresAt?: string;
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];
@@ -2255,6 +2260,7 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   canRent: boolean;
   rentPrerequisitesMet: boolean;
   sellerApprovalRequired: boolean;
+  rentBlockReason?: string;
   eligibility: MarketEligibility;
   readOnly: boolean;
   canDelete: boolean;
@@ -2335,6 +2341,28 @@ export type ShareMarketListing = {
 export type ShareMarketCatalog = {
   listings: ShareMarketListing[];
   trialHours: number;
+};
+
+export type ShareMarketRentQuote = {
+  id: string;
+  status: "active" | "consumed" | "expired";
+  expiresAt: string;
+  trialSecondsRemaining: number;
+  offer: {
+    seatId: string;
+    listingId: string;
+    shareId: string;
+    shareName: string;
+    ownerEmail: string;
+    seatPosition: number;
+    parallelLimit?: number;
+    tokenLimit?: number;
+    tokenPeriod: ShareTokenPeriod;
+    dailyRateMinor?: number;
+    currency?: "USD";
+    serviceDurationDays?: number;
+    offerRevision: number;
+  };
 };
 
 export type ShareMarketOwnedListings = {

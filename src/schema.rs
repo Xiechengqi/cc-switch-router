@@ -86,6 +86,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         22,
         include_str!("../schema/0022_client_market_subscription_subdomain.sql"),
     ),
+    (
+        23,
+        include_str!("../schema/0023_share_market_rent_contract.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -613,7 +617,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 116);
+        assert_eq!(table_count, 117);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -659,7 +663,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 22);
+        assert_eq!(versions.len(), 23);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -682,6 +686,7 @@ mod tests {
         assert_eq!(versions[19], (20, migration_checksum(MIGRATIONS[18].1)));
         assert_eq!(versions[20], (21, migration_checksum(MIGRATIONS[19].1)));
         assert_eq!(versions[21], (22, migration_checksum(MIGRATIONS[20].1)));
+        assert_eq!(versions[22], (23, migration_checksum(MIGRATIONS[21].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration

@@ -1414,7 +1414,10 @@ async fn list_host_usage_history(
     AxumPath(host_id): AxumPath<String>,
 ) -> Result<Json<Vec<HostUsageHistoryEntry>>, AppError> {
     Ok(Json(
-        state.store.client_market_host_usage_history(&host_id).await?,
+        state
+            .store
+            .client_market_host_usage_history(&host_id)
+            .await?,
     ))
 }
 

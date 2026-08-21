@@ -109,7 +109,7 @@ export function SegmentedControl<T extends string>({
             disabled={disabled}
             onClick={() => onChange(item.id)}
             className={cn(
-              "rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              "whitespace-nowrap rounded-md transition-colors active:bg-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50",
               size === "md"
                 ? "inline-flex h-9 items-center justify-center px-3 text-sm font-medium"
                 : "px-2.5 py-1.5 text-[11px]",

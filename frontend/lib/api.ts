@@ -76,6 +76,7 @@ import type {
   ShareMarketSubscriptions,
   ShareMarketOwnedShare,
   ShareMarketSeatInput,
+  ShareMarketRentQuote,
   AdminMarketBillingDispute,
   MarketBillingDashboard,
   MarketBillingConfig,
@@ -1529,12 +1530,24 @@ export async function deleteShareMarketListing(listingId: string) {
   );
 }
 
-export async function rentShareMarketSeat(seatId: string, offerRevision: number) {
-  return parseJson<{ ok: true; subscriptionId: string }>(
+export async function quoteShareMarketSeat(seatId: string) {
+  return parseJson<ShareMarketRentQuote>(
+    await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/quote`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function rentShareMarketSeat(
+  seatId: string,
+  quoteId: string,
+  idempotencyKey: string,
+) {
+  return parseJson<{ ok: true; subscriptionId: string; replayed: boolean }>(
     await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/rent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ offerRevision }),
+      body: JSON.stringify({ quoteId, idempotencyKey }),
     }),
   );
 }

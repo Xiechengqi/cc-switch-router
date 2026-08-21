@@ -9,6 +9,7 @@
     "flags:raster": "python3 scripts/raster-flags.py",
     "typecheck": "tsc --noEmit",
     "test:operational-status": "tsx --test components/dashboard/operational-status.test.ts",
+    "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts",
     "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check",
     "audit:settings-contract": "node ../scripts/audit/audit-settings-contract.mjs --check",
     "audit:market-billing-contract": "node ../scripts/audit/audit-market-billing-contract.mjs --check"
