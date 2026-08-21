@@ -166,6 +166,21 @@ body {
   opacity: 0;
 }
 
+.country-flag-native {
+  width: auto;
+  height: 1em;
+  line-height: 1;
+}
+
+.country-flag-glyph {
+  display: block;
+  font-family: "Apple Color Emoji", sans-serif;
+  font-style: normal;
+  font-weight: 400;
+  font-size: 1em;
+  line-height: 1;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
