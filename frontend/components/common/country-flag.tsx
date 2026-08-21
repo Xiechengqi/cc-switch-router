@@ -58,8 +58,8 @@ export function CountryFlag({
       <img
         src={`/flags/${slug}.png`}
         srcSet={`/flags/${slug}.png 1x, /flags/${slug}@2x.png 2x`}
-        width={20}
-        height={20}
+        width={16}
+        height={16}
         alt=""
         draggable={false}
         decoding="async"

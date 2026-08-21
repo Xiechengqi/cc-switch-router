@@ -31,7 +31,7 @@ type TickerUsageMeta = {
 
 const REQUEST_TICKER_LIMIT = 100;
 const REQUEST_TICKER_VISIBLE_ROWS = 5;
-const REQUEST_TICKER_ROW_HEIGHT_PX = 24;
+const REQUEST_TICKER_ROW_HEIGHT_PX = 22;
 const REQUEST_TICKER_ROW_GAP_PX = 4;
 const REQUEST_TICKER_PANEL_PAD_PX = 8;
 const REQUEST_TICKER_MAX_HEIGHT_PX =
@@ -475,9 +475,9 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                   key={eventKey}
                   className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === visibleEvents.length - 1 && event.requestId === newestRequestId ? "activity-feed-enter" : ""}`}
                 >
-                  <span className="inline-flex h-5 shrink-0 select-text items-center font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt, locale)}</span>
-                  <span className={`inline-flex h-5 shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
-                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] leading-5 text-slate-700"><strong className="font-semibold">{subdomain}</strong>{countryCode ? <> · <CountryFlag code={countryCode} title={countryCode} /></> : null} · {tickerDetail(mergedItem)}</span>
+                  <span className="inline-flex h-4 shrink-0 select-text items-center font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt, locale)}</span>
+                  <span className={`inline-flex h-4 shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
+                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] leading-4 text-slate-700"><strong className="font-semibold">{subdomain}</strong>{countryCode ? <> · <CountryFlag code={countryCode} title={countryCode} className="text-[14px]" /></> : null} · {tickerDetail(mergedItem)}</span>
                 </div>
               );
             })}
