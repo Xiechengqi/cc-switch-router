@@ -1157,14 +1157,14 @@ enum TunnelRouteProbe {
 
 #[cfg(test)]
 fn active_route_is_healthy(probe: TunnelRouteProbe) -> bool {
-    !matches!(probe, TunnelRouteProbe::Unhealthy)
+    matches!(probe, TunnelRouteProbe::Healthy)
 }
 
 fn route_probe_observation(probe: TunnelRouteProbe) -> (RouteHealthStatus, &'static str) {
     match probe {
         TunnelRouteProbe::Healthy => (RouteHealthStatus::Healthy, "probe_succeeded"),
         TunnelRouteProbe::Unhealthy => (RouteHealthStatus::Unhealthy, "probe_failed"),
-        TunnelRouteProbe::Unavailable => (RouteHealthStatus::Healthy, "active_route_unprobeable"),
+        TunnelRouteProbe::Unavailable => (RouteHealthStatus::Unknown, "active_route_unprobeable"),
     }
 }
 
@@ -1487,9 +1487,9 @@ mod tests {
     }
 
     #[test]
-    fn active_route_is_available_when_legacy_control_secret_is_missing() {
+    fn active_route_without_probe_credentials_is_unknown() {
         assert!(active_route_is_healthy(TunnelRouteProbe::Healthy));
-        assert!(active_route_is_healthy(TunnelRouteProbe::Unavailable));
+        assert!(!active_route_is_healthy(TunnelRouteProbe::Unavailable));
         assert!(!active_route_is_healthy(TunnelRouteProbe::Unhealthy));
     }
 }

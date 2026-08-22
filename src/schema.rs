@@ -90,6 +90,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         23,
         include_str!("../schema/0023_share_market_rent_contract.sql"),
     ),
+    (
+        24,
+        include_str!("../schema/0024_share_market_contract_integrity.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -663,7 +667,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 23);
+        assert_eq!(versions.len(), 24);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -687,6 +691,7 @@ mod tests {
         assert_eq!(versions[20], (21, migration_checksum(MIGRATIONS[19].1)));
         assert_eq!(versions[21], (22, migration_checksum(MIGRATIONS[20].1)));
         assert_eq!(versions[22], (23, migration_checksum(MIGRATIONS[21].1)));
+        assert_eq!(versions[23], (24, migration_checksum(MIGRATIONS[22].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1015,11 +1020,21 @@ mod tests {
     }
 
     fn install_schema_through(conn: &Connection, version: i64) {
-        assert!((1..=19).contains(&version));
+        assert!((1..=23).contains(&version));
         install_baseline(conn, &migration_checksum(BASELINE_SQL)).expect("install baseline");
         for (migration_version, sql) in MIGRATIONS.iter().copied().take((version - 1) as usize) {
+            if migration_version == LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION {
+                validate_legacy_token_market_archive(conn)
+                    .expect("validate legacy Token Market archive");
+            }
             conn.execute_batch(sql)
                 .unwrap_or_else(|error| panic!("apply migration {migration_version}: {error}"));
+            if migration_version == LEGACY_TOKEN_MARKET_RETIREMENT_VERSION {
+                populate_legacy_token_market_archive_checksums(conn)
+                    .expect("finalize legacy Token Market archive");
+                ensure_legacy_token_market_archive_is_read_only(conn)
+                    .expect("lock legacy Token Market archive");
+            }
             conn.execute(
                 "INSERT INTO schema_migrations (version, checksum, applied_at)
                  VALUES (?1, ?2, 'test')",
@@ -1027,6 +1042,125 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("record migration {migration_version}: {error}"));
         }
+    }
+
+    #[test]
+    fn migration_24_preserves_dispatched_terms_and_expires_legacy_quotes() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 23);
+        conn.execute_batch(
+            "INSERT INTO shares
+                (share_id, capacity_pool_id, installation_id, share_name, owner_email,
+                 for_sale, app_type, token_limit, parallel_limit, tokens_used,
+                 requests_count, share_status, created_at, expires_at, updated_at)
+             VALUES ('share-v23', 'pool-v23', 'installation-v23', 'Share v23',
+                     'owner@example.com', 'Free', 'codex', -1, -1, 0, 0, 'active',
+                     '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO share_market_listings
+                (id, share_id, installation_id, owner_user_id, owner_email, status,
+                 created_at, updated_at)
+             VALUES ('listing-v23', 'share-v23', 'installation-v23', 'owner-v23',
+                     'owner@example.com', 'active', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO share_market_seats
+                (id, listing_id, position, status, token_period_json,
+                 service_duration_days, offer_revision, current_subscription_id,
+                 created_at, updated_at)
+             VALUES
+                ('seat-v23-pending', 'listing-v23', 1, 'reserved', '\"day\"', 7, 1,
+                 'subscription-v23-pending', '2026-01-01T00:00:00Z',
+                 '2026-01-01T00:00:00Z'),
+                ('seat-v23-active', 'listing-v23', 2, 'occupied', '\"day\"', 7, 1,
+                 'subscription-v23-active', '2026-01-01T00:00:00Z',
+                 '2026-01-01T00:00:00Z');
+             INSERT INTO share_market_subscriptions
+                (id, seat_id, listing_id, share_id, installation_id, entitlement_id,
+                 owner_user_id, owner_email, renter_user_id, renter_email, status,
+                 token_period_json, service_duration_days, offer_revision,
+                 activated_at, expires_at, created_at, updated_at, service_started_at)
+             VALUES
+                ('subscription-v23-pending', 'seat-v23-pending', 'listing-v23', 'share-v23',
+                 'installation-v23', 'entitlement-v23-pending', 'owner-v23',
+                 'owner@example.com', 'renter-v23-pending', 'pending@example.com',
+                 'grant_pending', '\"day\"', 7, 1, NULL, NULL,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL),
+                ('subscription-v23-active', 'seat-v23-active', 'listing-v23', 'share-v23',
+                 'installation-v23', 'entitlement-v23-active', 'owner-v23',
+                 'owner@example.com', 'renter-v23-active', 'active@example.com',
+                 'active_postpaid', '\"day\"', 7, 1, '2026-01-02T00:00:00Z',
+                 '2026-01-09T00:00:00Z', '2026-01-01T00:00:00Z',
+                 '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z');
+             INSERT INTO share_market_rent_quotes
+                (id, seat_id, listing_id, share_id, renter_user_id, renter_email,
+                 offer_revision, snapshot_json, trial_seconds_remaining, status,
+                 expires_at, created_at, updated_at)
+             VALUES ('quote-v23', 'seat-v23-pending', 'listing-v23', 'share-v23',
+                     'renter-v23-pending', 'pending@example.com', 1, '{}', 0, 'active',
+                     '2026-01-01T00:02:00Z', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO market_service_contracts
+                (id, account_id, product_kind, product_ref, service_ref, service_label,
+                 buyer_user_id, buyer_email, supplier_user_id, supplier_email, currency,
+                 daily_rate_minor, offer_revision, status, trial_seconds_remaining,
+                 last_evaluated_at, activated_at, created_at, updated_at)
+             VALUES ('contract-v23', 'account-v23', 'share', 'subscription-v23-active',
+                     'share-v23', 'Share v23', 'renter-v23-active', 'active@example.com',
+                     'owner-v23', 'owner@example.com', 'USD', 1200, 1, 'active', 0,
+                     '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z',
+                     '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');",
+        )
+        .expect("seed version 23 Share Market contracts");
+
+        apply(&conn).expect("upgrade version 23 Share Market contracts");
+
+        let quote: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, required_app FROM share_market_rent_quotes WHERE id = 'quote-v23'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated quote");
+        assert_eq!(quote, ("expired".into(), None));
+        let subscriptions = conn
+            .prepare(
+                "SELECT id, required_app, json_extract(service_snapshot_json, '$.schemaVersion'),
+                        service_started_at
+                 FROM share_market_subscriptions ORDER BY id",
+            )
+            .expect("prepare migrated subscriptions")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .expect("query migrated subscriptions")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migrated subscriptions");
+        assert_eq!(
+            subscriptions,
+            vec![
+                (
+                    "subscription-v23-active".into(),
+                    "codex".into(),
+                    0,
+                    Some("2026-01-02T00:00:00Z".into()),
+                ),
+                ("subscription-v23-pending".into(), "codex".into(), 0, None,),
+            ]
+        );
+        let contract_service_started_at: String = conn
+            .query_row(
+                "SELECT service_started_at FROM market_service_contracts
+                 WHERE id = 'contract-v23'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated billing service start");
+        assert_eq!(contract_service_started_at, "2026-01-02T00:00:00Z");
     }
 
     #[test]

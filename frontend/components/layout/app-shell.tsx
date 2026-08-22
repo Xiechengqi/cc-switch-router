@@ -316,16 +316,13 @@ function Topbar({ active }: { active: DashboardShellActive }) {
             <LanguageSwitcher />
             {showAuthedChrome ? (
               <Dropdown>
-                <Dropdown.Trigger className="shrink-0 outline-none">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-9 max-w-[12rem] gap-1.5 px-2.5 text-sm font-medium text-slate-500 hover:text-slate-700 whitespace-nowrap [&_svg]:my-0"
-                    isDisabled={loading && !authed}
-                  >
-                    <UserRound className="h-4 w-4 shrink-0 text-slate-500" />
-                    <span className="hidden min-w-0 truncate sm:inline">{displayEmail}</span>
-                  </Button>
+                <Dropdown.Trigger
+                  aria-label={displayEmail || t("nav.userMenu")}
+                  isDisabled={loading && !authed}
+                  className="inline-flex h-9 max-w-[12rem] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-sm font-medium text-slate-500 outline-none hover:bg-slate-100 hover:text-slate-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                >
+                  <UserRound className="h-4 w-4 shrink-0 text-slate-500" />
+                  <span className="hidden min-w-0 truncate sm:inline">{displayEmail}</span>
                 </Dropdown.Trigger>
                 <Dropdown.Popover placement="bottom right">
                   <Dropdown.Menu aria-label={t("nav.userMenu")}>

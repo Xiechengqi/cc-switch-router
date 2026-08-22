@@ -895,6 +895,8 @@ pub struct ShareManagedGrantOperation {
     pub email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<ShareUserPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1197,6 +1199,10 @@ pub struct ShareEditAckPayload {
     pub current_config_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_share: Option<ShareDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_policy: Option<ShareUserPolicy>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1454,19 +1454,19 @@ export async function checkClientTunnelSubdomainAvailability(subdomain: string, 
 
 export async function getShareMarketCatalog(signal?: AbortSignal) {
   return parseJson<ShareMarketCatalog>(
-    await authFetch("/v1/share-market/listings", { cache: "no-store", signal }),
+    await authFetch("/v1/share-market/listings", { cache: "no-cache", signal }),
   );
 }
 
 export async function getShareMarketOwnedListings(signal?: AbortSignal) {
   return parseJson<ShareMarketOwnedListings>(
-    await authFetch("/v1/share-market/me/listings", { cache: "no-store", signal }),
+    await authFetch("/v1/share-market/me/listings", { cache: "no-cache", signal }),
   );
 }
 
 export async function getShareMarketSubscriptions(signal?: AbortSignal) {
   return parseJson<ShareMarketSubscriptions>(
-    await authFetch("/v1/share-market/me/subscriptions", { cache: "no-store", signal }),
+    await authFetch("/v1/share-market/me/subscriptions", { cache: "no-cache", signal }),
   );
 }
 
@@ -1530,10 +1530,12 @@ export async function deleteShareMarketListing(listingId: string) {
   );
 }
 
-export async function quoteShareMarketSeat(seatId: string) {
+export async function quoteShareMarketSeat(seatId: string, requiredApp?: string) {
   return parseJson<ShareMarketRentQuote>(
     await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/quote`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requiredApp }),
     }),
   );
 }

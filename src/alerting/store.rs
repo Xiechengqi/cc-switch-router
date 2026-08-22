@@ -96,6 +96,9 @@ impl AlertStore {
     }
 
     fn open(&self) -> Result<Connection, AppError> {
+        crate::db::initialize_sqlite_runtime().map_err(|error| {
+            AppError::Internal(format!("initialize alert database runtime failed: {error}"))
+        })?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 AppError::Internal(format!("create alert database directory failed: {error}"))
@@ -1875,9 +1878,13 @@ mod tests {
     use super::*;
     use crate::alerting::models::AlertChannelPolicy;
 
+    fn test_connection() -> Connection {
+        crate::db::initialize_sqlite_runtime().expect("initialize SQLite test runtime");
+        Connection::open_in_memory().expect("open alert test database")
+    }
+
     fn test_store(label: &str) -> AlertStore {
-        // libsql must select SQLite's serialized mode before libsql-rusqlite opens a connection.
-        drop(crate::db::Connection::open_in_memory().expect("initialize libsql test runtime"));
+        crate::db::initialize_sqlite_runtime().expect("initialize SQLite test runtime");
         AlertStore::new(std::env::temp_dir().join(format!(
             "cc-switch-router-alert-{label}-{}.db",
             Uuid::new_v4()
@@ -1886,7 +1893,7 @@ mod tests {
 
     #[test]
     fn init_alert_db_adds_diagnostic_columns_to_an_existing_database() {
-        let conn = Connection::open_in_memory().expect("open alert test database");
+        let conn = test_connection();
         conn.execute_batch(
             "CREATE TABLE alert_delivery_attempts (
                 id TEXT PRIMARY KEY,

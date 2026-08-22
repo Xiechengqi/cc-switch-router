@@ -47,6 +47,7 @@ const ACCOUNT_CLOSED: &str = "closed";
 const CONTRACT_TRIAL: &str = "trial";
 const CONTRACT_ACTIVE: &str = "active";
 const CONTRACT_BILLING_SUSPENDED: &str = "billing_suspended";
+const CONTRACT_PENDING_ACTIVATION: &str = "pending_activation";
 
 const INVOICE_OPEN: &str = "open";
 const INVOICE_PAYMENT_DECLARED: &str = "payment_declared";
@@ -1493,6 +1494,25 @@ pub(crate) fn activate_contract_tx(
     input: ActivateContractInput<'_>,
     now: &str,
 ) -> Result<String, AppError> {
+    create_contract_tx(tx, input, None, false, now)
+}
+
+pub(crate) fn reserve_contract_tx(
+    tx: &Transaction<'_>,
+    input: ActivateContractInput<'_>,
+    quoted_trial_seconds: i64,
+    now: &str,
+) -> Result<String, AppError> {
+    create_contract_tx(tx, input, Some(quoted_trial_seconds.max(0)), true, now)
+}
+
+fn create_contract_tx(
+    tx: &Transaction<'_>,
+    input: ActivateContractInput<'_>,
+    quoted_trial_seconds: Option<i64>,
+    pending_activation: bool,
+    now: &str,
+) -> Result<String, AppError> {
     if input.buyer_user_id == input.supplier_user_id {
         return Err(AppError::BadRequest(
             "market billing does not apply when buyer and supplier are the same account".into(),
@@ -1542,10 +1562,18 @@ pub(crate) fn activate_contract_tx(
             .unwrap_or(0);
         trial_seconds = trial_seconds.min(replacement_remaining);
     }
-    let status = if trial_seconds > 0 {
+    if let Some(quoted_trial_seconds) = quoted_trial_seconds {
+        trial_seconds = trial_seconds.min(quoted_trial_seconds);
+    }
+    let active_status = if trial_seconds > 0 {
         CONTRACT_TRIAL
     } else {
         CONTRACT_ACTIVE
+    };
+    let status = if pending_activation {
+        CONTRACT_PENDING_ACTIVATION
+    } else {
+        active_status
     };
     let id = Uuid::new_v4().to_string();
     tx.execute(
@@ -1554,10 +1582,11 @@ pub(crate) fn activate_contract_tx(
             buyer_user_id, buyer_email, supplier_user_id, supplier_email, currency,
             daily_rate_minor, offer_revision, status, trial_seconds_remaining,
             health_state, desired_control_state, applied_control_state,
-            last_evaluated_at, activated_at, replacement_of, created_at, updated_at
+            last_evaluated_at, activated_at, service_started_at, replacement_of,
+            created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                    ?12, ?13, ?14, ?15, 'unknown', 'active', 'active',
-                   ?16, ?16, ?17, ?16, ?16)",
+                   ?16, ?16, ?17, ?18, ?16, ?16)",
         params![
             id,
             account_id,
@@ -1575,17 +1604,23 @@ pub(crate) fn activate_contract_tx(
             status,
             trial_seconds,
             now,
+            (!pending_activation).then_some(now),
             normalized.replacement_of,
         ],
     )
-    .map_err(map_db("activate market billing contract"))?;
+    .map_err(map_db("create market billing contract"))?;
+    let event_type = if pending_activation {
+        "service_contract_reserved"
+    } else {
+        "service_contract_activated"
+    };
     record_event_tx(
         tx,
         Some(&account_id),
         Some(&id),
         None,
         Some(normalized.buyer_user_id),
-        "service_contract_activated",
+        event_type,
         serde_json::json!({
             "productKind": normalized.product_kind,
             "productRef": normalized.product_ref,
@@ -1593,10 +1628,101 @@ pub(crate) fn activate_contract_tx(
             "currency": currency,
             "trialSeconds": trial_seconds,
         }),
-        &format!("contract-activated:{id}"),
+        &format!("contract-{event_type}:{id}"),
         now,
     )?;
     Ok(id)
+}
+
+pub(crate) fn activate_reserved_contract_tx(
+    tx: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    service_started_at: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    let contract = tx
+        .query_row(
+            "SELECT contract.id, contract.account_id, contract.status,
+                    contract.trial_seconds_remaining, account.status
+             FROM market_service_contracts contract
+             JOIN market_credit_accounts account ON account.id = contract.account_id
+             WHERE contract.product_kind = ?1 AND contract.product_ref = ?2
+               AND contract.status != 'terminated'",
+            params![product_kind, product_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read reserved market billing contract"))?;
+    let Some((contract_id, account_id, status, trial_seconds_remaining, account_status)) = contract
+    else {
+        return Err(AppError::Internal(
+            "reserved market billing contract is missing".into(),
+        ));
+    };
+    if matches!(status.as_str(), CONTRACT_TRIAL | CONTRACT_ACTIVE) {
+        return Ok(true);
+    }
+    if status != CONTRACT_PENDING_ACTIVATION {
+        return Err(AppError::Conflict(format!(
+            "market billing contract cannot activate from status {status}"
+        )));
+    }
+    if !matches!(
+        account_status.as_str(),
+        ACCOUNT_ACTIVE | ACCOUNT_NEAR_CREDIT_LIMIT
+    ) {
+        terminate_contract_tx(
+            tx,
+            product_kind,
+            product_ref,
+            "billing_account_unavailable_before_activation",
+            now,
+        )?;
+        return Ok(false);
+    }
+    let active_status = if trial_seconds_remaining > 0 {
+        CONTRACT_TRIAL
+    } else {
+        CONTRACT_ACTIVE
+    };
+    let changed = tx
+        .execute(
+            "UPDATE market_service_contracts
+             SET status = ?2, health_state = 'unknown',
+                 last_evaluated_at = ?3, activated_at = ?3,
+                 service_started_at = ?3, updated_at = ?4
+             WHERE id = ?1 AND status = 'pending_activation'",
+            params![contract_id, active_status, service_started_at, now],
+        )
+        .map_err(map_db("activate reserved market billing contract"))?;
+    if changed == 1 {
+        record_event_tx(
+            tx,
+            Some(&account_id),
+            Some(&contract_id),
+            None,
+            None,
+            "service_contract_activated",
+            serde_json::json!({
+                "productKind": product_kind,
+                "productRef": product_ref,
+                "serviceStartedAt": service_started_at,
+                "trialSeconds": trial_seconds_remaining,
+            }),
+            &format!("contract-activated:{contract_id}"),
+            now,
+        )?;
+    }
+    Ok(true)
 }
 
 fn ensure_trial_ledger_tx(
@@ -3045,7 +3171,9 @@ impl AppStore {
                              THEN 'billing_suspended' ELSE status END,
                          desired_control_state = 'terminated',
                          control_error = 'supplier_credit_closed',
-                         suspended_at = COALESCE(suspended_at, ?2), updated_at = ?2
+                         suspended_at = CASE WHEN status IN ('trial', 'active')
+                             THEN COALESCE(suspended_at, ?2) ELSE suspended_at END,
+                         updated_at = ?2
                      WHERE account_id = ?1 AND status != 'terminated'",
                     params![account.id, now_text],
                 )
@@ -3090,10 +3218,15 @@ impl AppStore {
             .map_err(map_db("close empty market credit account"))?;
             tx.execute(
                 "UPDATE market_service_contracts
-                 SET status = 'billing_suspended', desired_control_state = 'terminated',
+                 SET status = CASE WHEN status IN ('trial', 'active')
+                         THEN 'billing_suspended' ELSE status END,
+                     desired_control_state = 'terminated',
                      control_error = 'supplier_credit_closed',
-                     suspended_at = COALESCE(suspended_at, ?2), updated_at = ?2
-                 WHERE account_id = ?1 AND status IN ('trial', 'active')",
+                     suspended_at = CASE WHEN status IN ('trial', 'active')
+                         THEN COALESCE(suspended_at, ?2) ELSE suspended_at END,
+                     updated_at = ?2
+                 WHERE account_id = ?1
+                   AND status IN ('trial', 'active', 'pending_activation')",
                 params![account.id, now_text],
             )
             .map_err(map_db("suspend contracts for empty account closure"))?;
@@ -3134,7 +3267,8 @@ impl AppStore {
                     "UPDATE market_service_contracts
                      SET desired_control_state = 'terminated',
                          control_error = 'supplier_credit_closed', updated_at = ?2
-                     WHERE account_id = ?1 AND status = 'billing_suspended'",
+                     WHERE account_id = ?1
+                       AND status IN ('billing_suspended', 'pending_activation')",
                     params![account.id, now_text],
                 )
                 .map_err(map_db("terminate contracts for market account closure"))?;
@@ -4783,9 +4917,17 @@ fn open_invoice_tx(
     .map_err(map_db("freeze market credit account"))?;
     tx.execute(
         "UPDATE market_service_contracts
-         SET status = 'billing_suspended', desired_control_state = 'suspended',
-             suspended_at = COALESCE(suspended_at, ?2), updated_at = ?2
-         WHERE account_id = ?1 AND status IN ('trial', 'active')",
+         SET status = CASE WHEN status IN ('trial', 'active')
+                 THEN 'billing_suspended' ELSE status END,
+             desired_control_state = CASE WHEN status = 'pending_activation'
+                 THEN 'terminated' ELSE 'suspended' END,
+             control_error = CASE WHEN status = 'pending_activation'
+                 THEN 'billing_account_unavailable_before_activation' ELSE control_error END,
+             suspended_at = CASE WHEN status IN ('trial', 'active')
+                 THEN COALESCE(suspended_at, ?2) ELSE suspended_at END,
+             updated_at = ?2
+         WHERE account_id = ?1
+           AND status IN ('trial', 'active', 'pending_activation')",
         params![account.id, opened_at],
     )
     .map_err(map_db("suspend market contracts for settlement"))?;
@@ -5243,7 +5385,9 @@ impl AppStore {
                      THEN 'billing_suspended' ELSE status END,
                  desired_control_state = 'terminated',
                  control_error = 'supplier_credit_revoked',
-                 suspended_at = COALESCE(suspended_at, ?1), updated_at = ?1
+                 suspended_at = CASE WHEN status IN ('trial', 'active')
+                     THEN COALESCE(suspended_at, ?1) ELSE suspended_at END,
+                 updated_at = ?1
              WHERE account_id IN (
                  SELECT id FROM market_credit_accounts WHERE credit_kind = 'none'
              ) AND status != 'terminated'",
@@ -5445,6 +5589,44 @@ mod tests {
             )
             .await
             .expect("activate Client billing contract")
+    }
+
+    async fn add_reserved_client_contract(
+        store: &AppStore,
+        buyer: &AuthSession,
+        supplier: &AuthSession,
+        installation_id: &str,
+        daily_rate_minor: i64,
+        now: DateTime<Utc>,
+    ) -> String {
+        let now = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin reserved Client billing contract");
+        let contract_id = reserve_contract_tx(
+            &tx,
+            ActivateContractInput {
+                product_kind: "client_host",
+                product_ref: installation_id,
+                service_ref: installation_id,
+                service_label: installation_id,
+                buyer_user_id: &buyer.user_id,
+                buyer_email: &buyer.email,
+                supplier_user_id: &supplier.user_id,
+                supplier_email: &supplier.email,
+                currency: "USD",
+                daily_rate_minor,
+                offer_revision: 1,
+                replacement_of: None,
+            },
+            TRIAL_SECONDS,
+            &now,
+        )
+        .expect("reserve Client billing contract");
+        tx.commit()
+            .expect("commit reserved Client billing contract");
+        contract_id
     }
 
     async fn record_client_health(
@@ -7087,6 +7269,135 @@ mod tests {
             Some(crate::market_access::ERROR_MARKET_RELATIONSHIP_CLOSED)
         );
         assert!(error.to_string().contains("permanently closed"));
+    }
+
+    #[tokio::test]
+    async fn supplier_closure_terminates_unactivated_paid_reservation() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-reserved-close", "buyer-reserved-close@example.com");
+        let supplier = session(
+            "supplier-reserved-close",
+            "supplier-reserved-close@example.com",
+        );
+        configure_supplier(&store, &supplier, 10_000).await;
+        let contract_id = add_reserved_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-reserved-close",
+            500,
+            Utc::now(),
+        )
+        .await;
+        let account_id = store
+            .market_billing_dashboard(&supplier)
+            .await
+            .expect("load reserved supplier credit account")
+            .accounts[0]
+            .id
+            .clone();
+
+        let actions = store
+            .market_billing_open_account_invoice(&supplier.user_id, &account_id, true, false)
+            .await
+            .expect("close account with an unactivated reservation");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].contract_id, contract_id);
+        assert_eq!(actions[0].kind, BillingActionKind::Terminate);
+
+        let conn = store.conn.lock().await;
+        let state: (String, String, Option<String>, String) = conn
+            .query_row(
+                "SELECT contract.status, contract.desired_control_state,
+                        contract.control_error, account.status
+                 FROM market_service_contracts contract
+                 JOIN market_credit_accounts account ON account.id = contract.account_id
+                 WHERE contract.id = ?1",
+                params![contract_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read closed reserved contract");
+        assert_eq!(state.0, CONTRACT_PENDING_ACTIVATION);
+        assert_eq!(state.1, "terminated");
+        assert_eq!(state.2.as_deref(), Some("supplier_credit_closed"));
+        assert_eq!(state.3, ACCOUNT_CLOSED);
+    }
+
+    #[tokio::test]
+    async fn settlement_terminates_pending_reservations_instead_of_resuming_them() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session(
+            "buyer-pending-settlement",
+            "buyer-pending-settlement@example.com",
+        );
+        let supplier = session(
+            "supplier-pending-settlement",
+            "supplier-pending-settlement@example.com",
+        );
+        configure_supplier(&store, &supplier, 100_000_000).await;
+        let started_at = Utc::now();
+        let active_contract_id = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-active-settlement",
+            86_400,
+            started_at,
+        )
+        .await;
+        force_contract_out_of_trial(&store, &active_contract_id, started_at).await;
+        let observed_at = started_at + Duration::seconds(1);
+        record_client_health(&store, "client-active-settlement", observed_at, "healthy").await;
+        assert!(
+            store
+                .market_billing_reconcile(observed_at)
+                .await
+                .expect("accrue active service before settlement")
+                .is_empty()
+        );
+        let pending_contract_id = add_reserved_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-pending-settlement",
+            500,
+            observed_at + Duration::seconds(1),
+        )
+        .await;
+        let account_id = store
+            .market_billing_dashboard(&buyer)
+            .await
+            .expect("load account before voluntary settlement")
+            .accounts[0]
+            .id
+            .clone();
+
+        let actions = store
+            .market_billing_open_account_invoice(&buyer.user_id, &account_id, false, false)
+            .await
+            .expect("open settlement with a pending reservation");
+        assert!(actions.iter().any(|action| {
+            action.contract_id == active_contract_id && action.kind == BillingActionKind::Suspend
+        }));
+        assert!(actions.iter().any(|action| {
+            action.contract_id == pending_contract_id && action.kind == BillingActionKind::Terminate
+        }));
+
+        let conn = store.conn.lock().await;
+        let pending_state: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT status, desired_control_state, control_error
+                 FROM market_service_contracts WHERE id = ?1",
+                params![pending_contract_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read pending reservation after settlement");
+        assert_eq!(pending_state.0, CONTRACT_PENDING_ACTIVATION);
+        assert_eq!(pending_state.1, "terminated");
+        assert_eq!(
+            pending_state.2.as_deref(),
+            Some("billing_account_unavailable_before_activation")
+        );
     }
 
     #[tokio::test]

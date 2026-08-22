@@ -47,6 +47,7 @@ import {
 import { recordDashboardUxEvent } from "@/lib/api";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
+import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 
 function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
   const appType = (request.appType || "").trim().toLowerCase();
@@ -170,6 +171,19 @@ export const ShareCard = React.memo(function ShareCard({
   const healthTone = app
     ? modelHealthTone(share, app)
     : { className: "bg-slate-50 text-muted-foreground", label: "" };
+  const providerPanelView = {
+    primaryLine: isApiProvider ? apiEndpoint : quotaStatusLine,
+    identityLine: isApiProvider ? "-" : accountLine,
+    modelsLine: actualModels,
+    primaryTitle: isApiProvider
+      ? `${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`
+      : quotaStatusLine,
+    identityTitle: isApiProvider ? "-" : accountLine,
+    modelsTitle: actualModels,
+    panelTitle: app ? modelHealthTitle(share, app) : undefined,
+    primaryMonospace: isApiProvider,
+    toneClassName: healthTone.className,
+  };
   const summary = shareOperationalSummary(share);
   const issue = summary.primaryReason
     ? operationalReasonLabel(summary.primaryReason, t)
@@ -354,46 +368,7 @@ export const ShareCard = React.memo(function ShareCard({
           ) : null}
         </div>
 
-        <div
-          className={`grid min-w-0 gap-1 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`}
-          title={app ? modelHealthTitle(share, app) : undefined}
-        >
-          {isApiProvider ? (
-            <>
-              <span
-                className="min-w-0 truncate font-mono text-[10px] font-semibold leading-4"
-                title={`${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`}
-              >
-                {apiEndpoint}
-              </span>
-              <span className="min-w-0 truncate opacity-80">-</span>
-              <span
-                className="min-w-0 truncate opacity-80"
-                title={actualModels}
-              >
-                {actualModels}
-              </span>
-            </>
-          ) : (
-            <>
-              <span
-                className="min-w-0 truncate font-semibold leading-4"
-                title={quotaStatusLine}
-              >
-                {quotaStatusLine}
-              </span>
-              <span className="min-w-0 truncate opacity-80" title={accountLine}>
-                {accountLine}
-              </span>
-              <span
-                className="min-w-0 truncate opacity-80"
-                title={actualModels}
-              >
-                {actualModels}
-              </span>
-            </>
-          )}
-        </div>
+        <ShareProviderStatusPanel view={providerPanelView} />
 
         <div className="grid gap-2 text-[11px]">
           <div className="grid grid-cols-2 gap-2">

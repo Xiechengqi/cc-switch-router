@@ -37,6 +37,9 @@ impl MetricsStore {
 
     /// Opens a connection, running the schema bootstrap only on the first call.
     fn open(&self) -> Result<Connection, AppError> {
+        crate::db::initialize_sqlite_runtime().map_err(|err| {
+            AppError::Internal(format!("initialize metrics database runtime failed: {err}"))
+        })?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 AppError::Internal(format!("create metrics db dir failed: {err}"))
@@ -1827,9 +1830,14 @@ mod tests {
         ClientMetricsSnapshot, DiskUsage, NetworkMetricsStatus, ProcessMetricsStatus,
     };
 
+    fn test_connection() -> Connection {
+        crate::db::initialize_sqlite_runtime().expect("initialize SQLite test runtime");
+        Connection::open_in_memory().expect("open in-memory metrics db")
+    }
+
     #[test]
     fn host_series_reads_avg_rss_as_real() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
 
         insert_host_metrics(&conn, &host_sample(900, 100)).expect("insert first host sample");
@@ -1844,7 +1852,7 @@ mod tests {
 
     #[test]
     fn client_series_uses_latest_sample_in_each_bucket() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
         insert_client_metrics(
             &conn,
@@ -1885,7 +1893,7 @@ mod tests {
 
     #[test]
     fn legacy_market_email_metrics_identity_is_physically_removed() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
 
         let columns = conn
@@ -1922,7 +1930,7 @@ mod tests {
 
     #[test]
     fn router_metrics_persist_all_ssh_forwarding_counters() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
         let router = RouterMetricsStatus {
             ssh_pending_channel_opens: 11,
@@ -1966,7 +1974,7 @@ mod tests {
 
     #[test]
     fn metrics_sample_transaction_rolls_back_partial_history() {
-        let mut conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let mut conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
         conn.execute("DROP TABLE router_metrics", [])
             .expect("remove router metrics table");
@@ -1990,7 +1998,7 @@ mod tests {
 
     #[test]
     fn concurrency_classification_survives_metric_enrichment_in_any_order() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
 
         for (request_id, first_kind, second_kind) in [
@@ -2023,7 +2031,7 @@ mod tests {
 
     #[test]
     fn llm_performance_uses_completed_streams_and_output_tokens_only() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
 
         let mut observed = llm_metric("observed", "");
@@ -2079,7 +2087,7 @@ mod tests {
 
     #[test]
     fn older_usage_revision_cannot_replace_completed_metric() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
 
         let mut completed = llm_metric("revisioned", "");
@@ -2139,7 +2147,7 @@ mod tests {
     #[test]
     fn share_terminal_and_gateway_context_merge_independently_of_arrival_order() {
         for gateway_first in [true, false] {
-            let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+            let conn = test_connection();
             init_metrics_db(&conn).expect("init metrics db");
 
             let mut terminal = llm_metric("cross-source", "");
@@ -2230,7 +2238,7 @@ mod tests {
 
     #[test]
     fn substitution_success_rate_ignores_pending_requests() {
-        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        let conn = test_connection();
         init_metrics_db(&conn).expect("init metrics db");
 
         for (request_id, status) in [

@@ -156,6 +156,10 @@ function assertProductDtoIsRedacted(errors, label, block) {
     "paymentProfileUpdatedAt",
     "qrImageUrl",
     "assetUrl",
+    "account_email",
+    "api_url",
+    "accountEmail",
+    "apiUrl",
   ]) {
     if (block.includes(forbidden)) errors.push(`${label} exposes ${forbidden}`);
   }
@@ -189,16 +193,35 @@ function main() {
     ["RouterSshHostView", extractRustBlock(clientSource, "struct RouterSshHostView")],
     ["RentalView", extractRustBlock(tradeSource, "pub struct RentalView")],
     ["Share ListingView", extractRustBlock(shareSource, "pub struct ListingView")],
+    ["Share ShareMarketAppCapability", extractRustBlock(shareSource, "pub struct ShareMarketAppCapability")],
     ["Share SeatView", extractRustBlock(shareSource, "pub struct SeatView")],
     ["Share SubscriptionView", extractRustBlock(shareSource, "pub struct SubscriptionView")],
     ["CreditAccountView", extractRustBlock(billingSource, "pub struct CreditAccountView")],
     ["ClientMarketHost", extractTypeBlock(typeSource, "ClientMarketHost")],
     ["ClientMarketRental", extractTypeBlock(typeSource, "ClientMarketRental")],
     ["ShareMarketListing", extractTypeBlock(typeSource, "ShareMarketListing")],
+    ["ShareMarketAppCapability", extractTypeBlock(typeSource, "ShareMarketAppCapability")],
     ["ShareMarketSubscription", extractTypeBlock(typeSource, "ShareMarketSubscription")],
     ["MarketCreditAccount", extractTypeBlock(typeSource, "MarketCreditAccount")],
   ]) {
     assertProductDtoIsRedacted(errors, label, block);
+  }
+
+  for (const [label, block, required] of [
+    [
+      "Share ShareMarketAppCapability",
+      extractRustBlock(shareSource, "pub struct ShareMarketAppCapability"),
+      ["health_state", "account_hint", "quota"],
+    ],
+    [
+      "ShareMarketAppCapability",
+      extractTypeBlock(typeSource, "ShareMarketAppCapability"),
+      ["healthState", "accountHint", "quota"],
+    ],
+  ]) {
+    for (const field of required) {
+      if (!block.includes(field)) errors.push(`${label} is missing ${field}`);
+    }
   }
 
   const invoiceType = extractTypeBlock(typeSource, "MarketBillingInvoice");
@@ -393,7 +416,7 @@ function main() {
     [
       "frontend/components/dashboard/share-market/buyer-catalog.tsx",
       [
-        "quoteShareMarketSeat(item.seat.id)",
+        "quoteShareMarketSeat(item.seat.id, requiredApp)",
         "setRentTarget({ ...item, quote, idempotencyKey:",
         "crypto.randomUUID()",
         "rentShareMarketSeat(rentTarget.seat.id, rentTarget.quote.id, rentTarget.idempotencyKey)",
@@ -401,8 +424,12 @@ function main() {
         "rentTarget.quote.offer.serviceDurationDays",
         "rentTarget.quote.trialSecondsRemaining",
         "shareMarket.rentConfirm.remainingTrial",
-        "shareMarket.rentConfirm.activationStart",
+        "shareMarket.rentConfirm.serviceFixed",
         "shareMarket.rentConfirm.quoteExpiry",
+        "shareMarket.rentConfirm.requote",
+        "rentTarget.quote.offer.service.requiredApp",
+        "rentTarget.quote.offer.service.shareParallelLimit",
+        "rentTarget.quote.offer.service.shareTokensUsed",
       ],
     ],
     [
@@ -423,6 +450,7 @@ function main() {
         "/v1/market-access/counterparties/batch",
         "/v1/market-access/inbox-summary",
         "/v1/share-market/seats/${encodeURIComponent(seatId)}/quote",
+        "body: JSON.stringify({ requiredApp })",
         "body: JSON.stringify({ quoteId, idempotencyKey })",
       ],
     ],
@@ -438,7 +466,10 @@ function main() {
     "share_market_commit_rent_quote",
     "trial_seconds_remaining_tx",
     "request_fingerprint",
-    "mark_share_rent_quote_consumed",
+    "consume_share_rent_quote_tx",
+    "required_app",
+    "service_snapshot_json",
+    "TransactionBehavior::Immediate",
   ]) {
     if (!shareSource.includes(required)) {
       errors.push(`Share rent quote backend contract is missing ${required}`);
@@ -446,9 +477,29 @@ function main() {
   }
 
   const rentQuoteType = extractTypeBlock(typeSource, "ShareMarketRentQuote");
-  for (const required of ["trialSecondsRemaining", "expiresAt", "offer"]) {
+  for (const required of [
+    "trialSecondsRemaining",
+    "expiresAt",
+    "offer",
+    "service",
+  ]) {
     if (!rentQuoteType.includes(required)) {
       errors.push(`ShareMarketRentQuote is missing ${required}`);
+    }
+  }
+  const rentServiceType = extractTypeBlock(typeSource, "ShareMarketRentService");
+  for (const required of [
+    "requiredApp",
+    "supportedApps",
+    "providerFamily",
+    "providerType",
+    "modelMode",
+    "shareParallelLimit",
+    "shareTokenLimit",
+    "shareTokensUsed",
+  ]) {
+    if (!rentServiceType.includes(required)) {
+      errors.push(`ShareMarketRentService is missing ${required}`);
     }
   }
 

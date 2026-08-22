@@ -751,7 +751,9 @@ fn counterparty_view_tx(conn: &Connection, id: &str) -> Result<CounterpartyView,
                         account.status,
                         (SELECT COUNT(*) FROM market_service_contracts contract
                          WHERE contract.account_id = account.id
-                           AND contract.status IN ('trial', 'active', 'billing_suspended'))
+                           AND contract.status IN (
+                               'pending_activation', 'trial', 'active', 'billing_suspended'
+                           ))
                  FROM market_credit_accounts account
                  JOIN market_counterparties counterparty ON counterparty.supplier_user_id = account.supplier_user_id
                  WHERE counterparty.id = ?1 AND account.buyer_user_id = ?2
@@ -994,7 +996,9 @@ impl AppStore {
                   AND account.buyer_user_id = counterparty.buyer_user_id
                  LEFT JOIN market_service_contracts contract
                    ON contract.account_id = account.id
-                  AND contract.status IN ('trial', 'active', 'billing_suspended')
+                  AND contract.status IN (
+                      'pending_activation', 'trial', 'active', 'billing_suspended'
+                  )
                  WHERE counterparty.supplier_user_id = ?1
                    AND counterparty.buyer_user_id IS NOT NULL
                    AND account.currency = 'USD'

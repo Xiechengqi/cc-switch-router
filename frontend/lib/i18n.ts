@@ -106,6 +106,10 @@ export const messages = {
     "shareMarket.catalog.coverage24h": "24h coverage",
     "shareMarket.catalog.coverage24hValue": "24h observation coverage: {value}%",
     "shareMarket.catalog.samplesValue": "{count} recent samples",
+    "shareMarket.catalog.observedMinutesValue": "{count} observed minutes in 24h",
+    "shareMarket.catalog.coverageInsufficient": "Coverage is still limited ({count} observed minutes)",
+    "shareMarket.catalog.freshness": "Signals updated at {time}",
+    "shareMarket.catalog.noObservations": "No recent observations",
     "shareMarket.catalog.approvalRequired": "Owner approval required",
     "shareMarket.catalog.postpaid": "Postpaid",
     "shareMarket.catalog.details": "Details",
@@ -152,6 +156,12 @@ export const messages = {
     "shareMarket.catalog.listingCount": "{count} Shares",
     "shareMarket.catalog.moreSeats": "+{count} more idle seats",
     "shareMarket.catalog.chooseSeat": "Choose a seat",
+    "shareMarket.catalog.chooseApp": "Required app",
+    "shareMarket.catalog.requiredApp": "Required app",
+    "shareMarket.catalog.provider": "Provider",
+    "shareMarket.catalog.modelPolicy": "Model policy",
+    "shareMarket.catalog.shareCapacity": "Share concurrency",
+    "shareMarket.catalog.shareTokens": "Share token usage",
     "shareMarket.catalog.selectSeatFirst": "Select a specific seat first",
     "shareMarket.catalog.frozenTermsHint": "The selected seat's terms are frozen in the next step.",
     "shareMarket.family.anthropic": "Claude",
@@ -219,6 +229,9 @@ export const messages = {
       "This Share is offline. Access will apply after the Server reconnects.",
     "shareMarket.rentConfirm.title": "Confirm Share rental",
     "shareMarket.rentConfirm.confirm": "Confirm rental",
+    "shareMarket.rentConfirm.expiresIn": "Frozen quote expires in {seconds}s.",
+    "shareMarket.rentConfirm.expired": "This frozen quote has expired. Refresh it before confirming.",
+    "shareMarket.rentConfirm.requote": "Refresh quote",
     "shareMarket.rentConfirm.postpaid":
       "The first {hours} hours of healthy service are free and do not create charges. After that, usage accrues on this Owner account at the daily rate. When this Owner's credit threshold is reached, one payable invoice may combine multiple Share and Client Host services.",
     "shareMarket.rentConfirm.freeBilling":
@@ -299,11 +312,14 @@ export const messages = {
       "The Share binding changed and the requested grant could not be applied.",
     "shareMarket.authorizationFailure.controlTimeout":
       "The Client did not confirm the grant before the control request timed out.",
+    "shareMarket.authorizationFailure.contractViolation":
+      "The Client confirmed terms or a service start time that did not match the frozen offer. Router rejected the grant and is reclaiming access.",
     "shareMarket.authorizationFailure.generic":
       "The Client could not grant this renter access.",
     "shareMarket.authorizationFailure.code": "Error code: {code}",
     "shareMarket.authorizationFailure.attempts": "Control attempts: {count}",
     "shareMarket.authorizationFailure.reason": "Client response: {reason}",
+    "shareMarket.subscription.statusDetail": "Status detail: {reason}",
     "shareMarket.subscription.released": "Reclaimed · read-only",
     "shareMarket.confirm.releaseTitle": "Return this seat?",
     "shareMarket.confirm.releaseDescription":
@@ -1258,6 +1274,8 @@ export const messages = {
       "You have unsaved market access changes. Leave this page and discard them?",
     "marketAccess.approveTitle": "Approve market access",
     "marketAccess.rejectTitle": "Reject market access",
+    "marketAccess.approvalScopeHint":
+      "This grants {buyer} access to every {pricing} {product} offer from your supplier account. {target} is the current request context, not the approval boundary.",
     "marketAccess.approvalCreditTitle": "Account-level USD credit",
     "marketAccess.approvalCreditHint":
       "This limit is shared by all paid Share seats and Client Hosts this buyer rents from you. The suggested amount covers about seven days of this requested service.",
@@ -2873,6 +2891,10 @@ export const messages = {
     "shareMarket.catalog.coverage24h": "24h 观测覆盖率",
     "shareMarket.catalog.coverage24hValue": "24h 观测覆盖率：{value}%",
     "shareMarket.catalog.samplesValue": "最近 {count} 个样本",
+    "shareMarket.catalog.observedMinutesValue": "24h 内已观测 {count} 分钟",
+    "shareMarket.catalog.coverageInsufficient": "观测覆盖仍不足（已观测 {count} 分钟）",
+    "shareMarket.catalog.freshness": "信号更新于 {time}",
+    "shareMarket.catalog.noObservations": "暂无近期观测",
     "shareMarket.catalog.approvalRequired": "需要车主准入",
     "shareMarket.catalog.postpaid": "后付费",
     "shareMarket.catalog.details": "详情",
@@ -2919,6 +2941,12 @@ export const messages = {
     "shareMarket.catalog.listingCount": "{count} 个 Share",
     "shareMarket.catalog.moreSeats": "另有 {count} 个空闲车位",
     "shareMarket.catalog.chooseSeat": "选择拼车位",
+    "shareMarket.catalog.chooseApp": "指定使用 App",
+    "shareMarket.catalog.requiredApp": "使用 App",
+    "shareMarket.catalog.provider": "供应商",
+    "shareMarket.catalog.modelPolicy": "模型策略",
+    "shareMarket.catalog.shareCapacity": "Share 总并发",
+    "shareMarket.catalog.shareTokens": "Share Token 用量",
     "shareMarket.catalog.selectSeatFirst": "请先选择一个具体拼车位",
     "shareMarket.catalog.frozenTermsHint": "下一步将冻结所选车位的完整条款。",
     "shareMarket.family.anthropic": "Claude",
@@ -2985,6 +3013,9 @@ export const messages = {
       "该 Share 当前离线，权限将在 Server 重新上线后生效。",
     "shareMarket.rentConfirm.title": "确认租用 Share 拼车位",
     "shareMarket.rentConfirm.confirm": "确认租用",
+    "shareMarket.rentConfirm.expiresIn": "冻结报价将在 {seconds} 秒后失效。",
+    "shareMarket.rentConfirm.expired": "该冻结报价已失效，请刷新报价后再确认。",
+    "shareMarket.rentConfirm.requote": "刷新报价",
     "shareMarket.rentConfirm.postpaid":
       "前 {hours} 小时健康服务时间免费且不产生费用；之后按实际健康服务时间和日费累计到该 Owner 的赊账账户。用满该 Owner 授予的信用额度后生成应付账单，一张账单可能合并多个 Share 和 Client Host 服务。",
     "shareMarket.rentConfirm.freeBilling": "该拼车位免费，不会产生赊账费用。",
@@ -3064,10 +3095,13 @@ export const messages = {
       "Share 绑定发生变化，当前授权无法应用。",
     "shareMarket.authorizationFailure.controlTimeout":
       "Client 未在控制请求超时前确认授权。",
+    "shareMarket.authorizationFailure.contractViolation":
+      "Client 确认的实际策略或服务起始时间与冻结报价不一致；Router 已拒绝该授权并正在安全回收访问权限。",
     "shareMarket.authorizationFailure.generic": "Client 未能为该用户授予访问权限。",
     "shareMarket.authorizationFailure.code": "错误码：{code}",
     "shareMarket.authorizationFailure.attempts": "控制尝试：{count} 次",
     "shareMarket.authorizationFailure.reason": "Client 返回：{reason}",
+    "shareMarket.subscription.statusDetail": "状态详情：{reason}",
     "shareMarket.subscription.released": "已回收 · 只读",
     "shareMarket.confirm.releaseTitle": "归还这个拼车位？",
     "shareMarket.confirm.releaseDescription":
@@ -3984,6 +4018,8 @@ export const messages = {
       "市场准入还有未保存的修改，离开后将丢弃，确认继续吗？",
     "marketAccess.approveTitle": "批准市场准入",
     "marketAccess.rejectTitle": "拒绝市场准入",
+    "marketAccess.approvalScopeHint":
+      "批准后，{buyer} 可访问你作为供应商发布的全部“{pricing} · {product}”服务；{target} 只是本次申请入口，不是准入边界。",
     "marketAccess.approvalCreditTitle": "账户级美元信用额度",
     "marketAccess.approvalCreditHint":
       "该额度由此买家向你租用的所有付费 Share 和 Client Host 共用；建议值约覆盖当前申请服务七天费用。",

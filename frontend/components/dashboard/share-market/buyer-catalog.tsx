@@ -12,6 +12,7 @@ import {
   Loader2,
   LogIn,
   MessageCircle,
+  RefreshCw,
   Search,
   Send,
   ShoppingCart,
@@ -21,17 +22,22 @@ import {
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { CompactSelect } from "@/components/common/compact-select";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import {
   MarketAccessDialog,
   marketEligibilityFromError,
 } from "@/components/common/seller-approval-dialog";
-import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { ShareProviderLogo } from "@/components/dashboard/share-provider-logo";
+import {
+  resolveShareProviderLogo,
+  ShareProviderLogo,
+} from "@/components/dashboard/share-provider-logo";
+import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
+import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
+import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
@@ -47,14 +53,15 @@ import { cn } from "@/lib/utils";
 import {
   PROVIDER_FAMILY_KEYS,
   PROVIDER_FAMILY_ORDER,
+  CORE_SHARE_APPS,
   activeSubscriptionForShare,
-  capabilityModelLabel,
   formatSeatPrice,
   formatTokenLimit,
   isCoreShareApp,
   isSeatIdle,
   listingIdleCount,
   listingLowestDailyRate,
+  marketProviderStatusView,
 } from "@/components/dashboard/share-market/market-utils";
 import {
   DEFAULT_CATALOG_AVAILABILITY,
@@ -64,11 +71,36 @@ import {
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
-type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat };
+type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat; requiredApp?: string };
 type AvailabilityFilter = "idle" | "all";
 type CatalogSort = "recommended" | "price" | "uptime";
 type SeatAction = "rent" | "approval" | "login" | "rented" | "granting" | "selling" | "unavailable";
 type RentTarget = SeatCard & { quote: ShareMarketRentQuote; idempotencyKey: string };
+
+function rentalApps(listing: ShareMarketListing) {
+  return CORE_SHARE_APPS.filter((app) => listing.supportedApps.includes(app));
+}
+
+function defaultRentalApp(listing: ShareMarketListing) {
+  const apps = rentalApps(listing);
+  return apps.includes(listing.appType as (typeof CORE_SHARE_APPS)[number])
+    ? listing.appType
+    : apps[0];
+}
+
+function compareReliability(left: ShareMarketListing, right: ShareMarketListing) {
+  const coverage = Number(right.reliability.sufficientCoverage) - Number(left.reliability.sufficientCoverage);
+  if (coverage) return coverage;
+  const rate = (right.reliability.onlineRate24h ?? -1) - (left.reliability.onlineRate24h ?? -1);
+  if (rate) return rate;
+  return right.reliability.observationCoverage24h - left.reliability.observationCoverage24h;
+}
+
+function uptimeValue(listing: ShareMarketListing) {
+  return listing.reliability.onlineRate24h == null
+    ? "-"
+    : `${listing.reliability.onlineRate24h.toFixed(1)}%`;
+}
 
 const RENT_BLOCK_REASON_KEYS: Record<string, MessageKey> = {
   owner: "shareMarket.blockReason.owner",
@@ -107,50 +139,37 @@ function seatAction(
   return "unavailable";
 }
 
-function AppLogos({ apps }: { apps: string[] }) {
-  return (
-    <span className="inline-flex items-center gap-1">
-      {apps.filter(isCoreShareApp).map((app) => <ShareAppLogo key={app} app={app} size={15} />)}
-    </span>
-  );
-}
-
 function Metric({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
     <div className="min-w-0">
-      <dt className="truncate text-[10px] text-slate-400">{label}</dt>
-      <dd className="truncate text-xs font-semibold tabular-nums text-slate-800" title={title}>{value}</dd>
+      <dt className="truncate text-[11px] text-muted-foreground">{label}</dt>
+      <dd className="truncate text-[11px] font-semibold tabular-nums text-foreground" title={title}>{value}</dd>
     </div>
   );
 }
 
-function providerSummary(listing: ShareMarketListing, unknown: string, passthrough: string) {
-  const names = [...new Set(listing.appCapabilities.map((item) => item.providerName || item.providerType).filter(Boolean))];
-  const levels = [...new Set(listing.appCapabilities.map((item) => item.subscriptionLevel).filter(Boolean))];
-  const models = [...new Set(listing.appCapabilities.map((item) => capabilityModelLabel(item, passthrough, unknown)))];
-  return [names.join(" / "), levels.join(" / "), models.join(" / ")].filter(Boolean).join(" · ") || unknown;
-}
-
-function ProviderStatusStrip({ listing }: { listing: ShareMarketListing }) {
-  const { t } = useLocaleText();
+function ListingProviderLogos({ listing }: { listing: ShareMarketListing }) {
   const capabilities = listing.appCapabilities.filter((item) => isCoreShareApp(item.app));
+  const entries = capabilities.reduce<typeof capabilities>((result, capability) => {
+    const logo = resolveShareProviderLogo(capability);
+    const key = logo?.key || capability.providerType || capability.providerName || capability.app;
+    if (!result.some((item) => {
+      const itemLogo = resolveShareProviderLogo(item);
+      return (itemLogo?.key || item.providerType || item.providerName || item.app) === key;
+    })) result.push(capability);
+    return result;
+  }, []);
   return (
-    <div className="flex min-w-0 items-center gap-2 rounded-md border border-slate-100 bg-slate-50 px-2 py-1.5">
-      <span className="inline-flex shrink-0 -space-x-1">
-        {capabilities.slice(0, 3).map((capability) => (
-          <ShareProviderLogo
-            key={`${capability.app}:${capability.providerType || capability.providerName || "provider"}`}
-            provider={capability}
-            fallbackApp={capability.app as "claude" | "codex" | "gemini"}
-            size={18}
-          />
-        ))}
-      </span>
-      <span className="min-w-0 flex-1 truncate text-[11px] text-slate-600" title={providerSummary(listing, t("shareMarket.catalog.providerUnknown"), t("shareMarket.modelPassthrough"))}>
-        {providerSummary(listing, t("shareMarket.catalog.providerUnknown"), t("shareMarket.modelPassthrough"))}
-      </span>
-      <AppLogos apps={listing.supportedApps} />
-    </div>
+    <span className="inline-flex shrink-0 items-center gap-1">
+      {entries.slice(0, 3).map((capability) => (
+        <ShareProviderLogo
+          key={`${capability.app}:${capability.providerType || capability.providerName || "provider"}`}
+          provider={capability}
+          fallbackApp={capability.app as "claude" | "codex" | "gemini"}
+          size={16}
+        />
+      ))}
+    </span>
   );
 }
 
@@ -181,37 +200,45 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
   const { locale, t } = useLocaleText();
   const idle = listing.seats.filter(isSeatIdle);
   const preview = catalogSeatPreview(listing.seats);
-  const primaryProvider = listing.appCapabilities.find((item) => isCoreShareApp(item.app))
-    || listing.appCapabilities[0];
   const ttft = listing.performance.averageTtftMs == null ? "-" : `${(listing.performance.averageTtftMs / 1_000).toFixed(2)}s`;
   const tps = listing.performance.averageTps == null ? "-" : listing.performance.averageTps.toFixed(1);
   const cheapest = idle.length ? [...idle].sort((a, b) => (a.dailyRateMinor ?? 0) - (b.dailyRateMinor ?? 0))[0] : undefined;
+  const providerView = marketProviderStatusView(listing, locale, {
+    unknown: t("shareMarket.catalog.providerUnknown"),
+    passthrough: t("shareMarket.modelPassthrough"),
+  });
+  const latestSignalAt = listing.performance.latestSampleAt || listing.reliability.latestObservedAt;
+  const qualityHint = !listing.reliability.sufficientCoverage
+    ? t("shareMarket.catalog.coverageInsufficient", { count: listing.reliability.observedMinutes24h })
+    : latestSignalAt
+      ? t("shareMarket.catalog.freshness", {
+          time: new Intl.DateTimeFormat(locale, { timeStyle: "short" }).format(new Date(latestSignalAt)),
+        })
+      : t("shareMarket.catalog.noObservations");
   return (
     <article
       id={`share-market-catalog-${listing.shareId}`}
       className={cn(
-        "grid min-h-[12rem] min-w-0 scroll-mt-20 grid-rows-[auto_auto_auto_1fr] gap-2 rounded-xl border bg-white p-3 shadow-sm transition-colors hover:border-primary/35",
-        focused ? "border-primary ring-2 ring-primary/20" : "border-slate-200",
-        !listing.shareOnline && "opacity-75",
+        "grid min-h-[15rem] min-w-0 scroll-mt-20 grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border bg-white p-3 shadow-sm transition-[border-color,box-shadow] hover:border-primary/35",
+        focused
+          ? "border-primary ring-2 ring-primary/20"
+          : listing.shareOnline
+            ? "border-slate-200"
+            : "border-rose-200",
       )}
     >
-      <header className="flex min-w-0 items-start justify-between gap-2">
-        <button type="button" className="flex min-w-0 items-center gap-2 rounded text-left active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
-          <span className="relative grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-slate-100 bg-slate-50">
-            {primaryProvider ? (
-              <ShareProviderLogo
-                provider={primaryProvider}
-                fallbackApp={isCoreShareApp(primaryProvider.app) ? primaryProvider.app : "codex"}
-                size={22}
-              />
-            ) : null}
-            <span className={cn("absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white", listing.shareOnline ? "bg-emerald-500" : "bg-rose-500")} />
-          </span>
-          <span className="min-w-0">
-            <strong className="block truncate text-sm text-slate-900">{listing.shareName}</strong>
-            <span className="block truncate font-mono text-[10px] text-slate-400">{listing.subdomain}</span>
-          </span>
-        </button>
+      <header className="flex min-w-0 items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span
+            className={cn("h-2 w-2 shrink-0 rounded-full", listing.shareOnline ? "bg-emerald-500" : "bg-rose-500")}
+            title={listing.shareOnline ? listing.shareStatus : t("shareMarket.blockReason.share_offline")}
+          />
+          <button type="button" className="min-w-0 rounded text-left active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
+            <strong className="block truncate text-sm font-semibold text-foreground" title={listing.shareName}>{listing.shareName}</strong>
+          </button>
+          {listing.subdomain ? <SubdomainCopyButton subdomain={listing.subdomain} /> : null}
+          <ListingProviderLogos listing={listing} />
+        </div>
         <button type="button" className="shrink-0 rounded text-right active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
           <strong className="block text-sm text-slate-900">
             {cheapest ? formatSeatPrice(cheapest, locale, t("shareMarket.free"), t("marketBilling.day")) : t("shareMarket.catalog.full")}
@@ -219,17 +246,23 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
           <span className="text-[10px] text-slate-500">{t("shareMarket.catalog.occupancy", { idle: idle.length, total: listing.seats.length })}</span>
         </button>
       </header>
-      <ProviderStatusStrip listing={listing} />
-      <dl className="grid grid-cols-3 gap-2 border-y border-slate-100 py-1.5">
-        <Metric
-          label={t("shareMarket.catalog.uptime24h")}
-          value={`${listing.reliability.onlineRate24h.toFixed(1)}%`}
-          title={t("shareMarket.catalog.coverage24hValue", { value: listing.reliability.observationCoverage24h.toFixed(1) })}
-        />
-        <Metric label="TTFT" value={ttft} title={t("shareMarket.catalog.samplesValue", { count: listing.performance.ttftSampleCount })} />
-        <Metric label="TPS" value={tps} title={t("shareMarket.catalog.samplesValue", { count: listing.performance.tpsSampleCount })} />
-      </dl>
-      <div className="grid content-start gap-0.5">
+      <ShareProviderStatusPanel view={providerView} />
+      <div className="min-w-0">
+        <dl className="grid grid-cols-2 gap-2">
+          <Metric
+            label={t("shareMarket.catalog.uptime24h")}
+            value={uptimeValue(listing)}
+            title={`${t("shareMarket.catalog.coverage24hValue", { value: listing.reliability.observationCoverage24h.toFixed(1) })} · ${t("shareMarket.catalog.observedMinutesValue", { count: listing.reliability.observedMinutes24h })}`}
+          />
+          <Metric
+            label="P50 TTFT/TPS"
+            value={`${ttft} / ${tps === "-" ? "-" : `${tps} tok/s`}`}
+            title={`${t("shareMarket.catalog.samplesValue", { count: listing.performance.ttftSampleCount })} · ${t("shareMarket.catalog.samplesValue", { count: listing.performance.tpsSampleCount })}`}
+          />
+        </dl>
+        <p className={cn("mt-1 truncate text-[10px]", listing.reliability.sufficientCoverage ? "text-slate-400" : "text-amber-700")} title={qualityHint}>{qualityHint}</p>
+      </div>
+      <div className="grid content-start gap-0.5 border-t border-slate-100 pt-1.5">
         {preview.map((seat) => <SeatPreview key={seat.id} seat={seat} onSelect={() => onOpen(seat)} />)}
         {idle.length > preview.length ? (
           <button type="button" className="rounded px-1.5 pt-1 text-left text-[10px] font-medium text-accent hover:underline active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
@@ -312,6 +345,7 @@ export function ShareMarketBuyerCatalog({
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
   const [busySeatId, setBusySeatId] = React.useState("");
   const [error, setError] = React.useState("");
+  const [quoteNowMs, setQuoteNowMs] = React.useState(() => Date.now());
   const focusedRef = React.useRef("");
   const blocking = !!rentTarget || !!accessTarget || !!busySeatId;
 
@@ -319,6 +353,13 @@ export function ShareMarketBuyerCatalog({
     onInteractionChange?.(blocking);
     return () => onInteractionChange?.(false);
   }, [blocking, onInteractionChange]);
+
+  React.useEffect(() => {
+    if (!rentTarget) return;
+    setQuoteNowMs(Date.now());
+    const timer = window.setInterval(() => setQuoteNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [rentTarget]);
 
   const listings = React.useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
@@ -339,8 +380,8 @@ export function ShareMarketBuyerCatalog({
         const online = Number(right.shareOnline) - Number(left.shareOnline);
         if (online) return online;
         if (sort === "price") return listingLowestDailyRate(left) - listingLowestDailyRate(right) || left.shareName.localeCompare(right.shareName);
-        if (sort === "uptime") return right.reliability.onlineRate24h - left.reliability.onlineRate24h || left.shareName.localeCompare(right.shareName);
-        return listingIdleCount(right) - listingIdleCount(left) || right.reliability.onlineRate24h - left.reliability.onlineRate24h || listingLowestDailyRate(left) - listingLowestDailyRate(right);
+        if (sort === "uptime") return compareReliability(left, right) || left.shareName.localeCompare(right.shareName);
+        return listingIdleCount(right) - listingIdleCount(left) || compareReliability(left, right) || listingLowestDailyRate(left) - listingLowestDailyRate(right);
       });
   }, [availability, catalog.listings, family, query, sort]);
 
@@ -349,7 +390,13 @@ export function ShareMarketBuyerCatalog({
     const listing = catalog.listings.find((item) => item.id === selected.listing.id);
     if (!listing) return setSelected(null);
     const seat = selected.seat ? preserveCatalogSeat(listing.seats, selected.seat.id) : undefined;
-    if (listing !== selected.listing || seat !== selected.seat) setSelected({ listing, seat });
+    const apps = rentalApps(listing);
+    const requiredApp = selected.requiredApp && apps.includes(selected.requiredApp as (typeof CORE_SHARE_APPS)[number])
+      ? selected.requiredApp
+      : defaultRentalApp(listing);
+    if (listing !== selected.listing || seat !== selected.seat || requiredApp !== selected.requiredApp) {
+      setSelected({ listing, seat, requiredApp });
+    }
   }, [catalog.listings, selected]);
 
   React.useEffect(() => {
@@ -358,16 +405,20 @@ export function ShareMarketBuyerCatalog({
     if (!listing) return;
     focusedRef.current = focusedShareId;
     setAvailability("all");
-    setSelected({ listing });
+    setSelected({ listing, requiredApp: defaultRentalApp(listing) });
     window.requestAnimationFrame(() => document.getElementById(`share-market-catalog-${focusedShareId}`)?.scrollIntoView({ block: "start" }));
   }, [catalog.listings, focusedShareId]);
 
   const openListing = (listing: ShareMarketListing, seat?: ShareMarketSeat) => {
     setError("");
-    setSelected({ listing, seat: initialCatalogSeat(listing.seats, seat) });
+    setSelected({
+      listing,
+      seat: initialCatalogSeat(listing.seats, seat),
+      requiredApp: defaultRentalApp(listing),
+    });
   };
 
-  const triggerSeat = async (item: SeatCard) => {
+  const triggerSeat = async (item: SeatCard, requiredApp?: string) => {
     const action = seatAction(item.listing, item.seat, subscriptions, authed);
     if (action === "login") return window.dispatchEvent(new Event("router-open-login"));
     if (action === "selling") return onSwitchSelling?.();
@@ -377,7 +428,7 @@ export function ShareMarketBuyerCatalog({
     setBusySeatId(item.seat.id);
     setError("");
     try {
-      const quote = await quoteShareMarketSeat(item.seat.id);
+      const quote = await quoteShareMarketSeat(item.seat.id, requiredApp);
       setRentTarget({ ...item, quote, idempotencyKey: `share-rent:${quote.id}:${crypto.randomUUID()}` });
     } catch (reason) {
       const eligibility = marketEligibilityFromError(reason);
@@ -388,8 +439,34 @@ export function ShareMarketBuyerCatalog({
     }
   };
 
+  const refreshQuote = async () => {
+    if (!rentTarget || busySeatId) return;
+    setBusySeatId(rentTarget.seat.id);
+    setError("");
+    try {
+      const quote = await quoteShareMarketSeat(
+        rentTarget.seat.id,
+        rentTarget.quote.offer.service.requiredApp,
+      );
+      setRentTarget({
+        listing: rentTarget.listing,
+        seat: rentTarget.seat,
+        quote,
+        idempotencyKey: `share-rent:${quote.id}:${crypto.randomUUID()}`,
+      });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusySeatId("");
+    }
+  };
+
   const confirmRent = async () => {
     if (!rentTarget || busySeatId) return;
+    if (Date.parse(rentTarget.quote.expiresAt) <= Date.now()) {
+      await refreshQuote();
+      return;
+    }
     setBusySeatId(rentTarget.seat.id);
     setError("");
     try {
@@ -397,7 +474,12 @@ export function ShareMarketBuyerCatalog({
       setRentTarget(null);
       await onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (reason instanceof ApiError && reason.status === 410) {
+        setQuoteNowMs(Date.parse(rentTarget.quote.expiresAt));
+        setError(t("shareMarket.rentConfirm.expired"));
+      } else {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
       setBusySeatId("");
     }
@@ -407,13 +489,18 @@ export function ShareMarketBuyerCatalog({
     ? seatAction(selected.listing, selected.seat, subscriptions, authed)
     : "unavailable";
   const activeFilterCount = Number(family !== "all") + Number(availability !== "idle") + Number(sort !== "recommended");
+  const selectedApps = selected ? rentalApps(selected.listing) : [];
+  const quoteRemainingSeconds = rentTarget
+    ? Math.max(0, Math.ceil((Date.parse(rentTarget.quote.expiresAt) - quoteNowMs) / 1_000))
+    : 0;
+  const quoteExpired = !!rentTarget && quoteRemainingSeconds <= 0;
 
   return (
     <div className="grid min-w-0 gap-4">
       <div className="flex min-w-0 items-center gap-2">
-        <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm shadow-sm">
+        <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
           <Search className="h-4 w-4 shrink-0 text-slate-400" />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none" placeholder={t("shareMarket.catalog.searchCompact")} />
+          <input aria-label={t("shareMarket.catalog.searchCompact")} value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none" placeholder={t("shareMarket.catalog.searchCompact")} />
           {query ? <button type="button" aria-label={t("common.reset")} className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => setQuery("")}><X className="h-4 w-4 text-slate-400" /></button> : null}
         </label>
         <details className="group relative">
@@ -462,24 +549,46 @@ export function ShareMarketBuyerCatalog({
             <Drawer.Body className="overflow-y-auto pb-28">
               {selected ? (
                 <div className="grid gap-5">
+                  {selectedApps.length > 1 ? (
+                    <section className="grid gap-2">
+                      <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.chooseApp")}</h3>
+                      <SegmentedControl
+                        value={selected.requiredApp || selectedApps[0]}
+                        onChange={(requiredApp) => setSelected({ ...selected, requiredApp })}
+                        items={selectedApps.map((app) => ({ id: app, label: SHARE_APP_LABELS[app] }))}
+                        ariaLabel={t("shareMarket.catalog.chooseApp")}
+                        fullWidth
+                      />
+                    </section>
+                  ) : null}
                   <section className="grid gap-3">
                     <div className="flex items-center justify-between">
                       <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.chooseSeat")}</h3>
                       <span className="text-xs text-slate-400">{t("shareMarket.catalog.idleSeats", { count: listingIdleCount(selected.listing) })}</span>
                     </div>
-                    {selected.listing.seats.map((seat) => <SeatChoice key={seat.id} seat={seat} selected={selected.seat?.id === seat.id} onSelect={() => setSelected({ listing: selected.listing, seat })} />)}
+                    {selected.listing.seats.map((seat) => <SeatChoice key={seat.id} seat={seat} selected={selected.seat?.id === seat.id} onSelect={() => setSelected({ ...selected, seat })} />)}
                   </section>
                   <section className="grid gap-3 border-t border-slate-200 pt-4">
                     <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.providerStatus")}</h3>
-                    <ProviderStatusStrip listing={selected.listing} />
+                    <ShareProviderStatusPanel
+                      view={marketProviderStatusView(selected.listing, locale, {
+                        unknown: t("shareMarket.catalog.providerUnknown"),
+                        passthrough: t("shareMarket.modelPassthrough"),
+                      })}
+                    />
                   </section>
                   <section className="grid gap-3 border-t border-slate-200 pt-4">
                     <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.serviceQuality")}</h3>
                     <dl className="grid grid-cols-3 gap-3">
                       <Metric label="TTFT" value={selected.listing.performance.averageTtftMs == null ? "-" : `${(selected.listing.performance.averageTtftMs / 1_000).toFixed(2)}s`} />
                       <Metric label="TPS" value={selected.listing.performance.averageTps == null ? "-" : selected.listing.performance.averageTps.toFixed(1)} />
-                      <Metric label={t("shareMarket.catalog.uptime24h")} value={`${selected.listing.reliability.onlineRate24h.toFixed(1)}%`} title={t("shareMarket.catalog.coverage24hValue", { value: selected.listing.reliability.observationCoverage24h.toFixed(1) })} />
+                      <Metric label={t("shareMarket.catalog.uptime24h")} value={uptimeValue(selected.listing)} title={t("shareMarket.catalog.coverage24hValue", { value: selected.listing.reliability.observationCoverage24h.toFixed(1) })} />
                     </dl>
+                    <p className={cn("text-xs", selected.listing.reliability.sufficientCoverage ? "text-slate-500" : "text-amber-700")}>
+                      {selected.listing.reliability.sufficientCoverage
+                        ? t("shareMarket.catalog.observedMinutesValue", { count: selected.listing.reliability.observedMinutes24h })
+                        : t("shareMarket.catalog.coverageInsufficient", { count: selected.listing.reliability.observedMinutes24h })}
+                    </p>
                   </section>
                   <section className="grid gap-3 border-t border-slate-200 pt-4">
                     <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.seller")}</h3>
@@ -500,7 +609,10 @@ export function ShareMarketBuyerCatalog({
                 <Button
                   variant="primary"
                   isDisabled={!selected.seat || selectedAction === "unavailable" || selectedAction === "rented" || selectedAction === "granting" || !!busySeatId}
-                  onClick={() => selected.seat && void triggerSeat({ listing: selected.listing, seat: selected.seat })}
+                  onClick={() => selected.seat && void triggerSeat(
+                    { listing: selected.listing, seat: selected.seat },
+                    selected.requiredApp,
+                  )}
                 >
                   {busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : selectedAction === "approval" ? <Send className="h-4 w-4" /> : selectedAction === "login" ? <LogIn className="h-4 w-4" /> : selectedAction === "rented" ? <Check className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}
                   {selected.seat ? actionLabel(selectedAction, t) : t("shareMarket.catalog.chooseSeat")}
@@ -520,21 +632,26 @@ export function ShareMarketBuyerCatalog({
                 <>
                   <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 border-y border-slate-200 py-3 text-sm">
                     <dt className="text-slate-500">{t("shareMarket.col.share")}</dt><dd className="font-medium">{rentTarget.quote.offer.shareName} · #{rentTarget.quote.offer.seatPosition}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.requiredApp")}</dt><dd className="font-medium">{isCoreShareApp(rentTarget.quote.offer.service.requiredApp) ? SHARE_APP_LABELS[rentTarget.quote.offer.service.requiredApp] : rentTarget.quote.offer.service.requiredApp}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.provider")}</dt><dd>{t(PROVIDER_FAMILY_KEYS[rentTarget.quote.offer.service.providerFamily])}{rentTarget.quote.offer.service.providerType ? ` · ${rentTarget.quote.offer.service.providerType}` : ""}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.modelPolicy")}</dt><dd>{rentTarget.quote.offer.service.modelMode === "passthrough" ? t("shareMarket.modelPassthrough") : rentTarget.quote.offer.service.upstreamModel || rentTarget.quote.offer.service.models.join(" / ") || t("shareMarket.catalog.modelUnknown")}</dd>
                     <dt className="text-slate-500">{t("shareMarket.parallel")}</dt><dd>{rentTarget.quote.offer.parallelLimit == null ? t("common.unlimited") : rentTarget.quote.offer.parallelLimit}</dd>
                     <dt className="text-slate-500">{t("shareMarket.tokens")}</dt><dd>{formatTokenLimit(rentTarget.quote.offer, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.shareCapacity")}</dt><dd>{rentTarget.quote.offer.service.shareParallelLimit == null ? t("common.unlimited") : t("shareMarket.parallelShort", { value: rentTarget.quote.offer.service.shareParallelLimit })}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.shareTokens")}</dt><dd>{rentTarget.quote.offer.service.shareTokenLimit == null ? t("common.unlimited") : `${new Intl.NumberFormat(locale).format(rentTarget.quote.offer.service.shareTokensUsed)} / ${new Intl.NumberFormat(locale).format(rentTarget.quote.offer.service.shareTokenLimit)}`}</dd>
                     <dt className="text-slate-500">{t("shareMarket.catalog.serviceTerm")}</dt><dd>{rentTarget.quote.offer.serviceDurationDays == null ? t("shareMarket.serviceDuration.permanent") : t("shareMarket.serviceDuration.daysValue", { count: rentTarget.quote.offer.serviceDurationDays })}</dd>
                     <dt className="text-slate-500">{t("shareMarket.dialog.amount")}</dt><dd className="font-medium">{formatSeatPrice({ isFree: rentTarget.quote.offer.dailyRateMinor == null, dailyRateMinor: rentTarget.quote.offer.dailyRateMinor }, locale, t("shareMarket.free"), t("marketBilling.day"))}</dd>
                   </dl>
-                  <div className="flex gap-3 border-l-2 border-sky-400 bg-sky-50 px-3 py-2 text-sm leading-6 text-sky-950"><Clock3 className="mt-1 h-4 w-4 shrink-0" /><p>{rentTarget.quote.offer.dailyRateMinor == null ? t("shareMarket.rentConfirm.freeBilling") : rentTarget.quote.trialSecondsRemaining > 0 ? t("shareMarket.rentConfirm.remainingTrial", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1) }) : t("shareMarket.rentConfirm.noTrial")}</p></div>
-                  <div className="flex gap-3 border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-950"><CalendarClock className="mt-1 h-4 w-4 shrink-0" /><p>{t("shareMarket.rentConfirm.activationStart")}</p></div>
-                  <p className="flex items-start gap-2 text-xs leading-5 text-slate-500"><Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />{t("shareMarket.rentConfirm.quoteExpiry", { time: new Intl.DateTimeFormat(locale, { timeStyle: "medium" }).format(new Date(rentTarget.quote.expiresAt)) })}</p>
+                  <div className="flex gap-3 border-l-2 border-sky-400 bg-sky-50 px-3 py-2 text-sm leading-6 text-sky-950"><Clock3 className="mt-1 h-4 w-4 shrink-0" /><div><p>{rentTarget.quote.offer.dailyRateMinor == null ? t("shareMarket.rentConfirm.freeBilling") : t("shareMarket.rentConfirm.postpaid", { hours: catalog.trialHours })}</p>{rentTarget.quote.offer.dailyRateMinor != null ? <strong className="mt-1 block text-xs">{rentTarget.quote.trialSecondsRemaining > 0 ? t("shareMarket.rentConfirm.remainingTrial", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1) }) : t("shareMarket.rentConfirm.noTrial")}</strong> : null}</div></div>
+                  <div className="flex gap-3 border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-950"><CalendarClock className="mt-1 h-4 w-4 shrink-0" /><p>{rentTarget.quote.offer.serviceDurationDays == null ? t("shareMarket.rentConfirm.servicePermanent") : t("shareMarket.rentConfirm.serviceFixed", { days: rentTarget.quote.offer.serviceDurationDays })}</p></div>
+                  <p className={cn("flex items-start gap-2 text-xs leading-5", quoteExpired ? "text-rose-700" : "text-slate-500")} title={t("shareMarket.rentConfirm.quoteExpiry", { time: new Intl.DateTimeFormat(locale, { timeStyle: "medium" }).format(new Date(rentTarget.quote.expiresAt)) })}><Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />{quoteExpired ? t("shareMarket.rentConfirm.expired") : t("shareMarket.rentConfirm.expiresIn", { seconds: quoteRemainingSeconds })}</p>
                   {error ? <p className="text-sm text-rose-700">{error}</p> : null}
                 </>
               ) : null}
             </Modal.Body>
             <Modal.Footer>
               <Button variant="ghost" isDisabled={!!busySeatId} onClick={() => setRentTarget(null)}>{t("common.cancel")}</Button>
-              <Button variant="primary" isDisabled={!!busySeatId} onClick={() => void confirmRent()}>{busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShoppingCart className="h-4 w-4" />}{t("shareMarket.rentConfirm.confirm")}</Button>
+              <Button variant="primary" isDisabled={!!busySeatId} onClick={() => void (quoteExpired ? refreshQuote() : confirmRent())}>{busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : quoteExpired ? <RefreshCw className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}{quoteExpired ? t("shareMarket.rentConfirm.requote") : t("shareMarket.rentConfirm.confirm")}</Button>
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>

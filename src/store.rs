@@ -9172,6 +9172,25 @@ impl AppStore {
             reject_pending_share_edit_reply(&conn, edit_id, &now.to_rfc3339(), &message)?;
             return Err(AppError::UnprocessableEntity(message));
         }
+        let managed_effect = edit.patch.managed_grant.as_ref().and_then(|operation| {
+            (operation.action == crate::models::ShareManagedGrantAction::Upsert)
+                .then(|| {
+                    returned_share
+                        .user_grants
+                        .values()
+                        .find(|grant| {
+                            grant.active
+                                && grant.entitlement_id.as_deref()
+                                    == Some(operation.entitlement_id.as_str())
+                        })
+                        .and_then(|grant| {
+                            i64::try_from(grant.updated_at_ms)
+                                .ok()
+                                .map(|applied_at_ms| (applied_at_ms, grant.policy.clone()))
+                        })
+                })
+                .flatten()
+        });
 
         let tx = conn
             .unchecked_transaction()
@@ -9203,11 +9222,17 @@ impl AppStore {
                 "share edit was no longer pending".into(),
             ));
         }
-        crate::share_market::handle_control_edit_ack(
+        crate::share_market::handle_control_edit_ack_with_effect(
             &tx,
             edit_id,
             "applied",
             None,
+            None,
+            None,
+            managed_effect
+                .as_ref()
+                .map(|(applied_at_ms, _)| *applied_at_ms),
+            managed_effect.as_ref().map(|(_, policy)| policy),
             &now.to_rfc3339(),
         )?;
         tx.commit().map_err(map_share_constraint_error)?;
@@ -9406,13 +9431,15 @@ impl AppStore {
                 ));
             }
         }
-        crate::share_market::handle_control_edit_ack_with_metadata(
+        crate::share_market::handle_control_edit_ack_with_effect(
             &tx,
             &ack_edit_id,
             status,
             ack_error.as_deref(),
             input.ack.error_code.as_deref(),
             input.ack.retryable,
+            input.ack.applied_at_ms,
+            input.ack.effective_policy.as_ref(),
             &now,
         )?;
         tx.commit().map_err(|error| {
@@ -17108,7 +17135,23 @@ fn validate_returned_share_against_patch(
                 }) else {
                     return Err("managedGrant");
                 };
-                if operation.policy.as_ref() != Some(&returned.policy) {
+                let policy_matches = operation.policy.as_ref().is_some_and(|expected| {
+                    if operation.duration_seconds.is_none() {
+                        expected == &returned.policy
+                    } else {
+                        expected.parallel_limit == returned.policy.parallel_limit
+                            && expected.token_limit == returned.policy.token_limit
+                            && expected.token_period == returned.policy.token_period
+                            && returned.policy.expires_at.is_some()
+                            && returned.policy.token_period_anchor_at_ms.is_some()
+                                == matches!(
+                                    expected.token_period,
+                                    crate::models::ShareTokenPeriod::SevenDays
+                                        | crate::models::ShareTokenPeriod::ThirtyDays
+                                )
+                    }
+                });
+                if !policy_matches {
                     return Err("managedGrant");
                 }
             }
@@ -22732,6 +22775,8 @@ mod tests {
                 retryable: None,
                 current_config_revision: None,
                 current_share: None,
+                applied_at_ms: None,
+                effective_policy: None,
             },
         };
         assert_eq!(
@@ -38649,6 +38694,8 @@ mod tests {
             retryable: None,
             current_config_revision: None,
             current_share: None,
+            applied_at_ms: None,
+            effective_policy: None,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();

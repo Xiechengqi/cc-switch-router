@@ -20,13 +20,9 @@ type LocaleContextValue = {
 
 const LocaleContext = React.createContext<LocaleContextValue | null>(null);
 
-function initialLocale(): AppLocale {
-  if (typeof window === "undefined") return "en";
-  return readStoredLocale() || detectBrowserLocale();
-}
-
 export function LocaleProvider({ children }: { children: React.ReactNode }) {
-  const [locale, setLocaleState] = React.useState<AppLocale>(initialLocale);
+  // Match the server snapshot during hydration, then apply the browser preference.
+  const [locale, setLocaleState] = React.useState<AppLocale>("en");
 
   React.useEffect(() => {
     const next = readStoredLocale() || detectBrowserLocale();

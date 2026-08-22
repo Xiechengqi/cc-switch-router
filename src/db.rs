@@ -125,6 +125,30 @@ fn database_runtime() -> &'static DatabaseRuntime {
     RUNTIME.get_or_init(DatabaseRuntime::start)
 }
 
+/// Selects SQLite's serialized threading mode before any direct
+/// `libsql-rusqlite` connection is opened in this process.
+///
+/// libsql performs this configuration during its first local database build.
+/// Metrics and alerting use the compatible synchronous API directly, so they
+/// must cross the same initialization barrier before opening their databases.
+pub fn initialize_sqlite_runtime() -> Result<()> {
+    static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    match INITIALIZED.get_or_init(|| {
+        database_runtime()
+            .run(async move {
+                let database = libsql::Builder::new_local(":memory:").build().await?;
+                drop(database);
+                Ok(())
+            })
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(Error::Runtime(format!(
+            "initialize SQLite threading mode failed: {error}"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionMode {
     Local,

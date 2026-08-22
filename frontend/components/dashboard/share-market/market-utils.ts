@@ -1,11 +1,23 @@
-import type { MessageKey } from "@/lib/i18n";
+import type { AppLocale, MessageKey } from "@/lib/i18n";
 import { formatUsdMoney } from "@/lib/market-money";
+import {
+  isApiProviderRuntime,
+  providerQuotaStatusLine,
+  providerStatusIdentity,
+} from "@/components/dashboard/share-dashboard-utils";
+import {
+  marketProviderHealthTone,
+  type ShareProviderStatusPanelView,
+} from "@/components/dashboard/share-provider-status-panel";
+import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
   ShareMarketAppCapability,
+  ShareMarketListing,
   ShareMarketProviderFamily,
   ShareMarketSeat,
   ShareMarketSubscription,
   ShareTokenPeriod,
+  ShareUpstreamProvider,
 } from "@/lib/types";
 
 export const PROVIDER_FAMILY_ORDER: ShareMarketProviderFamily[] = [
@@ -105,6 +117,110 @@ export function capabilityModelLabel(
   return capability.models.join(" / ") || unknownLabel;
 }
 
+function capabilityDetailScore(capability: ShareMarketAppCapability) {
+  return (
+    Number(Boolean(capability.quota)) * 4 +
+    Number(Boolean(capability.subscriptionLevel)) * 3 +
+    Number(Boolean(capability.accountHint)) * 2 +
+    Number(Boolean(capability.providerName || capability.providerType))
+  );
+}
+
+export function primaryMarketCapability(
+  capabilities: ShareMarketAppCapability[],
+) {
+  const core = CORE_SHARE_APPS.flatMap((app) => {
+    const capability = capabilities.find((item) => item.app === app);
+    return capability ? [capability] : [];
+  });
+  const candidates = core.length ? core : capabilities;
+  return candidates.reduce<ShareMarketAppCapability | undefined>(
+    (best, capability) =>
+      !best || capabilityDetailScore(capability) > capabilityDetailScore(best)
+        ? capability
+        : best,
+    undefined,
+  );
+}
+
+export function marketCapabilityRuntime(
+  capability: ShareMarketAppCapability,
+): ShareUpstreamProvider {
+  const upstreamModel =
+    capability.upstreamModel || capability.models[0] || "";
+  return {
+    app: capability.app,
+    kind: capability.providerType,
+    providerType: capability.providerType,
+    providerName: capability.providerName,
+    accountEmail: capability.accountHint,
+    subscriptionLevel: capability.subscriptionLevel,
+    quota: capability.quota
+      ? {
+          status: capability.quota.status,
+          plan: capability.quota.plan,
+          subscriptionPeriodEnd: capability.quota.subscriptionPeriodEnd,
+          tiers: capability.quota.tiers,
+        }
+      : capability.subscriptionLevel
+        ? {
+            status: "ok",
+            plan: capability.subscriptionLevel,
+            tiers: [],
+          }
+        : undefined,
+    models: capability.models.map((actualModel) => ({ actualModel })),
+    modelPolicy:
+      capability.modelMode === "passthrough"
+        ? { mode: "passthrough" }
+        : capability.modelMode === "fixed" && upstreamModel
+          ? { mode: "single", upstreamModel }
+          : undefined,
+  };
+}
+
+export function marketProviderStatusView(
+  listing: Pick<ShareMarketListing, "appCapabilities">,
+  locale: AppLocale,
+  labels: { unknown: string; passthrough: string },
+): ShareProviderStatusPanelView {
+  const primary = primaryMarketCapability(listing.appCapabilities);
+  if (!primary) {
+    return {
+      primaryLine: labels.unknown,
+      identityLine: "-",
+      modelsLine: "-",
+      toneClassName: marketProviderHealthTone("unknown"),
+    };
+  }
+  const runtime = marketCapabilityRuntime(primary);
+  const isApiProvider =
+    primary.providerFamily === "api" || isApiProviderRuntime(runtime);
+  const modelsLine = CORE_SHARE_APPS.flatMap((app) => {
+    const item = listing.appCapabilities.find((capability) => capability.app === app);
+    return item
+      ? [`${SHARE_APP_LABELS[app]}: ${capabilityModelLabel(item, labels.passthrough, labels.unknown)}`]
+      : [];
+  })
+    .join(" · ");
+  const healthState =
+    primary.healthState ||
+    (primary.available === false
+      ? "unavailable"
+      : primary.available === true
+        ? "healthy"
+        : "unknown");
+  return {
+    primaryLine: isApiProvider
+      ? primary.providerName || primary.providerType || labels.unknown
+      : providerQuotaStatusLine(runtime, locale),
+    identityLine: isApiProvider ? "-" : providerStatusIdentity(runtime),
+    modelsLine:
+      modelsLine || capabilityModelLabel(primary, labels.passthrough, labels.unknown),
+    toneClassName: marketProviderHealthTone(healthState),
+  };
+}
+
 export function subscriptionStatusKey(status: string): MessageKey | null {
   const keys: Record<string, MessageKey> = {
     grant_pending: "shareMarket.subscription.grantPending",
@@ -120,4 +236,21 @@ export function subscriptionStatusKey(status: string): MessageKey | null {
     released: "shareMarket.subscription.released",
   };
   return keys[status] || null;
+}
+
+export function grantFailureMessageKey(code?: string): MessageKey {
+  switch (code) {
+    case "cc_switch_share_revision_conflict":
+      return "shareMarket.authorizationFailure.revisionConflict";
+    case "cc_switch_share_policy_divergent":
+      return "shareMarket.authorizationFailure.policyDivergent";
+    case "cc_switch_share_binding_immutable":
+      return "shareMarket.authorizationFailure.bindingImmutable";
+    case "control_ack_timeout":
+      return "shareMarket.authorizationFailure.controlTimeout";
+    case "share_market_grant_contract_violation":
+      return "shareMarket.authorizationFailure.contractViolation";
+    default:
+      return "shareMarket.authorizationFailure.generic";
+  }
 }

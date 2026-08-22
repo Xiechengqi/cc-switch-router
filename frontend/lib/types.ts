@@ -2281,6 +2281,26 @@ export type ShareMarketProviderFamily =
   | "multi"
   | "other";
 
+export type ShareMarketProviderHealthState =
+  | "healthy"
+  | "degraded"
+  | "unavailable"
+  | "unknown";
+
+export type ShareMarketProviderQuota = {
+  status?: string;
+  plan?: string;
+  subscriptionPeriodEnd?: string;
+  tiers: Array<{
+    label: string;
+    utilization: number;
+    resetsAt?: string;
+    used?: number;
+    limit?: number;
+    unit?: string;
+  }>;
+};
+
 export type ShareMarketAppCapability = {
   app: string;
   providerFamily: ShareMarketProviderFamily;
@@ -2291,6 +2311,9 @@ export type ShareMarketAppCapability = {
   upstreamModel?: string;
   models: string[];
   available?: boolean;
+  healthState: ShareMarketProviderHealthState;
+  accountHint?: string;
+  quota?: ShareMarketProviderQuota;
 };
 
 export type ShareMarketPerformance = {
@@ -2299,12 +2322,16 @@ export type ShareMarketPerformance = {
   recentRequestCount: number;
   ttftSampleCount: number;
   tpsSampleCount: number;
+  latestSampleAt?: string;
+  windowHours: number;
 };
 
 export type ShareMarketReliability = {
-  onlineRate24h: number;
+  onlineRate24h?: number;
   observedMinutes24h: number;
   observationCoverage24h: number;
+  sufficientCoverage: boolean;
+  latestObservedAt?: string;
 };
 
 export type ShareMarketListing = {
@@ -2343,6 +2370,20 @@ export type ShareMarketCatalog = {
   trialHours: number;
 };
 
+export type ShareMarketRentService = {
+  schemaVersion: number;
+  requiredApp: string;
+  supportedApps: string[];
+  providerFamily: ShareMarketProviderFamily;
+  providerType?: string;
+  modelMode: "fixed" | "passthrough" | "unknown";
+  upstreamModel?: string;
+  models: string[];
+  shareParallelLimit?: number;
+  shareTokenLimit?: number;
+  shareTokensUsed: number;
+};
+
 export type ShareMarketRentQuote = {
   id: string;
   status: "active" | "consumed" | "expired";
@@ -2362,6 +2403,7 @@ export type ShareMarketRentQuote = {
     currency?: "USD";
     serviceDurationDays?: number;
     offerRevision: number;
+    service: ShareMarketRentService;
   };
 };
 

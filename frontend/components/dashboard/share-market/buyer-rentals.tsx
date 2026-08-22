@@ -28,6 +28,7 @@ import { formatUsdMoney } from "@/lib/market-money";
 import type { ShareMarketSubscription } from "@/lib/types";
 import {
   formatTokenLimit,
+  grantFailureMessageKey,
   isCoreShareApp,
   isTerminalSubscription,
   subscriptionStatusKey,
@@ -114,6 +115,12 @@ export function ShareMarketSubscriptionCard({
   const statusKey = subscriptionStatusKey(subscription.status);
   const app = isCoreShareApp(subscription.appType) ? subscription.appType : null;
   const priceChange = subscription.priceChange;
+  const grantFailed = subscription.status === "grant_failed";
+  const grantContractViolation = subscription.failureCode === "share_market_grant_contract_violation";
+  const hasStatusDetail = grantFailed
+    || !!subscription.releaseReason
+    || !!subscription.failureCode
+    || subscription.grantAttempts != null;
   const serviceTerm = subscription.serviceDurationDays == null
     ? t("shareMarket.serviceDuration.permanent")
     : t("shareMarket.serviceDuration.daysValue", { count: subscription.serviceDurationDays });
@@ -167,6 +174,15 @@ export function ShareMarketSubscriptionCard({
           <dd className="mt-0.5 text-muted-foreground">{formatDate(subscription.updatedAt, locale)}</dd>
         </div>
       </dl>
+
+      {hasStatusDetail ? (
+        <div className="grid gap-0.5 border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-900">
+          {grantFailed || grantContractViolation ? <p className="font-medium">{t(grantFailureMessageKey(subscription.failureCode))}</p> : null}
+          {subscription.failureCode ? <p className="break-all font-mono text-[10px] text-rose-800/70">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
+          {subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
+          {subscription.releaseReason ? <p className="break-words text-rose-800/80">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
+        </div>
+      ) : null}
 
       {priceChange ? (
         <div className="grid gap-2 border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-950">

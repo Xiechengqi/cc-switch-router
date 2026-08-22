@@ -1334,6 +1334,18 @@ export function AccountMarketAccessPage() {
                 </div>
               ) : null}
 
+              {requestAction?.kind === "approve" ? (
+                <p className="flex gap-2 border-l-2 border-sky-400 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-950">
+                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
+                  {t("marketAccess.approvalScopeHint", {
+                    buyer: requestAction.request.buyerEmail,
+                    product: t(requestAction.request.productKind === "share" ? "marketAccess.product.share" : "marketAccess.product.clientHost"),
+                    pricing: t(requestAction.request.pricingKind === "free" ? "marketAccess.pricing.free" : "marketAccess.pricing.paid"),
+                    target: requestAction.request.targetLabel,
+                  })}
+                </p>
+              ) : null}
+
               {requestAction?.kind === "approve" && requestAction.request.pricingKind === "paid" ? (
                 <section className="grid gap-3">
                   <div>
