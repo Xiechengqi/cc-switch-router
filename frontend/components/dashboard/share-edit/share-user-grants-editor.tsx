@@ -16,7 +16,11 @@ import type {
   ShareUserUsageEditMap,
 } from "@/lib/types";
 import { routerShareMarketManagedEmails } from "@/lib/share-settings";
-import { formatNumber } from "@/lib/utils";
+import {
+  formatTokenMillions,
+  millionsInputToTokens,
+  tokensToMillionsInput,
+} from "@/lib/token-units";
 import { applyShareUserPolicyBatch } from "./share-user-policy-batch";
 
 type GrantDraft = {
@@ -62,7 +66,7 @@ function makeDraft(email: string, policy: ShareUserPolicy): GrantDraft {
   return {
     email,
     parallelLimit: policy.parallelLimit == null ? "" : String(policy.parallelLimit),
-    tokenLimit: policy.tokenLimit == null ? "" : String(policy.tokenLimit),
+    tokenLimit: policy.tokenLimit == null ? "" : tokensToMillionsInput(policy.tokenLimit),
     tokenPeriod: policy.tokenPeriod || "lifetime",
     tokenPeriodAnchor: toUtcDateTime(policy.tokenPeriodAnchorAtMs),
     expiresAt: toLocalDateTime(policy.expiresAt),
@@ -115,12 +119,12 @@ function usageEditForGrant(
   }
   if (edit?.action === "set") {
     return {
-      consumedTokens: edit.targetTokens == null ? "" : String(edit.targetTokens),
+      consumedTokens: edit.targetTokens == null ? "" : tokensToMillionsInput(edit.targetTokens),
       usageAction: "set",
     };
   }
   return {
-    consumedTokens: String(currentGrantTokens(grant)),
+    consumedTokens: tokensToMillionsInput(currentGrantTokens(grant)),
     usageAction: "unchanged",
   };
 }
@@ -360,8 +364,9 @@ export function ShareUserGrantsEditor({
     const parallelLimit = grantDraft.parallelLimit.trim()
       ? Number(grantDraft.parallelLimit)
       : undefined;
-    const tokenLimit = grantDraft.tokenLimit.trim()
-      ? Number(grantDraft.tokenLimit)
+    const hasTokenLimit = !!grantDraft.tokenLimit.trim();
+    const tokenLimit = hasTokenLimit
+      ? millionsInputToTokens(grantDraft.tokenLimit)
       : undefined;
     const expiresAt = grantDraft.expiresAt
       ? new Date(grantDraft.expiresAt).getTime()
@@ -387,7 +392,7 @@ export function ShareUserGrantsEditor({
     }
     if (
       (parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
-      (tokenLimit != null && (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
+      (hasTokenLimit && (tokenLimit == null || tokenLimit < 1)) ||
       (expiresAt != null && !Number.isFinite(expiresAt)) ||
       (anchored && (
         tokenPeriodAnchorAtMs == null ||
@@ -400,20 +405,19 @@ export function ShareUserGrantsEditor({
     }
     const previous = value[editingEmail || email];
     const consumedTokens = grantDraft.consumedTokens.trim()
-      ? Number(grantDraft.consumedTokens)
+      ? millionsInputToTokens(grantDraft.consumedTokens)
       : undefined;
     const observedTokens = previous ? observedGrantTokens(previous) : 0;
     const usageInvalid =
       grantDraft.usageAction === "set" &&
       (consumedTokens == null ||
-        !Number.isSafeInteger(consumedTokens) ||
         consumedTokens < 0 ||
         consumedTokens < observedTokens);
     if (usageInvalid) {
       setError(
         consumedTokens != null && consumedTokens < observedTokens
           ? t("dashboard.userLimit.consumedBelowObserved", {
-              observed: formatNumber(observedTokens),
+              observed: formatTokenMillions(observedTokens),
             })
           : t("dashboard.userLimit.invalidUsage"),
       );
@@ -426,7 +430,7 @@ export function ShareUserGrantsEditor({
       active: true,
       policy: {
         parallelLimit,
-        tokenLimit,
+        tokenLimit: tokenLimit ?? undefined,
         tokenPeriod: grantDraft.tokenPeriod,
         tokenPeriodAnchorAtMs,
         expiresAt,
@@ -494,8 +498,9 @@ export function ShareUserGrantsEditor({
     const parallelLimit = batchDraft.parallelLimit.trim()
       ? Number(batchDraft.parallelLimit)
       : undefined;
-    const tokenLimit = batchDraft.tokenLimit.trim()
-      ? Number(batchDraft.tokenLimit)
+    const hasTokenLimit = !!batchDraft.tokenLimit.trim();
+    const tokenLimit = hasTokenLimit
+      ? millionsInputToTokens(batchDraft.tokenLimit)
       : undefined;
     const expiresAt = batchDraft.expiresAt
       ? new Date(batchDraft.expiresAt).getTime()
@@ -505,7 +510,7 @@ export function ShareUserGrantsEditor({
       ? parseUtcDateTime(batchDraft.tokenPeriodAnchor)
       : undefined;
     const consumedTokens = batchDraft.consumedTokens.trim()
-      ? Number(batchDraft.consumedTokens)
+      ? millionsInputToTokens(batchDraft.consumedTokens)
       : undefined;
     if (
       !batchDraft.applyParallelLimit &&
@@ -523,15 +528,14 @@ export function ShareUserGrantsEditor({
     const usageInvalid =
       batchDraft.applyConsumedTokens &&
       batchDraft.usageAction === "set" &&
-      consumedTokens != null &&
-      (!Number.isSafeInteger(consumedTokens) ||
+      (consumedTokens == null ||
         consumedTokens < 0 ||
         consumedTokens < usageFloor);
     if (
       (batchDraft.applyParallelLimit && parallelLimit != null &&
         (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
-      (batchDraft.applyTokenLimit && tokenLimit != null &&
-        (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
+      (batchDraft.applyTokenLimit && hasTokenLimit &&
+        (tokenLimit == null || tokenLimit < 1)) ||
       (batchDraft.applyExpiresAt && expiresAt != null && !Number.isFinite(expiresAt)) ||
       (batchDraft.applyTokenLimit && anchored && (
         tokenPeriodAnchorAtMs == null ||
@@ -544,7 +548,7 @@ export function ShareUserGrantsEditor({
         usageInvalid
           ? consumedTokens != null && consumedTokens < usageFloor
             ? t("dashboard.userLimit.consumedBelowObserved", {
-                observed: formatNumber(usageFloor),
+                observed: formatTokenMillions(usageFloor),
               })
             : t("dashboard.userLimit.invalidUsage")
           : t("dashboard.userLimit.invalidPolicy"),
@@ -563,7 +567,7 @@ export function ShareUserGrantsEditor({
       ...(batchDraft.applyTokenLimit
         ? {
             tokenLimit: {
-              value: tokenLimit,
+              value: tokenLimit ?? undefined,
               period: batchDraft.tokenPeriod,
               periodAnchorAtMs: tokenPeriodAnchorAtMs,
             },
@@ -822,15 +826,14 @@ export function ShareUserGrantsEditor({
                 </div>
                 <div className="grid gap-1.5">
                   <span className="mono-label text-muted-foreground">{t("dashboard.field.tokenLimit")}</span>
-                  <Input type="number" min={1} placeholder={t("common.unlimited")} value={grantDraft?.tokenLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, tokenLimit: event.target.value })} />
+                  <Input type="text" inputMode="decimal" placeholder={t("common.unlimited")} value={grantDraft?.tokenLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, tokenLimit: event.target.value })} />
                 </div>
                 <div className="grid gap-1.5 sm:col-span-2">
                   <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.consumedTokens")}</span>
                   <div className="flex items-center gap-2">
                     <Input
-                      type="number"
-                      min={0}
-                      step={1}
+                      type="text"
+                      inputMode="decimal"
                       placeholder="0"
                       value={grantDraft?.consumedTokens || ""}
                       onChange={(event) => grantDraft && setGrantDraft({
@@ -858,8 +861,8 @@ export function ShareUserGrantsEditor({
                   {editingEmail && value[editingEmail] ? (
                     <p className="text-xs text-muted-foreground">
                       {t("dashboard.userLimit.consumedHint", {
-                        effective: formatNumber(currentGrantTokens(value[editingEmail])),
-                        observed: formatNumber(observedGrantTokens(value[editingEmail])),
+                        effective: formatTokenMillions(currentGrantTokens(value[editingEmail])),
+                        observed: formatTokenMillions(observedGrantTokens(value[editingEmail])),
                       })}
                     </p>
                   ) : (
@@ -978,8 +981,8 @@ export function ShareUserGrantsEditor({
                   </Checkbox.Content>
                 </Checkbox>
                 <Input
-                  type="number"
-                  min={1}
+                  type="text"
+                  inputMode="decimal"
                   disabled={!batchDraft?.applyTokenLimit}
                   placeholder={t("common.unlimited")}
                   value={batchDraft?.tokenLimit || ""}
@@ -1040,9 +1043,8 @@ export function ShareUserGrantsEditor({
                 </Checkbox>
                 <div className="flex items-center gap-2">
                   <Input
-                    type="number"
-                    min={0}
-                    step={1}
+                    type="text"
+                    inputMode="decimal"
                     disabled={!batchDraft?.applyConsumedTokens}
                     placeholder="0"
                     value={batchDraft?.consumedTokens || ""}

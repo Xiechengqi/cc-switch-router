@@ -39,8 +39,10 @@ jobs:
         run: |
           npm ci
           npm run test:flags
+          npm run test:token-units
           npm run audit:settings-i18n
           npm run audit:market-billing-contract
+          npm run audit:web-token-units
           npm run build
 
       - name: Get version from Cargo.toml

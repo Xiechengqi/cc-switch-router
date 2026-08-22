@@ -7,12 +7,12 @@ import {
   DEFAULT_PARALLEL_LIMIT,
   DEFAULT_TOKEN_LIMIT,
   UNLIMITED_PARALLEL_LIMIT,
-  UNLIMITED_TOKEN_LIMIT,
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
 import { resolveShareCoreApp, shareProviderSupportedApps } from "@/lib/share-app";
 import type { ShareView } from "@/lib/types";
 import { updateShareSettings } from "@/lib/api";
+import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 import { formatDateTime } from "@/lib/utils";
 import {
   buildShareEditDraft,
@@ -177,19 +177,19 @@ export function useShareEditForm({
   const handleTokenUnlimited = React.useCallback((checked: boolean) => {
     onDraftChange((current) => {
       if (checked) {
-        const parsed = Number.parseInt(current.tokenLimitInput, 10);
+        const parsed = millionsInputToTokens(current.tokenLimitInput);
         return {
           ...current,
           tokenLimitUnlimited: true,
           lastFiniteTokenLimit:
-            Number.isFinite(parsed) && parsed > 0 ? parsed : current.lastFiniteTokenLimit || DEFAULT_TOKEN_LIMIT,
-          tokenLimitInput: String(UNLIMITED_TOKEN_LIMIT),
+            parsed != null && parsed > 0 ? parsed : current.lastFiniteTokenLimit || DEFAULT_TOKEN_LIMIT,
+          tokenLimitInput: "",
         };
       }
       return {
         ...current,
         tokenLimitUnlimited: false,
-        tokenLimitInput: String(current.lastFiniteTokenLimit || DEFAULT_TOKEN_LIMIT),
+        tokenLimitInput: tokensToMillionsInput(current.lastFiniteTokenLimit || DEFAULT_TOKEN_LIMIT),
       };
     });
   }, [onDraftChange]);
@@ -220,8 +220,8 @@ export function useShareEditForm({
 
   const descriptionLength = draft.description.trim().length;
   const descriptionInvalid = descriptionLength > 200;
-  const tokenParsed = Number.parseInt(draft.tokenLimitInput, 10);
-  const tokenInvalid = !draft.tokenLimitUnlimited && (!Number.isFinite(tokenParsed) || tokenParsed <= 0);
+  const tokenParsed = millionsInputToTokens(draft.tokenLimitInput);
+  const tokenInvalid = !draft.tokenLimitUnlimited && (tokenParsed == null || tokenParsed <= 0);
   const parallelParsed = Number.parseInt(draft.parallelLimitInput, 10);
   const parallelInvalid =
     !draft.parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed <= 0);
@@ -326,13 +326,13 @@ export function ShareEditFormBody({
       : Number.parseInt(draft.parallelLimitInput, 10),
     tokenLimit: draft.tokenLimitUnlimited
       ? undefined
-      : Number.parseInt(draft.tokenLimitInput, 10),
+      : millionsInputToTokens(draft.tokenLimitInput) ?? undefined,
     tokenPeriod: "lifetime" as const,
     expiresAt: draft.expiresPermanent
       ? undefined
       : new Date(draft.expiresAtInput).getTime(),
   };
-  const tokenParsed = Number.parseInt(draft.tokenLimitInput, 10);
+  const tokenParsed = millionsInputToTokens(draft.tokenLimitInput);
   const parallelParsed = Number.parseInt(draft.parallelLimitInput, 10);
   const ceilingInvalid = form.tokenInvalid || form.parallelInvalid || form.expiryInvalid;
   const expiryDisplay = draft.expiresPermanent
@@ -390,20 +390,19 @@ export function ShareEditFormBody({
             <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={form.tokenInvalid}>
               <div className="grid gap-2">
                 <Input
-                  type="number"
-                  min={1}
-                  step={1}
+                  type="text"
+                  inputMode="decimal"
                   value={draft.tokenLimitInput}
                   disabled={fieldsDisabled || draft.tokenLimitUnlimited}
                   onChange={(event) => {
                     const value = event.target.value;
                     form.onDraftChange((current) => {
-                      const parsed = Number.parseInt(value, 10);
+                      const parsed = millionsInputToTokens(value);
                       return {
                         ...current,
                         tokenLimitInput: value,
                         lastFiniteTokenLimit:
-                          Number.isFinite(parsed) && parsed > 0 ? parsed : current.lastFiniteTokenLimit,
+                          parsed != null && parsed > 0 ? parsed : current.lastFiniteTokenLimit,
                       };
                     });
                   }}

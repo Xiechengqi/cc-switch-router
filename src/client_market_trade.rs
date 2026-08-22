@@ -474,6 +474,7 @@ async fn require_session(
 
 pub(crate) const PAYMENT_PROFILE_REQUIRED_FOR_OFFER: &str =
     "configure payment details on the Account page before setting a Host offer";
+pub(crate) const ERROR_MARKET_PAYMENT_PROFILE_REQUIRED: &str = "MARKET_PAYMENT_PROFILE_REQUIRED";
 
 pub(crate) fn validate_offer(daily_rate_minor: Option<i64>) -> Result<Option<i64>, AppError> {
     match daily_rate_minor {
@@ -548,9 +549,21 @@ pub(crate) fn require_payment_profile_for_offer(
     if payment_profile_has_methods(conn, provider_id)? {
         return Ok(());
     }
-    Err(AppError::BadRequest(
-        PAYMENT_PROFILE_REQUIRED_FOR_OFFER.into(),
+    Err(AppError::coded_conflict(
+        ERROR_MARKET_PAYMENT_PROFILE_REQUIRED,
+        PAYMENT_PROFILE_REQUIRED_FOR_OFFER,
+        serde_json::json!({ "productKind": "client_host" }),
     ))
+}
+
+pub(crate) fn require_paid_offer_setup(
+    conn: &Connection,
+    provider_id: &str,
+    currency: &str,
+) -> Result<(), AppError> {
+    require_payment_profile_for_offer(conn, provider_id)?;
+    crate::market_billing::require_supplier_profile_tx(conn, provider_id, currency)?;
+    Ok(())
 }
 
 fn ensure_payment_profile_can_be_cleared(
@@ -2447,11 +2460,9 @@ impl AppStore {
                     .into(),
             ));
         }
-        // Paid offers require the Host owner's Account payment details so renters
-        // have a way to pay. Free offers do not require a payment profile.
+        // Paid offers require both visible payment details and supplier settlement terms.
         if daily_rate_minor.is_some() {
-            require_payment_profile_for_offer(&tx, &session.user_id)?;
-            crate::market_billing::require_supplier_profile_tx(
+            require_paid_offer_setup(
                 &tx,
                 &session.user_id,
                 currency
@@ -4955,6 +4966,32 @@ mod tests {
             address: None,
             instructions: Some("Wire transfer details".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn paid_host_requires_payment_profile_with_stable_error_code() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let conn = store.conn.lock().await;
+        let error = require_payment_profile_for_offer(&conn, "missing-provider")
+            .expect_err("missing payment profile must block a paid Host offer");
+        assert_eq!(error.code(), Some(ERROR_MARKET_PAYMENT_PROFILE_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn paid_host_requires_supplier_terms_with_stable_error_code() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("supplier-with-payment", "supplier@example.com");
+        store
+            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .await
+            .expect("configure payment profile");
+        let conn = store.conn.lock().await;
+        let error = require_paid_offer_setup(&conn, &supplier.user_id, "USD")
+            .expect_err("missing supplier terms must block a paid Host offer");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_billing::ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED)
+        );
     }
 
     #[tokio::test]

@@ -266,6 +266,7 @@ export const messages = {
     "shareMarket.parallel": "Parallel",
     "shareMarket.parallelShort": "Parallel {value}",
     "shareMarket.tokens": "Token limit",
+    "shareMarket.tokensMillions": "Token limit (M)",
     "shareMarket.period": "Token period",
     "shareMarket.tokenPeriod": "Token quota period",
     "shareMarket.rent": "Rent",
@@ -340,11 +341,47 @@ export const messages = {
     "shareMarket.confirm.deleteFailedDescription":
       "The failed seat will be hidden from this listing. Rental, billing, control, and audit history remains available.",
     "shareMarket.error.positiveInteger": "{field} must be a positive integer.",
+    "shareMarket.error.positiveMillions":
+      "{field} must be a positive M amount with no more than six decimal places.",
     "shareMarket.error.price":
       "Price must be greater than zero with no more than two decimal places.",
+    "shareMarket.error.priceRange": "Daily price cannot exceed USD 1,000,000.00.",
     "shareMarket.error.currency": "Currency must be USD.",
     "shareMarket.error.serviceDuration":
       "Service term must be 1 to 365 days, or have no fixed end date.",
+    "shareMarket.error.parallelExceedsShareValue":
+      "Seat parallel limit cannot exceed this Share's limit of {limit}.",
+    "shareMarket.error.paymentRequired":
+      "Add at least one Account payment method before publishing a paid seat.",
+    "shareMarket.error.settlementRequired":
+      "Configure USD supplier settlement terms before publishing a paid seat.",
+    "shareMarket.error.temporarilyUnavailable":
+      "Share Market is temporarily unavailable. Try again shortly.",
+    "shareMarket.error.shareInactive": "Activate this Share before listing it.",
+    "shareMarket.error.publicAccessEnabled":
+      "Turn off public free access before listing this Share in the market.",
+    "shareMarket.error.pendingShareEdit":
+      "Wait for the pending public-access change to finish before listing this Share.",
+    "shareMarket.error.alreadyListed": "This Share is already listed.",
+    "shareMarket.error.activeRentals":
+      "This Share still has active market rentals and cannot be relisted yet.",
+    "shareMarket.error.unsupportedPeriod":
+      "This Client does not support the selected Token period.",
+    "shareMarket.error.parallelExceedsShare":
+      "The seat parallel limit exceeds the Share-wide limit.",
+    "shareMarket.error.seatLimit": "This listing already has the maximum number of seats.",
+    "shareMarket.error.offerChanged":
+      "The seat offer changed. Reload it and review the latest terms.",
+    "shareMarket.error.seatNotEditable":
+      "Reclaim this seat before changing its offer.",
+    "shareMarket.error.shareChanged":
+      "This Share is no longer active or owned by this account.",
+    "shareMarket.error.ownerRequired": "Only the Share owner can perform this action.",
+    "shareMarket.error.notFound": "This Share Market record no longer exists.",
+    "shareMarket.error.conflict":
+      "The Share Market state changed. Reload and try again.",
+    "shareMarket.error.requestFailed":
+      "The Share Market request failed. Check your connection and try again.",
     "shareMarket.priceChange.action": "Change price",
     "shareMarket.priceChange.title": "Propose a new daily price",
     "shareMarket.priceChange.current": "Current price: {amount} / day",
@@ -376,6 +413,26 @@ export const messages = {
     "shareMarket.dialog.amount": "Daily price",
     "shareMarket.dialog.currency": "Currency",
     "shareMarket.dialog.unlimited": "Unlimited",
+    "shareMarket.dialog.shareCapacity": "Share-wide ceiling",
+    "shareMarket.dialog.capacityParallel": "Parallel {value}",
+    "shareMarket.dialog.capacityTokens": "Token {value}",
+    "shareMarket.dialog.blockedTitle": "Shares that cannot be listed",
+    "shareMarket.dialog.blocked.alreadyListed": "Already listed or still rented",
+    "shareMarket.dialog.blocked.freeAccess": "Public free access is enabled",
+    "shareMarket.dialog.blocked.inactive": "Share is not active",
+    "shareMarket.dialog.blocked.unknown": "Share is not currently eligible",
+    "shareMarket.dialog.manageShare": "Manage Share",
+    "shareMarket.paidReadiness.checking": "Checking paid-offer setup…",
+    "shareMarket.paidReadiness.failed":
+      "Paid-offer setup could not be checked. Retry before publishing.",
+    "shareMarket.paidReadiness.ready": "Paid-offer setup is ready.",
+    "shareMarket.paidReadiness.title": "Complete paid-offer setup",
+    "shareMarket.paidReadiness.paymentReady": "Account payment method configured",
+    "shareMarket.paidReadiness.paymentMissing": "Account payment method missing",
+    "shareMarket.paidReadiness.settlementReady": "USD settlement terms configured",
+    "shareMarket.paidReadiness.settlementMissing": "USD settlement terms missing",
+    "shareMarket.paidReadiness.goPayments": "Configure payment methods",
+    "shareMarket.paidReadiness.goSettlement": "Configure USD settlement terms",
     "shareMarket.serviceDuration.label": "Service term",
     "shareMarket.serviceDuration.fixed": "Fixed term",
     "shareMarket.serviceDuration.permanent": "No fixed end date",
@@ -809,8 +866,15 @@ export const messages = {
       "Blocked by fingerprint or installation binding checks. Inspect the host before retrying.",
     "clientMarket.offerRequiresPayment":
       "Set up payment details on the Account page before publishing a paid Host offer.",
+    "clientMarket.offerRequiresSettlement":
+      "Configure USD supplier settlement terms before publishing a paid Host offer.",
+    "clientMarket.offerSetupChecking": "Checking paid Host offer setup…",
+    "clientMarket.offerSetupFailed":
+      "Paid Host offer setup could not be checked. Retry before publishing.",
     "clientMarket.offerRequiresBilling":
-      "Paid Host offers require payment details and a USD payment grace policy.",
+      "Paid Host offers require payment details and USD supplier settlement terms.",
+    "clientMarket.offerUpdateFailed":
+      "The Host offer could not be updated. Check the setup and try again.",
     "clientMarket.goToBilling": "Configure market billing",
     "clientMarket.goToAccountPayment": "Go to Account → Payment details",
     "clientMarket.hostErrorGuidance.provisioningFailed":
@@ -1326,6 +1390,12 @@ export const messages = {
     "marketReadiness.payment.detail":
       "{methods} payment method(s) and {contacts} contact route(s) are visible to buyers when payment or approval is needed.",
     "marketReadiness.payment.action": "Manage payment details",
+    "marketReadiness.settlement.title": "USD supplier settlement terms",
+    "marketReadiness.settlement.readyDetail":
+      "{currency} settlement terms are configured for paid Share and Client Host offers.",
+    "marketReadiness.settlement.missingDetail":
+      "Configure {currency} settlement terms before publishing paid Share or Client Host offers.",
+    "marketReadiness.settlement.action": "Configure settlement terms",
     "marketReadiness.access.title": "Buyer access and credit",
     "marketReadiness.access.detail":
       "{buyers} active trusted buyer relationship(s), with free and paid scopes managed independently.",
@@ -2616,7 +2686,7 @@ export const messages = {
     "dashboard.shareSettings.invalidDescription":
       "Description must be 200 characters or fewer.",
     "dashboard.shareSettings.invalidToken":
-      "Token limit must be a positive integer or unlimited.",
+      "Token limit must be a positive M amount with at most six decimal places, or unlimited.",
     "dashboard.shareSettings.invalidParallel":
       "Parallel limit must be a positive integer or unlimited.",
     "dashboard.shareSettings.invalidExpiry": "Expiration time is invalid.",
@@ -2641,7 +2711,7 @@ export const messages = {
     "dashboard.field.ownerEmail": "Owner email",
     "dashboard.field.subdomain": "Subdomain",
     "dashboard.field.freeAccess": "Public free access",
-    "dashboard.field.tokenLimit": "Token limit",
+    "dashboard.field.tokenLimit": "Token limit (M)",
     "dashboard.field.parallelLimit": "Parallel limit",
     "dashboard.field.expiresAt": "Expires at",
     "dashboard.shareCeiling.title": "Share-wide ceiling",
@@ -2684,8 +2754,8 @@ export const messages = {
     "dashboard.userLimit.invalidEmail": "Enter a valid email address.",
     "dashboard.userLimit.duplicateEmail": "This user already exists.",
     "dashboard.userLimit.invalidPolicy":
-      "Limits must be positive integers and expiration must be valid.",
-    "dashboard.userLimit.consumedTokens": "Consumed tokens (current period)",
+      "Parallel limits must be positive integers; Token limits use M with at most six decimal places; expiration must be valid.",
+    "dashboard.userLimit.consumedTokens": "Consumed tokens (M, current period)",
     "dashboard.userLimit.consumedHint":
       "Effective {effective}; saving uses this as the baseline and continues adding new requests. Observed {observed}.",
     "dashboard.userLimit.newConsumedHint":
@@ -2695,7 +2765,7 @@ export const messages = {
     "dashboard.userLimit.consumedBelowObserved":
       "Consumed tokens cannot be below the current observed value ({observed}).",
     "dashboard.userLimit.invalidUsage":
-      "Consumed tokens must be an integer greater than or equal to 0.",
+      "Consumed tokens must be an M amount at or above 0 with at most six decimal places.",
     "dashboard.userLimit.empty": "No user limit configuration.",
     "dashboard.userLimit.permanent": "Permanent",
     "dashboard.userLimit.parallel": "Parallel",
@@ -3049,6 +3119,7 @@ export const messages = {
     "shareMarket.parallel": "并发限制",
     "shareMarket.parallelShort": "并发 {value}",
     "shareMarket.tokens": "Token 限额",
+    "shareMarket.tokensMillions": "Token 限额（M）",
     "shareMarket.period": "Token 周期",
     "shareMarket.tokenPeriod": "Token 限额周期",
     "shareMarket.rent": "租用",
@@ -3122,10 +3193,46 @@ export const messages = {
     "shareMarket.confirm.deleteFailedDescription":
       "该失败拼车位会从挂售中隐藏；租用、账务、控制和审计历史都会保留。",
     "shareMarket.error.positiveInteger": "{field} 必须是正整数。",
+    "shareMarket.error.positiveMillions":
+      "{field} 必须是正数百万 Token（M），且最多保留 6 位小数。",
     "shareMarket.error.price": "价格必须大于 0，且最多保留两位小数。",
+    "shareMarket.error.priceRange": "每日价格不能超过 USD 1,000,000.00。",
     "shareMarket.error.currency": "币种仅支持 USD。",
     "shareMarket.error.serviceDuration":
       "服务期限必须为 1 至 365 天，或选择无固定期限。",
+    "shareMarket.error.parallelExceedsShareValue":
+      "拼车位并发限制不能超过该 Share 的总上限 {limit}。",
+    "shareMarket.error.paymentRequired":
+      "发布付费拼车位前，请先在账户中添加至少一种收款方式。",
+    "shareMarket.error.settlementRequired":
+      "发布付费拼车位前，请先配置 USD 供应商结算条款。",
+    "shareMarket.error.temporarilyUnavailable":
+      "Share Market 暂时不可用，请稍后重试。",
+    "shareMarket.error.shareInactive": "请先启用该 Share，再发布挂售。",
+    "shareMarket.error.publicAccessEnabled":
+      "请先关闭公开免费使用，再将该 Share 发布到市场。",
+    "shareMarket.error.pendingShareEdit":
+      "公开访问设置仍在应用中，请等待完成后再发布挂售。",
+    "shareMarket.error.alreadyListed": "该 Share 已经挂售。",
+    "shareMarket.error.activeRentals":
+      "该 Share 仍有进行中的市场租用，暂时不能重新挂售。",
+    "shareMarket.error.unsupportedPeriod":
+      "该 Client 不支持所选 Token 周期。",
+    "shareMarket.error.parallelExceedsShare":
+      "拼车位并发限制超过了 Share 总并发上限。",
+    "shareMarket.error.seatLimit": "该挂售的拼车位数量已达上限。",
+    "shareMarket.error.offerChanged":
+      "拼车位报价已变化，请刷新并复核最新条款。",
+    "shareMarket.error.seatNotEditable":
+      "请先回收该拼车位，再修改其报价。",
+    "shareMarket.error.shareChanged":
+      "该 Share 已不再启用，或已不属于当前账户。",
+    "shareMarket.error.ownerRequired": "只有 Share Owner 可以执行此操作。",
+    "shareMarket.error.notFound": "该 Share Market 记录已不存在。",
+    "shareMarket.error.conflict":
+      "Share Market 状态已变化，请刷新后重试。",
+    "shareMarket.error.requestFailed":
+      "Share Market 请求失败，请检查网络后重试。",
     "shareMarket.priceChange.action": "调整价格",
     "shareMarket.priceChange.title": "提议新的每日价格",
     "shareMarket.priceChange.current": "当前价格：{amount} / 天",
@@ -3155,6 +3262,26 @@ export const messages = {
     "shareMarket.dialog.amount": "每日价格",
     "shareMarket.dialog.currency": "币种",
     "shareMarket.dialog.unlimited": "不限",
+    "shareMarket.dialog.shareCapacity": "Share 总上限",
+    "shareMarket.dialog.capacityParallel": "并发 {value}",
+    "shareMarket.dialog.capacityTokens": "Token {value}",
+    "shareMarket.dialog.blockedTitle": "暂时无法挂售的 Share",
+    "shareMarket.dialog.blocked.alreadyListed": "已经挂售或仍有租用",
+    "shareMarket.dialog.blocked.freeAccess": "已开启公开免费使用",
+    "shareMarket.dialog.blocked.inactive": "Share 未启用",
+    "shareMarket.dialog.blocked.unknown": "当前不满足挂售条件",
+    "shareMarket.dialog.manageShare": "管理 Share",
+    "shareMarket.paidReadiness.checking": "正在检查付费挂售配置…",
+    "shareMarket.paidReadiness.failed":
+      "无法检查付费挂售配置，请重试后再发布。",
+    "shareMarket.paidReadiness.ready": "付费挂售配置已就绪。",
+    "shareMarket.paidReadiness.title": "请完成付费挂售配置",
+    "shareMarket.paidReadiness.paymentReady": "账户收款方式已配置",
+    "shareMarket.paidReadiness.paymentMissing": "缺少账户收款方式",
+    "shareMarket.paidReadiness.settlementReady": "USD 结算条款已配置",
+    "shareMarket.paidReadiness.settlementMissing": "缺少 USD 结算条款",
+    "shareMarket.paidReadiness.goPayments": "配置收款方式",
+    "shareMarket.paidReadiness.goSettlement": "配置 USD 结算条款",
     "shareMarket.serviceDuration.label": "服务期限",
     "shareMarket.serviceDuration.fixed": "固定期限",
     "shareMarket.serviceDuration.permanent": "无固定期限",
@@ -3575,8 +3702,15 @@ export const messages = {
       "被指纹或不一致绑定拦截。请先检查主机再重试。",
     "clientMarket.offerRequiresPayment":
       "设置付费报价前，请先到账户页配置收款信息。",
+    "clientMarket.offerRequiresSettlement":
+      "发布付费 Host 前，请先配置 USD 供应商结算条款。",
+    "clientMarket.offerSetupChecking": "正在检查付费 Host 挂售配置…",
+    "clientMarket.offerSetupFailed":
+      "无法检查付费 Host 挂售配置，请重试后再发布。",
     "clientMarket.offerRequiresBilling":
-      "发布付费 Host 前，必须配置收款信息以及 USD 付款宽限。",
+      "发布付费 Host 前，必须配置收款信息以及 USD 供应商结算条款。",
+    "clientMarket.offerUpdateFailed":
+      "Host 报价更新失败，请检查配置后重试。",
     "clientMarket.goToBilling": "配置市场账务",
     "clientMarket.goToAccountPayment": "前往账户 → 收款信息",
     "clientMarket.hostErrorGuidance.provisioningFailed":
@@ -4067,6 +4201,12 @@ export const messages = {
     "marketReadiness.payment.detail":
       "已配置 {methods} 种收款方式和 {contacts} 个联系渠道，会在付款或申请准入时向买家展示。",
     "marketReadiness.payment.action": "管理收款信息",
+    "marketReadiness.settlement.title": "USD 供应商结算条款",
+    "marketReadiness.settlement.readyDetail":
+      "已配置 {currency} 结算条款，可用于付费 Share 和 Client Host 挂售。",
+    "marketReadiness.settlement.missingDetail":
+      "发布付费 Share 或 Client Host 前，请先配置 {currency} 结算条款。",
+    "marketReadiness.settlement.action": "配置结算条款",
     "marketReadiness.access.title": "买家准入与授信",
     "marketReadiness.access.detail":
       "当前有 {buyers} 个有效可信买家关系，免费和付费作用域分别管理。",
@@ -5308,7 +5448,8 @@ export const messages = {
       "已保存。客户端当前离线，修改已入队，将在其重新连接后生效。",
     "dashboard.shareEditApplied": "已保存，修改已生效。",
     "dashboard.shareSettings.invalidDescription": "描述最多 200 字。",
-    "dashboard.shareSettings.invalidToken": "Token 限制必须是正整数，或设为不限。",
+    "dashboard.shareSettings.invalidToken":
+      "Token 限制必须是正数百万 Token（M），最多保留 6 位小数，或设为不限。",
     "dashboard.shareSettings.invalidParallel": "并发限制必须是正整数，或设为不限。",
     "dashboard.shareSettings.invalidExpiry": "过期时间无效。",
     "dashboard.shareEditLocked": "该 Share 正在应用另一项修改，请等待完成后再编辑。",
@@ -5330,7 +5471,7 @@ export const messages = {
     "dashboard.field.ownerEmail": "Owner Email",
     "dashboard.field.subdomain": "子域名",
     "dashboard.field.freeAccess": "公开免费使用",
-    "dashboard.field.tokenLimit": "Token 限制",
+    "dashboard.field.tokenLimit": "Token 限制（M）",
     "dashboard.field.parallelLimit": "并发限制",
     "dashboard.field.expiresAt": "过期时间",
     "dashboard.shareCeiling.title": "Share 总上限",
@@ -5373,8 +5514,8 @@ export const messages = {
     "dashboard.userLimit.invalidEmail": "请输入有效邮箱。",
     "dashboard.userLimit.duplicateEmail": "该用户已存在。",
     "dashboard.userLimit.invalidPolicy":
-      "限制必须为正整数，且到期时间必须有效。",
-    "dashboard.userLimit.consumedTokens": "已消耗 Token（当前周期）",
+      "并发限制必须是正整数；Token 限制以 M 填写且最多保留 6 位小数；到期时间必须有效。",
+    "dashboard.userLimit.consumedTokens": "已消耗 Token（M，当前周期）",
     "dashboard.userLimit.consumedHint":
       "当前有效 {effective}；保存后以该值为基线，并继续累加新请求。当前观测值 {observed}。",
     "dashboard.userLimit.newConsumedHint": "可填写 0；留空表示不创建手工重基线。",
@@ -5382,7 +5523,8 @@ export const messages = {
     "dashboard.userLimit.rebaseTarget": "基线 {value}",
     "dashboard.userLimit.consumedBelowObserved":
       "已消耗 Token 不能低于当前观测值（{observed}）。",
-    "dashboard.userLimit.invalidUsage": "已消耗 Token 必须是大于等于 0 的整数。",
+    "dashboard.userLimit.invalidUsage":
+      "已消耗 Token 必须是大于等于 0 的 M 数值，且最多保留 6 位小数。",
     "dashboard.userLimit.empty": "暂无用户限制配置。",
     "dashboard.userLimit.permanent": "永久",
     "dashboard.userLimit.parallel": "并发",

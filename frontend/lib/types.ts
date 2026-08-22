@@ -2423,6 +2423,8 @@ export type ShareMarketOwnedShare = {
   ownerEmail: string;
   supportedApps: string[];
   shareStatus: string;
+  parallelLimit?: number;
+  tokenLimit?: number;
   alreadyListed: boolean;
   freeAccess: boolean;
   supportedUserTokenPeriods: ShareTokenPeriod[];

@@ -1,4 +1,5 @@
 import type { AppLocale, MessageKey } from "@/lib/i18n";
+import { ApiError } from "@/lib/api";
 import { formatUsdMoney } from "@/lib/market-money";
 import {
   isApiProviderRuntime,
@@ -19,6 +20,7 @@ import type {
   ShareTokenPeriod,
   ShareUpstreamProvider,
 } from "@/lib/types";
+import { formatTokenMillions } from "@/lib/token-units";
 
 export const PROVIDER_FAMILY_ORDER: ShareMarketProviderFamily[] = [
   "anthropic",
@@ -48,6 +50,51 @@ export const PROVIDER_FAMILY_KEYS: Record<ShareMarketProviderFamily, MessageKey>
 
 export const CORE_SHARE_APPS = ["claude", "codex", "gemini"] as const;
 export type CoreShareApp = (typeof CORE_SHARE_APPS)[number];
+
+type MarketTranslate = (key: MessageKey, values?: Record<string, string | number>) => string;
+
+export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
+  if (!(reason instanceof ApiError)) {
+    return t("shareMarket.error.requestFailed");
+  }
+
+  const coded: Partial<Record<string, MessageKey>> = {
+    SHARE_MARKET_PAYMENT_PROFILE_REQUIRED: "shareMarket.error.paymentRequired",
+    MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED: "shareMarket.error.settlementRequired",
+    DATABASE_UNAVAILABLE: "shareMarket.error.temporarilyUnavailable",
+  };
+  const codeKey = reason.code ? coded[reason.code] : undefined;
+  if (codeKey) return t(codeKey);
+
+  const message = reason.message.toLowerCase();
+  const known: Array<[string, MessageKey]> = [
+    ["configure account payment details", "shareMarket.error.paymentRequired"],
+    ["configure usd settlement terms", "shareMarket.error.settlementRequired"],
+    ["share must be active", "shareMarket.error.shareInactive"],
+    ["disable public free access", "shareMarket.error.publicAccessEnabled"],
+    ["pending public free access edit", "shareMarket.error.pendingShareEdit"],
+    ["share is already listed", "shareMarket.error.alreadyListed"],
+    ["still has active share market rentals", "shareMarket.error.activeRentals"],
+    ["token period is unsupported", "shareMarket.error.unsupportedPeriod"],
+    ["token period unsupported", "shareMarket.error.unsupportedPeriod"],
+    ["seat uses a token period unsupported", "shareMarket.error.unsupportedPeriod"],
+    ["exceeds share concurrency", "shareMarket.error.parallelExceedsShare"],
+    ["listing seat limit reached", "shareMarket.error.seatLimit"],
+    ["seat offer changed", "shareMarket.error.offerChanged"],
+    ["must be reclaimed before editing", "shareMarket.error.seatNotEditable"],
+    ["listing share is no longer", "shareMarket.error.shareChanged"],
+    ["only the share owner", "shareMarket.error.ownerRequired"],
+    ["only listing owner", "shareMarket.error.ownerRequired"],
+  ];
+  const messageKey = known.find(([fragment]) => message.includes(fragment))?.[1];
+  if (messageKey) return t(messageKey);
+  if (reason.status === 401) return t("shareMarket.loginRequired");
+  if (reason.status === 403) return t("shareMarket.error.ownerRequired");
+  if (reason.status === 404) return t("shareMarket.error.notFound");
+  if (reason.status === 409) return t("shareMarket.error.conflict");
+  if (reason.status >= 500) return t("shareMarket.error.temporarilyUnavailable");
+  return t("shareMarket.error.requestFailed");
+}
 
 export function isCoreShareApp(value: string): value is CoreShareApp {
   return CORE_SHARE_APPS.includes(value as CoreShareApp);
@@ -102,7 +149,7 @@ export function formatTokenLimit(
   periodLabel: (period: ShareTokenPeriod) => string,
 ) {
   if (seat.tokenLimit == null) return unlimitedLabel;
-  return `${new Intl.NumberFormat(locale).format(seat.tokenLimit)} · ${periodLabel(seat.tokenPeriod)}`;
+  return `${formatTokenMillions(seat.tokenLimit, locale)} · ${periodLabel(seat.tokenPeriod)}`;
 }
 
 export function capabilityModelLabel(

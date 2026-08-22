@@ -2,15 +2,16 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
-import { Loader2 } from "lucide-react";
+import { Loader2, RefreshCw } from "lucide-react";
 import { SegmentedControl } from "@/components/common/segmented-control";
+import { usePaidOfferReadiness } from "@/components/dashboard/share-market/paid-offer-readiness";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getAccountPaymentProfile, getMarketBillingDashboard, updateClientMarketHostOffer } from "@/lib/api";
+import { updateClientMarketHostOffer } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_PAYMENTS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { ClientMarketHost } from "@/lib/types";
 import {
-  isPaymentProfileRequiredError,
+  hostPaidOfferPrerequisiteError,
   parseFreeDurationDays,
   parseHostOffer,
 } from "@/components/dashboard/client-market/host-utils";
@@ -39,8 +40,12 @@ export function HostOfferDialog({
   );
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
-  const [paymentReady, setPaymentReady] = React.useState<boolean | null>(null);
-  const [billingCurrencies, setBillingCurrencies] = React.useState<string[] | null>(null);
+  const paidReadiness = usePaidOfferReadiness(open && pricing === "paid");
+  const paidOfferLoading = paidReadiness.status === "idle" ||
+    paidReadiness.status === "loading";
+  const paidOfferReady = paidReadiness.status === "loaded" &&
+    paidReadiness.paymentReady &&
+    paidReadiness.settlementReady;
 
   React.useEffect(() => {
     if (!open) return;
@@ -49,25 +54,6 @@ export function HostOfferDialog({
     setFreeDurationMode(host.freeDurationDays == null ? "permanent" : "fixed");
     setFreeDurationDays(String(host.freeDurationDays ?? 1));
     setError("");
-    setPaymentReady(null);
-    setBillingCurrencies(null);
-    let cancelled = false;
-    void Promise.all([getAccountPaymentProfile(), getMarketBillingDashboard()])
-      .then(([profile, billing]) => {
-        if (!cancelled) {
-          setPaymentReady(profile.methods.length > 0);
-          setBillingCurrencies(billing.supplierProfiles.map((item) => item.currency));
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setPaymentReady(false);
-          setBillingCurrencies([]);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [host.dailyRateMinor, host.freeDurationDays, open]);
 
   const save = async () => {
@@ -89,12 +75,16 @@ export function HostOfferDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(MARKET_CURRENCY))) {
+    if (pricing === "paid" && (!offer.dailyRateMinor || !paidOfferReady)) {
       if (!offer.dailyRateMinor) {
         setError(t("clientMarket.offerInvalid"));
         return;
       }
-      setError(t("clientMarket.offerRequiresBilling"));
+      setError(t(paidReadiness.status === "error"
+        ? "clientMarket.offerSetupFailed"
+        : paidOfferLoading
+          ? "clientMarket.offerSetupChecking"
+          : "clientMarket.offerRequiresBilling"));
       return;
     }
     setBusy(true);
@@ -105,8 +95,10 @@ export function HostOfferDialog({
       onSaved();
       onOpenChange(false);
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      setError(isPaymentProfileRequiredError(message) ? t("clientMarket.offerRequiresPayment") : message);
+      setError(
+        hostPaidOfferPrerequisiteError(reason, t) ||
+          t("clientMarket.offerUpdateFailed"),
+      );
     } finally {
       setBusy(false);
     }
@@ -117,14 +109,29 @@ export function HostOfferDialog({
       <Modal.Container placement="center">
         <Modal.Dialog className="light w-[min(460px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
           <Modal.Header><Modal.Heading>{t("clientMarket.editOffer")}</Modal.Heading></Modal.Header>
-          <Modal.Body className="grid gap-4">
+          <Modal.Body className="grid max-h-[75vh] gap-4 overflow-y-auto">
             <p className="text-sm text-muted-foreground">{t("clientMarket.editOfferHint")}</p>
-            {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(MARKET_CURRENCY))) ? (
-              <div className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
+            {pricing === "paid" && paidOfferLoading ? (
+              <div role="status" className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-600">
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                {t("clientMarket.offerSetupChecking")}
+              </div>
+            ) : null}
+            {pricing === "paid" && paidReadiness.status === "error" ? (
+              <div role="alert" className="flex flex-wrap items-center gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-3 text-sm text-rose-800">
+                <span className="min-w-[12rem] flex-1">{t("clientMarket.offerSetupFailed")}</span>
+                <Button className="whitespace-nowrap" size="sm" variant="outline" onClick={() => void paidReadiness.reload()}>
+                  <RefreshCw className="h-4 w-4" />
+                  {t("common.retry")}
+                </Button>
+              </div>
+            ) : null}
+            {pricing === "paid" && paidReadiness.status === "loaded" && !paidOfferReady ? (
+              <div role="alert" className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
                 <p>{t("clientMarket.offerRequiresBilling")}</p>
                 <div className="flex flex-wrap gap-3">
-                  <a href={DASHBOARD_ACCOUNT_BILLING_PATH} className="font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a>
-                  <a href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className="font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a>
+                  {!paidReadiness.settlementReady ? <a href={`${DASHBOARD_ACCOUNT_BILLING_PATH}?tab=receivables`} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
+                  {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
                 </div>
               </div>
             ) : null}
@@ -175,7 +182,7 @@ export function HostOfferDialog({
           </Modal.Body>
           <Modal.Footer>
             <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-            <Button variant="primary" isDisabled={busy || (pricing === "paid" && (paymentReady === null || billingCurrencies === null))} onClick={() => void save()}>
+            <Button variant="primary" isDisabled={busy || (pricing === "paid" && !paidOfferReady)} onClick={() => void save()}>
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
               {t("common.save")}
             </Button>

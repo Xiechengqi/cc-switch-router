@@ -28,6 +28,8 @@ use crate::store::AppStore;
 const TRIAL_HOURS: i64 = crate::market_billing::TRIAL_SECONDS / 3_600;
 const SERVICE_CYCLE_SECS: u64 = 5;
 const MAX_SEATS_PER_LISTING: usize = 20;
+pub(crate) const ERROR_SHARE_MARKET_PAYMENT_PROFILE_REQUIRED: &str =
+    "SHARE_MARKET_PAYMENT_PROFILE_REQUIRED";
 const MAX_SERVICE_DURATION_DAYS: u32 = 365;
 const MAX_CONTROL_ATTEMPTS: i64 = 8;
 const MAX_SUBSCRIPTIONS_PER_RECONCILE: usize = 200;
@@ -336,6 +338,10 @@ pub struct OwnedShareView {
     pub owner_email: String,
     pub supported_apps: Vec<String>,
     pub share_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u64>,
     pub already_listed: bool,
     pub free_access: bool,
     pub supported_user_token_periods: Vec<ShareTokenPeriod>,
@@ -3229,6 +3235,7 @@ impl AppStore {
                 "SELECT s.share_id, s.share_name, s.app_type,
                         COALESCE(s.subdomain, ''), COALESCE(s.owner_email, ''),
                         COALESCE(s.bindings_json, '{}'), s.share_status,
+                        s.parallel_limit, s.token_limit,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM share_market_listings listing
                             WHERE listing.share_id = s.share_id
@@ -3251,7 +3258,9 @@ impl AppStore {
             .query_map(params![session.email], |row| {
                 let app_type: String = row.get(2)?;
                 let bindings_json: String = row.get(5)?;
-                let periods_json: String = row.get(9)?;
+                let parallel_limit: i64 = row.get(7)?;
+                let token_limit: i64 = row.get(8)?;
+                let periods_json: String = row.get(11)?;
                 Ok(OwnedShareView {
                     share_id: row.get(0)?,
                     share_name: row.get(1)?,
@@ -3260,8 +3269,14 @@ impl AppStore {
                     owner_email: row.get(4)?,
                     supported_apps: supported_share_apps(&bindings_json, &app_type),
                     share_status: row.get(6)?,
-                    already_listed: row.get::<_, i64>(7)? != 0,
-                    free_access: row.get::<_, i64>(8)? != 0,
+                    parallel_limit: (parallel_limit >= 0)
+                        .then(|| u32::try_from(parallel_limit).ok())
+                        .flatten(),
+                    token_limit: (token_limit >= 0)
+                        .then(|| u64::try_from(token_limit).ok())
+                        .flatten(),
+                    already_listed: row.get::<_, i64>(9)? != 0,
+                    free_access: row.get::<_, i64>(10)? != 0,
                     supported_user_token_periods: serde_json::from_str(&periods_json)
                         .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]),
                 })
@@ -3761,8 +3776,10 @@ fn ensure_payment_profile_tx(tx: &Transaction<'_>, owner_user_id: &str) -> Resul
         .and_then(|value| serde_json::from_str::<Vec<PaymentMethod>>(value).ok())
         .is_some_and(|methods| !methods.is_empty());
     if !has_methods {
-        return Err(AppError::Conflict(
-            "configure Account payment details before adding a paid Share seat".into(),
+        return Err(AppError::coded_conflict(
+            ERROR_SHARE_MARKET_PAYMENT_PROFILE_REQUIRED,
+            "configure Account payment details before adding a paid Share seat",
+            serde_json::json!({ "productKind": "share" }),
         ));
     }
     Ok(())
@@ -9080,6 +9097,19 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn paid_share_requires_payment_profile_with_stable_error_code() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let conn = store.conn.lock().await;
+        let tx = conn.transaction().expect("start payment profile check");
+        let error = ensure_payment_profile_tx(&tx, "missing-owner")
+            .expect_err("missing payment profile must block a paid Share offer");
+        assert_eq!(
+            error.code(),
+            Some(ERROR_SHARE_MARKET_PAYMENT_PROFILE_REQUIRED)
+        );
+    }
+
     #[test]
     fn private_etag_json_revalidates_matching_strong_and_weak_tags() {
         let response = private_etag_json(&HeaderMap::new(), &serde_json::json!({ "value": 1 }))
@@ -10975,6 +11005,8 @@ mod tests {
         assert_eq!(shares[0].subdomain, "share-options-route");
         assert_eq!(shares[0].owner_email, owner.email);
         assert_eq!(shares[0].supported_apps, vec!["claude", "gemini"]);
+        assert_eq!(shares[0].parallel_limit, Some(3));
+        assert_eq!(shares[0].token_limit, None);
         assert!(!shares[0].free_access);
     }
 

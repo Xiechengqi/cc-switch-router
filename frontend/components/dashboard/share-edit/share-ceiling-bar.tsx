@@ -5,7 +5,7 @@ import { Pencil } from "lucide-react";
 import * as React from "react";
 
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
-import { compactTokens } from "@/lib/utils";
+import { formatTokenMillions } from "@/lib/token-units";
 
 export function formatShareCeilingToken(
   value: number | undefined | null,
@@ -14,7 +14,7 @@ export function formatShareCeilingToken(
 ) {
   if (unlimited) return t("common.unlimited");
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    return compactTokens(value);
+    return formatTokenMillions(value);
   }
   return "—";
 }

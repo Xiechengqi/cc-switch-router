@@ -26,6 +26,7 @@ import {
 } from "@/components/dashboard/share-edit/share-ceiling-bar";
 import { FieldGroup } from "@/components/dashboard/share-edit/share-edit-shared";
 import { compactTokens, formatDateTime } from "@/lib/utils";
+import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 
 function statusTone(online: boolean) {
   return online ? "success" : "default";
@@ -134,6 +135,9 @@ function ShareSettingsForm({
   const [expiryPermanent, setExpiryPermanent] = React.useState(() => draft.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(draft.expiresAt).getUTCFullYear() >= 2099);
   const [expiryLocal, setExpiryLocal] = React.useState(() => toDateTimeLocal(draft.expiresAt));
   const [tokenUnlimited, setTokenUnlimited] = React.useState(draft.tokenLimit === UNLIMITED_TOKEN_LIMIT);
+  const [tokenLimitInput, setTokenLimitInput] = React.useState(() =>
+    draft.tokenLimit === UNLIMITED_TOKEN_LIMIT ? "" : tokensToMillionsInput(draft.tokenLimit),
+  );
   const [parallelUnlimited, setParallelUnlimited] = React.useState(draft.parallelLimit === UNLIMITED_PARALLEL_LIMIT);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState("");
@@ -145,6 +149,9 @@ function ShareSettingsForm({
     setExpiryPermanent(next.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(next.expiresAt).getUTCFullYear() >= 2099);
     setExpiryLocal(toDateTimeLocal(next.expiresAt));
     setTokenUnlimited(next.tokenLimit === UNLIMITED_TOKEN_LIMIT);
+    setTokenLimitInput(
+      next.tokenLimit === UNLIMITED_TOKEN_LIMIT ? "" : tokensToMillionsInput(next.tokenLimit),
+    );
     setParallelUnlimited(next.parallelLimit === UNLIMITED_PARALLEL_LIMIT);
   }, [share]);
 
@@ -152,11 +159,13 @@ function ShareSettingsForm({
     const expiresAt = expiryPermanent ? PERMANENT_EXPIRES_AT_ISO : fromDateTimeLocal(expiryLocal);
     return {
       ...draft,
-      tokenLimit: tokenUnlimited ? UNLIMITED_TOKEN_LIMIT : draft.tokenLimit,
+      tokenLimit: tokenUnlimited
+        ? UNLIMITED_TOKEN_LIMIT
+        : millionsInputToTokens(tokenLimitInput) ?? 0,
       parallelLimit: parallelUnlimited ? UNLIMITED_PARALLEL_LIMIT : draft.parallelLimit,
       expiresAt,
     };
-  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenUnlimited]);
+  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenLimitInput, tokenUnlimited]);
   const fieldErrors = shareSettingsFieldErrors(effectiveDraft);
   const formInvalid = shareSettingsHasFieldErrors(fieldErrors);
   const ceilingInvalid =
@@ -289,11 +298,12 @@ function ShareSettingsForm({
           <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={fieldErrors.tokenLimit}>
             <div className="grid gap-2">
               <Input
-                type="number"
-                value={tokenUnlimited ? "" : String(draft.tokenLimit)}
+                type="text"
+                inputMode="decimal"
+                value={tokenUnlimited ? "" : tokenLimitInput}
                 placeholder={t("common.unlimited")}
                 disabled={!editable || tokenUnlimited}
-                onChange={(event) => setDraft((current) => ({ ...current, tokenLimit: Number.parseInt(event.target.value, 10) || 0 }))}
+                onChange={(event) => setTokenLimitInput(event.target.value)}
               />
               <Checkbox isSelected={tokenUnlimited} isDisabled={!editable} onChange={(value: boolean) => setTokenUnlimited(value)}>
                 <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>

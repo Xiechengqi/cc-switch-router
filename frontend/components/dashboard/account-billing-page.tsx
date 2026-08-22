@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Button, Chip, Modal, toast } from "@heroui/react";
+import { useSearchParams } from "next/navigation";
 import {
   AlertTriangle,
   Ban,
@@ -640,6 +641,7 @@ export function AccountBillingPage() {
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const isAdmin = !!session?.isAdmin;
+  const searchParams = useSearchParams();
   const [dashboard, setDashboard] = React.useState<MarketBillingDashboard | null>(null);
   const [adminDisputes, setAdminDisputes] = React.useState<AdminMarketBillingDispute[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -658,6 +660,19 @@ export function AccountBillingPage() {
   const [profileDirty, setProfileDirty] = React.useState<Record<Currency, boolean>>({
     USD: false,
   });
+
+  React.useEffect(() => {
+    const requested = searchParams.get("tab");
+    if (
+      requested === "todo" ||
+      requested === "payables" ||
+      requested === "receivables" ||
+      requested === "history" ||
+      (requested === "admin" && isAdmin)
+    ) {
+      setTab(requested);
+    }
+  }, [isAdmin, searchParams]);
 
   const load = React.useCallback(async (silent = false) => {
     if (!authed) return;

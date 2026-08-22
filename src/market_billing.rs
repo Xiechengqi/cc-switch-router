@@ -20,6 +20,8 @@ use crate::store::AppStore;
 
 pub const TRIAL_SECONDS: i64 = 12 * 60 * 60;
 pub(crate) const MARKET_CURRENCY: &str = "USD";
+pub(crate) const ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED: &str =
+    "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED";
 pub(crate) const USD_CNY_RATE_SCALE: i64 = 1_000_000;
 pub(crate) const DEFAULT_USD_CNY_RATE_MICROS: i64 = 7 * USD_CNY_RATE_SCALE;
 const MIN_USD_CNY_RATE_MICROS: i64 = USD_CNY_RATE_SCALE / 100;
@@ -1318,9 +1320,11 @@ pub(crate) fn require_supplier_profile_tx(
     .optional()
     .map_err(map_db("read supplier billing profile"))?
     .ok_or_else(|| {
-        AppError::Conflict(format!(
-            "configure {currency} settlement terms before publishing a paid offer"
-        ))
+        AppError::coded_conflict(
+            ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED,
+            format!("configure {currency} settlement terms before publishing a paid offer"),
+            serde_json::json!({ "currency": currency }),
+        )
     })
 }
 
@@ -5407,6 +5411,18 @@ impl AppStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn paid_offer_requires_supplier_terms_with_stable_error_code() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let conn = store.conn.lock().await;
+        let error = require_supplier_profile_tx(&conn, "missing-supplier", MARKET_CURRENCY)
+            .expect_err("missing supplier terms must block a paid offer");
+        assert_eq!(
+            error.code(),
+            Some(ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED)
+        );
+    }
 
     #[test]
     fn usd_cny_rate_parser_is_exact_and_bounded() {

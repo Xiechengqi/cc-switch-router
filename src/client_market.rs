@@ -1391,6 +1391,23 @@ async fn create_host(
             "host note cannot exceed 500 bytes".into(),
         ));
     }
+    let daily_rate_minor = crate::client_market_trade::validate_offer(input.daily_rate_minor)?;
+    let currency =
+        crate::client_market_trade::normalize_offer_currency(daily_rate_minor, input.currency)?;
+    let free_duration_days = crate::client_market_trade::validate_free_duration_days(
+        daily_rate_minor,
+        input.free_duration_days,
+    )?;
+    if daily_rate_minor.is_some() {
+        let conn = state.store.conn.lock().await;
+        crate::client_market_trade::require_paid_offer_setup(
+            &conn,
+            &session.user_id,
+            currency
+                .as_deref()
+                .ok_or_else(|| AppError::Internal("paid Host currency is missing".into()))?,
+        )?;
+    }
     if !state
         .client_market_job_secrets
         .lock()
@@ -1420,17 +1437,6 @@ async fn create_host(
             .await?;
     let intel_json = serde_json::to_string(&intel)
         .map_err(|e| AppError::Internal(format!("serialize host ip intel failed: {e}")))?;
-    let daily_rate_minor = crate::client_market_trade::validate_offer(input.daily_rate_minor)?;
-    let currency =
-        crate::client_market_trade::normalize_offer_currency(daily_rate_minor, input.currency)?;
-    let free_duration_days = crate::client_market_trade::validate_free_duration_days(
-        daily_rate_minor,
-        input.free_duration_days,
-    )?;
-    if daily_rate_minor.is_some() {
-        let conn = state.store.conn.lock().await;
-        crate::client_market_trade::require_payment_profile_for_offer(&conn, &session.user_id)?;
-    }
     state
         .store
         .client_market_ensure_provider(&session.user_id, &owner)
@@ -1636,7 +1642,13 @@ async fn import_one_host(
         )?;
         if daily_rate_minor.is_some() {
             let conn = state.store.conn.lock().await;
-            crate::client_market_trade::require_payment_profile_for_offer(&conn, &provider_id)?;
+            crate::client_market_trade::require_paid_offer_setup(
+                &conn,
+                &provider_id,
+                currency
+                    .as_deref()
+                    .ok_or_else(|| AppError::Internal("paid Host currency is missing".into()))?,
+            )?;
         }
         if let Some(existing_provider) = state
             .store
@@ -6071,7 +6083,7 @@ impl AppStore {
         let id = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
         if daily_rate_minor.is_some() {
-            crate::market_billing::require_supplier_profile_tx(
+            crate::client_market_trade::require_paid_offer_setup(
                 &conn,
                 provider_id,
                 currency

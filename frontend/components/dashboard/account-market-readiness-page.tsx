@@ -6,6 +6,7 @@ import { Chip } from "@heroui/react";
 import {
   ArrowRight,
   CircleAlert,
+  CircleDollarSign,
   ClipboardCheck,
   HandCoins,
   Loader2,
@@ -31,8 +32,9 @@ import type {
   MarketAccessPolicy,
   MarketBillingDashboard,
 } from "@/lib/types";
+import { MARKET_CURRENCY } from "@/lib/market-money";
 
-const ACTION_LINK_CLASS = "inline-flex h-9 shrink-0 items-center gap-2 rounded-md border border-border bg-white px-3 text-sm font-medium text-foreground transition-colors hover:bg-slate-50";
+const ACTION_LINK_CLASS = "inline-flex h-9 shrink-0 items-center gap-2 whitespace-nowrap rounded-md border border-border bg-white px-3 text-sm font-medium text-foreground transition-colors hover:bg-slate-50";
 
 function productLabel(policy: MarketAccessPolicy, t: ReturnType<typeof useLocaleText>["t"]) {
   return policy.productKind === "share"
@@ -93,6 +95,9 @@ export function AccountMarketReadinessPage() {
   if (!authed) return <p className="py-8 text-sm text-muted-foreground">{t("account.signInRequired")}</p>;
 
   const paymentReady = (payment?.methods.length || 0) > 0;
+  const settlementReady = billing?.supplierProfiles.some(
+    (profile) => profile.currency === MARKET_CURRENCY,
+  ) || false;
   const pendingRequests = access?.accessRequests.filter((request) => request.status === "requested").length || 0;
   const activeBuyers = access?.counterparties.filter((counterparty) => counterparty.status === "active").length || 0;
   const payableCount = billing?.accounts.filter((account) => account.isBuyer && ["open", "overdue"].includes(account.openInvoice?.status || "")).length || 0;
@@ -161,6 +166,22 @@ export function AccountMarketReadinessPage() {
             })}</p>
           </div>
           <Link href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className={ACTION_LINK_CLASS}>{t("marketReadiness.payment.action")}<ArrowRight className="h-4 w-4" /></Link>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-4 py-4">
+          <CircleDollarSign className="h-5 w-5 shrink-0 text-muted-foreground" />
+          <div className="min-w-[12rem] flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <strong className="text-sm">{t("marketReadiness.settlement.title")}</strong>
+              <Chip size="sm" variant="soft" className={settlementReady ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-800"}>
+                {settlementReady ? t("marketReadiness.ready") : t("marketReadiness.needsSetup")}
+              </Chip>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              {t(settlementReady ? "marketReadiness.settlement.readyDetail" : "marketReadiness.settlement.missingDetail", { currency: MARKET_CURRENCY })}
+            </p>
+          </div>
+          <Link href={`${DASHBOARD_ACCOUNT_BILLING_PATH}?tab=receivables`} className={ACTION_LINK_CLASS}>{t("marketReadiness.settlement.action")}<ArrowRight className="h-4 w-4" /></Link>
         </div>
 
         <div className="flex flex-wrap items-center gap-4 py-4">

@@ -1,5 +1,6 @@
 import type { ClientMarketHost, ClientMarketHostTransferDocument, HostIpIntel } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
+import { ApiError } from "@/lib/api";
 import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
 
 /**
@@ -481,6 +482,29 @@ export function parseHostOffer(priceValue: string, t: Translate) {
 
 export function isPaymentProfileRequiredError(message: string) {
   return message.toLowerCase().includes("configure payment details on the account page");
+}
+
+export function hostPaidOfferPrerequisiteError(reason: unknown, t: Translate) {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  if (
+    reason instanceof ApiError &&
+    reason.code === "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED"
+  ) {
+    return t("clientMarket.offerRequiresSettlement");
+  }
+  if (
+    reason instanceof ApiError &&
+    reason.code === "MARKET_PAYMENT_PROFILE_REQUIRED"
+  ) {
+    return t("clientMarket.offerRequiresPayment");
+  }
+  if (isPaymentProfileRequiredError(message)) {
+    return t("clientMarket.offerRequiresPayment");
+  }
+  if (message.toLowerCase().includes("configure usd settlement terms")) {
+    return t("clientMarket.offerRequiresSettlement");
+  }
+  return null;
 }
 
 export function cleanupPhaseLabelKey(phase: string): MessageKey {

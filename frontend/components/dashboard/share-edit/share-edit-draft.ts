@@ -7,6 +7,7 @@ import type {
   ShareView,
 } from "@/lib/types";
 import { isRouterShareMarketManagedGrant } from "@/lib/share-settings";
+import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 import {
   DEFAULT_PARALLEL_LIMIT,
   DEFAULT_TOKEN_LIMIT,
@@ -89,7 +90,7 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
   return {
     description: share.description || "",
     freeAccess: share.freeAccess,
-    tokenLimitInput: tokenUnlimited ? String(UNLIMITED_TOKEN_LIMIT) : String(tokenLimit),
+    tokenLimitInput: tokenUnlimited ? "" : tokensToMillionsInput(tokenLimit),
     tokenLimitUnlimited: tokenUnlimited,
     lastFiniteTokenLimit: !tokenUnlimited && tokenLimit > 0 ? tokenLimit : DEFAULT_TOKEN_LIMIT,
     parallelLimitInput: parallelUnlimited ? String(UNLIMITED_PARALLEL_LIMIT) : String(parallelLimit),
@@ -108,7 +109,9 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
 }
 
 export function buildShareEditPatch(draft: ShareEditDraft, share: ShareView, activeShareApps: PriceApp[]): ShareSettingsPatch {
-  const tokenLimit = draft.tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : Number.parseInt(draft.tokenLimitInput, 10);
+  const tokenLimit = draft.tokenLimitUnlimited
+    ? UNLIMITED_TOKEN_LIMIT
+    : millionsInputToTokens(draft.tokenLimitInput) ?? 0;
   const parallelLimit = draft.parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : Number.parseInt(draft.parallelLimitInput, 10);
   const expiresIso = draft.expiresPermanent ? PERMANENT_EXPIRES_AT_ISO : fromLocalDateTimeValue(draft.expiresAtInput);
   const ownerEmail = (share.ownerEmail || "").trim().toLowerCase();

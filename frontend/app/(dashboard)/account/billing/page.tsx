@@ -1,5 +1,6 @@
 import { AccountBillingPage } from "@/components/dashboard/account-billing-page";
+import { Suspense } from "react";
 
 export default function Page() {
-  return <AccountBillingPage />;
+  return <Suspense fallback={null}><AccountBillingPage /></Suspense>;
 }

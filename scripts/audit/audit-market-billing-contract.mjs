@@ -364,6 +364,35 @@ function main() {
   ]) {
     if (!source.includes(required)) errors.push(`${label} is missing ${required}`);
   }
+
+  const paidHostSetup = extractRustBlock(
+    tradeSource,
+    "pub(crate) fn require_paid_offer_setup",
+  );
+  for (const required of [
+    "require_payment_profile_for_offer",
+    "require_supplier_profile_tx",
+  ]) {
+    if (!paidHostSetup.includes(required)) {
+      errors.push(`Client Host paid-offer setup guard is missing ${required}`);
+    }
+  }
+  const earlyHostSetupChecks = clientSource.match(/require_paid_offer_setup/g)?.length || 0;
+  if (earlyHostSetupChecks < 3 || !tradeSource.includes("require_paid_offer_setup")) {
+    errors.push(
+      "Client Host create, import, insert, and edit paths must share the paid-offer setup guard",
+    );
+  }
+  for (const [label, block] of [
+    ["Client Host create", extractRustBlock(clientSource, "async fn create_host")],
+    ["Client Host import", extractRustBlock(clientSource, "async fn import_one_host")],
+  ]) {
+    const guardIndex = block.indexOf("require_paid_offer_setup");
+    const sshIndex = block.indexOf("ssh_verify_host");
+    if (guardIndex < 0 || sshIndex < 0 || guardIndex > sshIndex) {
+      errors.push(`${label} must validate paid-offer setup before SSH verification`);
+    }
+  }
   for (const [label, block] of [
     ["Share Market source event", extractRustBlock(shareSource, "fn event_tx")],
     ["Client Market source event", extractRustBlock(tradeSource, "fn insert_audit_tx")],
@@ -442,7 +471,59 @@ function main() {
     ],
     [
       "frontend/components/dashboard/account-market-readiness-page.tsx",
-      ["getAccountPaymentProfile", "getMarketAccessDashboard", "getMarketBillingDashboard"],
+      [
+        "getAccountPaymentProfile",
+        "getMarketAccessDashboard",
+        "getMarketBillingDashboard",
+        "marketReadiness.settlement.title",
+        "?tab=receivables",
+      ],
+    ],
+    [
+      "frontend/components/dashboard/share-market/owner-workspace.tsx",
+      [
+        "usePaidOfferReadiness(open && hasPaidSeat)",
+        "PaidOfferReadinessNotice",
+        "setSeatDialog({ listing, template: seat })",
+        "template={seatDialog?.template}",
+        "shareMarketMutationError(reason, t)",
+        "shareMarket.tokensMillions",
+      ],
+    ],
+    [
+      "frontend/components/dashboard/client-market/host-utils.ts",
+      [
+        "MARKET_PAYMENT_PROFILE_REQUIRED",
+        "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED",
+        "clientMarket.offerRequiresSettlement",
+      ],
+    ],
+    [
+      "frontend/components/dashboard/client-market/add-host-dialog.tsx",
+      [
+        'usePaidOfferReadiness(open && pricing === "paid")',
+        'paidReadiness.status === "error"',
+        "hostPaidOfferPrerequisiteError(err, t)",
+        "?tab=receivables",
+      ],
+    ],
+    [
+      "frontend/components/dashboard/client-market/host-offer-dialog.tsx",
+      [
+        'usePaidOfferReadiness(open && pricing === "paid")',
+        'paidReadiness.status === "error"',
+        "hostPaidOfferPrerequisiteError(reason, t)",
+        "?tab=receivables",
+      ],
+    ],
+    [
+      "frontend/components/dashboard/share-market/paid-offer-readiness.tsx",
+      [
+        "request !== requestRef.current",
+        'readiness.status !== "loaded"',
+        "shareMarket.paidReadiness.failed",
+        "requestRef.current += 1",
+      ],
     ],
     [
       "frontend/lib/api.ts",
@@ -473,6 +554,28 @@ function main() {
   ]) {
     if (!shareSource.includes(required)) {
       errors.push(`Share rent quote backend contract is missing ${required}`);
+    }
+  }
+
+  for (const [label, source, required] of [
+    [
+      "Client Host paid-offer payment prerequisite",
+      extractRustBlock(tradeSource, "pub(crate) fn require_payment_profile_for_offer"),
+      "MARKET_PAYMENT_PROFILE_REQUIRED",
+    ],
+    [
+      "Share paid-offer payment prerequisite",
+      shareSource,
+      "SHARE_MARKET_PAYMENT_PROFILE_REQUIRED",
+    ],
+    [
+      "Market supplier settlement prerequisite",
+      billingSource,
+      "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED",
+    ],
+  ]) {
+    if (!source.includes(required) || !source.includes("AppError::coded_conflict")) {
+      errors.push(`${label} must return coded conflict ${required}`);
     }
   }
 

@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
+import Link from "next/link";
 import {
   Ban,
   Copy,
@@ -18,6 +19,10 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
+import {
+  PaidOfferReadinessNotice,
+  usePaidOfferReadiness,
+} from "@/components/dashboard/share-market/paid-offer-readiness";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -33,7 +38,16 @@ import {
   updateShareMarketSeat,
 } from "@/lib/api";
 import { MARKET_CURRENCY } from "@/lib/market-money";
+import {
+  buildDashboardHref,
+  DASHBOARD_CLIENTS_PATH,
+} from "@/lib/dashboard-nav";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
+import {
+  formatTokenMillions,
+  millionsInputToTokens,
+  tokensToMillionsInput,
+} from "@/lib/token-units";
 import type {
   ShareMarketListing,
   ShareMarketOwnedShare,
@@ -49,6 +63,7 @@ import {
   formatTokenLimit,
   grantFailureMessageKey,
   isCoreShareApp,
+  shareMarketMutationError,
   subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
 
@@ -62,6 +77,11 @@ type SeatDraft = {
   serviceDurationMode: "fixed" | "permanent";
   serviceDurationDays: string;
   serviceDurationTouched: boolean;
+};
+type SeatDraftField = "parallelLimit" | "tokenLimit" | "price" | "serviceDurationDays";
+type SeatDraftValidation = {
+  message: string;
+  field?: SeatDraftField;
 };
 type ConfirmAction = {
   title: string;
@@ -79,6 +99,17 @@ const TOKEN_PERIODS: ShareTokenPeriod[] = [
   "calendarMonth",
   "thirtyDays",
 ];
+const MAX_DAILY_RATE_MINOR = 100_000_000;
+
+class SeatDraftError extends Error {
+  readonly field: SeatDraftField;
+
+  constructor(field: SeatDraftField, message: string) {
+    super(message);
+    this.name = "SeatDraftError";
+    this.field = field;
+  }
+}
 
 function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
   return {
@@ -96,7 +127,7 @@ function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
 function seatDraft(seat: ShareMarketSeat): SeatDraft {
   return {
     parallelLimit: seat.parallelLimit == null ? "" : String(seat.parallelLimit),
-    tokenLimit: seat.tokenLimit == null ? "" : String(seat.tokenLimit),
+    tokenLimit: seat.tokenLimit == null ? "" : tokensToMillionsInput(seat.tokenLimit),
     tokenPeriod: seat.tokenPeriod,
     paid: !seat.isFree,
     price: seat.dailyRateMinor == null ? "" : (seat.dailyRateMinor / 100).toFixed(2),
@@ -106,23 +137,56 @@ function seatDraft(seat: ShareMarketSeat): SeatDraft {
   };
 }
 
-function positiveOptional(value: string, label: string, t: TFn) {
+function positiveOptional(
+  value: string,
+  label: string,
+  field: "parallelLimit" | "serviceDurationDays",
+  t: TFn,
+) {
   if (!value.trim()) return undefined;
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1) {
-    throw new Error(t("shareMarket.error.positiveInteger", { field: label }));
+    throw new SeatDraftError(
+      field,
+      t("shareMarket.error.positiveInteger", { field: label }),
+    );
+  }
+  return parsed;
+}
+
+function positiveOptionalTokenMillions(value: string, label: string, t: TFn) {
+  if (!value.trim()) return undefined;
+  const parsed = millionsInputToTokens(value);
+  if (parsed == null || parsed < 1) {
+    throw new SeatDraftError(
+      "tokenLimit",
+      t("shareMarket.error.positiveMillions", { field: label }),
+    );
   }
   return parsed;
 }
 
 function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
-  const parallelLimit = positiveOptional(draft.parallelLimit, t("shareMarket.parallel"), t);
-  const tokenLimit = positiveOptional(draft.tokenLimit, t("shareMarket.tokens"), t);
+  const parallelLimit = positiveOptional(
+    draft.parallelLimit,
+    t("shareMarket.parallel"),
+    "parallelLimit",
+    t,
+  );
+  const tokenLimit = positiveOptionalTokenMillions(draft.tokenLimit, t("shareMarket.tokens"), t);
   const serviceDurationDays = draft.serviceDurationMode === "permanent"
     ? undefined
-    : positiveOptional(draft.serviceDurationDays, t("shareMarket.serviceDuration.days"), t);
+    : positiveOptional(
+        draft.serviceDurationDays,
+        t("shareMarket.serviceDuration.days"),
+        "serviceDurationDays",
+        t,
+      );
   if (serviceDurationDays != null && serviceDurationDays > 365) {
-    throw new Error(t("shareMarket.error.serviceDuration"));
+    throw new SeatDraftError(
+      "serviceDurationDays",
+      t("shareMarket.error.serviceDuration"),
+    );
   }
   const base: ShareMarketSeatInput = {
     parallelLimit,
@@ -134,39 +198,84 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   const amount = Number(draft.price);
   const dailyRateMinor = Math.round(amount * 100);
   if (!/^\d+(?:\.\d{1,2})?$/.test(draft.price.trim()) || amount <= 0 || !Number.isSafeInteger(dailyRateMinor)) {
-    throw new Error(t("shareMarket.error.price"));
+    throw new SeatDraftError("price", t("shareMarket.error.price"));
+  }
+  if (dailyRateMinor > MAX_DAILY_RATE_MINOR) {
+    throw new SeatDraftError("price", t("shareMarket.error.priceRange"));
   }
   return { ...base, dailyRateMinor, currency: MARKET_CURRENCY };
 }
 
-function fieldClass() {
-  return "h-10 min-w-0 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none focus:border-slate-400";
+function seatDraftValidation(
+  draft: SeatDraft,
+  t: TFn,
+  shareParallelLimit?: number,
+): SeatDraftValidation {
+  try {
+    const seat = normalizedSeat(draft, t);
+    if (
+      shareParallelLimit != null &&
+      shareParallelLimit >= 0 &&
+      seat.parallelLimit != null &&
+      seat.parallelLimit > shareParallelLimit
+    ) {
+      return {
+        field: "parallelLimit",
+        message: t("shareMarket.error.parallelExceedsShareValue", {
+          limit: shareParallelLimit,
+        }),
+      };
+    }
+    return { message: "" };
+  } catch (reason) {
+    return {
+      field: reason instanceof SeatDraftError ? reason.field : undefined,
+      message: reason instanceof Error ? reason.message : String(reason),
+    };
+  }
+}
+
+function fieldClass(invalid = false) {
+  return cn(
+    "h-10 min-w-0 rounded-md border bg-white px-3 text-sm text-slate-900 outline-none focus:border-slate-400 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-500",
+    invalid ? "border-rose-400" : "border-slate-200",
+  );
 }
 
 function SeatFields({
   draft,
   supportedPeriods,
+  disabled = false,
+  validation = { message: "" },
   onChange,
 }: {
   draft: SeatDraft;
   supportedPeriods?: ShareTokenPeriod[];
+  disabled?: boolean;
+  validation?: SeatDraftValidation;
   onChange: (draft: SeatDraft) => void;
 }) {
   const { t } = useLocaleText();
+  const errorId = React.useId();
   const periods = supportedPeriods?.length ? supportedPeriods : TOKEN_PERIODS;
   const patch = (value: Partial<SeatDraft>) => onChange({ ...draft, ...value });
+  const invalid = (field: SeatDraftField) => validation.field === field;
+  const describedBy = (field: SeatDraftField) => invalid(field) ? errorId : undefined;
   return (
     <div className="grid min-w-0 gap-3">
       <div className={cn("grid min-w-0 gap-3", draft.tokenLimit.trim() ? "sm:grid-cols-3" : "sm:grid-cols-2")}>
         <label className="grid gap-1 text-xs text-slate-500">
           {t("shareMarket.parallel")}
-          <input className={fieldClass()} inputMode="numeric" value={draft.parallelLimit} placeholder={t("shareMarket.dialog.unlimited")} onChange={(event) => patch({ parallelLimit: event.target.value })} />
+          <input className={fieldClass(invalid("parallelLimit"))} inputMode="numeric" disabled={disabled} aria-invalid={invalid("parallelLimit")} aria-describedby={describedBy("parallelLimit")} value={draft.parallelLimit} placeholder={t("shareMarket.dialog.unlimited")} onChange={(event) => patch({ parallelLimit: event.target.value })} />
         </label>
         <label className="grid gap-1 text-xs text-slate-500">
-          {t("shareMarket.tokens")}
+          {t("shareMarket.tokensMillions")}
           <input
-            className={fieldClass()}
-            inputMode="numeric"
+            className={fieldClass(invalid("tokenLimit"))}
+            inputMode="decimal"
+            disabled={disabled}
+            aria-invalid={invalid("tokenLimit")}
+            aria-describedby={describedBy("tokenLimit")}
             value={draft.tokenLimit}
             placeholder={t("shareMarket.dialog.unlimited")}
             onChange={(event) => {
@@ -188,6 +297,7 @@ function SeatFields({
               options={periods.map((period) => ({ value: period, label: t(`shareMarket.period.${period}`) }))}
               onChange={(value) => patch({ tokenPeriod: value as ShareTokenPeriod })}
               ariaLabel={t("shareMarket.tokenPeriod")}
+              disabled={disabled}
               className="w-full"
               triggerClassName="h-10 w-full text-sm"
             />
@@ -211,6 +321,7 @@ function SeatFields({
         ariaLabel={t("shareMarket.dialog.amount")}
         size="md"
         fullWidth
+        disabled={disabled}
         items={[
           { id: "free", label: t("shareMarket.dialog.freeMode") },
           { id: "paid", label: t("shareMarket.dialog.paidMode") },
@@ -220,7 +331,7 @@ function SeatFields({
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="grid gap-1 text-xs text-slate-500">
             {t("shareMarket.dialog.amount")}
-            <input className={fieldClass()} inputMode="decimal" value={draft.price} onChange={(event) => patch({ price: event.target.value })} />
+            <input className={fieldClass(invalid("price"))} inputMode="decimal" disabled={disabled} aria-invalid={invalid("price")} aria-describedby={describedBy("price")} value={draft.price} onChange={(event) => patch({ price: event.target.value })} />
           </label>
           <div className="grid gap-1 text-xs text-slate-500">
             {t("shareMarket.dialog.currency")}
@@ -236,6 +347,7 @@ function SeatFields({
           ariaLabel={t("shareMarket.serviceDuration.label")}
           size="md"
           fullWidth
+          disabled={disabled}
           items={[
             { id: "fixed", label: t("shareMarket.serviceDuration.fixed") },
             { id: "permanent", label: t("shareMarket.serviceDuration.permanent") },
@@ -244,12 +356,46 @@ function SeatFields({
         {draft.serviceDurationMode === "fixed" ? (
           <label className="grid gap-1 text-xs text-slate-500">
             {t("shareMarket.serviceDuration.days")}
-            <input type="number" min={1} max={365} className={fieldClass()} value={draft.serviceDurationDays} onChange={(event) => patch({ serviceDurationDays: event.target.value, serviceDurationTouched: true })} />
+            <input type="number" min={1} max={365} className={fieldClass(invalid("serviceDurationDays"))} disabled={disabled} aria-invalid={invalid("serviceDurationDays")} aria-describedby={describedBy("serviceDurationDays")} value={draft.serviceDurationDays} onChange={(event) => patch({ serviceDurationDays: event.target.value, serviceDurationTouched: true })} />
           </label>
         ) : null}
       </div>
+      {validation.message ? <p id={errorId} role="alert" className="text-xs leading-5 text-rose-700">{validation.message}</p> : null}
     </div>
   );
+}
+
+function ShareCapacitySummary({
+  parallelLimit,
+  tokenLimit,
+}: {
+  parallelLimit?: number;
+  tokenLimit?: number;
+}) {
+  const { locale, t } = useLocaleText();
+  return (
+    <div className="flex min-w-0 flex-wrap gap-x-4 gap-y-1 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+      <strong className="text-slate-700">{t("shareMarket.dialog.shareCapacity")}</strong>
+      <span>{t("shareMarket.dialog.capacityParallel", {
+        value: parallelLimit == null ? t("common.unlimited") : parallelLimit,
+      })}</span>
+      <span>{t("shareMarket.dialog.capacityTokens", {
+        value: tokenLimit == null ? t("common.unlimited") : formatTokenMillions(tokenLimit, locale),
+      })}</span>
+    </div>
+  );
+}
+
+function ownedShareBlockReason(share: ShareMarketOwnedShare, t: TFn) {
+  if (share.alreadyListed) return t("shareMarket.dialog.blocked.alreadyListed");
+  if (share.freeAccess) return t("shareMarket.dialog.blocked.freeAccess");
+  if (share.shareStatus !== "active") return t("shareMarket.dialog.blocked.inactive");
+  return t("shareMarket.dialog.blocked.unknown");
+}
+
+function shareSettingsHref(shareId: string) {
+  const params = new URLSearchParams({ drawerKind: "share", drawerId: shareId });
+  return buildDashboardHref(DASHBOARD_CLIENTS_PATH, params);
 }
 
 export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { open: boolean; onOpenChange: (open: boolean) => void; onSaved: () => void }) {
@@ -258,29 +404,57 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
   const [shareId, setShareId] = React.useState("");
   const [seats, setSeats] = React.useState<SeatDraft[]>([emptySeat()]);
   const [loading, setLoading] = React.useState(false);
+  const [loadRevision, setLoadRevision] = React.useState(0);
+  const [loadError, setLoadError] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
 
   React.useEffect(() => {
     if (!open) return;
+    const controller = new AbortController();
+    let active = true;
+    setShares([]);
+    setShareId("");
+    setSeats([emptySeat()]);
     setLoading(true);
+    setLoadError("");
     setError("");
-    getShareMarketOwnedShares()
+    getShareMarketOwnedShares(controller.signal)
       .then((items) => {
+        if (!active) return;
         const eligible = items.filter(
           (item) => !item.alreadyListed && !item.freeAccess && item.shareStatus === "active",
         );
-        setShares(eligible);
+        setShares(items);
         setShareId(eligible[0]?.shareId || "");
         setSeats([emptySeat(eligible[0]?.supportedUserTokenPeriods)]);
       })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
-      .finally(() => setLoading(false));
-  }, [open]);
+      .catch((reason) => {
+        if (active && !controller.signal.aborted) {
+          setLoadError(shareMarketMutationError(reason, t));
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [loadRevision, open, t]);
 
-  const selected = shares.find((share) => share.shareId === shareId);
+  const eligibleShares = shares.filter(
+    (item) => !item.alreadyListed && !item.freeAccess && item.shareStatus === "active",
+  );
+  const blockedShares = shares.filter((item) => !eligibleShares.includes(item));
+  const selected = eligibleShares.find((share) => share.shareId === shareId);
+  const seatErrors = seats.map((seat) => seatDraftValidation(seat, t, selected?.parallelLimit));
+  const hasPaidSeat = seats.some((seat) => seat.paid);
+  const paidReadiness = usePaidOfferReadiness(open && hasPaidSeat);
+  const formInvalid = seatErrors.some((validation) => !!validation.message) ||
+    (hasPaidSeat && paidReadiness.blocked);
   const save = async () => {
-    if (!shareId || busy) return;
+    if (!shareId || busy || formInvalid) return;
     setBusy(true);
     setError("");
     try {
@@ -288,7 +462,7 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
       onOpenChange(false);
       onSaved();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(shareMarketMutationError(reason, t));
     } finally {
       setBusy(false);
     }
@@ -300,20 +474,29 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
           <Modal.Header><Modal.Heading>{t("shareMarket.dialog.title")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid max-h-[75vh] gap-4 overflow-y-auto">
             {loading ? <div className="flex items-center gap-2 py-6 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div> : null}
-            {!loading && shares.length === 0 ? <p className="text-sm text-slate-500">{t("shareMarket.dialog.noShares")}</p> : null}
-            {!loading && shares.length ? (
+            {!loading && !loadError && eligibleShares.length === 0 ? <p className="text-sm text-slate-500">{t("shareMarket.dialog.noShares")}</p> : null}
+            {!loading && loadError ? (
+              <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-800">
+                <span className="min-w-[12rem] flex-1">{loadError}</span>
+                <Button className="whitespace-nowrap" size="sm" variant="outline" onClick={() => setLoadRevision((current) => current + 1)}>
+                  <RefreshCw className="h-4 w-4" />
+                  {t("common.retry")}
+                </Button>
+              </div>
+            ) : null}
+            {!loading && eligibleShares.length ? (
               <>
                 <label className="grid gap-1 text-xs text-slate-500">
                   {t("shareMarket.dialog.selectShare")}
                   <CompactSelect
                     value={shareId}
-                    options={shares.map((share) => ({
+                    options={eligibleShares.map((share) => ({
                       value: share.shareId,
                       label: share.subdomain ? `${share.shareName} · ${share.subdomain}` : share.shareName,
                       description: `${share.ownerEmail} · ${share.supportedApps.map((app) => app in SHARE_APP_LABELS ? SHARE_APP_LABELS[app as keyof typeof SHARE_APP_LABELS] : app).join(" / ")}`,
                     }))}
                     onChange={(value) => {
-                      const next = shares.find((share) => share.shareId === value);
+                      const next = eligibleShares.find((share) => share.shareId === value);
                       setShareId(value);
                       setSeats([emptySeat(next?.supportedUserTokenPeriods)]);
                     }}
@@ -322,28 +505,44 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
                     triggerClassName="min-h-12 w-full text-sm"
                   />
                 </label>
+                {selected ? <ShareCapacitySummary parallelLimit={selected.parallelLimit} tokenLimit={selected.tokenLimit} /> : null}
                 <div className="grid gap-4">
                   {seats.map((seat, index) => (
                     <section key={index} className="grid gap-3 border-t border-slate-200 pt-4 first:border-0 first:pt-0">
                       <div className="flex items-center justify-between gap-2">
                         <strong className="text-sm">{t("shareMarket.seat", { position: index + 1 })}</strong>
                         <div className="flex gap-1">
-                          <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.copySeat")} isDisabled={seats.length >= 20} onClick={() => setSeats((items) => [...items.slice(0, index + 1), { ...items[index] }, ...items.slice(index + 1)])}><Copy className="h-4 w-4" /></Button>
-                          {seats.length > 1 ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} onClick={() => setSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X className="h-4 w-4" /></Button> : null}
+                          <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.copySeat")} isDisabled={busy || seats.length >= 20} onClick={() => setSeats((items) => [...items.slice(0, index + 1), { ...items[index] }, ...items.slice(index + 1)])}><Copy className="h-4 w-4" /></Button>
+                          {seats.length > 1 ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={busy} onClick={() => setSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X className="h-4 w-4" /></Button> : null}
                         </div>
                       </div>
-                      <SeatFields draft={seat} supportedPeriods={selected?.supportedUserTokenPeriods} onChange={(next) => setSeats((items) => items.map((item, itemIndex) => itemIndex === index ? next : item))} />
+                      <SeatFields draft={seat} supportedPeriods={selected?.supportedUserTokenPeriods} disabled={busy} validation={seatErrors[index]} onChange={(next) => setSeats((items) => items.map((item, itemIndex) => itemIndex === index ? next : item))} />
                     </section>
                   ))}
-                  {seats.length < 20 ? <Button variant="outline" onClick={() => setSeats((items) => [...items, emptySeat(selected?.supportedUserTokenPeriods)])}><Plus className="h-4 w-4" />{t("shareMarket.dialog.addSeat")}</Button> : null}
+                  {seats.length < 20 ? <Button variant="outline" isDisabled={busy} onClick={() => setSeats((items) => [...items, emptySeat(selected?.supportedUserTokenPeriods)])}><Plus className="h-4 w-4" />{t("shareMarket.dialog.addSeat")}</Button> : null}
                 </div>
+                {hasPaidSeat ? <PaidOfferReadinessNotice readiness={paidReadiness} /> : null}
               </>
+            ) : null}
+            {!loading && blockedShares.length ? (
+              <section className="grid gap-2 border-t border-slate-200 pt-4">
+                <strong className="text-xs font-semibold text-slate-700">{t("shareMarket.dialog.blockedTitle")}</strong>
+                <div className="grid gap-2">
+                  {blockedShares.map((share) => (
+                    <div key={share.shareId} className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                      <span className="min-w-[10rem] flex-1 truncate font-medium text-slate-700">{share.shareName}</span>
+                      <span>{ownedShareBlockReason(share, t)}</span>
+                      <Link className="whitespace-nowrap font-medium text-accent hover:underline" href={shareSettingsHref(share.shareId)}>{t("shareMarket.dialog.manageShare")}</Link>
+                    </div>
+                  ))}
+                </div>
+              </section>
             ) : null}
             {error ? <p className="text-sm text-rose-700">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>
             <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-            <Button variant="primary" isDisabled={busy || loading || !shareId} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}{t("shareMarket.dialog.create")}</Button>
+            <Button variant="primary" isDisabled={busy || loading || !shareId || formInvalid} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}{t("shareMarket.dialog.create")}</Button>
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
@@ -354,25 +553,39 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
 function SeatDialog({
   listing,
   seat,
+  template,
   onOpenChange,
   onSaved,
 }: {
   listing: ShareMarketListing | null;
   seat?: ShareMarketSeat;
+  template?: ShareMarketSeat;
   onOpenChange: (open: boolean) => void;
   onSaved: () => void;
 }) {
   const { t } = useLocaleText();
-  const [draft, setDraft] = React.useState<SeatDraft>(emptySeat());
+  const [draft, setDraft] = React.useState<SeatDraft>(() =>
+    seat
+      ? seatDraft(seat)
+      : template
+        ? seatDraft(template)
+        : listing
+          ? emptySeat(listing.supportedUserTokenPeriods)
+          : emptySeat(),
+  );
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   React.useEffect(() => {
     if (!listing) return;
-    setDraft(seat ? seatDraft(seat) : emptySeat(listing.supportedUserTokenPeriods));
+    setDraft(seat ? seatDraft(seat) : template ? seatDraft(template) : emptySeat(listing.supportedUserTokenPeriods));
     setError("");
-  }, [listing, seat]);
+  }, [listing, seat, template]);
+  const validation = listing
+    ? seatDraftValidation(draft, t, listing.parallelLimit)
+    : { message: "" };
+  const paidReadiness = usePaidOfferReadiness(!!listing && draft.paid);
   const save = async () => {
-    if (!listing || busy) return;
+    if (!listing || busy || validation.message || (draft.paid && paidReadiness.blocked)) return;
     setBusy(true);
     setError("");
     try {
@@ -382,7 +595,7 @@ function SeatDialog({
       onOpenChange(false);
       onSaved();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(shareMarketMutationError(reason, t));
     } finally {
       setBusy(false);
     }
@@ -391,14 +604,16 @@ function SeatDialog({
     <Modal.Backdrop isOpen={!!listing} onOpenChange={(open) => !busy && onOpenChange(open)}>
       <Modal.Container placement="center">
         <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-          <Modal.Header><Modal.Heading>{seat ? t("shareMarket.manage") : t("shareMarket.addSeat")}</Modal.Heading></Modal.Header>
-          <Modal.Body className="grid gap-4">
-            <SeatFields draft={draft} supportedPeriods={listing?.supportedUserTokenPeriods} onChange={setDraft} />
+          <Modal.Header><Modal.Heading>{seat ? t("shareMarket.manage") : template ? t("shareMarket.createFromSeat") : t("shareMarket.addSeat")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid max-h-[75vh] gap-4 overflow-y-auto">
+            {listing ? <ShareCapacitySummary parallelLimit={listing.parallelLimit} tokenLimit={listing.tokenLimit} /> : null}
+            <SeatFields draft={draft} supportedPeriods={listing?.supportedUserTokenPeriods} disabled={busy} validation={validation} onChange={setDraft} />
+            {draft.paid ? <PaidOfferReadinessNotice readiness={paidReadiness} /> : null}
             {error ? <p className="text-sm text-rose-700">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>
             <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-            <Button variant="primary" isDisabled={busy} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.save")}</Button>
+            <Button variant="primary" isDisabled={busy || !!validation.message || (draft.paid && paidReadiness.blocked)} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.save")}</Button>
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
@@ -424,13 +639,17 @@ function PriceDialog({ subscription, onOpenChange, onSaved }: { subscription: Sh
       setError(t("shareMarket.error.price"));
       return;
     }
+    if (dailyRateMinor > MAX_DAILY_RATE_MINOR) {
+      setError(t("shareMarket.error.priceRange"));
+      return;
+    }
     setBusy(true);
     try {
       await proposeShareMarketPriceChange(subscription.id, dailyRateMinor, subscription.offerRevision);
       onOpenChange(false);
       onSaved();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(shareMarketMutationError(reason, t));
     } finally {
       setBusy(false);
     }
@@ -486,7 +705,7 @@ export function ShareMarketOwnerWorkspace({
   const { locale, t } = useLocaleText();
   const chat = useClientChat();
   const [addOpen, setAddOpen] = React.useState(false);
-  const [seatDialog, setSeatDialog] = React.useState<{ listing: ShareMarketListing; seat?: ShareMarketSeat } | null>(null);
+  const [seatDialog, setSeatDialog] = React.useState<{ listing: ShareMarketListing; seat?: ShareMarketSeat; template?: ShareMarketSeat } | null>(null);
   const [priceDialog, setPriceDialog] = React.useState<ShareMarketSubscription | null>(null);
   const [confirm, setConfirm] = React.useState<ConfirmAction | null>(null);
   const [busy, setBusy] = React.useState(false);
@@ -517,7 +736,7 @@ export function ShareMarketOwnerWorkspace({
       setConfirm(null);
       await onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(shareMarketMutationError(reason, t));
     } finally {
       setBusy(false);
     }
@@ -579,7 +798,7 @@ export function ShareMarketOwnerWorkspace({
           label: t("shareMarket.copySeat"),
           icon: <Copy className="h-4 w-4" />,
           iconOnly: true,
-          onClick: () => void run(() => addShareMarketSeat(listing.id, normalizedSeat(seatDraft(seat), t))),
+          onClick: () => setSeatDialog({ listing, template: seat }),
         },
       );
     }
@@ -656,6 +875,7 @@ export function ShareMarketOwnerWorkspace({
             variant={mobile ? "outline" : "ghost"}
             className="whitespace-nowrap"
             aria-label={action.label}
+            isDisabled={busy}
             onClick={action.onClick}
           >
             {action.icon}
@@ -796,7 +1016,7 @@ export function ShareMarketOwnerWorkspace({
       ) : null}
 
       <ShareMarketAddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void onChanged()} />
-      <SeatDialog listing={seatDialog?.listing || null} seat={seatDialog?.seat} onOpenChange={(open) => !open && setSeatDialog(null)} onSaved={() => void onChanged()} />
+      <SeatDialog key={seatDialog ? `${seatDialog.listing.id}:${seatDialog.seat?.id || `copy:${seatDialog.template?.id || "new"}`}` : "closed"} listing={seatDialog?.listing || null} seat={seatDialog?.seat} template={seatDialog?.template} onOpenChange={(open) => !open && setSeatDialog(null)} onSaved={() => void onChanged()} />
       <PriceDialog subscription={priceDialog} onOpenChange={(open) => !open && setPriceDialog(null)} onSaved={() => void onChanged()} />
       <ConfirmAlertDialog
         open={!!confirm}

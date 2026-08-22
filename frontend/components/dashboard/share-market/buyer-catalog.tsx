@@ -49,6 +49,7 @@ import type {
   ShareMarketSeat,
   ShareMarketSubscription,
 } from "@/lib/types";
+import { formatTokenMillions } from "@/lib/token-units";
 import { cn } from "@/lib/utils";
 import {
   PROVIDER_FAMILY_KEYS,
@@ -177,7 +178,7 @@ function compactSeatTerms(seat: ShareMarketSeat, locale: string, unlimited: stri
   const parallel = seat.parallelLimit == null ? "P∞" : `P${seat.parallelLimit}`;
   const tokens = seat.tokenLimit == null
     ? unlimited
-    : `${new Intl.NumberFormat(locale, { notation: "compact" }).format(seat.tokenLimit)}/${t(`shareMarket.period.${seat.tokenPeriod}`)}`;
+    : `${formatTokenMillions(seat.tokenLimit, locale)}/${t(`shareMarket.period.${seat.tokenPeriod}`)}`;
   return `${parallel} · ${tokens}`;
 }
 

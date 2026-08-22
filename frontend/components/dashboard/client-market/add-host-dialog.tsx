@@ -2,14 +2,13 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
-import { Check, ChevronDown, Circle, Loader2, X } from "lucide-react";
+import { Check, ChevronDown, Circle, Loader2, RefreshCw, X } from "lucide-react";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { SegmentedControl } from "@/components/common/segmented-control";
+import { usePaidOfferReadiness } from "@/components/dashboard/share-market/paid-offer-readiness";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   createClientMarketHost,
-  getAccountPaymentProfile,
-  getMarketBillingDashboard,
   getProvisionSshKey,
   lookupClientMarketHostIpInfo,
   testClientMarketHostSsh,
@@ -29,7 +28,7 @@ import {
   authorizedKeysInstallCommand,
   formatHostIpIntelSecondary,
   formatHostIpLocation,
-  isPaymentProfileRequiredError,
+  hostPaidOfferPrerequisiteError,
   parseFreeDurationDays,
   parseHostOffer,
 } from "@/components/dashboard/client-market/host-utils";
@@ -62,8 +61,12 @@ export function AddHostDialog({
   const [phase, setPhase] = React.useState<"form" | "progress" | "success">("form");
   const [stepStatus, setStepStatus] = React.useState<StepStatusMap>(IDLE_STEP_STATUS);
   const [ipIntel, setIpIntel] = React.useState<HostIpIntel | null>(null);
-  const [paymentReady, setPaymentReady] = React.useState<boolean | null>(null);
-  const [billingCurrencies, setBillingCurrencies] = React.useState<string[] | null>(null);
+  const paidReadiness = usePaidOfferReadiness(open && pricing === "paid");
+  const paidOfferLoading = paidReadiness.status === "idle" ||
+    paidReadiness.status === "loading";
+  const paidOfferReady = paidReadiness.status === "loaded" &&
+    paidReadiness.paymentReady &&
+    paidReadiness.settlementReady;
 
   React.useEffect(() => {
     if (!open) return;
@@ -73,23 +76,7 @@ export function AddHostDialog({
     setPhase("form");
     setStepStatus(IDLE_STEP_STATUS);
     setIpIntel(null);
-    setPaymentReady(null);
-    setBillingCurrencies(null);
     let cancelled = false;
-    void getAccountPaymentProfile()
-      .then((profile) => {
-        if (!cancelled) setPaymentReady(profile.methods.length > 0);
-      })
-      .catch(() => {
-        if (!cancelled) setPaymentReady(false);
-      });
-    void getMarketBillingDashboard()
-      .then((billing) => {
-        if (!cancelled) setBillingCurrencies(billing.supplierProfiles.map((item) => item.currency));
-      })
-      .catch(() => {
-        if (!cancelled) setBillingCurrencies([]);
-      });
     setSshKeyLoading(true);
     void getProvisionSshKey()
       .then((key) => {
@@ -180,12 +167,16 @@ export function AddHostDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(MARKET_CURRENCY))) {
+    if (pricing === "paid" && (!offer.dailyRateMinor || !paidOfferReady)) {
       if (!offer.dailyRateMinor) {
         setError(t("clientMarket.offerInvalid"));
         return;
       }
-      setError(t("clientMarket.offerRequiresBilling"));
+      setError(t(paidReadiness.status === "error"
+        ? "clientMarket.offerSetupFailed"
+        : paidOfferLoading
+          ? "clientMarket.offerSetupChecking"
+          : "clientMarket.offerRequiresBilling"));
       return;
     }
     if (note.length > 500) {
@@ -264,9 +255,7 @@ export function AddHostDialog({
       onAdded();
     } catch (err) {
       const raw = err instanceof Error ? err.message : String(err);
-      const message = isPaymentProfileRequiredError(raw)
-        ? t("clientMarket.offerRequiresPayment")
-        : mapHostError(raw);
+      const message = hostPaidOfferPrerequisiteError(err, t) || mapHostError(raw);
       setError(message);
       setStepStatus(markStepFailed);
     } finally {
@@ -345,7 +334,11 @@ export function AddHostDialog({
   };
 
   const canSubmit =
-    !!ip.trim() && (mode === "manual" || !!rootPassword) && !busy && !testing;
+    !!ip.trim() &&
+    (mode === "manual" || !!rootPassword) &&
+    !busy &&
+    !testing &&
+    (pricing === "free" || paidOfferReady);
 
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={closeDialog}>
@@ -362,7 +355,7 @@ export function AddHostDialog({
           </Modal.Header>
           {phase === "form" ? (
             <>
-              <Modal.Body className="grid gap-3 text-slate-900">
+              <Modal.Body className="grid max-h-[75vh] gap-3 overflow-y-auto text-slate-900">
                 <SegmentedControl
                   value={mode}
                   onChange={setMode}
@@ -490,12 +483,27 @@ export function AddHostDialog({
                   </div>
                 )}
                 <p className="text-xs text-muted-foreground">{pricing === "paid" ? t("clientMarket.offerHint") : t("clientMarket.freeDuration.hint")}</p>
-                {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(MARKET_CURRENCY))) ? (
-                  <div className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+                {pricing === "paid" && paidOfferLoading ? (
+                  <div role="status" className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                    {t("clientMarket.offerSetupChecking")}
+                  </div>
+                ) : null}
+                {pricing === "paid" && paidReadiness.status === "error" ? (
+                  <div role="alert" className="flex flex-wrap items-center gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+                    <span className="min-w-[12rem] flex-1">{t("clientMarket.offerSetupFailed")}</span>
+                    <Button className="whitespace-nowrap" size="sm" variant="outline" onClick={() => void paidReadiness.reload()}>
+                      <RefreshCw className="h-4 w-4" />
+                      {t("common.retry")}
+                    </Button>
+                  </div>
+                ) : null}
+                {pricing === "paid" && paidReadiness.status === "loaded" && !paidOfferReady ? (
+                  <div role="alert" className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
                     <span>{t("clientMarket.offerRequiresBilling")}</span>
                     <div className="flex flex-wrap gap-3">
-                      <a href={DASHBOARD_ACCOUNT_BILLING_PATH} className="font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a>
-                      <a href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className="font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a>
+                      {!paidReadiness.settlementReady ? <a href={`${DASHBOARD_ACCOUNT_BILLING_PATH}?tab=receivables`} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
+                      {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
                     </div>
                   </div>
                 ) : null}
@@ -534,7 +542,7 @@ export function AddHostDialog({
             </>
           ) : (
             <>
-              <Modal.Body className="grid gap-3 text-slate-900">
+              <Modal.Body className="grid max-h-[75vh] gap-3 overflow-y-auto text-slate-900">
                 {mode === "password" ? renderStep("installKey", t("clientMarket.stepInstallKey")) : null}
                 {renderStep("connectivity", t("clientMarket.stepConnectivity"))}
                 {renderStep(
