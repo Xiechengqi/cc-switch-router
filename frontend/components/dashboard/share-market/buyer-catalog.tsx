@@ -33,6 +33,7 @@ import {
   ShareProviderLogo,
 } from "@/components/dashboard/share-provider-logo";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
+import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -537,6 +538,7 @@ export function ShareMarketBuyerCatalog({
             <Drawer.Body className="overflow-y-auto pb-28">
               {selected ? (
                 <div className="grid gap-5">
+                  <ShareModelHealthHeatmap shareId={selected.listing.shareId} />
                   <section className="grid gap-3">
                     <div className="flex items-center justify-between">
                       <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.chooseSeat")}</h3>

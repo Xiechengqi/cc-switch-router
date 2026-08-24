@@ -61,14 +61,15 @@ use crate::models::{
     ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptorBatchSyncResponse,
     ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
-    ShareHeartbeatRequest, SharePendingEditsRequest, SharePruneRequest,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogBatchSyncResponse, ShareRequestLogEntry,
-    ShareRuntimeRefreshRequest, ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
-    SubdomainAvailabilityResponse, TelegramBindLinkResponse, TunnelActivateRequest,
-    TunnelStateRequest, TunnelStateResponse, UpdateNotificationSettingsRequest,
-    UpdateUsageCardSettingsRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
-    UpgradeInstallationStatusResponse, UsageCardSettingsResponse, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareHeartbeatRequest, ShareModelHealthCalendarResponse, SharePendingEditsRequest,
+    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogBatchSyncResponse,
+    ShareRequestLogEntry, ShareRuntimeRefreshRequest, ShareSettingsPatch,
+    ShareSettingsUpdateRequest, ShareSyncRequest, SubdomainAvailabilityResponse,
+    TelegramBindLinkResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
+    UpdateNotificationSettingsRequest, UpdateUsageCardSettingsRequest, UpgradeInstallationRequest,
+    UpgradeInstallationResponse, UpgradeInstallationStatusResponse, UsageCardSettingsResponse,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -168,6 +169,12 @@ struct ShareApiAuthQuery {
 #[serde(rename_all = "camelCase")]
 struct ShareUsageByEmailQuery {
     period: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShareModelHealthCalendarQuery {
+    #[serde(default)]
+    days: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,6 +415,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/test-connection",
             post(test_share_connection),
+        )
+        .route(
+            "/v1/shares/:share_id/model-health-calendar",
+            get(get_share_model_health_calendar),
         )
         .route(
             "/v1/shares/:share_id/refresh-usage",
@@ -3874,30 +3885,46 @@ mod tests {
     }
 
     #[test]
-    fn gemini_app_probe_uses_canonical_model_name() {
-        let probe = app_probe_for_kind("gemini", "text").expect("gemini probe should exist");
-
+    fn contract_probe_response_modes_are_explicit() {
         assert_eq!(
-            probe.path,
-            "/v1beta/models/gemini-2.5-flash:generateContent"
+            probe_response_mode("json").unwrap(),
+            ProbeResponseMode::Json
         );
+        assert_eq!(
+            probe_response_mode("anthropic_sse").unwrap(),
+            ProbeResponseMode::AnthropicSse
+        );
+        assert_eq!(
+            probe_response_mode("responses_sse").unwrap(),
+            ProbeResponseMode::ResponsesSse
+        );
+        assert_eq!(
+            probe_response_mode("gemini_sse").unwrap(),
+            ProbeResponseMode::GeminiSse
+        );
+        assert!(probe_response_mode("unknown").is_err());
     }
 
     #[test]
-    fn claude_tools_probe_exists_for_cursor_shares() {
-        let probe = app_probe_for_kind("claude", "tools").expect("claude tools probe");
-        assert_eq!(probe.path, "/v1/messages");
-        assert!(probe.body.contains("\"tools\""));
-        assert!(probe.body.contains("\"stream\":true"));
-    }
+    fn model_probe_test_respects_the_enabled_app_surface() {
+        let share = ShareForTest {
+            contract_version: 4,
+            subdomain: "share-subdomain".into(),
+            owner_email: "owner@example.com".into(),
+            user_grants: Default::default(),
+            bindings: Default::default(),
+            support: crate::models::ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
+            app_runtimes: Default::default(),
+            app_providers: Default::default(),
+        };
 
-    #[test]
-    fn codex_text_probe_includes_store_false_for_oauth() {
-        let probe = app_probe_for_kind("codex", "text").expect("codex text probe");
-        assert_eq!(probe.path, "/v1/responses");
-        assert!(probe.body.contains("\"store\":false"));
-        assert!(probe.body.contains("\"stream\":true"));
-        assert!(!probe.body.contains("max_output_tokens"));
+        assert!(share_model_probe_app_enabled(&share, "codex"));
+        assert!(!share_model_probe_app_enabled(&share, "claude"));
+        assert!(!share_model_probe_app_enabled(&share, "gemini"));
     }
 
     #[test]
@@ -3934,18 +3961,16 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_and_image_probes_use_their_protocol_terminals() {
+    fn anthropic_and_gemini_probes_use_their_protocol_terminals() {
         let mut anthropic = ProbeSseTracker::new(ProbeResponseMode::AnthropicSse);
         anthropic.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
         assert_eq!(anthropic.finish().0.as_deref(), Some("message_stop"));
 
-        let mut image = ProbeSseTracker::new(ProbeResponseMode::ImageSse);
-        image.push(b"event: image_generation.com");
-        image.push(b"pleted\ndata: {\"type\":\"image_generation.completed\"}\n\n");
-        assert_eq!(
-            image.finish().0.as_deref(),
-            Some("image_generation.completed")
+        let mut gemini = ProbeSseTracker::new(ProbeResponseMode::GeminiSse);
+        gemini.push(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
         );
+        assert_eq!(gemini.finish().0.as_deref(), Some("gemini.completed"));
     }
 
     #[tokio::test]
@@ -3982,96 +4007,6 @@ mod tests {
         assert!(body.total_bytes > body.preview.len());
         assert_eq!(body.terminal_event.as_deref(), Some("response.completed"));
         assert!(body.error.is_none());
-    }
-
-    #[test]
-    fn claude_tools_probe_enabled_for_cursor_binding() {
-        let share = ShareForTest {
-            subdomain: "share-sub".into(),
-            owner_email: "owner@example.com".into(),
-            user_grants: Default::default(),
-            bindings: std::collections::BTreeMap::from([("claude".into(), "cursor-1".into())]),
-            app_providers: crate::models::ShareAppProviders {
-                claude: vec![crate::models::ShareAppProvider {
-                    id: "cursor-1".into(),
-                    name: "Cursor".into(),
-                    app: "claude".into(),
-                    kind: Some("cursor_apikey".into()),
-                    provider_type: Some("cursor_apikey".into()),
-                    is_current: true,
-                    enabled: true,
-                    codex_image_generation_enabled: false,
-                    account_email: None,
-                    api_url: None,
-                    quota: None,
-                    models: Vec::new(),
-                    ..Default::default()
-                }],
-                ..crate::models::ShareAppProviders::default()
-            },
-        };
-
-        assert!(share_claude_cursor_tools_probe_enabled(&share));
-    }
-
-    #[test]
-    fn codex_image_test_requires_enabled_bound_provider() {
-        let share = ShareForTest {
-            subdomain: "share-sub".into(),
-            owner_email: "owner@example.com".into(),
-            user_grants: Default::default(),
-            bindings: std::collections::BTreeMap::from([("codex".into(), "provider-1".into())]),
-            app_providers: crate::models::ShareAppProviders {
-                codex: vec![crate::models::ShareAppProvider {
-                    id: "provider-1".into(),
-                    name: "OpenAI Official".into(),
-                    app: "codex".into(),
-                    kind: Some("official_oauth".into()),
-                    provider_type: Some("codex_oauth".into()),
-                    is_current: true,
-                    enabled: true,
-                    codex_image_generation_enabled: true,
-                    account_email: None,
-                    api_url: None,
-                    quota: None,
-                    models: Vec::new(),
-                    ..Default::default()
-                }],
-                ..crate::models::ShareAppProviders::default()
-            },
-        };
-
-        assert!(share_codex_image_generation_enabled(&share));
-    }
-
-    #[test]
-    fn codex_image_test_rejects_unbound_provider_capability() {
-        let share = ShareForTest {
-            subdomain: "share-sub".into(),
-            owner_email: "owner@example.com".into(),
-            user_grants: Default::default(),
-            bindings: std::collections::BTreeMap::from([("codex".into(), "provider-1".into())]),
-            app_providers: crate::models::ShareAppProviders {
-                codex: vec![crate::models::ShareAppProvider {
-                    id: "provider-2".into(),
-                    name: "Other Codex".into(),
-                    app: "codex".into(),
-                    kind: Some("official_oauth".into()),
-                    provider_type: Some("codex_oauth".into()),
-                    is_current: false,
-                    enabled: true,
-                    codex_image_generation_enabled: true,
-                    account_email: None,
-                    api_url: None,
-                    quota: None,
-                    models: Vec::new(),
-                    ..Default::default()
-                }],
-                ..crate::models::ShareAppProviders::default()
-            },
-        };
-
-        assert!(!share_codex_image_generation_enabled(&share));
     }
 }
 
@@ -6302,9 +6237,9 @@ async fn record_notification_admin_audit(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// P18: test-connection — dashboard 可以通过 share 的 subdomain + 调用者的 api token
-// 向 claude / codex / gemini 发一个最小探针（max_tokens=1），把原始 HTTP
-// 响应回传给前端展示。后端中转是因为 share subdomain 不同源，CORS 不通。
+// P18: test-connection — dashboard 通过 Share 的 subdomain 和调用者自己的
+// API token 执行 Server-authoritative modelProbe，并把原始 HTTP 响应回传。
+// 后端中转是因为 Share subdomain 不同源，浏览器不能直接调用。
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -6312,7 +6247,7 @@ async fn record_notification_admin_audit(
 struct ShareConnectionTestRequest {
     /// "claude" | "codex" | "gemini"
     app: String,
-    /// "text" | "chat" | "image" | "tools"; image is only supported for codex shares.
+    /// Legacy callers may still send "text"; all other old probe kinds are retired.
     #[serde(default)]
     kind: Option<String>,
     /// 可选，毫秒；默认 15000，上限 30000
@@ -6450,73 +6385,41 @@ enum ProbeResponseMode {
     Json,
     AnthropicSse,
     ResponsesSse,
-    ImageSse,
+    GeminiSse,
 }
 
-struct AppProbe {
-    method: &'static str,
-    path: &'static str,
-    body: &'static str,
-    response_mode: ProbeResponseMode,
+fn probe_response_mode(value: &str) -> Result<ProbeResponseMode, AppError> {
+    match value {
+        "json" => Ok(ProbeResponseMode::Json),
+        "anthropic_sse" => Ok(ProbeResponseMode::AnthropicSse),
+        "responses_sse" => Ok(ProbeResponseMode::ResponsesSse),
+        "gemini_sse" => Ok(ProbeResponseMode::GeminiSse),
+        _ => Err(AppError::Conflict(
+            "Share modelProbe response mode is not supported; upgrade or resync cc-switch-server"
+                .into(),
+        )),
+    }
 }
 
-fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
-    match (app, kind) {
-        ("claude", "text") => Some(AppProbe {
-            method: "POST",
-            path: "/v1/messages",
-            // cc-switch-server 的 ensure_claude_oauth_billing_header_system 会在
-            // ClaudeOAuth provider 路径下自动注入 x-anthropic-billing-header system
-            // 块 + cch 签名，所以这里用最简形式即可——与 api.anthropic.com 官方文档
-            // 示例完全一致。
-            //
-            // `stream: true` 是为了兼容 GitHub Copilot 这类 Anthropic-on-OpenAI 绑定：
-            // cc-switch-server 在非流式路径上会把上游响应做 openai_to_anthropic 转换；如果
-            // 上游碰巧返回 `choices: []`（短回复、Copilot 内部行为等），转换器会抛
-            // "Empty choices array"。claude-cli 真实流量恒为 stream:true，走 SSE
-            // passthrough 不触发这条转换，所以也对齐这一行为。
-            body: r#"{"model":"claude-opus-4-7","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"who are you"}]}"#,
-            response_mode: ProbeResponseMode::AnthropicSse,
-        }),
-        ("codex", "text") => Some(AppProbe {
-            method: "POST",
-            path: "/v1/responses",
-            // Codex OAuth 上游强制 store=false（否则 400 "Store must be set to false"）。
-            // 对齐 cc-switch-server provider_test_body：stream + reasoning + include，
-            // 不用 max_output_tokens（OAuth 端点会拒绝）。
-            body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"who are you"}],"stream":true,"store":false,"reasoning":{"effort":"low"},"include":["reasoning.encrypted_content"],"instructions":"","tools":[],"parallel_tool_calls":false}"#,
-            response_mode: ProbeResponseMode::ResponsesSse,
-        }),
-        ("codex", "chat") => Some(AppProbe {
-            method: "POST",
-            path: "/v1/chat/completions",
-            body: r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"who are you"}],"max_completion_tokens":16}"#,
-            response_mode: ProbeResponseMode::Json,
-        }),
-        ("codex", "image") => Some(AppProbe {
-            method: "POST",
-            path: "/v1/images/generations",
-            body: r#"{"model":"gpt-5.5","prompt":"A small robot painting a sunrise","size":"1024x1024","response_format":"b64_json","output_format":"png","stream":true,"partial_images":0}"#,
-            response_mode: ProbeResponseMode::ImageSse,
-        }),
-        ("gemini", "text") => Some(AppProbe {
-            method: "POST",
-            path: "/v1beta/models/gemini-2.5-flash:generateContent",
-            // 同 claude/codex 思路：避免极小 maxOutputTokens 触发上游 OAuth 网关的
-            // 探针检测。Gemini 2.5 Flash 也是 reasoning model。
-            body: r#"{"contents":[{"parts":[{"text":"who are you"}]}],"generationConfig":{"maxOutputTokens":16}}"#,
-            response_mode: ProbeResponseMode::Json,
-        }),
-        ("claude", "tools") => Some(AppProbe {
-            method: "POST",
-            path: "/v1/messages",
-            // Cursor AgentService path: Claude Code always ships tools. A passing
-            // probe should return tool_use or assistant text within the timeout,
-            // not stall after message_start.
-            body: r#"{"model":"claude-opus-4-7","max_tokens":256,"stream":true,"tools":[{"name":"Bash","description":"run bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],"messages":[{"role":"user","content":"run ls"}]}"#,
-            response_mode: ProbeResponseMode::AnthropicSse,
-        }),
+fn share_model_probe_for_app<'a>(
+    share: &'a ShareForTest,
+    app: &str,
+) -> Option<&'a crate::models::ProviderModelProbe> {
+    match app {
+        "claude" => share.app_runtimes.claude.as_ref(),
+        "codex" => share.app_runtimes.codex.as_ref(),
+        "gemini" => share.app_runtimes.gemini.as_ref(),
         _ => None,
+    }
+    .and_then(|runtime| runtime.model_probe.as_ref())
+}
+
+fn share_model_probe_app_enabled(share: &ShareForTest, app: &str) -> bool {
+    match app {
+        "claude" => share.support.claude,
+        "codex" => share.support.codex,
+        "gemini" => share.support.gemini,
+        _ => false,
     }
 }
 
@@ -6576,7 +6479,7 @@ impl ProbeSseTracker {
         let expected = match self.mode {
             ProbeResponseMode::AnthropicSse => "message_stop",
             ProbeResponseMode::ResponsesSse => "response.completed",
-            ProbeResponseMode::ImageSse => "image_generation.completed",
+            ProbeResponseMode::GeminiSse => "a Gemini finishReason",
             ProbeResponseMode::Json => "JSON response",
         };
         let message = if self.saw_done {
@@ -6605,6 +6508,12 @@ impl ProbeSseTracker {
             self.saw_done = true;
             return;
         }
+        if self.mode == ProbeResponseMode::GeminiSse
+            && let Some(event) = gemini_sse_event(data, truncated)
+        {
+            self.observe_event(&event);
+            return;
+        }
         if let Some(event) = sse_json_event_type(data, truncated) {
             self.observe_event(&event);
         }
@@ -6615,7 +6524,7 @@ impl ProbeSseTracker {
         let success = match self.mode {
             ProbeResponseMode::AnthropicSse => event == "message_stop",
             ProbeResponseMode::ResponsesSse => event == "response.completed",
-            ProbeResponseMode::ImageSse => event == "image_generation.completed",
+            ProbeResponseMode::GeminiSse => event == "gemini.completed",
             ProbeResponseMode::Json => false,
         };
         let failure = match self.mode {
@@ -6628,9 +6537,7 @@ impl ProbeSseTracker {
                     | "response.canceled"
                     | "error"
             ),
-            ProbeResponseMode::ImageSse => {
-                matches!(event, "image_generation.failed" | "error")
-            }
+            ProbeResponseMode::GeminiSse => event == "error",
             ProbeResponseMode::Json => false,
         };
         if failure && self.failure_event.is_none() {
@@ -6669,6 +6576,28 @@ fn sse_json_event_type(data: &[u8], truncated: bool) -> Option<String> {
     std::str::from_utf8(&remainder[..end])
         .ok()
         .map(str::to_string)
+}
+
+fn gemini_sse_event(data: &[u8], truncated: bool) -> Option<String> {
+    if truncated {
+        return None;
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(data).ok()?;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Some("error".to_string());
+    }
+    value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate
+                    .get("finishReason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| !reason.trim().is_empty())
+            })
+        })
+        .then(|| "gemini.completed".to_string())
 }
 
 async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> ProbeBodyRead {
@@ -6736,43 +6665,6 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
         terminal_event: error.is_none().then(|| "json.completed".to_string()),
         error,
     }
-}
-
-fn share_claude_cursor_tools_probe_enabled(share: &ShareForTest) -> bool {
-    let Some(bound_provider_id) = share
-        .bindings
-        .get("claude")
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-
-    share.app_providers.claude.iter().any(|provider| {
-        provider.id == bound_provider_id
-            && provider.enabled
-            && matches!(
-                provider.provider_type.as_deref(),
-                Some("cursor_oauth") | Some("cursor_apikey")
-            )
-    })
-}
-
-fn share_codex_image_generation_enabled(share: &ShareForTest) -> bool {
-    let Some(bound_provider_id) = share
-        .bindings
-        .get("codex")
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-
-    share.app_providers.codex.iter().any(|provider| {
-        provider.id == bound_provider_id
-            && provider.enabled
-            && provider.codex_image_generation_enabled
-    })
 }
 
 async fn refresh_share_usage(
@@ -7015,6 +6907,36 @@ async fn get_image_generation_result(
         .map_err(|e| AppError::Internal(format!("build image result response failed: {e}")))
 }
 
+async fn get_share_model_health_calendar(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Query(query): Query<ShareModelHealthCalendarQuery>,
+) -> Result<Json<ShareModelHealthCalendarResponse>, AppError> {
+    let viewer_email = extract_session_email(&state, &headers).await?;
+    let is_admin = {
+        let dynamic = state.dynamic.read().await;
+        viewer_email
+            .as_deref()
+            .is_some_and(|email| dynamic.is_admin(email))
+    };
+    if !state
+        .store
+        .can_view_share_model_health_calendar(&share_id, viewer_email.as_deref(), is_admin)
+        .await?
+    {
+        return Err(AppError::NotFound(
+            "Share model health calendar not found".into(),
+        ));
+    }
+    let calendar = state
+        .store
+        .share_model_health_calendar(&share_id, query.days.unwrap_or(365), Utc::now())
+        .await?
+        .ok_or_else(|| AppError::NotFound("Share model health calendar not found".into()))?;
+    Ok(Json(calendar))
+}
+
 async fn test_share_connection(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -7022,22 +6944,21 @@ async fn test_share_connection(
     Json(input): Json<ShareConnectionTestRequest>,
 ) -> Result<Json<ShareConnectionTestResponse>, AppError> {
     let current_user_email = require_user_email(&state, &headers, "share:read").await?;
-
-    let probe_kind = input
+    let app = input.app.trim().to_ascii_lowercase();
+    if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
+        return Err(AppError::BadRequest("unsupported Share App".into()));
+    }
+    if input
         .kind
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("text");
-    let app = input.app.trim().to_ascii_lowercase();
-    let probe = app_probe_for_kind(&app, probe_kind).ok_or_else(|| {
-        AppError::BadRequest(format!(
-            "unsupported app probe: app={} kind={probe_kind}",
-            app
-        ))
-    })?;
+        .is_some_and(|kind| !kind.is_empty() && kind != "text")
+    {
+        return Err(AppError::BadRequest(
+            "only the Server-authoritative model probe is supported".into(),
+        ));
+    }
 
-    // Load share — verify caller is owner or admin
     let share = state
         .store
         .get_share_for_test(&share_id)
@@ -7058,21 +6979,37 @@ async fn test_share_connection(
             "share does not have a {app} binding"
         )));
     }
-
-    if app == "codex" && probe_kind == "image" && !share_codex_image_generation_enabled(&share) {
-        return Err(AppError::BadRequest(
-            "codex image generation is not enabled for the bound provider".into(),
-        ));
+    if !share_model_probe_app_enabled(&share, &app) {
+        return Err(AppError::BadRequest(format!(
+            "share does not enable the {app} API"
+        )));
     }
-
-    if app == "claude" && probe_kind == "tools" && !share_claude_cursor_tools_probe_enabled(&share)
+    let probe = share_model_probe_for_app(&share, &app)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Conflict(format!(
+                "Share Contract v4 modelProbe is unavailable (contract version {}); upgrade or resync cc-switch-server",
+                share.contract_version
+            ))
+        })?;
+    let expected_api_type = match app.as_str() {
+        "claude" => "anthropic",
+        "codex" => "openai",
+        "gemini" => "gemini",
+        _ => unreachable!("Share App was validated above"),
+    };
+    if probe.api_type != expected_api_type
+        || crate::store::validate_provider_model_probe(&app, &probe).is_err()
     {
-        return Err(AppError::BadRequest(
-            "claude tools probe is only available for cursor_oauth / cursor_apikey shares".into(),
+        return Err(AppError::Conflict(
+            "Share modelProbe is incompatible; upgrade or resync cc-switch-server".into(),
         ));
     }
-
-    let subdomain = share.subdomain;
+    let response_mode = probe_response_mode(&probe.response_mode)?;
+    let probe_body = serde_json::to_string(&probe.body).map_err(|error| {
+        AppError::Internal(format!("encode Share modelProbe body failed: {error}"))
+    })?;
+    let subdomain = share.subdomain.clone();
 
     // Fetch the caller's own api token (not the share owner's)
     let api_token = state
@@ -7117,10 +7054,10 @@ async fn test_share_connection(
         .map_err(|e| AppError::Internal(format!("create test client failed: {e}")))?;
 
     let request_echo = TestRequestEcho {
-        method: probe.method.to_string(),
+        method: probe.method.clone(),
         url: public_url.clone(),
         headers: echo_headers,
-        body: Some(probe.body.to_string()),
+        body: Some(probe_body.clone()),
     };
 
     let started = std::time::Instant::now();
@@ -7129,8 +7066,8 @@ async fn test_share_connection(
         .header("Host", &public_host)
         .bearer_auth(&api_token)
         .header("Content-Type", "application/json")
-        .body(probe.body);
-    if probe.response_mode != ProbeResponseMode::Json {
+        .body(probe_body);
+    if response_mode != ProbeResponseMode::Json {
         request = request.header("Accept", "text/event-stream");
     }
     let result = request.send().await;
@@ -7163,7 +7100,7 @@ async fn test_share_connection(
                 .iter()
                 .map(|(k, v)| [k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
-            let body = read_probe_body(resp, probe.response_mode).await;
+            let body = read_probe_body(resp, response_mode).await;
             let duration_ms = started.elapsed().as_millis() as u64;
             let body_truncated = body.total_bytes > body.preview.len();
             let body_text = String::from_utf8_lossy(&body.preview).into_owned();

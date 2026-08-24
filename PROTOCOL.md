@@ -175,12 +175,26 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
+- 当前写出版本是 **Share Contract v4**。Router 为滚动升级仍可读取 v2..v4,但只有 v4 提供本节定义的 `modelProbe`;Share Market 发布、连接测试与半小时模型健康检查均要求当前版本。
 - `capacityPoolId` 是非空匿名标识。同一 Router 下复用相同物理账号或 API key 的不同 Share URL 使用同一值,用于容量与故障域去重；该值在凭据源不变期间稳定，账号绑定或 API key 改变时必须重新派生并同步。
 - `bindings` 必须包含 1 到 3 个不同 app 的 `{ app: providerId }` 绑定,app 仅允许 `claude`、`codex`、`gemini`;顶层 `appType` / `providerId` 必须对应其中一个绑定。
 - `support` 表示当前对外开启的 App API。关闭某个 API 不会删除对应 binding；至少保留一个已绑定 app 为开启。未开启的 app 不接受直连、Share Market 或 Gateway 请求。
-- `appRuntimes`、`appProviders` 与 `appAvailability` 只可声明已绑定 app。访问策略由 Share 级 `freeAccess` 与 `userGrants` 统一定义；Contract v2 不包含分 app ACL、`appSettings` 或普通 Share 价格字段。
+- `appRuntimes`、`appProviders` 与 `appAvailability` 只可声明已绑定 app。访问策略由 Share 级 `freeAccess` 与 `userGrants` 统一定义；v4 延续 v2 的边界,不包含分 app ACL、`appSettings` 或普通 Share 价格字段。
 - `userGrants[].usage` 是当前周期的 Server 派生快照；可选的 `usageRebase` 是 Server-owned 的官方额度重置基线。Router 必须原样 round-trip 该字段并使用 descriptor 中的有效 usage 做限制判断，不能通过普通设置补丁伪造或修改基线。
 - `upstreamProvider`、`appRuntimes` 和 `appProviders` 中的 Provider 投影携带有效 `modelPolicy`，并用 `modelPolicyScope=global|per_app` 与 `modelPolicySource=bundle_global|app_independent|profile_fixed` 明确控制来源。`global` 只统一 Bundle 中可配置的 Surface；Profile 固定策略可不同且必须标记为 `profile_fixed`。这些字段属于静态 descriptor 指纹，单独切换 scope 也必须提升投影并同步 Router。
+- v4 的每个可测试 Provider 运行时携带无凭据的 `modelProbe`。它是 Server 供应商测试请求的唯一公开描述,连接示例和 Router 定时测试不得自行维护模型名或请求模板。字段语义如下:
+
+| `modelProbe` 字段 | 语义 |
+|---|---|
+| `apiType` | 公网 API 协议名:`openai`、`anthropic` 或 `gemini`;分别对应内部 `codex`、`claude`、`gemini` |
+| `requestedModel` | Server 供应商配置选定的测试模型,可包含 `@low` 等请求修饰符 |
+| `wireModel` | 实际写入公网请求的模型名;请求修饰符已拆入 body 的对应字段 |
+| `method` / `path` / `body` | 可直接通过 Share URL 发出的结构化模型测试请求;当前 method 固定为 `POST`,body 上限 64 KiB |
+| `stream` / `responseMode` | 是否流式及完成判定:`json`、`anthropic_sse`、`responses_sse` 或 `gemini_sse` |
+| `payloadRevision` | 请求模板版本,当前为 `2`;未知版本必须 fail closed |
+| `healthFingerprint` | Provider revision、凭据世代和运行时策略的非敏感指纹,用于拒绝配置变更后的陈旧结果 |
+
+  Codex 使用 OpenAI Responses `/v1/responses`,Claude 使用 Anthropic Messages `/v1/messages`,Gemini 使用 URL 编码模型段的 native `generateContent`/`streamGenerateContent` 路径。Router 入库和执行前均校验固定路径、body 中的 wire model、stream/responseMode 一致性及 SHA-256 health fingerprint,并递归拒绝 Authorization、API key、OAuth token、Cookie 或其他凭据字段。
 - 调用 app 只由 URL 协议路径判定,客户端提供的 app header 不参与授权。未绑定 app 的直连、Share Market 和 Gateway 请求均被拒绝。
 
 已连接的 Server 使用签名续期 API 在**原 SSH 连接上**续期,不按 lease TTL 周期重建连接。
@@ -388,11 +402,43 @@ Router 经隧道拉取 share 侧运行时数据。Server 需实现:
 | `GET /_share-router/health` | 健康探测(`src/main.rs:858`) |
 | `GET /_share-router/request-logs` | 请求日志拉取 |
 | `GET /_share-router/share-runtime` | share 运行时状态(额度、用量、模型健康) |
-| `POST /_share-router/model-health` | 对绑定的上游供应商做实时健康探测 |
+| `POST /_share-router/model-health` | 兼容的单 Share、单 App 实时模型探测 |
+| `POST /_share-router/model-health/batch` | 模型健康批协议 v1,仅用于滚动升级回退 |
+| `POST /_share-router/model-health/batch-v2` | 当前模型健康批协议 v2;同一 installation 最多 256 个目标 |
 
-校验方式与第 7 节相同(同一 HMAC 契约),另需 `x-cc-switch-share-id` 头标识目标 share。
+校验方式与第 7 节相同(同一 HMAC 契约)。`request-logs` 与单目标 `model-health` 使用 `x-cc-switch-share-id` 标识目标 Share;`share-runtime` 在多 Share Server 上使用 `shareId` query;batch 端点从签名 body 的 `targets[] { shareId, appType }` 取目标,不依赖单 Share header。v2 body 还必须携带 `contractVersion=2`;Router 仅在 v2 返回 404/405 时回退 v1,其他协议错误不得静默降级。
 
-### 8.1 Share 请求日志 usage 生命周期
+### 8.1 连通性与模型健康是两套信号
+
+Router 每 30 秒对 Share/Client 隧道调用一次 `GET /_share-router/health`。这只验证隧道和 Server HTTP 控制端点的**连通性**,结果进入 route/share health 时间线,不消耗模型请求,也不计入模型健康热力图。
+
+模型健康按 UTC 半小时槽运行,每个完整监测日固定 48 槽。Router 的模型健康后台任务也每 30 秒唤醒,用于在启动、短暂故障或多实例接管后及时领取当前槽；`share_model_health_slots` 的 `(share_id, slot_start)` 主键和 claim token 保证同一 Share 每个半小时最多保留一个有效投影。目标先同步资格 epoch,实际轮到 installation 分块执行时才 claim；claim 会原子校验 epoch 仍覆盖当前槽,槽结束后不再领取排队目标。pending claim 超过 10 分钟后才允许接管,覆盖单批次 7 分钟总预算及持久化余量；`outcome=unobserved` 的控制面失败可在当前半小时内立即重新领取,真实 Provider `success`/`failure` 不可覆盖。每个活跃 Share 只选择一个已启用且携带可执行 `modelProbe` 的 App,优先级固定为:
+
+1. Codex → `appType=openai`
+2. Claude → `appType=anthropic`
+3. Gemini → `appType=gemini`
+
+已启用但没有可执行探针的高优先级 App 会被跳过并继续尝试下一 App；三者均不可测试时关闭当前资格 epoch,不会用硬编码请求补位。Router 先按 installation 分组,最多并行处理 16 个 installation；控制路由优先使用 installation 的 Client 隧道,再回退最多两个当前在线的 Share subdomain。同一 installation 内的 256 条分块保持顺序,每个已 claim 批次的全部 v2 路由尝试和可选 v1 回退共享 7 分钟总预算,且最晚不得超过槽结束后 5 分钟。v1 没有 canonical observation 幂等保证,因此每批最多回退一次；模糊传输失败记为 monitoring gap,不经另一 Share 路由重复消费模型请求。Server 在 batch 内按 Provider runtime 分组,最多并行探测 3 组,完成后按 App/Provider key 确定性排序。单个目标已删除、禁用或绑定失效时 Server 省略该结果；单个 Provider 组执行异常也只省略该组,不得让其他 Provider/Share 连带失败。Router 只把对应缺失目标记为 monitoring gap。
+
+`cycleId` 是确定性的 `utc-{slot_start}`。Server 按 Provider 运行时去重执行,一次实际探测可以投影到多个 Share；相同 cycle 的 HTTP 重试复用 health fingerprint 完全相同且内容稳定的 Provider 结果。Server 自己的半小时 Provider scheduler 在最近 45 分钟已有 Router cycle 时跳过对应 Provider,避免双重消耗。
+
+v2 每条结果必须携带 `observationId`、`outcome`、`failureDomain`、`reasonCode`、`evidenceScope=provider_runtime` 与 `evidenceVersion=2`。`observationId` 是 installation、cycle、App、Provider 和 health fingerprint 的稳定 SHA-256；Router 会重新计算,并严格匹配 App、Provider、`requestedModel`、`actualModel`、模型策略和 health fingerprint。`actualModel` 在固定上游策略下是固定上游模型,在透传策略下是 probe 的 wire model。一次 Provider observation 只写入 `share_model_probe_observations` 一次,各 Share 槽只保存其投影。相同 ID 的状态、时间、模型、延迟或故障分类发生漂移时整笔投影回滚。
+
+故障域固定为:上游/网络/限流属于 `upstream`,账户额度阻断属于 `quota`,鉴权、模型名和 Provider 协议配置属于 `provider_config`,隧道与控制请求属于 `control_transport`,Router 编解码/校验/持久化属于 `router_monitor`,无法稳定分类才使用 `unknown`。前三类是已实际观察到的上游侧失败；后两类没有观察到 Provider,必须写成 `outcome=unobserved` 并计入 monitoring gap,不得伪装成上游失败。v1 回退结果标为 `share_legacy`/`evidenceVersion=1`,继续展示但不得用于供应商信誉、SLA、退款或结算。
+
+每次监测配置的有效期由 probe epoch 精确表达,包含 App、Provider、容量池、测试模型、模型策略和 health fingerprint。启用、暂停、恢复或配置切换均开启/关闭 epoch；当前槽已经被领取时,切换从下一槽生效。完整资格日分母为 48；首次启用日、暂停日和恢复日仅计算实际落在 epoch 内且已经开始的槽。Share 运行前、暂停窗口和未来槽不进分母。
+
+`GET /v1/shares/:share_id/model-health-calendar?days=N` 返回 UTC 日历聚合,`N` 被限制在 1..400,Dashboard 默认读取 365 天。每个 active 日同时返回 eligible、completed、observed、successful、已确认上游侧失败、monitoring gap、成功率和覆盖率；成功率固定为 `successful / eligible`,覆盖率为 `observed / eligible`,缺失检查不能算成功。历史槽、canonical observation 与已结束 epoch 保留 400 天。日历只对以下调用方可见:活跃公开 Share Market listing 的访客、Share Owner、管理员、活跃 ShareTo 用户。
+
+Client 页和 Share Market 页的 Share 侧边栏使用同一个日历组件:日期方块按红、黄、浅绿、绿表达上游模型可用率,并显示月份横轴和星期纵轴。Tooltip 必须同时说明已观测数、确认的上游侧失败、监测缺口、覆盖率和同日配置切换；共享结果只标记“共享上游探针”,不披露其他 Share 数量。这一图表不能混用 30 秒连通率。
+
+### 8.2 连接示例与手动测试
+
+“连接”弹窗把手动操作明确标为**端到端连接测试**,对每个已启用 App 只显示一条 Server-authoritative 模型请求。Curl 的 method、path、body、流式 header 和测试模型全部由对应 `appRuntimes.<app>.modelProbe` 生成；Router 的手动 `test-connection` 经公开 Share 路由执行这份 probe 并按 `responseMode` 校验 JSON 或 SSE 完成事件。半小时定时探针则由 Server 在内部对绑定 Provider 执行同一测试模型。两者共用模型/策略来源,但证据范围不同,前端和 Router 后端不得保留硬编码的 GPT、Claude 或 Gemini 测试模型表。
+
+模型策略提示同样读取 Provider 投影:`passthrough` 明确说明模型名会透传到具体供应商,调用方应使用该供应商支持的模型名；`single` 明确说明任意请求模型都会映射到固定上游模型。弹窗展示的“测试模型”、Curl 以及半小时周期使用同一个 Server 配置来源。
+
+### 8.3 Share 请求日志 usage 生命周期
 
 Server 通过签名接口 `POST /v1/share-request-logs/batch-sync` 上送同一 `requestId` 的创建和终态记录。Token 数字字段为兼容字段，是否已经观测到真实 usage 必须由以下字段判定：
 

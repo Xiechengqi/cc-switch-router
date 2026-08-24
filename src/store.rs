@@ -66,7 +66,8 @@ use crate::models::{
     SHARE_CONTRACT_VERSION, SessionStatusResponse, ShareAppAvailability, ShareAppProviders,
     ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest,
     ShareDeleteRequest, ShareDescriptor, ShareDescriptorSyncAck, ShareEditAckEnvelope,
-    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareModelHealthCheckEntry,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareModelHealthCalendarDay,
+    ShareModelHealthCalendarResponse, ShareModelHealthCheckEntry, ShareModelHealthProbeEpoch,
     ShareModelHealthSummary, SharePendingEditsPayload, SharePendingEditsRequest,
     SharePendingEditsResponse, SharePruneRequest, ShareRequestLogBatchSyncRequest,
     ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRequestLogSyncAck,
@@ -944,18 +945,26 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
 /// P18: 测试接続で必要な share の基本情報。
 #[derive(Debug, Clone)]
 pub struct ShareForTest {
+    pub contract_version: u16,
     pub subdomain: String,
     pub owner_email: String,
     pub user_grants: BTreeMap<String, ShareUserGrant>,
     pub bindings: BTreeMap<String, String>,
+    pub support: ShareSupport,
+    pub app_runtimes: ShareAppRuntimes,
     pub app_providers: ShareAppProviders,
 }
 
 impl ShareForTest {
     pub fn has_active_shareto(&self, email: &str) -> bool {
+        let now_ms = Utc::now().timestamp_millis();
         self.user_grants.iter().any(|(key, grant)| {
             grant.active
                 && grant.role == "shareto"
+                && grant
+                    .policy
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > now_ms)
                 && (key.eq_ignore_ascii_case(email) || grant.email.eq_ignore_ascii_case(email))
         })
     }
@@ -1083,7 +1092,60 @@ pub struct ShareRouteTarget {
     pub installation_id: String,
     pub share_name: String,
     pub subdomain: String,
+    pub contract_version: u16,
+    pub capacity_pool_id: String,
+    pub bindings: BTreeMap<String, String>,
+    pub support: ShareSupport,
     pub app_runtimes: ShareAppRuntimes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareModelProbeEpochInput {
+    pub app_type: String,
+    pub api_type: String,
+    pub provider_id: String,
+    pub provider_name: Option<String>,
+    pub capacity_pool_id: String,
+    pub requested_model: String,
+    pub wire_model: String,
+    pub policy_mode: Option<String>,
+    pub health_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct StoredShareModelProbeEpoch {
+    epoch_id: String,
+    starts_at_slot: i64,
+    input: ShareModelProbeEpochInput,
+    evidence_version: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShareModelHealthSlotResult {
+    pub installation_id: String,
+    pub capacity_pool_id: String,
+    pub subdomain: String,
+    pub app_type: String,
+    pub api_type: String,
+    pub requested_model: String,
+    pub actual_model: String,
+    pub status: String,
+    pub status_code: Option<u16>,
+    pub latency_ms: u64,
+    pub provider_id: Option<String>,
+    pub provider_name: Option<String>,
+    pub policy_mode: Option<String>,
+    pub health_fingerprint: Option<String>,
+    pub observation_id: Option<String>,
+    pub outcome: String,
+    pub failure_domain: Option<String>,
+    pub reason_code: Option<String>,
+    pub evidence_scope: String,
+    pub evidence_version: u16,
+    pub error_category: Option<String>,
+    pub error_message: Option<String>,
+    pub checked_at: i64,
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -6714,29 +6776,52 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let row = conn
             .query_row(
-                "SELECT COALESCE(subdomain, '-'), owner_email, COALESCE(user_grants_json, '{}'), bindings_json, app_providers_json
+                "SELECT share_access_policy_version, COALESCE(subdomain, '-'), owner_email,
+                        COALESCE(user_grants_json, '{}'), bindings_json,
+                        enabled_claude, enabled_codex, enabled_gemini,
+                        app_runtimes_json, app_providers_json
                  FROM shares WHERE share_id = ?1",
                 params![share_id],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
-                        parse_share_user_grants(row.get(2)?)?,
-                        parse_share_bindings(row.get(3)?)?,
-                        parse_app_providers(row.get(4)?)?,
+                        row.get::<_, String>(2)?,
+                        parse_share_user_grants(row.get(3)?)?,
+                        parse_share_bindings(row.get(4)?)?,
+                        ShareSupport {
+                            claude: row.get::<_, i64>(5)? != 0,
+                            codex: row.get::<_, i64>(6)? != 0,
+                            gemini: row.get::<_, i64>(7)? != 0,
+                        },
+                        parse_app_runtimes(row.get(8)?)?,
+                        parse_app_providers(row.get(9)?)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share for test failed: {e}")))?;
-        let Some((subdomain, owner_email, user_grants, bindings, app_providers)) = row else {
-            return Ok(None);
-        };
-        Ok(Some(ShareForTest {
+        let Some((
+            contract_version,
             subdomain,
             owner_email,
             user_grants,
             bindings,
+            support,
+            app_runtimes,
+            app_providers,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ShareForTest {
+            contract_version: u16::try_from(contract_version).unwrap_or_default(),
+            subdomain,
+            owner_email,
+            user_grants,
+            bindings,
+            support,
+            app_runtimes,
             app_providers,
         }))
     }
@@ -7272,9 +7357,14 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("parse canonical Share user grants failed: {error}"))
             })?;
+        let now_ms = Utc::now().timestamp_millis();
         Ok(user_grants.iter().any(|(key, grant)| {
             grant.active
                 && grant.role == "shareto"
+                && grant
+                    .policy
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > now_ms)
                 && (key.eq_ignore_ascii_case(&email) || grant.email.eq_ignore_ascii_case(&email))
         }))
     }
@@ -10881,7 +10971,10 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT share_id, installation_id, share_name, subdomain, app_runtimes_json
+                "SELECT share_id, installation_id, share_name, subdomain,
+                        share_access_policy_version,
+                        enabled_claude, enabled_codex, enabled_gemini,
+                        app_runtimes_json, capacity_pool_id, bindings_json
                  FROM shares
                  WHERE subdomain IS NOT NULL
                    AND subdomain != ''
@@ -10897,11 +10990,29 @@ impl AppStore {
                     installation_id: row.get(1)?,
                     share_name: row.get(2)?,
                     subdomain: row.get(3)?,
-                    app_runtimes: parse_app_runtimes(row.get(4)?)?,
+                    contract_version: u16::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
+                    capacity_pool_id: row.get(9)?,
+                    bindings: parse_share_bindings(row.get(10)?)?,
+                    support: ShareSupport {
+                        claude: row.get::<_, i64>(5)? != 0,
+                        codex: row.get::<_, i64>(6)? != 0,
+                        gemini: row.get::<_, i64>(7)? != 0,
+                    },
+                    app_runtimes: parse_app_runtimes(row.get(8)?)?,
                 })
             })
             .map_err(|e| AppError::Internal(format!("query route targets failed: {e}")))?;
         collect_rows(rows)
+    }
+
+    pub async fn sync_share_model_probe_epoch(
+        &self,
+        share_id: &str,
+        slot_start: i64,
+        input: Option<&ShareModelProbeEpochInput>,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().await;
+        sync_share_model_probe_epoch_tx(&conn, share_id, slot_start, input)
     }
 
     pub async fn list_client_tunnel_route_targets(
@@ -11706,6 +11817,619 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn claim_share_model_health_slot(
+        &self,
+        share_id: &str,
+        slot_start: i64,
+        probe_epoch_id: &str,
+        app_type: &str,
+        api_type: &str,
+        requested_model: &str,
+        source: &str,
+        now: i64,
+    ) -> Result<Option<String>, AppError> {
+        // The Server allows a 60 second probe timeout plus five retries. Keep
+        // the claim alive beyond that worst case so another Router worker does
+        // not duplicate the same model request while the first is still live.
+        const STALE_CLAIM_SECS: i64 = 10 * 60;
+        let claim_token = Uuid::new_v4().to_string();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin Share model health slot claim failed: {error}"
+                ))
+            })?;
+        let epoch_is_current = tx
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM share_model_probe_epochs
+                     WHERE epoch_id = ?1
+                       AND share_id = ?2
+                       AND starts_at_slot <= ?3
+                       AND (ends_at_slot IS NULL OR ends_at_slot > ?3)
+                       AND app_type = ?4
+                       AND api_type = ?5
+                       AND requested_model = ?6
+                 )",
+                params![
+                    probe_epoch_id,
+                    share_id,
+                    slot_start,
+                    app_type,
+                    api_type,
+                    requested_model,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "validate Share model health claim epoch failed: {error}"
+                ))
+            })?;
+        if !epoch_is_current {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit rejected model health claim failed: {error}"
+                ))
+            })?;
+            return Ok(None);
+        }
+        let changed = tx
+            .execute(
+                "INSERT INTO share_model_health_slots (
+                    share_id, slot_start, claim_token, claimed_at, app_type, api_type,
+                    requested_model, status, source, updated_at, probe_epoch_id,
+                    outcome, evidence_scope, evidence_version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?4, ?9,
+                           'pending', 'share_projection', 2)
+                 ON CONFLICT(share_id, slot_start) DO UPDATE SET
+                    claim_token = excluded.claim_token,
+                    claimed_at = excluded.claimed_at,
+                    app_type = excluded.app_type,
+                    api_type = excluded.api_type,
+                    requested_model = excluded.requested_model,
+                    actual_model = '',
+                    status = 'pending',
+                    status_code = NULL,
+                    latency_ms = 0,
+                    provider_id = NULL,
+                    provider_name = NULL,
+                    policy_mode = NULL,
+                    health_fingerprint = NULL,
+                    observation_id = NULL,
+                    probe_epoch_id = excluded.probe_epoch_id,
+                    outcome = 'pending',
+                    failure_domain = NULL,
+                    reason_code = NULL,
+                    evidence_scope = 'share_projection',
+                    evidence_version = 2,
+                    error_category = NULL,
+                    error_message = NULL,
+                    checked_at = NULL,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                 WHERE (share_model_health_slots.status = 'pending'
+                        AND share_model_health_slots.claimed_at <= ?10)
+                    OR share_model_health_slots.outcome = 'unobserved'",
+                params![
+                    share_id,
+                    slot_start,
+                    claim_token,
+                    now,
+                    app_type,
+                    api_type,
+                    requested_model,
+                    source,
+                    probe_epoch_id,
+                    now - STALE_CLAIM_SECS,
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("claim Share model health slot failed: {error}"))
+            })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit Share model health slot claim failed: {error}"
+            ))
+        })?;
+        Ok((changed > 0).then_some(claim_token))
+    }
+
+    pub async fn finish_share_model_health_slot(
+        &self,
+        share_id: &str,
+        slot_start: i64,
+        claim_token: &str,
+        result: ShareModelHealthSlotResult,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin Share model health slot update failed: {error}"
+                ))
+            })?;
+        let changed = tx
+            .execute(
+                "UPDATE share_model_health_slots
+                 SET app_type = ?4,
+                     api_type = ?5,
+                     requested_model = ?6,
+                     actual_model = ?7,
+                     status = ?8,
+                     status_code = ?9,
+                     latency_ms = ?10,
+                     provider_id = ?11,
+                     provider_name = ?12,
+                     policy_mode = ?13,
+                     health_fingerprint = ?14,
+                     observation_id = ?15,
+                     outcome = ?16,
+                     failure_domain = ?17,
+                     reason_code = ?18,
+                     evidence_scope = ?19,
+                     evidence_version = ?20,
+                     error_category = ?21,
+                     error_message = ?22,
+                     checked_at = ?23,
+                     source = ?24,
+                     updated_at = ?25
+                 WHERE share_id = ?1 AND slot_start = ?2 AND claim_token = ?3
+                   AND status = 'pending'",
+                params![
+                    share_id,
+                    slot_start,
+                    claim_token,
+                    result.app_type,
+                    result.api_type,
+                    result.requested_model,
+                    result.actual_model,
+                    result.status,
+                    result.status_code.map(i64::from),
+                    i64::try_from(result.latency_ms).unwrap_or(i64::MAX),
+                    result.provider_id,
+                    result.provider_name,
+                    result.policy_mode,
+                    result.health_fingerprint,
+                    result.observation_id,
+                    result.outcome,
+                    result.failure_domain,
+                    result.reason_code,
+                    result.evidence_scope,
+                    i64::from(result.evidence_version),
+                    result.error_category,
+                    result.error_message,
+                    result.checked_at,
+                    result.source,
+                    Utc::now().timestamp(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("finish Share model health slot failed: {error}"))
+            })?;
+        if changed == 0 {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit stale model health result failed: {error}"))
+            })?;
+            return Ok(false);
+        }
+
+        record_share_model_probe_observation_tx(&tx, slot_start, &result)?;
+
+        if result.outcome != "unobserved" {
+            let requested_model = if result.requested_model.trim().is_empty() {
+                result.app_type.clone()
+            } else {
+                result.requested_model.clone()
+            };
+            let actual_model = if result.actual_model.trim().is_empty() {
+                requested_model.clone()
+            } else {
+                result.actual_model.clone()
+            };
+            record_share_model_health_check_conn(
+                &tx,
+                &ShareModelHealthCheckEntry {
+                    request_id: format!("router-model-health:{share_id}:{slot_start}"),
+                    share_id: share_id.to_string(),
+                    subdomain: result.subdomain,
+                    app_type: result.app_type,
+                    requested_model,
+                    actual_model,
+                    status: result.status,
+                    status_code: result.status_code,
+                    latency_ms: result.latency_ms,
+                    first_token_ms: None,
+                    error_message: result.error_message,
+                    checked_at: result.checked_at,
+                    source: result.source,
+                },
+            )?;
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit Share model health slot failed: {error}"))
+        })?;
+        Ok(true)
+    }
+
+    pub async fn prune_share_model_health_slots(&self, before: i64) -> Result<usize, AppError> {
+        let conn = self.conn.lock().await;
+        let deleted = conn
+            .execute(
+                "DELETE FROM share_model_health_slots WHERE slot_start < ?1",
+                params![before],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prune Share model health slots failed: {error}"))
+            })?;
+        conn.execute(
+            "DELETE FROM share_model_probe_observations
+             WHERE slot_start < ?1
+                OR NOT EXISTS(
+                    SELECT 1 FROM share_model_health_slots slots
+                    WHERE slots.observation_id = share_model_probe_observations.observation_id
+                )",
+            params![before],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "prune Share model probe observations failed: {error}"
+            ))
+        })?;
+        conn.execute(
+            "DELETE FROM share_model_probe_epochs
+             WHERE ends_at_slot IS NOT NULL
+               AND ends_at_slot <= ?1
+               AND NOT EXISTS(
+                   SELECT 1 FROM share_model_health_slots slots
+                   WHERE slots.probe_epoch_id = share_model_probe_epochs.epoch_id
+               )",
+            params![before],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prune Share model probe epochs failed: {error}"))
+        })?;
+        Ok(deleted)
+    }
+
+    pub async fn can_view_share_model_health_calendar(
+        &self,
+        share_id: &str,
+        viewer_email: Option<&str>,
+        is_admin: bool,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        let row = conn
+            .query_row(
+                "SELECT COALESCE(owner_email, ''), COALESCE(user_grants_json, '{}'),
+                        EXISTS(
+                            SELECT 1 FROM share_market_listings listing
+                            WHERE listing.share_id = shares.share_id
+                              AND listing.status = 'active'
+                              AND listing.deleted_at IS NULL
+                              AND shares.share_status = 'active'
+                              AND lower(listing.owner_email) = lower(shares.owner_email)
+                        )
+                 FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        parse_share_user_grants(row.get(1)?)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read Share model health access failed: {error}"))
+            })?;
+        let Some((owner_email, grants, publicly_listed)) = row else {
+            return Ok(false);
+        };
+        if is_admin || publicly_listed {
+            return Ok(true);
+        }
+        let Some(viewer_email) = viewer_email else {
+            return Ok(false);
+        };
+        if owner_email.eq_ignore_ascii_case(viewer_email.trim()) {
+            return Ok(true);
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        Ok(grants.iter().any(|(email, grant)| {
+            grant.active
+                && grant.role == "shareto"
+                && grant
+                    .policy
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > now_ms)
+                && (email.eq_ignore_ascii_case(viewer_email)
+                    || grant.email.eq_ignore_ascii_case(viewer_email))
+        }))
+    }
+
+    pub async fn share_model_health_calendar(
+        &self,
+        share_id: &str,
+        days: u16,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ShareModelHealthCalendarResponse>, AppError> {
+        const SLOTS_PER_DAY: u16 = 48;
+        const SLOT_SECONDS: i64 = 30 * 60;
+        #[derive(Default)]
+        struct DayCounts {
+            completed: u16,
+            successful: u16,
+            observed: u16,
+            upstream_failures: u16,
+            evidence_version: u16,
+            epoch_ids: HashSet<String>,
+        }
+
+        let days = days.clamp(1, 400);
+        let today = now.date_naive();
+        let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
+        let start_at = start_date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc()
+            .timestamp();
+        let current_slot = now.timestamp().div_euclid(SLOT_SECONDS) * SLOT_SECONDS;
+        let end_at = current_slot.saturating_add(SLOT_SECONDS);
+        let conn = self.conn.lock().await;
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read Share model health target failed: {error}"))
+            })?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        let epochs = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT epoch_id, starts_at_slot, ends_at_slot, app_type, api_type,
+                            provider_id, provider_name, requested_model, wire_model,
+                            policy_mode, evidence_version
+                     FROM share_model_probe_epochs
+                     WHERE share_id = ?1
+                       AND starts_at_slot < ?3
+                       AND (ends_at_slot IS NULL OR ends_at_slot > ?2)
+                     ORDER BY starts_at_slot ASC",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("prepare Share model probe epochs failed: {error}"))
+                })?;
+            let rows = statement
+                .query_map(params![share_id, start_at, end_at], |row| {
+                    Ok(ShareModelHealthProbeEpoch {
+                        epoch_id: row.get(0)?,
+                        starts_at: row.get(1)?,
+                        ends_at: row.get(2)?,
+                        app_type: row.get(3)?,
+                        api_type: row.get(4)?,
+                        provider_id: row.get(5)?,
+                        provider_name: row.get(6)?,
+                        requested_model: row.get(7)?,
+                        wire_model: row.get(8)?,
+                        policy_mode: row.get(9)?,
+                        evidence_version: u16::try_from(row.get::<_, i64>(10)?).unwrap_or_default(),
+                    })
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("query Share model probe epochs failed: {error}"))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                AppError::Internal(format!("read Share model probe epoch failed: {error}"))
+            })?
+        };
+
+        let mut expected_slots = HashMap::<NaiveDate, HashSet<i64>>::new();
+        let mut expected_epoch_by_slot = HashMap::<i64, String>::new();
+        let mut day_epoch_ids = HashMap::<NaiveDate, HashSet<String>>::new();
+        let mut day_epoch_evidence = HashMap::<NaiveDate, u16>::new();
+        for epoch in &epochs {
+            let mut slot = epoch.starts_at.max(start_at);
+            let epoch_end = epoch.ends_at.unwrap_or(end_at).min(end_at);
+            while slot < epoch_end {
+                if let Some(date) =
+                    DateTime::<Utc>::from_timestamp(slot, 0).map(|value| value.date_naive())
+                {
+                    expected_slots.entry(date).or_default().insert(slot);
+                    expected_epoch_by_slot.insert(slot, epoch.epoch_id.clone());
+                    day_epoch_ids
+                        .entry(date)
+                        .or_default()
+                        .insert(epoch.epoch_id.clone());
+                    day_epoch_evidence
+                        .entry(date)
+                        .and_modify(|version| *version = (*version).min(epoch.evidence_version))
+                        .or_insert(epoch.evidence_version);
+                }
+                slot = slot.saturating_add(SLOT_SECONDS);
+            }
+        }
+
+        let mut statement = conn
+            .prepare(
+                "SELECT slot_start, status, outcome, failure_domain,
+                        evidence_version, probe_epoch_id
+                 FROM share_model_health_slots
+                 WHERE share_id = ?1 AND slot_start >= ?2 AND slot_start <= ?3
+                 ORDER BY slot_start",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare Share model health calendar failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![share_id, start_at, current_slot], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    u16::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query Share model health calendar failed: {error}"))
+            })?;
+        let mut counts = HashMap::<NaiveDate, DayCounts>::new();
+        for row in rows {
+            let (slot_start, status, outcome, failure_domain, evidence_version, epoch_id) = row
+                .map_err(|error| {
+                    AppError::Internal(format!("read Share model health calendar failed: {error}"))
+                })?;
+            let Some(date) =
+                DateTime::<Utc>::from_timestamp(slot_start, 0).map(|value| value.date_naive())
+            else {
+                continue;
+            };
+            let Some(expected_epoch_id) = expected_epoch_by_slot.get(&slot_start) else {
+                continue;
+            };
+            if epoch_id.as_deref() != Some(expected_epoch_id.as_str()) {
+                continue;
+            }
+            let entry = counts.entry(date).or_default();
+            if status != "pending" {
+                entry.completed = entry.completed.saturating_add(1);
+            }
+            if outcome == "success"
+                || (evidence_version == 1 && matches!(status.as_str(), "success" | "degraded"))
+            {
+                entry.successful = entry.successful.saturating_add(1);
+            }
+            if matches!(outcome.as_str(), "success" | "failure") {
+                entry.observed = entry.observed.saturating_add(1);
+            }
+            if outcome == "failure"
+                && failure_domain.as_deref().is_some_and(|domain| {
+                    matches!(domain, "upstream" | "quota" | "provider_config")
+                })
+            {
+                entry.upstream_failures = entry.upstream_failures.saturating_add(1);
+            }
+            if evidence_version > 0 {
+                entry.evidence_version = if entry.evidence_version == 0 {
+                    evidence_version
+                } else {
+                    entry.evidence_version.min(evidence_version)
+                };
+            }
+            if let Some(epoch_id) = epoch_id {
+                entry.epoch_ids.insert(epoch_id);
+            }
+        }
+        drop(statement);
+        let shared_probe = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM share_model_health_slots own
+                     WHERE own.share_id = ?1
+                       AND own.slot_start >= ?2
+                       AND own.slot_start <= ?3
+                       AND own.observation_id IS NOT NULL
+                       AND EXISTS(
+                           SELECT 1 FROM share_model_health_slots peer
+                           WHERE peer.observation_id = own.observation_id
+                             AND peer.share_id != own.share_id
+                       )
+                 )",
+                params![share_id, start_at, current_slot],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read shared model probe evidence failed: {error}"))
+            })?;
+        drop(conn);
+
+        let mut calendar_days = Vec::with_capacity(usize::from(days));
+        for offset in 0..days {
+            let date = start_date + Duration::days(i64::from(offset));
+            let expected_checks = u16::try_from(
+                expected_slots
+                    .get(&date)
+                    .map(HashSet::len)
+                    .unwrap_or_default(),
+            )
+            .unwrap_or(SLOTS_PER_DAY)
+            .min(SLOTS_PER_DAY);
+            let active = expected_checks > 0;
+            let day_counts = counts.remove(&date).unwrap_or_default();
+            let successful_checks = day_counts.successful.min(expected_checks);
+            let observed_checks = day_counts.observed.min(expected_checks);
+            let completed_checks = day_counts.completed.min(expected_checks);
+            let upstream_failure_checks = day_counts.upstream_failures.min(expected_checks);
+            let monitoring_gap_checks = expected_checks.saturating_sub(observed_checks);
+            let success_rate = (expected_checks > 0)
+                .then(|| f64::from(successful_checks) * 100.0 / f64::from(expected_checks));
+            let coverage_rate = (expected_checks > 0)
+                .then(|| f64::from(observed_checks) * 100.0 / f64::from(expected_checks));
+            let mut epoch_ids = day_epoch_ids.remove(&date).unwrap_or_default();
+            epoch_ids.extend(day_counts.epoch_ids);
+            let epoch_evidence = day_epoch_evidence.get(&date).copied().unwrap_or_default();
+            let evidence_version = match (epoch_evidence, day_counts.evidence_version) {
+                (0, version) | (version, 0) => version,
+                (left, right) => left.min(right),
+            };
+            calendar_days.push(ShareModelHealthCalendarDay {
+                date: date.format("%Y-%m-%d").to_string(),
+                active,
+                expected_checks,
+                completed_checks,
+                successful_checks,
+                observed_checks,
+                upstream_failure_checks,
+                monitoring_gap_checks,
+                success_rate,
+                coverage_rate,
+                mixed_epoch: epoch_ids.len() > 1,
+                evidence_version,
+            });
+        }
+        let current_probe = epochs
+            .iter()
+            .rev()
+            .find(|epoch| {
+                epoch.starts_at <= current_slot
+                    && epoch.ends_at.is_none_or(|ends_at| ends_at > current_slot)
+            })
+            .cloned();
+        let evidence_version = epochs
+            .iter()
+            .map(|epoch| epoch.evidence_version)
+            .filter(|version| *version > 0)
+            .min()
+            .unwrap_or(2);
+        Ok(Some(ShareModelHealthCalendarResponse {
+            share_id: share_id.to_string(),
+            timezone: "UTC".to_string(),
+            expected_checks_per_full_day: SLOTS_PER_DAY,
+            start_date: start_date.format("%Y-%m-%d").to_string(),
+            end_date: today.format("%Y-%m-%d").to_string(),
+            days: calendar_days,
+            epochs,
+            current_probe,
+            shared_probe,
+            evidence_version,
+        }))
+    }
+
     pub async fn record_share_health_request_log(
         &self,
         installation_id: &str,
@@ -11719,6 +12443,10 @@ impl AppStore {
         &self,
         snapshot: ShareRuntimeSnapshotResponse,
     ) -> Result<(), AppError> {
+        let closes_model_probe_epoch = snapshot
+            .share_status
+            .as_deref()
+            .is_some_and(|status| status != "active");
         let app_runtimes_json = serde_json::to_string(&snapshot.app_runtimes)
             .map_err(|e| AppError::Internal(format!("serialize app runtimes failed: {e}")))?;
         let app_providers_json = serde_json::to_string(&snapshot.app_providers)
@@ -11758,6 +12486,10 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("update share runtime snapshot failed: {e}")))?;
+        if closes_model_probe_epoch {
+            let slot_start = Utc::now().timestamp().div_euclid(30 * 60) * (30 * 60);
+            sync_share_model_probe_epoch_tx(&tx, &snapshot.share_id, slot_start, None)?;
+        }
         record_runtime_model_health_snapshot_conn(&tx, &snapshot)?;
         crate::share_market::reconcile_share_contract_integrity_tx(
             &tx,
@@ -12038,10 +12770,270 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
     }
     share.token_limit = normalize_share_limit_value(share.token_limit);
     share.parallel_limit = normalize_share_limit_value(share.parallel_limit);
+    validate_share_model_probes(share)?;
     if share.expires_at == LEGACY_PERMANENT_SHARE_EXPIRES_AT {
         share.expires_at = PERMANENT_SHARE_EXPIRES_AT.to_string();
     }
     Ok(())
+}
+
+fn validate_share_model_probes(share: &ShareDescriptor) -> Result<(), AppError> {
+    let runtimes = [
+        ("claude", share.app_runtimes.claude.as_ref()),
+        ("codex", share.app_runtimes.codex.as_ref()),
+        ("gemini", share.app_runtimes.gemini.as_ref()),
+    ];
+    for (app, runtime) in runtimes {
+        if let Some(probe) = runtime.and_then(|runtime| runtime.model_probe.as_ref()) {
+            validate_provider_model_probe(app, probe)?;
+        }
+    }
+    for (app, providers) in [
+        ("claude", share.app_providers.claude.as_slice()),
+        ("codex", share.app_providers.codex.as_slice()),
+        ("gemini", share.app_providers.gemini.as_slice()),
+    ] {
+        for provider in providers {
+            if let Some(probe) = provider.model_probe.as_ref() {
+                validate_provider_model_probe(app, probe)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_provider_model_probe(
+    app: &str,
+    probe: &crate::models::ProviderModelProbe,
+) -> Result<(), AppError> {
+    let expected_api_type = match app {
+        "claude" => "anthropic",
+        "codex" => "openai",
+        "gemini" => "gemini",
+        _ => return Err(AppError::BadRequest("invalid modelProbe App".into())),
+    };
+    if probe.api_type != expected_api_type
+        || probe.method != "POST"
+        || !probe.path.starts_with('/')
+        || probe.path.starts_with("//")
+        || probe.path.len() > 2_048
+        || probe.requested_model.trim().is_empty()
+        || probe.requested_model.trim() != probe.requested_model
+        || probe.wire_model.trim().is_empty()
+        || probe.wire_model.trim() != probe.wire_model
+        || !probe.body.is_object()
+        || probe.payload_revision != 2
+        || probe.health_fingerprint.len() != 64
+        || !probe
+            .health_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::BadRequest(format!(
+            "invalid {app} modelProbe in Share contract"
+        )));
+    }
+    let body_size = serde_json::to_vec(&probe.body)
+        .map_err(|error| AppError::BadRequest(format!("invalid modelProbe body: {error}")))?
+        .len();
+    if body_size > 64 * 1024 {
+        return Err(AppError::BadRequest(
+            "modelProbe body exceeds 64 KiB".into(),
+        ));
+    }
+    if model_probe_body_contains_sensitive_field(&probe.body) {
+        return Err(AppError::BadRequest(
+            "modelProbe body must not contain credentials".into(),
+        ));
+    }
+
+    let body_model = probe.body.get("model").and_then(serde_json::Value::as_str);
+    let body_stream = probe
+        .body
+        .get("stream")
+        .and_then(serde_json::Value::as_bool);
+    let valid_wire_contract = match app {
+        "claude" => {
+            probe.path == "/v1/messages"
+                && body_model == Some(probe.wire_model.as_str())
+                && body_stream == Some(probe.stream)
+                && probe.response_mode
+                    == if probe.stream {
+                        "anthropic_sse"
+                    } else {
+                        "json"
+                    }
+        }
+        "codex" => {
+            probe.path == "/v1/responses"
+                && body_model == Some(probe.wire_model.as_str())
+                && body_stream == Some(probe.stream)
+                && probe.response_mode
+                    == if probe.stream {
+                        "responses_sse"
+                    } else {
+                        "json"
+                    }
+        }
+        "gemini" => {
+            let operation = if probe.stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            let expected_path = format!(
+                "/v1beta/models/{}:{operation}",
+                encode_model_probe_path_segment(&probe.wire_model)
+            );
+            probe.path == expected_path
+                && probe.body.get("model").is_none()
+                && probe.body.get("stream").is_none()
+                && probe.response_mode == if probe.stream { "gemini_sse" } else { "json" }
+        }
+        _ => false,
+    };
+    if !valid_wire_contract {
+        return Err(AppError::BadRequest(format!(
+            "invalid {app} modelProbe wire contract"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_model_probe_path_segment(value: &str) -> String {
+    let mut url =
+        url::Url::parse("https://probe.invalid/v1beta/models").expect("static probe URL is valid");
+    url.path_segments_mut()
+        .expect("static probe URL can accept path segments")
+        .push(value);
+    url.path()
+        .strip_prefix("/v1beta/models/")
+        .unwrap_or(value)
+        .to_string()
+}
+
+fn model_probe_body_contains_sensitive_field(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            let normalized = key
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            matches!(
+                normalized.as_str(),
+                "authorization"
+                    | "proxyauthorization"
+                    | "apikey"
+                    | "xapikey"
+                    | "token"
+                    | "accesstoken"
+                    | "refreshtoken"
+                    | "cookie"
+                    | "setcookie"
+                    | "password"
+                    | "secret"
+                    | "credential"
+            ) || model_probe_body_contains_sensitive_field(value)
+        }),
+        serde_json::Value::Array(values) => {
+            values.iter().any(model_probe_body_contains_sensitive_field)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod provider_model_probe_validation_tests {
+    use super::*;
+    use crate::models::ProviderModelProbe;
+    use serde_json::json;
+
+    fn probe(app: &str) -> ProviderModelProbe {
+        let (api_type, wire_model, path, body, response_mode) = match app {
+            "claude" => (
+                "anthropic",
+                "claude-sonnet-test",
+                "/v1/messages".to_string(),
+                json!({
+                    "model": "claude-sonnet-test",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": true
+                }),
+                "anthropic_sse",
+            ),
+            "codex" => (
+                "openai",
+                "gpt-test",
+                "/v1/responses".to_string(),
+                json!({
+                    "model": "gpt-test",
+                    "input": [{"role": "user", "content": "ping"}],
+                    "stream": true
+                }),
+                "responses_sse",
+            ),
+            "gemini" => (
+                "gemini",
+                "publishers/google/models/gemini-test",
+                "/v1beta/models/publishers%2Fgoogle%2Fmodels%2Fgemini-test:streamGenerateContent?alt=sse"
+                    .to_string(),
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                    "generationConfig": {"maxOutputTokens": 1}
+                }),
+                "gemini_sse",
+            ),
+            _ => unreachable!(),
+        };
+        ProviderModelProbe {
+            api_type: api_type.into(),
+            requested_model: wire_model.into(),
+            wire_model: wire_model.into(),
+            method: "POST".into(),
+            path,
+            body,
+            stream: true,
+            response_mode: response_mode.into(),
+            payload_revision: 2,
+            health_fingerprint: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn accepts_server_wire_contract_for_each_app() {
+        for app in ["claude", "codex", "gemini"] {
+            validate_provider_model_probe(app, &probe(app)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_model_stream_path_and_fingerprint_drift() {
+        let mut model = probe("codex");
+        model.body["model"] = json!("different-model");
+        assert!(validate_provider_model_probe("codex", &model).is_err());
+
+        let mut stream = probe("claude");
+        stream.body["stream"] = json!(false);
+        assert!(validate_provider_model_probe("claude", &stream).is_err());
+
+        let mut path = probe("gemini");
+        path.path = "/v1beta/models/other:streamGenerateContent?alt=sse".into();
+        assert!(validate_provider_model_probe("gemini", &path).is_err());
+
+        let mut fingerprint = probe("codex");
+        fingerprint.health_fingerprint = "not-a-sha256".into();
+        assert!(validate_provider_model_probe("codex", &fingerprint).is_err());
+    }
+
+    #[test]
+    fn rejects_credentials_nested_in_probe_body() {
+        let mut probe = probe("codex");
+        probe.body["metadata"] = json!({"x-api-key": "must-not-cross-contract"});
+
+        assert!(validate_provider_model_probe("codex", &probe).is_err());
+    }
 }
 
 fn reject_pending_share_edit_reply(
@@ -12265,6 +13257,276 @@ fn ensure_free_access_market_exclusive_tx(
     Ok(())
 }
 
+fn descriptor_model_probe_epoch_input(
+    share: &ShareDescriptor,
+) -> Option<ShareModelProbeEpochInput> {
+    if share.share_status != "active" || share.contract_version < 4 {
+        return None;
+    }
+    let (app_type, api_type, runtime, probe) = [
+        (
+            "codex",
+            "openai",
+            share.support.codex,
+            share.app_runtimes.codex.as_ref(),
+        ),
+        (
+            "claude",
+            "anthropic",
+            share.support.claude,
+            share.app_runtimes.claude.as_ref(),
+        ),
+        (
+            "gemini",
+            "gemini",
+            share.support.gemini,
+            share.app_runtimes.gemini.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(app_type, api_type, enabled, runtime)| {
+        let runtime = enabled.then_some(runtime).flatten()?;
+        let probe = runtime.model_probe.as_ref()?;
+        Some((app_type, api_type, runtime, probe))
+    })?;
+    let provider_id = share.bindings.get(app_type)?.trim();
+    if provider_id.is_empty() || probe.health_fingerprint.is_empty() {
+        return None;
+    }
+    let policy_mode = runtime.model_policy.as_ref().map(|policy| match policy {
+        crate::models::ShareProviderModelPolicy::Passthrough => "passthrough".to_string(),
+        crate::models::ShareProviderModelPolicy::Single { .. } => "single".to_string(),
+    });
+    Some(ShareModelProbeEpochInput {
+        app_type: app_type.to_string(),
+        api_type: api_type.to_string(),
+        provider_id: provider_id.to_string(),
+        provider_name: runtime.provider_name.clone(),
+        capacity_pool_id: share.capacity_pool_id.clone(),
+        requested_model: probe.requested_model.clone(),
+        wire_model: model_probe_actual_model(runtime, probe),
+        policy_mode,
+        health_fingerprint: probe.health_fingerprint.clone(),
+    })
+}
+
+pub(crate) fn model_probe_actual_model(
+    runtime: &ShareUpstreamProvider,
+    probe: &crate::models::ProviderModelProbe,
+) -> String {
+    match runtime.model_policy.as_ref() {
+        Some(crate::models::ShareProviderModelPolicy::Single { upstream_model })
+            if !upstream_model.trim().is_empty() =>
+        {
+            upstream_model.clone()
+        }
+        _ => probe.wire_model.clone(),
+    }
+}
+
+fn share_model_probe_epoch_matches(
+    stored: &StoredShareModelProbeEpoch,
+    input: &ShareModelProbeEpochInput,
+) -> bool {
+    stored.evidence_version == 2 && stored.input == *input
+}
+
+fn read_open_share_model_probe_epoch(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<Option<StoredShareModelProbeEpoch>, AppError> {
+    conn.query_row(
+        "SELECT epoch_id, starts_at_slot, app_type, api_type, provider_id,
+                provider_name, capacity_pool_id, requested_model, wire_model,
+                policy_mode, health_fingerprint, evidence_version
+         FROM share_model_probe_epochs
+         WHERE share_id = ?1 AND ends_at_slot IS NULL",
+        params![share_id],
+        |row| {
+            Ok(StoredShareModelProbeEpoch {
+                epoch_id: row.get(0)?,
+                starts_at_slot: row.get(1)?,
+                input: ShareModelProbeEpochInput {
+                    app_type: row.get(2)?,
+                    api_type: row.get(3)?,
+                    provider_id: row.get(4)?,
+                    provider_name: row.get(5)?,
+                    capacity_pool_id: row.get(6)?,
+                    requested_model: row.get(7)?,
+                    wire_model: row.get(8)?,
+                    policy_mode: row.get(9)?,
+                    health_fingerprint: row.get(10)?,
+                },
+                evidence_version: u16::try_from(row.get::<_, i64>(11)?).unwrap_or_default(),
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| {
+        AppError::Internal(format!("read open Share model probe epoch failed: {error}"))
+    })
+}
+
+fn sync_share_model_probe_epoch_tx(
+    conn: &Connection,
+    share_id: &str,
+    slot_start: i64,
+    input: Option<&ShareModelProbeEpochInput>,
+) -> Result<Option<String>, AppError> {
+    const SLOT_SECONDS: i64 = 30 * 60;
+    if slot_start < 0 || slot_start % SLOT_SECONDS != 0 {
+        return Err(AppError::BadRequest(
+            "Share model probe epoch must start on a UTC half-hour slot".into(),
+        ));
+    }
+    let open = read_open_share_model_probe_epoch(conn, share_id)?;
+    if let (Some(open), Some(input)) = (&open, input)
+        && share_model_probe_epoch_matches(open, input)
+    {
+        // A descriptor change after the current slot was claimed creates the
+        // replacement epoch at the next boundary. Until then the Server no
+        // longer exposes the old probe body, so leave an unobserved current
+        // slot untouched instead of executing the future configuration early.
+        return Ok((open.starts_at_slot <= slot_start).then(|| open.epoch_id.clone()));
+    }
+
+    let current_slot_exists = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM share_model_health_slots
+                 WHERE share_id = ?1 AND slot_start = ?2
+             )",
+            params![share_id, slot_start],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "inspect current Share model health slot failed: {error}"
+            ))
+        })?;
+    let transition_slot = if current_slot_exists {
+        slot_start.saturating_add(SLOT_SECONDS)
+    } else {
+        slot_start
+    };
+    if let Some(open) = open {
+        if transition_slot <= open.starts_at_slot {
+            conn.execute(
+                "DELETE FROM share_model_probe_epochs
+                 WHERE epoch_id = ?1
+                   AND NOT EXISTS(
+                       SELECT 1 FROM share_model_health_slots
+                       WHERE probe_epoch_id = ?1
+                   )",
+                params![open.epoch_id],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "replace empty Share model probe epoch failed: {error}"
+                ))
+            })?;
+        } else {
+            conn.execute(
+                "UPDATE share_model_probe_epochs
+                 SET ends_at_slot = ?2, updated_at = ?3
+                 WHERE epoch_id = ?1 AND ends_at_slot IS NULL",
+                params![open.epoch_id, transition_slot, Utc::now().timestamp()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("close Share model probe epoch failed: {error}"))
+            })?;
+        }
+    }
+
+    if let Some(input) = input {
+        conn.execute(
+            "DELETE FROM share_model_probe_epochs
+             WHERE share_id = ?1 AND starts_at_slot = ?2
+               AND NOT EXISTS(
+                   SELECT 1 FROM share_model_health_slots
+                   WHERE probe_epoch_id = share_model_probe_epochs.epoch_id
+               )",
+            params![share_id, transition_slot],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "clear superseded Share model probe epoch failed: {error}"
+            ))
+        })?;
+        let epoch_id = Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO share_model_probe_epochs (
+                epoch_id, share_id, starts_at_slot, app_type, api_type, provider_id,
+                provider_name, capacity_pool_id, requested_model, wire_model,
+                policy_mode, health_fingerprint, evidence_version, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 2, ?13, ?13)",
+            params![
+                epoch_id,
+                share_id,
+                transition_slot,
+                input.app_type,
+                input.api_type,
+                input.provider_id,
+                input.provider_name,
+                input.capacity_pool_id,
+                input.requested_model,
+                input.wire_model,
+                input.policy_mode,
+                input.health_fingerprint,
+                now,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("open Share model probe epoch failed: {error}"))
+        })?;
+    }
+
+    let effective = conn
+        .query_row(
+            "SELECT epoch_id, starts_at_slot, app_type, api_type, provider_id,
+                    provider_name, capacity_pool_id, requested_model, wire_model,
+                    policy_mode, health_fingerprint, evidence_version
+         FROM share_model_probe_epochs
+         WHERE share_id = ?1
+           AND starts_at_slot <= ?2
+           AND (ends_at_slot IS NULL OR ends_at_slot > ?2)
+         ORDER BY starts_at_slot DESC
+         LIMIT 1",
+            params![share_id, slot_start],
+            |row| {
+                Ok(StoredShareModelProbeEpoch {
+                    epoch_id: row.get(0)?,
+                    starts_at_slot: row.get(1)?,
+                    input: ShareModelProbeEpochInput {
+                        app_type: row.get(2)?,
+                        api_type: row.get(3)?,
+                        provider_id: row.get(4)?,
+                        provider_name: row.get(5)?,
+                        capacity_pool_id: row.get(6)?,
+                        requested_model: row.get(7)?,
+                        wire_model: row.get(8)?,
+                        policy_mode: row.get(9)?,
+                        health_fingerprint: row.get(10)?,
+                    },
+                    evidence_version: u16::try_from(row.get::<_, i64>(11)?).unwrap_or_default(),
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read effective Share model probe epoch failed: {error}"
+            ))
+        })?;
+    Ok(match (effective, input) {
+        (Some(epoch), Some(input)) if share_model_probe_epoch_matches(&epoch, input) => {
+            Some(epoch.epoch_id)
+        }
+        _ => None,
+    })
+}
+
 fn upsert_share_tx(
     conn: &Connection,
     installation_id: &str,
@@ -12273,6 +13535,7 @@ fn upsert_share_tx(
     normalize_share_descriptor_fields(&mut share)?;
     validate_share_descriptor_bindings(&share)?;
     let chat_share_id = share.share_id.clone();
+    let next_model_probe_epoch = descriptor_model_probe_epoch_input(&share);
     let previous_event_snapshot = conn
         .query_row(
             "SELECT share_status, expires_at, upstream_provider_json, bindings_json,
@@ -12468,6 +13731,13 @@ fn upsert_share_tx(
             conn,
             &chat_share_id,
             Utc::now(),
+        )?;
+        let slot_start = Utc::now().timestamp().div_euclid(30 * 60) * (30 * 60);
+        sync_share_model_probe_epoch_tx(
+            conn,
+            &chat_share_id,
+            slot_start,
+            next_model_probe_epoch.as_ref(),
         )?;
     }
     if let Some((
@@ -17627,6 +18897,8 @@ fn parse_app_providers(value: Option<String>) -> Result<ShareAppProviders, crate
 fn normalize_model_health_status(status: &str) -> &'static str {
     if status.eq_ignore_ascii_case("success") {
         "success"
+    } else if status.eq_ignore_ascii_case("degraded") {
+        "degraded"
     } else if status.eq_ignore_ascii_case("skipped") {
         "skipped"
     } else {
@@ -17841,6 +19113,158 @@ fn purge_unbound_model_health(
     Ok(())
 }
 
+fn record_share_model_probe_observation_tx(
+    conn: &Connection,
+    slot_start: i64,
+    result: &ShareModelHealthSlotResult,
+) -> Result<(), AppError> {
+    let Some(observation_id) = result.observation_id.as_deref() else {
+        let valid_legacy = result.evidence_version == 1
+            && result.evidence_scope == "share_legacy"
+            && matches!(result.outcome.as_str(), "success" | "failure");
+        let valid_projection = result.evidence_version == 2
+            && result.evidence_scope == "share_projection"
+            && result.outcome == "unobserved";
+        if !valid_legacy && !valid_projection {
+            return Err(AppError::Internal(
+                "model health result without an observation has invalid evidence semantics".into(),
+            ));
+        }
+        return Ok(());
+    };
+    if result.evidence_version != 2
+        || result.evidence_scope != "provider_runtime"
+        || !matches!(result.outcome.as_str(), "success" | "failure")
+        || observation_id.len() != 64
+        || !observation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::Internal(
+            "invalid canonical Share model probe observation".into(),
+        ));
+    }
+    let provider_id = result
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Internal("canonical model probe omitted providerId".into()))?;
+    let health_fingerprint = result
+        .health_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::Internal("canonical model probe omitted healthFingerprint".into())
+        })?;
+    let cycle_id = result
+        .source
+        .strip_prefix("cc-switch-router-cycle:")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Internal("canonical model probe omitted cycleId".into()))?;
+    let actual_model = if result.actual_model.trim().is_empty() {
+        result.requested_model.as_str()
+    } else {
+        result.actual_model.as_str()
+    };
+    let now = Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO share_model_probe_observations (
+            observation_id, installation_id, cycle_id, slot_start, capacity_pool_id,
+            app_type, api_type, provider_id, provider_name, health_fingerprint,
+            requested_model, actual_model, status, outcome, failure_domain,
+            reason_code, status_code, latency_ms, checked_at, evidence_scope,
+            evidence_version, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19, 'provider_runtime', 2, ?20
+         )
+         ON CONFLICT(observation_id) DO NOTHING",
+        params![
+            observation_id,
+            result.installation_id,
+            cycle_id,
+            slot_start,
+            result.capacity_pool_id,
+            result.app_type,
+            result.api_type,
+            provider_id,
+            result.provider_name,
+            health_fingerprint,
+            result.requested_model,
+            actual_model,
+            result.status,
+            result.outcome,
+            result.failure_domain,
+            result.reason_code,
+            result.status_code.map(i64::from),
+            i64::try_from(result.latency_ms).unwrap_or(i64::MAX),
+            result.checked_at,
+            now,
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("store canonical Share model probe failed: {error}"))
+    })?;
+    let matches = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM share_model_probe_observations
+                WHERE observation_id = ?1
+                  AND installation_id = ?2
+                  AND cycle_id = ?3
+                  AND slot_start = ?4
+                  AND capacity_pool_id = ?5
+                  AND app_type = ?6
+                  AND api_type = ?7
+                  AND provider_id = ?8
+                  AND health_fingerprint = ?9
+                  AND requested_model = ?10
+                  AND actual_model = ?11
+                  AND status = ?12
+                  AND outcome = ?13
+                  AND COALESCE(failure_domain, '') = COALESCE(?14, '')
+                  AND COALESCE(reason_code, '') = COALESCE(?15, '')
+                  AND COALESCE(status_code, -1) = COALESCE(?16, -1)
+                  AND latency_ms = ?17
+                  AND checked_at = ?18
+            )",
+            params![
+                observation_id,
+                result.installation_id,
+                cycle_id,
+                slot_start,
+                result.capacity_pool_id,
+                result.app_type,
+                result.api_type,
+                provider_id,
+                health_fingerprint,
+                result.requested_model,
+                actual_model,
+                result.status,
+                result.outcome,
+                result.failure_domain,
+                result.reason_code,
+                result.status_code.map(i64::from),
+                i64::try_from(result.latency_ms).unwrap_or(i64::MAX),
+                result.checked_at,
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "verify canonical Share model probe failed: {error}"
+            ))
+        })?;
+    if !matches {
+        return Err(AppError::Conflict(
+            "canonical Share model probe observation changed within one cycle".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn record_share_model_health_check_conn(
     conn: &Connection,
     check: &ShareModelHealthCheckEntry,
@@ -17890,14 +19314,14 @@ fn record_share_model_health_check_conn(
             last_success_at, last_failed_at, last_checked_at, recent_results_json,
             error_message, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5,
-            CASE WHEN ?5 = 'success' THEN ?6 ELSE NULL END,
+            CASE WHEN ?5 IN ('success', 'degraded') THEN ?6 ELSE NULL END,
             CASE WHEN ?5 = 'failed' THEN ?6 ELSE NULL END,
             ?6, ?7, ?8, ?6)
          ON CONFLICT(share_id, app_type, requested_model) DO UPDATE SET
             actual_model = CASE WHEN excluded.last_checked_at >= share_model_health_state.last_checked_at THEN excluded.actual_model ELSE share_model_health_state.actual_model END,
             last_status = CASE WHEN excluded.last_checked_at >= share_model_health_state.last_checked_at THEN excluded.last_status ELSE share_model_health_state.last_status END,
             last_success_at = CASE
-                WHEN excluded.last_status = 'success'
+                WHEN excluded.last_status IN ('success', 'degraded')
                  AND (share_model_health_state.last_success_at IS NULL OR excluded.last_checked_at > share_model_health_state.last_success_at)
                 THEN excluded.last_checked_at
                 ELSE share_model_health_state.last_success_at
@@ -23918,6 +25342,32 @@ mod tests {
         .expect("update canonical Share grants");
     }
 
+    async fn expire_shareto_user(store: &AppStore, share_id: &str, email: &str) {
+        let conn = store.conn.lock().await;
+        let grants_json: String = conn
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .expect("read Share grants");
+        let mut grants: BTreeMap<String, ShareUserGrant> =
+            serde_json::from_str(&grants_json).expect("parse Share grants");
+        grants
+            .get_mut(&email.to_ascii_lowercase())
+            .expect("ShareTo grant")
+            .policy
+            .expires_at = Some(Utc::now().timestamp_millis().saturating_sub(1));
+        conn.execute(
+            "UPDATE shares SET user_grants_json = ?2 WHERE share_id = ?1",
+            params![
+                share_id,
+                serde_json::to_string(&grants).expect("serialize expired Share grants")
+            ],
+        )
+        .expect("expire ShareTo grant");
+    }
+
     #[tokio::test]
     async fn default_user_api_token_is_unique_resolvable_and_resettable() {
         let (store, config) = setup_store("user-api-token-lifecycle").await;
@@ -24024,6 +25474,21 @@ mod tests {
                 .user_can_invoke_share("shared@example.com", "share-acl", Some("codex"))
                 .await
                 .expect("ShareTo access")
+        );
+        expire_shareto_user(&store, "share-acl", "shared@example.com").await;
+        assert!(
+            !store
+                .user_can_invoke_share("shared@example.com", "share-acl", Some("codex"))
+                .await
+                .expect("expired ShareTo access")
+        );
+        assert!(
+            !store
+                .get_share_for_test("share-acl")
+                .await
+                .expect("read Share test ACL")
+                .expect("Share test ACL")
+                .has_active_shareto("shared@example.com")
         );
         assert!(
             !store
@@ -24209,6 +25674,949 @@ mod tests {
                 .user_can_invoke_share("other@example.com", "share-free", Some("codex"))
                 .await
                 .expect("private Share access")
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    fn model_health_slot_result(
+        status: &str,
+        checked_at: i64,
+        installation_id: &str,
+        capacity_pool_id: &str,
+    ) -> ShareModelHealthSlotResult {
+        let succeeded = matches!(status, "success" | "degraded");
+        ShareModelHealthSlotResult {
+            installation_id: installation_id.into(),
+            capacity_pool_id: capacity_pool_id.into(),
+            subdomain: "health-sub".into(),
+            app_type: "codex".into(),
+            api_type: "openai".into(),
+            requested_model: "server-test-model@low".into(),
+            actual_model: "server-test-model".into(),
+            status: status.into(),
+            status_code: Some(if matches!(status, "success" | "degraded") {
+                200
+            } else {
+                500
+            }),
+            latency_ms: 25,
+            provider_id: Some("provider-test".into()),
+            provider_name: Some("Provider Test".into()),
+            policy_mode: Some("single".into()),
+            health_fingerprint: Some("health-fingerprint".into()),
+            observation_id: Some(format!("{checked_at:064x}")),
+            outcome: if succeeded { "success" } else { "failure" }.into(),
+            failure_domain: (!succeeded).then(|| "upstream".into()),
+            reason_code: Some(if succeeded {
+                "probe_succeeded".into()
+            } else {
+                "upstream_failure".into()
+            }),
+            evidence_scope: "provider_runtime".into(),
+            evidence_version: 2,
+            error_category: (status == "failed").then(|| "upstream".into()),
+            error_message: (status == "failed").then(|| "probe failed".into()),
+            checked_at,
+            source: "cc-switch-router-cycle:utc-test".into(),
+        }
+    }
+
+    fn model_probe_epoch_input(
+        capacity_pool_id: &str,
+        health_fingerprint: &str,
+    ) -> ShareModelProbeEpochInput {
+        ShareModelProbeEpochInput {
+            app_type: "codex".into(),
+            api_type: "openai".into(),
+            provider_id: "provider-test".into(),
+            provider_name: Some("Provider Test".into()),
+            capacity_pool_id: capacity_pool_id.into(),
+            requested_model: "server-test-model@low".into(),
+            wire_model: "server-test-model".into(),
+            policy_mode: Some("single".into()),
+            health_fingerprint: health_fingerprint.into(),
+        }
+    }
+
+    fn test_provider_model_probe(api_type: &str, model: &str) -> crate::models::ProviderModelProbe {
+        let (path, body, response_mode) = match api_type {
+            "anthropic" => (
+                "/v1/messages".to_string(),
+                serde_json::json!({"model": model, "stream": true}),
+                "anthropic_sse",
+            ),
+            "openai" => (
+                "/v1/responses".to_string(),
+                serde_json::json!({"model": model, "stream": true}),
+                "responses_sse",
+            ),
+            "gemini" => (
+                format!("/v1beta/models/{model}:streamGenerateContent?alt=sse"),
+                serde_json::json!({"contents": []}),
+                "gemini_sse",
+            ),
+            _ => unreachable!("test probe uses a core API type"),
+        };
+        crate::models::ProviderModelProbe {
+            api_type: api_type.into(),
+            requested_model: model.into(),
+            wire_model: model.into(),
+            method: "POST".into(),
+            path,
+            body,
+            stream: true,
+            response_mode: response_mode.into(),
+            payload_revision: 2,
+            health_fingerprint: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn descriptor_epoch_selection_skips_an_enabled_app_without_a_probe() {
+        let mut share = test_share_descriptor("probe-priority", "probe-priority");
+        share.support = ShareSupport {
+            codex: true,
+            claude: true,
+            gemini: true,
+        };
+        share.bindings = BTreeMap::from([
+            ("codex".into(), "provider-codex".into()),
+            ("claude".into(), "provider-claude".into()),
+            ("gemini".into(), "provider-gemini".into()),
+        ]);
+        share.app_runtimes.codex = Some(ShareUpstreamProvider::default());
+        share.app_runtimes.claude = Some(ShareUpstreamProvider {
+            model_probe: Some(test_provider_model_probe("anthropic", "claude-test")),
+            ..ShareUpstreamProvider::default()
+        });
+        share.app_runtimes.gemini = Some(ShareUpstreamProvider {
+            model_probe: Some(test_provider_model_probe("gemini", "gemini-test")),
+            ..ShareUpstreamProvider::default()
+        });
+
+        let selected = descriptor_model_probe_epoch_input(&share)
+            .expect("Claude should become the first executable probe");
+        assert_eq!(selected.app_type, "claude");
+        assert_eq!(selected.api_type, "anthropic");
+        assert_eq!(selected.provider_id, "provider-claude");
+
+        share.app_runtimes.claude = Some(ShareUpstreamProvider::default());
+        let selected = descriptor_model_probe_epoch_input(&share)
+            .expect("Gemini should become the next executable probe");
+        assert_eq!(selected.app_type, "gemini");
+    }
+
+    #[tokio::test]
+    async fn share_model_health_slot_claim_rejects_duplicates_and_allows_stale_takeover() {
+        let (store, config) = setup_store("share-model-health-slot-claim").await;
+        insert_installation(&store, "health-installation").await;
+        insert_share(
+            &store,
+            "health-installation",
+            "health-share",
+            "health-sub",
+            "active",
+        )
+        .await;
+        let slot_start = 1_787_443_200;
+        let epoch_id = store
+            .sync_share_model_probe_epoch(
+                "health-share",
+                slot_start,
+                Some(&model_probe_epoch_input(
+                    "pool-health-share",
+                    &"a".repeat(64),
+                )),
+            )
+            .await
+            .expect("sync claim test epoch")
+            .expect("claim test epoch");
+        let first = store
+            .claim_share_model_health_slot(
+                "health-share",
+                slot_start,
+                &epoch_id,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-test",
+                slot_start,
+            )
+            .await
+            .expect("claim first slot")
+            .expect("first claim token");
+        assert!(
+            store
+                .claim_share_model_health_slot(
+                    "health-share",
+                    slot_start,
+                    &epoch_id,
+                    "codex",
+                    "openai",
+                    "server-test-model@low",
+                    "cc-switch-router-cycle:utc-test",
+                    slot_start + 599,
+                )
+                .await
+                .expect("reject fresh duplicate")
+                .is_none()
+        );
+        let takeover = store
+            .claim_share_model_health_slot(
+                "health-share",
+                slot_start,
+                &epoch_id,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-test",
+                slot_start + 601,
+            )
+            .await
+            .expect("take over stale claim")
+            .expect("takeover claim token");
+        assert_ne!(first, takeover);
+        assert!(
+            !store
+                .finish_share_model_health_slot(
+                    "health-share",
+                    slot_start,
+                    &first,
+                    model_health_slot_result(
+                        "success",
+                        slot_start + 10,
+                        "health-installation",
+                        "health-share",
+                    ),
+                )
+                .await
+                .expect("ignore stale result")
+        );
+        assert!(
+            store
+                .finish_share_model_health_slot(
+                    "health-share",
+                    slot_start,
+                    &takeover,
+                    model_health_slot_result(
+                        "success",
+                        slot_start + 602,
+                        "health-installation",
+                        "health-share",
+                    ),
+                )
+                .await
+                .expect("finish takeover result")
+        );
+        assert!(
+            store
+                .claim_share_model_health_slot(
+                    "health-share",
+                    slot_start,
+                    &epoch_id,
+                    "codex",
+                    "openai",
+                    "server-test-model@low",
+                    "cc-switch-router-cycle:utc-test",
+                    slot_start + 330,
+                )
+                .await
+                .expect("preserve observed result")
+                .is_none()
+        );
+
+        let retry_slot = slot_start + 1_800;
+        let gap_claim = store
+            .claim_share_model_health_slot(
+                "health-share",
+                retry_slot,
+                &epoch_id,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-test-retry",
+                retry_slot,
+            )
+            .await
+            .expect("claim monitoring gap slot")
+            .expect("monitoring gap claim");
+        let mut gap = model_health_slot_result(
+            "failed",
+            retry_slot + 5,
+            "health-installation",
+            "health-share",
+        );
+        gap.observation_id = None;
+        gap.outcome = "unobserved".into();
+        gap.failure_domain = Some("control_transport".into());
+        gap.reason_code = Some("control_transport_failed".into());
+        gap.evidence_scope = "share_projection".into();
+        assert!(
+            store
+                .finish_share_model_health_slot("health-share", retry_slot, &gap_claim, gap,)
+                .await
+                .expect("finish monitoring gap")
+        );
+        {
+            let conn = store.conn.lock().await;
+            let (history_count, last_status): (i64, String) = conn
+                .query_row(
+                    "SELECT COUNT(*), state.last_status
+                     FROM share_model_health_checks history
+                     JOIN share_model_health_state state
+                       ON state.share_id = history.share_id
+                      AND state.app_type = history.app_type
+                      AND state.requested_model = history.requested_model
+                     WHERE history.share_id = 'health-share'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read legacy model health projection after monitoring gap");
+            assert_eq!(history_count, 1);
+            assert_eq!(last_status, "success");
+        }
+        assert!(
+            store
+                .claim_share_model_health_slot(
+                    "health-share",
+                    retry_slot,
+                    &epoch_id,
+                    "codex",
+                    "openai",
+                    "server-test-model@low",
+                    "cc-switch-router-cycle:utc-test-retry",
+                    retry_slot + 30,
+                )
+                .await
+                .expect("retry unobserved monitoring gap")
+                .is_some()
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_model_health_calendar_uses_utc_slots_and_counts_missing_checks() {
+        let (store, config) = setup_store("share-model-health-calendar").await;
+        insert_installation(&store, "health-calendar-installation").await;
+        insert_share(
+            &store,
+            "health-calendar-installation",
+            "health-calendar-share",
+            "health-calendar-sub",
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET created_at = '2026-08-22T00:00:00Z' WHERE share_id = ?1",
+                params!["health-calendar-share"],
+            )
+            .expect("set deterministic Share creation date");
+        }
+        let day_start = 1_787_443_200;
+        let epoch_id = store
+            .sync_share_model_probe_epoch(
+                "health-calendar-share",
+                day_start,
+                Some(&model_probe_epoch_input(
+                    "health-calendar-share",
+                    "health-fingerprint",
+                )),
+            )
+            .await
+            .expect("open calendar probe epoch")
+            .expect("calendar probe epoch");
+        for (offset, status) in [(0, "success"), (1_800, "degraded"), (3_600, "failed")] {
+            let slot_start = day_start + offset;
+            let claim = store
+                .claim_share_model_health_slot(
+                    "health-calendar-share",
+                    slot_start,
+                    &epoch_id,
+                    "codex",
+                    "openai",
+                    "server-test-model@low",
+                    "cc-switch-router-cycle:utc-test",
+                    slot_start,
+                )
+                .await
+                .expect("claim calendar slot")
+                .expect("calendar claim token");
+            assert!(
+                store
+                    .finish_share_model_health_slot(
+                        "health-calendar-share",
+                        slot_start,
+                        &claim,
+                        model_health_slot_result(
+                            status,
+                            slot_start + 5,
+                            "health-calendar-installation",
+                            "health-calendar-share",
+                        ),
+                    )
+                    .await
+                    .expect("finish calendar slot")
+            );
+        }
+        let now = DateTime::parse_from_rfc3339("2026-08-24T12:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let calendar = store
+            .share_model_health_calendar("health-calendar-share", 4, now)
+            .await
+            .expect("read calendar")
+            .expect("calendar Share");
+        assert_eq!(calendar.timezone, "UTC");
+        assert_eq!(calendar.expected_checks_per_full_day, 48);
+        assert_eq!(calendar.days.len(), 4);
+        assert!(!calendar.days[0].active);
+        assert_eq!(calendar.days[0].expected_checks, 0);
+        assert!(calendar.days[0].success_rate.is_none());
+        assert!(!calendar.days[1].active);
+        assert_eq!(calendar.days[1].expected_checks, 0);
+        assert_eq!(calendar.days[2].date, "2026-08-23");
+        assert_eq!(calendar.days[2].expected_checks, 48);
+        assert_eq!(calendar.days[2].completed_checks, 3);
+        assert_eq!(calendar.days[2].successful_checks, 2);
+        assert!((calendar.days[2].success_rate.unwrap() - (200.0 / 48.0)).abs() < 0.001);
+        assert_eq!(calendar.days[3].date, "2026-08-24");
+        assert_eq!(calendar.days[3].expected_checks, 25);
+        assert_eq!(calendar.days[3].success_rate, Some(0.0));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_model_health_calendar_tracks_partial_pause_and_resume_epochs() {
+        let (store, config) = setup_store("share-model-health-epoch-windows").await;
+        insert_installation(&store, "health-window-installation").await;
+        insert_share(
+            &store,
+            "health-window-installation",
+            "health-window-share",
+            "health-window-sub",
+            "active",
+        )
+        .await;
+        let day_start = 1_787_443_200;
+        let first_epoch = store
+            .sync_share_model_probe_epoch(
+                "health-window-share",
+                day_start + 6 * 3_600,
+                Some(&model_probe_epoch_input(
+                    "health-window-share",
+                    "health-fingerprint-a",
+                )),
+            )
+            .await
+            .expect("open first partial epoch")
+            .expect("first partial epoch");
+        assert!(
+            store
+                .sync_share_model_probe_epoch("health-window-share", day_start + 12 * 3_600, None,)
+                .await
+                .expect("pause probe epoch")
+                .is_none()
+        );
+        let second_epoch = store
+            .sync_share_model_probe_epoch(
+                "health-window-share",
+                day_start + 18 * 3_600,
+                Some(&model_probe_epoch_input(
+                    "health-window-share",
+                    "health-fingerprint-b",
+                )),
+            )
+            .await
+            .expect("resume probe epoch")
+            .expect("resumed probe epoch");
+        assert_ne!(first_epoch, second_epoch);
+
+        let now = DateTime::parse_from_rfc3339("2026-08-24T12:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let calendar = store
+            .share_model_health_calendar("health-window-share", 2, now)
+            .await
+            .expect("read partial epoch calendar")
+            .expect("partial epoch calendar");
+        assert_eq!(calendar.days[0].date, "2026-08-23");
+        assert_eq!(calendar.days[0].expected_checks, 24);
+        assert_eq!(calendar.days[0].observed_checks, 0);
+        assert_eq!(calendar.days[0].monitoring_gap_checks, 24);
+        assert!(calendar.days[0].mixed_epoch);
+        assert_eq!(calendar.days[1].expected_checks, 25);
+        assert!(!calendar.days[1].mixed_epoch);
+        assert_eq!(calendar.epochs.len(), 2);
+        assert_eq!(
+            calendar.current_probe.as_ref().map(|epoch| &epoch.epoch_id),
+            Some(&second_epoch)
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_model_probe_epoch_switch_waits_for_the_next_unclaimed_slot() {
+        let (store, config) = setup_store("share-model-health-epoch-switch").await;
+        insert_installation(&store, "health-switch-installation").await;
+        insert_share(
+            &store,
+            "health-switch-installation",
+            "health-switch-share",
+            "health-switch-sub",
+            "active",
+        )
+        .await;
+        let day_start = 1_787_443_200;
+        let first_epoch = store
+            .sync_share_model_probe_epoch(
+                "health-switch-share",
+                day_start,
+                Some(&model_probe_epoch_input(
+                    "health-switch-share",
+                    "health-fingerprint-a",
+                )),
+            )
+            .await
+            .expect("open switch epoch")
+            .expect("switch epoch");
+        let switch_slot = day_start + 3_600;
+        store
+            .claim_share_model_health_slot(
+                "health-switch-share",
+                switch_slot,
+                &first_epoch,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-switch",
+                switch_slot,
+            )
+            .await
+            .expect("claim switch slot")
+            .expect("switch slot claim");
+        let effective_epoch = store
+            .sync_share_model_probe_epoch(
+                "health-switch-share",
+                switch_slot,
+                Some(&model_probe_epoch_input(
+                    "health-switch-share",
+                    "health-fingerprint-b",
+                )),
+            )
+            .await
+            .expect("switch probe configuration");
+        assert!(effective_epoch.is_none());
+        assert!(
+            store
+                .sync_share_model_probe_epoch(
+                    "health-switch-share",
+                    switch_slot,
+                    Some(&model_probe_epoch_input(
+                        "health-switch-share",
+                        "health-fingerprint-b",
+                    )),
+                )
+                .await
+                .expect("recheck queued probe configuration")
+                .is_none()
+        );
+
+        let during_claimed_slot = DateTime::<Utc>::from_timestamp(switch_slot + 60, 0).unwrap();
+        let current_calendar = store
+            .share_model_health_calendar("health-switch-share", 1, during_claimed_slot)
+            .await
+            .expect("read switched epoch calendar")
+            .expect("switched epoch calendar");
+        assert_eq!(current_calendar.epochs.len(), 1);
+        assert_eq!(
+            current_calendar.epochs[0].ends_at,
+            Some(switch_slot + 1_800)
+        );
+        assert!(!current_calendar.days[0].mixed_epoch);
+        assert_eq!(
+            current_calendar
+                .current_probe
+                .as_ref()
+                .map(|epoch| &epoch.epoch_id),
+            Some(&first_epoch)
+        );
+
+        let after_transition = DateTime::<Utc>::from_timestamp(switch_slot + 1_860, 0).unwrap();
+        let calendar = store
+            .share_model_health_calendar("health-switch-share", 1, after_transition)
+            .await
+            .expect("read effective switched epoch calendar")
+            .expect("effective switched epoch calendar");
+        assert_eq!(calendar.epochs.len(), 2);
+        assert_eq!(calendar.epochs[0].ends_at, Some(switch_slot + 1_800));
+        assert_eq!(calendar.epochs[1].starts_at, switch_slot + 1_800);
+        assert!(calendar.days[0].mixed_epoch);
+        assert_eq!(
+            calendar.current_probe.as_ref().map(|epoch| &epoch.epoch_id),
+            Some(&calendar.epochs[1].epoch_id)
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_model_health_claim_rejects_a_superseded_epoch() {
+        let (store, config) = setup_store("share-model-health-stale-epoch-claim").await;
+        insert_installation(&store, "health-stale-installation").await;
+        insert_share(
+            &store,
+            "health-stale-installation",
+            "health-stale-share",
+            "health-stale-sub",
+            "active",
+        )
+        .await;
+        let slot_start = 1_787_443_200;
+        let first_epoch = store
+            .sync_share_model_probe_epoch(
+                "health-stale-share",
+                slot_start,
+                Some(&model_probe_epoch_input(
+                    "health-stale-share",
+                    "health-fingerprint-a",
+                )),
+            )
+            .await
+            .expect("open stale claim epoch")
+            .expect("stale claim epoch");
+        let replacement = store
+            .sync_share_model_probe_epoch(
+                "health-stale-share",
+                slot_start,
+                Some(&model_probe_epoch_input(
+                    "health-stale-share",
+                    "health-fingerprint-b",
+                )),
+            )
+            .await
+            .expect("replace unclaimed epoch")
+            .expect("replacement epoch");
+        assert_ne!(first_epoch, replacement);
+
+        assert!(
+            store
+                .claim_share_model_health_slot(
+                    "health-stale-share",
+                    slot_start,
+                    &first_epoch,
+                    "codex",
+                    "openai",
+                    "server-test-model@low",
+                    "cc-switch-router-cycle:utc-stale",
+                    slot_start,
+                )
+                .await
+                .expect("reject stale epoch claim")
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_share_model_health_slot(
+                    "health-stale-share",
+                    slot_start,
+                    &replacement,
+                    "codex",
+                    "openai",
+                    "server-test-model@low",
+                    "cc-switch-router-cycle:utc-current",
+                    slot_start,
+                )
+                .await
+                .expect("claim replacement epoch")
+                .is_some()
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn paused_runtime_snapshot_closes_the_model_probe_epoch() {
+        let (store, config) = setup_store("share-model-health-runtime-pause").await;
+        insert_installation(&store, "health-pause-installation").await;
+        insert_share(
+            &store,
+            "health-pause-installation",
+            "health-pause-share",
+            "health-pause-sub",
+            "active",
+        )
+        .await;
+        let now = Utc::now();
+        let slot_start = now.timestamp().div_euclid(1_800) * 1_800;
+        let epoch_id = store
+            .sync_share_model_probe_epoch(
+                "health-pause-share",
+                slot_start,
+                Some(&model_probe_epoch_input(
+                    "health-pause-share",
+                    "health-fingerprint-pause",
+                )),
+            )
+            .await
+            .expect("open pause fixture epoch")
+            .expect("pause fixture epoch");
+        store
+            .claim_share_model_health_slot(
+                "health-pause-share",
+                slot_start,
+                &epoch_id,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-pause",
+                now.timestamp(),
+            )
+            .await
+            .expect("claim pause fixture slot")
+            .expect("pause fixture claim");
+
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "health-pause-share".into(),
+                queried_at: now.timestamp(),
+                support: ShareSupport {
+                    claude: false,
+                    codex: true,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes::default(),
+                app_providers: ShareAppProviders::default(),
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: Some("paused".into()),
+                model_health: ShareModelHealthSummary::default(),
+            })
+            .await
+            .expect("record paused runtime snapshot");
+
+        let conn = store.conn.lock().await;
+        let ends_at: Option<i64> = conn
+            .query_row(
+                "SELECT ends_at_slot FROM share_model_probe_epochs WHERE epoch_id = ?1",
+                params![epoch_id],
+                |row| row.get(0),
+            )
+            .expect("read paused epoch boundary");
+        assert_eq!(ends_at, Some(slot_start + 1_800));
+        drop(conn);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn shared_provider_probe_is_canonical_and_rejects_content_drift() {
+        let (store, config) = setup_store("share-model-health-shared-observation").await;
+        insert_installation(&store, "health-shared-installation").await;
+        for (share_id, subdomain) in [
+            ("health-shared-a", "health-shared-a-sub"),
+            ("health-shared-b", "health-shared-b-sub"),
+        ] {
+            insert_share(
+                &store,
+                "health-shared-installation",
+                share_id,
+                subdomain,
+                "active",
+            )
+            .await;
+        }
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET capacity_pool_id = 'health-shared-pool'
+                 WHERE share_id IN ('health-shared-a', 'health-shared-b')",
+                [],
+            )
+            .expect("align shared capacity pool");
+        }
+        let slot_start = 1_787_443_200;
+        let mut claims = Vec::new();
+        for share_id in ["health-shared-a", "health-shared-b"] {
+            let epoch_id = store
+                .sync_share_model_probe_epoch(
+                    share_id,
+                    slot_start,
+                    Some(&model_probe_epoch_input(
+                        "health-shared-pool",
+                        "health-fingerprint-shared",
+                    )),
+                )
+                .await
+                .expect("open shared probe epoch")
+                .expect("shared probe epoch");
+            let claim = store
+                .claim_share_model_health_slot(
+                    share_id,
+                    slot_start,
+                    &epoch_id,
+                    "codex",
+                    "openai",
+                    "server-test-model@low",
+                    "cc-switch-router-cycle:utc-test",
+                    slot_start,
+                )
+                .await
+                .expect("claim shared probe slot")
+                .expect("shared probe claim");
+            claims.push((share_id, claim));
+        }
+        let result = model_health_slot_result(
+            "success",
+            slot_start + 5,
+            "health-shared-installation",
+            "health-shared-pool",
+        );
+        assert!(
+            store
+                .finish_share_model_health_slot(
+                    claims[0].0,
+                    slot_start,
+                    &claims[0].1,
+                    result.clone(),
+                )
+                .await
+                .expect("finish first shared projection")
+        );
+        let mut drifted = result.clone();
+        drifted.latency_ms += 1;
+        assert!(matches!(
+            store
+                .finish_share_model_health_slot(claims[1].0, slot_start, &claims[1].1, drifted,)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(
+            store
+                .finish_share_model_health_slot(claims[1].0, slot_start, &claims[1].1, result,)
+                .await
+                .expect("finish matching shared projection")
+        );
+        {
+            let conn = store.conn.lock().await;
+            let observations = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM share_model_probe_observations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count canonical observations");
+            assert_eq!(observations, 1);
+        }
+        let now = DateTime::<Utc>::from_timestamp(slot_start + 60, 0).unwrap();
+        for share_id in ["health-shared-a", "health-shared-b"] {
+            let calendar = store
+                .share_model_health_calendar(share_id, 1, now)
+                .await
+                .expect("read shared probe calendar")
+                .expect("shared probe calendar");
+            assert!(calendar.shared_probe);
+            assert_eq!(calendar.days[0].observed_checks, 1);
+            assert_eq!(calendar.days[0].successful_checks, 1);
+        }
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_model_health_calendar_visibility_matches_market_and_share_acl() {
+        let (store, config) = setup_store("share-model-health-calendar-access").await;
+        insert_installation(&store, "health-access-installation").await;
+        insert_share(
+            &store,
+            "health-access-installation",
+            "health-access-share",
+            "health-access-sub",
+            "active",
+        )
+        .await;
+        set_shareto_users(&store, "health-access-share", &["buyer@example.com"]).await;
+
+        assert!(
+            store
+                .can_view_share_model_health_calendar(
+                    "health-access-share",
+                    Some("owner@example.com"),
+                    false,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .can_view_share_model_health_calendar(
+                    "health-access-share",
+                    Some("buyer@example.com"),
+                    false,
+                )
+                .await
+                .unwrap()
+        );
+        expire_shareto_user(&store, "health-access-share", "buyer@example.com").await;
+        assert!(
+            !store
+                .can_view_share_model_health_calendar(
+                    "health-access-share",
+                    Some("buyer@example.com"),
+                    false,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .can_view_share_model_health_calendar("health-access-share", None, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .can_view_share_model_health_calendar(
+                    "health-access-share",
+                    Some("other@example.com"),
+                    false,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .can_view_share_model_health_calendar("health-access-share", None, false)
+                .await
+                .unwrap()
+        );
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO share_market_listings (
+                    id, share_id, installation_id, owner_user_id, owner_email,
+                    status, created_at, updated_at
+                 ) VALUES (
+                    'health-access-listing', 'health-access-share',
+                    'health-access-installation', 'owner-user', 'owner@example.com',
+                    'active', ?1, ?1
+                 )",
+                params![now],
+            )
+            .expect("publish Share Market listing");
+        }
+        assert!(
+            store
+                .can_view_share_model_health_calendar("health-access-share", None, false)
+                .await
+                .unwrap()
         );
 
         let _ = std::fs::remove_file(&config.database.path);
@@ -27657,7 +30065,7 @@ mod tests {
     #[test]
     fn upstream_provider_field_order_matches_server_signer() {
         use crate::models::{
-            ShareProviderModelPolicy, ShareProviderModelPolicyScope,
+            ProviderModelProbe, ShareProviderModelPolicy, ShareProviderModelPolicyScope,
             ShareProviderModelPolicySource, ShareUpstreamModel, ShareUpstreamProvider,
             ShareUpstreamQuota,
         };
@@ -27694,6 +30102,18 @@ mod tests {
             model_policy: Some(ShareProviderModelPolicy::Single {
                 upstream_model: "gpt".into(),
             }),
+            model_probe: Some(ProviderModelProbe {
+                api_type: "openai".into(),
+                requested_model: "server-test@low".into(),
+                wire_model: "server-test".into(),
+                method: "POST".into(),
+                path: "/v1/responses".into(),
+                body: serde_json::json!({"model": "server-test"}),
+                stream: true,
+                response_mode: "responses_sse".into(),
+                payload_revision: 2,
+                health_fingerprint: "fingerprint".into(),
+            }),
             health: None,
             available: None,
         };
@@ -27703,11 +30123,17 @@ mod tests {
         let queried_at = json.find("queriedAt").expect("queriedAt");
         let api = json.find("apiUrl").expect("apiUrl");
         let models = json.find("models").expect("models");
+        let policy = json.find("modelPolicy").expect("modelPolicy");
+        let probe = json.find("modelProbe").expect("modelProbe");
         assert!(
             plan < activity_cost && activity_cost < queried_at,
             "expected activityCost between plan and queriedAt, got {json}"
         );
         assert!(api < models, "expected apiUrl before models, got {json}");
+        assert!(
+            policy < probe,
+            "expected modelPolicy before modelProbe, got {json}"
+        );
     }
 
     fn public_key_b64(signing_key: &SigningKey) -> String {

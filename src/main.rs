@@ -42,6 +42,7 @@ mod secure_file;
 mod server_logs;
 mod server_state;
 mod share_market;
+mod share_model_health;
 mod ssh;
 mod startup_config;
 mod store;
@@ -304,6 +305,9 @@ async fn main() -> Result<()> {
     let runtime_proxy = state.proxy.clone();
     let runtime_config = config.clone();
     let runtime_traffic = state.recent_traffic.clone();
+    let model_health_store = state.store.clone();
+    let model_health_proxy = state.proxy.clone();
+    let model_health_config = config.clone();
     let request_log_recovery_store = state.store.clone();
     let request_log_recovery_proxy = state.proxy.clone();
     let request_log_recovery_config = config.clone();
@@ -528,6 +532,34 @@ async fn main() -> Result<()> {
                 .await
                 {
                     tracing::warn!("share runtime refresh failed: {err}");
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
+    let model_health_task = spawn_background_task(
+        "Share model health",
+        background_shutdown_rx.clone(),
+        async move {
+            let client = reqwest::Client::builder()
+                .user_agent("cc-switch-router/0.1 share-model-health")
+                .timeout(crate::share_model_health::BATCH_REQUEST_TIMEOUT)
+                .build()?;
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(error) = crate::share_model_health::run_cycle(
+                    &model_health_store,
+                    &model_health_proxy,
+                    &model_health_config,
+                    &client,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    tracing::warn!(error = %error, "Share model health cycle failed");
                 }
             }
             #[allow(unreachable_code)]
@@ -771,6 +803,7 @@ async fn main() -> Result<()> {
         ("IP blacklist logger", ip_blacklist_log_task),
         ("route health probe", probe_task),
         ("Share runtime refresh", runtime_task),
+        ("Share model health", model_health_task),
         ("Share request log recovery", request_log_recovery_task),
         ("Resend usage refresh", resend_usage_task),
         ("metrics collector", metrics_task),
@@ -1472,6 +1505,10 @@ mod tests {
                     installation_id: "inst-1".into(),
                     share_name: "Share 1".into(),
                     subdomain: "aaa".into(),
+                    contract_version: 4,
+                    capacity_pool_id: "pool-1".into(),
+                    bindings: Default::default(),
+                    support: Default::default(),
                     app_runtimes: Default::default(),
                 },
                 ShareRouteTarget {
@@ -1479,6 +1516,10 @@ mod tests {
                     installation_id: "inst-2".into(),
                     share_name: "Share 2".into(),
                     subdomain: "bbb".into(),
+                    contract_version: 4,
+                    capacity_pool_id: "pool-2".into(),
+                    bindings: Default::default(),
+                    support: Default::default(),
                     app_runtimes: Default::default(),
                 },
             ],

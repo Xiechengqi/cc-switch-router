@@ -6,6 +6,7 @@ import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
+import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
 import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, operationalReasonLabel, operationalStateLabel, shareIsEnabled, shareOperationalSummary, summarizeShareAvailability, useStableOperationalRanks } from "@/components/dashboard/operational-status";
@@ -1074,7 +1075,10 @@ export function ClientBoard({
               <Drawer.Body className="overflow-y-auto">
                 {selectedShare ? (
                   <div className="grid gap-5">
-                    <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
+                    {!["online", "available"].includes(shareOperationalSummary(selectedShare).state) ? (
+                      <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
+                    ) : null}
+                    <ShareModelHealthHeatmap shareId={selectedShare.shareId} />
                     <DrawerSection label={t("shareMarket.title")}>
                       <ShareAccess share={selectedShare} t={t} />
                     </DrawerSection>

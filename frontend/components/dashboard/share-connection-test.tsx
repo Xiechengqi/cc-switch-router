@@ -2,136 +2,37 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
-import { Check, ChevronDown, ChevronRight, Copy, Loader2, RefreshCw } from "lucide-react";
+import { Check, ChevronDown, Copy, Loader2, RefreshCw } from "lucide-react";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { refreshShareUsage, testShareConnection } from "@/lib/api";
-import type { MessageKey } from "@/lib/i18n";
-import type { ShareConnectionTestResponse, ShareView } from "@/lib/types";
+import { SHARE_APP_LABELS } from "@/lib/share-app";
+import { buildShareProbeCurl } from "@/lib/share-model-probe";
+import type {
+  ShareConnectionTestResponse,
+  ShareUpstreamProvider,
+  ShareView,
+} from "@/lib/types";
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
 type TestApp = "claude" | "codex" | "gemini";
-type TestKind = "text" | "chat" | "image" | "tools";
-type AppProbe = {
-  labelKey: MessageKey;
-  method: "POST";
-  path: string;
-  body: string;
-};
 
-/** 每 app 写死的 curl 参数 */
-const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
-  claude: {
-    text: {
-      labelKey: "dashboard.connectDialog.test.textApiCall",
-      method: "POST",
-      path: "/v1/messages",
-      body: JSON.stringify({
-        model: "claude-opus-4-7",
-        max_tokens: 16,
-        // stream:true 与真实 claude-cli 一致——绕开 cc-switch-server 在非流路径
-        // openai_to_anthropic 转换（GitHub Copilot 这类绑定会因 Empty choices 抛 422）。
-        stream: true,
-        messages: [{ role: "user", content: "who are you" }],
-      }),
-    },
-    tools: {
-      labelKey: "dashboard.connectDialog.test.toolsApiCall",
-      method: "POST",
-      path: "/v1/messages",
-      body: JSON.stringify({
-        model: "claude-opus-4-7",
-        max_tokens: 256,
-        stream: true,
-        tools: [
-          {
-            name: "Bash",
-            description: "run bash",
-            input_schema: {
-              type: "object",
-              properties: { command: { type: "string" } },
-            },
-          },
-        ],
-        messages: [{ role: "user", content: "run ls" }],
-      }),
-    },
-  },
-    codex: {
-    text: {
-      labelKey: "dashboard.connectDialog.test.textApiCall",
-      method: "POST",
-      path: "/v1/responses",
-      body: JSON.stringify({
-        model: "gpt-5.5",
-        input: [{ role: "user", content: "who are you" }],
-        stream: true,
-        store: false,
-        reasoning: { effort: "low" },
-        include: ["reasoning.encrypted_content"],
-        instructions: "",
-        tools: [],
-        parallel_tool_calls: false,
-      }),
-    },
-    chat: {
-      labelKey: "dashboard.connectDialog.test.chatApiCall",
-      method: "POST",
-      path: "/v1/chat/completions",
-      body: JSON.stringify({
-        model: "gpt-5.5",
-        messages: [{ role: "user", content: "who are you" }],
-        max_completion_tokens: 16,
-      }),
-    },
-    image: {
-      labelKey: "dashboard.connectDialog.test.imageApiCall",
-      method: "POST",
-      path: "/v1/images/generations",
-      body: JSON.stringify({
-        model: "gpt-5.5",
-        prompt: "A small robot painting a sunrise",
-        size: "1024x1024",
-        response_format: "b64_json",
-        output_format: "png",
-        stream: true,
-        partial_images: 0,
-      }),
-    },
-  },
-  gemini: {
-    text: {
-      labelKey: "dashboard.connectDialog.test.textApiCall",
-      method: "POST",
-      path: "/v1beta/models/gemini-2.5-flash:generateContent",
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: "who are you" }] }],
-        generationConfig: { maxOutputTokens: 16 },
-      }),
-    },
-  },
-} as const;
-
-function getAppProbe(app: TestApp, kind: TestKind) {
-  return APP_PROBE[app][kind] ?? null;
+function runtimeForApp(share: ShareView, app: TestApp) {
+  return share.appRuntimes?.[app];
 }
 
-function buildCurlCommand(baseUrl: string, app: TestApp, kind: TestKind, apiToken: string) {
-  const probe = getAppProbe(app, kind);
-  if (!probe) return "";
-  const url = `${baseUrl}${probe.path}`;
-  const bearer = apiToken
-    ? `Bearer ${apiToken}`
-    : "Bearer <your-api-token>";
-  return [
-    `curl ${kind === "image" || kind === "tools" || (app === "codex" && kind === "text") ? "-N " : ""}-sS -X ${probe.method} \\`,
-    `  '${url}' \\`,
-    `  -H 'Authorization: ${bearer}' \\`,
-    ...(kind === "image" || kind === "tools" || (app === "codex" && kind === "text")
-      ? [`  -H 'Accept: text/event-stream' \\`]
-      : []),
-    `  -H 'Content-Type: application/json' \\`,
-    `  -d '${probe.body}'`,
-  ].join("\n");
+function modelPolicyDescription(runtime: ShareUpstreamProvider | undefined, t: TFn) {
+  if (runtime?.modelPolicy?.mode === "single") {
+    return t("dashboard.connectDialog.test.policySingle", {
+      model: runtime.modelPolicy.upstreamModel,
+    });
+  }
+  if (runtime?.modelPolicy?.mode === "passthrough") {
+    return t("dashboard.connectDialog.test.policyPassthrough", {
+      provider: runtime.providerName || runtime.providerType || t("dashboard.connectDialog.test.providerUnknown"),
+    });
+  }
+  return t("dashboard.connectDialog.test.policyUnknown");
 }
 
 function InlineCopyButton({ value, t }: { value: string; t: TFn }) {
@@ -158,6 +59,7 @@ function InlineCopyButton({ value, t }: { value: string; t: TFn }) {
         onClick={copy}
         disabled={!value}
         title={copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
+        aria-label={copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
         className="inline-flex h-6 w-6 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
       >
         <Copy className="h-3.5 w-3.5" />
@@ -181,14 +83,12 @@ type TestState = "idle" | "running" | "done" | "error";
 export function ShareConnectionTestRow({
   share,
   app,
-  kind = "text",
   apiToken,
   baseUrl,
   canExecute,
 }: {
   share: ShareView;
   app: TestApp;
-  kind?: TestKind;
   apiToken: string;
   baseUrl: string;
   canExecute: boolean;
@@ -199,33 +99,32 @@ export function ShareConnectionTestRow({
   const [errorMsg, setErrorMsg] = React.useState("");
   const [refreshState, setRefreshState] = React.useState<TestState>("idle");
   const [refreshMsg, setRefreshMsg] = React.useState("");
-  const [resultOpen, setResultOpen] = React.useState(false);
 
   const isBound = !!(share.bindings?.[app]);
-  const probe = getAppProbe(app, kind);
+  const runtime = runtimeForApp(share, app);
+  const probe = runtime?.modelProbe;
   const curlCmd = React.useMemo(
-    () => (baseUrl ? buildCurlCommand(baseUrl, app, kind, apiToken) : ""),
-    [baseUrl, app, kind, apiToken],
+    () => (baseUrl && probe ? buildShareProbeCurl(baseUrl, probe, apiToken) : ""),
+    [baseUrl, probe, apiToken],
   );
 
   const runTest = React.useCallback(async () => {
     if (!canExecute || !isBound || !probe || testState === "running") return;
     setTestState("running");
+    setResult(null);
     setErrorMsg("");
     try {
       const response = await testShareConnection(share.shareId, {
         app,
-        kind,
-        timeoutMs: kind === "tools" ? 30000 : 15000,
+        timeoutMs: 30000,
       });
       setResult(response);
-      setResultOpen(true);
       setTestState(response.success ? "done" : "error");
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
       setTestState("error");
     }
-  }, [canExecute, isBound, probe, testState, share.shareId, app, kind]);
+  }, [canExecute, isBound, probe, testState, share.shareId, app]);
 
   const runUsageRefresh = React.useCallback(async () => {
     if (!canExecute || !isBound || refreshState === "running") return;
@@ -256,10 +155,11 @@ export function ShareConnectionTestRow({
 
   const running = testState === "running";
   const refreshing = refreshState === "running";
-  const canRefreshUsage = kind === "text" && share.canManage;
+  const canRefreshUsage = share.canManage;
 
   let disabledReason: string | null = null;
   if (!isBound) disabledReason = t("dashboard.connectDialog.test.notBound");
+  else if (!probe) disabledReason = t("dashboard.connectDialog.test.probeUnavailable");
   else if (!canExecute) disabledReason = t("dashboard.connectDialog.test.needPermission");
 
   const statusColor = result?.response
@@ -270,28 +170,33 @@ export function ShareConnectionTestRow({
         : "text-red-700"
     : "text-slate-500";
 
+  if (!isBound) {
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 px-3 py-2 text-sm">
+        <span className="flex min-w-0 items-center gap-2">
+          <ShareAppLogo app={app} size={14} />
+          <span className="font-medium text-slate-700">{SHARE_APP_LABELS[app]}</span>
+        </span>
+        <span className="text-xs text-slate-400">{disabledReason}</span>
+      </div>
+    );
+  }
+
   return (
-    <div className={`grid gap-2 rounded-lg border px-3 py-2.5 text-sm ${isBound ? "border-slate-200 bg-slate-50" : "border-slate-100 bg-slate-50/40 opacity-60"}`}>
-      {/* Header row: app label + disabled reason or test button */}
+    <div className="grid gap-2.5 rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-mono text-xs font-semibold uppercase tracking-wide text-slate-600">
-            {app}
-          </span>
-          {probe ? (
-            <span className="min-w-0 truncate text-xs text-slate-500">
-              {t(probe.labelKey)}
-            </span>
-          ) : null}
+          <ShareAppLogo app={app} size={14} />
+          <span className="shrink-0 font-medium text-slate-900">{SHARE_APP_LABELS[app]}</span>
         </div>
         {disabledReason ? (
-          <span className="text-[11px] text-slate-400">{disabledReason}</span>
+          <span className="text-xs text-slate-400">{disabledReason}</span>
         ) : (
           <div className="flex shrink-0 items-center gap-1.5">
             {canRefreshUsage ? (
               <Button
                 size="sm"
-                variant="secondary"
+                variant="ghost"
                 isDisabled={refreshing}
                 onClick={refreshing ? undefined : runUsageRefresh}
                 aria-label={t("dashboard.connectDialog.test.refreshUsage")}
@@ -323,9 +228,18 @@ export function ShareConnectionTestRow({
         )}
       </div>
 
+      {probe ? (
+        <p className="text-xs leading-5 text-slate-500">
+          {modelPolicyDescription(runtime, t)}{" "}
+          <span className="text-slate-400">·</span>{" "}
+          {t("dashboard.connectDialog.test.testModel")}{" "}
+          <code className="break-all font-mono text-slate-700">{probe.requestedModel}</code>
+        </p>
+      ) : null}
+
       {refreshMsg ? (
         <div
-          className={`rounded border px-3 py-2 text-xs ${
+          className={`rounded-lg border px-3 py-2 text-xs ${
             refreshState === "error"
               ? "border-red-200 bg-red-50 text-red-700"
               : "border-emerald-200 bg-emerald-50 text-emerald-700"
@@ -337,98 +251,85 @@ export function ShareConnectionTestRow({
         </div>
       ) : null}
 
-      {/* curl preview */}
       {curlCmd ? (
-        <div className="grid gap-1">
-          <div className="flex items-start gap-1">
-            <span className="mt-0.5 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-              {t("dashboard.connectDialog.test.curlLabel")}
-            </span>
-          </div>
-          <div className="relative rounded border border-slate-200 bg-white">
-            <pre className="whitespace-pre-wrap break-all px-3 py-2 pr-9 text-[11px] leading-relaxed text-slate-800">{curlCmd}</pre>
-            <span className="absolute right-1.5 top-1.5">
-              <InlineCopyButton value={curlCmd} t={t} />
-            </span>
-          </div>
-        </div>
+        <details className="group rounded-lg border border-slate-200 bg-slate-50/60">
+          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
+            <ChevronDown className="h-3.5 w-3.5 shrink-0 -rotate-90 text-slate-400 transition-transform group-open:rotate-0" />
+            <span className="min-w-0 flex-1 font-mono">{t("dashboard.connectDialog.test.curlLabel")}</span>
+            <InlineCopyButton value={curlCmd} t={t} />
+          </summary>
+          <pre className="overflow-x-auto whitespace-pre-wrap break-all border-t border-slate-200 px-3 py-2 font-mono text-[11px] leading-relaxed text-slate-800">
+            {curlCmd}
+          </pre>
+        </details>
       ) : null}
 
-      {/* Error from fetch itself (network / auth) */}
       {testState === "error" && errorMsg ? (
-        <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
           {t("dashboard.connectDialog.test.networkError", { message: errorMsg })}
         </div>
       ) : null}
 
-      {/* Result panel */}
       {result ? (
-        <div className="grid gap-1">
-          {/* Summary line – always visible, click to expand */}
-          <button
-            type="button"
-            onClick={() => setResultOpen((v) => !v)}
-            className="flex items-center gap-2 text-xs"
-          >
-            {resultOpen ? <ChevronDown className="h-3.5 w-3.5 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-400" />}
-            {result.error ? (
-              <span className="text-red-600">{result.error}</span>
-            ) : result.response ? (
-              <>
-                <span className={`font-semibold ${statusColor}`}>
-                  {result.response.statusCode} {result.response.statusText}
-                </span>
-                <span className="text-slate-400">·</span>
-                <span className="text-slate-500">
-                  {t("dashboard.connectDialog.test.durationMs", { ms: String(result.durationMs) })}
-                </span>
-                {result.schedulingRecovery ? (
-                  <>
-                    <span className="text-slate-400">·</span>
-                    <span className="text-emerald-700">
-                      {t("dashboard.connectDialog.test.schedulingRecovered")}
-                    </span>
-                  </>
-                ) : null}
-              </>
-            ) : null}
-          </button>
+        <div className="grid gap-2">
+          {result.error ? (
+            <p className="text-xs text-red-600">{result.error}</p>
+          ) : result.response ? (
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+              <span className={`font-semibold ${statusColor}`}>
+                {result.response.statusCode} {result.response.statusText}
+              </span>
+              <span className="text-slate-400">·</span>
+              <span className="text-slate-500">
+                {t("dashboard.connectDialog.test.durationMs", { ms: String(result.durationMs) })}
+              </span>
+              {result.schedulingRecovery ? (
+                <>
+                  <span className="text-slate-400">·</span>
+                  <span className="text-emerald-700">
+                    {t("dashboard.connectDialog.test.schedulingRecovered")}
+                  </span>
+                </>
+              ) : null}
+            </div>
+          ) : null}
 
-          {resultOpen && result.response ? (
-            <div className="grid gap-2 rounded border border-slate-200 bg-white px-3 py-2">
-              {/* Response headers */}
-              <div className="grid gap-0.5">
-                <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                  {t("dashboard.connectDialog.test.headers")}
-                </span>
-                <div className="max-h-28 overflow-y-auto font-mono text-[11px] text-slate-700">
-                  {result.response.headers.map(([k, v], i) => (
-                    <div key={i} className="flex gap-2 leading-relaxed">
-                      <span className="shrink-0 text-slate-400">{k}:</span>
-                      <span className="min-w-0 break-all">{v}</span>
-                    </div>
-                  ))}
+          {result.response ? (
+            <details className="group rounded-lg border border-slate-200 bg-slate-50/60">
+              <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 -rotate-90 text-slate-400 transition-transform group-open:rotate-0" />
+                <span className="min-w-0 flex-1">{t("dashboard.connectDialog.test.responseToggle")}</span>
+                <InlineCopyButton value={result.response.bodyText} t={t} />
+              </summary>
+              <div className="grid gap-3 border-t border-slate-200 px-3 py-2">
+                <div className="grid gap-0.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                    {t("dashboard.connectDialog.test.headers")}
+                  </span>
+                  <div className="max-h-28 overflow-y-auto font-mono text-[11px] text-slate-700">
+                    {result.response.headers.map(([k, v], i) => (
+                      <div key={i} className="flex gap-2 leading-relaxed">
+                        <span className="shrink-0 text-slate-400">{k}:</span>
+                        <span className="min-w-0 break-all">{v}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
-
-              {/* Response body */}
-              <div className="grid gap-0.5">
-                <div className="flex items-center justify-between gap-1">
+                <div className="grid gap-0.5">
                   <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                     {t("dashboard.connectDialog.test.body")}
                   </span>
-                  <InlineCopyButton value={result.response.bodyText} t={t} />
+                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-slate-100 bg-white px-2 py-1.5 text-[11px] leading-relaxed text-slate-800">
+                    {result.response.bodyText || "(empty)"}
+                  </pre>
+                  {result.response.bodyTruncated ? (
+                    <span className="text-[10px] text-slate-400">
+                      {t("dashboard.connectDialog.test.bodyTruncated")}
+                    </span>
+                  ) : null}
                 </div>
-                <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded border border-slate-100 bg-slate-50 px-2 py-1.5 text-[11px] leading-relaxed text-slate-800">
-                  {result.response.bodyText || "(empty)"}
-                </pre>
-                {result.response.bodyTruncated ? (
-                  <span className="text-[10px] text-slate-400">
-                    {t("dashboard.connectDialog.test.bodyTruncated")}
-                  </span>
-                ) : null}
               </div>
-            </div>
+            </details>
           ) : null}
         </div>
       ) : null}

@@ -40,9 +40,12 @@ jobs:
           npm ci
           npm run test:flags
           npm run test:token-units
+          npm run test:share-model-probe
+          npm run test:share-model-health-heatmap
           npm run audit:settings-i18n
           npm run audit:market-billing-contract
           npm run audit:web-token-units
+          npm run audit:share-model-health-contract
           npm run build
 
       - name: Get version from Cargo.toml

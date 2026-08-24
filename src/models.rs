@@ -1,10 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
+use serde_json::{Value, value::RawValue};
 use std::collections::BTreeMap;
 
 pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
-pub const SHARE_CONTRACT_VERSION: u16 = 3;
+pub const SHARE_CONTRACT_VERSION: u16 = 4;
 
 pub fn default_share_parallel_limit() -> i64 {
     -1
@@ -2135,6 +2135,22 @@ pub enum ShareProviderModelPolicy {
     Single { upstream_model: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderModelProbe {
+    pub api_type: String,
+    pub requested_model: String,
+    pub wire_model: String,
+    pub method: String,
+    pub path: String,
+    pub body: Value,
+    pub stream: bool,
+    pub response_mode: String,
+    pub payload_revision: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health_fingerprint: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareProviderHealth {
@@ -2188,6 +2204,8 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_policy: Option<ShareProviderModelPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_probe: Option<ProviderModelProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
@@ -2212,6 +2230,7 @@ impl Default for ShareUpstreamProvider {
             model_policy_scope: None,
             model_policy_source: None,
             model_policy: None,
+            model_probe: None,
             health: None,
             available: None,
         }
@@ -2263,6 +2282,8 @@ pub struct ShareAppProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_policy: Option<ShareProviderModelPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_probe: Option<ProviderModelProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
@@ -2293,6 +2314,7 @@ impl Default for ShareAppProvider {
             model_policy_scope: None,
             model_policy_source: None,
             model_policy: None,
+            model_probe: None,
             health: None,
             available: None,
         }
@@ -3127,6 +3149,65 @@ pub struct ShareView {
     pub banked_reset_expiry_lead_minutes: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub previous_response_cache_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareModelHealthCalendarDay {
+    pub date: String,
+    pub active: bool,
+    pub expected_checks: u16,
+    pub completed_checks: u16,
+    pub successful_checks: u16,
+    pub observed_checks: u16,
+    pub upstream_failure_checks: u16,
+    pub monitoring_gap_checks: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_rate: Option<f64>,
+    #[serde(default)]
+    pub mixed_epoch: bool,
+    #[serde(default)]
+    pub evidence_version: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareModelHealthProbeEpoch {
+    pub epoch_id: String,
+    pub starts_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<i64>,
+    pub app_type: String,
+    pub api_type: String,
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    pub requested_model: String,
+    pub wire_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_mode: Option<String>,
+    pub evidence_version: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareModelHealthCalendarResponse {
+    pub share_id: String,
+    pub timezone: String,
+    pub expected_checks_per_full_day: u16,
+    pub start_date: String,
+    pub end_date: String,
+    pub days: Vec<ShareModelHealthCalendarDay>,
+    #[serde(default)]
+    pub epochs: Vec<ShareModelHealthProbeEpoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_probe: Option<ShareModelHealthProbeEpoch>,
+    #[serde(default)]
+    pub shared_probe: bool,
+    #[serde(default)]
+    pub evidence_version: u16,
 }
 
 #[derive(Debug, Deserialize)]

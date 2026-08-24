@@ -6,38 +6,15 @@ import { Check, Copy, ExternalLink, LogIn, Mail } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getUserApiToken } from "@/lib/api";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { ShareConnectionTestRow } from "@/components/dashboard/share-connection-test";
 import {
-  boundProviderIdForShareApp,
   shareEnabledApps,
   SHARE_APP_LABELS,
 } from "@/lib/share-app";
 import type { ShareView, UserApiTokenStatus } from "@/lib/types";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
-
-function shareCodexImageGenerationEnabled(share: ShareView | null) {
-  const providerId = boundProviderIdForShareApp(share, "codex");
-  if (!providerId) return false;
-  return !!share?.appProviders?.codex?.some(
-    (provider) =>
-      provider.id === providerId &&
-      provider.enabled === true &&
-      provider.codexImageGenerationEnabled === true,
-  );
-}
-
-function shareClaudeCursorToolsProbeEnabled(share: ShareView | null) {
-  const providerId = boundProviderIdForShareApp(share, "claude");
-  if (!providerId) return false;
-  return !!share?.appProviders?.claude?.some(
-    (provider) =>
-      provider.id === providerId &&
-      provider.enabled === true &&
-      (provider.providerType === "cursor_oauth" ||
-        provider.providerType === "cursor_apikey"),
-  );
-}
 
 /**
  * P18: 让 dashboard ShareTable 行点击「连接」时打开这个弹窗。
@@ -62,14 +39,6 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   const { session, loading } = useAuth();
   const authenticated = !!session?.authenticated;
   const canViewSecret = !!share?.canViewSecret;
-  const codexImageGenerationEnabled = React.useMemo(
-    () => shareCodexImageGenerationEnabled(share),
-    [share],
-  );
-  const claudeCursorToolsProbeEnabled = React.useMemo(
-    () => shareClaudeCursorToolsProbeEnabled(share),
-    [share],
-  );
 
   const baseUrl = React.useMemo(() => {
     if (!share?.subdomain) return "";
@@ -146,92 +115,67 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
         <Modal.Container placement="center">
-          <Modal.Dialog className="light w-[min(920px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
+          <Modal.Dialog className="light flex max-h-[min(90vh,calc(100vh-1.5rem))] w-[min(640px,calc(100vw-2rem))] max-w-none flex-col overflow-hidden !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-            <Modal.Header>
-              <div>
+            <Modal.Header className="border-0 shadow-none">
+              <div className="pr-8">
                 <Modal.Heading>
                   {t("dashboard.connectDialog.title")}
                 </Modal.Heading>
-                <p className="mt-1 text-sm text-slate-600">
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-600">
+                  <span className="break-all font-medium text-slate-900">
+                    {share.subdomain || share.shareName || share.shareId}
+                  </span>
+                  {shareApps.map((app) => (
+                    <ShareAppLogo key={app} app={app} size={14} />
+                  ))}
+                </div>
+                <p className="mt-1 text-xs text-slate-500">
                   {shareAppLabel
                     ? t("dashboard.connectDialog.appSharedSingle", { app: shareAppLabel })
                     : t("dashboard.connectDialog.appShared")}
                 </p>
               </div>
             </Modal.Header>
-            <Modal.Body className="grid gap-4 !text-slate-900">
-              <BaseUrlRow t={t} baseUrl={baseUrl} />
-              <ApiKeyRow
-                t={t}
-                state={
-                  loading
-                    ? "loading"
-                    : !authenticated
-                      ? "unauth"
-                      : !canViewSecret
-                        ? "forbidden"
-                        : tokenBusy
-                          ? "loading"
-                          : tokenError
-                            ? "error"
-                            : "revealable"
-                }
-                apiKeyDisplay={apiKeyDisplay}
-                apiKeyIsPlaintext={apiKeyIsPlaintext}
-                tokenError={tokenError}
-                requestLogin={requestLogin}
-                requestAccessHref={requestAccessHref}
-              />
-              {/* P18: test rows — always render (disabled states show explanatory text) */}
-              <div className="grid gap-2">
-                <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                  {t("dashboard.connectDialog.test.section")}
-                </span>
+            <Modal.Body className="grid min-h-0 flex-1 gap-5 overflow-y-auto !px-6 !py-5 !text-slate-900">
+              <ConnectSection title={t("dashboard.connectDialog.credentials")}>
+                <BaseUrlRow t={t} baseUrl={baseUrl} />
+                <ApiKeyRow
+                  t={t}
+                  state={
+                    loading
+                      ? "loading"
+                      : !authenticated
+                        ? "unauth"
+                        : !canViewSecret
+                          ? "forbidden"
+                          : tokenBusy
+                            ? "loading"
+                            : tokenError
+                              ? "error"
+                              : "revealable"
+                  }
+                  apiKeyDisplay={apiKeyDisplay}
+                  apiKeyIsPlaintext={apiKeyIsPlaintext}
+                  tokenError={tokenError}
+                  requestLogin={requestLogin}
+                  requestAccessHref={requestAccessHref}
+                />
+              </ConnectSection>
+              <ConnectSection title={t("dashboard.connectDialog.test.section")}>
                 {shareApps.map((app) => (
-                  <React.Fragment key={app}>
-                    <ShareConnectionTestRow
-                      share={share}
-                      app={app}
-                      apiToken={apiTokenPlain}
-                      baseUrl={baseUrl}
-                      canExecute={authenticated && canViewSecret}
-                    />
-                    {app === "codex" ? (
-                      <ShareConnectionTestRow
-                        share={share}
-                        app="codex"
-                        kind="chat"
-                        apiToken={apiTokenPlain}
-                        baseUrl={baseUrl}
-                        canExecute={authenticated && canViewSecret}
-                      />
-                    ) : null}
-                    {app === "codex" && codexImageGenerationEnabled ? (
-                      <ShareConnectionTestRow
-                        share={share}
-                        app="codex"
-                        kind="image"
-                        apiToken={apiTokenPlain}
-                        baseUrl={baseUrl}
-                        canExecute={authenticated && canViewSecret}
-                      />
-                    ) : null}
-                    {app === "claude" && claudeCursorToolsProbeEnabled ? (
-                      <ShareConnectionTestRow
-                        share={share}
-                        app="claude"
-                        kind="tools"
-                        apiToken={apiTokenPlain}
-                        baseUrl={baseUrl}
-                        canExecute={authenticated && canViewSecret}
-                      />
-                    ) : null}
-                  </React.Fragment>
+                  <ShareConnectionTestRow
+                    key={`${share.shareId}:${app}:${share.appRuntimes?.[app]?.modelProbe?.healthFingerprint || "no-probe"}`}
+                    share={share}
+                    app={app}
+                    apiToken={apiTokenPlain}
+                    baseUrl={baseUrl}
+                    canExecute={authenticated && canViewSecret}
+                  />
                 ))}
-              </div>
+              </ConnectSection>
             </Modal.Body>
-            <Modal.Footer>
+            <Modal.Footer className="sticky bottom-0 shrink-0 border-0 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80">
               <Button
                 variant="outline"
                 onClick={() => onOpenChange(false)}
@@ -245,6 +189,21 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   );
 });
 
+function ConnectSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="grid gap-3 rounded-2xl border border-slate-200/80 bg-white p-4">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{title}</h3>
+      {children}
+    </section>
+  );
+}
+
 function BaseUrlRow({
   t,
   baseUrl,
@@ -253,12 +212,12 @@ function BaseUrlRow({
   baseUrl: string;
 }) {
   return (
-    <div className="grid gap-2">
+    <div className="grid gap-1">
       <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
         {t("dashboard.connectDialog.baseUrl")}
       </span>
       <div className="flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-900">
-        <div className="min-w-0 flex-1 break-all font-mono text-xs">
+        <div className="min-w-0 flex-1 break-all font-mono text-xs leading-5">
           {baseUrl || "-"}
         </div>
         <CopyButton value={baseUrl} t={t} />
@@ -292,7 +251,7 @@ function ApiKeyRow({
   requestAccessHref: string | null;
 }) {
   return (
-    <div className="grid gap-2">
+    <div className="grid gap-1">
       <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
         {t("dashboard.connectDialog.apiKey")}
       </span>

@@ -9,6 +9,7 @@ import type {
   ShareEditView,
   ShareConnectionTestRequest,
   ShareConnectionTestResponse,
+  ShareModelHealthCalendar,
   ShareUsageRefreshRequest,
   ShareUsageRefreshResponse,
   ImageGenerationRequestLog,
@@ -814,6 +815,20 @@ export async function testShareConnection(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
     }),
+  );
+}
+
+export async function getShareModelHealthCalendar(
+  shareId: string,
+  days = 365,
+  signal?: AbortSignal,
+): Promise<ShareModelHealthCalendar> {
+  const params = new URLSearchParams({ days: String(days) });
+  return parseJson<ShareModelHealthCalendar>(
+    await authFetch(
+      `/v1/shares/${encodeURIComponent(shareId)}/model-health-calendar?${params}`,
+      { cache: "no-store", signal },
+    ),
   );
 }
 

@@ -99,6 +99,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0025_share_market_completion.sql"),
     ),
     (26, include_str!("../schema/0026_share_market_all_apps.sql")),
+    (
+        27,
+        include_str!("../schema/0027_share_model_health_slots.sql"),
+    ),
+    (
+        28,
+        include_str!("../schema/0028_share_model_health_evidence.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -626,7 +634,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 121);
+        assert_eq!(table_count, 124);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -699,6 +707,8 @@ mod tests {
         assert_eq!(versions[23], (24, migration_checksum(MIGRATIONS[22].1)));
         assert_eq!(versions[24], (25, migration_checksum(MIGRATIONS[23].1)));
         assert_eq!(versions[25], (26, migration_checksum(MIGRATIONS[24].1)));
+        assert_eq!(versions[26], (27, migration_checksum(MIGRATIONS[25].1)));
+        assert_eq!(versions[27], (28, migration_checksum(MIGRATIONS[26].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1027,7 +1037,7 @@ mod tests {
     }
 
     fn install_schema_through(conn: &Connection, version: i64) {
-        assert!((1..=25).contains(&version));
+        assert!((1..=28).contains(&version));
         install_baseline(conn, &migration_checksum(BASELINE_SQL)).expect("install baseline");
         for (migration_version, sql) in MIGRATIONS.iter().copied().take((version - 1) as usize) {
             if migration_version == LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION {
@@ -1049,6 +1059,60 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("record migration {migration_version}: {error}"));
         }
+    }
+
+    #[test]
+    fn migrations_27_and_28_upgrade_a_version_26_database() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 26);
+
+        let before = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                    'share_model_health_slots',
+                    'share_model_probe_observations',
+                    'share_model_probe_epochs'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("inspect version 26 model-health tables");
+        assert_eq!(before, 0);
+
+        apply(&conn).expect("upgrade version 26 through model-health evidence schema");
+        let tables = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                    'share_model_health_slots',
+                    'share_model_probe_observations',
+                    'share_model_probe_epochs'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count model-health tables after upgrade");
+        assert_eq!(tables, 3);
+        let evidence_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('share_model_health_slots')
+                 WHERE name IN (
+                    'observation_id', 'probe_epoch_id', 'outcome', 'failure_domain',
+                    'reason_code', 'evidence_scope', 'evidence_version'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count model-health evidence columns after upgrade");
+        assert_eq!(evidence_columns, 7);
+        let latest_version = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("read upgraded schema version");
+        assert_eq!(latest_version, 28);
+        check_compatibility(&conn).expect("upgraded version 28 is compatible");
     }
 
     #[test]

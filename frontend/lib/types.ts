@@ -821,6 +821,19 @@ export type ShareProviderModelPolicySource =
 export type ShareProviderModelPolicy =
   { mode: "passthrough" } | { mode: "single"; upstreamModel: string };
 
+export type ProviderModelProbe = {
+  apiType: "openai" | "anthropic" | "gemini" | string;
+  requestedModel: string;
+  wireModel: string;
+  method: "POST" | string;
+  path: string;
+  body: Record<string, unknown>;
+  stream: boolean;
+  responseMode: "json" | "anthropic_sse" | "responses_sse" | "gemini_sse" | string;
+  payloadRevision: number;
+  healthFingerprint?: string;
+};
+
 export type ShareUpstreamProvider = {
   providerName?: string;
   kind?: string;
@@ -857,6 +870,7 @@ export type ShareUpstreamProvider = {
   modelPolicyScope?: ShareProviderModelPolicyScope;
   modelPolicySource?: ShareProviderModelPolicySource;
   modelPolicy?: ShareProviderModelPolicy;
+  modelProbe?: ProviderModelProbe;
 };
 
 export type ShareAppProvider = {
@@ -877,6 +891,7 @@ export type ShareAppProvider = {
   modelPolicyScope?: ShareProviderModelPolicyScope;
   modelPolicySource?: ShareProviderModelPolicySource;
   modelPolicy?: ShareProviderModelPolicy;
+  modelProbe?: ProviderModelProbe;
 };
 
 export type ShareAppProviders = {
@@ -1548,7 +1563,6 @@ export type ClientChatVisit = {
 // P18: test-connection types
 export type ShareConnectionTestRequest = {
   app: "claude" | "codex" | "gemini";
-  kind?: "text" | "chat" | "image" | "tools";
   timeoutMs?: number;
 };
 
@@ -1572,9 +1586,51 @@ export type ShareConnectionTestResponse = {
   terminalEvent?: string | null;
   schedulingRecovery?: {
     shareModelHealthDeleted: number;
-    marketModelFailuresDeleted: number;
-    marketRuntimeStatesDeleted: number;
+    gatewayModelFailuresDeleted: number;
+    gatewayRuntimeStatesDeleted: number;
   };
+};
+
+export type ShareModelHealthCalendarDay = {
+  date: string;
+  active: boolean;
+  expectedChecks: number;
+  completedChecks: number;
+  successfulChecks: number;
+  observedChecks: number;
+  upstreamFailureChecks: number;
+  monitoringGapChecks: number;
+  successRate?: number;
+  coverageRate?: number;
+  mixedEpoch: boolean;
+  evidenceVersion: number;
+};
+
+export type ShareModelHealthProbeEpoch = {
+  epochId: string;
+  startsAt: number;
+  endsAt?: number;
+  appType: "claude" | "codex" | "gemini" | string;
+  apiType: "anthropic" | "openai" | "gemini" | string;
+  providerId: string;
+  providerName?: string;
+  requestedModel: string;
+  wireModel: string;
+  policyMode?: "passthrough" | "single" | string;
+  evidenceVersion: number;
+};
+
+export type ShareModelHealthCalendar = {
+  shareId: string;
+  timezone: "UTC" | string;
+  expectedChecksPerFullDay: number;
+  startDate: string;
+  endDate: string;
+  days: ShareModelHealthCalendarDay[];
+  epochs: ShareModelHealthProbeEpoch[];
+  currentProbe?: ShareModelHealthProbeEpoch;
+  sharedProbe: boolean;
+  evidenceVersion: number;
 };
 
 export type ShareUsageRefreshRequest = {
