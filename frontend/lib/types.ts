@@ -2207,6 +2207,7 @@ export type ShareMarketSubscription = {
   installationId: string;
   shareName: string;
   appType: string;
+  apps: string[];
   subdomain?: string;
   shareOnline?: boolean;
   ownerEmail: string;
@@ -2431,15 +2432,19 @@ export type ShareMarketCatalog = {
   trialHours: number;
 };
 
-export type ShareMarketRentService = {
-  schemaVersion: number;
-  requiredApp: string;
-  supportedApps: string[];
+export type ShareMarketRentAppService = {
+  app: string;
   providerFamily: ShareMarketProviderFamily;
   providerType?: string;
   modelMode: "fixed" | "passthrough" | "unknown";
   upstreamModel?: string;
-  models: string[];
+  models?: string[];
+};
+
+export type ShareMarketRentService = {
+  schemaVersion: number;
+  supportedApps: string[];
+  apps: ShareMarketRentAppService[];
   shareParallelLimit?: number;
   shareTokenLimit?: number;
   shareTokensUsed: number;

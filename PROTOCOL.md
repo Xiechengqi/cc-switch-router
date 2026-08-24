@@ -263,7 +263,7 @@ Router **从不改写** Server 返回的 descriptor,只做校验(`store::apply_s
 |---|---|
 | `patch.managedGrant.action` | `upsert` 授予拼车位 / `revoke` 回收 |
 | `patch.managedGrant.entitlementId` | 稳定 entitlement ID,与订阅绑定 |
-| `patch.managedGrant.policy` | 拼车位并行/Token 限制与周期(upsert 必填) |
+| `patch.managedGrant.policy` | 拼车位并行/Token 限制、周期及显式 `allowedApps`(upsert 必填) |
 | Server 落库 `userGrants[].manager` | 固定为 `routerShareMarket` |
 
 Server 要求:
@@ -272,6 +272,8 @@ Server 要求:
 2. pending-edit 应用路径接受 managed grant,写入/移除 `routerShareMarket` grant。
 3. 普通用户编辑不得修改或删除 `manager=routerShareMarket` 的 grant。
 4. edit-ack(`POST /v1/shares/edit-ack`)成功后,Router 将订阅从 `grant_pending` 推进到 `active_free` 或 `active_postpaid`,或完成 revoke 后释放座位。
+
+一个拼车位授权整个 Share,不出售单一 App。报价会冻结当时全部已启用 App 的供应商与模型条款(`service.apps[]`),租客不能再通过 `requiredApp` 收窄授权；该旧请求字段仅作为兼容输入保留并被忽略。Router-managed grant 对三个核心 App 显式下发 `allowedApps=[claude,codex,gemini]`,Server 再以目标 App 当前是否已绑定且启用作为实际可调用边界，因此 Share 后续启用的核心 App 无需重建租约即可使用。升级前的单 App 活跃 grant 通过幂等 upsert 原地扩权,不 revoke、不暂停服务或账单；迁移时已经在途的 v1 初次授权或恢复授权可完成一次旧范围确认，但不会标记为扩权完成，下一轮立即原地扩权。v2 租约不接受该兼容行为。
 
 用户“已消耗 Token / 周期起点”重基线只由 Server Provider 编辑入口提交 `userUsageEdits`；Router Share Market grant 仍只读。重基线变化会带来新的 descriptor generation，普通请求 usage 计数不会触发同步风暴。
 
@@ -285,6 +287,7 @@ Server 要求:
 | `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选(`alreadyListed`、`subdomain`、`ownerEmail`、`supportedApps`) |
 | `POST` | `/v1/share-market/listings/:id/seats` | 添加拼车位(可 reopen closed listing) |
 | `PATCH`/`DELETE` | `/v1/share-market/seats/:id` | 编辑/删除空闲座位 |
+| `POST` | `/v1/share-market/seats/:id/quote` | 冻结车位及 Share 全部已启用 App 的服务条款 |
 | `POST` | `/v1/share-market/seats/:id/rent` | 租用 |
 | `POST` | `/v1/share-market/subscriptions/:id/release` | 租客归还 |
 | `POST` | `/v1/share-market/subscriptions/:id/force-revoke` | Owner 强制回收,可同时拒绝该买家后续 Share 租用 |

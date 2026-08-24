@@ -53,6 +53,7 @@ const SHARE_RUNTIME_FRESHNESS_SECS: i64 = 15 * 60;
 const SHARE_MODEL_HEALTH_FRESHNESS_SECS: i64 = 20 * 60;
 const SHARE_ROUTE_HEALTH_FRESHNESS_SECS: i64 = 90;
 const SHARE_NEAR_EXPIRY_DAYS: i64 = 7;
+const MARKET_ALLOWED_APPS: [&str; 3] = ["claude", "codex", "gemini"];
 pub(crate) const SHARE_MARKET_CONTROL_ACTOR_EMAIL: &str = "share-market@router.internal";
 pub(crate) const SHARE_REVISION_CONFLICT_CODE: &str = "cc_switch_share_revision_conflict";
 const SHARE_GRANT_CONTRACT_VIOLATION_CODE: &str = "share_market_grant_contract_violation";
@@ -338,6 +339,7 @@ pub struct SubscriptionView {
     pub installation_id: String,
     pub share_name: String,
     pub app_type: String,
+    pub apps: Vec<String>,
     pub subdomain: String,
     pub share_online: bool,
     pub owner_email: String,
@@ -481,10 +483,34 @@ pub struct QuoteSeatRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct RentAppServiceSnapshot {
+    pub app: String,
+    pub provider_family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_binding_fingerprint: Option<String>,
+    pub model_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct RentServiceSnapshot {
     pub schema_version: u32,
+    /// Compatibility-only primary App for v1 consumers. It never narrows the
+    /// Share-wide market entitlement in schema v2.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub required_app: String,
+    #[serde(default)]
     pub supported_apps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<RentAppServiceSnapshot>,
+    /// Compatibility projection of the primary App's service fields.
+    #[serde(default)]
     pub provider_family: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
@@ -492,6 +518,7 @@ pub struct RentServiceSnapshot {
     /// persisted in the quote but removed from the public response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_binding_fingerprint: Option<String>,
+    #[serde(default)]
     pub model_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
@@ -891,7 +918,8 @@ pub(crate) fn validate_market_protected_share_patch_tx(
 ) -> Result<(), AppError> {
     let rows = conn
         .prepare(
-            "SELECT required_app, service_snapshot_json, parallel_limit, expires_at
+            "SELECT required_app, contract_apps_json, service_snapshot_json,
+                    parallel_limit, expires_at
              FROM share_market_subscriptions
              WHERE share_id = ?1 AND status NOT IN ('released', 'grant_failed')",
         )
@@ -901,8 +929,9 @@ pub(crate) fn validate_market_protected_share_patch_tx(
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()
@@ -911,20 +940,37 @@ pub(crate) fn validate_market_protected_share_patch_tx(
     if rows.is_empty() {
         return Ok(());
     }
-    let protected = |field: &str, reason: &str| {
+    let protected = |field: &str, reason: &str, app: Option<&str>| {
         AppError::coded_conflict(
             "share_market_contract_settings_protected",
             "this Share setting is protected by an active rental contract",
-            serde_json::json!({ "field": field, "reason": reason }),
+            serde_json::json!({ "field": field, "reason": reason, "app": app }),
         )
     };
-    for (required_app, snapshot_json, seat_parallel_limit, subscription_expires_at) in rows {
+    for (
+        required_app,
+        contract_apps_json,
+        snapshot_json,
+        seat_parallel_limit,
+        subscription_expires_at,
+    ) in rows
+    {
         let snapshot = serde_json::from_str::<RentServiceSnapshot>(&snapshot_json).ok();
-        if let (Some(support), Some(required_app)) =
-            (patch.support.as_ref(), required_app.as_deref())
-            && !share_supports_app(support, required_app)
+        let mut contract_apps = serde_json::from_str::<Vec<String>>(&contract_apps_json)
+            .map(canonical_market_apps)
+            .unwrap_or_default();
+        if contract_apps.is_empty()
+            && let Some(required_app) =
+                required_app.filter(|app| MARKET_ALLOWED_APPS.contains(&app.as_str()))
         {
-            return Err(protected("support", "required_app_in_use"));
+            contract_apps.push(required_app);
+        }
+        if let Some(support) = patch.support.as_ref()
+            && let Some(app) = contract_apps
+                .iter()
+                .find(|app| !share_supports_app(support, app))
+        {
+            return Err(protected("support", "contract_app_in_use", Some(app)));
         }
         if let Some(next_parallel_limit) = patch.parallel_limit
             && next_parallel_limit >= 0
@@ -934,7 +980,11 @@ pub(crate) fn validate_market_protected_share_patch_tx(
                 .and_then(|snapshot| snapshot.share_parallel_limit.map(i64::from))
                 .or(seat_parallel_limit);
             if required_parallel_limit.is_none_or(|required| next_parallel_limit < required) {
-                return Err(protected("parallelLimit", "contract_capacity_reduction"));
+                return Err(protected(
+                    "parallelLimit",
+                    "contract_capacity_reduction",
+                    None,
+                ));
             }
         }
         if let Some(next_token_limit) = patch.token_limit
@@ -945,7 +995,7 @@ pub(crate) fn validate_market_protected_share_patch_tx(
                 .and_then(|snapshot| snapshot.share_token_limit)
                 .and_then(|value| i64::try_from(value).ok());
             if required_token_limit.is_none_or(|required| next_token_limit < required) {
-                return Err(protected("tokenLimit", "contract_capacity_reduction"));
+                return Err(protected("tokenLimit", "contract_capacity_reduction", None));
             }
         }
         if let Some(next_expires_at) = patch.expires_at.as_deref() {
@@ -957,10 +1007,10 @@ pub(crate) fn validate_market_protected_share_patch_tx(
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc))
             else {
-                return Err(protected("expiresAt", "permanent_contract_in_use"));
+                return Err(protected("expiresAt", "permanent_contract_in_use", None));
             };
             if next_expires_at < contract_expires_at {
-                return Err(protected("expiresAt", "fixed_term_not_covered"));
+                return Err(protected("expiresAt", "fixed_term_not_covered", None));
             }
         }
     }
@@ -992,6 +1042,25 @@ fn token_period_anchor_at_ms(period: ShareTokenPeriod, now: DateTime<Utc>) -> Op
         ShareTokenPeriod::SevenDays | ShareTokenPeriod::ThirtyDays
     )
     .then(|| now.timestamp_millis().div_euclid(60_000) * 60_000)
+}
+
+fn market_allowed_apps() -> Vec<String> {
+    MARKET_ALLOWED_APPS
+        .iter()
+        .map(|app| (*app).to_string())
+        .collect()
+}
+
+fn canonical_market_apps(apps: impl IntoIterator<Item = String>) -> Vec<String> {
+    let apps = apps
+        .into_iter()
+        .map(|app| app.trim().to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    MARKET_ALLOWED_APPS
+        .iter()
+        .filter(|app| apps.contains(**app))
+        .map(|app| (*app).to_string())
+        .collect()
 }
 
 fn supported_share_apps(bindings_json: &str, fallback_app: &str) -> Vec<String> {
@@ -1280,10 +1349,26 @@ fn confirmed_model_unavailable_tx(
 
     let relevant_models = service
         .map(|service| {
-            service
-                .upstream_model
-                .iter()
-                .chain(service.models.iter())
+            let app_service = service.apps.iter().find(|item| item.app == required_app);
+            let upstream_model = app_service
+                .and_then(|item| item.upstream_model.as_ref())
+                .or_else(|| {
+                    (service.required_app == required_app)
+                        .then_some(service.upstream_model.as_ref())
+                        .flatten()
+                });
+            let models = app_service
+                .map(|item| item.models.as_slice())
+                .unwrap_or_else(|| {
+                    if service.required_app == required_app {
+                        service.models.as_slice()
+                    } else {
+                        &[]
+                    }
+                });
+            upstream_model
+                .into_iter()
+                .chain(models.iter())
                 .map(|value| value.trim().to_ascii_lowercase())
                 .filter(|value| !value.is_empty())
                 .collect::<HashSet<_>>()
@@ -1451,7 +1536,7 @@ fn evaluate_share_market_service_availability_tx(
     })
 }
 
-fn availability_error(availability: &ShareMarketServiceAvailability) -> AppError {
+fn availability_error(app: &str, availability: &ShareMarketServiceAvailability) -> AppError {
     let reason = availability
         .blocking_reason
         .as_deref()
@@ -1471,6 +1556,7 @@ fn availability_error(availability: &ShareMarketServiceAvailability) -> AppError
         "the selected Share service is currently unavailable",
         serde_json::json!({
             "reason": reason,
+            "app": app,
             "serviceState": availability.state,
             "serviceReasons": availability.reasons,
         }),
@@ -1617,13 +1703,13 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
             .map(parse_time)
             .transpose()?
             .map(|value| value.timestamp_millis()),
-        allowed_apps: vec![record.app_type.clone()],
+        allowed_apps: market_allowed_apps(),
     })
 }
 
 fn active_grant_has_contract_scope(grants_json: Option<&str>, record: &SubscriptionRecord) -> bool {
     active_entitlement_grant(grants_json, &record.entitlement_id)
-        .is_some_and(|grant| grant.policy.allowed_apps == [record.app_type.clone()])
+        .is_some_and(|grant| grant.policy.allowed_apps == market_allowed_apps())
 }
 
 fn subscription_integrity_violations_tx(
@@ -1641,8 +1727,9 @@ fn subscription_integrity_violations_tx(
     if share.contract_version < i64::from(SHARE_CONTRACT_VERSION) {
         push_reason(&mut violations, "share_contract_upgrade_required");
     }
-    if !share_supports_app(&share.support, &record.app_type) {
-        push_reason(&mut violations, "required_app_disabled");
+    let contract_apps = subscription_contract_apps(record);
+    if contract_apps.is_empty() {
+        push_reason(&mut violations, "contract_apps_missing");
     }
     if share.parallel_limit >= 0
         && record
@@ -1658,41 +1745,23 @@ fn subscription_integrity_violations_tx(
         if share_expires_at.is_none_or(|expires_at| expires_at < service_ends_at) {
             push_reason(&mut violations, "fixed_term_not_covered");
         }
-        if required_app_upstream_expiry(&share, &record.app_type)
-            .is_some_and(|expires_at| expires_at < service_ends_at)
-        {
-            push_reason(&mut violations, "upstream_fixed_term_not_covered");
+        for app in &contract_apps {
+            if required_app_upstream_expiry(&share, app)
+                .is_some_and(|expires_at| expires_at < service_ends_at)
+            {
+                push_reason(&mut violations, "upstream_fixed_term_not_covered");
+            }
         }
     }
 
     let bindings =
         serde_json::from_str::<BTreeMap<String, String>>(&share.bindings_json).unwrap_or_default();
-    let binding_id = bindings
-        .get(&record.app_type)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty());
-    if binding_id.is_none() {
-        push_reason(&mut violations, "binding_missing");
-    }
     let providers = share
         .app_providers_json
         .as_deref()
         .and_then(|value| serde_json::from_str::<crate::models::ShareAppProviders>(value).ok())
         .unwrap_or_default();
-    if let Some(binding_id) = binding_id {
-        let candidates = app_provider_candidates(&providers, &record.app_type);
-        if !candidates.is_empty() {
-            match candidates.iter().find(|provider| provider.id == binding_id) {
-                Some(provider) if !provider.enabled => {
-                    push_reason(&mut violations, "provider_disabled")
-                }
-                None => push_reason(&mut violations, "binding_unresolved"),
-                _ => {}
-            }
-        }
-    }
-
-    if let Ok(snapshot) = serde_json::from_str::<RentServiceSnapshot>(
+    let snapshot = serde_json::from_str::<RentServiceSnapshot>(
         &conn
             .query_row(
                 "SELECT service_snapshot_json FROM share_market_subscriptions WHERE id = ?1",
@@ -1700,41 +1769,93 @@ fn subscription_integrity_violations_tx(
                 |row| row.get::<_, String>(0),
             )
             .map_err(map_db("read immutable Share service snapshot"))?,
-    ) && snapshot.schema_version >= 1
-    {
-        let capabilities = enabled_public_app_capabilities(
-            &share.bindings_json,
-            share.app_runtimes_json.as_deref(),
-            share.app_providers_json.as_deref(),
-            &share.app_type,
-            &share.support,
-        );
+    )
+    .ok();
+    let capabilities = enabled_public_app_capabilities(
+        &share.bindings_json,
+        share.app_runtimes_json.as_deref(),
+        share.app_providers_json.as_deref(),
+        &share.app_type,
+        &share.support,
+    );
+    if snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.schema_version >= 2
+            && canonical_market_apps(snapshot.supported_apps.clone()) != contract_apps
+    }) {
+        push_reason(&mut violations, "contract_apps_changed");
+    }
+    for app in &contract_apps {
+        if !share_supports_app(&share.support, app) {
+            push_reason(&mut violations, "required_app_disabled");
+        }
+        let binding_id = bindings
+            .get(app)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        if binding_id.is_none() {
+            push_reason(&mut violations, "binding_missing");
+        }
+        if let Some(binding_id) = binding_id {
+            let candidates = app_provider_candidates(&providers, app);
+            if !candidates.is_empty() {
+                match candidates.iter().find(|provider| provider.id == binding_id) {
+                    Some(provider) if !provider.enabled => {
+                        push_reason(&mut violations, "provider_disabled")
+                    }
+                    None => push_reason(&mut violations, "binding_unresolved"),
+                    _ => {}
+                }
+            }
+        }
         let capability = capabilities
             .iter()
-            .find(|capability| capability.app == record.app_type);
+            .find(|capability| capability.app == *app);
         let current_binding_fingerprint = binding_id.map(|binding_id| {
             crate::api::sha256_hex(
-                format!(
-                    "share-market-provider-binding-v1\n{}\n{binding_id}",
-                    record.app_type
-                )
-                .as_bytes(),
+                format!("share-market-provider-binding-v1\n{app}\n{binding_id}").as_bytes(),
             )
         });
-        if snapshot.required_app != record.app_type
-            || snapshot.provider_binding_fingerprint != current_binding_fingerprint
+        let expected = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.apps.iter().find(|service| service.app == *app));
+        if let Some(expected) = expected {
+            if expected.provider_binding_fingerprint != current_binding_fingerprint {
+                push_reason(&mut violations, "provider_binding_changed");
+            }
+            match capability {
+                Some(capability)
+                    if expected.provider_family == capability.provider_family
+                        && expected.provider_type == capability.provider_type
+                        && expected.model_mode == capability.model_mode
+                        && expected.upstream_model == capability.upstream_model
+                        && expected.models == capability.models => {}
+                Some(_) => push_reason(&mut violations, "provider_model_changed"),
+                None => push_reason(&mut violations, "required_app_unavailable"),
+            }
+        } else if let Some(snapshot) = snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.schema_version == 1 && snapshot.required_app == *app)
         {
-            push_reason(&mut violations, "provider_binding_changed");
-        }
-        match capability {
-            Some(capability)
-                if snapshot.provider_family == capability.provider_family
-                    && snapshot.provider_type == capability.provider_type
-                    && snapshot.model_mode == capability.model_mode
-                    && snapshot.upstream_model == capability.upstream_model
-                    && snapshot.models == capability.models => {}
-            Some(_) => push_reason(&mut violations, "provider_model_changed"),
-            None => push_reason(&mut violations, "required_app_unavailable"),
+            if snapshot.provider_binding_fingerprint != current_binding_fingerprint {
+                push_reason(&mut violations, "provider_binding_changed");
+            }
+            match capability {
+                Some(capability)
+                    if snapshot.provider_family == capability.provider_family
+                        && snapshot.provider_type == capability.provider_type
+                        && snapshot.model_mode == capability.model_mode
+                        && snapshot.upstream_model == capability.upstream_model
+                        && snapshot.models == capability.models => {}
+                Some(_) => push_reason(&mut violations, "provider_model_changed"),
+                None => push_reason(&mut violations, "required_app_unavailable"),
+            }
+        } else if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.schema_version >= 2)
+        {
+            push_reason(&mut violations, "contract_apps_changed");
+        } else if capability.is_none() {
+            push_reason(&mut violations, "required_app_unavailable");
         }
     }
 
@@ -1831,6 +1952,51 @@ fn begin_subscription_integrity_remediation_tx(
     Ok(())
 }
 
+fn is_pending_all_app_scope_upgrade(record: &SubscriptionRecord, violations: &[String]) -> bool {
+    record.integrity_state == "compatible"
+        && record.app_scope_enforced_at.is_none()
+        && matches!(
+            record.status.as_str(),
+            SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+        )
+        && violations == ["app_scope_not_enforced"]
+}
+
+fn enqueue_non_disruptive_app_scope_upgrade_tx(
+    conn: &Connection,
+    record: &SubscriptionRecord,
+    now: &str,
+) -> Result<(), AppError> {
+    let policy = contract_policy(record)?;
+    let operation_id = enqueue_control_operation_tx(
+        conn,
+        &record.share_id,
+        &record.id,
+        &record.entitlement_id,
+        "upsert",
+        &record.renter_email,
+        Some(&policy),
+        now,
+    )?;
+    let policy_json = serde_json::to_string(&policy)
+        .map_err(|error| AppError::Internal(format!("encode all-App grant failed: {error}")))?;
+    conn.execute(
+        "UPDATE share_control_operations
+         SET policy_json = ?2, updated_at = ?3
+         WHERE id = ?1 AND status = 'pending'",
+        params![operation_id, policy_json, now],
+    )
+    .map_err(map_db("refresh pending all-App grant"))?;
+    conn.execute(
+        "UPDATE share_market_subscriptions
+         SET integrity_checked_at = ?2, updated_at = ?2
+         WHERE id = ?1 AND integrity_state = 'compatible'",
+        params![record.id, now],
+    )
+    .map_err(map_db("record all-App grant upgrade attempt"))?;
+    Ok(())
+}
+
 pub(crate) fn reconcile_share_contract_integrity_tx(
     conn: &Connection,
     share_id: &str,
@@ -1852,6 +2018,10 @@ pub(crate) fn reconcile_share_contract_integrity_tx(
             continue;
         };
         let violations = subscription_integrity_violations_tx(conn, &record, now_dt)?;
+        if is_pending_all_app_scope_upgrade(&record, &violations) {
+            enqueue_non_disruptive_app_scope_upgrade_tx(conn, &record, &now_dt.to_rfc3339())?;
+            continue;
+        }
         begin_subscription_integrity_remediation_tx(conn, &record, &violations, now_dt)?;
     }
     Ok(())
@@ -1863,6 +2033,10 @@ fn reconcile_subscription_integrity_tx(
     now_dt: DateTime<Utc>,
 ) -> Result<bool, AppError> {
     let violations = subscription_integrity_violations_tx(conn, record, now_dt)?;
+    if is_pending_all_app_scope_upgrade(record, &violations) {
+        enqueue_non_disruptive_app_scope_upgrade_tx(conn, record, &now_dt.to_rfc3339())?;
+        return Ok(true);
+    }
     if record.integrity_state == "terminated" {
         return Ok(true);
     }
@@ -2078,7 +2252,8 @@ pub(crate) fn share_market_billing_observation_tx(
 ) -> Result<Option<(i64, String, String)>, AppError> {
     let subscription = conn
         .query_row(
-            "SELECT share_id, required_app, service_snapshot_json, integrity_state
+            "SELECT share_id, required_app, contract_apps_json,
+                    service_snapshot_json, integrity_state
              FROM share_market_subscriptions
              WHERE id = ?1 AND status = 'active_postpaid'",
             params![subscription_id],
@@ -2088,17 +2263,27 @@ pub(crate) fn share_market_billing_observation_tx(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(map_db("read billable Share Market subscription"))?;
-    let Some((share_id, required_app, snapshot_json, integrity_state)) = subscription else {
+    let Some((share_id, required_app, contract_apps_json, snapshot_json, integrity_state)) =
+        subscription
+    else {
         return Ok(None);
     };
-    let Some(required_app) =
-        required_app.filter(|app| matches!(app.as_str(), "claude" | "codex" | "gemini"))
-    else {
+    let mut contract_apps = serde_json::from_str::<Vec<String>>(&contract_apps_json)
+        .map(canonical_market_apps)
+        .unwrap_or_default();
+    if contract_apps.is_empty()
+        && let Some(required_app) =
+            required_app.filter(|app| MARKET_ALLOWED_APPS.contains(&app.as_str()))
+    {
+        contract_apps.push(required_app);
+    }
+    if contract_apps.is_empty() {
         // Legacy contracts predate App-scoped availability and retain the old,
         // route-only conservative billing behavior until they naturally end.
         return conn
@@ -2128,31 +2313,43 @@ pub(crate) fn share_market_billing_observation_tx(
                 <= SHARE_ROUTE_HEALTH_FRESHNESS_SECS
     });
     let service = serde_json::from_str::<RentServiceSnapshot>(&snapshot_json).ok();
-    let availability = evaluate_share_market_service_availability_tx(
-        conn,
-        &share_id,
-        &required_app,
-        Some(route_online),
-        Some(&integrity_state),
-        service.as_ref(),
-        observed_at,
-    )?;
-    let reason = availability
-        .blocking_reason
-        .clone()
-        .or_else(|| availability.reasons.first().cloned())
-        .unwrap_or_else(|| "share_market_service_available".into());
-    let status = if availability.available() {
-        "healthy"
-    } else if matches!(
-        availability.blocking_reason.as_deref(),
-        Some("runtime_stale" | "share_offline")
-    ) {
-        "unknown"
-    } else {
-        "unhealthy"
-    };
-    Ok(Some((observed_at.timestamp(), status.into(), reason)))
+    let mut combined_status = "healthy";
+    let mut combined_reason = "share_market_service_available".to_string();
+    for app in contract_apps {
+        let availability = evaluate_share_market_service_availability_tx(
+            conn,
+            &share_id,
+            &app,
+            Some(route_online),
+            Some(&integrity_state),
+            service.as_ref(),
+            observed_at,
+        )?;
+        let reason = availability
+            .blocking_reason
+            .clone()
+            .or_else(|| availability.reasons.first().cloned())
+            .unwrap_or_else(|| "share_market_service_available".into());
+        if !availability.available()
+            && !matches!(
+                availability.blocking_reason.as_deref(),
+                Some("runtime_stale" | "share_offline")
+            )
+        {
+            combined_status = "unhealthy";
+            combined_reason = reason;
+            break;
+        }
+        if !availability.available() && combined_status == "healthy" {
+            combined_status = "unknown";
+            combined_reason = reason;
+        }
+    }
+    Ok(Some((
+        observed_at.timestamp(),
+        combined_status.into(),
+        combined_reason,
+    )))
 }
 
 fn first_nonempty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
@@ -2250,7 +2447,6 @@ fn public_provider_health_state(
 
 #[allow(clippy::too_many_arguments)]
 fn build_rent_service_snapshot(
-    required_app: Option<&str>,
     bindings_json: &str,
     app_runtimes_json: Option<&str>,
     app_providers_json: Option<&str>,
@@ -2267,84 +2463,78 @@ fn build_rent_service_snapshot(
         fallback_app,
         support,
     );
-    let supported_apps = capabilities
-        .iter()
-        .map(|capability| capability.app.clone())
-        .collect::<Vec<_>>();
-    let required_app = required_app
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .or_else(|| (supported_apps.len() == 1).then(|| supported_apps[0].clone()))
-        .ok_or_else(|| {
-            AppError::coded_conflict(
-                "share_market_required_app",
-                "choose which supported app this rental must provide",
-                serde_json::json!({
-                    "reason": "required_app_missing",
-                    "supportedApps": supported_apps,
-                }),
-            )
-        })?;
-    let binding_id = serde_json::from_str::<BTreeMap<String, String>>(bindings_json)
-        .ok()
-        .and_then(|bindings| bindings.get(&required_app).cloned())
-        .map(|binding| binding.trim().to_string())
-        .filter(|binding| !binding.is_empty());
-    let binding_missing = binding_id.is_none();
-    let hard_failure = if binding_missing {
-        Some("binding_missing")
-    } else {
-        required_app_hard_failure(
-            &required_app,
-            bindings_json,
-            app_runtimes_json,
-            app_providers_json,
-        )
-    };
-    if let Some(reason) = hard_failure {
+    if capabilities.is_empty() {
         return Err(AppError::coded_conflict(
             "share_market_required_app_unavailable",
-            "the selected app currently has a hard availability failure",
+            "the Share has no enabled App API to include in this seat",
             serde_json::json!({
-                "reason": reason,
-                "requiredApp": required_app,
+                "reason": "enabled_apps_missing",
+                "supportedApps": [],
             }),
         ));
     }
-    if !matches!(required_app.as_str(), "claude" | "codex" | "gemini") {
-        return Err(AppError::BadRequest(
-            "requiredApp must be claude, codex, or gemini".into(),
-        ));
-    }
-    let capability = capabilities
-        .into_iter()
-        .find(|capability| capability.app == required_app)
-        .ok_or_else(|| {
+    let bindings =
+        serde_json::from_str::<BTreeMap<String, String>>(bindings_json).map_err(|_| {
             AppError::coded_conflict(
                 "share_market_required_app_unavailable",
-                "the Share no longer supports the selected app",
-                serde_json::json!({
-                    "reason": "required_app_unavailable",
-                    "requiredApp": required_app,
-                    "supportedApps": supported_apps,
-                }),
+                "the Share App bindings are invalid",
+                serde_json::json!({ "reason": "binding_unresolved" }),
             )
         })?;
-    let provider_binding_fingerprint = binding_id.map(|binding_id| {
-        crate::api::sha256_hex(
-            format!("share-market-provider-binding-v1\n{required_app}\n{binding_id}").as_bytes(),
-        )
-    });
+    let mut apps = Vec::with_capacity(capabilities.len());
+    for capability in capabilities {
+        let app = capability.app.clone();
+        if let Some(reason) =
+            required_app_hard_failure(&app, bindings_json, app_runtimes_json, app_providers_json)
+        {
+            return Err(AppError::coded_conflict(
+                "share_market_required_app_unavailable",
+                "an enabled Share App currently has a hard availability failure",
+                serde_json::json!({
+                    "reason": reason,
+                    "app": app,
+                }),
+            ));
+        }
+        let binding_id = bindings
+            .get(&app)
+            .map(|binding| binding.trim())
+            .filter(|binding| !binding.is_empty())
+            .ok_or_else(|| {
+                AppError::coded_conflict(
+                    "share_market_required_app_unavailable",
+                    "an enabled Share App has no Provider binding",
+                    serde_json::json!({ "reason": "binding_missing", "app": app }),
+                )
+            })?;
+        apps.push(RentAppServiceSnapshot {
+            app: app.clone(),
+            provider_family: capability.provider_family,
+            provider_type: capability.provider_type,
+            provider_binding_fingerprint: Some(crate::api::sha256_hex(
+                format!("share-market-provider-binding-v1\n{app}\n{binding_id}").as_bytes(),
+            )),
+            model_mode: capability.model_mode,
+            upstream_model: capability.upstream_model,
+            models: capability.models,
+        });
+    }
+    let supported_apps = apps.iter().map(|app| app.app.clone()).collect::<Vec<_>>();
+    let primary = apps
+        .first()
+        .cloned()
+        .ok_or_else(|| AppError::Internal("Share App bundle is unexpectedly empty".into()))?;
     Ok(RentServiceSnapshot {
-        schema_version: 1,
-        required_app,
+        schema_version: 2,
+        required_app: primary.app,
         supported_apps,
-        provider_family: capability.provider_family,
-        provider_type: capability.provider_type,
-        provider_binding_fingerprint,
-        model_mode: capability.model_mode,
-        upstream_model: capability.upstream_model,
-        models: capability.models,
+        apps,
+        provider_family: primary.provider_family,
+        provider_type: primary.provider_type,
+        provider_binding_fingerprint: primary.provider_binding_fingerprint,
+        model_mode: primary.model_mode,
+        upstream_model: primary.upstream_model,
+        models: primary.models,
         share_parallel_limit: (share_parallel_limit >= 0)
             .then(|| u32::try_from(share_parallel_limit).ok())
             .flatten(),
@@ -2359,16 +2549,23 @@ fn validate_service_snapshot_unchanged(
     quoted: &RentServiceSnapshot,
     current: &RentServiceSnapshot,
 ) -> Result<(), AppError> {
-    let unchanged = quoted.required_app == current.required_app
-        && current.supported_apps.contains(&quoted.required_app)
-        && quoted.provider_family == current.provider_family
-        && quoted.provider_type == current.provider_type
-        && quoted.provider_binding_fingerprint == current.provider_binding_fingerprint
-        && quoted.model_mode == current.model_mode
-        && quoted.upstream_model == current.upstream_model
-        && quoted.models == current.models
-        && quoted.share_parallel_limit == current.share_parallel_limit
-        && quoted.share_token_limit == current.share_token_limit;
+    let unchanged = if quoted.schema_version >= 2 {
+        quoted.supported_apps == current.supported_apps
+            && quoted.apps == current.apps
+            && quoted.share_parallel_limit == current.share_parallel_limit
+            && quoted.share_token_limit == current.share_token_limit
+    } else {
+        quoted.required_app == current.required_app
+            && current.supported_apps.contains(&quoted.required_app)
+            && quoted.provider_family == current.provider_family
+            && quoted.provider_type == current.provider_type
+            && quoted.provider_binding_fingerprint == current.provider_binding_fingerprint
+            && quoted.model_mode == current.model_mode
+            && quoted.upstream_model == current.upstream_model
+            && quoted.models == current.models
+            && quoted.share_parallel_limit == current.share_parallel_limit
+            && quoted.share_token_limit == current.share_token_limit
+    };
     if unchanged {
         return Ok(());
     }
@@ -2377,7 +2574,7 @@ fn validate_service_snapshot_unchanged(
         "the Share service contract changed; request a new quote",
         serde_json::json!({
             "reason": "service_changed",
-            "requiredApp": quoted.required_app,
+            "supportedApps": quoted.supported_apps,
         }),
     ))
 }
@@ -3503,6 +3700,7 @@ struct SubscriptionRecord {
     integrity_state: String,
     integrity_reason: Option<String>,
     integrity_violated_at: Option<String>,
+    app_scope_enforced_at: Option<String>,
     seat_position: i64,
     parallel_limit: Option<i64>,
     token_limit: Option<i64>,
@@ -3523,6 +3721,19 @@ struct SubscriptionRecord {
     released_at: Option<String>,
     created_at: String,
     updated_at: String,
+    contract_apps_json: String,
+    service_schema_version: u32,
+}
+
+fn subscription_contract_apps(record: &SubscriptionRecord) -> Vec<String> {
+    let apps = serde_json::from_str::<Vec<String>>(&record.contract_apps_json)
+        .map(canonical_market_apps)
+        .unwrap_or_default();
+    if apps.is_empty() && MARKET_ALLOWED_APPS.contains(&record.app_type.as_str()) {
+        vec![record.app_type.clone()]
+    } else {
+        apps
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3623,7 +3834,11 @@ fn subscription_record(
                         ELSE NULL END
                  ) FROM market_contract_adjustments adjustment
                  WHERE adjustment.product_kind = 'share' AND adjustment.product_ref = sub.id
-                 ORDER BY adjustment.created_at DESC LIMIT 1)
+                 ORDER BY adjustment.created_at DESC LIMIT 1),
+                sub.contract_apps_json, sub.app_scope_enforced_at,
+                COALESCE(CASE WHEN json_valid(sub.service_snapshot_json)
+                    THEN CAST(json_extract(sub.service_snapshot_json, '$.schemaVersion') AS INTEGER)
+                    END, 0)
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -3669,6 +3884,9 @@ fn subscription_record(
                 token_period_json: row.get(34)?,
                 service_started_at: row.get(35)?,
                 termination_adjustment_json: row.get(36)?,
+                contract_apps_json: row.get(37)?,
+                app_scope_enforced_at: row.get(38)?,
+                service_schema_version: row.get::<_, i64>(39)?.try_into().unwrap_or_default(),
             })
         },
     )
@@ -3813,7 +4031,11 @@ fn catalog_subscription_records(
                         ELSE NULL END
                  ) FROM market_contract_adjustments adjustment
                  WHERE adjustment.product_kind = 'share' AND adjustment.product_ref = sub.id
-                 ORDER BY adjustment.created_at DESC LIMIT 1)
+                 ORDER BY adjustment.created_at DESC LIMIT 1),
+                sub.contract_apps_json, sub.app_scope_enforced_at,
+                COALESCE(CASE WHEN json_valid(sub.service_snapshot_json)
+                    THEN CAST(json_extract(sub.service_snapshot_json, '$.schemaVersion') AS INTEGER)
+                    END, 0)
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -3862,6 +4084,12 @@ fn catalog_subscription_records(
                         token_period_json: row.get(34)?,
                         service_started_at: row.get(35)?,
                         termination_adjustment_json: row.get(36)?,
+                        contract_apps_json: row.get(37)?,
+                        app_scope_enforced_at: row.get(38)?,
+                        service_schema_version: row
+                            .get::<_, i64>(39)?
+                            .try_into()
+                            .unwrap_or_default(),
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -4546,6 +4774,7 @@ fn subscription_view(
         && price_change.is_none();
     let share_online =
         !record.subdomain.is_empty() && active_subdomains.contains(&record.subdomain);
+    let apps = subscription_contract_apps(&record);
     let contract_violation = record.failure_code.as_deref()
         == Some(SHARE_GRANT_CONTRACT_VIOLATION_CODE)
         || record.release_reason.as_deref() == Some(SHARE_GRANT_CONTRACT_VIOLATION_CODE);
@@ -4575,6 +4804,7 @@ fn subscription_view(
         installation_id: record.installation_id,
         share_name: record.share_name,
         app_type: record.app_type,
+        apps,
         subdomain: record.subdomain,
         share_online,
         owner_email: record.owner_email,
@@ -4957,13 +5187,13 @@ impl AppStore {
                     Utc::now(),
                 )?);
             }
-            let service_available = app_availability
-                .iter()
-                .any(ShareMarketServiceAvailability::available);
+            let service_available = !app_availability.is_empty()
+                && app_availability
+                    .iter()
+                    .all(ShareMarketServiceAvailability::available);
             let service_state = if service_available {
                 if app_availability
                     .iter()
-                    .filter(|availability| availability.available())
                     .all(|availability| availability.state == "available")
                 {
                     "available"
@@ -6928,7 +7158,7 @@ impl AppStore {
         &self,
         session: &AuthSession,
         seat_id: &str,
-        required_app: Option<&str>,
+        _required_app: Option<&str>,
     ) -> Result<RentQuoteView, AppError> {
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
@@ -7115,7 +7345,6 @@ impl AppStore {
             0
         };
         let service = build_rent_service_snapshot(
-            required_app,
             &bindings_json,
             app_runtimes_json.as_deref(),
             app_providers_json.as_deref(),
@@ -7129,25 +7358,27 @@ impl AppStore {
             share_token_limit,
             share_tokens_used,
         )?;
-        let availability = evaluate_share_market_service_availability_tx(
-            &tx,
-            &share_id,
-            &service.required_app,
-            None,
-            None,
-            Some(&service),
-            now_dt,
-        )?;
-        if !availability.available() {
-            return Err(availability_error(&availability));
+        for app in &service.supported_apps {
+            let availability = evaluate_share_market_service_availability_tx(
+                &tx,
+                &share_id,
+                app,
+                None,
+                None,
+                Some(&service),
+                now_dt,
+            )?;
+            if !availability.available() {
+                return Err(availability_error(app, &availability));
+            }
+            ensure_fixed_service_term_fulfillable_tx(
+                &tx,
+                &share_id,
+                app,
+                service_duration_days.and_then(|value| u32::try_from(value).ok()),
+                now_dt,
+            )?;
         }
-        ensure_fixed_service_term_fulfillable_tx(
-            &tx,
-            &share_id,
-            &service.required_app,
-            service_duration_days.and_then(|value| u32::try_from(value).ok()),
-            now_dt,
-        )?;
         if let (Some(seat_limit), Some(share_limit)) = (
             parallel_limit.and_then(|value| u32::try_from(value).ok()),
             service.share_parallel_limit,
@@ -7185,6 +7416,10 @@ impl AppStore {
         let snapshot_json = serde_json::to_string(&snapshot).map_err(|error| {
             AppError::Internal(format!("encode Share rent quote failed: {error}"))
         })?;
+        let contract_apps_json =
+            serde_json::to_string(&service.supported_apps).map_err(|error| {
+                AppError::Internal(format!("encode Share contract Apps failed: {error}"))
+            })?;
         tx.execute(
             "UPDATE share_market_rent_quotes
              SET status = 'expired', updated_at = ?3
@@ -7196,9 +7431,9 @@ impl AppStore {
             "INSERT INTO share_market_rent_quotes (
                 id, seat_id, listing_id, share_id, renter_user_id, renter_email,
                 offer_revision, snapshot_json, trial_seconds_remaining, status,
-                required_app,
+                required_app, contract_apps_json,
                 expires_at, consumed_subscription_id, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?11, NULL, ?12, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?11, ?12, NULL, ?13, ?13)",
             params![
                 quote_id,
                 seat_id,
@@ -7210,6 +7445,7 @@ impl AppStore {
                 snapshot_json,
                 trial_seconds_remaining,
                 service.required_app,
+                contract_apps_json,
                 expires_at,
                 now,
             ],
@@ -7218,6 +7454,9 @@ impl AppStore {
         tx.commit().map_err(map_db("commit Share rent quote"))?;
         let mut public_snapshot = snapshot;
         public_snapshot.service.provider_binding_fingerprint = None;
+        for app in &mut public_snapshot.service.apps {
+            app.provider_binding_fingerprint = None;
+        }
         Ok(RentQuoteView {
             id: quote_id,
             status: "active".into(),
@@ -7316,10 +7555,12 @@ impl AppStore {
             snapshot_json,
             trial_seconds_remaining,
             required_app,
+            contract_apps_json,
         ) = tx
             .query_row(
                 "SELECT seat_id, offer_revision, status, expires_at, renter_user_id,
-                        snapshot_json, trial_seconds_remaining, required_app
+                        snapshot_json, trial_seconds_remaining, required_app,
+                        contract_apps_json
                  FROM share_market_rent_quotes WHERE id = ?1",
                 params![quote_id],
                 |row| {
@@ -7332,6 +7573,7 @@ impl AppStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
@@ -7355,9 +7597,22 @@ impl AppStore {
         }
         let snapshot: RentQuoteSnapshot = serde_json::from_str(&snapshot_json)
             .map_err(|_| AppError::Internal("stored Share rent quote is invalid".into()))?;
+        if snapshot.service.schema_version < 2 {
+            return Err(AppError::Gone(
+                "Share rent quote uses retired single-App terms; request a new quote".into(),
+            ));
+        }
         if required_app.as_deref() != Some(snapshot.service.required_app.as_str()) {
             return Err(AppError::Conflict(
-                "Share rent quote required app is inconsistent".into(),
+                "Share rent quote compatibility App is inconsistent".into(),
+            ));
+        }
+        let stored_contract_apps = serde_json::from_str::<Vec<String>>(&contract_apps_json)
+            .map(canonical_market_apps)
+            .map_err(|_| AppError::Internal("stored Share quote App bundle is invalid".into()))?;
+        if stored_contract_apps != snapshot.service.supported_apps {
+            return Err(AppError::Conflict(
+                "Share rent quote App bundle is inconsistent".into(),
             ));
         }
         let metadata = RentCommitMetadata {
@@ -7901,7 +8156,6 @@ impl AppStore {
             service_duration_days,
         };
         let current_service = build_rent_service_snapshot(
-            quote_snapshot.map(|snapshot| snapshot.service.required_app.as_str()),
             &bindings_json,
             app_runtimes_json.as_deref(),
             app_providers_json.as_deref(),
@@ -7916,25 +8170,27 @@ impl AppStore {
             share_tokens_used,
         )?;
         let now_dt = parse_time(now)?;
-        let availability = evaluate_share_market_service_availability_tx(
-            tx,
-            &share_id,
-            &current_service.required_app,
-            None,
-            None,
-            Some(&current_service),
-            now_dt,
-        )?;
-        if !availability.available() {
-            return Err(availability_error(&availability));
+        for app in &current_service.supported_apps {
+            let availability = evaluate_share_market_service_availability_tx(
+                tx,
+                &share_id,
+                app,
+                None,
+                None,
+                Some(&current_service),
+                now_dt,
+            )?;
+            if !availability.available() {
+                return Err(availability_error(app, &availability));
+            }
+            ensure_fixed_service_term_fulfillable_tx(
+                tx,
+                &share_id,
+                app,
+                service_duration_days,
+                now_dt,
+            )?;
         }
-        ensure_fixed_service_term_fulfillable_tx(
-            tx,
-            &share_id,
-            &current_service.required_app,
-            service_duration_days,
-            now_dt,
-        )?;
         if let Some(snapshot) = quote_snapshot {
             if snapshot.seat_id != seat_id
                 || snapshot.listing_id != listing_id
@@ -7964,13 +8220,17 @@ impl AppStore {
                 "encode Share rental service snapshot failed: {error}"
             ))
         })?;
+        let contract_apps_json =
+            serde_json::to_string(&current_service.supported_apps).map_err(|error| {
+                AppError::Internal(format!("encode Share contract Apps failed: {error}"))
+            })?;
         let policy = ShareUserPolicy {
             parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
             token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
             token_period,
             token_period_anchor_at_ms: None,
             expires_at: None,
-            allowed_apps: vec![current_service.required_app.clone()],
+            allowed_apps: market_allowed_apps(),
         };
         let subscription_id = Uuid::new_v4().to_string();
         let entitlement_id = Uuid::new_v4().to_string();
@@ -7982,11 +8242,11 @@ impl AppStore {
                 service_duration_days, offer_revision, release_reason,
                 activated_at, expires_at, created_at, updated_at, released_at,
                 free_usage_seconds, rent_quote_id, idempotency_key, request_fingerprint,
-                required_app, service_snapshot_json
+                required_app, service_snapshot_json, contract_apps_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'grant_pending',
                        ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                        NULL, NULL, ?18, ?19, ?19, NULL, ?20, ?21, ?22, ?23,
-                       ?24, ?25)",
+                       ?24, ?25, ?26)",
             params![
                 subscription_id,
                 seat_id,
@@ -8013,6 +8273,7 @@ impl AppStore {
                 metadata.map(|value| value.request_fingerprint.as_str()),
                 current_service.required_app,
                 service_snapshot_json,
+                contract_apps_json,
             ],
         )
         .map_err(|error| {
@@ -8896,6 +9157,16 @@ fn persist_effective_control_policy(
     Ok(())
 }
 
+fn effective_policy_has_contract_app_scope(
+    record: &SubscriptionRecord,
+    effective_policy: &ShareUserPolicy,
+) -> bool {
+    effective_policy.allowed_apps == market_allowed_apps()
+        || (record.service_schema_version < 2
+            && record.app_scope_enforced_at.is_none()
+            && effective_policy.allowed_apps == [record.app_type.clone()])
+}
+
 fn validate_effective_initial_policy(
     record: &SubscriptionRecord,
     applied_at_ms: i64,
@@ -8929,7 +9200,7 @@ fn validate_effective_initial_policy(
         || effective_policy.token_period != token_period
         || effective_policy.token_period_anchor_at_ms != expected_anchor
         || effective_policy.expires_at != expected_expiry
-        || effective_policy.allowed_apps != [record.app_type.clone()]
+        || !effective_policy_has_contract_app_scope(record, effective_policy)
     {
         return Err(AppError::Conflict(
             "client applied a managed grant policy that differs from the rented terms".into(),
@@ -8965,7 +9236,7 @@ fn validate_effective_resume_policy(
         || effective_policy.token_period != token_period
         || effective_policy.token_period_anchor_at_ms != expected_anchor
         || effective_policy.expires_at != expected_expiry
-        || effective_policy.allowed_apps != [record.app_type.clone()]
+        || !effective_policy_has_contract_app_scope(record, effective_policy)
     {
         return Err(AppError::Conflict(
             "client restored a managed grant policy that differs from the active rental contract"
@@ -9173,39 +9444,42 @@ fn activate_granted_subscription_tx(
         )
         .map_err(map_db("read Share activation service contract"))?;
     let service_snapshot = serde_json::from_str::<RentServiceSnapshot>(&service_snapshot_json).ok();
-    let availability = evaluate_share_market_service_availability_tx(
-        conn,
-        &record.share_id,
-        &record.app_type,
-        Some(true),
-        Some(&integrity_state),
-        service_snapshot.as_ref(),
-        parse_time(&service_started_at)?,
-    )?;
-    if let Some(reason) = availability.blocking_reason.as_deref() {
-        reject_unfulfillable_activation_tx(conn, record, reason, now)?;
-        return Ok(());
-    }
-    if let Err(error) = ensure_fixed_service_term_fulfillable_tx(
-        conn,
-        &record.share_id,
-        &record.app_type,
-        record.service_duration_days,
-        parse_time(&service_started_at)?,
-    ) {
-        tracing::warn!(
-            subscription_id = %record.id,
-            share_id = %record.share_id,
-            error = %error,
-            "Share fixed service term became unfulfillable before activation"
-        );
-        reject_unfulfillable_activation_tx(
+    for app in subscription_contract_apps(record) {
+        let availability = evaluate_share_market_service_availability_tx(
             conn,
-            record,
-            "service_term_unfulfillable_before_activation",
-            now,
+            &record.share_id,
+            &app,
+            Some(true),
+            Some(&integrity_state),
+            service_snapshot.as_ref(),
+            parse_time(&service_started_at)?,
         )?;
-        return Ok(());
+        if let Some(reason) = availability.blocking_reason.as_deref() {
+            reject_unfulfillable_activation_tx(conn, record, reason, now)?;
+            return Ok(());
+        }
+        if let Err(error) = ensure_fixed_service_term_fulfillable_tx(
+            conn,
+            &record.share_id,
+            &app,
+            record.service_duration_days,
+            parse_time(&service_started_at)?,
+        ) {
+            tracing::warn!(
+                subscription_id = %record.id,
+                share_id = %record.share_id,
+                app,
+                error = %error,
+                "Share fixed service term became unfulfillable before activation"
+            );
+            reject_unfulfillable_activation_tx(
+                conn,
+                record,
+                "service_term_unfulfillable_before_activation",
+                now,
+            )?;
+            return Ok(());
+        }
     }
     if record.daily_rate_minor.is_some()
         && !crate::market_billing::activate_reserved_contract_tx(
@@ -9228,13 +9502,24 @@ fn activate_granted_subscription_tx(
         )?;
         return Ok(());
     }
+    let app_scope_enforced_at =
+        (effective_policy.allowed_apps == market_allowed_apps()).then_some(now);
     let changed = conn
         .execute(
             "UPDATE share_market_subscriptions
              SET status = ?2, activated_at = ?3, service_started_at = ?3,
-                 expires_at = ?4, release_reason = NULL, updated_at = ?5
+                 expires_at = ?4, release_reason = NULL,
+                 app_scope_enforced_at = COALESCE(app_scope_enforced_at, ?5),
+                 updated_at = ?6
              WHERE id = ?1 AND status = 'grant_pending' AND service_started_at IS NULL",
-            params![record.id, status, service_started_at, expires_at, now],
+            params![
+                record.id,
+                status,
+                service_started_at,
+                expires_at,
+                app_scope_enforced_at,
+                now
+            ],
         )
         .map_err(map_db("activate granted Share subscription"))?;
     if changed == 0 {
@@ -10415,11 +10700,16 @@ impl AppStore {
                     } else {
                         SUB_ACTIVE_FREE
                     };
+                    let app_scope_enforced_at = (grant.policy.allowed_apps
+                        == market_allowed_apps())
+                    .then_some(now.as_str());
                     tx.execute(
                         "UPDATE share_market_subscriptions
-                         SET status = ?2, release_reason = NULL, updated_at = ?3
+                         SET status = ?2, release_reason = NULL,
+                             app_scope_enforced_at = COALESCE(app_scope_enforced_at, ?3),
+                             updated_at = ?4
                          WHERE id = ?1",
-                        params![record.id, active_status, now],
+                        params![record.id, active_status, app_scope_enforced_at, now],
                     )
                     .map_err(map_db("confirm Share billing resume"))?;
                     event_tx(
@@ -12632,7 +12922,6 @@ mod tests {
         );
         assert!(
             build_rent_service_snapshot(
-                Some("codex"),
                 &bindings,
                 None,
                 Some(&degraded_json),
@@ -13242,7 +13531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_app_rental_view_uses_the_frozen_required_app() {
+    async fn multi_app_rental_ignores_legacy_app_selection_and_grants_the_bundle() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-required-app", "owner-required-app@example.com");
         let renter = session("renter-required-app", "renter-required-app@example.com");
@@ -13266,10 +13555,21 @@ mod tests {
             .expect("make Share multi-app");
         let (_, seat_id) = create_listing(&store, &owner, "share-required-app", free_seat()).await;
         let quote = store
-            .share_market_create_rent_quote(&renter, &seat_id, Some("codex"))
+            .share_market_create_rent_quote(&renter, &seat_id, Some("gemini"))
             .await
-            .expect("quote Codex on a Claude-primary Share");
-        assert_eq!(quote.offer.service.required_app, "codex");
+            .expect("ignore an unavailable legacy App selection");
+        assert_eq!(quote.offer.service.required_app, "claude");
+        assert_eq!(quote.offer.service.supported_apps, ["claude", "codex"]);
+        assert_eq!(
+            quote
+                .offer
+                .service
+                .apps
+                .iter()
+                .map(|service| service.app.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex"]
+        );
         let committed = store
             .share_market_commit_rent_quote(&renter, &seat_id, &quote.id, "required-app-view")
             .await
@@ -13284,7 +13584,276 @@ mod tests {
             .iter()
             .find(|subscription| subscription.id == committed.subscription_id)
             .expect("committed subscription");
-        assert_eq!(subscription.app_type, "codex");
+        assert_eq!(subscription.app_type, "claude");
+        assert_eq!(subscription.apps, ["claude", "codex"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_single_app_grant_is_widened_without_interrupting_the_subscription() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-app-widen", "owner-app-widen@example.com");
+        let renter = session("renter-app-widen", "renter-app-widen@example.com");
+        insert_share(
+            &store,
+            "share-app-widen",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) = create_listing(&store, &owner, "share-app-widen", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent legacy App scope seat");
+        let activated_at = Utc::now();
+        activate_subscription(&store, &subscription_id, activated_at).await;
+
+        let upgrade_at = activated_at + Duration::seconds(1);
+        {
+            let conn = store.conn.lock().await;
+            let grants_json: String = conn
+                .query_row(
+                    "SELECT user_grants_json FROM shares WHERE share_id = 'share-app-widen'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read all-App managed grant");
+            let mut grants: BTreeMap<String, ShareUserGrant> =
+                serde_json::from_str(&grants_json).expect("decode all-App managed grant");
+            grants
+                .get_mut(&renter.email)
+                .expect("managed renter grant")
+                .policy
+                .allowed_apps = vec!["codex".into()];
+            conn.execute(
+                "UPDATE shares SET user_grants_json = ?2,
+                    config_revision = config_revision + 1, updated_at = ?3
+                 WHERE share_id = ?1",
+                params![
+                    "share-app-widen",
+                    serde_json::to_string(&grants).expect("encode legacy single-App grant"),
+                    upgrade_at.to_rfc3339(),
+                ],
+            )
+            .expect("seed legacy single-App grant");
+            conn.execute(
+                "UPDATE share_market_subscriptions SET app_scope_enforced_at = NULL
+                 WHERE id = ?1",
+                params![subscription_id],
+            )
+            .expect("schedule App scope upgrade");
+
+            reconcile_share_contract_integrity_tx(&conn, "share-app-widen", upgrade_at)
+                .expect("enqueue non-disruptive App scope upgrade");
+            let state: (String, String, i64, i64) = conn
+                .query_row(
+                    "SELECT status, integrity_state,
+                            (SELECT COUNT(*) FROM share_control_operations operation
+                             WHERE operation.subscription_id = sub.id
+                               AND operation.action = 'upsert'
+                               AND operation.status = 'pending'),
+                            (SELECT COUNT(*) FROM share_control_operations operation
+                             WHERE operation.subscription_id = sub.id
+                               AND operation.action = 'revoke')
+                     FROM share_market_subscriptions sub WHERE id = ?1",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read uninterrupted App scope upgrade state");
+            assert_eq!(state, (SUB_ACTIVE_FREE.into(), "compatible".into(), 1, 0));
+
+            let policy_json: String = conn
+                .query_row(
+                    "SELECT policy_json FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert' AND status = 'pending'",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read widened grant policy");
+            let policy: ShareUserPolicy =
+                serde_json::from_str(&policy_json).expect("decode widened grant policy");
+            assert_eq!(policy.allowed_apps, ["claude", "codex", "gemini"]);
+        }
+
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(upgrade_at)
+                .await
+                .expect("dispatch non-disruptive App scope upgrade")
+                .len(),
+            1
+        );
+        set_entitlement_from_stored_policy(&store, &subscription_id, upgrade_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(upgrade_at)
+                .await
+                .expect("confirm widened App scope")
+                .is_empty()
+        );
+
+        let final_state: (String, String, Option<String>, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, integrity_state, app_scope_enforced_at,
+                        (SELECT COUNT(*) FROM share_control_operations operation
+                         WHERE operation.subscription_id = sub.id
+                           AND operation.action = 'revoke'),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'contract_integrity_violated')
+                 FROM share_market_subscriptions sub WHERE id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read completed App scope upgrade");
+        assert_eq!(final_state.0, SUB_ACTIVE_FREE);
+        assert_eq!(final_state.1, "compatible");
+        assert!(final_state.2.is_some());
+        assert_eq!((final_state.3, final_state.4), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn legacy_inflight_single_app_grant_activates_then_widens_without_quarantine() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-inflight-widen", "owner-inflight-widen@example.com");
+        let renter = session("renter-inflight-widen", "renter-inflight-widen@example.com");
+        insert_share(
+            &store,
+            "share-inflight-widen",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) =
+            create_listing(&store, &owner, "share-inflight-widen", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent seat before simulating the upgrade boundary");
+
+        {
+            let conn = store.conn.lock().await;
+            let policy_json: String = conn
+                .query_row(
+                    "SELECT policy_json FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read pre-migration grant policy");
+            let mut policy: ShareUserPolicy =
+                serde_json::from_str(&policy_json).expect("decode pre-migration grant policy");
+            policy.allowed_apps = vec!["codex".into()];
+            conn.execute(
+                "UPDATE share_control_operations SET policy_json = ?2 WHERE subscription_id = ?1",
+                params![
+                    subscription_id,
+                    serde_json::to_string(&policy).expect("encode pre-migration grant policy")
+                ],
+            )
+            .expect("seed a pre-migration grant policy");
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET service_snapshot_json = json_remove(
+                         json_set(service_snapshot_json, '$.schemaVersion', 1), '$.apps'
+                     ),
+                     app_scope_enforced_at = NULL
+                 WHERE id = ?1",
+                params![subscription_id],
+            )
+            .expect("seed a v1 grant that was in flight during migration");
+        }
+
+        let applied_at = Utc::now();
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(applied_at)
+                .await
+                .expect("dispatch legacy in-flight grant")
+                .len(),
+            1
+        );
+        set_entitlement(&store, &subscription_id, applied_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(applied_at)
+                .await
+                .expect("accept and activate legacy in-flight grant")
+                .is_empty()
+        );
+        let activated: (String, Option<String>, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, app_scope_enforced_at,
+                        (SELECT COUNT(*) FROM share_control_operations operation
+                         WHERE operation.subscription_id = sub.id
+                           AND operation.action = 'revoke')
+                 FROM share_market_subscriptions sub WHERE id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read legacy activation state");
+        assert_eq!(activated, (SUB_ACTIVE_FREE.into(), None, 0));
+
+        let upgrade_at = applied_at + Duration::seconds(1);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(upgrade_at)
+                .await
+                .expect("dispatch post-activation all-App widening")
+                .len(),
+            1
+        );
+        set_entitlement_from_stored_policy(&store, &subscription_id, upgrade_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(upgrade_at)
+                .await
+                .expect("confirm post-activation all-App widening")
+                .is_empty()
+        );
+        let final_state: (String, String, Option<String>, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, integrity_state, app_scope_enforced_at,
+                        (SELECT COUNT(*) FROM share_control_operations operation
+                         WHERE operation.subscription_id = sub.id
+                           AND operation.action = 'revoke'),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'entitlement_contract_violation')
+                 FROM share_market_subscriptions sub WHERE id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read widened in-flight grant state");
+        assert_eq!(final_state.0, SUB_ACTIVE_FREE);
+        assert_eq!(final_state.1, "compatible");
+        assert!(final_state.2.is_some());
+        assert_eq!((final_state.3, final_state.4), (0, 0));
     }
 
     #[tokio::test]
@@ -13776,6 +14345,7 @@ mod tests {
                 schema_version: 1,
                 required_app: "codex".into(),
                 supported_apps: vec!["codex".into()],
+                apps: Vec::new(),
                 provider_family: "openai".into(),
                 provider_type: Some("oauth".into()),
                 provider_binding_fingerprint: Some("binding-fingerprint".into()),
@@ -16251,6 +16821,9 @@ mod tests {
             let mut policy = expected_policy.clone();
             policy.expires_at = Some(policy.expires_at.unwrap_or_default().saturating_add(1));
             divergent.push(policy);
+            let mut policy = expected_policy.clone();
+            policy.allowed_apps = vec!["codex".into()];
+            divergent.push(policy);
 
             let record = subscription_record(&conn, &subscription_id)
                 .expect("read pending billing resume")
@@ -16384,7 +16957,20 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("read frozen active policy for a legacy billing resume");
-            serde_json::from_str(&policy_json).expect("decode frozen legacy resume policy")
+            let mut policy: ShareUserPolicy =
+                serde_json::from_str(&policy_json).expect("decode frozen legacy resume policy");
+            policy.allowed_apps = vec!["codex".into()];
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET service_snapshot_json = json_remove(
+                         json_set(service_snapshot_json, '$.schemaVersion', 1), '$.apps'
+                     ),
+                     app_scope_enforced_at = NULL
+                 WHERE id = ?1",
+                params![subscription_id],
+            )
+            .expect("mark the billing resume contract as migrated from v1");
+            policy
         };
         clear_entitlements(&store, "share-resume-legacy-policy").await;
 
@@ -16488,6 +17074,41 @@ mod tests {
             serde_json::from_str::<ShareUserPolicy>(&stored_policy).unwrap(),
             expected_policy
         );
+
+        let upgrade_at = ack_at + Duration::seconds(2);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(upgrade_at)
+                .await
+                .expect("dispatch all-App widening after legacy billing resume")
+                .len(),
+            1
+        );
+        set_entitlement_from_stored_policy(&store, &subscription_id, upgrade_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(upgrade_at)
+                .await
+                .expect("confirm all-App widening after legacy billing resume")
+                .is_empty()
+        );
+        let final_state: (String, Option<String>, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, app_scope_enforced_at,
+                        (SELECT COUNT(*) FROM share_control_operations operation
+                         WHERE operation.subscription_id = sub.id
+                           AND operation.action = 'revoke')
+                 FROM share_market_subscriptions sub WHERE id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read widened legacy billing resume state");
+        assert_eq!(final_state.0, SUB_ACTIVE_POSTPAID);
+        assert!(final_state.1.is_some());
+        assert_eq!(final_state.2, 0);
     }
 
     #[tokio::test]
@@ -20316,7 +20937,7 @@ mod tests {
                 .expect("read restored scoped policy");
             let policy: ShareUserPolicy =
                 serde_json::from_str(&policy_json).expect("decode restored scoped policy");
-            assert_eq!(policy.allowed_apps, ["codex"]);
+            assert_eq!(policy.allowed_apps, ["claude", "codex", "gemini"]);
         }
         set_entitlement_from_stored_policy(&store, &subscription_id, restored_at).await;
         assert!(

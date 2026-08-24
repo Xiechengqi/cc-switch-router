@@ -326,6 +326,8 @@ export function integrityReasonText(reason: string | undefined, t: MarketTransla
     share_missing: "shareMarket.integrity.reason.shareMissing",
     share_inactive: "shareMarket.integrity.reason.shareInactive",
     share_contract_upgrade_required: "shareMarket.integrity.reason.clientUpgradeRequired",
+    contract_apps_missing: "shareMarket.integrity.reason.contractAppsMissing",
+    contract_apps_changed: "shareMarket.integrity.reason.contractAppsChanged",
     required_app_disabled: "shareMarket.integrity.reason.requiredAppDisabled",
     share_parallel_capacity_reduced: "shareMarket.integrity.reason.parallelReduced",
     fixed_term_not_covered: "shareMarket.integrity.reason.fixedTermNotCovered",

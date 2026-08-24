@@ -445,7 +445,7 @@ function main() {
     [
       "frontend/components/dashboard/share-market/buyer-catalog.tsx",
       [
-        "quoteShareMarketSeat(item.seat.id, requiredApp)",
+        "quoteShareMarketSeat(item.seat.id)",
         "setRentTarget({ ...item, quote, idempotencyKey:",
         "crypto.randomUUID()",
         "rentShareMarketSeat(rentTarget.seat.id, rentTarget.quote.id, rentTarget.idempotencyKey)",
@@ -456,7 +456,8 @@ function main() {
         "shareMarket.rentConfirm.serviceFixed",
         "shareMarket.rentConfirm.quoteExpiry",
         "shareMarket.rentConfirm.requote",
-        "rentTarget.quote.offer.service.requiredApp",
+        "rentTarget.quote.offer.service.apps.map",
+        "shareMarket.catalog.enabledApps",
         "rentTarget.quote.offer.service.shareParallelLimit",
         "rentTarget.quote.offer.service.shareTokensUsed",
       ],
@@ -531,7 +532,7 @@ function main() {
         "/v1/market-access/counterparties/batch",
         "/v1/market-access/inbox-summary",
         "/v1/share-market/seats/${encodeURIComponent(seatId)}/quote",
-        "body: JSON.stringify({ requiredApp })",
+        "export async function quoteShareMarketSeat(seatId: string)",
         "body: JSON.stringify({ quoteId, idempotencyKey })",
       ],
     ],
@@ -542,13 +543,26 @@ function main() {
     }
   }
 
+  for (const relativePath of [
+    "frontend/components/dashboard/share-market/buyer-catalog.tsx",
+    "frontend/lib/api.ts",
+    "frontend/lib/types.ts",
+  ]) {
+    const source = fs.readFileSync(path.join(root, relativePath), "utf8");
+    if (source.includes("requiredApp")) {
+      errors.push(`${relativePath} must not expose the retired single-App rental selector`);
+    }
+  }
+
   for (const required of [
     "share_market_create_rent_quote",
     "share_market_commit_rent_quote",
     "trial_seconds_remaining_tx",
     "request_fingerprint",
     "consume_share_rent_quote_tx",
-    "required_app",
+    "MARKET_ALLOWED_APPS",
+    "RentAppServiceSnapshot",
+    "contract_apps_json",
     "service_snapshot_json",
     "TransactionBehavior::Immediate",
   ]) {
@@ -592,17 +606,20 @@ function main() {
   }
   const rentServiceType = extractTypeBlock(typeSource, "ShareMarketRentService");
   for (const required of [
-    "requiredApp",
     "supportedApps",
-    "providerFamily",
-    "providerType",
-    "modelMode",
+    "apps",
     "shareParallelLimit",
     "shareTokenLimit",
     "shareTokensUsed",
   ]) {
     if (!rentServiceType.includes(required)) {
       errors.push(`ShareMarketRentService is missing ${required}`);
+    }
+  }
+  const rentAppServiceType = extractTypeBlock(typeSource, "ShareMarketRentAppService");
+  for (const required of ["app", "providerFamily", "providerType", "modelMode", "models"]) {
+    if (!rentAppServiceType.includes(required)) {
+      errors.push(`ShareMarketRentAppService is missing ${required}`);
     }
   }
 

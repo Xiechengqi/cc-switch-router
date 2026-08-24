@@ -98,6 +98,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         25,
         include_str!("../schema/0025_share_market_completion.sql"),
     ),
+    (26, include_str!("../schema/0026_share_market_all_apps.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -697,6 +698,7 @@ mod tests {
         assert_eq!(versions[22], (23, migration_checksum(MIGRATIONS[21].1)));
         assert_eq!(versions[23], (24, migration_checksum(MIGRATIONS[22].1)));
         assert_eq!(versions[24], (25, migration_checksum(MIGRATIONS[23].1)));
+        assert_eq!(versions[25], (26, migration_checksum(MIGRATIONS[24].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1025,7 +1027,7 @@ mod tests {
     }
 
     fn install_schema_through(conn: &Connection, version: i64) {
-        assert!((1..=24).contains(&version));
+        assert!((1..=25).contains(&version));
         install_baseline(conn, &migration_checksum(BASELINE_SQL)).expect("install baseline");
         for (migration_version, sql) in MIGRATIONS.iter().copied().take((version - 1) as usize) {
             if migration_version == LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION {
@@ -1166,6 +1168,147 @@ mod tests {
             )
             .expect("read migrated billing service start");
         assert_eq!(contract_service_started_at, "2026-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn migration_26_backfills_app_bundles_and_schedules_active_scope_upgrades() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 25);
+        conn.execute_batch(
+            r#"INSERT INTO shares
+                (share_id, capacity_pool_id, installation_id, share_name, owner_email,
+                 for_sale, app_type, token_limit, parallel_limit, tokens_used,
+                 requests_count, share_status, created_at, expires_at, updated_at)
+             VALUES ('share-v25', 'pool-v25', 'installation-v25', 'Share v25',
+                     'owner@example.com', 'Free', 'codex', -1, 3, 0, 0, 'active',
+                     '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO share_market_listings
+                (id, share_id, installation_id, owner_user_id, owner_email, status,
+                 created_at, updated_at)
+             VALUES ('listing-v25', 'share-v25', 'installation-v25', 'owner-v25',
+                     'owner@example.com', 'active', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO share_market_seats
+                (id, listing_id, position, status, token_period_json, offer_revision,
+                 current_subscription_id, created_at, updated_at)
+             VALUES
+                ('seat-v25-active', 'listing-v25', 1, 'occupied', '"day"', 1,
+                 'subscription-v25-active', '2026-01-01T00:00:00Z',
+                 '2026-01-01T00:00:00Z'),
+                ('seat-v25-released', 'listing-v25', 2, 'available', '"day"', 1,
+                 NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO share_market_subscriptions
+                (id, seat_id, listing_id, share_id, installation_id, entitlement_id,
+                 owner_user_id, owner_email, renter_user_id, renter_email, status,
+                 token_period_json, offer_revision, activated_at, service_started_at,
+                 created_at, updated_at, released_at, required_app,
+                 service_snapshot_json, app_scope_enforced_at)
+             VALUES
+                ('subscription-v25-active', 'seat-v25-active', 'listing-v25',
+                 'share-v25', 'installation-v25', 'entitlement-v25-active',
+                 'owner-v25', 'owner@example.com', 'renter-v25-active',
+                 'active@example.com', 'active_free', '"day"', 1,
+                 '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z',
+                 '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', NULL, 'codex',
+                 '{"schemaVersion":1,"requiredApp":"codex","supportedApps":["claude","codex"]}',
+                 '2026-01-02T00:00:00Z'),
+                ('subscription-v25-released', 'seat-v25-released', 'listing-v25',
+                 'share-v25', 'installation-v25', 'entitlement-v25-released',
+                 'owner-v25', 'owner@example.com', 'renter-v25-released',
+                 'released@example.com', 'released', '"day"', 1, NULL, NULL,
+                 '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z',
+                 '2026-01-03T00:00:00Z', 'gemini', '{}',
+                 '2026-01-02T00:00:00Z');
+             INSERT INTO share_market_rent_quotes
+                (id, seat_id, listing_id, share_id, renter_user_id, renter_email,
+                 offer_revision, snapshot_json, trial_seconds_remaining, status,
+                 required_app, expires_at, created_at, updated_at)
+             VALUES
+                ('quote-v25-active', 'seat-v25-active', 'listing-v25', 'share-v25',
+                 'quote-renter-v25-active', 'quote-active@example.com', 1,
+                 '{"service":{"schemaVersion":1,"requiredApp":"codex","supportedApps":["claude","codex"]}}',
+                 0, 'active', 'codex', '2026-01-01T00:02:00Z',
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                ('quote-v25-consumed', 'seat-v25-released', 'listing-v25', 'share-v25',
+                 'quote-renter-v25-consumed', 'quote-consumed@example.com', 1, '{}',
+                 0, 'consumed', 'gemini', '2026-01-01T00:02:00Z',
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"#,
+        )
+        .expect("seed version 25 App-scoped Share Market contracts");
+
+        apply(&conn).expect("upgrade version 25 Share Market App contracts");
+
+        let quotes = conn
+            .prepare(
+                "SELECT id, status, contract_apps_json
+                 FROM share_market_rent_quotes ORDER BY id",
+            )
+            .expect("prepare migrated App quote rows")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query migrated App quote rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migrated App quote rows");
+        assert_eq!(
+            quotes,
+            vec![
+                (
+                    "quote-v25-active".into(),
+                    "expired".into(),
+                    r#"["claude","codex"]"#.into(),
+                ),
+                (
+                    "quote-v25-consumed".into(),
+                    "consumed".into(),
+                    r#"["gemini"]"#.into(),
+                ),
+            ]
+        );
+        let subscriptions = conn
+            .prepare(
+                "SELECT id, contract_apps_json, app_scope_enforced_at
+                 FROM share_market_subscriptions ORDER BY id",
+            )
+            .expect("prepare migrated App subscription rows")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .expect("query migrated App subscription rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migrated App subscription rows");
+        assert_eq!(
+            subscriptions,
+            vec![
+                (
+                    "subscription-v25-active".into(),
+                    r#"["claude","codex"]"#.into(),
+                    None,
+                ),
+                (
+                    "subscription-v25-released".into(),
+                    r#"["gemini"]"#.into(),
+                    Some("2026-01-02T00:00:00Z".into()),
+                ),
+            ]
+        );
+        let invalid_bundle = conn.execute(
+            "UPDATE share_market_subscriptions SET contract_apps_json = '{}' WHERE id = ?1",
+            params!["subscription-v25-active"],
+        );
+        assert!(
+            invalid_bundle.is_err(),
+            "contract Apps must remain a JSON array"
+        );
     }
 
     #[test]

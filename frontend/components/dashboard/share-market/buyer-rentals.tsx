@@ -25,6 +25,7 @@ import {
   shareMarketHref,
 } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
+import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketSubscription } from "@/lib/types";
 import {
   formatTokenLimit,
@@ -115,7 +116,9 @@ export function ShareMarketSubscriptionCard({
     ? shareMarketHref({ workspace: "selling", shareId: subscription.shareId })
     : undefined;
   const statusKey = subscriptionStatusKey(subscription.status);
-  const app = isCoreShareApp(subscription.appType) ? subscription.appType : null;
+  const apps = [...new Set(
+    (subscription.apps?.length ? subscription.apps : [subscription.appType]).filter(isCoreShareApp),
+  )];
   const priceChange = subscription.priceChange;
   const grantFailed = subscription.status === "grant_failed";
   const grantContractViolation = subscription.failureCode === "share_market_grant_contract_violation";
@@ -143,7 +146,11 @@ export function ShareMarketSubscriptionCard({
       className={`grid gap-3 rounded-md border bg-card p-4 shadow-sm sm:p-5 ${anomalous ? "border-rose-200 ring-1 ring-rose-100" : "border-border"}`}
     >
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        {app ? <ShareAppLogo app={app} size={18} /> : null}
+        {apps.length ? (
+          <span className="inline-flex items-center gap-1" title={apps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}>
+            {apps.map((app) => <ShareAppLogo key={app} app={app} size={18} />)}
+          </span>
+        ) : null}
         <strong className="truncate text-sm">{subscription.shareName}</strong>
         <Chip size="sm" variant={anomalous ? "primary" : "tertiary"}>{statusKey ? t(statusKey) : subscription.status}</Chip>
         <Chip size="sm" variant="tertiary">{subscription.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</Chip>

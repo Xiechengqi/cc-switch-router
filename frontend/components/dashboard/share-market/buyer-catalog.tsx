@@ -22,7 +22,6 @@ import {
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { CompactSelect } from "@/components/common/compact-select";
-import { SegmentedControl } from "@/components/common/segmented-control";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import {
@@ -45,6 +44,7 @@ import type {
   ShareMarketCatalog,
   ShareMarketListing,
   ShareMarketProviderFamily,
+  ShareMarketRentAppService,
   ShareMarketRentQuote,
   ShareMarketSeat,
   ShareMarketSubscription,
@@ -54,7 +54,6 @@ import { cn } from "@/lib/utils";
 import {
   PROVIDER_FAMILY_KEYS,
   PROVIDER_FAMILY_ORDER,
-  CORE_SHARE_APPS,
   activeSubscriptionForShare,
   formatSeatPrice,
   formatTokenLimit,
@@ -73,22 +72,11 @@ import {
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
-type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat; requiredApp?: string };
+type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat };
 type AvailabilityFilter = "idle" | "all";
 type CatalogSort = "recommended" | "price" | "uptime";
 type SeatAction = "rent" | "approval" | "login" | "rented" | "granting" | "selling" | "unavailable";
 type RentTarget = SeatCard & { quote: ShareMarketRentQuote; idempotencyKey: string };
-
-function rentalApps(listing: ShareMarketListing) {
-  return CORE_SHARE_APPS.filter((app) => listing.supportedApps.includes(app));
-}
-
-function defaultRentalApp(listing: ShareMarketListing) {
-  const apps = rentalApps(listing);
-  return apps.includes(listing.appType as (typeof CORE_SHARE_APPS)[number])
-    ? listing.appType
-    : apps[0];
-}
 
 function compareReliability(left: ShareMarketListing, right: ShareMarketListing) {
   const coverage = Number(right.reliability.sufficientCoverage) - Number(left.reliability.sufficientCoverage);
@@ -102,6 +90,15 @@ function uptimeValue(listing: ShareMarketListing) {
   return listing.reliability.onlineRate24h == null
     ? "-"
     : `${listing.reliability.onlineRate24h.toFixed(1)}%`;
+}
+
+function rentAppLabel(app: string) {
+  return isCoreShareApp(app) ? SHARE_APP_LABELS[app] : app;
+}
+
+function rentAppModel(service: ShareMarketRentAppService, t: ReturnType<typeof useLocaleText>["t"]) {
+  if (service.modelMode === "passthrough") return t("shareMarket.modelPassthrough");
+  return service.upstreamModel || service.models?.join(" / ") || t("shareMarket.catalog.modelUnknown");
 }
 
 const RENT_BLOCK_REASON_KEYS: Record<string, MessageKey> = {
@@ -390,12 +387,8 @@ export function ShareMarketBuyerCatalog({
     const listing = catalog.listings.find((item) => item.id === selected.listing.id);
     if (!listing) return setSelected(null);
     const seat = selected.seat ? preserveCatalogSeat(listing.seats, selected.seat.id) : undefined;
-    const apps = rentalApps(listing);
-    const requiredApp = selected.requiredApp && apps.includes(selected.requiredApp as (typeof CORE_SHARE_APPS)[number])
-      ? selected.requiredApp
-      : defaultRentalApp(listing);
-    if (listing !== selected.listing || seat !== selected.seat || requiredApp !== selected.requiredApp) {
-      setSelected({ listing, seat, requiredApp });
+    if (listing !== selected.listing || seat !== selected.seat) {
+      setSelected({ listing, seat });
     }
   }, [catalog.listings, selected]);
 
@@ -405,7 +398,7 @@ export function ShareMarketBuyerCatalog({
     if (!listing) return;
     focusedRef.current = focusedShareId;
     setAvailability("all");
-    setSelected({ listing, requiredApp: defaultRentalApp(listing) });
+    setSelected({ listing });
     window.requestAnimationFrame(() => document.getElementById(`share-market-catalog-${focusedShareId}`)?.scrollIntoView({ block: "start" }));
   }, [catalog.listings, focusedShareId]);
 
@@ -414,11 +407,10 @@ export function ShareMarketBuyerCatalog({
     setSelected({
       listing,
       seat: initialCatalogSeat(listing.seats, seat),
-      requiredApp: defaultRentalApp(listing),
     });
   };
 
-  const triggerSeat = async (item: SeatCard, requiredApp?: string) => {
+  const triggerSeat = async (item: SeatCard) => {
     const action = seatAction(item.listing, item.seat, subscriptions, authed);
     if (action === "login") return window.dispatchEvent(new Event("router-open-login"));
     if (action === "selling") return onSwitchSelling?.();
@@ -428,7 +420,7 @@ export function ShareMarketBuyerCatalog({
     setBusySeatId(item.seat.id);
     setError("");
     try {
-      const quote = await quoteShareMarketSeat(item.seat.id, requiredApp);
+      const quote = await quoteShareMarketSeat(item.seat.id);
       setRentTarget({ ...item, quote, idempotencyKey: `share-rent:${quote.id}:${crypto.randomUUID()}` });
     } catch (reason) {
       const eligibility = marketEligibilityFromError(reason);
@@ -444,10 +436,7 @@ export function ShareMarketBuyerCatalog({
     setBusySeatId(rentTarget.seat.id);
     setError("");
     try {
-      const quote = await quoteShareMarketSeat(
-        rentTarget.seat.id,
-        rentTarget.quote.offer.service.requiredApp,
-      );
+      const quote = await quoteShareMarketSeat(rentTarget.seat.id);
       setRentTarget({
         listing: rentTarget.listing,
         seat: rentTarget.seat,
@@ -489,7 +478,6 @@ export function ShareMarketBuyerCatalog({
     ? seatAction(selected.listing, selected.seat, subscriptions, authed)
     : "unavailable";
   const activeFilterCount = Number(family !== "all") + Number(availability !== "idle") + Number(sort !== "recommended");
-  const selectedApps = selected ? rentalApps(selected.listing) : [];
   const quoteRemainingSeconds = rentTarget
     ? Math.max(0, Math.ceil((Date.parse(rentTarget.quote.expiresAt) - quoteNowMs) / 1_000))
     : 0;
@@ -549,18 +537,6 @@ export function ShareMarketBuyerCatalog({
             <Drawer.Body className="overflow-y-auto pb-28">
               {selected ? (
                 <div className="grid gap-5">
-                  {selectedApps.length > 1 ? (
-                    <section className="grid gap-2">
-                      <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.chooseApp")}</h3>
-                      <SegmentedControl
-                        value={selected.requiredApp || selectedApps[0]}
-                        onChange={(requiredApp) => setSelected({ ...selected, requiredApp })}
-                        items={selectedApps.map((app) => ({ id: app, label: SHARE_APP_LABELS[app] }))}
-                        ariaLabel={t("shareMarket.catalog.chooseApp")}
-                        fullWidth
-                      />
-                    </section>
-                  ) : null}
                   <section className="grid gap-3">
                     <div className="flex items-center justify-between">
                       <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.chooseSeat")}</h3>
@@ -569,7 +545,7 @@ export function ShareMarketBuyerCatalog({
                     {selected.listing.seats.map((seat) => <SeatChoice key={seat.id} seat={seat} selected={selected.seat?.id === seat.id} onSelect={() => setSelected({ ...selected, seat })} />)}
                   </section>
                   <section className="grid gap-3 border-t border-slate-200 pt-4">
-                    <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.providerStatus")}</h3>
+                    <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.appCapabilities")}</h3>
                     <ShareProviderStatusPanel
                       view={marketProviderStatusView(selected.listing, locale, {
                         unknown: t("shareMarket.catalog.providerUnknown"),
@@ -609,10 +585,7 @@ export function ShareMarketBuyerCatalog({
                 <Button
                   variant="primary"
                   isDisabled={!selected.seat || selectedAction === "unavailable" || selectedAction === "rented" || selectedAction === "granting" || !!busySeatId}
-                  onClick={() => selected.seat && void triggerSeat(
-                    { listing: selected.listing, seat: selected.seat },
-                    selected.requiredApp,
-                  )}
+                  onClick={() => selected.seat && void triggerSeat({ listing: selected.listing, seat: selected.seat })}
                 >
                   {busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : selectedAction === "approval" ? <Send className="h-4 w-4" /> : selectedAction === "login" ? <LogIn className="h-4 w-4" /> : selectedAction === "rented" ? <Check className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}
                   {selected.seat ? actionLabel(selectedAction, t) : t("shareMarket.catalog.chooseSeat")}
@@ -632,9 +605,16 @@ export function ShareMarketBuyerCatalog({
                 <>
                   <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 border-y border-slate-200 py-3 text-sm">
                     <dt className="text-slate-500">{t("shareMarket.col.share")}</dt><dd className="font-medium">{rentTarget.quote.offer.shareName} · #{rentTarget.quote.offer.seatPosition}</dd>
-                    <dt className="text-slate-500">{t("shareMarket.catalog.requiredApp")}</dt><dd className="font-medium">{isCoreShareApp(rentTarget.quote.offer.service.requiredApp) ? SHARE_APP_LABELS[rentTarget.quote.offer.service.requiredApp] : rentTarget.quote.offer.service.requiredApp}</dd>
-                    <dt className="text-slate-500">{t("shareMarket.catalog.provider")}</dt><dd>{t(PROVIDER_FAMILY_KEYS[rentTarget.quote.offer.service.providerFamily])}{rentTarget.quote.offer.service.providerType ? ` · ${rentTarget.quote.offer.service.providerType}` : ""}</dd>
-                    <dt className="text-slate-500">{t("shareMarket.catalog.modelPolicy")}</dt><dd>{rentTarget.quote.offer.service.modelMode === "passthrough" ? t("shareMarket.modelPassthrough") : rentTarget.quote.offer.service.upstreamModel || rentTarget.quote.offer.service.models.join(" / ") || t("shareMarket.catalog.modelUnknown")}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.enabledApps")}</dt>
+                    <dd className="grid gap-2">
+                      {rentTarget.quote.offer.service.apps.map((service) => (
+                        <div key={service.app} className="grid min-w-0 gap-0.5 border-l-2 border-slate-200 pl-2">
+                          <strong className="font-medium">{rentAppLabel(service.app)}</strong>
+                          <span className="break-words text-xs text-slate-600">{t(PROVIDER_FAMILY_KEYS[service.providerFamily])}{service.providerType ? ` · ${service.providerType}` : ""}</span>
+                          <span className="break-words text-xs text-slate-500">{rentAppModel(service, t)}</span>
+                        </div>
+                      ))}
+                    </dd>
                     <dt className="text-slate-500">{t("shareMarket.parallel")}</dt><dd>{rentTarget.quote.offer.parallelLimit == null ? t("common.unlimited") : rentTarget.quote.offer.parallelLimit}</dd>
                     <dt className="text-slate-500">{t("shareMarket.tokens")}</dt><dd>{formatTokenLimit(rentTarget.quote.offer, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}</dd>
                     <dt className="text-slate-500">{t("shareMarket.catalog.shareCapacity")}</dt><dd>{rentTarget.quote.offer.service.shareParallelLimit == null ? t("common.unlimited") : t("shareMarket.parallelShort", { value: rentTarget.quote.offer.service.shareParallelLimit })}</dd>

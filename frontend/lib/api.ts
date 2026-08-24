@@ -1633,12 +1633,10 @@ export async function deleteShareMarketListing(listingId: string) {
   );
 }
 
-export async function quoteShareMarketSeat(seatId: string, requiredApp?: string) {
+export async function quoteShareMarketSeat(seatId: string) {
   return parseJson<ShareMarketRentQuote>(
     await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/quote`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requiredApp }),
     }),
   );
 }

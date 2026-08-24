@@ -180,19 +180,21 @@ test("provider panel excludes bound apps whose Share API is disabled", () => {
 
 test("contract integrity reasons are localized without exposing internal codes", () => {
   const text = integrityReasonText(
-    "share_contract_upgrade_required,app_scope_not_enforced,entitlement_missing,unknown_reason",
+    "share_contract_upgrade_required,contract_apps_missing,contract_apps_changed,app_scope_not_enforced,entitlement_missing,unknown_reason",
     (key) => key,
   );
   assert.equal(
     text,
     [
       "shareMarket.integrity.reason.clientUpgradeRequired",
+      "shareMarket.integrity.reason.contractAppsMissing",
+      "shareMarket.integrity.reason.contractAppsChanged",
       "shareMarket.integrity.reason.appScopeNotEnforced",
       "shareMarket.integrity.reason.entitlementMissing",
       "shareMarket.integrity.reason.unknown",
     ].join(" · "),
   );
-  assert.doesNotMatch(text, /share_contract_upgrade_required|app_scope_not_enforced|entitlement_missing/);
+  assert.doesNotMatch(text, /share_contract_upgrade_required|contract_apps|app_scope_not_enforced|entitlement_missing/);
 });
 
 const subscription = (
