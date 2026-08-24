@@ -37,6 +37,7 @@ const BILLING_CYCLE_SECS: u64 = 5;
 const MAX_ACCOUNTS_PER_RECONCILE: usize = 100;
 const MAX_MAINTENANCE_ROWS_PER_RECONCILE: usize = 200;
 pub(crate) const MAX_DAILY_RATE_MINOR: i64 = 100_000_000;
+const EXTERNAL_REFUND_DUE_DAYS: i64 = 7;
 
 const ACCOUNT_ACTIVE: &str = "active";
 const ACCOUNT_NEAR_CREDIT_LIMIT: &str = "near_credit_limit";
@@ -202,6 +203,51 @@ pub struct CreditNoteView {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierTerminationCalculation {
+    pub contract_id: String,
+    pub account_id: String,
+    pub product_kind: String,
+    pub product_ref: String,
+    pub currency: String,
+    pub service_started_at: String,
+    pub service_ends_at: String,
+    pub evaluated_at: String,
+    pub elapsed_bps: i64,
+    pub refund_bps: i64,
+    pub refundable_base_units: i64,
+    pub amount_units: i64,
+    pub amount_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefundObligationView {
+    pub id: String,
+    pub adjustment_id: String,
+    pub invoice_id: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub status: String,
+    pub due_at: String,
+    pub external_reference: Option<String>,
+    pub recorded_at: Option<String>,
+    pub can_record: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierTerminationAdjustment {
+    pub id: String,
+    pub status: String,
+    pub calculation: SupplierTerminationCalculation,
+    pub unbilled_credit_minor: i64,
+    pub invoice_credit_minor: i64,
+    pub external_refund_minor: i64,
+    pub obligations: Vec<RefundObligationView>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BillingDisputeView {
@@ -258,6 +304,7 @@ pub struct BillingDashboardView {
     pub accounts: Vec<CreditAccountView>,
     pub supplier_profiles: Vec<SupplierBillingProfileView>,
     pub restrictions: Vec<CreditRestrictionView>,
+    pub refund_obligations: Vec<RefundObligationView>,
     pub trial_hours: i64,
     pub usd_cny_rate_micros: i64,
 }
@@ -324,6 +371,12 @@ struct CreateCreditNoteRequest {
     amount_minor: i64,
     reason: String,
     external_reference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordRefundRequest {
+    external_reference: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +490,10 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/market-billing/invoices/:invoice_id/credit-notes",
             post(create_credit_note),
+        )
+        .route(
+            "/v1/market-billing/refund-obligations/:obligation_id/record",
+            post(record_refund_obligation),
         )
         .route(
             "/v1/admin/market-billing/disputes",
@@ -775,6 +832,24 @@ async fn create_credit_note(
         .await?;
     dispatch_actions(&state, actions).await;
     Ok(Json(state.store.market_billing_dashboard(&session).await?))
+}
+
+async fn record_refund_obligation(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(obligation_id): Path<String>,
+    Json(input): Json<RecordRefundRequest>,
+) -> Result<Json<RefundObligationView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let external_reference =
+        clean_optional(Some(input.external_reference), 200, "externalReference")?
+            .ok_or_else(|| AppError::BadRequest("externalReference is required".into()))?;
+    Ok(Json(
+        state
+            .store
+            .market_billing_record_refund_obligation(&session, &obligation_id, &external_reference)
+            .await?,
+    ))
 }
 
 async fn list_admin_disputes(
@@ -1202,13 +1277,14 @@ fn enqueue_billing_client_chat_events_tx(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let public_payload = crate::store::client_chat::public_market_event_payload(&payload);
         crate::store::client_chat::enqueue_client_system_event_tx(
             tx,
             &installation_id,
             "market_billing",
             source_event_id,
             chat_event_type,
-            payload,
+            public_payload,
             &followers,
             now,
         )?;
@@ -1986,6 +2062,1263 @@ pub(crate) fn terminate_contract_tx(
         now,
     )?;
     Ok(())
+}
+
+pub(crate) fn suspend_contract_for_integrity_tx(
+    conn: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    accrue_contract_until_tx(conn, product_kind, product_ref, now)?;
+    let now = now.to_rfc3339();
+    conn.execute(
+        "UPDATE market_service_contracts
+         SET status = CASE WHEN status IN ('trial', 'active')
+                 THEN 'billing_suspended' ELSE status END,
+             health_state = 'unhealthy', desired_control_state = 'suspended',
+             control_error = ?3,
+             suspended_at = COALESCE(suspended_at, ?4), updated_at = ?4
+         WHERE product_kind = ?1 AND product_ref = ?2
+           AND status IN ('trial', 'active', 'billing_suspended')",
+        params![product_kind, product_ref, reason, now],
+    )
+    .map_err(map_db("suspend market contract for integrity remediation"))?;
+    Ok(())
+}
+
+pub(crate) fn request_contract_resume_after_integrity_tx(
+    conn: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    let contract = conn
+        .query_row(
+            "SELECT contract.id, contract.status, contract.desired_control_state,
+                    account.status, account.close_requested, account.credit_kind
+             FROM market_service_contracts contract
+             JOIN market_credit_accounts account ON account.id = contract.account_id
+             WHERE contract.product_kind = ?1 AND contract.product_ref = ?2
+               AND contract.status != 'terminated'",
+            params![product_kind, product_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db(
+            "read market contract before integrity remediation resume",
+        ))?
+        .ok_or_else(|| {
+            AppError::Internal(
+                "paid Share integrity remediation is missing its billing contract".into(),
+            )
+        })?;
+    let account_can_resume = matches!(
+        contract.3.as_str(),
+        ACCOUNT_ACTIVE | ACCOUNT_NEAR_CREDIT_LIMIT
+    ) && !contract.4
+        && contract.5 != crate::market_access::CREDIT_NONE;
+    if contract.1 != CONTRACT_BILLING_SUSPENDED || contract.2 == "terminated" || !account_can_resume
+    {
+        return Ok(false);
+    }
+    let changed = conn
+        .execute(
+            "UPDATE market_service_contracts
+         SET health_state = 'unknown', desired_control_state = 'active',
+             control_error = NULL, updated_at = ?2
+         WHERE id = ?1 AND status = 'billing_suspended'
+           AND desired_control_state != 'terminated'",
+            params![contract.0, now],
+        )
+        .map_err(map_db(
+            "request market contract resume after integrity remediation",
+        ))?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn complete_contract_resume_after_integrity_tx(
+    conn: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE market_service_contracts
+         SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
+             health_state = 'unknown', desired_control_state = 'active',
+             control_error = NULL, suspended_at = NULL,
+             last_evaluated_at = ?3, updated_at = ?3
+         WHERE product_kind = ?1 AND product_ref = ?2
+           AND status = 'billing_suspended' AND desired_control_state = 'active'
+           AND EXISTS (
+               SELECT 1 FROM market_credit_accounts account
+               WHERE account.id = market_service_contracts.account_id
+                 AND account.status IN ('active', 'near_credit_limit')
+                 AND account.close_requested = 0 AND account.credit_kind != 'none'
+           )",
+            params![product_kind, product_ref, now],
+        )
+        .map_err(map_db(
+            "complete market contract resume after integrity remediation",
+        ))?;
+    Ok(changed == 1)
+}
+
+fn ceil_mul_div(value: i64, numerator: i128, denominator: i128) -> Result<i64, AppError> {
+    if value <= 0 || numerator <= 0 {
+        return Ok(0);
+    }
+    if denominator <= 0 {
+        return Err(AppError::Internal(
+            "market refund calculation denominator is invalid".into(),
+        ));
+    }
+    let scaled = i128::from(value)
+        .checked_mul(numerator)
+        .ok_or_else(|| AppError::Internal("market refund calculation overflowed".into()))?;
+    i64::try_from((scaled + denominator - 1) / denominator)
+        .map_err(|_| AppError::Internal("market refund amount overflowed".into()))
+}
+
+fn fixed_term_refund_terms(
+    refundable_base_units: i64,
+    elapsed_ms: i128,
+    total_ms: i128,
+) -> Result<(i64, i64), AppError> {
+    if total_ms <= 0 {
+        return Err(AppError::Internal(
+            "fixed-term refund interval is invalid".into(),
+        ));
+    }
+    let elapsed_ms = elapsed_ms.clamp(0, total_ms);
+    let remaining_ms = total_ms - elapsed_ms;
+    if elapsed_ms * 2 < total_ms {
+        Ok((10_000, refundable_base_units.max(0)))
+    } else if elapsed_ms * 5 < total_ms * 4 {
+        Ok((5_000, ceil_mul_div(refundable_base_units, 1, 2)?))
+    } else if remaining_ms > 0 {
+        Ok((
+            i64::try_from((remaining_ms * 10_000 + total_ms - 1) / total_ms)
+                .unwrap_or(10_000)
+                .clamp(0, 10_000),
+            ceil_mul_div(refundable_base_units, remaining_ms, total_ms)?,
+        ))
+    } else {
+        Ok((0, 0))
+    }
+}
+
+pub(crate) fn supplier_termination_calculation_tx(
+    conn: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    now: DateTime<Utc>,
+) -> Result<SupplierTerminationCalculation, AppError> {
+    accrue_contract_until_tx(conn, product_kind, product_ref, now)?;
+    let row = conn
+        .query_row(
+            "SELECT contract.id, contract.account_id, contract.product_kind,
+                    contract.product_ref, contract.currency,
+                    COALESCE(contract.service_started_at, contract.activated_at),
+                    subscription.expires_at
+             FROM market_service_contracts contract
+             LEFT JOIN share_market_subscriptions subscription
+               ON contract.product_kind = 'share' AND subscription.id = contract.product_ref
+             WHERE contract.product_kind = ?1 AND contract.product_ref = ?2
+               AND contract.status != 'terminated'",
+            params![product_kind, product_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read fixed-term market contract"))?
+        .ok_or_else(|| AppError::NotFound("active market contract not found".into()))?;
+    let service_ends_at = row.6.ok_or_else(|| {
+        AppError::coded_conflict(
+            "share_market_fixed_term_required",
+            "supplier early-termination refunds apply only to fixed-term rentals",
+            serde_json::json!({ "reason": "fixed_term_required" }),
+        )
+    })?;
+    let service_started = parse_time(&row.5)?;
+    let service_ends = parse_time(&service_ends_at)?;
+    if service_ends <= service_started {
+        return Err(AppError::Internal(
+            "stored fixed-term market contract has an invalid service interval".into(),
+        ));
+    }
+    let total_ms = i128::from(
+        service_ends
+            .timestamp_millis()
+            .saturating_sub(service_started.timestamp_millis()),
+    );
+    let elapsed_ms = i128::from(
+        now.timestamp_millis()
+            .saturating_sub(service_started.timestamp_millis()),
+    )
+    .clamp(0, total_ms);
+    let refundable_base_units = conn
+        .query_row(
+            "SELECT COALESCE(SUM(MAX(accrual.amount_units - accrual.credited_units, 0)), 0)
+             FROM market_accrual_entries accrual
+             LEFT JOIN market_invoices invoice ON invoice.id = accrual.invoice_id
+             WHERE accrual.contract_id = ?1
+               AND (accrual.status = 'unbilled'
+                    OR (accrual.status = 'invoiced' AND invoice.status != 'void'))",
+            params![row.0],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("read refundable market accrual"))?
+        .max(0);
+    let (refund_bps, amount_units) =
+        fixed_term_refund_terms(refundable_base_units, elapsed_ms, total_ms)?;
+    let elapsed_bps = i64::try_from(elapsed_ms * 10_000 / total_ms)
+        .unwrap_or(10_000)
+        .clamp(0, 10_000);
+    Ok(SupplierTerminationCalculation {
+        contract_id: row.0,
+        account_id: row.1,
+        product_kind: row.2,
+        product_ref: row.3,
+        currency: row.4,
+        service_started_at: row.5,
+        service_ends_at,
+        evaluated_at: now.to_rfc3339(),
+        elapsed_bps,
+        refund_bps,
+        refundable_base_units,
+        amount_units,
+        amount_minor: ceil_minor(amount_units),
+    })
+}
+
+#[derive(Debug)]
+struct RefundAllocationDraft {
+    target_kind: &'static str,
+    target_id: String,
+    amount_units: i64,
+    amount_minor: i64,
+}
+
+fn distribute_refund_minor(
+    drafts: &mut [RefundAllocationDraft],
+    total_minor: i64,
+) -> Result<(), AppError> {
+    let mut assigned = 0_i64;
+    let mut remainders = Vec::with_capacity(drafts.len());
+    for (index, draft) in drafts.iter_mut().enumerate() {
+        draft.amount_minor = draft.amount_units / MONEY_UNITS_PER_MINOR;
+        assigned = assigned
+            .checked_add(draft.amount_minor)
+            .ok_or_else(|| AppError::Internal("refund minor allocation overflowed".into()))?;
+        remainders.push((draft.amount_units % MONEY_UNITS_PER_MINOR, index));
+    }
+    if assigned > total_minor {
+        return Err(AppError::Internal(
+            "refund minor allocation exceeds its total".into(),
+        ));
+    }
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut remaining = total_minor - assigned;
+    for (_, index) in remainders {
+        if remaining == 0 {
+            break;
+        }
+        drafts[index].amount_minor += 1;
+        remaining -= 1;
+    }
+    if remaining != 0 {
+        return Err(AppError::Internal(
+            "refund minor allocation did not conserve its total".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn distribute_amount_by_weight(
+    weights: &[(String, i64)],
+    total_amount: i64,
+) -> Result<Vec<(String, i64)>, AppError> {
+    if total_amount < 0 || weights.iter().any(|(_, weight)| *weight < 0) {
+        return Err(AppError::Internal(
+            "market invoice allocation contains a negative amount".into(),
+        ));
+    }
+    let total_weight = weights.iter().try_fold(0_i64, |total, (_, weight)| {
+        total
+            .checked_add(*weight)
+            .ok_or_else(|| AppError::Internal("market invoice allocation overflowed".into()))
+    })?;
+    if total_weight == 0 {
+        if total_amount == 0 {
+            return Ok(weights.iter().map(|(id, _)| (id.clone(), 0)).collect());
+        }
+        return Err(AppError::Internal(
+            "market invoice has money without a remaining line balance".into(),
+        ));
+    }
+
+    let denominator = i128::from(total_weight);
+    let mut assigned = 0_i64;
+    let mut allocations = Vec::with_capacity(weights.len());
+    let mut remainders = Vec::with_capacity(weights.len());
+    for (index, (id, weight)) in weights.iter().enumerate() {
+        let scaled = i128::from(*weight)
+            .checked_mul(i128::from(total_amount))
+            .ok_or_else(|| AppError::Internal("market invoice allocation overflowed".into()))?;
+        let amount = i64::try_from(scaled / denominator)
+            .map_err(|_| AppError::Internal("market invoice allocation overflowed".into()))?;
+        assigned = assigned
+            .checked_add(amount)
+            .ok_or_else(|| AppError::Internal("market invoice allocation overflowed".into()))?;
+        allocations.push((id.clone(), amount));
+        remainders.push((scaled % denominator, index));
+    }
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut remaining = total_amount.saturating_sub(assigned);
+    for (_, index) in remainders {
+        if remaining == 0 {
+            break;
+        }
+        allocations[index].1 += 1;
+        remaining -= 1;
+    }
+    if remaining != 0 {
+        return Err(AppError::Internal(
+            "market invoice allocation did not conserve its total".into(),
+        ));
+    }
+    Ok(allocations)
+}
+
+fn rebalance_invoice_lines_tx(
+    conn: &Connection,
+    invoice_id: &str,
+    amount_minor: i64,
+    amount_cny_minor: i64,
+) -> Result<(), AppError> {
+    let line_weights = conn
+        .prepare(
+            "SELECT id, amount_units FROM market_invoice_lines
+             WHERE invoice_id = ?1 ORDER BY id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![invoice_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read market invoice lines for reallocation"))?;
+    if line_weights.is_empty() {
+        return Err(AppError::Internal(
+            "market invoice has no lines to reallocate".into(),
+        ));
+    }
+    let usd_allocations = distribute_amount_by_weight(&line_weights, amount_minor)?;
+    let cny_weights = usd_allocations
+        .iter()
+        .map(|(id, amount)| (id.clone(), *amount))
+        .collect::<Vec<_>>();
+    let cny_allocations = distribute_amount_by_weight(&cny_weights, amount_cny_minor)?;
+    for ((line_id, line_amount_minor), (cny_line_id, line_amount_cny_minor)) in
+        usd_allocations.iter().zip(&cny_allocations)
+    {
+        if line_id != cny_line_id {
+            return Err(AppError::Internal(
+                "market invoice line allocation order changed".into(),
+            ));
+        }
+        conn.execute(
+            "UPDATE market_invoice_lines
+             SET amount_minor = ?2, amount_cny_minor = ?3 WHERE id = ?1",
+            params![line_id, line_amount_minor, line_amount_cny_minor],
+        )
+        .map_err(map_db("reallocate market invoice line money"))?;
+    }
+    Ok(())
+}
+
+fn supplier_termination_adjustment_tx(
+    conn: &Connection,
+    idempotency_key: &str,
+) -> Result<Option<SupplierTerminationAdjustment>, AppError> {
+    let row = conn
+        .query_row(
+            "SELECT id, status, calculation_json
+             FROM market_contract_adjustments WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read idempotent market adjustment"))?;
+    let Some((id, status, calculation_json)) = row else {
+        return Ok(None);
+    };
+    let calculation = serde_json::from_str(&calculation_json).map_err(|_| {
+        AppError::Internal("stored market adjustment calculation is invalid".into())
+    })?;
+    let allocation_minor = |kind: &str| -> Result<i64, AppError> {
+        conn.query_row(
+            "SELECT COALESCE(SUM(amount_minor), 0)
+             FROM market_adjustment_allocations
+             WHERE adjustment_id = ?1 AND target_kind = ?2",
+            params![id, kind],
+            |row| row.get(0),
+        )
+        .map_err(map_db("read market adjustment allocation"))
+    };
+    let obligations = conn
+        .prepare(
+            "SELECT id, adjustment_id, invoice_id, amount_minor, currency, status,
+                    due_at, external_reference, recorded_at
+             FROM market_refund_obligations WHERE adjustment_id = ?1
+             ORDER BY created_at, id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![id], |row| {
+                    Ok(RefundObligationView {
+                        id: row.get(0)?,
+                        adjustment_id: row.get(1)?,
+                        invoice_id: row.get(2)?,
+                        amount_minor: row.get(3)?,
+                        currency: row.get(4)?,
+                        status: row.get(5)?,
+                        due_at: row.get(6)?,
+                        external_reference: row.get(7)?,
+                        recorded_at: row.get(8)?,
+                        can_record: false,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read market refund obligations"))?;
+    let unbilled_credit_minor = allocation_minor("unbilled_accrual")?;
+    let invoice_credit_minor = allocation_minor("invoice_credit")?;
+    let external_refund_minor = allocation_minor("external_refund")?;
+    Ok(Some(SupplierTerminationAdjustment {
+        id,
+        status,
+        calculation,
+        unbilled_credit_minor,
+        invoice_credit_minor,
+        external_refund_minor,
+        obligations,
+    }))
+}
+
+pub(crate) fn apply_supplier_early_termination_refund_tx(
+    conn: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    reason: &str,
+    idempotency_key: &str,
+    now: DateTime<Utc>,
+) -> Result<SupplierTerminationAdjustment, AppError> {
+    if let Some(adjustment) = idempotent_supplier_termination_adjustment_tx(
+        conn,
+        idempotency_key,
+        product_kind,
+        product_ref,
+    )? {
+        return Ok(adjustment);
+    }
+    let calculation = supplier_termination_calculation_tx(conn, product_kind, product_ref, now)?;
+    apply_supplier_termination_calculation_tx(conn, calculation, reason, idempotency_key, now)
+}
+
+pub(crate) fn apply_quoted_supplier_early_termination_refund_tx(
+    conn: &Connection,
+    calculation: &SupplierTerminationCalculation,
+    reason: &str,
+    idempotency_key: &str,
+    now: DateTime<Utc>,
+) -> Result<SupplierTerminationAdjustment, AppError> {
+    if let Some(adjustment) = idempotent_supplier_termination_adjustment_tx(
+        conn,
+        idempotency_key,
+        &calculation.product_kind,
+        &calculation.product_ref,
+    )? {
+        return Ok(adjustment);
+    }
+    validate_quoted_supplier_termination_calculation_tx(conn, calculation)?;
+    apply_supplier_termination_calculation_tx(
+        conn,
+        calculation.clone(),
+        reason,
+        idempotency_key,
+        now,
+    )
+}
+
+fn idempotent_supplier_termination_adjustment_tx(
+    conn: &Connection,
+    idempotency_key: &str,
+    product_kind: &str,
+    product_ref: &str,
+) -> Result<Option<SupplierTerminationAdjustment>, AppError> {
+    let adjustment = supplier_termination_adjustment_tx(conn, idempotency_key)?;
+    if adjustment.as_ref().is_some_and(|adjustment| {
+        adjustment.calculation.product_kind != product_kind
+            || adjustment.calculation.product_ref != product_ref
+    }) {
+        return Err(AppError::Conflict(
+            "supplier termination idempotency key was already used for another contract".into(),
+        ));
+    }
+    Ok(adjustment)
+}
+
+fn validate_quoted_supplier_termination_calculation_tx(
+    conn: &Connection,
+    calculation: &SupplierTerminationCalculation,
+) -> Result<(), AppError> {
+    if calculation.elapsed_bps < 0
+        || calculation.elapsed_bps > 10_000
+        || calculation.refund_bps < 0
+        || calculation.refund_bps > 10_000
+        || calculation.refundable_base_units < 0
+        || calculation.amount_units < 0
+        || calculation.amount_units > calculation.refundable_base_units
+        || calculation.amount_minor != ceil_minor(calculation.amount_units)
+    {
+        return Err(AppError::Internal(
+            "stored supplier termination quote is invalid".into(),
+        ));
+    }
+    let contract = conn
+        .query_row(
+            "SELECT id, account_id, currency FROM market_service_contracts
+             WHERE product_kind = ?1 AND product_ref = ?2 AND status != 'terminated'",
+            params![calculation.product_kind, calculation.product_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("validate quoted market contract"))?
+        .ok_or_else(|| {
+            AppError::Conflict("the quoted market contract is no longer active".into())
+        })?;
+    if contract.0 != calculation.contract_id
+        || contract.1 != calculation.account_id
+        || contract.2 != calculation.currency
+    {
+        return Err(AppError::Conflict(
+            "the quoted market contract identity changed".into(),
+        ));
+    }
+    let available_units = conn
+        .query_row(
+            "SELECT COALESCE(SUM(MAX(accrual.amount_units - accrual.credited_units, 0)), 0)
+             FROM market_accrual_entries accrual
+             LEFT JOIN market_invoices invoice ON invoice.id = accrual.invoice_id
+             WHERE accrual.contract_id = ?1
+               AND (accrual.status = 'unbilled'
+                    OR (accrual.status = 'invoiced' AND invoice.status != 'void'))",
+            params![calculation.contract_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("validate quoted refundable market accrual"))?;
+    if available_units < calculation.amount_units {
+        return Err(AppError::Conflict(
+            "the refundable balance changed; request a new termination quote".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_supplier_termination_calculation_tx(
+    conn: &Connection,
+    calculation: SupplierTerminationCalculation,
+    reason: &str,
+    idempotency_key: &str,
+    now: DateTime<Utc>,
+) -> Result<SupplierTerminationAdjustment, AppError> {
+    let adjustment_id = Uuid::new_v4().to_string();
+    let now_text = now.to_rfc3339();
+    let calculation_json = serde_json::to_string(&calculation)
+        .map_err(|error| AppError::Internal(format!("encode market refund failed: {error}")))?;
+    conn.execute(
+        "INSERT INTO market_contract_adjustments (
+            id, account_id, contract_id, product_kind, product_ref, kind, status,
+            currency, elapsed_bps, refund_bps, refundable_base_units,
+            amount_units, amount_minor, unbilled_credit_units, invoice_credit_units,
+            external_refund_units, reason, calculation_json, idempotency_key,
+            created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'supplier_early_termination_refund',
+                   'applied', ?6, ?7, ?8, ?9, ?10, ?11, 0, 0, 0,
+                   ?12, ?13, ?14, ?15, ?15)",
+        params![
+            adjustment_id,
+            calculation.account_id,
+            calculation.contract_id,
+            calculation.product_kind,
+            calculation.product_ref,
+            calculation.currency,
+            calculation.elapsed_bps,
+            calculation.refund_bps,
+            calculation.refundable_base_units,
+            calculation.amount_units,
+            calculation.amount_minor,
+            reason,
+            calculation_json,
+            idempotency_key,
+            now_text,
+        ],
+    )
+    .map_err(map_db("create supplier termination adjustment"))?;
+
+    let rows = conn
+        .prepare(
+            "SELECT accrual.id, accrual.status, accrual.invoice_id,
+                    MAX(accrual.amount_units - accrual.credited_units, 0),
+                    invoice.status
+             FROM market_accrual_entries accrual
+             LEFT JOIN market_invoices invoice ON invoice.id = accrual.invoice_id
+             WHERE accrual.contract_id = ?1
+               AND MAX(accrual.amount_units - accrual.credited_units, 0) > 0
+               AND (accrual.status = 'unbilled'
+                    OR (accrual.status = 'invoiced' AND invoice.status != 'void'))
+             ORDER BY CASE
+                        WHEN accrual.status = 'unbilled' THEN 0
+                        WHEN invoice.status != 'paid' THEN 1 ELSE 2 END,
+                      accrual.created_at, accrual.id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![calculation.contract_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read refundable market accrual entries"))?;
+    let mut remaining = calculation.amount_units;
+    let mut grouped = BTreeMap::<(String, String), i64>::new();
+    for (accrual_id, accrual_status, invoice_id, available_units, invoice_status) in rows {
+        if remaining <= 0 {
+            break;
+        }
+        let amount_units = available_units.min(remaining);
+        if amount_units <= 0 {
+            continue;
+        }
+        conn.execute(
+            "UPDATE market_accrual_entries
+             SET credited_units = credited_units + ?2,
+                 status = CASE WHEN status = 'unbilled'
+                                    AND credited_units + ?2 >= amount_units
+                               THEN 'credited' ELSE status END,
+                 updated_at = ?3 WHERE id = ?1",
+            params![accrual_id, amount_units, now_text],
+        )
+        .map_err(map_db("credit market accrual entry"))?;
+        let (kind, target_id) = if accrual_status == "unbilled" {
+            ("unbilled_accrual", calculation.contract_id.clone())
+        } else {
+            let invoice_id = invoice_id.ok_or_else(|| {
+                AppError::Internal("invoiced market accrual is missing its invoice".into())
+            })?;
+            if invoice_status.as_deref() == Some(INVOICE_PAID) {
+                ("external_refund", invoice_id)
+            } else {
+                ("invoice_credit", invoice_id)
+            }
+        };
+        grouped
+            .entry((kind.into(), target_id))
+            .and_modify(|units| *units = units.saturating_add(amount_units))
+            .or_insert(amount_units);
+        remaining -= amount_units;
+    }
+    if remaining != 0 {
+        return Err(AppError::Internal(
+            "refundable market accrual changed during adjustment".into(),
+        ));
+    }
+    let mut drafts = grouped
+        .into_iter()
+        .map(|((kind, target_id), amount_units)| RefundAllocationDraft {
+            target_kind: match kind.as_str() {
+                "unbilled_accrual" => "unbilled_accrual",
+                "invoice_credit" => "invoice_credit",
+                _ => "external_refund",
+            },
+            target_id,
+            amount_units,
+            amount_minor: 0,
+        })
+        .collect::<Vec<_>>();
+    distribute_refund_minor(&mut drafts, calculation.amount_minor)?;
+    let mut unbilled_units = 0_i64;
+    let mut invoice_credit_units = 0_i64;
+    let mut external_refund_units = 0_i64;
+    for draft in &drafts {
+        conn.execute(
+            "INSERT INTO market_adjustment_allocations (
+                id, adjustment_id, target_kind, target_id,
+                amount_units, amount_minor, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                adjustment_id,
+                draft.target_kind,
+                draft.target_id,
+                draft.amount_units,
+                draft.amount_minor,
+                now_text,
+            ],
+        )
+        .map_err(map_db("record market refund allocation"))?;
+        match draft.target_kind {
+            "unbilled_accrual" => {
+                unbilled_units = unbilled_units.saturating_add(draft.amount_units);
+            }
+            "invoice_credit" => {
+                invoice_credit_units = invoice_credit_units.saturating_add(draft.amount_units);
+                apply_supplier_invoice_credit_tx(
+                    conn,
+                    &adjustment_id,
+                    &calculation,
+                    &draft.target_id,
+                    draft.amount_units,
+                    draft.amount_minor,
+                    reason,
+                    &now_text,
+                )?;
+            }
+            _ => {
+                external_refund_units = external_refund_units.saturating_add(draft.amount_units);
+                if draft.amount_minor > 0 {
+                    conn.execute(
+                        "INSERT INTO market_refund_obligations (
+                            id, adjustment_id, account_id, invoice_id,
+                            supplier_user_id, buyer_user_id, amount_units, amount_minor,
+                            currency, status, due_at, created_at, updated_at
+                         ) SELECT ?1, ?2, ?3, ?4, account.supplier_user_id,
+                                  account.buyer_user_id, ?5, ?6, ?7, 'pending', ?8, ?9, ?9
+                           FROM market_credit_accounts account WHERE account.id = ?3",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            adjustment_id,
+                            calculation.account_id,
+                            draft.target_id,
+                            draft.amount_units,
+                            draft.amount_minor,
+                            calculation.currency,
+                            (now + Duration::days(EXTERNAL_REFUND_DUE_DAYS)).to_rfc3339(),
+                            now_text,
+                        ],
+                    )
+                    .map_err(map_db("create external market refund obligation"))?;
+                }
+            }
+        }
+    }
+    if unbilled_units > 0 {
+        conn.execute(
+            "UPDATE market_credit_accounts
+             SET balance_units = MAX(balance_units - ?2, 0),
+                 version = version + 1, updated_at = ?3 WHERE id = ?1",
+            params![calculation.account_id, unbilled_units, now_text],
+        )
+        .map_err(map_db("apply unbilled market refund credit"))?;
+    }
+    conn.execute(
+        "UPDATE market_contract_adjustments
+         SET status = CASE WHEN EXISTS (
+                SELECT 1 FROM market_refund_obligations obligation
+                WHERE obligation.adjustment_id = ?1 AND obligation.status != 'recorded'
+             ) THEN 'refund_due' ELSE 'applied' END,
+             unbilled_credit_units = ?2, invoice_credit_units = ?3,
+             external_refund_units = ?4, updated_at = ?5 WHERE id = ?1",
+        params![
+            adjustment_id,
+            unbilled_units,
+            invoice_credit_units,
+            external_refund_units,
+            now_text,
+        ],
+    )
+    .map_err(map_db("complete supplier termination adjustment"))?;
+    record_event_tx(
+        conn,
+        Some(&calculation.account_id),
+        Some(&calculation.contract_id),
+        None,
+        None,
+        "supplier_early_termination_refund",
+        serde_json::json!({
+            "adjustmentId": adjustment_id,
+            "elapsedBps": calculation.elapsed_bps,
+            "refundBps": calculation.refund_bps,
+            "amountMinor": calculation.amount_minor,
+            "currency": calculation.currency,
+        }),
+        &format!("supplier-termination-adjustment:{idempotency_key}"),
+        &now_text,
+    )?;
+    supplier_termination_adjustment_tx(conn, idempotency_key)?.ok_or_else(|| {
+        AppError::Internal("created supplier termination adjustment is missing".into())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_supplier_invoice_credit_tx(
+    conn: &Connection,
+    adjustment_id: &str,
+    calculation: &SupplierTerminationCalculation,
+    invoice_id: &str,
+    amount_units: i64,
+    amount_minor: i64,
+    reason: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    let (invoice_status, rate_micros, invoice_amount_units, invoice_amount_minor) = conn
+        .query_row(
+            "SELECT status, usd_cny_rate_micros, amount_units,
+                    amount_minor
+             FROM market_invoices WHERE id = ?1",
+            params![invoice_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .map_err(map_db("read invoice for supplier termination credit"))?;
+    if invoice_status == INVOICE_PAID || invoice_status == INVOICE_VOID {
+        return Err(AppError::Conflict(
+            "invoice status changed during supplier termination refund".into(),
+        ));
+    }
+    if amount_units <= 0
+        || amount_units > invoice_amount_units
+        || amount_minor < 0
+        || amount_minor > invoice_amount_minor
+    {
+        return Err(AppError::Internal(
+            "supplier termination credit exceeds the invoice balance".into(),
+        ));
+    }
+    let (target_line_count, target_line_units) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(amount_units), 0)
+             FROM market_invoice_lines WHERE invoice_id = ?1 AND contract_id = ?2",
+            params![invoice_id, calculation.contract_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(map_db("validate supplier termination invoice line"))?;
+    if target_line_count != 1 || target_line_units < amount_units {
+        return Err(AppError::Internal(
+            "supplier termination invoice line is missing or inconsistent".into(),
+        ));
+    }
+    let fully_credited = invoice_amount_units <= amount_units;
+    let remaining_amount_units = invoice_amount_units.saturating_sub(amount_units);
+    let remaining_amount_minor = invoice_amount_minor.saturating_sub(amount_minor);
+    let remaining_amount_cny_minor = usd_minor_to_cny_minor(remaining_amount_minor, rate_micros);
+    if amount_minor > 0 {
+        conn.execute(
+            "INSERT INTO market_credit_notes (
+                id, account_id, invoice_id, kind, amount_units, amount_minor,
+                currency, reason, external_reference, status,
+                created_by_user_id, created_by_email, created_at,
+                contract_id, adjustment_id, idempotency_key
+             ) SELECT ?1, ?2, ?3, 'service_credit', ?4, ?5, ?6, ?7,
+                      NULL, 'applied', account.supplier_user_id,
+                      account.supplier_email, ?8, ?9, ?10, ?11
+               FROM market_credit_accounts account WHERE account.id = ?2",
+            params![
+                Uuid::new_v4().to_string(),
+                calculation.account_id,
+                invoice_id,
+                amount_units,
+                amount_minor,
+                calculation.currency,
+                reason,
+                now,
+                calculation.contract_id,
+                adjustment_id,
+                format!("supplier-termination-credit:{adjustment_id}:{invoice_id}"),
+            ],
+        )
+        .map_err(map_db("create supplier termination credit note"))?;
+    }
+    let changed = conn
+        .execute(
+            "UPDATE market_invoice_lines
+         SET amount_units = MAX(amount_units - ?3, 0)
+         WHERE invoice_id = ?1 AND contract_id = ?2",
+            params![invoice_id, calculation.contract_id, amount_units],
+        )
+        .map_err(map_db("apply supplier credit to invoice line"))?;
+    if changed != 1 {
+        return Err(AppError::Internal(
+            "supplier termination invoice line changed concurrently".into(),
+        ));
+    }
+    conn.execute(
+        "UPDATE market_invoices
+         SET amount_units = ?2,
+             amount_minor = ?3,
+             amount_cny_minor = ?4,
+             status = CASE WHEN ?2 = 0 THEN 'void'
+                           WHEN status = 'payment_declared' THEN 'open' ELSE status END,
+             voided_at = CASE WHEN ?2 = 0 THEN ?5 ELSE voided_at END,
+             declared_at = CASE WHEN status = 'payment_declared' THEN NULL ELSE declared_at END
+         WHERE id = ?1",
+        params![
+            invoice_id,
+            remaining_amount_units,
+            remaining_amount_minor,
+            remaining_amount_cny_minor,
+            now
+        ],
+    )
+    .map_err(map_db("apply supplier credit to invoice"))?;
+    rebalance_invoice_lines_tx(
+        conn,
+        invoice_id,
+        remaining_amount_minor,
+        remaining_amount_cny_minor,
+    )?;
+    conn.execute(
+        "UPDATE market_payment_declarations SET status = 'superseded'
+         WHERE invoice_id = ?1 AND status = 'declared'",
+        params![invoice_id],
+    )
+    .map_err(map_db("supersede changed invoice payment declaration"))?;
+    if fully_credited {
+        let (close_requested, credit_kind) = conn
+            .query_row(
+                "SELECT close_requested, credit_kind
+                 FROM market_credit_accounts WHERE id = ?1",
+                params![calculation.account_id],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+            )
+            .map_err(map_db("read fully credited market account"))?;
+        let credit_revoked = credit_kind == crate::market_access::CREDIT_NONE;
+        conn.execute(
+            "UPDATE market_credit_accounts
+             SET balance_units = MAX(balance_units - ?2, 0),
+                 status = CASE WHEN ?3 THEN 'closed' ELSE 'active' END,
+                 open_invoice_id = NULL,
+                 version = version + 1, updated_at = ?4 WHERE id = ?1",
+            params![calculation.account_id, amount_units, close_requested, now],
+        )
+        .map_err(map_db("settle fully credited market account"))?;
+        conn.execute(
+            "UPDATE market_credit_restrictions SET status = 'lifted', lifted_at = ?2
+             WHERE invoice_id = ?1 AND status = 'active'",
+            params![invoice_id, now],
+        )
+        .map_err(map_db("lift fully credited invoice restriction"))?;
+        conn.execute(
+            "UPDATE market_billing_disputes
+             SET status = 'resolved', resolution = 'service_credit', resolved_at = ?2
+             WHERE invoice_id = ?1 AND status = 'open'",
+            params![invoice_id, now],
+        )
+        .map_err(map_db("resolve fully credited invoice dispute"))?;
+        if close_requested || credit_revoked {
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET desired_control_state = 'terminated', control_error = ?2, updated_at = ?3
+                 WHERE account_id = ?1 AND status = 'billing_suspended'",
+                params![
+                    calculation.account_id,
+                    if close_requested {
+                        "supplier_credit_closed"
+                    } else {
+                        "supplier_credit_revoked"
+                    },
+                    now,
+                ],
+            )
+            .map_err(map_db(
+                "retain service termination after full supplier credit",
+            ))?;
+        } else {
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
+                     desired_control_state = 'active', applied_control_state = 'suspended',
+                     suspended_at = NULL, last_evaluated_at = ?2, updated_at = ?2
+                 WHERE account_id = ?1 AND status = 'billing_suspended'",
+                params![calculation.account_id, now],
+            )
+            .map_err(map_db("resume services after full supplier credit"))?;
+        }
+    } else {
+        conn.execute(
+            "UPDATE market_credit_accounts
+             SET balance_units = MAX(balance_units - ?2, 0),
+                 status = CASE WHEN status = 'payment_declared' THEN 'settlement_due'
+                               ELSE status END,
+                 version = version + 1, updated_at = ?3 WHERE id = ?1",
+            params![calculation.account_id, amount_units, now],
+        )
+        .map_err(map_db("apply partial supplier credit to market account"))?;
+    }
+    Ok(())
+}
+
+fn refund_obligation_view_tx(
+    conn: &Connection,
+    obligation_id: &str,
+    actor_user_id: Option<&str>,
+) -> Result<Option<RefundObligationView>, AppError> {
+    conn.query_row(
+        "SELECT id, adjustment_id, invoice_id, amount_minor, currency, status,
+                due_at, external_reference, recorded_at, supplier_user_id
+         FROM market_refund_obligations WHERE id = ?1",
+        params![obligation_id],
+        |row| {
+            let status = row.get::<_, String>(5)?;
+            let supplier_user_id = row.get::<_, String>(9)?;
+            Ok(RefundObligationView {
+                id: row.get(0)?,
+                adjustment_id: row.get(1)?,
+                invoice_id: row.get(2)?,
+                amount_minor: row.get(3)?,
+                currency: row.get(4)?,
+                can_record: actor_user_id
+                    .is_some_and(|actor| supplier_user_id == actor && status != "recorded"),
+                status,
+                due_at: row.get(6)?,
+                external_reference: row.get(7)?,
+                recorded_at: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_db("read market refund obligation"))
+}
+
+fn refund_obligations_for_actor_tx(
+    conn: &Connection,
+    actor_user_id: &str,
+) -> Result<Vec<RefundObligationView>, AppError> {
+    conn.prepare(
+        "SELECT id, adjustment_id, invoice_id, amount_minor, currency, status,
+                due_at, external_reference, recorded_at, supplier_user_id
+         FROM market_refund_obligations
+         WHERE supplier_user_id = ?1 OR buyer_user_id = ?1
+         ORDER BY CASE status WHEN 'overdue' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                  created_at DESC, id DESC
+         LIMIT 100",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![actor_user_id], |row| {
+                let status = row.get::<_, String>(5)?;
+                let supplier_user_id = row.get::<_, String>(9)?;
+                Ok(RefundObligationView {
+                    id: row.get(0)?,
+                    adjustment_id: row.get(1)?,
+                    invoice_id: row.get(2)?,
+                    amount_minor: row.get(3)?,
+                    currency: row.get(4)?,
+                    can_record: supplier_user_id == actor_user_id && status != "recorded",
+                    status,
+                    due_at: row.get(6)?,
+                    external_reference: row.get(7)?,
+                    recorded_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .map_err(map_db("read market refund obligations for dashboard"))
+}
+
+impl AppStore {
+    pub async fn market_billing_record_refund_obligation(
+        &self,
+        session: &AuthSession,
+        obligation_id: &str,
+        external_reference: &str,
+    ) -> Result<RefundObligationView, AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin external market refund record"))?;
+        let row = tx
+            .query_row(
+                "SELECT obligation.adjustment_id, obligation.invoice_id,
+                        obligation.supplier_user_id, obligation.amount_units,
+                        obligation.amount_minor, obligation.currency, obligation.status,
+                        adjustment.account_id, adjustment.contract_id
+                 FROM market_refund_obligations obligation
+                 JOIN market_contract_adjustments adjustment
+                   ON adjustment.id = obligation.adjustment_id
+                 WHERE obligation.id = ?1",
+                params![obligation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read external market refund actor"))?
+            .ok_or_else(|| AppError::NotFound("market refund obligation not found".into()))?;
+        if row.2 != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the supplier can record this external refund".into(),
+            ));
+        }
+        if row.6 == "recorded" {
+            let view = refund_obligation_view_tx(&tx, obligation_id, Some(&session.user_id))?
+                .ok_or_else(|| {
+                    AppError::Internal("recorded market refund obligation is missing".into())
+                })?;
+            if view.external_reference.as_deref() != Some(external_reference) {
+                return Err(AppError::Conflict(
+                    "this refund was already recorded with another external reference".into(),
+                ));
+            }
+            tx.commit()
+                .map_err(map_db("commit idempotent external market refund"))?;
+            return Ok(view);
+        }
+        tx.execute(
+            "UPDATE market_refund_obligations
+             SET status = 'recorded', external_reference = ?2,
+                 recorded_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND status IN ('pending', 'overdue')",
+            params![obligation_id, external_reference, now],
+        )
+        .map_err(map_db("record external market refund"))?;
+        tx.execute(
+            "INSERT INTO market_credit_notes (
+                id, account_id, invoice_id, kind, amount_units, amount_minor,
+                currency, reason, external_reference, status,
+                created_by_user_id, created_by_email, created_at,
+                contract_id, adjustment_id, idempotency_key
+             ) VALUES (?1, ?2, ?3, 'external_refund', ?4, ?5, ?6,
+                       'supplier early termination refund', ?7, 'recorded',
+                       ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                Uuid::new_v4().to_string(),
+                row.7,
+                row.1,
+                row.3,
+                row.4,
+                row.5,
+                external_reference,
+                session.user_id,
+                session.email,
+                now,
+                row.8,
+                row.0,
+                format!("external-refund-recorded:{obligation_id}"),
+            ],
+        )
+        .map_err(map_db("create recorded external refund note"))?;
+        tx.execute(
+            "UPDATE market_contract_adjustments
+             SET status = CASE WHEN EXISTS (
+                    SELECT 1 FROM market_refund_obligations
+                    WHERE adjustment_id = ?1 AND status != 'recorded'
+                 ) THEN 'refund_due' ELSE 'settled' END,
+                 updated_at = ?2 WHERE id = ?1",
+            params![row.0, now],
+        )
+        .map_err(map_db("settle market termination adjustment"))?;
+        record_event_tx(
+            &tx,
+            Some(&row.7),
+            Some(&row.8),
+            Some(&row.1),
+            Some(&session.user_id),
+            "external_refund_recorded",
+            serde_json::json!({
+                "obligationId": obligation_id,
+                "amountMinor": row.4,
+                "currency": row.5,
+                "externalReference": external_reference,
+            }),
+            &format!("external-refund-recorded:{obligation_id}"),
+            &now,
+        )?;
+        crate::store::enqueue_operator_alert_signal_tx(
+            &tx,
+            &format!("market-refund-recorded:{obligation_id}"),
+            &format!("market_refund_overdue:refund_obligation:{obligation_id}"),
+            "resolved",
+            "market_refund_overdue",
+            "refund_obligation",
+            Some(obligation_id),
+            "warning",
+            "Market refund obligation recorded",
+            "The supplier recorded the required external refund.",
+            serde_json::json!({
+                "obligationId": obligation_id,
+                "adjustmentId": row.0,
+                "invoiceId": row.1,
+            }),
+            parse_time(&now)?,
+        )?;
+        let view = refund_obligation_view_tx(&tx, obligation_id, Some(&session.user_id))?
+            .ok_or_else(|| {
+                AppError::Internal("recorded market refund obligation is missing".into())
+            })?;
+        tx.commit()
+            .map_err(map_db("commit external market refund record"))?;
+        Ok(view)
+    }
 }
 
 fn ensure_account_tx(
@@ -3002,10 +4335,12 @@ impl AppStore {
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("read market credit restrictions"))?;
+        let refund_obligations = refund_obligations_for_actor_tx(&conn, &session.user_id)?;
         Ok(BillingDashboardView {
             accounts,
             supplier_profiles,
             restrictions,
+            refund_obligations,
             trial_hours: TRIAL_SECONDS / 3_600,
             usd_cny_rate_micros: self.market_usd_cny_rate_micros(),
         })
@@ -3635,10 +4970,10 @@ impl AppStore {
                 },
             )
             .map_err(map_db("read market invoice for credit note"))?;
-        let amount_units = amount_minor
+        let requested_units = amount_minor
             .checked_mul(MONEY_UNITS_PER_MINOR)
             .ok_or_else(|| AppError::BadRequest("credit note amount is too large".into()))?;
-        let credit_note_status = if kind == "service_credit" {
+        let (credit_note_status, amount_units) = if kind == "service_credit" {
             if !matches!(
                 invoice_status.as_str(),
                 INVOICE_OPEN | INVOICE_OVERDUE | INVOICE_DISPUTED
@@ -3648,12 +4983,17 @@ impl AppStore {
                         .into(),
                 ));
             }
-            if amount_minor > invoice_amount_minor || amount_units > invoice_amount_units {
+            if amount_minor > invoice_amount_minor {
                 return Err(AppError::BadRequest(
                     "service credit exceeds the remaining invoice amount".into(),
                 ));
             }
-            "applied"
+            let amount_units = if amount_minor == invoice_amount_minor {
+                invoice_amount_units
+            } else {
+                requested_units.min(invoice_amount_units)
+            };
+            ("applied", amount_units)
         } else {
             if invoice_status != INVOICE_PAID {
                 return Err(AppError::Conflict(
@@ -3665,21 +5005,42 @@ impl AppStore {
                     "externalReference is required for an external refund".into(),
                 ));
             }
-            let already_refunded = tx
+            let already_refunded_minor = tx
                 .query_row(
-                    "SELECT COALESCE(SUM(amount_minor), 0) FROM market_credit_notes
-                     WHERE invoice_id = ?1 AND kind = 'external_refund'",
+                    "SELECT COALESCE(SUM(amount_minor), 0)
+                     FROM market_credit_notes
+                     WHERE invoice_id = ?1 AND kind = 'external_refund' AND status = 'recorded'",
                     params![invoice_id],
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(map_db("read recorded external refunds"))?;
-            if already_refunded.saturating_add(amount_minor) > invoice_amount_minor {
+            if already_refunded_minor.saturating_add(amount_minor) > invoice_amount_minor {
                 return Err(AppError::BadRequest(
                     "recorded external refunds exceed the paid invoice amount".into(),
                 ));
             }
-            "recorded"
+            let refundable_units = tx
+                .query_row(
+                    "SELECT COALESCE(SUM(MAX(amount_units - credited_units, 0)), 0)
+                     FROM market_accrual_entries WHERE invoice_id = ?1",
+                    params![invoice_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(map_db("read paid invoice refundable accrual"))?
+                .min(invoice_amount_units);
+            let amount_units =
+                if already_refunded_minor.saturating_add(amount_minor) == invoice_amount_minor {
+                    refundable_units
+                } else {
+                    requested_units.min(refundable_units)
+                };
+            ("recorded", amount_units)
         };
+        if amount_units <= 0 {
+            return Err(AppError::Conflict(
+                "this invoice has no refundable balance remaining".into(),
+            ));
+        }
         let credit_note_id = Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO market_credit_notes (
@@ -3704,6 +5065,7 @@ impl AppStore {
             ],
         )
         .map_err(map_db("insert market credit note"))?;
+        credit_invoice_accruals_tx(&tx, invoice_id, amount_units, &now)?;
         if kind == "service_credit" {
             let remaining_minor = invoice_amount_minor - amount_minor;
             let remaining_units = invoice_amount_units - amount_units;
@@ -4120,6 +5482,53 @@ impl AppStore {
     }
 }
 
+fn credit_invoice_accruals_tx(
+    conn: &Connection,
+    invoice_id: &str,
+    amount_units: i64,
+    now: &str,
+) -> Result<(), AppError> {
+    if amount_units <= 0 {
+        return Ok(());
+    }
+    let rows = conn
+        .prepare(
+            "SELECT id, MAX(amount_units - credited_units, 0)
+             FROM market_accrual_entries
+             WHERE invoice_id = ?1 AND MAX(amount_units - credited_units, 0) > 0
+             ORDER BY created_at, id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![invoice_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read invoice accruals for credit"))?;
+    let mut remaining = amount_units;
+    for (accrual_id, available_units) in rows {
+        if remaining <= 0 {
+            break;
+        }
+        let credited_units = remaining.min(available_units);
+        conn.execute(
+            "UPDATE market_accrual_entries
+             SET credited_units = credited_units + ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![accrual_id, credited_units, now],
+        )
+        .map_err(map_db("apply invoice credit to accrual"))?;
+        remaining -= credited_units;
+    }
+    if remaining != 0 {
+        return Err(AppError::Conflict(
+            "invoice refundable balance changed; reload before recording the credit".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn void_invoice_tx(
     tx: &Transaction<'_>,
     invoice_id: &str,
@@ -4255,8 +5664,14 @@ fn latest_health_observation_tx(
     if !service_active {
         return Ok(None);
     }
+    if product_kind == "share" {
+        return crate::share_market::share_market_billing_observation_tx(
+            tx,
+            product_ref,
+            observed_at,
+        );
+    }
     let (table, key) = match product_kind {
-        "share" => ("share_health_checks", "share_id"),
         "client_host" => ("installation_health_checks", "installation_id"),
         _ => {
             return Err(AppError::Internal(format!(
@@ -4717,7 +6132,8 @@ fn open_invoice_tx(
         .prepare(
             "SELECT contract.id, contract.product_kind, contract.product_ref,
                     contract.service_ref, contract.service_label, contract.daily_rate_minor,
-                    SUM(accrual.billable_seconds), SUM(accrual.amount_units),
+                    SUM(accrual.billable_seconds),
+                    SUM(MAX(accrual.amount_units - accrual.credited_units, 0)),
                     MIN(interval.started_at), MAX(interval.ended_at)
              FROM market_accrual_entries accrual
              JOIN market_service_contracts contract ON contract.id = accrual.contract_id
@@ -4725,6 +6141,7 @@ fn open_invoice_tx(
              WHERE accrual.account_id = ?1 AND accrual.status = 'unbilled'
              GROUP BY contract.id, contract.product_kind, contract.product_ref,
                       contract.service_ref, contract.service_label, contract.daily_rate_minor
+             HAVING SUM(MAX(accrual.amount_units - accrual.credited_units, 0)) > 0
              ORDER BY MIN(interval.started_at), contract.id",
         )
         .and_then(|mut statement| {
@@ -5048,6 +6465,105 @@ fn mark_overdue_invoices_tx(tx: &Transaction<'_>, now: &str) -> Result<(), AppEr
             "invoice_overdue",
             serde_json::json!({}),
             &format!("invoice-overdue:{invoice_id}"),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+fn mark_overdue_refund_obligations_tx(
+    tx: &Transaction<'_>,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let now_text = now.to_rfc3339();
+    let obligations = tx
+        .prepare(
+            "SELECT obligation.id, obligation.adjustment_id, obligation.invoice_id,
+                    obligation.amount_minor, obligation.currency,
+                    adjustment.account_id, adjustment.contract_id
+             FROM market_refund_obligations obligation
+             JOIN market_contract_adjustments adjustment
+               ON adjustment.id = obligation.adjustment_id
+             WHERE obligation.status = 'pending' AND obligation.due_at <= ?1
+             ORDER BY obligation.due_at, obligation.id
+             LIMIT ?2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![now_text, MAX_MAINTENANCE_ROWS_PER_RECONCILE],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read overdue market refund obligations"))?;
+    for (
+        obligation_id,
+        adjustment_id,
+        invoice_id,
+        amount_minor,
+        currency,
+        account_id,
+        contract_id,
+    ) in obligations
+    {
+        let changed = tx
+            .execute(
+                "UPDATE market_refund_obligations
+                 SET status = 'overdue', updated_at = ?2
+                 WHERE id = ?1 AND status = 'pending'",
+                params![obligation_id, now_text],
+            )
+            .map_err(map_db("mark market refund obligation overdue"))?;
+        if changed == 0 {
+            continue;
+        }
+        record_event_tx(
+            tx,
+            Some(&account_id),
+            Some(&contract_id),
+            Some(&invoice_id),
+            None,
+            "external_refund_overdue",
+            serde_json::json!({
+                "obligationId": obligation_id,
+                "adjustmentId": adjustment_id,
+                "amountMinor": amount_minor,
+                "currency": currency,
+            }),
+            &format!("external-refund-overdue:{obligation_id}"),
+            &now_text,
+        )?;
+        crate::store::enqueue_operator_alert_signal_tx(
+            tx,
+            &format!("market-refund-overdue:{obligation_id}"),
+            &format!("market_refund_overdue:refund_obligation:{obligation_id}"),
+            "firing",
+            "market_refund_overdue",
+            "refund_obligation",
+            Some(&obligation_id),
+            "critical",
+            "Market refund obligation is overdue",
+            &format!(
+                "External refund obligation {obligation_id} for {amount_minor} minor {currency} units is overdue."
+            ),
+            serde_json::json!({
+                "obligationId": obligation_id,
+                "adjustmentId": adjustment_id,
+                "invoiceId": invoice_id,
+                "amountMinor": amount_minor,
+                "currency": currency,
+            }),
             now,
         )?;
     }
@@ -5401,6 +6917,7 @@ impl AppStore {
         crate::share_market::apply_accepted_price_changes_tx(&tx, &now_text)?;
         open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
         mark_overdue_invoices_tx(&tx, &now_text)?;
+        mark_overdue_refund_obligations_tx(&tx, now)?;
         let actions = pending_control_actions_tx(&tx)?;
         tx.commit()
             .map_err(map_db("commit market billing reconciliation"))?;
@@ -5432,6 +6949,298 @@ mod tests {
         assert!(parse_usd_cny_rate_micros("7.1234567").is_err());
         assert!(parse_usd_cny_rate_micros("0").is_err());
         assert!(parse_usd_cny_rate_micros("100.01").is_err());
+    }
+
+    #[test]
+    fn fixed_term_supplier_refund_uses_exact_50_and_80_percent_boundaries() {
+        let base = 1_000_000;
+        let total = 10_000_i128;
+        assert_eq!(
+            fixed_term_refund_terms(base, 4_999, total).unwrap(),
+            (10_000, base)
+        );
+        assert_eq!(
+            fixed_term_refund_terms(base, 5_000, total).unwrap(),
+            (5_000, 500_000)
+        );
+        assert_eq!(
+            fixed_term_refund_terms(base, 7_999, total).unwrap(),
+            (5_000, 500_000)
+        );
+        assert_eq!(
+            fixed_term_refund_terms(base, 8_000, total).unwrap(),
+            (2_000, 200_000)
+        );
+        assert_eq!(
+            fixed_term_refund_terms(base, 9_999, total).unwrap(),
+            (1, 100)
+        );
+        assert_eq!(
+            fixed_term_refund_terms(base, 10_000, total).unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn tiny_refund_minor_is_distributed_once_across_multiple_targets() {
+        let mut drafts = vec![
+            RefundAllocationDraft {
+                target_kind: "unbilled_accrual",
+                target_id: "contract".into(),
+                amount_units: 1,
+                amount_minor: 0,
+            },
+            RefundAllocationDraft {
+                target_kind: "invoice_credit",
+                target_id: "open-invoice".into(),
+                amount_units: 1,
+                amount_minor: 0,
+            },
+            RefundAllocationDraft {
+                target_kind: "external_refund",
+                target_id: "paid-invoice".into(),
+                amount_units: 1,
+                amount_minor: 0,
+            },
+        ];
+
+        distribute_refund_minor(&mut drafts, 1).expect("distribute one minor unit");
+
+        assert_eq!(
+            drafts.iter().map(|draft| draft.amount_minor).sum::<i64>(),
+            1
+        );
+        assert_eq!(
+            drafts
+                .iter()
+                .filter(|draft| draft.amount_minor == 1)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn supplier_invoice_credit_rebalances_rounded_multi_contract_lines() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO market_credit_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, balance_units, open_invoice_id, credit_kind,
+                credit_limit_minor, credit_source, credit_revision, created_at, updated_at
+             ) VALUES ('rounded-credit-account', 'rounded-credit-buyer', 'buyer@example.com',
+                       'rounded-credit-supplier', 'supplier@example.com', 'USD',
+                       'settlement_due', 172800, 'rounded-credit-invoice', 'limited',
+                       1000, 'counterparty', 1, ?1, ?1)",
+            params![now_text],
+        )
+        .expect("insert rounded credit account");
+        conn.execute(
+            "INSERT INTO market_invoices (
+                id, account_id, sequence, amount_minor, amount_cny_minor,
+                usd_cny_rate_micros, amount_units, currency, payment_methods_json,
+                payment_contacts_json, payment_profile_updated_at, status,
+                due_at, deadline_at, opened_at
+             ) VALUES ('rounded-credit-invoice', 'rounded-credit-account', 1, 2, 3,
+                       1500000, 172800, 'USD', '[]', '[]', ?1, 'open', ?1, ?1, ?1)",
+            params![now_text],
+        )
+        .expect("insert rounded credit invoice");
+        for (id, contract_id, units, minor, cny_minor) in [
+            (
+                "rounded-target-line",
+                "rounded-target-contract",
+                1_i64,
+                0_i64,
+                0_i64,
+            ),
+            (
+                "rounded-other-line",
+                "rounded-other-contract",
+                172_799_i64,
+                2_i64,
+                3_i64,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO market_invoice_lines (
+                    id, invoice_id, contract_id, product_kind, product_ref,
+                    service_ref, service_label, daily_rate_minor, billable_seconds,
+                    amount_minor, amount_cny_minor, amount_units,
+                    service_started_at, service_ended_at, evidence_json, created_at
+                 ) VALUES (?1, 'rounded-credit-invoice', ?2, 'share', ?2, ?2, ?2,
+                           1, 1, ?4, ?5, ?3, ?6, ?6, '{}', ?6)",
+                params![id, contract_id, units, minor, cny_minor, now_text],
+            )
+            .expect("insert rounded credit invoice line");
+        }
+        let calculation = SupplierTerminationCalculation {
+            contract_id: "rounded-target-contract".into(),
+            account_id: "rounded-credit-account".into(),
+            product_kind: "share".into(),
+            product_ref: "rounded-target-subscription".into(),
+            currency: "USD".into(),
+            service_started_at: now_text.clone(),
+            service_ends_at: (now + Duration::days(1)).to_rfc3339(),
+            evaluated_at: now_text.clone(),
+            elapsed_bps: 0,
+            refund_bps: 10_000,
+            refundable_base_units: 1,
+            amount_units: 1,
+            amount_minor: 1,
+        };
+
+        apply_supplier_invoice_credit_tx(
+            &conn,
+            "rounded-credit-adjustment",
+            &calculation,
+            "rounded-credit-invoice",
+            1,
+            1,
+            "supplier_early_termination",
+            &now_text,
+        )
+        .expect("apply rounded supplier invoice credit");
+
+        let invoice: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT amount_units, amount_minor, amount_cny_minor
+                 FROM market_invoices WHERE id = 'rounded-credit-invoice'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read rounded invoice");
+        assert_eq!(invoice, (172_799, 1, 2));
+        let line_totals: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT SUM(amount_units), SUM(amount_minor), SUM(amount_cny_minor)
+                 FROM market_invoice_lines WHERE invoice_id = 'rounded-credit-invoice'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read rounded invoice line totals");
+        assert_eq!(line_totals, invoice);
+        let target_line: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT amount_units, amount_minor, amount_cny_minor
+                 FROM market_invoice_lines WHERE id = 'rounded-target-line'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read rounded target line");
+        assert_eq!(target_line, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn invoice_credits_track_exact_accrual_net_units_including_rounded_tails() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("credit-net-supplier", "credit-net-supplier@example.com");
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO market_credit_accounts (
+                    id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                    currency, status, balance_units, open_invoice_id, credit_kind,
+                    credit_limit_minor, credit_source, credit_revision, created_at, updated_at
+                 ) VALUES ('credit-net-account', 'credit-net-buyer', 'buyer@example.com',
+                           ?1, ?2, 'USD', 'settlement_due', 129600, 'credit-net-open',
+                           'limited', 1000, 'counterparty', 1, ?3, ?3)",
+                params![supplier.user_id, supplier.email, now],
+            )
+            .expect("insert credit net account");
+            for (invoice_id, sequence, amount_units, amount_minor, status) in [
+                ("credit-net-open", 1_i64, 129_600_i64, 2_i64, "open"),
+                ("credit-net-paid", 2_i64, 100_i64, 1_i64, "paid"),
+            ] {
+                conn.execute(
+                    "INSERT INTO market_invoices (
+                        id, account_id, sequence, amount_minor, amount_cny_minor,
+                        usd_cny_rate_micros, amount_units, currency, payment_methods_json,
+                        payment_contacts_json, payment_profile_updated_at, status,
+                        due_at, deadline_at, opened_at, paid_at
+                     ) VALUES (?1, 'credit-net-account', ?2, ?3, ?3, 1000000, ?4,
+                               'USD', '[]', '[]', ?5, ?6, ?5, ?5, ?5,
+                               CASE WHEN ?6 = 'paid' THEN ?5 ELSE NULL END)",
+                    params![
+                        invoice_id,
+                        sequence,
+                        amount_minor,
+                        amount_units,
+                        now,
+                        status
+                    ],
+                )
+                .expect("insert credit net invoice");
+                conn.execute(
+                    "INSERT INTO market_accrual_entries (
+                        id, account_id, contract_id, interval_id, currency, daily_rate_minor,
+                        billable_seconds, amount_units, status, invoice_id, created_at,
+                        updated_at, credited_units
+                     ) VALUES (?1, 'credit-net-account', ?2, ?3, 'USD', 1, 1, ?4,
+                               'invoiced', ?5, ?6, ?6, 0)",
+                    params![
+                        format!("accrual-{invoice_id}"),
+                        format!("contract-{invoice_id}"),
+                        format!("interval-{invoice_id}"),
+                        amount_units,
+                        invoice_id,
+                        now,
+                    ],
+                )
+                .expect("insert credit net accrual");
+            }
+        }
+
+        store
+            .market_billing_create_credit_note(
+                &supplier,
+                "credit-net-open",
+                "service_credit",
+                1,
+                "partial service credit",
+                None,
+            )
+            .await
+            .expect("apply partial service credit");
+        store
+            .market_billing_create_credit_note(
+                &supplier,
+                "credit-net-paid",
+                "external_refund",
+                1,
+                "full external refund",
+                Some("external-refund-reference"),
+            )
+            .await
+            .expect("record rounded external refund");
+
+        let conn = store.conn.lock().await;
+        let partial: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT invoice.amount_units, accrual.credited_units, account.balance_units
+                 FROM market_invoices invoice
+                 JOIN market_accrual_entries accrual ON accrual.invoice_id = invoice.id
+                 JOIN market_credit_accounts account ON account.id = invoice.account_id
+                 WHERE invoice.id = 'credit-net-open'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read partial service credit net units");
+        assert_eq!(partial, (43_200, 86_400, 43_200));
+        let external: (i64, i64) = conn
+            .query_row(
+                "SELECT accrual.credited_units, note.amount_units
+                 FROM market_accrual_entries accrual
+                 JOIN market_credit_notes note ON note.invoice_id = accrual.invoice_id
+                 WHERE accrual.invoice_id = 'credit-net-paid'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read rounded external refund net units");
+        assert_eq!(external, (100, 100));
     }
 
     fn session(user_id: &str, email: &str) -> AuthSession {
@@ -5769,7 +7578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoice_events_share_one_client_chat_and_publish_full_billing_context() {
+    async fn invoice_events_share_one_client_chat_with_public_projection() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let now = Utc::now();
         let (subscription_id, installation_id) = {
@@ -5907,24 +7716,32 @@ mod tests {
                 .expect("read enriched billing payload");
             let payload: serde_json::Value =
                 serde_json::from_str(&payload).expect("parse billing payload");
-            assert_eq!(payload["invoiceId"], "billing-chat-invoice");
-            assert_eq!(payload["amountMinor"], 1234);
-            assert_eq!(payload["amountUsdMinor"], 1234);
-            assert_eq!(payload["amountCnyMinor"], 8638);
-            assert_eq!(payload["usdCnyRateMicros"], 7_000_000);
-            assert_eq!(payload["currency"], "USD");
             assert_eq!(payload["billingEventType"], "payment_declared");
-            assert_eq!(payload["buyerEmail"], "renter@example.com");
             assert_eq!(payload["supplierEmail"], "owner@example.com");
+            assert_eq!(payload["paymentMethodKinds"], serde_json::json!(["custom"]));
             assert_eq!(
-                payload["paymentDeclaration"]["paymentReference"],
-                "wire-reference-001"
+                payload["contacts"],
+                serde_json::json!([{"channel":"telegram","handle":"@provider"}])
             );
-            assert_eq!(
-                payload["paymentDeclaration"]["evidenceUrl"],
-                "https://evidence.example.com/receipt/001"
-            );
-            assert_eq!(payload["services"].as_array().map(Vec::len), Some(2));
+            for private_field in [
+                "invoiceId",
+                "amountMinor",
+                "amountUsdMinor",
+                "amountCnyMinor",
+                "usdCnyRateMicros",
+                "currency",
+                "buyerEmail",
+                "buyerUserId",
+                "balanceUnits",
+                "creditLimitMinor",
+                "paymentDeclaration",
+                "services",
+            ] {
+                assert!(
+                    payload.get(private_field).is_none(),
+                    "public billing event leaked {private_field}"
+                );
+            }
         }
 
         assert_eq!(

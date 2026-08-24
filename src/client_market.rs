@@ -10357,7 +10357,7 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
             assert_eq!(event_type, "cleanup_started");
             assert_eq!(payload["clientLabel"], "cleanup-client");
-            assert_eq!(payload["clientOwnerEmail"], "client@example.com");
+            assert!(payload.get("clientOwnerEmail").is_none());
             assert_eq!(payload["providerEmail"], "host@example.com");
             assert_eq!(payload["status"], "releasing");
         }

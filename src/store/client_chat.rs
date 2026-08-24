@@ -458,6 +458,11 @@ pub(crate) fn enqueue_client_system_event_tx(
         return Ok(());
     }
     let payload = sanitize_system_event_payload(payload)?;
+    let payload = if is_public_market_source_kind(source_kind) {
+        public_market_event_payload(&payload)
+    } else {
+        payload
+    };
     let payload_json = serde_json::to_string(&payload)
         .map_err(|error| AppError::Internal(format!("encode client chat event failed: {error}")))?;
     if payload_json.len() > 64 * 1024 {
@@ -522,6 +527,115 @@ pub(crate) fn sanitize_system_event_payload(
     }
     sanitize_system_event_value(&mut payload, None)?;
     Ok(payload)
+}
+
+fn is_public_market_source_kind(source_kind: &str) -> bool {
+    matches!(
+        source_kind,
+        "share_market" | "market_billing" | "client_market"
+    )
+}
+
+/// Client chat is intentionally public. Market producers keep rich private
+/// events in their own tables; the outbox and materializer only accept this
+/// allowlisted projection for the public room.
+pub(crate) fn public_market_event_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let mut public = serde_json::Map::new();
+    for field in [
+        "summary",
+        "marketKind",
+        "billingEventType",
+        "installationId",
+        "shareId",
+        "shareName",
+        "appType",
+        "subdomain",
+        "ownerEmail",
+        "supplierEmail",
+    ] {
+        if let Some(value) = payload.get(field) {
+            public.insert(field.into(), value.clone());
+        }
+    }
+
+    let market_kind = payload
+        .get("marketKind")
+        .and_then(serde_json::Value::as_str);
+    if market_kind == Some("share") {
+        for field in [
+            "listingId",
+            "seatId",
+            "seatPosition",
+            "seatStatus",
+            "subscriptionStatus",
+            "parallelLimit",
+            "tokenLimit",
+            "tokenPeriod",
+            "dailyRateMinor",
+            "currency",
+            "serviceDurationDays",
+            "offerRevision",
+        ] {
+            if let Some(value) = payload.get(field) {
+                public.insert(field.into(), value.clone());
+            }
+        }
+    }
+    if matches!(market_kind, Some("client" | "client_host")) {
+        for field in [
+            "clientLabel",
+            "providerEmail",
+            "hostname",
+            "status",
+            "dailyRateMinor",
+            "currency",
+            "offerRevision",
+            "trialHours",
+            "freeDurationDays",
+            "activatedAt",
+            "expiresAt",
+            "providerDeniedClientAccess",
+            "reason",
+            "failureCode",
+        ] {
+            if let Some(value) = payload.get(field) {
+                public.insert(field.into(), value.clone());
+            }
+        }
+        if !public.contains_key("supplierEmail")
+            && let Some(value) = payload.get("providerEmail")
+        {
+            public.insert("supplierEmail".into(), value.clone());
+        }
+    }
+
+    let method_kinds = payload
+        .get("paymentMethodKinds")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            payload
+                .get("paymentMethods")
+                .and_then(serde_json::Value::as_array)
+                .map(|methods| {
+                    methods
+                        .iter()
+                        .filter_map(|method| method.get("kind").and_then(serde_json::Value::as_str))
+                        .map(|kind| serde_json::Value::String(kind.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+    public.insert("paymentMethodKinds".into(), method_kinds.into());
+    public.insert(
+        "contacts".into(),
+        payload
+            .get("contacts")
+            .or_else(|| payload.get("paymentContacts"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    );
+    serde_json::Value::Object(public)
 }
 
 pub(crate) fn sanitize_system_event_text(value: &str) -> String {
@@ -2296,6 +2410,11 @@ fn materialize_client_system_event_tx(
     let payload = serde_json::from_str::<serde_json::Value>(&payload_json)
         .map_err(|error| AppError::Internal(format!("parse client chat event failed: {error}")))?;
     let payload = sanitize_system_event_payload(payload)?;
+    let payload = if is_public_market_source_kind(&source_kind) {
+        public_market_event_payload(&payload)
+    } else {
+        payload
+    };
     let payload_json = serde_json::to_string(&payload)
         .map_err(|error| AppError::Internal(format!("encode client chat event failed: {error}")))?;
     let mut follower_user_ids = serde_json::from_str::<Vec<String>>(&follower_user_ids_json)
@@ -2325,6 +2444,11 @@ fn materialize_client_system_event_tx(
         .map_err(|error| AppError::Internal(format!("follow client chat room failed: {error}")))?;
     }
     let message_source_id = format!("{source_kind}:{source_event_id}:{installation_id}");
+    let payload_version = if is_public_market_source_kind(&source_kind) {
+        2
+    } else {
+        1
+    };
     let body = payload
         .get("summary")
         .and_then(serde_json::Value::as_str)
@@ -2337,7 +2461,7 @@ fn materialize_client_system_event_tx(
             author_kind, message_kind, event_type, event_payload_json, payload_version,
             source_event_id, body, status, created_at, updated_at
          ) VALUES (?1, ?2, 'system', '', 'System message', ?3,
-                   'system', 'market_event', ?4, ?5, 1, ?3, ?6,
+                   'system', 'market_event', ?4, ?5, ?8, ?3, ?6,
                    'visible', ?7, ?7)",
         params![
             message_id,
@@ -2347,6 +2471,7 @@ fn materialize_client_system_event_tx(
             payload_json,
             body,
             created_at,
+            payload_version,
         ],
     )
     .map_err(|error| {

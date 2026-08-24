@@ -29,8 +29,12 @@ import type { ShareMarketSubscription } from "@/lib/types";
 import {
   formatTokenLimit,
   grantFailureMessageKey,
+  integrityReasonText,
+  integrityStatusKey,
   isCoreShareApp,
   isTerminalSubscription,
+  refundStatusKey,
+  shareMarketMutationError,
   subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
 
@@ -41,8 +45,6 @@ type PendingAction = {
   label: string;
   run: () => Promise<unknown>;
 };
-
-const HISTORY_PAGE_SIZE = 8;
 
 function isAnomalous(status: string) {
   return [
@@ -107,7 +109,7 @@ export function ShareMarketSubscriptionCard({
   onRejectPrice?: () => void;
 }) {
   const { locale, t } = useLocaleText();
-  const anomalous = isAnomalous(subscription.status);
+  const anomalous = isAnomalous(subscription.status) || subscription.integrityState !== "compatible";
   const openUrl = subdomainTunnelUrl(subscription.subdomain);
   const manageHref = perspective === "provider"
     ? shareMarketHref({ workspace: "selling", shareId: subscription.shareId })
@@ -120,7 +122,9 @@ export function ShareMarketSubscriptionCard({
   const hasStatusDetail = grantFailed
     || !!subscription.releaseReason
     || !!subscription.failureCode
-    || subscription.grantAttempts != null;
+    || subscription.grantAttempts != null
+    || subscription.integrityState !== "compatible"
+    || !!subscription.terminationAdjustment;
   const serviceTerm = subscription.serviceDurationDays == null
     ? t("shareMarket.serviceDuration.permanent")
     : t("shareMarket.serviceDuration.daysValue", { count: subscription.serviceDurationDays });
@@ -181,6 +185,8 @@ export function ShareMarketSubscriptionCard({
           {subscription.failureCode ? <p className="break-all font-mono text-[10px] text-rose-800/70">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
           {subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
           {subscription.releaseReason ? <p className="break-words text-rose-800/80">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
+          {subscription.integrityState !== "compatible" ? <p>{t(integrityStatusKey(subscription.integrityState))}{subscription.integrityReason ? ` · ${integrityReasonText(subscription.integrityReason, t)}` : ""}</p> : null}
+          {subscription.terminationAdjustment ? <p>{t("shareMarket.refund.summary", { amount: formatUsdMoney(subscription.terminationAdjustment.amountMinor, locale), status: t(refundStatusKey(subscription.terminationAdjustment.status)) })}</p> : null}
         </div>
       ) : null}
 
@@ -234,18 +240,23 @@ export function ShareMarketBuyerRentals({
   loading,
   onChanged,
   onInteractionChange,
+  nextCursor,
+  loadingMore = false,
+  onLoadMore,
 }: {
   subscriptions: ShareMarketSubscription[];
   loading: boolean;
   onChanged: () => Promise<void> | void;
   onInteractionChange?: (active: boolean) => void;
+  nextCursor?: string | null;
+  loadingMore?: boolean;
+  onLoadMore?: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
   const [busyId, setBusyId] = React.useState("");
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
-  const [historyLimit, setHistoryLimit] = React.useState(HISTORY_PAGE_SIZE);
-  const interactionActive = !!busyId || !!action;
+  const interactionActive = !!busyId || !!action || loadingMore;
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
@@ -268,7 +279,7 @@ export function ShareMarketBuyerRentals({
       setAction(null);
       await onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(shareMarketMutationError(reason, t));
     } finally {
       setBusyId("");
     }
@@ -327,11 +338,14 @@ export function ShareMarketBuyerRentals({
         <h3 id="share-rentals-history" className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t("account.share.history")}</h3>
         {history.length ? (
           <>
-            {history.slice(0, historyLimit).map((subscription) => (
+            {history.map((subscription) => (
               <ShareMarketSubscriptionCard key={subscription.id} subscription={subscription} busy={false} />
             ))}
-            {history.length > historyLimit ? (
-              <Button variant="outline" className="justify-self-center" onClick={() => setHistoryLimit((value) => value + HISTORY_PAGE_SIZE)}>{t("account.share.loadMore")}</Button>
+            {nextCursor && onLoadMore ? (
+              <Button variant="outline" className="justify-self-center" isDisabled={loadingMore} onClick={() => void onLoadMore()}>
+                {loadingMore ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                {t("account.share.loadMore")}
+              </Button>
             ) : null}
           </>
         ) : <p className="py-3 text-sm text-muted-foreground">{t("account.share.historyEmpty")}</p>}

@@ -37,6 +37,7 @@ import {
   getMarketBillingDashboard,
   getMarketBillingInvoiceHistory,
   rejectMarketBillingPayment,
+  recordMarketRefundObligation,
   requestMarketBillingSettlement,
   resolveAdminMarketBillingDispute,
   settleMarketBillingAccount,
@@ -50,6 +51,7 @@ import type {
   MarketBillingInvoice,
   MarketBillingPaymentDeclaration,
   MarketCreditAccount,
+  ShareMarketRefundObligation,
 } from "@/lib/types";
 import {
   DEFAULT_USD_CNY_RATE_MICROS,
@@ -66,6 +68,7 @@ type ProfileDraft = { graceHours: string };
 type Action =
   | { kind: "settle" | "request-settlement" | "close"; account: MarketCreditAccount }
   | { kind: "declare" | "confirm" | "reject" | "dispute"; account: MarketCreditAccount; invoice: MarketBillingInvoice }
+  | { kind: "record-refund"; obligation: ShareMarketRefundObligation }
   | { kind: "admin-uphold" | "admin-void"; dispute: AdminMarketBillingDispute }
   | { kind: "admin-invoice-void"; dispute: AdminMarketBillingDispute };
 
@@ -131,10 +134,66 @@ function actionSubmitLabel(action: Action, t: ReturnType<typeof useLocaleText>["
     case "confirm": return t("marketBilling.action.confirm");
     case "reject": return t("marketBilling.action.reject");
     case "dispute": return t("marketBilling.action.dispute");
+    case "record-refund": return t("marketBilling.refund.record");
     case "admin-uphold": return t("marketBilling.admin.uphold");
     case "admin-void": return t("marketBilling.admin.voidDispute");
     case "admin-invoice-void": return t("marketBilling.admin.voidInvoice");
   }
+}
+
+function RefundObligationPanel({
+  obligation,
+  locale,
+  usdCnyRateMicros,
+  onRecord,
+}: {
+  obligation: ShareMarketRefundObligation;
+  locale: string;
+  usdCnyRateMicros: number;
+  onRecord: (obligation: ShareMarketRefundObligation) => void;
+}) {
+  const { t } = useLocaleText();
+  const open = obligation.status !== "recorded";
+  return (
+    <div className={`grid gap-3 rounded-lg border p-4 ${obligation.status === "overdue" ? "border-rose-200 bg-rose-50/60" : "border-border bg-card"}`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <CircleDollarSign className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+            <strong className="text-sm">{t("marketBilling.refund.title")}</strong>
+            <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${statusTone(obligation.status)}`}>
+              {t(`marketBilling.refund.status.${obligation.status}` as Parameters<typeof t>[0])}
+            </span>
+          </div>
+          <p className="mt-1 break-all text-xs text-muted-foreground">
+            {t("marketBilling.refund.invoice", { invoice: obligation.invoiceId })}
+          </p>
+        </div>
+        <strong className="text-sm tabular-nums">
+          {formatUsdCnyMoney(
+            obligation.amountMinor,
+            locale,
+            usdMinorToCnyMinor(obligation.amountMinor, usdCnyRateMicros),
+          )}
+        </strong>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-current/10 pt-3 text-xs text-muted-foreground">
+        <span>
+          {open
+            ? t("marketBilling.refund.due", { date: formatDate(obligation.dueAt, locale) })
+            : t("marketBilling.refund.recordedAt", { date: formatDate(obligation.recordedAt, locale) })}
+          {obligation.externalReference
+            ? ` · ${t("marketBilling.refund.reference", { reference: obligation.externalReference })}`
+            : ""}
+        </span>
+        {open && obligation.canRecord ? (
+          <Button size="sm" variant="primary" onClick={() => onRecord(obligation)}>
+            {t("marketBilling.refund.record")}
+          </Button>
+        ) : open ? <span>{t("marketBilling.refund.awaitingSupplier")}</span> : null}
+      </div>
+    </div>
+  );
 }
 
 function actionIsDangerous(action: Action) {
@@ -641,6 +700,9 @@ export function AccountBillingPage() {
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const isAdmin = !!session?.isAdmin;
+  const actorKey = authed
+    ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
+    : "anonymous";
   const searchParams = useSearchParams();
   const [dashboard, setDashboard] = React.useState<MarketBillingDashboard | null>(null);
   const [adminDisputes, setAdminDisputes] = React.useState<AdminMarketBillingDispute[]>([]);
@@ -660,6 +722,10 @@ export function AccountBillingPage() {
   const [profileDirty, setProfileDirty] = React.useState<Record<Currency, boolean>>({
     USD: false,
   });
+  const [loadedActorKey, setLoadedActorKey] = React.useState(actorKey);
+  const requestRef = React.useRef<AbortController | null>(null);
+  const actorKeyRef = React.useRef(actorKey);
+  actorKeyRef.current = actorKey;
 
   React.useEffect(() => {
     const requested = searchParams.get("tab");
@@ -676,32 +742,61 @@ export function AccountBillingPage() {
 
   const load = React.useCallback(async (silent = false) => {
     if (!authed) return;
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    const requestedActorKey = actorKey;
+    requestRef.current = controller;
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
       const [nextDashboard, nextDisputes] = await Promise.all([
-        getMarketBillingDashboard(),
-        isAdmin ? getAdminMarketBillingDisputes() : Promise.resolve([]),
+        getMarketBillingDashboard(controller.signal),
+        isAdmin ? getAdminMarketBillingDisputes(controller.signal) : Promise.resolve([]),
       ]);
+      if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
       setDashboard(nextDashboard);
       setAdminDisputes(nextDisputes);
+      setLoadedActorKey(requestedActorKey);
     } catch (error) {
+      if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
       toast.danger(error instanceof Error ? error.message : String(error));
+      setLoadedActorKey(requestedActorKey);
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, [authed, isAdmin]);
+  }, [actorKey, authed, isAdmin]);
 
   React.useEffect(() => {
+    requestRef.current?.abort();
+    setAction(null);
+    setBusy("");
+    setReason("");
+    setReference("");
+    setNote("");
+    setEvidenceUrl("");
+    setPaymentKind("");
+    setProfiles({ USD: { ...EMPTY_PROFILE } });
+    setProfileDirty({ USD: false });
+    setDashboard(null);
+    setAdminDisputes([]);
+    if (!isAdmin) setTab((current) => current === "admin" ? "todo" : current);
+    if (authLoading) return;
     if (!authed) {
+      setLoadedActorKey(actorKey);
       setLoading(false);
       return;
     }
     void load();
     const timer = window.setInterval(() => void load(true), 20_000);
-    return () => window.clearInterval(timer);
-  }, [authed, load]);
+    return () => {
+      window.clearInterval(timer);
+      requestRef.current?.abort();
+    };
+  }, [actorKey, authed, authLoading, isAdmin, load]);
 
   React.useEffect(() => {
     if (!dashboard) return;
@@ -736,20 +831,25 @@ export function AccountBillingPage() {
       toast.danger(t("marketBilling.profile.invalidGrace"));
       return;
     }
+    const requestedActorKey = actorKey;
     setBusy(`profile:${currency}`);
     try {
-      setDashboard(await updateMarketBillingSupplierProfile(currency, graceHours));
+      const nextDashboard = await updateMarketBillingSupplierProfile(currency, graceHours);
+      if (actorKeyRef.current !== requestedActorKey) return;
+      setDashboard(nextDashboard);
       setProfileDirty((current) => ({ ...current, [currency]: false }));
       toast.success(t("marketBilling.profile.saved", { currency }));
     } catch (error) {
+      if (actorKeyRef.current !== requestedActorKey) return;
       toast.danger(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy("");
+      if (actorKeyRef.current === requestedActorKey) setBusy("");
     }
   };
 
   const submitAction = async () => {
     if (!action || busy) return;
+    const requestedActorKey = actorKey;
     const actionKey = action.kind;
     setBusy(actionKey);
     try {
@@ -783,6 +883,10 @@ export function AccountBillingPage() {
           if (!reason.trim()) throw new Error(t("marketBilling.reasonRequired"));
           nextDashboard = await disputeMarketBillingInvoice(action.invoice.id, reason.trim());
           break;
+        case "record-refund":
+          if (!reference.trim()) throw new Error(t("marketBilling.refund.referenceRequired"));
+          await recordMarketRefundObligation(action.obligation.id, reference.trim());
+          break;
         case "admin-uphold":
           await resolveAdminMarketBillingDispute(action.dispute.dispute.id, "uphold", note || undefined);
           break;
@@ -794,18 +898,20 @@ export function AccountBillingPage() {
           await voidAdminMarketBillingInvoice(action.dispute.invoice.id, reason.trim());
           break;
       }
+      if (actorKeyRef.current !== requestedActorKey) return;
       if (nextDashboard) setDashboard(nextDashboard);
       setAction(null);
       toast.success(t("marketBilling.action.completed"));
-      if (action.kind.startsWith("admin-") || action.kind === "request-settlement") await load(true);
+      if (action.kind.startsWith("admin-") || action.kind === "request-settlement" || action.kind === "record-refund") await load(true);
     } catch (error) {
+      if (actorKeyRef.current !== requestedActorKey) return;
       toast.danger(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy("");
+      if (actorKeyRef.current === requestedActorKey) setBusy("");
     }
   };
 
-  if (authLoading || loading) {
+  if (authLoading || loading || (authed && loadedActorKey !== actorKey)) {
     return <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div>;
   }
   if (!authed) {
@@ -815,6 +921,9 @@ export function AccountBillingPage() {
   const buyerAccounts = dashboard?.accounts.filter((account) => account.isBuyer) || [];
   const supplierAccounts = dashboard?.accounts.filter((account) => account.isSupplier) || [];
   const restrictions = dashboard?.restrictions || [];
+  const refundObligations = dashboard?.refundObligations || [];
+  const openRefundObligations = refundObligations.filter((item) => item.status !== "recorded");
+  const recordedRefundObligations = refundObligations.filter((item) => item.status === "recorded");
   const todoEntries = [
     ...buyerAccounts
       .filter((account) => {
@@ -915,7 +1024,7 @@ export function AccountBillingPage() {
         ariaLabel={t("marketBilling.tabs.label")}
         size="md"
         items={[
-          { id: "todo", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.todo")}<span className="tabular-nums text-muted-foreground">{todoEntries.length}</span></span> },
+          { id: "todo", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.todo")}<span className="tabular-nums text-muted-foreground">{todoEntries.length + openRefundObligations.length}</span></span> },
           { id: "payables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.payables")}<span className="tabular-nums text-muted-foreground">{buyerAccounts.length}</span></span> },
           { id: "receivables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.receivables")}<span className="tabular-nums text-muted-foreground">{supplierAccounts.length}</span></span> },
           { id: "history", label: t("marketBilling.tabs.history") },
@@ -968,9 +1077,13 @@ export function AccountBillingPage() {
           <h3 className="text-base font-semibold">{t("marketBilling.todo.title")}</h3>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.todo.hint")}</p>
         </div>
-        {todoEntries.length ? todoEntries.map(({ account, perspective }) => (
+        {openRefundObligations.map((obligation) => (
+          <RefundObligationPanel key={obligation.id} obligation={obligation} locale={locale} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onRecord={(item) => openAction({ kind: "record-refund", obligation: item })} />
+        ))}
+        {todoEntries.map(({ account, perspective }) => (
           <CreditAccountPanel key={`todo:${perspective}:${account.id}`} account={account} perspective={perspective} onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
-        )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.todo.empty")}</p>}
+        ))}
+        {!todoEntries.length && !openRefundObligations.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.todo.empty")}</p> : null}
       </section> : null}
 
       {tab === "payables" ? <section className="grid gap-3">
@@ -998,9 +1111,13 @@ export function AccountBillingPage() {
           <h3 className="text-base font-semibold">{t("marketBilling.history.title")}</h3>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.history.hint")}</p>
         </div>
-        {historyEntries.length ? historyEntries.map(({ account, perspective }) => (
+        {recordedRefundObligations.map((obligation) => (
+          <RefundObligationPanel key={obligation.id} obligation={obligation} locale={locale} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onRecord={(item) => openAction({ kind: "record-refund", obligation: item })} />
+        ))}
+        {historyEntries.map(({ account, perspective }) => (
           <CreditAccountPanel key={`history:${perspective}:${account.id}`} account={account} perspective={perspective} mode="history" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
-        )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.history.empty")}</p>}
+        ))}
+        {!historyEntries.length && !recordedRefundObligations.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.history.empty")}</p> : null}
       </section> : null}
 
       {isAdmin && tab === "admin" ? (
@@ -1047,10 +1164,12 @@ export function AccountBillingPage() {
               <Modal.Heading>{action ? t(`marketBilling.dialog.${action.kind}` as Parameters<typeof t>[0]) : ""}</Modal.Heading>
             </Modal.Header>
             <Modal.Body className="grid max-h-[70vh] gap-4 overflow-y-auto">
-              {action ? (
-                <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">
-                  {t("chat.marketPublicNotice")}
-                </p>
+              {action?.kind === "record-refund" ? (
+                <div className="grid gap-1 rounded-md border border-border bg-slate-50 p-3 text-sm">
+                  <span className="text-muted-foreground">{t("marketBilling.refund.amount")}</span>
+                  <strong>{formatUsdCnyMoney(action.obligation.amountMinor, locale, usdMinorToCnyMinor(action.obligation.amountMinor, dashboard?.usdCnyRateMicros || 0))}</strong>
+                  <span className="mt-1 text-xs text-muted-foreground">{t("marketBilling.refund.privateNotice")}</span>
+                </div>
               ) : null}
               {actionInvoice ? (
                 <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-slate-50 p-3 text-sm">
@@ -1092,6 +1211,12 @@ export function AccountBillingPage() {
                   <p className="text-xs leading-5 text-muted-foreground">{t("marketBilling.declare.notice")}</p>
                 </>
               ) : null}
+              {action?.kind === "record-refund" ? (
+                <label className="grid gap-1 text-sm">
+                  <span className="text-muted-foreground">{t("marketBilling.refund.referenceLabel")}</span>
+                  <input value={reference} onChange={(event) => setReference(event.target.value)} maxLength={200} className="h-10 rounded-md border border-border px-3" autoFocus />
+                </label>
+              ) : null}
               {needsReason ? (
                 <label className="grid gap-1 text-sm">
                   <span className="text-muted-foreground">{t("marketBilling.reason")}</span>
@@ -1115,7 +1240,7 @@ export function AccountBillingPage() {
               <Button variant="ghost" isDisabled={!!busy} onClick={() => setAction(null)}>{t("common.cancel")}</Button>
               <Button
                 variant={action && actionIsDangerous(action) ? "danger" : "primary"}
-                isDisabled={!!busy || !!(needsReason && !reason.trim())}
+                isDisabled={!!busy || !!(needsReason && !reason.trim()) || !!(action?.kind === "record-refund" && !reference.trim())}
                 onClick={() => void submitAction()}
               >
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}

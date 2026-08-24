@@ -4340,6 +4340,7 @@ fn enqueue_client_market_chat_event_tx(
         "clientOwnerEmail": client_owner_email,
         "providerUserId": provider_user_id,
         "providerEmail": provider_email,
+        "supplierEmail": provider_email,
         "hostId": host_id,
         "hostname": hostname,
         "status": status,
@@ -4402,13 +4403,14 @@ fn enqueue_client_market_chat_event_tx(
     if let Some(actor_user_id) = actor_user_id {
         followers.push(actor_user_id.to_string());
     }
+    let public_payload = crate::store::client_chat::public_market_event_payload(&payload);
     crate::store::client_chat::enqueue_client_system_event_tx(
         tx,
         installation_id,
         "client_market",
         source_event_id,
         event_type,
-        payload,
+        public_payload,
         &followers,
         now,
     )
@@ -5023,6 +5025,100 @@ mod tests {
             .expect("read sanitized Client Market audit");
         assert!(!detail.contains("fake-audit-secret"));
         assert!(detail.contains("[credential omitted]"));
+    }
+
+    #[tokio::test]
+    async fn client_market_audit_producer_enqueues_only_the_public_market_projection() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let provider = session("provider-chat-projection", "provider-chat@example.com");
+        let contacts = [PaymentContact {
+            channel: "telegram".into(),
+            handle: "@public-provider".into(),
+        }];
+        store
+            .client_market_update_payment_profile(
+                &provider,
+                &[custom_payment_method()],
+                Some(&contacts),
+            )
+            .await
+            .expect("configure projected Provider payment profile");
+
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO client_market_subscriptions (
+                installation_id, host_id, provider_id, host_owner_email,
+                client_user_id, client_owner_email, status, daily_rate_minor,
+                currency, offer_revision, created_at, updated_at
+             ) VALUES ('client-chat-projection', 'host-chat-projection', ?1, ?2,
+                       'private-client-user', 'private-client@example.com',
+                       'release_failed', 125, 'USD', 7, ?3, ?3)",
+            params![provider.user_id, provider.email, now_text],
+        )
+        .expect("insert projected Client Market subscription");
+        let tx = conn
+            .transaction()
+            .expect("begin projected Client Market event");
+        insert_audit_tx(
+            &tx,
+            Some("client-chat-projection"),
+            Some("host-chat-projection"),
+            Some("private-actor-user"),
+            Some("private-actor@example.com"),
+            "cleanup_failed",
+            serde_json::json!({
+                "failureCode": "cleanup_timeout",
+                "reason": "cleanup did not finish",
+                "buyerBalanceMinor": 900,
+                "paymentReference": "private-payment-reference",
+                "evidenceUrl": "https://evidence.example.com/private-receipt",
+                "rawError": "private raw cleanup diagnostics",
+            }),
+            now,
+        )
+        .expect("produce Client Market chat event");
+        tx.commit().expect("commit projected Client Market event");
+
+        let payload_json: String = conn
+            .query_row(
+                "SELECT payload_json FROM client_chat_system_outbox
+                 WHERE source_kind = 'client_market'
+                   AND installation_id = 'client-chat-projection'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read Client Market chat outbox payload");
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).expect("parse Client Market chat payload");
+        assert_eq!(payload["marketKind"], "client");
+        assert_eq!(payload["supplierEmail"], provider.email);
+        assert_eq!(payload["providerEmail"], provider.email);
+        assert_eq!(payload["dailyRateMinor"], 125);
+        assert_eq!(payload["offerRevision"], 7);
+        assert_eq!(payload["failureCode"], "cleanup_timeout");
+        assert_eq!(payload["paymentMethodKinds"], serde_json::json!(["custom"]));
+        assert_eq!(payload["contacts"], serde_json::to_value(contacts).unwrap());
+        for private_field in [
+            "clientUserId",
+            "clientOwnerEmail",
+            "providerUserId",
+            "actorUserId",
+            "actorEmail",
+            "hostId",
+            "buyerBalanceMinor",
+            "paymentReference",
+            "evidenceUrl",
+            "rawError",
+            "paymentMethods",
+            "paymentContacts",
+        ] {
+            assert!(
+                payload.get(private_field).is_none(),
+                "private field leaked from Client Market producer: {private_field}"
+            );
+        }
     }
 
     #[tokio::test]

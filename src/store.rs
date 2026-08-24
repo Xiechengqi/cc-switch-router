@@ -57,28 +57,28 @@ use crate::models::{
     InstallationSetupCompletedStatus, InstallationUpgradeTaskReportPayload,
     InstallationUpgradeTaskReportRequest, InstallationUpgradeTaskReportResponse,
     InstallationUpgradeView, InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint,
-    MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings, ModelHealthSummary,
-    OperationalReason, OperationalSummary, PublicMapClientPoint, PublicMapPointsResponse,
-    PublicNetworkStatsResponse, RefreshSessionRequest, RegisterAuthDeviceRequest,
-    RegisterAuthDeviceResponse, RegisterGatewayRequest, RegisterGatewayResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, RenewLeaseRequest,
-    RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse, SHARE_CONTRACT_VERSION,
-    SessionStatusResponse, ShareAppAvailability, ShareAppProviders, ShareAppRuntimes,
-    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareDescriptor, ShareDescriptorSyncAck, ShareEditAckEnvelope, ShareEditAckRequest,
-    ShareEditView, ShareHeartbeatRequest, ShareModelHealthCheckEntry, ShareModelHealthSummary,
-    SharePendingEditsPayload, SharePendingEditsRequest, SharePendingEditsResponse,
-    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRequestLogSyncAck, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareServiceReadiness,
-    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse,
-    ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant, ShareUserLimitStatusResponse,
-    ShareUserLimitStatusRow, ShareUserPolicy, ShareView, SubdomainAvailabilityResponse,
-    TunnelActivateRequest, TunnelLease, TunnelStateRequest, TunnelStateResponse,
-    UpgradeInstallationStatusResponse, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    MIN_SHARE_CONTRACT_VERSION, MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings,
+    ModelHealthSummary, OperationalReason, OperationalSummary, PublicMapClientPoint,
+    PublicMapPointsResponse, PublicNetworkStatsResponse, RefreshSessionRequest,
+    RegisterAuthDeviceRequest, RegisterAuthDeviceResponse, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SHARE_CONTRACT_VERSION, SessionStatusResponse, ShareAppAvailability, ShareAppProviders,
+    ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest,
+    ShareDeleteRequest, ShareDescriptor, ShareDescriptorSyncAck, ShareEditAckEnvelope,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareModelHealthCheckEntry,
+    ShareModelHealthSummary, SharePendingEditsPayload, SharePendingEditsRequest,
+    SharePendingEditsResponse, SharePruneRequest, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRequestLogSyncAck,
+    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
+    ShareServiceReadiness, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
+    ShareSupport, ShareSyncRequest, ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota,
+    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant,
+    ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareUserPolicy, ShareView,
+    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
+    TunnelStateResponse, UpgradeInstallationStatusResponse, UserApiTokenResetResponse,
+    UserApiTokenResponse, UserApiTokenStatus, UserShareView, UserSharesResponse,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -9053,6 +9053,7 @@ impl AppStore {
             Some(&existing_user_grants),
             Some(supported_apps.as_slice()),
         )?;
+        crate::share_market::validate_market_protected_share_patch_tx(&conn, share_id, &patch)?;
         let effective_free_access = patch.free_access.unwrap_or(current_free_access);
         ensure_free_access_market_exclusive_tx(&conn, share_id, effective_free_access)?;
         let supported_user_token_periods =
@@ -11725,9 +11726,15 @@ impl AppStore {
         let refreshed_at = DateTime::<Utc>::from_timestamp(snapshot.queried_at, 0)
             .unwrap_or_else(Utc::now)
             .to_rfc3339();
+        let observed_at = Utc::now();
 
         let conn = self.conn.lock().await;
-        conn.execute(
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| {
+                AppError::Internal(format!("begin share runtime snapshot tx failed: {e}"))
+            })?;
+        tx.execute(
             "UPDATE shares
              SET app_runtimes_json = ?2,
                  app_providers_json = ?3,
@@ -11747,11 +11754,19 @@ impl AppStore {
                 snapshot.tokens_used,
                 snapshot.requests_count,
                 snapshot.share_status,
-                Utc::now().to_rfc3339(),
+                observed_at.to_rfc3339(),
             ],
         )
         .map_err(|e| AppError::Internal(format!("update share runtime snapshot failed: {e}")))?;
-        record_runtime_model_health_snapshot_conn(&conn, &snapshot)?;
+        record_runtime_model_health_snapshot_conn(&tx, &snapshot)?;
+        crate::share_market::reconcile_share_contract_integrity_tx(
+            &tx,
+            &snapshot.share_id,
+            observed_at,
+        )?;
+        tx.commit().map_err(|e| {
+            AppError::Internal(format!("commit share runtime snapshot tx failed: {e}"))
+        })?;
         Ok(())
     }
 
@@ -12015,10 +12030,10 @@ fn normalize_share_limit_value(value: i64) -> i64 {
 }
 
 fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), AppError> {
-    if share.contract_version != SHARE_CONTRACT_VERSION {
+    if !(MIN_SHARE_CONTRACT_VERSION..=SHARE_CONTRACT_VERSION).contains(&share.contract_version) {
         return Err(AppError::BadRequest(format!(
-            "unsupported Share contractVersion {}; expected {}",
-            share.contract_version, SHARE_CONTRACT_VERSION
+            "unsupported Share contractVersion {}; expected {}..={}",
+            share.contract_version, MIN_SHARE_CONTRACT_VERSION, SHARE_CONTRACT_VERSION
         )));
     }
     share.token_limit = normalize_share_limit_value(share.token_limit);
@@ -12432,7 +12447,7 @@ fn upsert_share_tx(
             i64::from(share.banked_reset_expiry_lead_minutes),
             i64::from(share.previous_response_cache_enabled as u8),
             i64::from(share.free_access as u8),
-            i64::from(SHARE_CONTRACT_VERSION),
+            i64::from(share.contract_version),
         ],
     )
     .map_err(map_share_constraint_error)?;
@@ -12449,6 +12464,11 @@ fn upsert_share_tx(
             )
             .map_err(|e| AppError::Internal(format!("store share binding failed: {e}")))?;
         }
+        crate::share_market::reconcile_share_contract_integrity_tx(
+            conn,
+            &chat_share_id,
+            Utc::now(),
+        )?;
     }
     if let Some((
         previous_status,
@@ -24578,6 +24598,7 @@ mod tests {
                 token_period: crate::models::ShareTokenPeriod::Day,
                 token_period_anchor_at_ms: None,
                 expires_at: Some(1_900_000_000_000),
+                allowed_apps: Vec::new(),
             },
             usage: crate::models::ShareUserUsage {
                 lifetime: crate::models::ShareUserUsageBucket {
@@ -40303,6 +40324,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_snapshot_rolls_back_share_update_when_later_health_write_fails() {
+        let (store, config) = setup_store("runtime-snapshot-atomic-rollback").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        let now = Utc::now().timestamp();
+        let initial_state: (i64, i64, i64, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT token_limit, tokens_used, requests_count, share_status
+                 FROM shares WHERE share_id = 'share-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read initial runtime state");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute_batch(
+                "CREATE TRIGGER fail_runtime_health_insert
+                 BEFORE INSERT ON share_model_health_checks
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced runtime health failure');
+                 END;",
+            )
+            .expect("install forced model health failure");
+        }
+
+        let error = store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now,
+                support: ShareSupport {
+                    claude: false,
+                    codex: true,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes {
+                    codex: Some(test_upstream_provider("gpt-5.5")),
+                    ..ShareAppRuntimes::default()
+                },
+                app_providers: ShareAppProviders::default(),
+                token_limit: Some(1_000_000),
+                tokens_used: Some(999_999),
+                requests_count: Some(77),
+                share_status: Some("paused".into()),
+                model_health: ShareModelHealthSummary {
+                    codex: vec![test_model_summary("gpt-5.5", &["success"])],
+                    ..ShareModelHealthSummary::default()
+                },
+            })
+            .await
+            .expect_err("later health failure must reject the whole runtime snapshot");
+        assert!(error.to_string().contains("forced runtime health failure"));
+
+        let conn = store.conn.lock().await;
+        let state: (i64, i64, i64, String, i64) = conn
+            .query_row(
+                "SELECT token_limit, tokens_used, requests_count, share_status,
+                        (SELECT COUNT(*) FROM share_model_health_checks
+                         WHERE share_id = shares.share_id)
+                 FROM shares WHERE share_id = 'share-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read rolled-back runtime state");
+        drop(conn);
+        assert_eq!(
+            state,
+            (
+                initial_state.0,
+                initial_state.1,
+                initial_state.2,
+                initial_state.3,
+                0,
+            )
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn runtime_snapshot_clears_current_health_for_omitted_bound_apps() {
         let (store, config) = setup_store("runtime-clears-omitted-bound-app-health").await;
         insert_installation(&store, "inst-1").await;
@@ -41028,7 +41139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_system_event_follows_participants_and_preserves_public_details() {
+    async fn market_system_event_follows_participants_and_projects_public_details() {
         let (store, config) = setup_store("client-chat-market-system-event").await;
         let installation_id = "share-chat-installation-public-event";
         insert_installation(&store, installation_id).await;
@@ -41047,6 +41158,9 @@ mod tests {
                 "billing_payment_declared",
                 serde_json::json!({
                     "summary": "Payment declared",
+                    "marketKind": "billing",
+                    "billingEventType": "payment_declared",
+                    "installationId": installation_id,
                     "buyerEmail": "renter@example.com",
                     "supplierEmail": "provider@example.com",
                     "amountMinor": 12345,
@@ -41099,22 +41213,26 @@ mod tests {
         assert_eq!(message.author_kind, "system");
         assert_eq!(message.message_kind, "market_event");
         let payload = message.event_payload.as_ref().expect("event payload");
-        assert_eq!(payload["buyerEmail"], "renter@example.com");
+        assert_eq!(payload["marketKind"], "billing");
+        assert_eq!(payload["billingEventType"], "payment_declared");
         assert_eq!(payload["supplierEmail"], "provider@example.com");
-        assert_eq!(payload["amountMinor"], 12345);
-        assert_eq!(payload["paymentReference"], "wire-reference-001");
-        assert_eq!(payload["paymentMethods"][0]["token"], "USDT");
-        assert_eq!(
-            payload["paymentMethods"][0]["assetUrl"],
-            "/v1/account/payment-assets/public-receipt"
-        );
-        assert_eq!(payload["paymentContacts"][0]["handle"], "provider-account");
-        assert_eq!(
-            payload["evidenceUrl"],
-            "https://evidence.example.com/receipt/001"
-        );
-        assert_eq!(payload["reason"], "manual settlement");
-        assert_eq!(payload["rawError"], "upstream returned HTTP 503");
+        assert_eq!(payload["paymentMethodKinds"], serde_json::json!(["crypto"]));
+        assert_eq!(payload["contacts"][0]["handle"], "provider-account");
+        for private_field in [
+            "buyerEmail",
+            "amountMinor",
+            "paymentReference",
+            "paymentMethods",
+            "paymentContacts",
+            "evidenceUrl",
+            "reason",
+            "rawError",
+        ] {
+            assert!(
+                payload.get(private_field).is_none(),
+                "{private_field} must not be exposed in public Client chat"
+            );
+        }
         assert!(matches!(
             store
                 .delete_client_chat_message(&message.id, "admin@example.com")
@@ -41150,23 +41268,25 @@ mod tests {
             0
         );
         let conn = store.conn.lock().await;
-        let source_count: i64 = conn
+        let (source_count, payload_version): (i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*) FROM chat_messages WHERE source_event_id = ?1",
+                "SELECT COUNT(*), MAX(payload_version) FROM chat_messages
+                 WHERE source_event_id = ?1",
                 params![format!(
                     "market_billing:{source_event_id}:{installation_id}"
                 )],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("count idempotent event messages");
         assert_eq!(source_count, 1);
+        assert_eq!(payload_version, 2);
         drop(conn);
         let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]
-    async fn published_chat_payment_asset_is_public_and_retained() {
-        let (store, config) = setup_store("client-chat-public-payment-asset").await;
+    async fn market_chat_does_not_publish_private_payment_asset() {
+        let (store, config) = setup_store("client-chat-private-payment-asset").await;
         let installation_id = "share-chat-installation-public-payment-asset";
         insert_installation(&store, installation_id).await;
         ensure_test_chat_room(&store, installation_id).await;
@@ -41198,6 +41318,9 @@ mod tests {
                 "payment_due",
                 serde_json::json!({
                     "summary": "Payment due",
+                    "marketKind": "billing",
+                    "billingEventType": "payment_due",
+                    "installationId": installation_id,
                     "supplierUserId": provider.user_id.clone(),
                     "paymentMethods": [{
                         "kind": "crypto",
@@ -41219,13 +41342,12 @@ mod tests {
                 .expect("materialize public payment asset event"),
             1
         );
-        assert_eq!(
+        assert!(matches!(
             store
                 .client_market_payment_asset_for_viewer(&asset_id, None)
-                .await
-                .expect("anonymous viewer reads published payment asset"),
-            vec![1, 2, 3, 4]
-        );
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
         assert!(matches!(
             store
                 .client_market_payment_asset_for_viewer(&unpublished_asset_id, None)
@@ -41236,25 +41358,18 @@ mod tests {
         store
             .client_market_update_payment_profile(&provider, &[], None)
             .await
-            .expect("clear live profile without deleting published asset");
-        assert_eq!(
-            store
-                .client_market_payment_asset_for_viewer(&asset_id, None)
-                .await
-                .expect("published payment asset survives profile replacement"),
-            vec![1, 2, 3, 4]
-        );
-        let unpublished_exists: i64 = store
+            .expect("clear live profile and private assets");
+        let remaining_assets: i64 = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT COUNT(*) FROM account_payment_assets WHERE id = ?1",
-                params![unpublished_asset_id],
+                "SELECT COUNT(*) FROM account_payment_assets WHERE id IN (?1, ?2)",
+                params![asset_id, unpublished_asset_id],
                 |row| row.get(0),
             )
-            .expect("check unpublished payment asset cleanup");
-        assert_eq!(unpublished_exists, 0);
+            .expect("check private payment asset cleanup");
+        assert_eq!(remaining_assets, 0);
         let _ = std::fs::remove_file(config.database.path);
     }
 
@@ -41356,7 +41471,7 @@ mod tests {
             )
             .expect("read sanitized payload");
         assert!(!stored_payload.contains("AIza-do-not-store"));
-        assert!(stored_payload.contains("[credential omitted]"));
+        assert!(!stored_payload.contains("rawError"));
         drop(conn);
         let _ = std::fs::remove_file(config.database.path);
     }

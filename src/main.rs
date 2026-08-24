@@ -57,6 +57,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use anyhow::Result;
+use futures_util::{StreamExt, stream};
 use proxy::{ProxyRegistry, RouteAvailability};
 use resend_rs::Resend;
 use tokio::net::TcpListener;
@@ -88,6 +89,8 @@ const APP_NAME: &str = "cc-switch-router";
 const HTTP_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const ROUTE_HEALTH_PROBE_CONCURRENCY: usize = 16;
+const SHARE_RUNTIME_REFRESH_CONCURRENCY: usize = 16;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -512,7 +515,7 @@ async fn main() -> Result<()> {
                 .build()?;
 
             let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
-            interval.tick().await;
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 if let Err(err) = run_share_runtime_refresh_cycle(
@@ -1013,8 +1016,7 @@ async fn run_route_health_probe_cycle(
     reconnect_grace: Duration,
     router_epoch: &str,
 ) -> Result<()> {
-    let targets = store.list_share_route_targets().await?;
-    for target in targets {
+    stream::iter(store.list_share_route_targets().await?.into_iter().map(|target| async move {
         let (status, reason) = match proxy
             .route_availability(&target.subdomain, reconnect_grace)
             .await
@@ -1035,9 +1037,12 @@ async fn run_route_health_probe_cycle(
         {
             tracing::warn!(share_id = %target.share_id, "record route health failed: {err}");
         }
-    }
+    }))
+    .buffer_unordered(ROUTE_HEALTH_PROBE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
     let client_targets = store.list_client_tunnel_route_targets().await?;
-    for target in client_targets {
+    stream::iter(client_targets.into_iter().map(|target| async move {
         let (status, reason) = match proxy
             .route_availability(&target.subdomain, reconnect_grace)
             .await
@@ -1061,7 +1066,10 @@ async fn run_route_health_probe_cycle(
                 "record client tunnel route health failed: {err}"
             );
         }
-    }
+    }))
+    .buffer_unordered(ROUTE_HEALTH_PROBE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
     Ok(())
 }
 
@@ -1076,17 +1084,10 @@ async fn run_share_runtime_refresh_cycle(
         store.list_share_route_targets().await?,
         proxy.active_subdomains().await,
     );
-    for target in targets {
+    stream::iter(targets.into_iter().map(|target| async move {
         match fetch_share_runtime_snapshot_from_route(
-            store,
-            config,
-            client,
-            &target.subdomain,
-            &target.share_id,
-            &target.installation_id,
-        )
-        .await
-        {
+            store, config, client, &target.subdomain, &target.share_id, &target.installation_id,
+        ).await {
             Ok(snapshot) => {
                 record_runtime_model_health_traffic(recent_traffic, &target, &snapshot).await;
                 if let Err(err) = store.record_share_runtime_snapshot(snapshot).await {
@@ -1097,7 +1098,10 @@ async fn run_share_runtime_refresh_cycle(
                 tracing::warn!(share_id = %target.share_id, "fetch share runtime failed: {err}");
             }
         }
-    }
+    }))
+    .buffer_unordered(SHARE_RUNTIME_REFRESH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
     Ok(())
 }
 

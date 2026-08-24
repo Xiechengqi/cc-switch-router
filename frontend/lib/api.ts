@@ -1,4 +1,4 @@
-import { authFetch } from "@/lib/auth";
+import { authFetch, readAuthState } from "@/lib/auth";
 import type {
   DashboardResponse,
   ClearMetricsResponse,
@@ -77,6 +77,9 @@ import type {
   ShareMarketOwnedShare,
   ShareMarketSeatInput,
   ShareMarketRentQuote,
+  ShareMarketTerminationQuote,
+  ShareMarketTerminationAdjustment,
+  ShareMarketRefundObligation,
   AdminMarketBillingDispute,
   MarketBillingDashboard,
   MarketBillingConfig,
@@ -96,6 +99,7 @@ import type {
   ServerLogMeta,
   ServerLogScope,
   ShareRequestLogsPage,
+  ShareControlDeadLetterPage,
 } from "@/lib/types";
 
 
@@ -129,6 +133,83 @@ export async function parseJson<T>(response: Response): Promise<T> {
     );
   }
   return data as T;
+}
+
+type ShareMarketGetCacheEntry = { etag?: string; body: unknown };
+const SHARE_MARKET_GET_CACHE_MAX_ENTRIES = 32;
+const shareMarketGetCache = new Map<string, ShareMarketGetCacheEntry>();
+const shareMarketGetInflight = new Map<string, Promise<unknown>>();
+let shareMarketCacheActor: string | undefined;
+
+function selectShareMarketCacheActor() {
+  return readAuthState().email?.trim().toLowerCase() || "anonymous";
+}
+
+function synchronizeShareMarketCacheActor(actor: string) {
+  if (shareMarketCacheActor === actor) return;
+  shareMarketCacheActor = actor;
+  shareMarketGetCache.clear();
+  shareMarketGetInflight.clear();
+}
+
+function storeShareMarketCacheEntry(key: string, entry: ShareMarketGetCacheEntry) {
+  shareMarketGetCache.delete(key);
+  shareMarketGetCache.set(key, entry);
+  while (shareMarketGetCache.size > SHARE_MARKET_GET_CACHE_MAX_ENTRIES) {
+    const oldest = shareMarketGetCache.keys().next().value;
+    if (oldest === undefined) break;
+    shareMarketGetCache.delete(oldest);
+  }
+}
+
+function callerAbortError() {
+  return typeof DOMException === "undefined"
+    ? new Error("request aborted")
+    : new DOMException("request aborted", "AbortError");
+}
+
+function waitForCaller<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(callerAbortError());
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(callerAbortError());
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+async function fetchShareMarketCached<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const actor = selectShareMarketCacheActor();
+  synchronizeShareMarketCacheActor(actor);
+  const key = `${actor}\n${url}`;
+  let shared = shareMarketGetInflight.get(key) as Promise<T> | undefined;
+  if (!shared) {
+    const cached = shareMarketGetCache.get(key);
+    shared = (async () => {
+      const request = async (etag?: string) => authFetch(url, {
+        cache: "no-cache",
+        headers: etag ? { "If-None-Match": etag } : undefined,
+      });
+      let response = await request(cached?.etag);
+      if (response.status === 304) {
+        if (cached) return cached.body as T;
+        response = await request();
+      }
+      const body = await parseJson<T>(response);
+      if (shareMarketCacheActor === actor) {
+        storeShareMarketCacheEntry(key, {
+          etag: response.headers.get("etag") || undefined,
+          body,
+        });
+      }
+      return body;
+    })();
+    shareMarketGetInflight.set(key, shared);
+    shared.finally(() => {
+      if (shareMarketGetInflight.get(key) === shared) shareMarketGetInflight.delete(key);
+    }).catch(() => undefined);
+  }
+  return waitForCaller(shared, signal);
 }
 
 export async function getDashboard(signal?: AbortSignal) {
@@ -1086,6 +1167,22 @@ export async function disputeMarketBillingInvoice(invoiceId: string, reason: str
   );
 }
 
+export async function recordMarketRefundObligation(
+  obligationId: string,
+  externalReference: string,
+) {
+  return parseJson<ShareMarketRefundObligation>(
+    await authFetch(
+      `/v1/market-billing/refund-obligations/${encodeURIComponent(obligationId)}/record`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ externalReference }),
+      },
+    ),
+  );
+}
+
 export async function getAdminMarketBillingDisputes(signal?: AbortSignal) {
   return parseJson<AdminMarketBillingDispute[]>(
     await authFetch("/v1/admin/market-billing/disputes", { cache: "no-store", signal }),
@@ -1453,20 +1550,26 @@ export async function checkClientTunnelSubdomainAvailability(subdomain: string, 
 }
 
 export async function getShareMarketCatalog(signal?: AbortSignal) {
-  return parseJson<ShareMarketCatalog>(
-    await authFetch("/v1/share-market/listings", { cache: "no-cache", signal }),
-  );
+  return fetchShareMarketCached<ShareMarketCatalog>("/v1/share-market/listings", signal);
 }
 
 export async function getShareMarketOwnedListings(signal?: AbortSignal) {
-  return parseJson<ShareMarketOwnedListings>(
-    await authFetch("/v1/share-market/me/listings", { cache: "no-cache", signal }),
+  return fetchShareMarketCached<ShareMarketOwnedListings>(
+    "/v1/share-market/me/listings",
+    signal,
   );
 }
 
-export async function getShareMarketSubscriptions(signal?: AbortSignal) {
-  return parseJson<ShareMarketSubscriptions>(
-    await authFetch("/v1/share-market/me/subscriptions", { cache: "no-cache", signal }),
+export async function getShareMarketSubscriptions(
+  signal?: AbortSignal,
+  cursor?: string,
+  limit = 8,
+) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (cursor) query.set("cursor", cursor);
+  return fetchShareMarketCached<ShareMarketSubscriptions>(
+    `/v1/share-market/me/subscriptions?${query.toString()}`,
+    signal,
   );
 }
 
@@ -1571,6 +1674,64 @@ export async function forceRevokeShareMarketSubscription(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function retryShareMarketSubscriptionGrant(subscriptionId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/retry-grant`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function getShareControlDeadLetters(cursor?: string, limit = 20) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (cursor) query.set("cursor", cursor);
+  return parseJson<ShareControlDeadLetterPage>(
+    await authFetch(`/v1/admin/share-market/control-operations/dead-letters?${query.toString()}`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function requeueShareControlDeadLetter(operationId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/admin/share-market/control-operations/${encodeURIComponent(operationId)}/requeue`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function quoteShareMarketSubscriptionTermination(
+  subscriptionId: string,
+  signal?: AbortSignal,
+) {
+  return parseJson<ShareMarketTerminationQuote>(
+    await authFetch(
+      `/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/termination-quote`,
+      { method: "POST", signal },
+    ),
+  );
+}
+
+export async function terminateShareMarketSubscription(
+  subscriptionId: string,
+  quoteId: string,
+  idempotencyKey: string,
+  denyFutureAccess: boolean,
+) {
+  return parseJson<{
+    ok: true;
+    subscriptionId: string;
+    replayed: boolean;
+    adjustment: ShareMarketTerminationAdjustment;
+  }>(
+    await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/terminate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quoteId, idempotencyKey, denyFutureAccess }),
     }),
   );
 }

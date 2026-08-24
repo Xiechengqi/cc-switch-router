@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 
-pub const SHARE_CONTRACT_VERSION: u16 = 2;
+pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
+pub const SHARE_CONTRACT_VERSION: u16 = 3;
 
 pub fn default_share_parallel_limit() -> i64 {
     -1
@@ -935,6 +936,22 @@ mod share_settings_patch_tests {
             serde_json::from_str(r#"{}"#).expect("parse omitted description");
         assert_eq!(omitted.description, None);
     }
+
+    #[test]
+    fn market_app_scope_uses_the_v3_allowed_apps_wire_field() {
+        let policy = ShareUserPolicy {
+            allowed_apps: vec!["codex".to_string()],
+            ..ShareUserPolicy::default()
+        };
+
+        assert_eq!(
+            serde_json::to_value(&policy).expect("serialize App-scoped policy"),
+            serde_json::json!({
+                "tokenPeriod": "lifetime",
+                "allowedApps": ["codex"]
+            })
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -962,6 +979,8 @@ pub struct ShareUserPolicy {
     pub token_period_anchor_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_apps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]

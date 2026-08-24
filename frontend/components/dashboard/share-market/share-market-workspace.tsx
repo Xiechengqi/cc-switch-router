@@ -9,6 +9,8 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareMarketBuyerCatalog } from "@/components/dashboard/share-market/buyer-catalog";
 import { ShareMarketBuyerRentals } from "@/components/dashboard/share-market/buyer-rentals";
+import { shareMarketMutationError } from "@/components/dashboard/share-market/market-utils";
+import { mergeShareMarketSubscriptionPage } from "@/components/dashboard/share-market/subscription-utils";
 import { ShareMarketOwnerWorkspace } from "@/components/dashboard/share-market/owner-workspace";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -46,16 +48,27 @@ export function ShareMarketWorkspace() {
   const { session, loading: authLoading } = useAuth();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
+  const actorKey = authed
+    ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
+    : "anonymous";
   const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(null);
   const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
   const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
+  const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
+  const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
   const [pausePolling, setPausePolling] = React.useState(false);
   const [workspace, setWorkspaceState] = React.useState<Workspace>(() =>
     workspaceFromQuery(searchParams.get("view") || searchParams.get("tab")),
   );
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
+  const [loadedActorKey, setLoadedActorKey] = React.useState(actorKey);
   const requestRef = React.useRef<AbortController | null>(null);
+  const loadMoreRequestRef = React.useRef<AbortController | null>(null);
+  const actorKeyRef = React.useRef(actorKey);
+  actorKeyRef.current = actorKey;
+  const expandedSubscriptionHistoryRef = React.useRef(false);
+  const subscriptionHistoryGenerationRef = React.useRef(0);
   const focusedShareId = searchParams.get("focus") || undefined;
 
   const load = React.useCallback(async ({
@@ -63,7 +76,17 @@ export function ShareMarketWorkspace() {
     silent = false,
     skipIfBusy = false,
   }: { scope?: LoadScope; silent?: boolean; skipIfBusy?: boolean } = {}) => {
+    const requestedActorKey = actorKey;
+    if (actorKeyRef.current !== requestedActorKey) return;
     if (skipIfBusy && requestRef.current) return;
+    const resetSubscriptionHistory = !silent
+      && (scope === "all" || scope === "catalog" || scope === "rentals");
+    if (resetSubscriptionHistory) {
+      subscriptionHistoryGenerationRef.current += 1;
+      loadMoreRequestRef.current?.abort();
+      loadMoreRequestRef.current = null;
+      setLoadingMoreSubscriptions(false);
+    }
     requestRef.current?.abort();
     const controller = new AbortController();
     requestRef.current = controller;
@@ -71,12 +94,24 @@ export function ShareMarketWorkspace() {
     if (!skipIfBusy) setError("");
 
     try {
+      if (resetSubscriptionHistory) expandedSubscriptionHistoryRef.current = false;
+      const applySubscriptionPage = (page: Awaited<ReturnType<typeof getShareMarketSubscriptions>>) => {
+        setSubscriptions((current) => resetSubscriptionHistory
+          ? page.subscriptions
+          : mergeShareMarketSubscriptionPage(current, page.subscriptions, false));
+        if (resetSubscriptionHistory || !expandedSubscriptionHistoryRef.current) {
+          setSubscriptionCursor(page.nextCursor || null);
+        }
+      };
+
       if (!authed) {
         const nextCatalog = await getShareMarketCatalog(controller.signal);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setCatalog(nextCatalog);
         setOwnedListings([]);
         setSubscriptions([]);
+        setSubscriptionCursor(null);
+        setLoadedActorKey(actorKey);
         return;
       }
 
@@ -86,40 +121,79 @@ export function ShareMarketWorkspace() {
           getShareMarketOwnedListings(controller.signal),
           getShareMarketSubscriptions(controller.signal),
         ]);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setCatalog(nextCatalog);
         setOwnedListings(nextOwned.listings);
-        setSubscriptions(nextSubscriptions.subscriptions);
+        applySubscriptionPage(nextSubscriptions);
+        setLoadedActorKey(actorKey);
       } else if (scope === "catalog") {
         const [nextCatalog, nextSubscriptions] = await Promise.all([
           getShareMarketCatalog(controller.signal),
           getShareMarketSubscriptions(controller.signal),
         ]);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setCatalog(nextCatalog);
-        setSubscriptions(nextSubscriptions.subscriptions);
+        applySubscriptionPage(nextSubscriptions);
+        setLoadedActorKey(actorKey);
       } else if (scope === "rentals") {
         const nextSubscriptions = await getShareMarketSubscriptions(controller.signal);
-        if (controller.signal.aborted) return;
-        setSubscriptions(nextSubscriptions.subscriptions);
+        if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
+        applySubscriptionPage(nextSubscriptions);
+        setLoadedActorKey(actorKey);
       } else {
         const nextOwned = await getShareMarketOwnedListings(controller.signal);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setOwnedListings(nextOwned.listings);
+        setLoadedActorKey(actorKey);
       }
     } catch (reason) {
-      if (controller.signal.aborted) return;
-      if (!skipIfBusy) setError(reason instanceof Error ? reason.message : String(reason));
+      if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
+      if (!skipIfBusy) setError(shareMarketMutationError(reason, t));
     } finally {
       if (requestRef.current === controller) {
         requestRef.current = null;
         setLoading(false);
       }
     }
-  }, [authed]);
+  }, [actorKey, authed, t]);
+
+  const loadMoreSubscriptions = React.useCallback(async () => {
+    if (!subscriptionCursor || loadingMoreSubscriptions) return;
+    const requestedActorKey = actorKey;
+    const requestedGeneration = subscriptionHistoryGenerationRef.current;
+    const controller = new AbortController();
+    loadMoreRequestRef.current?.abort();
+    loadMoreRequestRef.current = controller;
+    setLoadingMoreSubscriptions(true);
+    setError("");
+    try {
+      const page = await getShareMarketSubscriptions(controller.signal, subscriptionCursor);
+      if (controller.signal.aborted
+        || actorKeyRef.current !== requestedActorKey
+        || subscriptionHistoryGenerationRef.current !== requestedGeneration) return;
+      expandedSubscriptionHistoryRef.current = true;
+      setSubscriptions((current) => mergeShareMarketSubscriptionPage(current, page.subscriptions, true));
+      setSubscriptionCursor(page.nextCursor || null);
+    } catch (reason) {
+      if (controller.signal.aborted
+        || actorKeyRef.current !== requestedActorKey
+        || subscriptionHistoryGenerationRef.current !== requestedGeneration) return;
+      setError(shareMarketMutationError(reason, t));
+    } finally {
+      if (loadMoreRequestRef.current === controller) {
+        loadMoreRequestRef.current = null;
+        setLoadingMoreSubscriptions(false);
+      }
+    }
+  }, [actorKey, loadingMoreSubscriptions, subscriptionCursor, t]);
 
   React.useEffect(() => {
     if (authLoading) return;
+    subscriptionHistoryGenerationRef.current += 1;
+    loadMoreRequestRef.current?.abort();
+    loadMoreRequestRef.current = null;
+    setLoadingMoreSubscriptions(false);
+    expandedSubscriptionHistoryRef.current = false;
     if (!authed) {
       setWorkspaceState((current) => {
         if (current !== "catalog") replaceWorkspaceQuery("catalog");
@@ -127,8 +201,11 @@ export function ShareMarketWorkspace() {
       });
     }
     void load({ scope: "all" });
-    return () => requestRef.current?.abort();
-  }, [authed, authLoading, load]);
+    return () => {
+      requestRef.current?.abort();
+      loadMoreRequestRef.current?.abort();
+    };
+  }, [actorKey, authed, authLoading, load]);
 
   React.useEffect(() => {
     if (authLoading) return;
@@ -153,6 +230,12 @@ export function ShareMarketWorkspace() {
     replaceWorkspaceQuery(next);
     void load({ scope: next });
   };
+
+  const actorDataCurrent = loadedActorKey === actorKey;
+  const visibleCatalog = actorDataCurrent ? catalog : null;
+  const visibleOwnedListings = actorDataCurrent ? ownedListings : [];
+  const visibleSubscriptions = actorDataCurrent ? subscriptions : [];
+  const visibleSubscriptionCursor = actorDataCurrent ? subscriptionCursor : null;
 
   return (
     <main className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
@@ -192,7 +275,7 @@ export function ShareMarketWorkspace() {
         </div>
       </div>
 
-      {loading && !catalog && workspace === "catalog" ? (
+      {loading && !visibleCatalog && workspace === "catalog" ? (
         <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-500">
           <Loader2 className="h-4 w-4 animate-spin" />
           {t("shareMarket.loading")}
@@ -200,10 +283,11 @@ export function ShareMarketWorkspace() {
       ) : null}
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
 
-      {catalog && workspace === "catalog" ? (
+      {visibleCatalog && workspace === "catalog" ? (
         <ShareMarketBuyerCatalog
-          catalog={catalog}
-          subscriptions={subscriptions}
+          key={`catalog:${actorKey}`}
+          catalog={visibleCatalog}
+          subscriptions={visibleSubscriptions}
           authed={authed}
           focusedShareId={focusedShareId}
           onChanged={() => load({ scope: "catalog", silent: true })}
@@ -213,15 +297,20 @@ export function ShareMarketWorkspace() {
       ) : null}
       {authed && workspace === "rentals" ? (
         <ShareMarketBuyerRentals
-          subscriptions={subscriptions}
+          key={`rentals:${actorKey}`}
+          subscriptions={visibleSubscriptions}
           loading={loading}
           onChanged={() => load({ scope: "rentals", silent: true })}
           onInteractionChange={setPausePolling}
+          nextCursor={visibleSubscriptionCursor}
+          loadingMore={loadingMoreSubscriptions}
+          onLoadMore={loadMoreSubscriptions}
         />
       ) : null}
       {authed && workspace === "selling" ? (
         <ShareMarketOwnerWorkspace
-          listings={ownedListings}
+          key={`selling:${actorKey}`}
+          listings={visibleOwnedListings}
           loading={loading}
           focusedShareId={focusedShareId}
           onChanged={() => load({ scope: "selling", silent: true })}

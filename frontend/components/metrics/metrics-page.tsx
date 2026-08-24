@@ -32,6 +32,8 @@ import {
   getMetricsHostInfo,
   getMetricsSeries,
   getMetricsSnapshot,
+  getShareControlDeadLetters,
+  requeueShareControlDeadLetter,
 } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
 import type {
@@ -42,6 +44,7 @@ import type {
   MetricEvent,
   MetricsSeriesResponse,
   MetricsSnapshot,
+  ShareControlDeadLetterPage,
 } from "@/lib/types";
 import { compactTokens, fixed, formatBytes, formatDateTime, formatNumber, formatUptime, percent } from "@/lib/utils";
 import { deltaSeries, diskPercent, memoryPercent, mergeMetricEvents, pipelineState, toneFor } from "./metrics-utils";
@@ -100,6 +103,8 @@ export function MetricsPage() {
   const [failover, setFailover] = React.useState<LlmReliabilityResponse | null>(null);
   const [sharePerformance, setSharePerformance] = React.useState<LlmTopResponse | null>(null);
   const [alerting, setAlerting] = React.useState<AlertingOverview | null>(null);
+  const [shareControl, setShareControl] = React.useState<ShareControlDeadLetterPage | null>(null);
+  const [shareControlBusy, setShareControlBusy] = React.useState("");
   const [busy, setBusy] = React.useState("");
   const [error, setError] = React.useState("");
   const [clearOpen, setClearOpen] = React.useState(false);
@@ -119,7 +124,8 @@ export function MetricsPage() {
       const wantEvents = activeTab === "overview" || activeTab === "events";
       const wantTop = activeTab === "llm";
       const wantAlerting = activeTab === "alerts";
-      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop, nextFailover, nextSharePerformance, nextAlerting] = await Promise.all([
+      const wantShareControl = activeTab === "router";
+      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop, nextFailover, nextSharePerformance, nextAlerting, nextShareControl] = await Promise.all([
         getMetricsSnapshot(),
         wantSeries ? getMetricsSeries(range) : Promise.resolve(null),
         wantInfo ? getMetricsHostInfo() : Promise.resolve(null),
@@ -128,6 +134,7 @@ export function MetricsPage() {
         wantTop ? getLlmMetricsFailover(range, 10) : Promise.resolve(null),
         wantTop ? getLlmMetricsTop(range, "share-performance", 50) : Promise.resolve(null),
         wantAlerting ? getAlertingOverview(200) : Promise.resolve(null),
+        wantShareControl ? getShareControlDeadLetters() : Promise.resolve(null),
       ]);
       setSnapshot(nextSnapshot);
       if (nextSeries) setSeries(nextSeries);
@@ -137,6 +144,7 @@ export function MetricsPage() {
       if (nextFailover) setFailover(nextFailover);
       if (nextSharePerformance) setSharePerformance(nextSharePerformance);
       if (nextAlerting) setAlerting(nextAlerting);
+      if (nextShareControl) setShareControl(nextShareControl);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (/login required/i.test(message)) {
@@ -147,6 +155,37 @@ export function MetricsPage() {
       if (!silent) setBusy("");
     }
   }, [isAdmin, range, activeTab, refreshAuth]);
+
+  const requeueShareControl = React.useCallback(async (operationId: string) => {
+    if (shareControlBusy) return;
+    setShareControlBusy(operationId);
+    try {
+      await requeueShareControlDeadLetter(operationId);
+      setShareControl(await getShareControlDeadLetters());
+      setBanner(t("metrics.shareControl.requeued"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setShareControlBusy("");
+    }
+  }, [shareControlBusy, t]);
+
+  const loadMoreShareControl = React.useCallback(async () => {
+    if (!shareControl?.nextCursor || shareControlBusy) return;
+    setShareControlBusy("load-more");
+    try {
+      const page = await getShareControlDeadLetters(shareControl.nextCursor);
+      setShareControl((current) => current ? {
+        operations: [...current.operations, ...page.operations.filter((operation) => !current.operations.some((item) => item.id === operation.id))],
+        summary: page.summary,
+        nextCursor: page.nextCursor,
+      } : page);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setShareControlBusy("");
+    }
+  }, [shareControl, shareControlBusy]);
 
   React.useEffect(() => {
     load().catch(console.error);
@@ -273,7 +312,7 @@ export function MetricsPage() {
         <>
           {activeTab === "overview" ? <OverviewTab snapshot={snapshot} series={series} events={alertEvents} state={chartState} /> : null}
           {activeTab === "host" ? <HostTab snapshot={snapshot} series={series} hostInfo={hostInfo} state={chartState} /> : null}
-          {activeTab === "router" ? <RouterTab snapshot={snapshot} series={series} state={chartState} /> : null}
+          {activeTab === "router" ? <RouterTab snapshot={snapshot} series={series} state={chartState} shareControl={shareControl} shareControlBusy={shareControlBusy} onRequeueShareControl={requeueShareControl} onLoadMoreShareControl={loadMoreShareControl} /> : null}
           {activeTab === "clients" ? <ClientsTab clients={snapshot?.clients} series={series} state={chartState} /> : null}
           {activeTab === "llm" ? <LlmTab snapshot={snapshot} series={series} top={top} failover={failover} sharePerformance={sharePerformance} state={chartState} /> : null}
           {activeTab === "alerts" ? <AlertsTab overview={alerting} onReload={() => load(true)} /> : null}
@@ -514,14 +553,80 @@ function HostTab({
   );
 }
 
+function ShareControlPanel({
+  page,
+  busy,
+  onRequeue,
+  onLoadMore,
+}: {
+  page: ShareControlDeadLetterPage | null;
+  busy: string;
+  onRequeue: (operationId: string) => Promise<void> | void;
+  onLoadMore: () => Promise<void> | void;
+}) {
+  const { locale, t } = useLocaleText();
+  return (
+    <Card className="rounded-xl">
+      <Card.Header>
+        <Card.Title>{t("metrics.shareControl.title")}</Card.Title>
+        <Card.Description>{t("metrics.shareControl.description")}</Card.Description>
+      </Card.Header>
+      <Card.Content className="grid gap-4">
+        <div className="grid grid-cols-3 gap-4 border-y border-border py-3 text-sm">
+          <div><span className="block text-xs text-muted-foreground">{t("metrics.shareControl.pending")}</span><strong className="tabular-nums">{formatNumber(page?.summary.pending)}</strong></div>
+          <div><span className="block text-xs text-muted-foreground">{t("metrics.shareControl.dispatched")}</span><strong className="tabular-nums">{formatNumber(page?.summary.dispatched)}</strong></div>
+          <div><span className="block text-xs text-muted-foreground">{t("metrics.shareControl.deadLettered")}</span><strong className="tabular-nums text-rose-600">{formatNumber(page?.summary.deadLettered)}</strong></div>
+        </div>
+        {page?.operations.length ? (
+          <div className="divide-y divide-border border-y border-border">
+            {page.operations.map((operation) => (
+              <div key={operation.id} className="grid gap-2 py-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+                <div className="min-w-0 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <strong className="font-mono text-foreground">{operation.action}</strong>
+                    <span className="break-all text-muted-foreground">{operation.shareId}</span>
+                    <span className="text-muted-foreground">{t("metrics.shareControl.attempts", { count: operation.attempts })}</span>
+                  </div>
+                  <p className="mt-1 break-all text-muted-foreground">{operation.email} · {formatDateTime(operation.deadLetteredAt, locale)}</p>
+                  {operation.lastError ? <p className="mt-1 break-words text-rose-700">{operation.errorCode ? `${operation.errorCode}: ` : ""}{operation.lastError}</p> : null}
+                </div>
+                {operation.canRequeue ? (
+                  <Button size="sm" variant="outline" isDisabled={!!busy} onClick={() => void onRequeue(operation.id)}>
+                    {busy === operation.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                    {t("metrics.shareControl.requeue")}
+                  </Button>
+                ) : <span className="text-xs text-muted-foreground">{t("metrics.shareControl.manualOnly")}</span>}
+              </div>
+            ))}
+          </div>
+        ) : <p className="py-4 text-sm text-muted-foreground">{t("metrics.shareControl.empty")}</p>}
+        {page?.nextCursor ? (
+          <Button variant="outline" className="justify-self-center" isDisabled={!!busy} onClick={() => void onLoadMore()}>
+            {busy === "load-more" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+            {t("account.share.loadMore")}
+          </Button>
+        ) : null}
+      </Card.Content>
+    </Card>
+  );
+}
+
 function RouterTab({
   snapshot,
   series,
   state,
+  shareControl,
+  shareControlBusy,
+  onRequeueShareControl,
+  onLoadMoreShareControl,
 }: {
   snapshot: MetricsSnapshot | null;
   series: MetricsSeriesResponse | null;
   state: ChartState;
+  shareControl: ShareControlDeadLetterPage | null;
+  shareControlBusy: string;
+  onRequeueShareControl: (operationId: string) => Promise<void> | void;
+  onLoadMoreShareControl: () => Promise<void> | void;
 }) {
   const { t } = useLocaleText();
   const router = snapshot?.router;
@@ -582,6 +687,7 @@ function RouterTab({
           timestamps={series?.router.map((p) => p.timestamp) || []}
         />
       </div>
+      <ShareControlPanel page={shareControl} busy={shareControlBusy} onRequeue={onRequeueShareControl} onLoadMore={onLoadMoreShareControl} />
       <CountersTable router={router} />
     </div>
   );

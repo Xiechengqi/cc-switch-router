@@ -94,6 +94,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         24,
         include_str!("../schema/0024_share_market_contract_integrity.sql"),
     ),
+    (
+        25,
+        include_str!("../schema/0025_share_market_completion.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -621,7 +625,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 117);
+        assert_eq!(table_count, 121);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -667,7 +671,7 @@ mod tests {
             .expect("query migration history")
             .collect::<Result<Vec<_>, _>>()
             .expect("read migration history");
-        assert_eq!(versions.len(), 24);
+        assert_eq!(versions.len(), MIGRATIONS.len() + 1);
         assert_eq!(versions[0], (1, migration_checksum(BASELINE_SQL)));
         assert_eq!(versions[1], (2, migration_checksum(MIGRATIONS[0].1)));
         assert_eq!(versions[2], (3, migration_checksum(MIGRATIONS[1].1)));
@@ -692,6 +696,7 @@ mod tests {
         assert_eq!(versions[21], (22, migration_checksum(MIGRATIONS[20].1)));
         assert_eq!(versions[22], (23, migration_checksum(MIGRATIONS[21].1)));
         assert_eq!(versions[23], (24, migration_checksum(MIGRATIONS[22].1)));
+        assert_eq!(versions[24], (25, migration_checksum(MIGRATIONS[23].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1020,7 +1025,7 @@ mod tests {
     }
 
     fn install_schema_through(conn: &Connection, version: i64) {
-        assert!((1..=23).contains(&version));
+        assert!((1..=24).contains(&version));
         install_baseline(conn, &migration_checksum(BASELINE_SQL)).expect("install baseline");
         for (migration_version, sql) in MIGRATIONS.iter().copied().take((version - 1) as usize) {
             if migration_version == LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION {
@@ -1161,6 +1166,415 @@ mod tests {
             )
             .expect("read migrated billing service start");
         assert_eq!(contract_service_started_at, "2026-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn migration_25_matches_runtime_public_market_projection_and_backfills_release_time() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 24);
+        let payload = serde_json::json!({
+            "summary": "Share seat rented",
+            "marketKind": "share",
+            "billingEventType": "service_started",
+            "installationId": "installation-v24",
+            "shareId": "share-v24",
+            "shareName": "Share v24",
+            "appType": "codex",
+            "subdomain": "share-v24-route",
+            "ownerEmail": "owner@example.com",
+            "supplierEmail": "supplier@example.com",
+            "listingId": "listing-v24",
+            "seatId": "seat-v24",
+            "seatPosition": 1,
+            "seatStatus": "occupied",
+            "subscriptionStatus": "released",
+            "parallelLimit": 2,
+            "tokenLimit": 1_000_000,
+            "tokenPeriod": "day",
+            "dailyRateMinor": 1200,
+            "currency": "USD",
+            "serviceDurationDays": 10,
+            "offerRevision": 3,
+            "paymentMethods": [{
+                "kind": "alipay",
+                "account": "private-payment-account"
+            }],
+            "paymentContacts": [{
+                "kind": "email",
+                "value": "payments@example.com"
+            }],
+            "renterUserId": "private-renter-id",
+            "renterEmail": "private-renter@example.com",
+            "buyerEmail": "private-buyer@example.com",
+            "balanceMinor": 1234,
+            "invoiceId": "private-invoice",
+            "paymentReference": "private-reference",
+            "evidenceUrl": "https://private.invalid/evidence",
+            "dispute": { "reason": "private-dispute" },
+            "actorUserId": "private-actor-id",
+            "actorEmail": "private-actor@example.com"
+        });
+        let payload_json = serde_json::to_string(&payload).expect("encode historical payload");
+        let billing_payload = serde_json::json!({
+            "summary": "Payment is due",
+            "marketKind": "billing",
+            "billingEventType": "payment_due",
+            "installationId": "installation-v24",
+            "supplierEmail": "supplier@example.com",
+            "paymentMethods": [{
+                "kind": "alipay",
+                "account": "private-billing-account"
+            }],
+            "paymentContacts": [{
+                "kind": "email",
+                "value": "payments@example.com"
+            }],
+            "buyerUserId": "private-buyer-id",
+            "buyerEmail": "private-buyer@example.com",
+            "balanceMinor": 1234,
+            "creditLimitMinor": 5000,
+            "invoiceId": "private-invoice",
+            "paymentReference": "private-reference",
+            "evidenceUrl": "https://private.invalid/evidence",
+            "dispute": { "reason": "private-dispute" },
+            "refundReference": "private-refund-reference"
+        });
+        let billing_payload_json =
+            serde_json::to_string(&billing_payload).expect("encode historical billing payload");
+        let client_payload = serde_json::json!({
+            "summary": "Client provisioned",
+            "marketKind": "client",
+            "installationId": "installation-v24",
+            "clientLabel": "client-v24-route",
+            "providerEmail": "provider@example.com",
+            "hostname": "host-v24.example.com",
+            "status": "active",
+            "dailyRateMinor": 2400,
+            "currency": "USD",
+            "offerRevision": 4,
+            "trialHours": 12,
+            "freeDurationDays": 3,
+            "activatedAt": "2026-01-01T00:00:00Z",
+            "expiresAt": "2026-02-01T00:00:00Z",
+            "providerDeniedClientAccess": false,
+            "reason": "service ready",
+            "failureCode": "none",
+            "paymentMethods": [{
+                "kind": "crypto",
+                "account": "private-client-payment-account",
+                "address": "private-client-payment-address"
+            }],
+            "paymentContacts": [{
+                "channel": "telegram",
+                "handle": "public-provider-contact"
+            }],
+            "clientUserId": "private-client-user-id",
+            "clientOwnerEmail": "private-client-owner@example.com",
+            "providerUserId": "private-provider-user-id",
+            "actorUserId": "private-actor-id",
+            "actorEmail": "private-actor@example.com"
+        });
+        let client_payload_json =
+            serde_json::to_string(&client_payload).expect("encode historical Client payload");
+        conn.execute_batch(
+            "INSERT INTO shares
+                (share_id, capacity_pool_id, installation_id, share_name, owner_email,
+                 for_sale, app_type, token_limit, parallel_limit, tokens_used,
+                 requests_count, share_status, created_at, expires_at, updated_at)
+             VALUES ('share-v24', 'pool-v24', 'installation-v24', 'Share v24',
+                     'owner@example.com', 'Free', 'codex', -1, 3, 0, 0, 'active',
+                     '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z',
+                     '2026-02-01T00:00:00Z');
+             INSERT INTO share_market_listings
+                (id, share_id, installation_id, owner_user_id, owner_email, status,
+                 created_at, updated_at)
+             VALUES ('listing-v24', 'share-v24', 'installation-v24', 'owner-v24',
+                     'owner@example.com', 'active', '2026-01-01T00:00:00Z',
+                     '2026-02-01T00:00:00Z');
+             INSERT INTO share_market_seats
+                (id, listing_id, position, status, token_period_json,
+                 offer_revision, current_subscription_id, created_at, updated_at)
+             VALUES ('seat-v24', 'listing-v24', 1, 'available', '\"day\"', 3,
+                     NULL, '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z');
+             INSERT INTO share_market_subscriptions
+                (id, seat_id, listing_id, share_id, installation_id, entitlement_id,
+                 owner_user_id, owner_email, renter_user_id, renter_email, status,
+                 parallel_limit, token_limit, token_period_json, daily_rate_minor,
+                 currency, service_duration_days, offer_revision, created_at, updated_at,
+                 released_at)
+             VALUES ('subscription-v24', 'seat-v24', 'listing-v24', 'share-v24',
+                     'installation-v24', 'entitlement-v24', 'owner-v24',
+                     'owner@example.com', 'renter-v24', 'renter@example.com', 'released',
+                     2, 1000000, '\"day\"', 1200, 'USD', 10, 3,
+                     '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z', NULL);
+             INSERT INTO chat_rooms
+                (id, installation_id, client_label_snapshot, owner_email_snapshot,
+                 created_at, updated_at)
+             VALUES ('room-v24', 'installation-v24', 'Client v24', 'owner@example.com',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .expect("seed version 24 Share and chat rows");
+        conn.execute(
+            "INSERT INTO chat_messages (
+                id, room_id, author_user_id, author_email, author_label,
+                client_message_id, author_kind, message_kind, event_type,
+                event_payload_json, payload_version, source_event_id, body,
+                created_at, updated_at
+             ) VALUES ('message-v24', 'room-v24', 'system', '', 'System message',
+                       'share-market:event-v24', 'system', 'market_event', 'seat_rented',
+                       ?1, 1, 'share-market:event-v24', 'Share seat rented',
+                       '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            params![payload_json],
+        )
+        .expect("seed historical materialized market event");
+        conn.execute(
+            "INSERT INTO chat_messages (
+                id, room_id, author_user_id, author_email, author_label,
+                client_message_id, author_kind, message_kind, event_type,
+                event_payload_json, payload_version, source_event_id, body,
+                created_at, updated_at
+             ) VALUES ('billing-message-v24', 'room-v24', 'system', '', 'System message',
+                       'market_billing:event-v24', 'system', 'market_event', 'payment_due',
+                       ?1, 1, 'market_billing:event-v24', 'Payment is due',
+                       '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z')",
+            params![billing_payload_json],
+        )
+        .expect("seed historical materialized billing event");
+        conn.execute(
+            "INSERT INTO client_chat_system_outbox (
+                id, installation_id, source_kind, source_event_id, event_type,
+                payload_json, follower_user_ids_json, status, attempts,
+                created_at, updated_at
+             ) VALUES ('outbox-v24', 'installation-v24', 'share_market', 'event-v24',
+                       'seat_rented', ?1, '[]', 'dead_letter', 3,
+                       '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            params![payload_json],
+        )
+        .expect("seed historical dead-letter market event");
+        conn.execute(
+            "INSERT INTO chat_messages (
+                id, room_id, author_user_id, author_email, author_label,
+                client_message_id, author_kind, message_kind, event_type,
+                event_payload_json, payload_version, source_event_id, body,
+                created_at, updated_at
+             ) VALUES ('client-message-v24', 'room-v24', 'system', '', 'System message',
+                       'client_market:event-v24', 'system', 'market_event', 'client_provisioned',
+                       ?1, 1, 'client_market:event-v24', 'Client provisioned',
+                       '2026-01-01T00:00:02Z', '2026-01-01T00:00:02Z')",
+            params![client_payload_json],
+        )
+        .expect("seed historical materialized Client Market event");
+        conn.execute(
+            "INSERT INTO client_chat_system_outbox (
+                id, installation_id, source_kind, source_event_id, event_type,
+                payload_json, follower_user_ids_json, status, attempts,
+                created_at, updated_at, completed_at
+             ) VALUES ('client-outbox-v24', 'installation-v24', 'client_market',
+                       'client-event-v24', 'client_provisioned', ?1, '[]', 'completed', 1,
+                       '2026-01-01T00:00:02Z', '2026-01-01T00:00:02Z',
+                       '2026-01-01T00:00:02Z')",
+            params![client_payload_json],
+        )
+        .expect("seed historical completed Client Market event");
+
+        apply(&conn).expect("upgrade version 24 public market events");
+
+        let expected = crate::store::client_chat::public_market_event_payload(&payload);
+        let (message_payload, payload_version): (String, i64) = conn
+            .query_row(
+                "SELECT event_payload_json, payload_version FROM chat_messages
+                 WHERE id = 'message-v24'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated market message");
+        let outbox_payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM client_chat_system_outbox WHERE id = 'outbox-v24'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated market outbox");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&message_payload)
+                .expect("decode migrated message payload"),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&outbox_payload)
+                .expect("decode migrated outbox payload"),
+            expected
+        );
+        assert_eq!(payload_version, 2);
+        let (billing_message_payload, billing_payload_version): (String, i64) = conn
+            .query_row(
+                "SELECT event_payload_json, payload_version FROM chat_messages
+                 WHERE id = 'billing-message-v24'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated billing message");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&billing_message_payload)
+                .expect("decode migrated billing payload"),
+            crate::store::client_chat::public_market_event_payload(&billing_payload)
+        );
+        assert_eq!(billing_payload_version, 2);
+        let expected_client =
+            crate::store::client_chat::public_market_event_payload(&client_payload);
+        let (client_message_payload, client_payload_version): (String, i64) = conn
+            .query_row(
+                "SELECT event_payload_json, payload_version FROM chat_messages
+                 WHERE id = 'client-message-v24'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated Client Market message");
+        let client_outbox_payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM client_chat_system_outbox
+                 WHERE id = 'client-outbox-v24'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated Client Market outbox");
+        let client_message_payload =
+            serde_json::from_str::<serde_json::Value>(&client_message_payload)
+                .expect("decode migrated Client Market message");
+        assert_eq!(client_message_payload, expected_client);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&client_outbox_payload)
+                .expect("decode migrated Client Market outbox"),
+            expected_client
+        );
+        assert_eq!(client_payload_version, 2);
+        assert_eq!(
+            client_message_payload["supplierEmail"],
+            "provider@example.com"
+        );
+        assert_eq!(client_message_payload["clientLabel"], "client-v24-route");
+        assert_eq!(client_message_payload["dailyRateMinor"], 2400);
+        assert_eq!(
+            client_message_payload["paymentMethodKinds"],
+            serde_json::json!(["crypto"])
+        );
+        assert_eq!(
+            client_message_payload["contacts"][0]["handle"],
+            "public-provider-contact"
+        );
+        for private_field in [
+            "clientUserId",
+            "clientOwnerEmail",
+            "providerUserId",
+            "actorUserId",
+            "actorEmail",
+            "paymentMethods",
+        ] {
+            assert!(client_message_payload.get(private_field).is_none());
+        }
+        let released_at: String = conn
+            .query_row(
+                "SELECT released_at FROM share_market_subscriptions
+                 WHERE id = 'subscription-v24'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read backfilled terminal timestamp");
+        assert_eq!(released_at, "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn migration_25_backfills_historical_invoice_credits_into_accrual_net_amounts() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 24);
+        conn.execute_batch(
+            "INSERT INTO market_credit_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, credit_kind, credit_limit_minor, credit_source,
+                credit_revision, created_at, updated_at
+             ) VALUES ('credit-backfill-account', 'credit-backfill-buyer', 'buyer@example.com',
+                       'credit-backfill-supplier', 'supplier@example.com', 'USD', 'active',
+                       'limited', 1000, 'counterparty', 1,
+                       '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO market_service_contracts (
+                id, account_id, product_kind, product_ref, service_ref, service_label,
+                buyer_user_id, buyer_email, supplier_user_id, supplier_email, currency,
+                daily_rate_minor, offer_revision, status, trial_seconds_remaining,
+                last_evaluated_at, activated_at, created_at, updated_at
+             ) VALUES ('credit-backfill-contract', 'credit-backfill-account', 'client_host',
+                       'credit-backfill-product', 'credit-backfill-service', 'Backfill service',
+                       'credit-backfill-buyer', 'buyer@example.com', 'credit-backfill-supplier',
+                       'supplier@example.com', 'USD', 100, 1, 'active', 0,
+                       '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO market_invoices (
+                id, account_id, sequence, amount_minor, amount_cny_minor,
+                usd_cny_rate_micros, amount_units, currency, payment_methods_json,
+                payment_contacts_json, payment_profile_updated_at, status, due_at,
+                deadline_at, opened_at
+             ) VALUES ('credit-backfill-invoice', 'credit-backfill-account', 1, 1, 7,
+                       7000000, 300, 'USD', '[]', '[]', '2026-01-01T00:00:00Z',
+                       'paid', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z',
+                       '2026-01-01T00:00:00Z');
+             INSERT INTO market_service_intervals (
+                id, contract_id, state, observation_reason, started_at, ended_at,
+                elapsed_seconds, trial_seconds, billable_seconds, amount_units,
+                invoice_id, created_at, updated_at
+             ) VALUES
+                ('credit-backfill-interval-1', 'credit-backfill-contract', 'healthy', 'test',
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', 60, 0, 60, 100,
+                 'credit-backfill-invoice', '2026-01-01T00:01:00Z', '2026-01-01T00:01:00Z'),
+                ('credit-backfill-interval-2', 'credit-backfill-contract', 'healthy', 'test',
+                 '2026-01-01T00:01:00Z', '2026-01-01T00:02:00Z', 60, 0, 60, 200,
+                 'credit-backfill-invoice', '2026-01-01T00:02:00Z', '2026-01-01T00:02:00Z');
+             INSERT INTO market_accrual_entries (
+                id, account_id, contract_id, interval_id, currency, daily_rate_minor,
+                billable_seconds, amount_units, status, invoice_id, created_at, updated_at
+             ) VALUES
+                ('credit-backfill-accrual-1', 'credit-backfill-account',
+                 'credit-backfill-contract', 'credit-backfill-interval-1', 'USD', 100, 60,
+                 100, 'invoiced', 'credit-backfill-invoice', '2026-01-01T00:01:00Z',
+                 '2026-01-01T00:01:00Z'),
+                ('credit-backfill-accrual-2', 'credit-backfill-account',
+                 'credit-backfill-contract', 'credit-backfill-interval-2', 'USD', 100, 60,
+                 200, 'invoiced', 'credit-backfill-invoice', '2026-01-01T00:02:00Z',
+                 '2026-01-01T00:02:00Z');
+             INSERT INTO market_credit_notes (
+                id, account_id, invoice_id, kind, amount_units, amount_minor, currency,
+                reason, status, created_by_user_id, created_by_email, created_at
+             ) VALUES
+                ('credit-backfill-service-note', 'credit-backfill-account',
+                 'credit-backfill-invoice', 'service_credit', 150, 1, 'USD', 'service credit',
+                 'applied', 'credit-backfill-supplier', 'supplier@example.com',
+                 '2026-01-01T00:03:00Z'),
+                ('credit-backfill-refund-note', 'credit-backfill-account',
+                 'credit-backfill-invoice', 'external_refund', 75, 1, 'USD', 'external refund',
+                 'recorded', 'credit-backfill-supplier', 'supplier@example.com',
+                 '2026-01-01T00:04:00Z');",
+        )
+        .expect("seed historical invoice credits");
+
+        apply(&conn).expect("upgrade historical invoice credits");
+
+        let credits = conn
+            .prepare(
+                "SELECT id, credited_units FROM market_accrual_entries
+                 WHERE invoice_id = 'credit-backfill-invoice' ORDER BY created_at, id",
+            )
+            .expect("prepare migrated accrual credits")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query migrated accrual credits")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migrated accrual credits");
+        assert_eq!(
+            credits,
+            vec![
+                ("credit-backfill-accrual-1".into(), 100),
+                ("credit-backfill-accrual-2".into(), 125),
+            ]
+        );
     }
 
     #[test]

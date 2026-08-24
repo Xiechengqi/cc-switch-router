@@ -5,6 +5,7 @@ import { Button, Modal } from "@heroui/react";
 import Link from "next/link";
 import {
   Ban,
+  Clock3,
   Copy,
   Loader2,
   MessageCircle,
@@ -35,9 +36,13 @@ import {
   forceRevokeShareMarketSubscription,
   getShareMarketOwnedShares,
   proposeShareMarketPriceChange,
+  quoteShareMarketSubscriptionTermination,
+  retryShareMarketSubscriptionGrant,
+  terminateShareMarketSubscription,
   updateShareMarketSeat,
+  ApiError,
 } from "@/lib/api";
-import { MARKET_CURRENCY } from "@/lib/market-money";
+import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
 import {
   buildDashboardHref,
   DASHBOARD_CLIENTS_PATH,
@@ -54,15 +59,20 @@ import type {
   ShareMarketSeat,
   ShareMarketSeatInput,
   ShareMarketSubscription,
+  ShareMarketTerminationQuote,
   ShareTokenPeriod,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
   capabilityModelLabel,
+  enabledMarketCapabilities,
   formatSeatPrice,
   formatTokenLimit,
   grantFailureMessageKey,
+  integrityReasonText,
+  integrityStatusKey,
   isCoreShareApp,
+  refundStatusKey,
   shareMarketMutationError,
   subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
@@ -675,11 +685,156 @@ function PriceDialog({ subscription, onOpenChange, onSaved }: { subscription: Sh
   );
 }
 
+function TerminationDialog({
+  target,
+  onOpenChange,
+  onSaved,
+}: {
+  target: { subscription: ShareMarketSubscription; denyFutureAccess: boolean } | null;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const { locale, t } = useLocaleText();
+  const [quote, setQuote] = React.useState<ShareMarketTerminationQuote | null>(null);
+  const [loadingQuote, setLoadingQuote] = React.useState(false);
+  const [committing, setCommitting] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const [quoteNowMs, setQuoteNowMs] = React.useState(() => Date.now());
+  const idempotencyKey = React.useRef("");
+  const quoteRequestRef = React.useRef<AbortController | null>(null);
+
+  const requestQuote = React.useCallback(async (
+    currentTarget: NonNullable<typeof target>,
+  ) => {
+    quoteRequestRef.current?.abort();
+    const controller = new AbortController();
+    quoteRequestRef.current = controller;
+    setQuote(null);
+    setError("");
+    setLoadingQuote(true);
+    idempotencyKey.current = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    try {
+      const value = await quoteShareMarketSubscriptionTermination(
+        currentTarget.subscription.id,
+        controller.signal,
+      );
+      if (controller.signal.aborted || quoteRequestRef.current !== controller) return;
+      setQuote(value);
+      setQuoteNowMs(Date.now());
+    } catch (reason) {
+      if (controller.signal.aborted || quoteRequestRef.current !== controller) return;
+      setError(shareMarketMutationError(reason, t));
+    } finally {
+      if (quoteRequestRef.current === controller) {
+        quoteRequestRef.current = null;
+        setLoadingQuote(false);
+      }
+    }
+  }, [t]);
+
+  React.useEffect(() => {
+    if (!target) {
+      quoteRequestRef.current?.abort();
+      quoteRequestRef.current = null;
+      setQuote(null);
+      setError("");
+      setLoadingQuote(false);
+      return;
+    }
+    void requestQuote(target);
+    return () => quoteRequestRef.current?.abort();
+  }, [requestQuote, target]);
+
+  React.useEffect(() => {
+    if (!target || !quote) return;
+    const timer = window.setInterval(() => setQuoteNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [quote, target]);
+
+  const quoteRemainingSeconds = quote
+    ? Math.max(0, Math.ceil((Date.parse(quote.expiresAt) - quoteNowMs) / 1_000))
+    : 0;
+  const quoteExpired = !!quote && quoteRemainingSeconds <= 0;
+
+  const confirm = async () => {
+    if (!target || !quote || committing || loadingQuote) return;
+    if (quoteExpired) {
+      await requestQuote(target);
+      return;
+    }
+    setCommitting(true);
+    setError("");
+    try {
+      await terminateShareMarketSubscription(
+        target.subscription.id,
+        quote.id,
+        idempotencyKey.current,
+        target.denyFutureAccess,
+      );
+      onOpenChange(false);
+      onSaved();
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 410) {
+        setQuoteNowMs(Date.parse(quote.expiresAt));
+        setError(t("shareMarket.termination.expired"));
+      } else {
+        setError(shareMarketMutationError(reason, t));
+      }
+    } finally {
+      setCommitting(false);
+    }
+  };
+  const calculation = quote?.calculation;
+  const refreshRequired = !quote || quoteExpired;
+  return (
+    <Modal.Backdrop isOpen={!!target} onOpenChange={(open) => !committing && onOpenChange(open)}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light w-[min(520px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{t("shareMarket.termination.title")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid gap-4">
+            {calculation ? (
+              <>
+                <p className="text-sm leading-6 text-slate-600">{t("shareMarket.termination.description", { email: target?.subscription.renterEmail || "-" })}</p>
+                <dl className="grid grid-cols-2 gap-x-4 gap-y-3 border-y border-slate-200 py-4 text-sm">
+                  <div><dt className="text-xs text-slate-500">{t("shareMarket.termination.elapsed")}</dt><dd className="mt-1 font-medium">{(calculation.elapsedBps / 100).toFixed(2)}%</dd></div>
+                  <div><dt className="text-xs text-slate-500">{t("shareMarket.termination.refundRate")}</dt><dd className="mt-1 font-medium">{(calculation.refundBps / 100).toFixed(2)}%</dd></div>
+                  <div><dt className="text-xs text-slate-500">{t("shareMarket.termination.netBilled")}</dt><dd className="mt-1 font-medium">{formatUsdMoney(Math.ceil(calculation.refundableBaseUnits / 86_400), locale)}</dd></div>
+                  <div><dt className="text-xs text-slate-500">{t("shareMarket.termination.refundAmount")}</dt><dd className="mt-1 font-semibold text-rose-700">{formatUsdMoney(calculation.amountMinor, locale)}</dd></div>
+                </dl>
+                <p className="text-xs leading-5 text-slate-500">{t("shareMarket.termination.policy")}</p>
+                {target?.denyFutureAccess ? <p className="text-xs font-medium text-rose-700">{t("shareMarket.termination.denyNotice")}</p> : null}
+                <p className={cn("flex items-center gap-1.5 text-xs", quoteExpired ? "text-rose-700" : "text-slate-500")}>
+                  <Clock3 className="h-3.5 w-3.5 shrink-0" />
+                  {quoteExpired
+                    ? t("shareMarket.termination.expired")
+                    : t("shareMarket.termination.expiresIn", { seconds: quoteRemainingSeconds })}
+                </p>
+              </>
+            ) : loadingQuote ? <p className="inline-flex items-center gap-2 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</p> : null}
+            {error ? <p className="text-sm text-rose-700">{error}</p> : null}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="ghost" isDisabled={committing} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
+            <Button
+              variant="danger"
+              isDisabled={committing || loadingQuote}
+              onClick={() => void (refreshRequired && target ? requestQuote(target) : confirm())}
+            >
+              {committing || loadingQuote ? <Loader2 className="h-4 w-4 animate-spin" /> : refreshRequired ? <RefreshCw className="h-4 w-4" /> : null}
+              {refreshRequired ? t("shareMarket.termination.refresh") : t("shareMarket.termination.confirm")}
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+  );
+}
+
 function AppSummary({ listing }: { listing: ShareMarketListing }) {
   const { t } = useLocaleText();
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
-      {listing.appCapabilities.map((capability) => (
+      {enabledMarketCapabilities(listing).map((capability) => (
         <span key={capability.app} className="inline-flex min-w-0 items-center gap-1.5">
           {isCoreShareApp(capability.app) ? <ShareAppLogo app={capability.app} size={14} /> : null}
           <span className="truncate">{capabilityModelLabel(capability, t("shareMarket.modelPassthrough"), t("shareMarket.catalog.modelUnknown"))}</span>
@@ -707,11 +862,12 @@ export function ShareMarketOwnerWorkspace({
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listing: ShareMarketListing; seat?: ShareMarketSeat; template?: ShareMarketSeat } | null>(null);
   const [priceDialog, setPriceDialog] = React.useState<ShareMarketSubscription | null>(null);
+  const [terminationTarget, setTerminationTarget] = React.useState<{ subscription: ShareMarketSubscription; denyFutureAccess: boolean } | null>(null);
   const [confirm, setConfirm] = React.useState<ConfirmAction | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const focusedRef = React.useRef("");
-  const interactionActive = addOpen || !!seatDialog || !!priceDialog || !!confirm || busy;
+  const interactionActive = addOpen || !!seatDialog || !!priceDialog || !!terminationTarget || !!confirm || busy;
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
@@ -756,6 +912,8 @@ export function ShareMarketOwnerWorkspace({
       || !!subscription.releaseReason
       || !!subscription.failureCode
       || subscription.grantAttempts != null
+      || subscription.integrityState !== "compatible"
+      || !!subscription.terminationAdjustment
     );
 
     if (!subscription || !hasStatusDetail) return null;
@@ -769,6 +927,8 @@ export function ShareMarketOwnerWorkspace({
         {subscription.failureCode ? <p className="break-all font-mono text-[10px] text-slate-500">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
         {subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
         {subscription.releaseReason ? <p className="break-words text-slate-500">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
+        {subscription.integrityState !== "compatible" ? <p>{t(integrityStatusKey(subscription.integrityState))}{subscription.integrityReason ? ` · ${integrityReasonText(subscription.integrityReason, t)}` : ""}</p> : null}
+        {subscription.terminationAdjustment ? <p>{t("shareMarket.refund.summary", { amount: formatUsdMoney(subscription.terminationAdjustment.amountMinor, locale), status: t(refundStatusKey(subscription.terminationAdjustment.status)) })}</p> : null}
       </div>
     );
   };
@@ -819,6 +979,22 @@ export function ShareMarketOwnerWorkspace({
         }),
       });
     }
+    if (subscription?.canRetryGrant) {
+      actions.push({
+        key: "retry-grant",
+        label: t("shareMarket.authorizationFailure.retry"),
+        icon: <RefreshCw className="h-4 w-4" />,
+        onClick: () => setConfirm({
+          title: t("shareMarket.authorizationFailure.retryTitle"),
+          description: t("shareMarket.authorizationFailure.retryDescription", {
+            email: subscription.renterEmail || "-",
+          }),
+          label: t("shareMarket.authorizationFailure.retry"),
+          tone: "warning",
+          run: () => retryShareMarketSubscriptionGrant(subscription.id),
+        }),
+      });
+    }
     if (subscription?.canProposePriceChange) {
       actions.push({
         key: "price",
@@ -834,32 +1010,39 @@ export function ShareMarketOwnerWorkspace({
       });
     }
     if (subscription?.canForceRevoke) {
+      const requiresRefundConfirmation = subscription.dailyRateMinor != null
+        && subscription.serviceDurationDays != null
+        && !!subscription.serviceStartedAt;
       actions.push(
         {
           key: "revoke",
           label: t("shareMarket.forceRevoke"),
           icon: <RefreshCw className="h-4 w-4" />,
           iconOnly: true,
-          onClick: () => setConfirm({
+          onClick: () => requiresRefundConfirmation
+            ? setTerminationTarget({ subscription, denyFutureAccess: false })
+            : setConfirm({
             title: t("shareMarket.confirm.revokeTitle"),
             description: t("shareMarket.confirm.revokeDescription", { email: subscription.renterEmail || "-" }),
             label: t("shareMarket.forceRevoke"),
             tone: "warning",
             run: () => forceRevokeShareMarketSubscription(subscription.id, { denyFutureAccess: false }),
-          }),
+            }),
         },
         {
           key: "deny",
           label: t("shareMarket.denyAndRevoke"),
           icon: <UserRoundX className="h-4 w-4" />,
           iconOnly: true,
-          onClick: () => setConfirm({
+          onClick: () => requiresRefundConfirmation
+            ? setTerminationTarget({ subscription, denyFutureAccess: true })
+            : setConfirm({
             title: t("shareMarket.confirm.denyTitle"),
             description: t("shareMarket.confirm.denyDescription", { email: subscription.renterEmail || "-" }),
             label: t("shareMarket.denyAndRevoke"),
             tone: "danger",
             run: () => forceRevokeShareMarketSubscription(subscription.id, { denyFutureAccess: true }),
-          }),
+            }),
         },
       );
     }
@@ -1018,6 +1201,7 @@ export function ShareMarketOwnerWorkspace({
       <ShareMarketAddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void onChanged()} />
       <SeatDialog key={seatDialog ? `${seatDialog.listing.id}:${seatDialog.seat?.id || `copy:${seatDialog.template?.id || "new"}`}` : "closed"} listing={seatDialog?.listing || null} seat={seatDialog?.seat} template={seatDialog?.template} onOpenChange={(open) => !open && setSeatDialog(null)} onSaved={() => void onChanged()} />
       <PriceDialog subscription={priceDialog} onOpenChange={(open) => !open && setPriceDialog(null)} onSaved={() => void onChanged()} />
+      <TerminationDialog target={terminationTarget} onOpenChange={(open) => !open && setTerminationTarget(null)} onSaved={() => void onChanged()} />
       <ConfirmAlertDialog
         open={!!confirm}
         title={confirm?.title || ""}

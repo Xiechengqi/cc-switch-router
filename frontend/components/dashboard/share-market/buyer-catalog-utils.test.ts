@@ -7,10 +7,15 @@ import {
   preserveCatalogSeat,
 } from "./buyer-catalog-utils";
 import {
+  integrityReasonText,
   marketProviderStatusView,
   primaryMarketCapability,
 } from "./market-utils";
-import type { ShareMarketAppCapability } from "@/lib/types";
+import { mergeShareMarketSubscriptionPage } from "./subscription-utils";
+import type {
+  ShareMarketAppCapability,
+  ShareMarketSubscription,
+} from "@/lib/types";
 
 const seat = (id: string, status = "available", readOnly = false) => ({ id, status, readOnly });
 
@@ -69,9 +74,10 @@ test("provider panel prefers a capability with public account status", () => {
   );
 });
 
-test("provider panel reproduces quota, masked identity and app model rows", () => {
+test("provider panel reproduces quota, provider identity and enabled app model rows", () => {
   const view = marketProviderStatusView(
     {
+      supportedApps: ["claude", "codex"],
       appCapabilities: [
         capability({
           accountHint: "p***@example.com",
@@ -96,7 +102,7 @@ test("provider panel reproduces quota, masked identity and app model rows", () =
   );
   assert.match(view.primaryLine, /Plus/);
   assert.match(view.primaryLine, /weekly 55%/i);
-  assert.equal(view.identityLine, "p***@example.com");
+  assert.equal(view.identityLine, "OpenAI Official · codex_oauth");
   assert.match(view.modelsLine, /Claude: grok-4\.6/);
   assert.match(view.modelsLine, /Codex: gpt-5/);
   assert.match(view.toneClassName, /emerald/);
@@ -105,6 +111,7 @@ test("provider panel reproduces quota, masked identity and app model rows", () =
 test("provider panel keeps degraded and API providers safe", () => {
   const view = marketProviderStatusView(
     {
+      supportedApps: ["codex"],
       appCapabilities: [
         capability({
           providerFamily: "api",
@@ -119,7 +126,7 @@ test("provider panel keeps degraded and API providers safe", () => {
     { unknown: "Unknown", passthrough: "Passthrough" },
   );
   assert.equal(view.primaryLine, "Private API");
-  assert.equal(view.identityLine, "-");
+  assert.equal(view.identityLine, "Private API · openai_compatible");
   assert.match(view.toneClassName, /amber/);
   assert.doesNotMatch(JSON.stringify(view), /https?:\/\//);
 });
@@ -127,6 +134,7 @@ test("provider panel keeps degraded and API providers safe", () => {
 test("provider panel uses subscription level and stable app order without quota", () => {
   const view = marketProviderStatusView(
     {
+      supportedApps: ["claude", "codex"],
       appCapabilities: [
         capability({ app: "codex", subscriptionLevel: "Pro" }),
         capability({
@@ -144,4 +152,87 @@ test("provider panel uses subscription level and stable app order without quota"
   );
   assert.equal(view.primaryLine, "Pro");
   assert.ok(view.modelsLine.indexOf("Claude:") < view.modelsLine.indexOf("Codex:"));
+});
+
+test("provider panel excludes bound apps whose Share API is disabled", () => {
+  const view = marketProviderStatusView(
+    {
+      supportedApps: ["codex"],
+      appCapabilities: [
+        capability(),
+        capability({
+          app: "claude",
+          providerFamily: "xai",
+          providerName: "Grok OAuth",
+          providerType: "grok_oauth",
+          upstreamModel: "grok-4.6",
+          models: ["grok-4.6"],
+        }),
+      ],
+    },
+    "en",
+    { unknown: "Unknown", passthrough: "Passthrough" },
+  );
+
+  assert.match(view.modelsLine, /Codex: gpt-5/);
+  assert.doesNotMatch(view.modelsLine, /Claude:/);
+});
+
+test("contract integrity reasons are localized without exposing internal codes", () => {
+  const text = integrityReasonText(
+    "share_contract_upgrade_required,app_scope_not_enforced,entitlement_missing,unknown_reason",
+    (key) => key,
+  );
+  assert.equal(
+    text,
+    [
+      "shareMarket.integrity.reason.clientUpgradeRequired",
+      "shareMarket.integrity.reason.appScopeNotEnforced",
+      "shareMarket.integrity.reason.entitlementMissing",
+      "shareMarket.integrity.reason.unknown",
+    ].join(" · "),
+  );
+  assert.doesNotMatch(text, /share_contract_upgrade_required|app_scope_not_enforced|entitlement_missing/);
+});
+
+const subscription = (
+  id: string,
+  status: string,
+  updatedAt = "2026-01-01T00:00:00Z",
+) => ({ id, status, updatedAt }) as ShareMarketSubscription;
+
+test("subscription refresh retains loaded history and replaces active rows", () => {
+  const history = subscription("history", "released");
+  const staleActive = subscription("active", "active_free");
+  const removedActive = subscription("removed", "active_free");
+  const refreshedActive = subscription("active", "active_free", "2026-01-02T00:00:00Z");
+
+  assert.deepEqual(
+    mergeShareMarketSubscriptionPage(
+      [history, staleActive, removedActive],
+      [refreshedActive],
+      false,
+    ),
+    [history, refreshedActive],
+  );
+});
+
+test("subscription refresh preserves an active-to-terminal transition", () => {
+  const active = subscription("transition", "active_postpaid");
+  const released = subscription("transition", "released", "2026-01-02T00:00:00Z");
+  const transitioned = mergeShareMarketSubscriptionPage([active], [released], false);
+
+  assert.deepEqual(transitioned, [released]);
+  assert.deepEqual(mergeShareMarketSubscriptionPage(transitioned, [], false), [released]);
+});
+
+test("subscription history pages append once by id", () => {
+  const active = subscription("active", "active_free");
+  const first = subscription("history-1", "released");
+  const second = subscription("history-2", "grant_failed");
+
+  assert.deepEqual(
+    mergeShareMarketSubscriptionPage([active, first], [first, second], true),
+    [active, first, second],
+  );
 });

@@ -63,6 +63,7 @@ import {
   listingIdleCount,
   listingLowestDailyRate,
   marketProviderStatusView,
+  shareMarketMutationError,
 } from "@/components/dashboard/share-market/market-utils";
 import {
   DEFAULT_CATALOG_AVAILABILITY,
@@ -150,7 +151,10 @@ function Metric({ label, value, title }: { label: string; value: string; title?:
 }
 
 function ListingProviderLogos({ listing }: { listing: ShareMarketListing }) {
-  const capabilities = listing.appCapabilities.filter((item) => isCoreShareApp(item.app));
+  const enabledApps = new Set(listing.supportedApps);
+  const capabilities = listing.appCapabilities.filter(
+    (item) => isCoreShareApp(item.app) && enabledApps.has(item.app),
+  );
   const entries = capabilities.reduce<typeof capabilities>((result, capability) => {
     const logo = resolveShareProviderLogo(capability);
     const key = logo?.key || capability.providerType || capability.providerName || capability.app;
@@ -203,19 +207,11 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
   const preview = catalogSeatPreview(listing.seats);
   const ttft = listing.performance.averageTtftMs == null ? "-" : `${(listing.performance.averageTtftMs / 1_000).toFixed(2)}s`;
   const tps = listing.performance.averageTps == null ? "-" : listing.performance.averageTps.toFixed(1);
-  const cheapest = idle.length ? [...idle].sort((a, b) => (a.dailyRateMinor ?? 0) - (b.dailyRateMinor ?? 0))[0] : undefined;
   const providerView = marketProviderStatusView(listing, locale, {
     unknown: t("shareMarket.catalog.providerUnknown"),
     passthrough: t("shareMarket.modelPassthrough"),
   });
-  const latestSignalAt = listing.performance.latestSampleAt || listing.reliability.latestObservedAt;
-  const qualityHint = !listing.reliability.sufficientCoverage
-    ? t("shareMarket.catalog.coverageInsufficient", { count: listing.reliability.observedMinutes24h })
-    : latestSignalAt
-      ? t("shareMarket.catalog.freshness", {
-          time: new Intl.DateTimeFormat(locale, { timeStyle: "short" }).format(new Date(latestSignalAt)),
-        })
-      : t("shareMarket.catalog.noObservations");
+  const subdomain = listing.subdomain?.trim() || listing.shareName;
   return (
     <article
       id={`share-market-catalog-${listing.shareId}`}
@@ -234,20 +230,19 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
             className={cn("h-2 w-2 shrink-0 rounded-full", listing.shareOnline ? "bg-emerald-500" : "bg-rose-500")}
             title={listing.shareOnline ? listing.shareStatus : t("shareMarket.blockReason.share_offline")}
           />
+          <ListingProviderLogos listing={listing} />
           <button type="button" className="min-w-0 rounded text-left active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
-            <strong className="block truncate text-sm font-semibold text-foreground" title={listing.shareName}>{listing.shareName}</strong>
+            <strong className="block truncate font-mono text-xs font-semibold text-foreground" title={subdomain}>{subdomain}</strong>
           </button>
           {listing.subdomain ? <SubdomainCopyButton subdomain={listing.subdomain} /> : null}
-          <ListingProviderLogos listing={listing} />
         </div>
         <button type="button" className="shrink-0 rounded text-right active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
-          <strong className="block text-sm text-slate-900">
-            {cheapest ? formatSeatPrice(cheapest, locale, t("shareMarket.free"), t("marketBilling.day")) : t("shareMarket.catalog.full")}
+          <strong className="whitespace-nowrap text-[11px] font-semibold tabular-nums text-slate-700">
+            {t("shareMarket.catalog.occupancy", { idle: idle.length, total: listing.seats.length })}
           </strong>
-          <span className="text-[10px] text-slate-500">{t("shareMarket.catalog.occupancy", { idle: idle.length, total: listing.seats.length })}</span>
         </button>
       </header>
-      <ShareProviderStatusPanel view={providerView} />
+      <ShareProviderStatusPanel view={providerView} wrapPrimaryLine />
       <div className="min-w-0">
         <dl className="grid grid-cols-2 gap-2">
           <Metric
@@ -261,7 +256,11 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
             title={`${t("shareMarket.catalog.samplesValue", { count: listing.performance.ttftSampleCount })} · ${t("shareMarket.catalog.samplesValue", { count: listing.performance.tpsSampleCount })}`}
           />
         </dl>
-        <p className={cn("mt-1 truncate text-[10px]", listing.reliability.sufficientCoverage ? "text-slate-400" : "text-amber-700")} title={qualityHint}>{qualityHint}</p>
+        <p className="mt-1 flex min-w-0 items-start gap-1 text-[10px] leading-4 text-slate-500">
+          <UserRound className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+          <span className="shrink-0">{t("shareMarket.owner")}:</span>
+          <span className="min-w-0 break-all" title={listing.ownerEmail}>{listing.ownerEmail}</span>
+        </p>
       </div>
       <div className="grid content-start gap-0.5 border-t border-slate-100 pt-1.5">
         {preview.map((seat) => <SeatPreview key={seat.id} seat={seat} onSelect={() => onOpen(seat)} />)}
@@ -434,7 +433,7 @@ export function ShareMarketBuyerCatalog({
     } catch (reason) {
       const eligibility = marketEligibilityFromError(reason);
       if (eligibility) setAccessTarget({ ...item, eligibility });
-      else setError(reason instanceof Error ? reason.message : String(reason));
+      else setError(shareMarketMutationError(reason, t));
     } finally {
       setBusySeatId("");
     }
@@ -456,7 +455,7 @@ export function ShareMarketBuyerCatalog({
         idempotencyKey: `share-rent:${quote.id}:${crypto.randomUUID()}`,
       });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(shareMarketMutationError(reason, t));
     } finally {
       setBusySeatId("");
     }
@@ -479,7 +478,7 @@ export function ShareMarketBuyerCatalog({
         setQuoteNowMs(Date.parse(rentTarget.quote.expiresAt));
         setError(t("shareMarket.rentConfirm.expired"));
       } else {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        setError(shareMarketMutationError(reason, t));
       }
     } finally {
       setBusySeatId("");
@@ -532,7 +531,7 @@ export function ShareMarketBuyerCatalog({
       </div>
 
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
-      <div className="grid min-w-0 gap-3 md:grid-cols-2 xl:grid-cols-3">
+      <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
         {listings.map((listing) => <ListingCard key={listing.id} listing={listing} focused={focusedShareId === listing.shareId} onOpen={(seat) => openListing(listing, seat)} />)}
       </div>
       {!listings.length ? <div className="grid min-h-48 place-items-center border-y border-dashed border-slate-200 text-sm text-slate-500">{t("shareMarket.catalog.empty")}</div> : null}
@@ -639,7 +638,7 @@ export function ShareMarketBuyerCatalog({
                     <dt className="text-slate-500">{t("shareMarket.parallel")}</dt><dd>{rentTarget.quote.offer.parallelLimit == null ? t("common.unlimited") : rentTarget.quote.offer.parallelLimit}</dd>
                     <dt className="text-slate-500">{t("shareMarket.tokens")}</dt><dd>{formatTokenLimit(rentTarget.quote.offer, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}</dd>
                     <dt className="text-slate-500">{t("shareMarket.catalog.shareCapacity")}</dt><dd>{rentTarget.quote.offer.service.shareParallelLimit == null ? t("common.unlimited") : t("shareMarket.parallelShort", { value: rentTarget.quote.offer.service.shareParallelLimit })}</dd>
-                    <dt className="text-slate-500">{t("shareMarket.catalog.shareTokens")}</dt><dd>{rentTarget.quote.offer.service.shareTokenLimit == null ? t("common.unlimited") : `${new Intl.NumberFormat(locale).format(rentTarget.quote.offer.service.shareTokensUsed)} / ${new Intl.NumberFormat(locale).format(rentTarget.quote.offer.service.shareTokenLimit)}`}</dd>
+                    <dt className="text-slate-500">{t("shareMarket.catalog.shareTokens")}</dt><dd>{rentTarget.quote.offer.service.shareTokenLimit == null ? t("common.unlimited") : `${formatTokenMillions(rentTarget.quote.offer.service.shareTokensUsed, locale)} / ${formatTokenMillions(rentTarget.quote.offer.service.shareTokenLimit, locale)}`}</dd>
                     <dt className="text-slate-500">{t("shareMarket.catalog.serviceTerm")}</dt><dd>{rentTarget.quote.offer.serviceDurationDays == null ? t("shareMarket.serviceDuration.permanent") : t("shareMarket.serviceDuration.daysValue", { count: rentTarget.quote.offer.serviceDurationDays })}</dd>
                     <dt className="text-slate-500">{t("shareMarket.dialog.amount")}</dt><dd className="font-medium">{formatSeatPrice({ isFree: rentTarget.quote.offer.dailyRateMinor == null, dailyRateMinor: rentTarget.quote.offer.dailyRateMinor }, locale, t("shareMarket.free"), t("marketBilling.day"))}</dd>
                   </dl>

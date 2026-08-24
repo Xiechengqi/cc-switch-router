@@ -5,11 +5,13 @@ use crate::db::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
 };
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -19,9 +21,9 @@ use crate::client_market_trade::PaymentContact;
 use crate::client_market_trade::PaymentMethod;
 use crate::error::AppError;
 use crate::models::{
-    AuthSession, ShareEditAvailableEvent, ShareGrantManager, ShareManagedGrantAction,
-    ShareManagedGrantOperation, ShareSettingsPatch, ShareTokenPeriod, ShareUserGrant,
-    ShareUserPolicy,
+    AuthSession, SHARE_CONTRACT_VERSION, ShareEditAvailableEvent, ShareGrantManager,
+    ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareSupport,
+    ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
 };
 use crate::store::AppStore;
 
@@ -41,10 +43,16 @@ const CONTROL_EDIT_TTL_SECS: i64 = 5 * 60;
 const CONTROL_RETRY_BASE_SECS: i64 = 15;
 const CONTROL_RETRY_MAX_SECS: i64 = 15 * 60;
 const RENT_QUOTE_TTL_SECS: i64 = 2 * 60;
+const TERMINATION_QUOTE_TTL_SECS: i64 = 2 * 60;
+const CONTRACT_REPAIR_WINDOW_HOURS: i64 = 24;
 const RENT_QUOTE_RETENTION_DAYS: i64 = 7;
 const MARKET_PERFORMANCE_WINDOW_HOURS: i64 = 24;
 const MARKET_RELIABILITY_MIN_OBSERVED_MINUTES: u32 = 72;
 const MANAGED_GRANT_MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
+const SHARE_RUNTIME_FRESHNESS_SECS: i64 = 15 * 60;
+const SHARE_MODEL_HEALTH_FRESHNESS_SECS: i64 = 20 * 60;
+const SHARE_ROUTE_HEALTH_FRESHNESS_SECS: i64 = 90;
+const SHARE_NEAR_EXPIRY_DAYS: i64 = 7;
 pub(crate) const SHARE_MARKET_CONTROL_ACTOR_EMAIL: &str = "share-market@router.internal";
 pub(crate) const SHARE_REVISION_CONFLICT_CODE: &str = "cc_switch_share_revision_conflict";
 const SHARE_GRANT_CONTRACT_VIOLATION_CODE: &str = "share_market_grant_contract_violation";
@@ -93,6 +101,63 @@ pub struct ShareMarketOwnedListings {
 #[serde(rename_all = "camelCase")]
 pub struct ShareMarketSubscriptions {
     pub subscriptions: Vec<SubscriptionView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareControlOperationSummary {
+    pub pending: i64,
+    pub dispatched: i64,
+    pub dead_lettered: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareControlDeadLetterView {
+    pub id: String,
+    pub share_id: String,
+    pub subscription_id: String,
+    pub action: String,
+    pub email: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub error_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub dead_lettered_at: String,
+    pub can_requeue: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareControlDeadLetterPage {
+    pub operations: Vec<ShareControlDeadLetterView>,
+    pub summary: ShareControlOperationSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubscriptionPageQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControlDeadLetterQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DescendingCursor {
+    timestamp: String,
+    id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +271,9 @@ pub struct ListingView {
     pub share_status: String,
     pub subdomain: String,
     pub share_online: bool,
+    pub service_state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_reasons: Vec<String>,
     pub is_owner: bool,
     pub can_delete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,6 +344,13 @@ pub struct SubscriptionView {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub renter_email: String,
     pub status: String,
+    pub integrity_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_violated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_adjustment: Option<TerminationAdjustmentSummaryView>,
     pub seat_position: i64,
     pub parallel_limit: Option<u32>,
     pub token_limit: Option<u64>,
@@ -295,6 +370,7 @@ pub struct SubscriptionView {
     pub contacts: Vec<PaymentContact>,
     pub can_release: bool,
     pub can_force_revoke: bool,
+    pub can_retry_grant: bool,
     pub can_propose_price_change: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_change: Option<PriceChangeView>,
@@ -308,6 +384,22 @@ pub struct SubscriptionView {
     pub released_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminationAdjustmentSummaryView {
+    pub id: String,
+    pub status: String,
+    pub currency: String,
+    pub elapsed_bps: i64,
+    pub refund_bps: i64,
+    pub amount_minor: i64,
+    pub unbilled_credit_minor: i64,
+    pub invoice_credit_minor: i64,
+    pub external_refund_minor: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund_obligation_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -412,6 +504,35 @@ pub struct RentServiceSnapshot {
     pub share_tokens_used: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShareMarketServiceAvailability {
+    pub state: String,
+    pub blocking_reason: Option<String>,
+    pub reasons: Vec<String>,
+}
+
+impl ShareMarketServiceAvailability {
+    fn available(&self) -> bool {
+        self.blocking_reason.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ShareAvailabilityRecord {
+    share_status: String,
+    expires_at: String,
+    contract_version: i64,
+    app_type: String,
+    parallel_limit: i64,
+    runtime_refreshed_at: Option<String>,
+    bindings_json: String,
+    app_runtimes_json: Option<String>,
+    app_providers_json: Option<String>,
+    support: ShareSupport,
+    token_limit: i64,
+    tokens_used: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RentQuoteSnapshot {
@@ -488,6 +609,34 @@ pub struct CommitRentQuoteResponse {
 pub struct ForceRevokeRequest {
     #[serde(default)]
     pub deny_future_access: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminationQuoteView {
+    pub id: String,
+    pub subscription_id: String,
+    pub status: String,
+    pub expires_at: String,
+    pub calculation: crate::market_billing::SupplierTerminationCalculation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommitTerminationRequest {
+    pub quote_id: String,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub deny_future_access: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitTerminationResponse {
+    pub ok: bool,
+    pub subscription_id: String,
+    pub replayed: bool,
+    pub adjustment: crate::market_billing::SupplierTerminationAdjustment,
 }
 
 #[derive(Debug, Deserialize)]
@@ -576,6 +725,18 @@ pub fn router() -> Router<ServerState> {
             post(force_revoke_subscription),
         )
         .route(
+            "/v1/share-market/subscriptions/:id/retry-grant",
+            post(retry_grant_subscription),
+        )
+        .route(
+            "/v1/share-market/subscriptions/:id/termination-quote",
+            post(quote_subscription_termination),
+        )
+        .route(
+            "/v1/share-market/subscriptions/:id/terminate",
+            post(commit_subscription_termination),
+        )
+        .route(
             "/v1/share-market/subscriptions/:id/price-changes",
             post(propose_price_change),
         )
@@ -590,6 +751,14 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/share-market/price-changes/:id/cancel",
             post(cancel_price_change),
+        )
+        .route(
+            "/v1/admin/share-market/control-operations/dead-letters",
+            get(list_control_dead_letters),
+        )
+        .route(
+            "/v1/admin/share-market/control-operations/:id/requeue",
+            post(requeue_control_dead_letter),
         )
 }
 
@@ -673,6 +842,131 @@ fn validate_seat_share_capacity(
     Ok(())
 }
 
+fn ensure_share_market_app_scope_supported_tx(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<(), AppError> {
+    let version = conn
+        .query_row(
+            "SELECT COALESCE(share_access_policy_version, 0) FROM shares WHERE share_id = ?1",
+            params![share_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_db("read Share contract version"))?
+        .ok_or_else(|| AppError::NotFound("Share not found".into()))?;
+    if version < i64::from(SHARE_CONTRACT_VERSION) {
+        return Err(AppError::coded_conflict(
+            "share_market_client_upgrade_required",
+            "the Share owner must upgrade cc-switch-server before accepting market rentals",
+            serde_json::json!({
+                "reason": "share_contract_upgrade_required",
+                "currentVersion": version,
+                "requiredVersion": SHARE_CONTRACT_VERSION,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_share_total_tokens_available(token_limit: i64, tokens_used: i64) -> Result<(), AppError> {
+    if token_limit >= 0 && tokens_used.max(0) >= token_limit {
+        return Err(AppError::coded_conflict(
+            "share_market_share_tokens_exhausted",
+            "the Share total token pool is exhausted",
+            serde_json::json!({
+                "reason": "share_tokens_exhausted",
+                "shareTokenLimit": token_limit,
+                "shareTokensUsed": tokens_used.max(0),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_market_protected_share_patch_tx(
+    conn: &Connection,
+    share_id: &str,
+    patch: &ShareSettingsPatch,
+) -> Result<(), AppError> {
+    let rows = conn
+        .prepare(
+            "SELECT required_app, service_snapshot_json, parallel_limit, expires_at
+             FROM share_market_subscriptions
+             WHERE share_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![share_id], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read protected Share Market contracts"))?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let protected = |field: &str, reason: &str| {
+        AppError::coded_conflict(
+            "share_market_contract_settings_protected",
+            "this Share setting is protected by an active rental contract",
+            serde_json::json!({ "field": field, "reason": reason }),
+        )
+    };
+    for (required_app, snapshot_json, seat_parallel_limit, subscription_expires_at) in rows {
+        let snapshot = serde_json::from_str::<RentServiceSnapshot>(&snapshot_json).ok();
+        if let (Some(support), Some(required_app)) =
+            (patch.support.as_ref(), required_app.as_deref())
+            && !share_supports_app(support, required_app)
+        {
+            return Err(protected("support", "required_app_in_use"));
+        }
+        if let Some(next_parallel_limit) = patch.parallel_limit
+            && next_parallel_limit >= 0
+        {
+            let required_parallel_limit = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.share_parallel_limit.map(i64::from))
+                .or(seat_parallel_limit);
+            if required_parallel_limit.is_none_or(|required| next_parallel_limit < required) {
+                return Err(protected("parallelLimit", "contract_capacity_reduction"));
+            }
+        }
+        if let Some(next_token_limit) = patch.token_limit
+            && next_token_limit >= 0
+        {
+            let required_token_limit = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.share_token_limit)
+                .and_then(|value| i64::try_from(value).ok());
+            if required_token_limit.is_none_or(|required| next_token_limit < required) {
+                return Err(protected("tokenLimit", "contract_capacity_reduction"));
+            }
+        }
+        if let Some(next_expires_at) = patch.expires_at.as_deref() {
+            let next_expires_at = DateTime::parse_from_rfc3339(next_expires_at)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|_| AppError::BadRequest("expiresAt must be RFC3339".into()))?;
+            let Some(contract_expires_at) = subscription_expires_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                return Err(protected("expiresAt", "permanent_contract_in_use"));
+            };
+            if next_expires_at < contract_expires_at {
+                return Err(protected("expiresAt", "fixed_term_not_covered"));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn require_session(
     state: &ServerState,
     headers: &HeaderMap,
@@ -716,6 +1010,26 @@ fn supported_share_apps(bindings_json: &str, fallback_app: &str) -> Vec<String> 
         apps.push(fallback_app.to_string());
     }
     apps
+}
+
+fn share_supports_app(support: &ShareSupport, app: &str) -> bool {
+    match app {
+        "claude" => support.claude,
+        "codex" => support.codex,
+        "gemini" => support.gemini,
+        _ => false,
+    }
+}
+
+fn enabled_share_apps(
+    bindings_json: &str,
+    fallback_app: &str,
+    support: &ShareSupport,
+) -> Vec<String> {
+    supported_share_apps(bindings_json, fallback_app)
+        .into_iter()
+        .filter(|app| share_supports_app(support, app))
+        .collect()
 }
 
 fn normalized_provider_family_parts(
@@ -881,6 +1195,966 @@ fn required_app_hard_failure(
     None
 }
 
+fn load_share_availability_record_tx(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<Option<ShareAvailabilityRecord>, AppError> {
+    conn.query_row(
+        "SELECT share_status, expires_at, COALESCE(share_access_policy_version, 0),
+                app_type, parallel_limit, runtime_refreshed_at,
+                COALESCE(bindings_json, '{}'), app_runtimes_json,
+                app_providers_json, COALESCE(enabled_claude, 0),
+                COALESCE(enabled_codex, 0), COALESCE(enabled_gemini, 0),
+                token_limit, COALESCE(tokens_used, 0)
+         FROM shares WHERE share_id = ?1",
+        params![share_id],
+        |row| {
+            Ok(ShareAvailabilityRecord {
+                share_status: row.get(0)?,
+                expires_at: row.get(1)?,
+                contract_version: row.get(2)?,
+                app_type: row.get(3)?,
+                parallel_limit: row.get(4)?,
+                runtime_refreshed_at: row.get(5)?,
+                bindings_json: row.get(6)?,
+                app_runtimes_json: row.get(7)?,
+                app_providers_json: row.get(8)?,
+                support: ShareSupport {
+                    claude: row.get::<_, i64>(9)? != 0,
+                    codex: row.get::<_, i64>(10)? != 0,
+                    gemini: row.get::<_, i64>(11)? != 0,
+                },
+                token_limit: row.get(12)?,
+                tokens_used: row.get(13)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_db("read Share Market service availability"))
+}
+
+fn parse_optional_runtime_time(value: Option<&str>) -> Option<DateTime<Utc>> {
+    value
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn confirmed_model_unavailable_tx(
+    conn: &Connection,
+    share_id: &str,
+    required_app: &str,
+    service: Option<&RentServiceSnapshot>,
+    now: DateTime<Utc>,
+) -> Result<(bool, bool), AppError> {
+    let rows = conn
+        .prepare(
+            "SELECT requested_model, actual_model, last_status, recent_results_json,
+                    last_checked_at
+             FROM share_model_health_state
+             WHERE share_id = ?1 AND app_type = ?2
+               AND last_checked_at >= ?3",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![
+                        share_id,
+                        required_app,
+                        now.timestamp() - SHARE_MODEL_HEALTH_FRESHNESS_SECS
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read required App model health"))?;
+    if rows.is_empty() {
+        return Ok((false, false));
+    }
+
+    let relevant_models = service
+        .map(|service| {
+            service
+                .upstream_model
+                .iter()
+                .chain(service.models.iter())
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut relevant = Vec::new();
+    let mut app_level_unavailable = false;
+    for (requested, actual, last_status, recent_json) in rows {
+        let recent = serde_json::from_str::<Vec<String>>(&recent_json).unwrap_or_default();
+        let unavailable = recent.len() >= 3
+            && recent
+                .iter()
+                .all(|status| status.eq_ignore_ascii_case("failed"));
+        let degraded = last_status.eq_ignore_ascii_case("failed")
+            || recent
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case("failed"));
+        let requested_key = requested.trim().to_ascii_lowercase();
+        let actual_key = actual.trim().to_ascii_lowercase();
+        let app_level = requested_key == required_app && actual_key == required_app;
+        if app_level && unavailable {
+            app_level_unavailable = true;
+        }
+        if app_level
+            || relevant_models.is_empty()
+            || relevant_models.contains(&requested_key)
+            || relevant_models.contains(&actual_key)
+        {
+            relevant.push((unavailable, degraded));
+        }
+    }
+    if app_level_unavailable {
+        return Ok((true, true));
+    }
+    if relevant.is_empty() {
+        return Ok((false, false));
+    }
+    Ok((
+        relevant.iter().all(|(unavailable, _)| *unavailable),
+        relevant.iter().any(|(_, degraded)| *degraded),
+    ))
+}
+
+fn push_reason(reasons: &mut Vec<String>, reason: impl Into<String>) {
+    let reason = reason.into();
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+fn block_availability(
+    blocking_reason: &mut Option<String>,
+    reasons: &mut Vec<String>,
+    reason: &str,
+) {
+    if blocking_reason.is_none() {
+        *blocking_reason = Some(reason.to_string());
+    }
+    push_reason(reasons, reason);
+}
+
+fn evaluate_share_market_service_availability_tx(
+    conn: &Connection,
+    share_id: &str,
+    required_app: &str,
+    route_online: Option<bool>,
+    integrity_state: Option<&str>,
+    service: Option<&RentServiceSnapshot>,
+    now: DateTime<Utc>,
+) -> Result<ShareMarketServiceAvailability, AppError> {
+    let Some(record) = load_share_availability_record_tx(conn, share_id)? else {
+        return Ok(ShareMarketServiceAvailability {
+            state: "unavailable".into(),
+            blocking_reason: Some("share_missing".into()),
+            reasons: vec!["share_missing".into()],
+        });
+    };
+    let mut blocking_reason = None;
+    let mut reasons = Vec::new();
+    if route_online == Some(false) {
+        block_availability(&mut blocking_reason, &mut reasons, "share_offline");
+    }
+    if record.share_status != "active" {
+        block_availability(&mut blocking_reason, &mut reasons, "share_inactive");
+    }
+    let share_expires_at = DateTime::parse_from_rfc3339(&record.expires_at)
+        .ok()
+        .map(|value| value.with_timezone(&Utc));
+    match share_expires_at {
+        Some(expires_at) if expires_at <= now => {
+            block_availability(&mut blocking_reason, &mut reasons, "share_expired")
+        }
+        Some(expires_at) if expires_at <= now + Duration::days(SHARE_NEAR_EXPIRY_DAYS) => {
+            push_reason(&mut reasons, "share_near_expiry")
+        }
+        None => block_availability(&mut blocking_reason, &mut reasons, "share_expiry_invalid"),
+        _ => {}
+    }
+    if record.contract_version < i64::from(SHARE_CONTRACT_VERSION) {
+        block_availability(
+            &mut blocking_reason,
+            &mut reasons,
+            "share_contract_upgrade_required",
+        );
+    }
+    if !share_supports_app(&record.support, required_app) {
+        block_availability(&mut blocking_reason, &mut reasons, "required_app_disabled");
+    }
+    let runtime_refreshed_at = parse_optional_runtime_time(record.runtime_refreshed_at.as_deref());
+    if runtime_refreshed_at.is_none_or(|refreshed_at| {
+        refreshed_at > now + Duration::minutes(5)
+            || now - refreshed_at > Duration::seconds(SHARE_RUNTIME_FRESHNESS_SECS)
+    }) {
+        block_availability(&mut blocking_reason, &mut reasons, "runtime_stale");
+    }
+    if record.token_limit >= 0 && record.tokens_used.max(0) >= record.token_limit {
+        block_availability(&mut blocking_reason, &mut reasons, "share_tokens_exhausted");
+    }
+    if let Some(reason) = required_app_hard_failure(
+        required_app,
+        &record.bindings_json,
+        record.app_runtimes_json.as_deref(),
+        record.app_providers_json.as_deref(),
+    ) {
+        block_availability(&mut blocking_reason, &mut reasons, reason);
+    }
+    let (model_unavailable, model_degraded) =
+        confirmed_model_unavailable_tx(conn, share_id, required_app, service, now)?;
+    if model_unavailable {
+        block_availability(&mut blocking_reason, &mut reasons, "model_unavailable");
+    } else if model_degraded {
+        push_reason(&mut reasons, "model_degraded");
+    }
+    if integrity_state.is_some_and(|state| state != "compatible") {
+        block_availability(&mut blocking_reason, &mut reasons, "contract_incompatible");
+    }
+
+    let capabilities = enabled_public_app_capabilities(
+        &record.bindings_json,
+        record.app_runtimes_json.as_deref(),
+        record.app_providers_json.as_deref(),
+        required_app,
+        &record.support,
+    );
+    if capabilities
+        .iter()
+        .find(|capability| capability.app == required_app)
+        .is_some_and(|capability| {
+            matches!(capability.health_state.as_str(), "degraded" | "unavailable")
+        })
+    {
+        push_reason(&mut reasons, "provider_degraded");
+    }
+    let state = if blocking_reason.is_some() {
+        "unavailable"
+    } else if reasons.is_empty() {
+        "available"
+    } else {
+        "degraded"
+    };
+    Ok(ShareMarketServiceAvailability {
+        state: state.into(),
+        blocking_reason,
+        reasons,
+    })
+}
+
+fn availability_error(availability: &ShareMarketServiceAvailability) -> AppError {
+    let reason = availability
+        .blocking_reason
+        .as_deref()
+        .unwrap_or("share_unavailable");
+    let code = match reason {
+        "share_offline" => "share_market_share_offline",
+        "share_expired" | "share_expiry_invalid" => "share_market_share_expired",
+        "share_contract_upgrade_required" => "share_market_client_upgrade_required",
+        "runtime_stale" => "share_market_runtime_stale",
+        "share_tokens_exhausted" => "share_market_share_tokens_exhausted",
+        "model_unavailable" => "share_market_model_unavailable",
+        "contract_incompatible" => "share_market_contract_incompatible",
+        _ => "share_market_required_app_unavailable",
+    };
+    AppError::coded_conflict(
+        code,
+        "the selected Share service is currently unavailable",
+        serde_json::json!({
+            "reason": reason,
+            "serviceState": availability.state,
+            "serviceReasons": availability.reasons,
+        }),
+    )
+}
+
+fn parse_provider_expiry(value: Option<&str>) -> Option<DateTime<Utc>> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn required_app_upstream_expiry(
+    record: &ShareAvailabilityRecord,
+    required_app: &str,
+) -> Option<DateTime<Utc>> {
+    let bindings = serde_json::from_str::<BTreeMap<String, String>>(&record.bindings_json).ok()?;
+    let binding_id = bindings.get(required_app)?.trim();
+    if binding_id.is_empty() {
+        return None;
+    }
+    let runtimes = record
+        .app_runtimes_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<crate::models::ShareAppRuntimes>(value).ok())
+        .unwrap_or_default();
+    let providers = record
+        .app_providers_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<crate::models::ShareAppProviders>(value).ok())
+        .unwrap_or_default();
+    let runtime = app_runtime(&runtimes, required_app);
+    let provider = app_provider_candidates(&providers, required_app)
+        .iter()
+        .find(|provider| provider.id == binding_id);
+    let mut expiries = Vec::new();
+    for expiry in [
+        runtime.and_then(|value| parse_provider_expiry(value.subscription_expires_at.as_deref())),
+        runtime.and_then(|value| {
+            parse_provider_expiry(
+                value
+                    .quota
+                    .as_ref()
+                    .and_then(|quota| quota.subscription_period_end.as_deref()),
+            )
+        }),
+        provider.and_then(|value| parse_provider_expiry(value.subscription_expires_at.as_deref())),
+        provider.and_then(|value| {
+            parse_provider_expiry(
+                value
+                    .quota
+                    .as_ref()
+                    .and_then(|quota| quota.subscription_period_end.as_deref()),
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        expiries.push(expiry);
+    }
+    let refreshed_at = parse_optional_runtime_time(record.runtime_refreshed_at.as_deref());
+    for remaining_ms in [
+        runtime.and_then(|value| value.subscription_remaining_ms),
+        provider.and_then(|value| value.subscription_remaining_ms),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(refreshed_at) = refreshed_at
+            && let Some(expiry) =
+                refreshed_at.checked_add_signed(Duration::milliseconds(remaining_ms))
+        {
+            expiries.push(expiry);
+        }
+    }
+    expiries.into_iter().min()
+}
+
+fn ensure_fixed_service_term_fulfillable_tx(
+    conn: &Connection,
+    share_id: &str,
+    required_app: &str,
+    service_duration_days: Option<u32>,
+    service_starts_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let Some(days) = service_duration_days else {
+        return Ok(());
+    };
+    let service_ends_at = service_starts_at
+        .checked_add_signed(Duration::days(i64::from(days)))
+        .ok_or_else(|| AppError::Internal("Share service term overflowed".into()))?;
+    let record = load_share_availability_record_tx(conn, share_id)?
+        .ok_or_else(|| AppError::NotFound("Share not found".into()))?;
+    let share_expires_at = DateTime::parse_from_rfc3339(&record.expires_at)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| AppError::Internal("stored Share expiry is invalid".into()))?;
+    let upstream_expires_at = required_app_upstream_expiry(&record, required_app);
+    let blocking_expiry = std::iter::once(("share", share_expires_at))
+        .chain(upstream_expires_at.map(|expiry| ("upstream_subscription", expiry)))
+        .filter(|(_, expiry)| *expiry < service_ends_at)
+        .min_by_key(|(_, expiry)| *expiry);
+    if let Some((source, available_until)) = blocking_expiry {
+        return Err(AppError::coded_conflict(
+            "share_market_service_term_unfulfillable",
+            "the Share cannot currently guarantee the complete fixed service term",
+            serde_json::json!({
+                "reason": "service_term_unfulfillable",
+                "source": source,
+                "requiredApp": required_app,
+                "serviceStartsAt": service_starts_at.to_rfc3339(),
+                "serviceEndsAt": service_ends_at.to_rfc3339(),
+                "availableUntil": available_until.to_rfc3339(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppError> {
+    let token_period: ShareTokenPeriod = serde_json::from_str(&record.token_period_json)
+        .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
+    let service_started_at = record
+        .service_started_at
+        .as_deref()
+        .or(record.activated_at.as_deref())
+        .map(parse_time)
+        .transpose()?;
+    Ok(ShareUserPolicy {
+        parallel_limit: record
+            .parallel_limit
+            .and_then(|value| u32::try_from(value).ok()),
+        token_limit: record
+            .token_limit
+            .and_then(|value| u64::try_from(value).ok()),
+        token_period,
+        token_period_anchor_at_ms: service_started_at
+            .and_then(|started_at| token_period_anchor_at_ms(token_period, started_at)),
+        expires_at: record
+            .expires_at
+            .as_deref()
+            .map(parse_time)
+            .transpose()?
+            .map(|value| value.timestamp_millis()),
+        allowed_apps: vec![record.app_type.clone()],
+    })
+}
+
+fn active_grant_has_contract_scope(grants_json: Option<&str>, record: &SubscriptionRecord) -> bool {
+    active_entitlement_grant(grants_json, &record.entitlement_id)
+        .is_some_and(|grant| grant.policy.allowed_apps == [record.app_type.clone()])
+}
+
+fn subscription_integrity_violations_tx(
+    conn: &Connection,
+    record: &SubscriptionRecord,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, AppError> {
+    let Some(share) = load_share_availability_record_tx(conn, &record.share_id)? else {
+        return Ok(vec!["share_missing".into()]);
+    };
+    let mut violations = Vec::new();
+    if share.share_status != "active" {
+        push_reason(&mut violations, "share_inactive");
+    }
+    if share.contract_version < i64::from(SHARE_CONTRACT_VERSION) {
+        push_reason(&mut violations, "share_contract_upgrade_required");
+    }
+    if !share_supports_app(&share.support, &record.app_type) {
+        push_reason(&mut violations, "required_app_disabled");
+    }
+    if share.parallel_limit >= 0
+        && record
+            .parallel_limit
+            .is_some_and(|limit| limit > share.parallel_limit)
+    {
+        push_reason(&mut violations, "share_parallel_capacity_reduced");
+    }
+    if let Some(service_ends_at) = record.expires_at.as_deref().map(parse_time).transpose()? {
+        let share_expires_at = DateTime::parse_from_rfc3339(&share.expires_at)
+            .ok()
+            .map(|value| value.with_timezone(&Utc));
+        if share_expires_at.is_none_or(|expires_at| expires_at < service_ends_at) {
+            push_reason(&mut violations, "fixed_term_not_covered");
+        }
+        if required_app_upstream_expiry(&share, &record.app_type)
+            .is_some_and(|expires_at| expires_at < service_ends_at)
+        {
+            push_reason(&mut violations, "upstream_fixed_term_not_covered");
+        }
+    }
+
+    let bindings =
+        serde_json::from_str::<BTreeMap<String, String>>(&share.bindings_json).unwrap_or_default();
+    let binding_id = bindings
+        .get(&record.app_type)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if binding_id.is_none() {
+        push_reason(&mut violations, "binding_missing");
+    }
+    let providers = share
+        .app_providers_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<crate::models::ShareAppProviders>(value).ok())
+        .unwrap_or_default();
+    if let Some(binding_id) = binding_id {
+        let candidates = app_provider_candidates(&providers, &record.app_type);
+        if !candidates.is_empty() {
+            match candidates.iter().find(|provider| provider.id == binding_id) {
+                Some(provider) if !provider.enabled => {
+                    push_reason(&mut violations, "provider_disabled")
+                }
+                None => push_reason(&mut violations, "binding_unresolved"),
+                _ => {}
+            }
+        }
+    }
+
+    if let Ok(snapshot) = serde_json::from_str::<RentServiceSnapshot>(
+        &conn
+            .query_row(
+                "SELECT service_snapshot_json FROM share_market_subscriptions WHERE id = ?1",
+                params![record.id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_db("read immutable Share service snapshot"))?,
+    ) && snapshot.schema_version >= 1
+    {
+        let capabilities = enabled_public_app_capabilities(
+            &share.bindings_json,
+            share.app_runtimes_json.as_deref(),
+            share.app_providers_json.as_deref(),
+            &share.app_type,
+            &share.support,
+        );
+        let capability = capabilities
+            .iter()
+            .find(|capability| capability.app == record.app_type);
+        let current_binding_fingerprint = binding_id.map(|binding_id| {
+            crate::api::sha256_hex(
+                format!(
+                    "share-market-provider-binding-v1\n{}\n{binding_id}",
+                    record.app_type
+                )
+                .as_bytes(),
+            )
+        });
+        if snapshot.required_app != record.app_type
+            || snapshot.provider_binding_fingerprint != current_binding_fingerprint
+        {
+            push_reason(&mut violations, "provider_binding_changed");
+        }
+        match capability {
+            Some(capability)
+                if snapshot.provider_family == capability.provider_family
+                    && snapshot.provider_type == capability.provider_type
+                    && snapshot.model_mode == capability.model_mode
+                    && snapshot.upstream_model == capability.upstream_model
+                    && snapshot.models == capability.models => {}
+            Some(_) => push_reason(&mut violations, "provider_model_changed"),
+            None => push_reason(&mut violations, "required_app_unavailable"),
+        }
+    }
+
+    if matches!(
+        record.status.as_str(),
+        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+    ) {
+        let grants_json = conn
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+                params![record.share_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_db("read Share grant App scope"))?
+            .flatten();
+        if active_entitlement_grant(grants_json.as_deref(), &record.entitlement_id).is_none() {
+            push_reason(&mut violations, "entitlement_missing");
+        } else if share.contract_version >= i64::from(SHARE_CONTRACT_VERSION)
+            && !active_grant_has_contract_scope(grants_json.as_deref(), record)
+        {
+            push_reason(&mut violations, "app_scope_not_enforced");
+        }
+    }
+    let _ = now;
+    Ok(violations)
+}
+
+fn begin_subscription_integrity_remediation_tx(
+    conn: &Connection,
+    record: &SubscriptionRecord,
+    violations: &[String],
+    now_dt: DateTime<Utc>,
+) -> Result<(), AppError> {
+    if violations.is_empty() || matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED) {
+        return Ok(());
+    }
+    let now = now_dt.to_rfc3339();
+    let reason = violations.join(",");
+    let first_violation = record.integrity_state == "compatible";
+    conn.execute(
+        "UPDATE share_market_subscriptions
+         SET integrity_state = 'violated', integrity_reason = ?2,
+             integrity_checked_at = ?3,
+             integrity_violated_at = COALESCE(integrity_violated_at, ?3),
+             updated_at = ?3 WHERE id = ?1 AND integrity_state != 'terminated'",
+        params![record.id, reason, now],
+    )
+    .map_err(map_db("mark Share contract integrity violation"))?;
+    if record.status == SUB_GRANT_PENDING {
+        reject_unfulfillable_activation_tx(conn, record, &reason, &now)?;
+        return Ok(());
+    }
+    crate::market_billing::suspend_contract_for_integrity_tx(
+        conn, "share", &record.id, &reason, now_dt,
+    )?;
+    if matches!(
+        record.status.as_str(),
+        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+    ) {
+        enqueue_control_operation_tx(
+            conn,
+            &record.share_id,
+            &record.id,
+            &record.entitlement_id,
+            "revoke",
+            &record.renter_email,
+            None,
+            &now,
+        )?;
+        conn.execute(
+            "UPDATE share_market_subscriptions
+             SET status = 'billing_suspend_pending', release_reason = ?2, updated_at = ?3
+             WHERE id = ?1 AND status IN ('active_free', 'active_postpaid')",
+            params![record.id, reason, now],
+        )
+        .map_err(map_db("isolate violated Share contract"))?;
+    }
+    if first_violation {
+        event_tx(
+            conn,
+            Some(&record.listing_id),
+            Some(&record.seat_id),
+            Some(&record.id),
+            None,
+            "contract_integrity_violated",
+            serde_json::json!({
+                "reasons": violations,
+                "repairDeadlineAt": (now_dt + Duration::hours(CONTRACT_REPAIR_WINDOW_HOURS)).to_rfc3339(),
+            }),
+            &now,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_share_contract_integrity_tx(
+    conn: &Connection,
+    share_id: &str,
+    now_dt: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let subscription_ids = conn
+        .prepare(
+            "SELECT id FROM share_market_subscriptions
+             WHERE share_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![share_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read Share contracts for integrity check"))?;
+    for subscription_id in subscription_ids {
+        let Some(record) = subscription_record(conn, &subscription_id)? else {
+            continue;
+        };
+        let violations = subscription_integrity_violations_tx(conn, &record, now_dt)?;
+        begin_subscription_integrity_remediation_tx(conn, &record, &violations, now_dt)?;
+    }
+    Ok(())
+}
+
+fn reconcile_subscription_integrity_tx(
+    conn: &Connection,
+    record: &SubscriptionRecord,
+    now_dt: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let violations = subscription_integrity_violations_tx(conn, record, now_dt)?;
+    if record.integrity_state == "terminated" {
+        return Ok(true);
+    }
+    if record.integrity_state != "compatible" {
+        let violated_at = record
+            .integrity_violated_at
+            .as_deref()
+            .map(parse_time)
+            .transpose()?
+            .unwrap_or(now_dt);
+        if now_dt >= violated_at + Duration::hours(CONTRACT_REPAIR_WINDOW_HOURS) {
+            let reason = "contract_integrity_repair_timeout";
+            if record.daily_rate_minor.is_some()
+                && record.service_duration_days.is_some()
+                && record.service_started_at.is_some()
+            {
+                crate::market_billing::apply_supplier_early_termination_refund_tx(
+                    conn,
+                    "share",
+                    &record.id,
+                    reason,
+                    &format!(
+                        "share-integrity-timeout:{}:{}",
+                        record.id,
+                        violated_at.to_rfc3339()
+                    ),
+                    violated_at,
+                )?;
+            }
+            terminate_subscription_for_supplier_tx(
+                conn,
+                &record.id,
+                reason,
+                None,
+                false,
+                &now_dt.to_rfc3339(),
+            )?;
+            return Ok(true);
+        }
+    }
+    if !violations.is_empty() {
+        begin_subscription_integrity_remediation_tx(conn, record, &violations, now_dt)?;
+        return Ok(true);
+    }
+    if record.integrity_state == "compatible" {
+        let grants_json = conn
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+                params![record.share_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_db("read compatible Share App scope"))?
+            .flatten();
+        if active_grant_has_contract_scope(grants_json.as_deref(), record) {
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET integrity_checked_at = ?2,
+                     app_scope_enforced_at = COALESCE(app_scope_enforced_at, ?2)
+                 WHERE id = ?1",
+                params![record.id, now_dt.to_rfc3339()],
+            )
+            .map_err(map_db("confirm Share App scope"))?;
+        }
+        return Ok(false);
+    }
+    if record.status == SUB_BILLING_SUSPENDED && !record.has_active_control_work {
+        if record.daily_rate_minor.is_some()
+            && !crate::market_billing::request_contract_resume_after_integrity_tx(
+                conn,
+                "share",
+                &record.id,
+                &now_dt.to_rfc3339(),
+            )?
+        {
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET integrity_state = 'compatible', integrity_reason = NULL,
+                     integrity_checked_at = ?2, integrity_violated_at = NULL,
+                     release_reason = 'billing_resume_blocked', updated_at = ?2
+                 WHERE id = ?1 AND status = 'billing_suspended'",
+                params![record.id, now_dt.to_rfc3339()],
+            )
+            .map_err(map_db(
+                "complete Share integrity repair while billing remains suspended",
+            ))?;
+            event_tx(
+                conn,
+                Some(&record.listing_id),
+                Some(&record.seat_id),
+                Some(&record.id),
+                None,
+                "contract_integrity_restored",
+                serde_json::json!({ "serviceRemainsSuspended": true }),
+                &now_dt.to_rfc3339(),
+            )?;
+            return Ok(true);
+        }
+        let policy = contract_policy(record)?;
+        enqueue_control_operation_tx(
+            conn,
+            &record.share_id,
+            &record.id,
+            &record.entitlement_id,
+            "upsert",
+            &record.renter_email,
+            Some(&policy),
+            &now_dt.to_rfc3339(),
+        )?;
+        conn.execute(
+            "UPDATE share_market_subscriptions
+             SET status = 'billing_resume_pending', integrity_state = 'remediating',
+                 release_reason = NULL, integrity_checked_at = ?2, updated_at = ?2
+             WHERE id = ?1 AND status = 'billing_suspended'",
+            params![record.id, now_dt.to_rfc3339()],
+        )
+        .map_err(map_db("resume remediated Share contract"))?;
+        event_tx(
+            conn,
+            Some(&record.listing_id),
+            Some(&record.seat_id),
+            Some(&record.id),
+            None,
+            "contract_integrity_repair_started",
+            serde_json::json!({}),
+            &now_dt.to_rfc3339(),
+        )?;
+        return Ok(true);
+    }
+    if matches!(
+        record.status.as_str(),
+        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+    ) {
+        let grants_json = conn
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+                params![record.share_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_db("read repaired Share App scope"))?
+            .flatten();
+        if active_grant_has_contract_scope(grants_json.as_deref(), record) {
+            if record.daily_rate_minor.is_some()
+                && !crate::market_billing::complete_contract_resume_after_integrity_tx(
+                    conn,
+                    "share",
+                    &record.id,
+                    &now_dt.to_rfc3339(),
+                )?
+            {
+                enqueue_control_operation_tx(
+                    conn,
+                    &record.share_id,
+                    &record.id,
+                    &record.entitlement_id,
+                    "revoke",
+                    &record.renter_email,
+                    None,
+                    &now_dt.to_rfc3339(),
+                )?;
+                conn.execute(
+                    "UPDATE share_market_subscriptions
+                     SET status = 'billing_suspend_pending', integrity_state = 'compatible',
+                         integrity_reason = NULL, integrity_checked_at = ?2,
+                         integrity_violated_at = NULL, release_reason = 'billing_resume_blocked',
+                         updated_at = ?2 WHERE id = ?1",
+                    params![record.id, now_dt.to_rfc3339()],
+                )
+                .map_err(map_db(
+                    "re-isolate repaired Share after billing resume was blocked",
+                ))?;
+                event_tx(
+                    conn,
+                    Some(&record.listing_id),
+                    Some(&record.seat_id),
+                    Some(&record.id),
+                    None,
+                    "contract_integrity_restored",
+                    serde_json::json!({ "serviceRemainsSuspended": true }),
+                    &now_dt.to_rfc3339(),
+                )?;
+                return Ok(true);
+            }
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET integrity_state = 'compatible', integrity_reason = NULL,
+                     integrity_checked_at = ?2, integrity_violated_at = NULL,
+                     app_scope_enforced_at = COALESCE(app_scope_enforced_at, ?2),
+                     updated_at = ?2 WHERE id = ?1",
+                params![record.id, now_dt.to_rfc3339()],
+            )
+            .map_err(map_db("complete Share contract integrity repair"))?;
+            event_tx(
+                conn,
+                Some(&record.listing_id),
+                Some(&record.seat_id),
+                Some(&record.id),
+                None,
+                "contract_integrity_restored",
+                serde_json::json!({}),
+                &now_dt.to_rfc3339(),
+            )?;
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn share_market_billing_observation_tx(
+    conn: &Connection,
+    subscription_id: &str,
+    observed_at: DateTime<Utc>,
+) -> Result<Option<(i64, String, String)>, AppError> {
+    let subscription = conn
+        .query_row(
+            "SELECT share_id, required_app, service_snapshot_json, integrity_state
+             FROM share_market_subscriptions
+             WHERE id = ?1 AND status = 'active_postpaid'",
+            params![subscription_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read billable Share Market subscription"))?;
+    let Some((share_id, required_app, snapshot_json, integrity_state)) = subscription else {
+        return Ok(None);
+    };
+    let Some(required_app) =
+        required_app.filter(|app| matches!(app.as_str(), "claude" | "codex" | "gemini"))
+    else {
+        // Legacy contracts predate App-scoped availability and retain the old,
+        // route-only conservative billing behavior until they naturally end.
+        return conn
+            .query_row(
+                "SELECT checked_at, status, reason FROM share_health_checks
+                 WHERE share_id = ?1 AND checked_at <= ?2
+                 ORDER BY checked_at DESC LIMIT 1",
+                params![share_id, observed_at.timestamp()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(map_db("read legacy Share billing observation"));
+    };
+    let route = conn
+        .query_row(
+            "SELECT checked_at, status FROM share_health_checks
+             WHERE share_id = ?1 AND checked_at <= ?2
+             ORDER BY checked_at DESC LIMIT 1",
+            params![share_id, observed_at.timestamp()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_db("read Share route billing observation"))?;
+    let route_online = route.as_ref().is_some_and(|(checked_at, status)| {
+        status == "healthy"
+            && observed_at.timestamp().saturating_sub(*checked_at)
+                <= SHARE_ROUTE_HEALTH_FRESHNESS_SECS
+    });
+    let service = serde_json::from_str::<RentServiceSnapshot>(&snapshot_json).ok();
+    let availability = evaluate_share_market_service_availability_tx(
+        conn,
+        &share_id,
+        &required_app,
+        Some(route_online),
+        Some(&integrity_state),
+        service.as_ref(),
+        observed_at,
+    )?;
+    let reason = availability
+        .blocking_reason
+        .clone()
+        .or_else(|| availability.reasons.first().cloned())
+        .unwrap_or_else(|| "share_market_service_available".into());
+    let status = if availability.available() {
+        "healthy"
+    } else if matches!(
+        availability.blocking_reason.as_deref(),
+        Some("runtime_stale" | "share_offline")
+    ) {
+        "unknown"
+    } else {
+        "unhealthy"
+    };
+    Ok(Some((observed_at.timestamp(), status.into(), reason)))
+}
+
 fn first_nonempty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
     values
         .into_iter()
@@ -981,15 +2255,17 @@ fn build_rent_service_snapshot(
     app_runtimes_json: Option<&str>,
     app_providers_json: Option<&str>,
     fallback_app: &str,
+    support: &ShareSupport,
     share_parallel_limit: i64,
     share_token_limit: i64,
     share_tokens_used: i64,
 ) -> Result<RentServiceSnapshot, AppError> {
-    let capabilities = public_app_capabilities(
+    let capabilities = enabled_public_app_capabilities(
         bindings_json,
         app_runtimes_json,
         app_providers_json,
         fallback_app,
+        support,
     );
     let supported_apps = capabilities
         .iter()
@@ -1289,6 +2565,24 @@ fn public_app_capabilities(
             }
         })
         .collect()
+}
+
+fn enabled_public_app_capabilities(
+    bindings_json: &str,
+    app_runtimes_json: Option<&str>,
+    app_providers_json: Option<&str>,
+    fallback_app: &str,
+    support: &ShareSupport,
+) -> Vec<ShareMarketAppCapability> {
+    public_app_capabilities(
+        bindings_json,
+        app_runtimes_json,
+        app_providers_json,
+        fallback_app,
+    )
+    .into_iter()
+    .filter(|capability| share_supports_app(support, &capability.app))
+    .collect()
 }
 
 fn listing_provider_families(capabilities: &[ShareMarketAppCapability]) -> (String, Vec<String>) {
@@ -1748,13 +3042,14 @@ fn enqueue_share_market_system_event_tx(
         object.insert("actorUserId".into(), actor.user_id.clone().into());
         object.insert("actorEmail".into(), actor.email.clone().into());
     }
+    let public_detail = crate::store::client_chat::public_market_event_payload(&detail);
     crate::store::client_chat::enqueue_client_system_event_tx(
         conn,
         &target.installation_id,
         "share_market",
         event_id,
         event_type,
-        detail,
+        public_detail,
         &followers,
         now,
     )
@@ -2205,6 +3500,9 @@ struct SubscriptionRecord {
     renter_user_id: String,
     renter_email: String,
     status: String,
+    integrity_state: String,
+    integrity_reason: Option<String>,
+    integrity_violated_at: Option<String>,
     seat_position: i64,
     parallel_limit: Option<i64>,
     token_limit: Option<i64>,
@@ -2220,6 +3518,7 @@ struct SubscriptionRecord {
     has_active_billing_contract: bool,
     activated_at: Option<String>,
     service_started_at: Option<String>,
+    termination_adjustment_json: Option<String>,
     expires_at: Option<String>,
     released_at: Option<String>,
     created_at: String,
@@ -2266,6 +3565,7 @@ fn subscription_record(
                 COALESCE(s.subdomain, ''),
                 sub.entitlement_id, sub.owner_user_id, sub.owner_email,
                 sub.renter_user_id, sub.renter_email, sub.status,
+                sub.integrity_state, sub.integrity_reason, sub.integrity_violated_at,
                 sub.daily_rate_minor, sub.currency, sub.service_duration_days,
                 sub.offer_revision, sub.release_reason, sub.activated_at, sub.expires_at,
                 sub.released_at,
@@ -2291,7 +3591,39 @@ fn subscription_record(
                 ),
                 COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
                 sub.parallel_limit, sub.token_limit, sub.token_period_json,
-                sub.service_started_at
+                sub.service_started_at,
+                (SELECT json_object(
+                    'id', adjustment.id,
+                    'status', adjustment.status,
+                    'currency', adjustment.currency,
+                    'elapsedBps', adjustment.elapsed_bps,
+                    'refundBps', adjustment.refund_bps,
+                    'amountMinor', adjustment.amount_minor,
+                    'unbilledCreditMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
+                        WHERE allocation.adjustment_id = adjustment.id
+                          AND allocation.target_kind = 'unbilled_accrual'
+                    ), 0),
+                    'invoiceCreditMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
+                        WHERE allocation.adjustment_id = adjustment.id
+                          AND allocation.target_kind = 'invoice_credit'
+                    ), 0),
+                    'externalRefundMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
+                        WHERE allocation.adjustment_id = adjustment.id
+                          AND allocation.target_kind = 'external_refund'
+                    ), 0),
+                    'refundObligationStatus', CASE
+                        WHEN EXISTS(SELECT 1 FROM market_refund_obligations obligation
+                            WHERE obligation.adjustment_id = adjustment.id
+                              AND obligation.status != 'recorded') THEN 'pending'
+                        WHEN EXISTS(SELECT 1 FROM market_refund_obligations obligation
+                            WHERE obligation.adjustment_id = adjustment.id) THEN 'recorded'
+                        ELSE NULL END
+                 ) FROM market_contract_adjustments adjustment
+                 WHERE adjustment.product_kind = 'share' AND adjustment.product_ref = sub.id
+                 ORDER BY adjustment.created_at DESC LIMIT 1)
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -2312,27 +3644,31 @@ fn subscription_record(
                 renter_user_id: row.get(11)?,
                 renter_email: row.get(12)?,
                 status: row.get(13)?,
-                daily_rate_minor: row.get(14)?,
-                currency: row.get(15)?,
+                integrity_state: row.get(14)?,
+                integrity_reason: row.get(15)?,
+                integrity_violated_at: row.get(16)?,
+                daily_rate_minor: row.get(17)?,
+                currency: row.get(18)?,
                 service_duration_days: row
-                    .get::<_, Option<i64>>(16)?
+                    .get::<_, Option<i64>>(19)?
                     .and_then(|value| u32::try_from(value).ok()),
-                offer_revision: row.get(17)?,
-                release_reason: row.get(18)?,
-                activated_at: row.get(19)?,
-                expires_at: row.get(20)?,
-                released_at: row.get(21)?,
-                created_at: row.get(22)?,
-                updated_at: row.get(23)?,
-                failure_code: row.get(24)?,
-                grant_attempts: row.get(25)?,
-                has_active_control_work: row.get::<_, i64>(26)? != 0,
-                has_active_billing_contract: row.get::<_, i64>(27)? != 0,
-                seat_position: row.get(28)?,
-                parallel_limit: row.get(29)?,
-                token_limit: row.get(30)?,
-                token_period_json: row.get(31)?,
-                service_started_at: row.get(32)?,
+                offer_revision: row.get(20)?,
+                release_reason: row.get(21)?,
+                activated_at: row.get(22)?,
+                expires_at: row.get(23)?,
+                released_at: row.get(24)?,
+                created_at: row.get(25)?,
+                updated_at: row.get(26)?,
+                failure_code: row.get(27)?,
+                grant_attempts: row.get(28)?,
+                has_active_control_work: row.get::<_, i64>(29)? != 0,
+                has_active_billing_contract: row.get::<_, i64>(30)? != 0,
+                seat_position: row.get(31)?,
+                parallel_limit: row.get(32)?,
+                token_limit: row.get(33)?,
+                token_period_json: row.get(34)?,
+                service_started_at: row.get(35)?,
+                termination_adjustment_json: row.get(36)?,
             })
         },
     )
@@ -2418,7 +3754,9 @@ fn catalog_subscription_records(
                 COALESCE(sub.required_app, share.app_type, ''),
                 COALESCE(share.subdomain, ''), sub.entitlement_id,
                 sub.owner_user_id, sub.owner_email, sub.renter_user_id,
-                sub.renter_email, sub.status, sub.daily_rate_minor, sub.currency,
+                sub.renter_email, sub.status,
+                sub.integrity_state, sub.integrity_reason, sub.integrity_violated_at,
+                sub.daily_rate_minor, sub.currency,
                 sub.service_duration_days, sub.offer_revision,
                 sub.release_reason, sub.activated_at, sub.expires_at, sub.released_at,
                 sub.created_at, sub.updated_at,
@@ -2443,7 +3781,39 @@ fn catalog_subscription_records(
                 ),
                 COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
                 sub.parallel_limit, sub.token_limit, sub.token_period_json,
-                sub.service_started_at
+                sub.service_started_at,
+                (SELECT json_object(
+                    'id', adjustment.id,
+                    'status', adjustment.status,
+                    'currency', adjustment.currency,
+                    'elapsedBps', adjustment.elapsed_bps,
+                    'refundBps', adjustment.refund_bps,
+                    'amountMinor', adjustment.amount_minor,
+                    'unbilledCreditMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
+                        WHERE allocation.adjustment_id = adjustment.id
+                          AND allocation.target_kind = 'unbilled_accrual'
+                    ), 0),
+                    'invoiceCreditMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
+                        WHERE allocation.adjustment_id = adjustment.id
+                          AND allocation.target_kind = 'invoice_credit'
+                    ), 0),
+                    'externalRefundMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
+                        WHERE allocation.adjustment_id = adjustment.id
+                          AND allocation.target_kind = 'external_refund'
+                    ), 0),
+                    'refundObligationStatus', CASE
+                        WHEN EXISTS(SELECT 1 FROM market_refund_obligations obligation
+                            WHERE obligation.adjustment_id = adjustment.id
+                              AND obligation.status != 'recorded') THEN 'pending'
+                        WHEN EXISTS(SELECT 1 FROM market_refund_obligations obligation
+                            WHERE obligation.adjustment_id = adjustment.id) THEN 'recorded'
+                        ELSE NULL END
+                 ) FROM market_contract_adjustments adjustment
+                 WHERE adjustment.product_kind = 'share' AND adjustment.product_ref = sub.id
+                 ORDER BY adjustment.created_at DESC LIMIT 1)
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -2467,27 +3837,31 @@ fn catalog_subscription_records(
                         renter_user_id: row.get(11)?,
                         renter_email: row.get(12)?,
                         status: row.get(13)?,
-                        daily_rate_minor: row.get(14)?,
-                        currency: row.get(15)?,
+                        integrity_state: row.get(14)?,
+                        integrity_reason: row.get(15)?,
+                        integrity_violated_at: row.get(16)?,
+                        daily_rate_minor: row.get(17)?,
+                        currency: row.get(18)?,
                         service_duration_days: row
-                            .get::<_, Option<i64>>(16)?
+                            .get::<_, Option<i64>>(19)?
                             .and_then(|value| u32::try_from(value).ok()),
-                        offer_revision: row.get(17)?,
-                        release_reason: row.get(18)?,
-                        activated_at: row.get(19)?,
-                        expires_at: row.get(20)?,
-                        released_at: row.get(21)?,
-                        created_at: row.get(22)?,
-                        updated_at: row.get(23)?,
-                        failure_code: row.get(24)?,
-                        grant_attempts: row.get(25)?,
-                        has_active_control_work: row.get::<_, i64>(26)? != 0,
-                        has_active_billing_contract: row.get::<_, i64>(27)? != 0,
-                        seat_position: row.get(28)?,
-                        parallel_limit: row.get(29)?,
-                        token_limit: row.get(30)?,
-                        token_period_json: row.get(31)?,
-                        service_started_at: row.get(32)?,
+                        offer_revision: row.get(20)?,
+                        release_reason: row.get(21)?,
+                        activated_at: row.get(22)?,
+                        expires_at: row.get(23)?,
+                        released_at: row.get(24)?,
+                        created_at: row.get(25)?,
+                        updated_at: row.get(26)?,
+                        failure_code: row.get(27)?,
+                        grant_attempts: row.get(28)?,
+                        has_active_control_work: row.get::<_, i64>(29)? != 0,
+                        has_active_billing_contract: row.get::<_, i64>(30)? != 0,
+                        seat_position: row.get(31)?,
+                        parallel_limit: row.get(32)?,
+                        token_limit: row.get(33)?,
+                        token_period_json: row.get(34)?,
+                        service_started_at: row.get(35)?,
+                        termination_adjustment_json: row.get(36)?,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -2943,11 +4317,15 @@ fn redact_public_subscription(subscription: &mut SubscriptionView) {
     subscription.payment_method_kinds.clear();
     subscription.can_release = false;
     subscription.can_force_revoke = false;
+    subscription.can_retry_grant = false;
     subscription.can_propose_price_change = false;
     subscription.price_change = None;
     subscription.failure_code = None;
     subscription.grant_attempts = None;
     subscription.release_reason = None;
+    subscription.integrity_reason = None;
+    subscription.integrity_violated_at = None;
+    subscription.termination_adjustment = None;
 }
 
 fn retain_public_catalog(catalog: &mut ShareMarketCatalog) {
@@ -3156,6 +4534,11 @@ fn subscription_view(
     // Allow retry while revoke is stuck (e.g. earlier grant edit blocked dispatch).
     let can_force_revoke =
         is_owner && !matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED);
+    let can_retry_grant = is_owner
+        && record.status == SUB_GRANT_FAILED
+        && record.failure_code.as_deref() != Some(SHARE_GRANT_CONTRACT_VIOLATION_CODE)
+        && !record.has_active_control_work
+        && !record.has_active_billing_contract;
     let price_change = active_price_change_view(price_change, is_owner, is_renter);
     let can_propose_price_change = is_owner
         && record.status == SUB_ACTIVE_POSTPAID
@@ -3180,6 +4563,10 @@ fn subscription_view(
         .then_some(record.grant_attempts)
         .flatten()
         .and_then(|attempts| u32::try_from(attempts).ok());
+    let termination_adjustment = record
+        .termination_adjustment_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok());
     SubscriptionView {
         id: record.id,
         seat_id: record.seat_id,
@@ -3193,6 +4580,10 @@ fn subscription_view(
         owner_email: record.owner_email,
         renter_email: record.renter_email,
         status: record.status,
+        integrity_state: record.integrity_state,
+        integrity_reason: record.integrity_reason,
+        integrity_violated_at: record.integrity_violated_at,
+        termination_adjustment,
         seat_position: record.seat_position,
         parallel_limit: record
             .parallel_limit
@@ -3213,6 +4604,7 @@ fn subscription_view(
         contacts,
         can_release,
         can_force_revoke,
+        can_retry_grant,
         can_propose_price_change,
         price_change,
         release_reason,
@@ -3248,7 +4640,9 @@ impl AppStore {
                               AND sub.status NOT IN ('released', 'grant_failed')
                         ) THEN 1 ELSE 0 END,
                         COALESCE(s.free_access, 0),
-                        COALESCE(s.supported_user_token_periods_json, '[]')
+                        COALESCE(s.supported_user_token_periods_json, '[]'),
+                        COALESCE(s.enabled_claude, 0), COALESCE(s.enabled_codex, 0),
+                        COALESCE(s.enabled_gemini, 0)
                  FROM shares s
                  WHERE lower(s.owner_email) = lower(?1)
                  ORDER BY s.share_name, s.share_id",
@@ -3261,13 +4655,18 @@ impl AppStore {
                 let parallel_limit: i64 = row.get(7)?;
                 let token_limit: i64 = row.get(8)?;
                 let periods_json: String = row.get(11)?;
+                let support = ShareSupport {
+                    claude: row.get::<_, i64>(12)? != 0,
+                    codex: row.get::<_, i64>(13)? != 0,
+                    gemini: row.get::<_, i64>(14)? != 0,
+                };
                 Ok(OwnedShareView {
                     share_id: row.get(0)?,
                     share_name: row.get(1)?,
                     app_type: app_type.clone(),
                     subdomain: row.get(3)?,
                     owner_email: row.get(4)?,
-                    supported_apps: supported_share_apps(&bindings_json, &app_type),
+                    supported_apps: enabled_share_apps(&bindings_json, &app_type, &support),
                     share_status: row.get(6)?,
                     parallel_limit: (parallel_limit >= 0)
                         .then(|| u32::try_from(parallel_limit).ok())
@@ -3299,6 +4698,109 @@ impl AppStore {
         .await
     }
 
+    pub async fn share_market_subscriptions_page(
+        &self,
+        session: &AuthSession,
+        active_subdomains: &[String],
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ShareMarketSubscriptions, AppError> {
+        let cursor = decode_descending_cursor(cursor)?;
+        let conn = self.conn.lock().await;
+        let active_ids = conn
+            .prepare(
+                "SELECT id FROM share_market_subscriptions
+                 WHERE renter_user_id = ?1 AND status NOT IN ('released', 'grant_failed')
+                 ORDER BY updated_at DESC, id DESC",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![session.user_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read active Share rental subscriptions"))?;
+        let cursor_timestamp = cursor.as_ref().map(|value| value.timestamp.as_str());
+        let cursor_id = cursor.as_ref().map(|value| value.id.as_str());
+        let mut terminal_rows = conn
+            .prepare(
+                "SELECT id, released_at FROM share_market_subscriptions
+                 WHERE renter_user_id = ?1 AND status IN ('released', 'grant_failed')
+                   AND released_at IS NOT NULL
+                   AND (?2 IS NULL OR released_at < ?2 OR (released_at = ?2 AND id < ?3))
+                 ORDER BY released_at DESC, id DESC LIMIT ?4",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(
+                        params![
+                            session.user_id,
+                            cursor_timestamp,
+                            cursor_id,
+                            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read Share rental history page"))?;
+        let has_more = terminal_rows.len() > limit;
+        terminal_rows.truncate(limit);
+        let next_cursor = if has_more {
+            terminal_rows
+                .last()
+                .map(|(id, timestamp)| {
+                    encode_descending_cursor(&DescendingCursor {
+                        timestamp: timestamp.clone(),
+                        id: id.clone(),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let ids = active_ids
+            .into_iter()
+            .chain(terminal_rows.into_iter().map(|(id, _)| id))
+            .collect::<Vec<_>>();
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = subscription_record(&conn, &id)? {
+                records.push(record);
+            }
+        }
+        let owner_ids = records
+            .iter()
+            .map(|record| record.owner_user_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let subscription_ids = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        let profiles = payment_profiles(&conn, &owner_ids)?;
+        let price_changes = active_price_changes(&conn, &subscription_ids)?;
+        let active_subdomains = active_subdomains.iter().cloned().collect::<HashSet<_>>();
+        let subscriptions = records
+            .into_iter()
+            .map(|record| {
+                let profile = profiles.get(&record.owner_user_id);
+                let price_change = price_changes.get(&record.id);
+                subscription_view(
+                    record,
+                    Some(session),
+                    &active_subdomains,
+                    profile,
+                    price_change,
+                )
+            })
+            .collect();
+        Ok(ShareMarketSubscriptions {
+            subscriptions,
+            next_cursor,
+        })
+    }
+
     async fn share_market_catalog_with_scope(
         &self,
         viewer: Option<&AuthSession>,
@@ -3314,7 +4816,9 @@ impl AppStore {
                     COALESCE(s.subdomain, ''), listing.created_at, listing.updated_at,
                     COALESCE(s.supported_user_token_periods_json, '[]'),
                     COALESCE(s.owner_email, ''), COALESCE(s.user_grants_json, '{{}}'),
-                    COALESCE(s.bindings_json, '{{}}'), s.app_runtimes_json,
+                    COALESCE(s.bindings_json, '{{}}'),
+                    COALESCE(s.enabled_claude, 0), COALESCE(s.enabled_codex, 0),
+                    COALESCE(s.enabled_gemini, 0), s.app_runtimes_json,
                     s.app_providers_json, s.token_limit, s.parallel_limit,
                     COALESCE(s.tokens_used, 0), listing.installation_id
              FROM share_market_listings listing
@@ -3345,12 +4849,15 @@ impl AppStore {
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
                     row.get::<_, String>(14)?,
-                    row.get::<_, Option<String>>(15)?,
-                    row.get::<_, Option<String>>(16)?,
-                    row.get::<_, Option<i64>>(17)?,
-                    row.get::<_, Option<i64>>(18)?,
-                    row.get::<_, i64>(19)?,
-                    row.get::<_, String>(20)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, i64>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<String>>(19)?,
+                    row.get::<_, Option<i64>>(20)?,
+                    row.get::<_, Option<i64>>(21)?,
+                    row.get::<_, i64>(22)?,
+                    row.get::<_, String>(23)?,
                 ))
             })
             .map_err(map_db("query Share Market catalog"))?
@@ -3409,6 +4916,9 @@ impl AppStore {
             current_owner_email,
             grants_json,
             bindings_json,
+            enabled_claude,
+            enabled_codex,
+            enabled_gemini,
             app_runtimes_json,
             app_providers_json,
             token_limit,
@@ -3419,16 +4929,57 @@ impl AppStore {
         {
             let is_owner = viewer.is_some_and(|value| value.user_id == owner_user_id);
             let share_online = !subdomain.is_empty() && active_subdomains.contains(&subdomain);
-            let app_capabilities = public_app_capabilities(
+            let support = ShareSupport {
+                claude: enabled_claude != 0,
+                codex: enabled_codex != 0,
+                gemini: enabled_gemini != 0,
+            };
+            let app_capabilities = enabled_public_app_capabilities(
                 &bindings_json,
                 app_runtimes_json.as_deref(),
                 app_providers_json.as_deref(),
                 &app_type,
+                &support,
             );
             let supported_apps = app_capabilities
                 .iter()
                 .map(|capability| capability.app.clone())
                 .collect::<Vec<_>>();
+            let mut app_availability = Vec::with_capacity(supported_apps.len());
+            for app in &supported_apps {
+                app_availability.push(evaluate_share_market_service_availability_tx(
+                    &conn,
+                    &share_id,
+                    app,
+                    Some(share_online),
+                    None,
+                    None,
+                    Utc::now(),
+                )?);
+            }
+            let service_available = app_availability
+                .iter()
+                .any(ShareMarketServiceAvailability::available);
+            let service_state = if service_available {
+                if app_availability
+                    .iter()
+                    .filter(|availability| availability.available())
+                    .all(|availability| availability.state == "available")
+                {
+                    "available"
+                } else {
+                    "degraded"
+                }
+            } else {
+                "unavailable"
+            };
+            let mut service_reasons = Vec::new();
+            for reason in app_availability
+                .iter()
+                .flat_map(|availability| availability.reasons.iter())
+            {
+                push_reason(&mut service_reasons, reason.clone());
+            }
             let (provider_family, provider_families) = listing_provider_families(&app_capabilities);
             let viewer_already_renting = viewer_active_share_ids.contains(&share_id);
             let viewer_has_direct_grant = viewer.is_some_and(|session| {
@@ -3503,6 +5054,7 @@ impl AppStore {
                     status == "active"
                         && share_status == "active"
                         && share_online
+                        && service_available
                         && current_owner_email.eq_ignore_ascii_case(&owner_email)
                         && seat.status == SEAT_AVAILABLE
                         && seat.retired_at.is_none()
@@ -3523,7 +5075,7 @@ impl AppStore {
                     Some("direct_access".to_string())
                 } else if viewer.is_none() {
                     Some("login_required".to_string())
-                } else if status != "active" || share_status != "active" {
+                } else if status != "active" || share_status != "active" || !service_available {
                     Some("share_unavailable".to_string())
                 } else if !share_online {
                     Some("share_offline".to_string())
@@ -3595,6 +5147,8 @@ impl AppStore {
                 share_status,
                 subdomain: subdomain.clone(),
                 share_online,
+                service_state: service_state.into(),
+                service_reasons,
                 is_owner,
                 can_delete: delete_capability.can_delete,
                 delete_blocked_reason: delete_capability.blocked_reason.map(str::to_string),
@@ -3692,6 +5246,27 @@ fn private_etag_json<T: Serialize>(headers: &HeaderMap, value: &T) -> Result<Res
         .map_err(|error| AppError::Internal(format!("build Share Market response failed: {error}")))
 }
 
+fn encode_descending_cursor(cursor: &DescendingCursor) -> Result<String, AppError> {
+    serde_json::to_vec(cursor)
+        .map(|value| URL_SAFE_NO_PAD.encode(value))
+        .map_err(|error| AppError::Internal(format!("encode Share Market cursor failed: {error}")))
+}
+
+fn decode_descending_cursor(value: Option<&str>) -> Result<Option<DescendingCursor>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| AppError::BadRequest("invalid Share Market cursor".into()))?;
+    let cursor = serde_json::from_slice::<DescendingCursor>(&bytes)
+        .map_err(|_| AppError::BadRequest("invalid Share Market cursor".into()))?;
+    if cursor.timestamp.trim().is_empty() || cursor.id.trim().is_empty() {
+        return Err(AppError::BadRequest("invalid Share Market cursor".into()));
+    }
+    Ok(Some(cursor))
+}
+
 async fn list_catalog(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -3735,23 +5310,50 @@ async fn list_my_listings(
 async fn list_my_subscriptions(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    Query(query): Query<SubscriptionPageQuery>,
 ) -> Result<Response, AppError> {
     let session = require_session(&state, &headers).await?;
     let active_subdomains = state.proxy.active_subdomains().await;
-    let catalog = state
+    let page = state
         .store
-        .share_market_catalog_with_scope(
-            Some(&session),
+        .share_market_subscriptions_page(
+            &session,
             &active_subdomains,
-            ShareMarketCatalogScope::Renter,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(8).clamp(1, 50),
         )
         .await?;
-    private_etag_json(
-        &headers,
-        &ShareMarketSubscriptions {
-            subscriptions: catalog.my_subscriptions,
-        },
-    )
+    private_etag_json(&headers, &page)
+}
+
+async fn list_control_dead_letters(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ControlDeadLetterQuery>,
+) -> Result<Json<ShareControlDeadLetterPage>, AppError> {
+    crate::api::require_admin_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .share_market_control_dead_letters(
+                query.cursor.as_deref(),
+                query.limit.unwrap_or(20).clamp(1, 50),
+            )
+            .await?,
+    ))
+}
+
+async fn requeue_control_dead_letter(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(operation_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    state
+        .store
+        .share_market_requeue_control_dead_letter(&session, &operation_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn list_owned_shares(
@@ -3955,6 +5557,7 @@ impl AppStore {
                 "Share must be active before it can be listed".into(),
             ));
         }
+        ensure_share_market_app_scope_supported_tx(&tx, share_id)?;
         if free_access {
             return Err(AppError::Conflict(
                 "disable public free access before listing the Share in Share Market".into(),
@@ -4132,6 +5735,7 @@ impl AppStore {
                 "listing Share is no longer active or owned by this account".into(),
             ));
         }
+        ensure_share_market_app_scope_supported_tx(&tx, &share_id)?;
         if free_access {
             return Err(AppError::Conflict(
                 "disable public free access before adding or reopening Share Market seats".into(),
@@ -5110,6 +6714,208 @@ fn has_terminal_revoke_operation_tx(
     .map_err(map_db("check terminal Share revoke"))
 }
 
+impl AppStore {
+    pub async fn share_market_control_dead_letters(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ShareControlDeadLetterPage, AppError> {
+        let cursor = decode_descending_cursor(cursor)?;
+        let conn = self.conn.lock().await;
+        let summary = conn
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM share_control_operations",
+                [],
+                |row| {
+                    Ok(ShareControlOperationSummary {
+                        pending: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                        dispatched: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        dead_lettered: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    })
+                },
+            )
+            .map_err(map_db("read Share control operation summary"))?;
+        let cursor_timestamp = cursor.as_ref().map(|value| value.timestamp.as_str());
+        let cursor_id = cursor.as_ref().map(|value| value.id.as_str());
+        let mut operations = conn
+            .prepare(
+                "SELECT operation.id, operation.share_id, operation.subscription_id,
+                        operation.action, operation.email, operation.attempts,
+                        operation.last_error, edit.error_code, operation.created_at,
+                        operation.updated_at, operation.dead_lettered_at
+                 FROM share_control_operations operation
+                 LEFT JOIN share_edit_requests edit ON edit.id = operation.edit_id
+                 WHERE operation.dead_lettered_at IS NOT NULL
+                   AND (?1 IS NULL OR operation.dead_lettered_at < ?1
+                        OR (operation.dead_lettered_at = ?1 AND operation.id < ?2))
+                 ORDER BY operation.dead_lettered_at DESC, operation.id DESC LIMIT ?3",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(
+                        params![
+                            cursor_timestamp,
+                            cursor_id,
+                            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+                        ],
+                        |row| {
+                            let action = row.get::<_, String>(3)?;
+                            Ok(ShareControlDeadLetterView {
+                                id: row.get(0)?,
+                                share_id: row.get(1)?,
+                                subscription_id: row.get(2)?,
+                                can_requeue: action == "revoke",
+                                action,
+                                email: row.get(4)?,
+                                attempts: row.get(5)?,
+                                last_error: row.get(6)?,
+                                error_code: row.get(7)?,
+                                created_at: row.get(8)?,
+                                updated_at: row.get(9)?,
+                                dead_lettered_at: row.get(10)?,
+                            })
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read Share control dead letters"))?;
+        let has_more = operations.len() > limit;
+        operations.truncate(limit);
+        let next_cursor = if has_more {
+            operations
+                .last()
+                .map(|operation| {
+                    encode_descending_cursor(&DescendingCursor {
+                        timestamp: operation.dead_lettered_at.clone(),
+                        id: operation.id.clone(),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(ShareControlDeadLetterPage {
+            operations,
+            summary,
+            next_cursor,
+        })
+    }
+
+    pub async fn share_market_requeue_control_dead_letter(
+        &self,
+        session: &AuthSession,
+        operation_id: &str,
+    ) -> Result<(), AppError> {
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Share control dead-letter requeue"))?;
+        let operation = tx
+            .query_row(
+                "SELECT operation.share_id, operation.subscription_id, operation.action,
+                        operation.status, operation.dead_lettered_at,
+                        subscription.listing_id, subscription.seat_id,
+                        subscription.status, operation.edit_id
+                 FROM share_control_operations operation
+                 JOIN share_market_subscriptions subscription
+                   ON subscription.id = operation.subscription_id
+                 WHERE operation.id = ?1",
+                params![operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Share control dead letter for requeue"))?
+            .ok_or_else(|| AppError::NotFound("Share control operation not found".into()))?;
+        if operation.2 != "revoke" || operation.3 != "rejected" || operation.4.is_none() {
+            return Err(AppError::Conflict(
+                "only a dead-lettered Share revoke can be requeued".into(),
+            ));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE share_control_operations
+                 SET status = 'pending', edit_id = NULL, attempts = 0,
+                     last_error = NULL, next_attempt_at = ?2,
+                     dead_lettered_at = NULL, applied_at = NULL, updated_at = ?2
+                 WHERE id = ?1 AND action = 'revoke' AND status = 'rejected'
+                   AND dead_lettered_at IS NOT NULL",
+                params![operation_id, now],
+            )
+            .map_err(map_db("requeue Share control dead letter"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "Share control operation was already requeued".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE share_market_subscriptions
+             SET status = CASE
+                    WHEN status = 'revoke_failed' THEN 'revoke_pending'
+                    WHEN status = 'billing_control_failed' THEN 'billing_suspend_pending'
+                    ELSE status END,
+                 release_reason = CASE
+                    WHEN status IN ('revoke_failed', 'billing_control_failed') THEN NULL
+                    ELSE release_reason END,
+                 updated_at = ?2 WHERE id = ?1",
+            params![operation.1, now],
+        )
+        .map_err(map_db("restore Share subscription control state"))?;
+        event_tx(
+            &tx,
+            Some(&operation.5),
+            Some(&operation.6),
+            Some(&operation.1),
+            Some(session),
+            "control_dead_letter_requeued",
+            serde_json::json!({
+                "operationId": operation_id,
+                "previousEditId": operation.8,
+                "previousSubscriptionStatus": operation.7,
+            }),
+            &now,
+        )?;
+        crate::store::enqueue_operator_alert_signal_tx(
+            &tx,
+            &format!("share-control-dead-letter-requeued:{operation_id}"),
+            &format!("share_control_dead_letter:share:{}", operation.0),
+            "resolved",
+            "share_control_dead_letter",
+            "share",
+            Some(&operation.0),
+            "critical",
+            "Share control dead letter requeued",
+            "An administrator safely requeued the failed Share revoke operation.",
+            serde_json::json!({
+                "operationId": operation_id,
+                "subscriptionId": operation.1,
+                "shareId": operation.0,
+            }),
+            now_dt,
+        )?;
+        tx.commit()
+            .map_err(map_db("commit Share control dead-letter requeue"))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RentCommitMetadata {
     quote_id: String,
@@ -5163,6 +6969,9 @@ impl AppStore {
             Option<i64>,
             String,
             String,
+            i64,
+            i64,
+            i64,
             Option<String>,
             Option<String>,
             String,
@@ -5176,7 +6985,9 @@ impl AppStore {
                         seat.position, seat.offer_revision, seat.parallel_limit, seat.token_limit,
                         seat.token_period_json, seat.daily_rate_minor, seat.currency,
                         seat.service_duration_days, COALESCE(share.user_grants_json, '{}'),
-                        COALESCE(share.bindings_json, '{}'), share.app_runtimes_json,
+                        COALESCE(share.bindings_json, '{}'),
+                        COALESCE(share.enabled_claude, 0), COALESCE(share.enabled_codex, 0),
+                        COALESCE(share.enabled_gemini, 0), share.app_runtimes_json,
                         share.app_providers_json, share.app_type, share.parallel_limit,
                         share.token_limit, share.tokens_used
                  FROM share_market_seats seat
@@ -5192,7 +7003,7 @@ impl AppStore {
                         row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
                         row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
                         row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?,
-                        row.get(20)?, row.get(21)?,
+                        row.get(20)?, row.get(21)?, row.get(22)?, row.get(23)?, row.get(24)?,
                     ))
                 },
             )
@@ -5215,6 +7026,9 @@ impl AppStore {
             service_duration_days,
             grants_json,
             bindings_json,
+            enabled_claude,
+            enabled_codex,
+            enabled_gemini,
             app_runtimes_json,
             app_providers_json,
             fallback_app,
@@ -5232,6 +7046,8 @@ impl AppStore {
         if listing_status != "active" {
             return Err(AppError::Conflict("listing is no longer active".into()));
         }
+        ensure_share_market_app_scope_supported_tx(&tx, &share_id)?;
+        ensure_share_total_tokens_available(share_token_limit, share_tokens_used)?;
         if owner_user_id == session.user_id || owner_email.eq_ignore_ascii_case(&session.email) {
             return Err(AppError::BadRequest(
                 "Share owner cannot rent their own seat".into(),
@@ -5304,9 +7120,33 @@ impl AppStore {
             app_runtimes_json.as_deref(),
             app_providers_json.as_deref(),
             &fallback_app,
+            &ShareSupport {
+                claude: enabled_claude != 0,
+                codex: enabled_codex != 0,
+                gemini: enabled_gemini != 0,
+            },
             share_parallel_limit,
             share_token_limit,
             share_tokens_used,
+        )?;
+        let availability = evaluate_share_market_service_availability_tx(
+            &tx,
+            &share_id,
+            &service.required_app,
+            None,
+            None,
+            Some(&service),
+            now_dt,
+        )?;
+        if !availability.available() {
+            return Err(availability_error(&availability));
+        }
+        ensure_fixed_service_term_fulfillable_tx(
+            &tx,
+            &share_id,
+            &service.required_app,
+            service_duration_days.and_then(|value| u32::try_from(value).ok()),
+            now_dt,
         )?;
         if let (Some(seat_limit), Some(share_limit)) = (
             parallel_limit.and_then(|value| u32::try_from(value).ok()),
@@ -5598,6 +7438,246 @@ impl AppStore {
         Ok(subscription_id)
     }
 
+    pub async fn share_market_retry_grant(
+        &self,
+        session: &AuthSession,
+        subscription_id: &str,
+    ) -> Result<(), AppError> {
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Share grant retry"))?;
+        let record = subscription_record(&tx, subscription_id)?
+            .ok_or_else(|| AppError::NotFound("Share subscription not found".into()))?;
+        if record.owner_user_id != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the Share owner can retry this grant".into(),
+            ));
+        }
+        if record.status == SUB_GRANT_PENDING {
+            let already_requeued = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM share_control_operations
+                        WHERE subscription_id = ?1 AND action = 'upsert'
+                          AND status IN ('pending', 'dispatched')
+                    ) AND EXISTS(
+                        SELECT 1 FROM share_market_seats
+                        WHERE id = ?2 AND current_subscription_id = ?1
+                          AND status = 'reserved'
+                    )",
+                    params![subscription_id, record.seat_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(map_db("check idempotent Share grant retry"))?
+                != 0;
+            if already_requeued {
+                tx.commit()
+                    .map_err(map_db("commit idempotent Share grant retry"))?;
+                return Ok(());
+            }
+        }
+        if record.status != SUB_GRANT_FAILED {
+            return Err(AppError::Conflict(
+                "only a failed initial Share grant can be retried".into(),
+            ));
+        }
+        if record.failure_code.as_deref() == Some(SHARE_GRANT_CONTRACT_VIOLATION_CODE) {
+            return Err(AppError::Conflict(
+                "a contract-violating Share grant cannot be retried".into(),
+            ));
+        }
+        if record.has_active_control_work || record.has_active_billing_contract {
+            return Err(AppError::Conflict(
+                "this Share subscription still has active control or billing work".into(),
+            ));
+        }
+        let violations = subscription_integrity_violations_tx(&tx, &record, now_dt)?;
+        if !violations.is_empty() {
+            return Err(AppError::coded_conflict(
+                "share_market_contract_incompatible",
+                "the frozen Share rental contract is no longer compatible",
+                serde_json::json!({ "reasons": violations }),
+            ));
+        }
+        let (seat_status, current_subscription_id, retired_subscription_id) = tx
+            .query_row(
+                "SELECT status, current_subscription_id, retired_subscription_id
+                 FROM share_market_seats WHERE id = ?1",
+                params![record.seat_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Share seat for grant retry"))?
+            .ok_or_else(|| AppError::Conflict("the original Share seat no longer exists".into()))?;
+        if seat_status == SEAT_DELETED
+            || current_subscription_id.is_some()
+            || retired_subscription_id.as_deref() != Some(subscription_id)
+        {
+            return Err(AppError::Conflict(
+                "the original Share seat is no longer available for recovery".into(),
+            ));
+        }
+        let subscription_conflict = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM share_market_subscriptions
+                    WHERE id != ?1 AND status NOT IN ('released', 'grant_failed')
+                      AND (seat_id = ?2 OR (renter_user_id = ?3 AND share_id = ?4))
+                )",
+                params![
+                    subscription_id,
+                    record.seat_id,
+                    record.renter_user_id,
+                    record.share_id,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("check Share grant retry conflicts"))?
+            != 0;
+        if subscription_conflict {
+            return Err(AppError::Conflict(
+                "another active rental now conflicts with this Share grant".into(),
+            ));
+        }
+        let grants_json = tx
+            .query_row(
+                "SELECT COALESCE(user_grants_json, '{}') FROM shares WHERE share_id = ?1",
+                params![record.share_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("read direct Share access for grant retry"))?
+            .ok_or_else(|| AppError::Conflict("the Share no longer exists".into()))?;
+        let grants = serde_json::from_str::<BTreeMap<String, ShareUserGrant>>(&grants_json)
+            .unwrap_or_default();
+        if grants
+            .get(&record.renter_email.to_ascii_lowercase())
+            .is_some_and(|grant| {
+                grant.active && grant.entitlement_id.as_deref() != Some(&record.entitlement_id)
+            })
+        {
+            return Err(AppError::Conflict(
+                "the renter now has another direct Share entitlement".into(),
+            ));
+        }
+        let (operation_id, old_edit_id) = tx
+            .query_row(
+                "SELECT id, edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'
+                 ORDER BY share_sequence DESC LIMIT 1",
+                params![subscription_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(map_db("read failed Share grant operation"))?
+            .ok_or_else(|| AppError::Conflict("the failed Share grant is missing".into()))?;
+        if let Some(daily_rate_minor) = record.daily_rate_minor {
+            let currency = record.currency.as_deref().ok_or_else(|| {
+                AppError::Internal("paid Share subscription currency is missing".into())
+            })?;
+            let replacement_contract_id = tx
+                .query_row(
+                    "SELECT id FROM market_service_contracts
+                     WHERE product_kind = 'share' AND product_ref = ?1 AND status = 'terminated'
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    params![subscription_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_db("read failed Share billing reservation"))?
+                .ok_or_else(|| {
+                    AppError::Conflict("the failed Share billing reservation is missing".into())
+                })?;
+            crate::market_billing::reserve_contract_tx(
+                &tx,
+                crate::market_billing::ActivateContractInput {
+                    product_kind: "share",
+                    product_ref: subscription_id,
+                    service_ref: &record.share_id,
+                    service_label: &record.share_name,
+                    buyer_user_id: &record.renter_user_id,
+                    buyer_email: &record.renter_email,
+                    supplier_user_id: &record.owner_user_id,
+                    supplier_email: &record.owner_email,
+                    currency,
+                    daily_rate_minor,
+                    offer_revision: record.offer_revision,
+                    replacement_of: Some(&replacement_contract_id),
+                },
+                i64::MAX,
+                &now,
+            )?;
+        }
+        let policy = contract_policy(&record)?;
+        let policy_json = serde_json::to_string(&policy).map_err(|error| {
+            AppError::Internal(format!("encode retried Share grant policy failed: {error}"))
+        })?;
+        let operation_changed = tx
+            .execute(
+                "UPDATE share_control_operations
+                 SET status = 'pending', edit_id = NULL, attempts = 0,
+                     last_error = NULL, policy_json = ?2, applied_at = NULL,
+                     next_attempt_at = ?3, dead_lettered_at = NULL, updated_at = ?3
+                 WHERE id = ?1 AND action = 'upsert' AND status = 'rejected'",
+                params![operation_id, policy_json, now],
+            )
+            .map_err(map_db("requeue failed Share grant"))?;
+        if operation_changed != 1 {
+            return Err(AppError::Conflict(
+                "the failed Share grant operation is no longer retryable".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE share_market_subscriptions
+             SET status = 'grant_pending', release_reason = NULL,
+                 released_at = NULL, integrity_state = 'compatible',
+                 integrity_reason = NULL, integrity_checked_at = ?2,
+                 integrity_violated_at = NULL, updated_at = ?2
+             WHERE id = ?1 AND status = 'grant_failed'",
+            params![subscription_id, now],
+        )
+        .map_err(map_db("restore failed Share subscription"))?;
+        let seat_changed = tx
+            .execute(
+                "UPDATE share_market_seats
+                 SET status = 'reserved', current_subscription_id = ?2,
+                     retired_subscription_id = NULL, retired_at = NULL, updated_at = ?3
+                 WHERE id = ?1 AND status != 'deleted' AND current_subscription_id IS NULL
+                   AND retired_subscription_id = ?2",
+                params![record.seat_id, subscription_id, now],
+            )
+            .map_err(map_db("restore failed Share seat"))?;
+        if seat_changed != 1 {
+            return Err(AppError::Conflict(
+                "the original Share seat changed during grant recovery".into(),
+            ));
+        }
+        event_tx(
+            &tx,
+            Some(&record.listing_id),
+            Some(&record.seat_id),
+            Some(subscription_id),
+            Some(session),
+            "entitlement_grant_retried",
+            serde_json::json!({
+                "operationId": operation_id,
+                "previousEditId": old_edit_id,
+            }),
+            &now,
+        )?;
+        tx.commit().map_err(map_db("commit Share grant retry"))?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn share_market_rent_seat_tx(
         &self,
@@ -5630,6 +7710,9 @@ impl AppStore {
             String,
             String,
             String,
+            i64,
+            i64,
+            i64,
             Option<String>,
             Option<String>,
             String,
@@ -5645,7 +7728,9 @@ impl AppStore {
                         seat.daily_rate_minor, seat.currency, seat.service_duration_days,
                         COALESCE(s.user_grants_json, '{}'),
                         COALESCE(s.share_name, listing.share_id), listing.installation_id,
-                        COALESCE(s.bindings_json, '{}'), s.app_runtimes_json,
+                        COALESCE(s.bindings_json, '{}'),
+                        COALESCE(s.enabled_claude, 0), COALESCE(s.enabled_codex, 0),
+                        COALESCE(s.enabled_gemini, 0), s.app_runtimes_json,
                         s.app_providers_json, s.app_type, s.parallel_limit,
                         s.token_limit, s.tokens_used
                  FROM share_market_seats seat
@@ -5681,6 +7766,9 @@ impl AppStore {
                         row.get(21)?,
                         row.get(22)?,
                         row.get(23)?,
+                        row.get(24)?,
+                        row.get(25)?,
+                        row.get(26)?,
                     ))
                 },
             )
@@ -5705,6 +7793,9 @@ impl AppStore {
             share_name,
             installation_id,
             bindings_json,
+            enabled_claude,
+            enabled_codex,
+            enabled_gemini,
             app_runtimes_json,
             app_providers_json,
             fallback_app,
@@ -5720,6 +7811,8 @@ impl AppStore {
         if listing_status != "active" || seat_status != SEAT_AVAILABLE {
             return Err(AppError::Conflict("seat is no longer available".into()));
         }
+        ensure_share_market_app_scope_supported_tx(tx, &share_id)?;
+        ensure_share_total_tokens_available(share_token_limit, share_tokens_used)?;
         if offer_revision != input.offer_revision {
             return Err(AppError::Conflict(
                 "seat offer changed; reload and retry".into(),
@@ -5813,9 +7906,34 @@ impl AppStore {
             app_runtimes_json.as_deref(),
             app_providers_json.as_deref(),
             &fallback_app,
+            &ShareSupport {
+                claude: enabled_claude != 0,
+                codex: enabled_codex != 0,
+                gemini: enabled_gemini != 0,
+            },
             share_parallel_limit,
             share_token_limit,
             share_tokens_used,
+        )?;
+        let now_dt = parse_time(now)?;
+        let availability = evaluate_share_market_service_availability_tx(
+            tx,
+            &share_id,
+            &current_service.required_app,
+            None,
+            None,
+            Some(&current_service),
+            now_dt,
+        )?;
+        if !availability.available() {
+            return Err(availability_error(&availability));
+        }
+        ensure_fixed_service_term_fulfillable_tx(
+            tx,
+            &share_id,
+            &current_service.required_app,
+            service_duration_days,
+            now_dt,
         )?;
         if let Some(snapshot) = quote_snapshot {
             if snapshot.seat_id != seat_id
@@ -5852,6 +7970,7 @@ impl AppStore {
             token_period,
             token_period_anchor_at_ms: None,
             expires_at: None,
+            allowed_apps: vec![current_service.required_app.clone()],
         };
         let subscription_id = Uuid::new_v4().to_string();
         let entitlement_id = Uuid::new_v4().to_string();
@@ -5992,10 +8111,13 @@ impl AppStore {
             String,
             String,
             Option<i64>,
+            Option<i64>,
+            Option<String>,
         )> = tx
             .query_row(
                 "SELECT share_id, seat_id, listing_id, entitlement_id, owner_user_id,
-                        renter_user_id, renter_email, status, daily_rate_minor
+                        renter_user_id, renter_email, status, daily_rate_minor,
+                        service_duration_days, service_started_at
                  FROM share_market_subscriptions
                  WHERE id = ?1 AND status NOT IN ('released', 'grant_failed')",
                 params![subscription_id],
@@ -6010,6 +8132,8 @@ impl AppStore {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -6024,7 +8148,9 @@ impl AppStore {
             renter_user_id,
             renter_email,
             _subscription_status,
-            _daily_rate_minor,
+            daily_rate_minor,
+            service_duration_days,
+            service_started_at,
         )) = row
         else {
             return Err(AppError::NotFound("active subscription not found".into()));
@@ -6037,6 +8163,20 @@ impl AppStore {
         if !authorized {
             return Err(AppError::Forbidden(
                 "subscription does not belong to this account".into(),
+            ));
+        }
+        if owner_override
+            && daily_rate_minor.is_some()
+            && service_duration_days.is_some()
+            && service_started_at.is_some()
+        {
+            return Err(AppError::coded_conflict(
+                "share_market_termination_quote_required",
+                "preview and confirm the fixed-term refund before terminating this rental",
+                serde_json::json!({
+                    "reason": "termination_quote_required",
+                    "subscriptionId": subscription_id,
+                }),
             ));
         }
         let reason = if owner_override {
@@ -6114,6 +8254,332 @@ impl AppStore {
         tx.commit().map_err(map_db("commit Share seat release"))?;
         Ok(())
     }
+
+    pub async fn share_market_create_termination_quote(
+        &self,
+        session: &AuthSession,
+        subscription_id: &str,
+    ) -> Result<TerminationQuoteView, AppError> {
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let expires_at = (now_dt + Duration::seconds(TERMINATION_QUOTE_TTL_SECS)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Share termination quote"))?;
+        let owner_user_id = tx
+            .query_row(
+                "SELECT owner_user_id FROM share_market_subscriptions
+                 WHERE id = ?1 AND daily_rate_minor IS NOT NULL
+                   AND service_duration_days IS NOT NULL
+                   AND service_started_at IS NOT NULL
+                   AND status NOT IN ('released', 'grant_failed')",
+                params![subscription_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db(
+                "read fixed Share subscription for termination quote",
+            ))?
+            .ok_or_else(|| {
+                AppError::coded_conflict(
+                    "share_market_fixed_term_required",
+                    "only an active paid fixed-term rental uses the refund termination flow",
+                    serde_json::json!({ "reason": "fixed_term_required" }),
+                )
+            })?;
+        if owner_user_id != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the Share owner can terminate this rental".into(),
+            ));
+        }
+        let calculation = crate::market_billing::supplier_termination_calculation_tx(
+            &tx,
+            "share",
+            subscription_id,
+            now_dt,
+        )?;
+        let quote_id = Uuid::new_v4().to_string();
+        let snapshot_json = serde_json::to_string(&calculation).map_err(|error| {
+            AppError::Internal(format!("encode Share termination quote failed: {error}"))
+        })?;
+        tx.execute(
+            "UPDATE share_market_termination_quotes
+             SET status = 'expired', updated_at = ?3
+             WHERE subscription_id = ?1 AND owner_user_id = ?2 AND status = 'active'",
+            params![subscription_id, session.user_id, now],
+        )
+        .map_err(map_db("expire previous Share termination quote"))?;
+        tx.execute(
+            "INSERT INTO share_market_termination_quotes (
+                id, subscription_id, owner_user_id, snapshot_json, status,
+                expires_at, consumed_adjustment_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, NULL, ?6, ?6)",
+            params![
+                quote_id,
+                subscription_id,
+                session.user_id,
+                snapshot_json,
+                expires_at,
+                now,
+            ],
+        )
+        .map_err(map_db("create Share termination quote"))?;
+        tx.commit()
+            .map_err(map_db("commit Share termination quote"))?;
+        Ok(TerminationQuoteView {
+            id: quote_id,
+            subscription_id: subscription_id.to_string(),
+            status: "active".into(),
+            expires_at,
+            calculation,
+        })
+    }
+
+    pub async fn share_market_commit_termination(
+        &self,
+        session: &AuthSession,
+        subscription_id: &str,
+        quote_id: &str,
+        idempotency_key: &str,
+        deny_future_access: bool,
+    ) -> Result<CommitTerminationResponse, AppError> {
+        let quote_id = quote_id.trim();
+        let idempotency_key = idempotency_key.trim();
+        if quote_id.is_empty() {
+            return Err(AppError::BadRequest("quoteId is required".into()));
+        }
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(AppError::BadRequest(
+                "idempotencyKey must contain 1-128 non-control characters".into(),
+            ));
+        }
+        let adjustment_key = format!("share-termination:{subscription_id}:{idempotency_key}");
+        let request_fingerprint = crate::api::sha256_hex(
+            format!(
+                "share-market-termination-v1\n{subscription_id}\n{quote_id}\n{deny_future_access}"
+            )
+            .as_bytes(),
+        );
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Share supplier termination"))?;
+        let replayed_adjustment_id = tx
+            .query_row(
+                "SELECT id FROM market_contract_adjustments
+                 WHERE idempotency_key = ?1 AND product_kind = 'share' AND product_ref = ?2",
+                params![adjustment_key, subscription_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("check idempotent Share supplier termination"))?;
+        let replayed = replayed_adjustment_id.is_some();
+        let quote = tx
+            .query_row(
+                "SELECT owner_user_id, status, expires_at, snapshot_json,
+                        consumed_adjustment_id, commit_fingerprint
+                 FROM share_market_termination_quotes
+                 WHERE id = ?1 AND subscription_id = ?2",
+                params![quote_id, subscription_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Share termination quote"))?
+            .ok_or_else(|| AppError::NotFound("Share termination quote not found".into()))?;
+        if quote.0 != session.user_id {
+            return Err(AppError::Forbidden(
+                "Share termination quote belongs to another account".into(),
+            ));
+        }
+        let quoted: crate::market_billing::SupplierTerminationCalculation =
+            serde_json::from_str(&quote.3).map_err(|_| {
+                AppError::Internal("stored Share termination quote is invalid".into())
+            })?;
+        if quoted.product_kind != "share" || quoted.product_ref != subscription_id {
+            return Err(AppError::Conflict(
+                "Share termination quote no longer matches this rental".into(),
+            ));
+        }
+        if let Some(adjustment_id) = replayed_adjustment_id.as_deref() {
+            if quote.1 != "consumed"
+                || quote.4.as_deref() != Some(adjustment_id)
+                || quote.5.as_deref() != Some(request_fingerprint.as_str())
+            {
+                return Err(AppError::Conflict(
+                    "termination idempotency key was reused with a different request".into(),
+                ));
+            }
+        } else if quote.1 != "active" || parse_time(&quote.2)? <= now_dt {
+            return Err(AppError::Gone(
+                "Share termination quote expired; request a new quote".into(),
+            ));
+        }
+        // The quote locks the reviewed refund bracket and base. Service delivered
+        // after that snapshot remains billable until terminate_contract_tx below
+        // records the final interval at commit time.
+        let adjustment = crate::market_billing::apply_quoted_supplier_early_termination_refund_tx(
+            &tx,
+            &quoted,
+            "owner_early_termination",
+            &adjustment_key,
+            now_dt,
+        )?;
+        if !replayed {
+            terminate_subscription_for_supplier_tx(
+                &tx,
+                subscription_id,
+                "owner_early_termination",
+                Some(session),
+                deny_future_access,
+                &now,
+            )?;
+            let consumed = tx
+                .execute(
+                    "UPDATE share_market_termination_quotes
+                 SET status = 'consumed', consumed_adjustment_id = ?2,
+                     commit_fingerprint = ?3, updated_at = ?4
+                 WHERE id = ?1 AND status = 'active'",
+                    params![quote_id, adjustment.id, request_fingerprint, now],
+                )
+                .map_err(map_db("consume Share termination quote"))?;
+            if consumed != 1 {
+                return Err(AppError::Conflict(
+                    "Share termination quote was already consumed".into(),
+                ));
+            }
+        }
+        tx.commit()
+            .map_err(map_db("commit Share supplier termination"))?;
+        Ok(CommitTerminationResponse {
+            ok: true,
+            subscription_id: subscription_id.to_string(),
+            replayed,
+            adjustment,
+        })
+    }
+}
+
+fn terminate_subscription_for_supplier_tx(
+    tx: &Connection,
+    subscription_id: &str,
+    reason: &str,
+    actor: Option<&AuthSession>,
+    deny_future_access: bool,
+    now: &str,
+) -> Result<(), AppError> {
+    let record = subscription_record(tx, subscription_id)?
+        .ok_or_else(|| AppError::NotFound("Share subscription not found".into()))?;
+    if matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED) {
+        return Ok(());
+    }
+    crate::market_billing::terminate_contract_tx(tx, "share", subscription_id, reason, now)?;
+    let retired = retire_unconfirmed_grant_tx(tx, subscription_id, reason, now)?;
+    let grants_json = tx
+        .query_row(
+            "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+            params![record.share_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_db("read Share grants during supplier termination"))?
+        .flatten();
+    let has_entitlement = active_entitlement(grants_json.as_deref(), &record.entitlement_id);
+    let grant_never_reached_client = !entitlement_was_activated_tx(tx, subscription_id)?
+        && !has_entitlement
+        && !retired.had_dispatched;
+    if grant_never_reached_client {
+        finish_release_tx(
+            tx,
+            subscription_id,
+            &record.seat_id,
+            &record.listing_id,
+            reason,
+            now,
+        )?;
+    } else if has_terminal_revoke_operation_tx(tx, subscription_id)? {
+        tx.execute(
+            "UPDATE share_market_subscriptions
+             SET status = 'revoke_failed', release_reason = ?2, updated_at = ?3
+             WHERE id = ?1 AND status NOT IN ('released', 'grant_failed')",
+            params![subscription_id, reason, now],
+        )
+        .map_err(map_db("retain supplier termination revoke dead-letter"))?;
+        tx.execute(
+            "UPDATE share_market_seats SET status = 'revoking', updated_at = ?2
+             WHERE id = ?1 AND current_subscription_id = ?3",
+            params![record.seat_id, now, subscription_id],
+        )
+        .map_err(map_db("retain supplier termination seat isolation"))?;
+    } else {
+        request_revoke_tx(
+            tx,
+            subscription_id,
+            &record.share_id,
+            &record.seat_id,
+            &record.entitlement_id,
+            &record.renter_email,
+            reason,
+            now,
+        )?;
+    }
+    tx.execute(
+        "UPDATE share_market_subscriptions
+         SET integrity_state = 'terminated', integrity_reason = ?2,
+             integrity_checked_at = ?3, updated_at = ?3 WHERE id = ?1",
+        params![subscription_id, reason, now],
+    )
+    .map_err(map_db("mark supplier-terminated Share contract"))?;
+    if deny_future_access {
+        let actor = actor.ok_or_else(|| {
+            AppError::BadRequest("an authenticated owner is required to deny future access".into())
+        })?;
+        for pricing_kind in [
+            crate::market_access::PRICING_FREE,
+            crate::market_access::PRICING_PAID,
+        ] {
+            crate::market_access::set_product_access_decision_tx(
+                tx,
+                &record.owner_user_id,
+                &actor.email,
+                &record.renter_user_id,
+                &record.renter_email,
+                crate::market_access::PRODUCT_SHARE,
+                pricing_kind,
+                crate::market_access::DECISION_DENY,
+                &actor.user_id,
+                now,
+            )?;
+        }
+    }
+    event_tx(
+        tx,
+        Some(&record.listing_id),
+        Some(&record.seat_id),
+        Some(subscription_id),
+        actor,
+        "supplier_termination_requested",
+        serde_json::json!({
+            "reason": reason,
+            "futureAccessDenied": deny_future_access,
+        }),
+        now,
+    )?;
+    Ok(())
 }
 
 async fn ensure_share_market_seat_online(
@@ -6211,13 +8677,6 @@ async fn rent_seat(
             share_online,
         )
         .await?;
-    if let Err(error) = run_once(&state).await {
-        tracing::warn!(
-            subscription_id = %response.subscription_id,
-            error = %error,
-            "Share rental committed; immediate authorization advance failed"
-        );
-    }
     Ok(Json(response))
 }
 
@@ -6231,9 +8690,6 @@ async fn release_subscription(
         .store
         .share_market_request_release(&session, &subscription_id, false, false)
         .await?;
-    if let Err(error) = run_once(&state).await {
-        tracing::warn!(%subscription_id, error = %error, "Share release committed; immediate revoke advance failed");
-    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -6248,10 +8704,55 @@ async fn force_revoke_subscription(
         .store
         .share_market_request_release(&session, &subscription_id, true, input.deny_future_access)
         .await?;
-    if let Err(error) = run_once(&state).await {
-        tracing::warn!(%subscription_id, error = %error, "Share force-revoke committed; immediate revoke advance failed");
-    }
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn retry_grant_subscription(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(subscription_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    state
+        .store
+        .share_market_retry_grant(&session, &subscription_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn quote_subscription_termination(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(subscription_id): Path<String>,
+) -> Result<Json<TerminationQuoteView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .share_market_create_termination_quote(&session, &subscription_id)
+            .await?,
+    ))
+}
+
+async fn commit_subscription_termination(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(subscription_id): Path<String>,
+    Json(input): Json<CommitTerminationRequest>,
+) -> Result<Json<CommitTerminationResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .share_market_commit_termination(
+                &session,
+                &subscription_id,
+                &input.quote_id,
+                &input.idempotency_key,
+                input.deny_future_access,
+            )
+            .await?,
+    ))
 }
 
 async fn propose_price_change(
@@ -6428,6 +8929,7 @@ fn validate_effective_initial_policy(
         || effective_policy.token_period != token_period
         || effective_policy.token_period_anchor_at_ms != expected_anchor
         || effective_policy.expires_at != expected_expiry
+        || effective_policy.allowed_apps != [record.app_type.clone()]
     {
         return Err(AppError::Conflict(
             "client applied a managed grant policy that differs from the rented terms".into(),
@@ -6463,6 +8965,7 @@ fn validate_effective_resume_policy(
         || effective_policy.token_period != token_period
         || effective_policy.token_period_anchor_at_ms != expected_anchor
         || effective_policy.expires_at != expected_expiry
+        || effective_policy.allowed_apps != [record.app_type.clone()]
     {
         return Err(AppError::Conflict(
             "client restored a managed grant policy that differs from the active rental contract"
@@ -6566,6 +9069,67 @@ fn latest_upsert_control_context(
     .ok_or_else(|| AppError::Internal("Share grant control operation is missing".into()))
 }
 
+fn reject_unfulfillable_activation_tx(
+    conn: &Connection,
+    record: &SubscriptionRecord,
+    reason: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    crate::market_billing::terminate_contract_tx(conn, "share", &record.id, reason, now)?;
+    let retired = retire_unconfirmed_grant_tx(conn, &record.id, reason, now)?;
+    let grants_json = conn
+        .query_row(
+            "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+            params![record.share_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_db("read Share grants during rejected activation"))?
+        .flatten();
+    let has_entitlement = active_entitlement(grants_json.as_deref(), &record.entitlement_id);
+    conn.execute(
+        "UPDATE share_market_subscriptions
+         SET integrity_state = 'terminated', integrity_reason = ?2,
+             integrity_checked_at = ?3, integrity_violated_at = COALESCE(integrity_violated_at, ?3),
+             release_reason = ?2, updated_at = ?3
+         WHERE id = ?1",
+        params![record.id, reason, now],
+    )
+    .map_err(map_db("record unfulfillable Share activation"))?;
+    if !has_entitlement && !retired.had_dispatched {
+        finish_release_tx(
+            conn,
+            &record.id,
+            &record.seat_id,
+            &record.listing_id,
+            reason,
+            now,
+        )?;
+    } else {
+        request_revoke_tx(
+            conn,
+            &record.id,
+            &record.share_id,
+            &record.seat_id,
+            &record.entitlement_id,
+            &record.renter_email,
+            reason,
+            now,
+        )?;
+    }
+    event_tx(
+        conn,
+        Some(&record.listing_id),
+        Some(&record.seat_id),
+        Some(&record.id),
+        None,
+        "service_activation_rejected",
+        serde_json::json!({ "reason": reason }),
+        now,
+    )?;
+    Ok(())
+}
+
 fn activate_granted_subscription_tx(
     conn: &Connection,
     record: &SubscriptionRecord,
@@ -6600,6 +9164,49 @@ fn activate_granted_subscription_tx(
     } else {
         SUB_ACTIVE_FREE
     };
+    let (service_snapshot_json, integrity_state): (String, String) = conn
+        .query_row(
+            "SELECT service_snapshot_json, integrity_state
+             FROM share_market_subscriptions WHERE id = ?1",
+            params![record.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(map_db("read Share activation service contract"))?;
+    let service_snapshot = serde_json::from_str::<RentServiceSnapshot>(&service_snapshot_json).ok();
+    let availability = evaluate_share_market_service_availability_tx(
+        conn,
+        &record.share_id,
+        &record.app_type,
+        Some(true),
+        Some(&integrity_state),
+        service_snapshot.as_ref(),
+        parse_time(&service_started_at)?,
+    )?;
+    if let Some(reason) = availability.blocking_reason.as_deref() {
+        reject_unfulfillable_activation_tx(conn, record, reason, now)?;
+        return Ok(());
+    }
+    if let Err(error) = ensure_fixed_service_term_fulfillable_tx(
+        conn,
+        &record.share_id,
+        &record.app_type,
+        record.service_duration_days,
+        parse_time(&service_started_at)?,
+    ) {
+        tracing::warn!(
+            subscription_id = %record.id,
+            share_id = %record.share_id,
+            error = %error,
+            "Share fixed service term became unfulfillable before activation"
+        );
+        reject_unfulfillable_activation_tx(
+            conn,
+            record,
+            "service_term_unfulfillable_before_activation",
+            now,
+        )?;
+        return Ok(());
+    }
     if record.daily_rate_minor.is_some()
         && !crate::market_billing::activate_reserved_contract_tx(
             conn,
@@ -6724,7 +9331,7 @@ fn retire_unconfirmed_grant_tx(
         .query_row(
             "SELECT EXISTS (
                 SELECT 1 FROM share_control_operations
-                WHERE subscription_id = ?1 AND action = 'upsert' AND status = 'dispatched'
+                WHERE subscription_id = ?1 AND action = 'upsert' AND attempts > 0
              )",
             params![subscription_id],
             |row| row.get::<_, i64>(0),
@@ -7062,6 +9669,7 @@ pub(crate) fn terminate_installation_for_takeover_tx(
             .map_err(map_db("read takeover Share subscriptions"))?
     };
     for (subscription_id, seat_id) in subscriptions {
+        apply_automatic_supplier_termination_refund_tx(tx, &subscription_id, reason, now)?;
         crate::market_billing::terminate_contract_tx(tx, "share", &subscription_id, reason, now)?;
         tx.execute(
             "UPDATE share_control_operations
@@ -7150,6 +9758,7 @@ pub(crate) fn retire_deleted_share_market_tx(
             .map_err(map_db("read deleted Share subscriptions"))?
     };
     for (subscription_id, seat_id, listing_id) in subscriptions {
+        apply_automatic_supplier_termination_refund_tx(conn, &subscription_id, reason, now)?;
         crate::market_billing::terminate_contract_tx(conn, "share", &subscription_id, reason, now)?;
         conn.execute(
             "UPDATE share_control_operations
@@ -7282,6 +9891,12 @@ pub(crate) fn rebind_share_market_owner_tx(
             .map_err(map_db("read transferred Share subscriptions"))?
     };
     for (subscription_id, seat_id, listing_id, entitlement_id, renter_email) in subscriptions {
+        apply_automatic_supplier_termination_refund_tx(
+            conn,
+            &subscription_id,
+            "share_owner_changed",
+            now,
+        )?;
         crate::market_billing::terminate_contract_tx(
             conn,
             "share",
@@ -7339,6 +9954,46 @@ pub(crate) fn rebind_share_market_owner_tx(
             now,
         )?;
     }
+    Ok(())
+}
+
+fn apply_automatic_supplier_termination_refund_tx(
+    conn: &Connection,
+    subscription_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    let terms = conn
+        .query_row(
+            "SELECT daily_rate_minor, service_duration_days, service_started_at, expires_at
+             FROM share_market_subscriptions WHERE id = ?1",
+            params![subscription_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read automatic Share termination refund terms"))?;
+    let Some((Some(daily_rate_minor), Some(_), Some(_), Some(expires_at))) = terms else {
+        return Ok(());
+    };
+    let now = parse_time(now)?;
+    if daily_rate_minor <= 0 || now >= parse_time(&expires_at)? {
+        return Ok(());
+    }
+    crate::market_billing::apply_supplier_early_termination_refund_tx(
+        conn,
+        "share",
+        subscription_id,
+        reason,
+        &format!("share-automatic-supplier-termination:{subscription_id}"),
+        now,
+    )?;
     Ok(())
 }
 
@@ -7600,6 +10255,14 @@ impl AppStore {
                 }
             }
 
+            if !matches!(
+                record.status.as_str(),
+                SUB_REVOKE_PENDING | SUB_REVOKE_FAILED | SUB_RELEASED | SUB_GRANT_FAILED
+            ) && reconcile_subscription_integrity_tx(&tx, &record, now_dt)?
+            {
+                continue;
+            }
+
             if matches!(
                 record.status.as_str(),
                 SUB_REVOKE_PENDING | SUB_REVOKE_FAILED
@@ -7747,11 +10410,16 @@ impl AppStore {
                         continue;
                     }
                     confirm_control_effect_tx(&tx, &record.id, "upsert", &now)?;
+                    let active_status = if record.daily_rate_minor.is_some() {
+                        SUB_ACTIVE_POSTPAID
+                    } else {
+                        SUB_ACTIVE_FREE
+                    };
                     tx.execute(
                         "UPDATE share_market_subscriptions
-                         SET status = 'active_postpaid', release_reason = NULL, updated_at = ?2
+                         SET status = ?2, release_reason = NULL, updated_at = ?3
                          WHERE id = ?1",
-                        params![record.id, now],
+                        params![record.id, active_status, now],
                     )
                     .map_err(map_db("confirm Share billing resume"))?;
                     event_tx(
@@ -8778,7 +11446,6 @@ pub async fn suspend_for_billing(
         tx.commit()
             .map_err(map_db("commit Share billing suspension"))?;
     }
-    run_once(state).await?;
     Ok(())
 }
 
@@ -8859,13 +11526,9 @@ pub async fn resume_after_billing(
                     "Share subscription is not suspended for billing".into(),
                 ));
             }
-            let policy = row
-                .6
-                .as_deref()
-                .map(serde_json::from_str::<ShareUserPolicy>)
-                .transpose()
-                .map_err(|_| AppError::Internal("stored Share billing policy is invalid".into()))?
-                .ok_or_else(|| AppError::Internal("Share billing policy is missing".into()))?;
+            let record = subscription_record(&tx, subscription_id)?
+                .ok_or_else(|| AppError::NotFound("Share subscription not found".into()))?;
+            let policy = contract_policy(&record)?;
             enqueue_control_operation_tx(
                 &tx,
                 &row.0,
@@ -8896,7 +11559,6 @@ pub async fn resume_after_billing(
             tx.commit().map_err(map_db("commit Share billing resume"))?;
         }
     }
-    run_once(state).await?;
     Ok(())
 }
 
@@ -8972,7 +11634,7 @@ pub async fn terminate_for_billing(
         tx.commit()
             .map_err(map_db("commit Share billing termination"))?;
     }
-    run_once(state).await
+    Ok(())
 }
 
 async fn try_apply_dispatched_edit_via_ctl(
@@ -9197,12 +11859,13 @@ mod tests {
             .execute(
                 "INSERT INTO shares (
                     share_id, capacity_pool_id, installation_id, share_name, owner_email, subdomain,
-                    app_type, token_limit, parallel_limit, tokens_used, requests_count,
+                    app_type, enabled_codex, token_limit, parallel_limit, tokens_used, requests_count,
                     share_status, created_at, expires_at, user_grants_json, bindings_json,
-                    supported_user_token_periods_json, config_revision, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'codex', -1, 3, 0, 0,
+                    supported_user_token_periods_json, config_revision, updated_at,
+                    share_access_policy_version, runtime_refreshed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'codex', 1, -1, 3, 0, 0,
                            'active', ?7, '9999-12-31T23:59:59Z', '{}',
-                           '{\"codex\":\"provider-test\"}', ?8, 1, ?7)",
+                           '{\"codex\":\"provider-test\"}', ?8, 1, ?7, ?9, ?7)",
                 params![
                     share_id,
                     format!("pool-{share_id}"),
@@ -9212,6 +11875,7 @@ mod tests {
                     format!("{share_id}-route"),
                     now,
                     periods,
+                    i64::from(SHARE_CONTRACT_VERSION),
                 ],
             )
             .expect("insert Share");
@@ -9421,17 +12085,225 @@ mod tests {
     }
 
     async fn record_share_health(store: &AppStore, share_id: &str, now: DateTime<Utc>) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO share_health_checks (
+                    share_id, checked_at, is_healthy, status, reason, router_epoch
+                 ) VALUES (?1, ?2, 1, 'healthy', 'test_observation', 'test')",
+            params![share_id, now.timestamp()],
+        )
+        .expect("insert Share health observation");
+        conn.execute(
+            "UPDATE shares SET runtime_refreshed_at = ?2 WHERE share_id = ?1",
+            params![share_id, now.to_rfc3339()],
+        )
+        .expect("refresh Share runtime observation");
+    }
+
+    async fn set_entitlement_from_stored_policy(
+        store: &AppStore,
+        subscription_id: &str,
+        applied_at: DateTime<Utc>,
+    ) {
+        let (record, policy) = {
+            let conn = store.conn.lock().await;
+            let record = subscription_record(&conn, subscription_id)
+                .expect("read subscription")
+                .expect("subscription");
+            let policy_json: String = conn
+                .query_row(
+                    "SELECT policy_json FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'
+                     ORDER BY share_sequence DESC LIMIT 1",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read stored managed grant policy");
+            let policy = serde_json::from_str(&policy_json).expect("decode stored grant policy");
+            (record, policy)
+        };
+        let applied_at_ms = applied_at.timestamp_millis();
+        let grant = ShareUserGrant {
+            email: record.renter_email.clone(),
+            role: "shareto".into(),
+            active: true,
+            policy,
+            created_at_ms: applied_at_ms.max(0) as u128,
+            updated_at_ms: applied_at_ms.max(0) as u128,
+            revision: 2,
+            manager: ShareGrantManager::RouterShareMarket,
+            entitlement_id: Some(record.entitlement_id),
+            ..ShareUserGrant::default()
+        };
+        let grants = serde_json::to_string(&BTreeMap::from([(record.renter_email, grant)]))
+            .expect("serialize restored managed grant");
         store
             .conn
             .lock()
             .await
             .execute(
-                "INSERT INTO share_health_checks (
-                    share_id, checked_at, is_healthy, status, reason, router_epoch
-                 ) VALUES (?1, ?2, 1, 'healthy', 'test_observation', 'test')",
-                params![share_id, now.timestamp()],
+                "UPDATE shares SET user_grants_json = ?2,
+                    config_revision = config_revision + 1, updated_at = ?3
+                 WHERE share_id = ?1",
+                params![record.share_id, grants, applied_at.to_rfc3339()],
             )
-            .expect("insert Share health observation");
+            .expect("publish restored managed grant descriptor");
+    }
+
+    async fn exhaust_control_operation(
+        store: &AppStore,
+        subscription_id: &str,
+        action: &str,
+        mut dispatched_at: DateTime<Utc>,
+    ) -> (String, Vec<String>) {
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(dispatched_at)
+                .await
+                .expect("dispatch control operation")
+                .len(),
+            1
+        );
+        let mut edit_ids = Vec::new();
+        for attempt in 1..=MAX_CONTROL_ATTEMPTS {
+            let (operation_id, edit_id): (String, String) = store
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT id, edit_id FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = ?2
+                     ORDER BY share_sequence DESC LIMIT 1",
+                    params![subscription_id, action],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read dispatched control operation");
+            edit_ids.push(edit_id.clone());
+            let rejected_at = dispatched_at + Duration::seconds(1);
+            {
+                let conn = store.conn.lock().await;
+                conn.execute(
+                    "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
+                    params![edit_id],
+                )
+                .expect("reject control edit");
+                handle_control_edit_ack_with_metadata(
+                    &conn,
+                    edit_ids.last().expect("control edit id"),
+                    "rejected",
+                    Some("temporary control failure"),
+                    Some("temporary_control_failure"),
+                    Some(true),
+                    &rejected_at.to_rfc3339(),
+                )
+                .expect("record retryable control rejection");
+            }
+            if attempt == MAX_CONTROL_ATTEMPTS {
+                return (operation_id, edit_ids);
+            }
+            let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0);
+            let delay = CONTROL_RETRY_BASE_SECS
+                .saturating_mul(2_i64.saturating_pow(exponent))
+                .min(CONTROL_RETRY_MAX_SECS);
+            dispatched_at = rejected_at + Duration::seconds(delay);
+            assert_eq!(
+                store
+                    .share_market_reconcile_and_dispatch(dispatched_at)
+                    .await
+                    .expect("dispatch retried control operation")
+                    .len(),
+                1
+            );
+        }
+        unreachable!("control operation attempts are nonzero")
+    }
+
+    async fn create_active_paid_fixed_subscription(
+        store: &AppStore,
+        owner: &AuthSession,
+        renter: &AuthSession,
+        share_id: &str,
+    ) -> (String, String, DateTime<Utc>) {
+        configure_payment_profile(store, owner, "payment-account", "profile-v1").await;
+        insert_share(store, share_id, &owner.email, &[ShareTokenPeriod::Day]).await;
+        let mut seat = paid_seat();
+        seat.service_duration_days = Some(10);
+        let (_, seat_id) = create_listing(store, owner, share_id, seat).await;
+        let subscription_id = store
+            .share_market_rent_seat(renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent fixed paid seat");
+        let activated_at = Utc::now() + Duration::seconds(1);
+        record_share_health(store, share_id, activated_at).await;
+        activate_subscription(store, &subscription_id, activated_at).await;
+        (subscription_id, seat_id, activated_at)
+    }
+
+    #[tokio::test]
+    async fn near_expiry_is_degraded_but_stale_runtime_is_blocking() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        insert_share(
+            &store,
+            "share-availability-policy",
+            "owner@example.com",
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET expires_at = ?2, runtime_refreshed_at = ?3
+                 WHERE share_id = ?1",
+                params![
+                    "share-availability-policy",
+                    (now + Duration::days(3)).to_rfc3339(),
+                    now.to_rfc3339(),
+                ],
+            )
+            .expect("configure near-expiry Share");
+            let availability = evaluate_share_market_service_availability_tx(
+                &conn,
+                "share-availability-policy",
+                "codex",
+                Some(true),
+                Some("compatible"),
+                None,
+                now,
+            )
+            .expect("evaluate near-expiry Share");
+            assert!(availability.available());
+            assert_eq!(availability.state, "degraded");
+            assert!(
+                availability
+                    .reasons
+                    .contains(&"share_near_expiry".to_string())
+            );
+
+            conn.execute(
+                "UPDATE shares SET runtime_refreshed_at = ?2 WHERE share_id = ?1",
+                params![
+                    "share-availability-policy",
+                    (now - Duration::minutes(16)).to_rfc3339(),
+                ],
+            )
+            .expect("make Share runtime stale");
+            let availability = evaluate_share_market_service_availability_tx(
+                &conn,
+                "share-availability-policy",
+                "codex",
+                Some(true),
+                Some("compatible"),
+                None,
+                now,
+            )
+            .expect("evaluate stale Share runtime");
+            assert!(!availability.available());
+            assert_eq!(
+                availability.blocking_reason.as_deref(),
+                Some("runtime_stale")
+            );
+        }
     }
 
     fn insert_performance_sample(
@@ -9544,6 +12416,32 @@ mod tests {
                 "multi".into(),
                 vec!["anthropic".into(), "google".into(), "openai".into()]
             )
+        );
+    }
+
+    #[test]
+    fn market_capabilities_include_only_enabled_share_app_apis() {
+        let bindings = serde_json::json!({
+            "claude": "grok-provider",
+            "codex": "grok-provider",
+            "gemini": "grok-provider",
+        })
+        .to_string();
+        let support = ShareSupport {
+            codex: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            enabled_share_apps(&bindings, "codex", &support),
+            vec!["codex"]
+        );
+        assert_eq!(
+            enabled_public_app_capabilities(&bindings, None, None, "codex", &support)
+                .into_iter()
+                .map(|capability| capability.app)
+                .collect::<Vec<_>>(),
+            vec!["codex"]
         );
     }
 
@@ -9739,6 +12637,10 @@ mod tests {
                 None,
                 Some(&degraded_json),
                 "codex",
+                &ShareSupport {
+                    codex: true,
+                    ..Default::default()
+                },
                 3,
                 -1,
                 0,
@@ -10356,7 +13258,7 @@ mod tests {
             .lock()
             .await
             .execute(
-                "UPDATE shares SET app_type = 'claude',
+                "UPDATE shares SET app_type = 'claude', enabled_claude = 1,
                     bindings_json = '{\"claude\":\"provider-claude\",\"codex\":\"provider-codex\"}'
                  WHERE share_id = 'share-required-app'",
                 [],
@@ -10970,7 +13872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_share_options_include_domain_owner_and_all_bound_apps() {
+    async fn owned_share_options_include_domain_owner_and_enabled_bound_apps() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-options", "owner-options@example.com");
         insert_share(
@@ -10985,7 +13887,10 @@ mod tests {
             .lock()
             .await
             .execute(
-                "UPDATE shares SET bindings_json = ?2 WHERE share_id = ?1",
+                "UPDATE shares
+                 SET bindings_json = ?2, enabled_claude = 1, enabled_codex = 0,
+                     enabled_gemini = 1
+                 WHERE share_id = ?1",
                 params![
                     "share-options",
                     serde_json::json!({
@@ -11573,6 +14478,7 @@ mod tests {
         assert!(pending_policy.token_period_anchor_at_ms.is_none());
 
         let dispatched_at = Utc::now() + Duration::hours(3);
+        record_share_health(&store, "share-anchor", dispatched_at).await;
         activate_subscription(&store, &subscription_id, dispatched_at).await;
         let policy_json: String = store
             .conn
@@ -11698,6 +14604,28 @@ mod tests {
             )
             .expect("read unchanged seat offer");
         assert_eq!(unchanged, (Some(2), 1));
+
+        let second_seat = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect("second burst-pool seat may reuse Share capacity");
+        let third_seat = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect("aggregate seat concurrency is not a reserved-capacity sum");
+        assert_ne!(second_seat, third_seat);
+        let configured_total: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT SUM(parallel_limit) FROM share_market_seats
+                 WHERE listing_id = ?1 AND status != 'deleted'",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .expect("sum burst-pool seat limits");
+        assert_eq!(configured_total, 6);
     }
 
     #[tokio::test]
@@ -11959,49 +14887,44 @@ mod tests {
                 [],
             )
             .expect("pause Share after grant dispatch");
-        assert!(
+        assert_eq!(
             store
                 .share_market_reconcile_and_dispatch(now + Duration::seconds(1))
                 .await
-                .expect("queue ordered revoke")
-                .is_empty()
+                .expect("dispatch ordered revoke")
+                .len(),
+            1
         );
-        store
-            .share_market_reconcile_and_dispatch(now + Duration::seconds(2))
-            .await
-            .expect("do not infer revoke from an unconfirmed empty snapshot");
         assert_eq!(
             subscription_status(&store, &subscription_id).await,
             SUB_REVOKE_PENDING
         );
 
-        let upsert_edit: String = store
+        let (upsert_status, upsert_edit_status, revoke_edit): (String, String, String) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT edit_id FROM share_control_operations
-                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                "SELECT upsert.status, upsert_edit.status, revoke.edit_id
+                 FROM share_control_operations upsert
+                 JOIN share_edit_requests upsert_edit ON upsert_edit.id = upsert.edit_id
+                 JOIN share_control_operations revoke
+                   ON revoke.subscription_id = upsert.subscription_id
+                  AND revoke.action = 'revoke'
+                 WHERE upsert.subscription_id = ?1 AND upsert.action = 'upsert'",
                 params![subscription_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("read dispatched grant edit");
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
-                params![upsert_edit],
-            )
-            .expect("reject grant edit after revoke was requested");
-            handle_control_edit_ack(
-                &conn,
-                &upsert_edit,
-                "rejected",
-                Some("Share is unavailable"),
-                &(now + Duration::seconds(3)).to_rfc3339(),
-            )
-            .expect("complete failed grant operation without releasing the revoking seat");
-        }
+            .expect("read ordered grant and revoke controls");
+        assert_eq!(upsert_status, "rejected");
+        assert_eq!(upsert_edit_status, "cancelled");
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(2))
+                .await
+                .expect("do not infer revoke from an unconfirmed empty snapshot")
+                .is_empty()
+        );
         let seat_status: String = store
             .conn
             .lock()
@@ -12014,28 +14937,9 @@ mod tests {
             .expect("read fenced seat after late grant failure");
         assert_eq!(seat_status, "revoking");
         assert_eq!(
-            store
-                .share_market_reconcile_and_dispatch(now + Duration::seconds(4))
-                .await
-                .expect("dispatch revoke after grant resolves")
-                .len(),
-            1
-        );
-        assert_eq!(
             subscription_status(&store, &subscription_id).await,
             SUB_REVOKE_PENDING
         );
-        let revoke_edit: String = store
-            .conn
-            .lock()
-            .await
-            .query_row(
-                "SELECT edit_id FROM share_control_operations
-                 WHERE subscription_id = ?1 AND action = 'revoke'",
-                params![subscription_id],
-                |row| row.get(0),
-            )
-            .expect("read dispatched revoke edit");
         {
             let conn = store.conn.lock().await;
             conn.execute(
@@ -12048,12 +14952,12 @@ mod tests {
                 &revoke_edit,
                 "applied",
                 None,
-                &(now + Duration::seconds(5)).to_rfc3339(),
+                &(now + Duration::seconds(3)).to_rfc3339(),
             )
             .expect("complete revoke operation");
         }
         store
-            .share_market_reconcile_and_dispatch(now + Duration::seconds(6))
+            .share_market_reconcile_and_dispatch(now + Duration::seconds(4))
             .await
             .expect("release after confirmed revoke");
         assert_eq!(
@@ -12504,13 +15408,14 @@ mod tests {
             let payload: serde_json::Value =
                 serde_json::from_str(&payload_json).expect("parse Share rental chat event");
             assert_eq!(payload["ownerEmail"], owner.email);
-            assert_eq!(payload["renterEmail"], renter.email);
             assert_eq!(payload["parallelLimit"], 2);
             assert_eq!(payload["tokenLimit"], 10_000);
             assert_eq!(payload["tokenPeriod"], "day");
             assert_eq!(payload["dailyRateMinor"], 1_200);
             assert_eq!(payload["currency"], "USD");
-            assert_eq!(payload["paymentMethods"][0]["account"], "account-v1");
+            assert_eq!(payload["paymentMethodKinds"], serde_json::json!(["alipay"]));
+            assert!(payload.get("renterEmail").is_none());
+            assert!(payload.get("paymentMethods").is_none());
         }
         assert_eq!(
             subscription_status(&store, &subscription_id).await,
@@ -13020,10 +15925,13 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read sanitized rejected-grant outbox");
-        for stored in [release_reason, event_detail, outbox_payload] {
+        for stored in [release_reason, event_detail] {
             assert!(!stored.contains("fake-managed-grant-secret"));
             assert!(stored.contains("[credential omitted]"));
         }
+        assert!(!outbox_payload.contains("fake-managed-grant-secret"));
+        assert!(!outbox_payload.contains("credential omitted"));
+        assert!(!outbox_payload.contains("error"));
     }
 
     #[tokio::test]
@@ -15012,6 +17920,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_blocks_rent_when_all_share_app_apis_are_disabled() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-disabled-apps", "owner-disabled-apps@example.com");
+        let renter = session("renter-disabled-apps", "renter-disabled-apps@example.com");
+        insert_share(
+            &store,
+            "share-disabled-apps",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) = create_listing(&store, &owner, "share-disabled-apps", free_seat()).await;
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET enabled_codex = 0 WHERE share_id = 'share-disabled-apps'",
+                [],
+            )
+            .expect("disable the only Share App API");
+
+        let catalog = store
+            .share_market_catalog(Some(&renter), &["share-disabled-apps-route".into()])
+            .await
+            .expect("catalog with disabled Share App APIs");
+        let listing = &catalog.listings[0];
+        assert!(listing.supported_apps.is_empty());
+        assert!(listing.app_capabilities.is_empty());
+        assert!(!listing.seats[0].can_rent);
+        assert_eq!(
+            listing.seats[0].rent_block_reason.as_deref(),
+            Some("share_unavailable")
+        );
+        assert!(
+            store
+                .share_market_create_rent_quote(&renter, &seat_id, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn catalog_can_rent_respects_access_existing_rental_and_direct_grant() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-canrent", "owner-canrent@example.com");
@@ -15452,8 +18403,9 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
-        let (listing_id, seat_id) =
-            create_listing(&store, &owner, "share-delete", paid_seat()).await;
+        let mut seat = paid_seat();
+        seat.service_duration_days = Some(10);
+        let (listing_id, seat_id) = create_listing(&store, &owner, "share-delete", seat).await;
         let subscription_id = store
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
@@ -15499,18 +18451,89 @@ mod tests {
         assert_eq!(state.3, SEAT_DELETED);
         assert_eq!(state.4, SUB_RELEASED);
         assert_eq!(state.5, 0);
-        let contract_status: String = store
+        let contract_state: (String, i64) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT status FROM market_service_contracts
-                 WHERE product_kind = 'share' AND product_ref = ?1",
+                "SELECT contract.status, adjustment.refund_bps
+                 FROM market_service_contracts contract
+                 INNER JOIN market_contract_adjustments adjustment
+                   ON adjustment.contract_id = contract.id
+                  AND adjustment.kind = 'supplier_early_termination_refund'
+                 WHERE contract.product_kind = 'share' AND contract.product_ref = ?1",
                 params![subscription_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("read terminated Share contract");
-        assert_eq!(contract_status, "terminated");
+            .expect("read terminated Share contract refund");
+        assert_eq!(contract_state.0, "terminated");
+        assert_eq!(contract_state.1, 10_000);
+    }
+
+    #[tokio::test]
+    async fn installation_takeover_refunds_active_paid_fixed_rental_once() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-takeover-refund", "owner-takeover-refund@example.com");
+        let renter = session(
+            "renter-takeover-refund",
+            "renter-takeover-refund@example.com",
+        );
+        let (subscription_id, seat_id, activated_at) =
+            create_active_paid_fixed_subscription(&store, &owner, &renter, "share-takeover-refund")
+                .await;
+        let interrupted_at = activated_at + Duration::days(2);
+        {
+            let conn = store.conn.lock().await;
+            terminate_installation_for_takeover_tx(
+                &conn,
+                "installation-share-takeover-refund",
+                "client_subdomain_takeover",
+                &interrupted_at.to_rfc3339(),
+            )
+            .expect("terminate takeover Share market rental");
+            terminate_installation_for_takeover_tx(
+                &conn,
+                "installation-share-takeover-refund",
+                "client_subdomain_takeover",
+                &interrupted_at.to_rfc3339(),
+            )
+            .expect("repeat takeover Share market termination");
+        }
+        let state: (String, String, String, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT subscription.status, seat.status, contract.status,
+                        adjustment.refund_bps,
+                        (SELECT COUNT(*) FROM market_contract_adjustments duplicate
+                         WHERE duplicate.product_kind = 'share'
+                           AND duplicate.product_ref = subscription.id)
+                 FROM share_market_subscriptions subscription
+                 INNER JOIN share_market_seats seat ON seat.id = subscription.seat_id
+                 INNER JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = subscription.id
+                 INNER JOIN market_contract_adjustments adjustment
+                   ON adjustment.contract_id = contract.id
+                  AND adjustment.kind = 'supplier_early_termination_refund'
+                 WHERE subscription.id = ?1 AND seat.id = ?2",
+                params![subscription_id, seat_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read takeover termination refund");
+        assert_eq!(state.0, SUB_RELEASED);
+        assert_eq!(state.1, SEAT_DELETED);
+        assert_eq!(state.2, "terminated");
+        assert_eq!(state.3, 10_000);
+        assert_eq!(state.4, 1);
     }
 
     #[tokio::test]
@@ -15527,8 +18550,9 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
-        let (listing_id, seat_id) =
-            create_listing(&store, &owner, "share-transfer", paid_seat()).await;
+        let mut seat = paid_seat();
+        seat.service_duration_days = Some(10);
+        let (listing_id, seat_id) = create_listing(&store, &owner, "share-transfer", seat).await;
         let subscription_id = store
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
@@ -15551,17 +18575,20 @@ mod tests {
             )
             .expect("rebind Share market owner");
         }
-        let state: (String, String, String, String, String) = store
+        let state: (String, String, String, String, String, i64) = store
             .conn
             .lock()
             .await
             .query_row(
                 "SELECT listing.owner_user_id, listing.owner_email, sub.owner_user_id,
-                        sub.status, contract.status
+                        sub.status, contract.status, adjustment.refund_bps
                  FROM share_market_listings listing
                  INNER JOIN share_market_subscriptions sub ON sub.listing_id = listing.id
                  INNER JOIN market_service_contracts contract
                    ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 INNER JOIN market_contract_adjustments adjustment
+                   ON adjustment.contract_id = contract.id
+                  AND adjustment.kind = 'supplier_early_termination_refund'
                  WHERE listing.id = ?1",
                 params![listing_id],
                 |row| {
@@ -15571,6 +18598,7 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -15580,6 +18608,7 @@ mod tests {
         assert_eq!(state.2, new_owner.user_id);
         assert_eq!(state.3, SUB_REVOKE_PENDING);
         assert_eq!(state.4, "terminated");
+        assert_eq!(state.5, 10_000);
     }
 
     #[tokio::test]
@@ -15908,5 +18937,1890 @@ mod tests {
                 1,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn failed_free_and_paid_grants_recover_original_operation_seat_and_contract() {
+        for paid in [false, true] {
+            let store = AppStore::new_in_memory_for_tests().expect("test store");
+            let suffix = if paid { "paid" } else { "free" };
+            let owner = session(
+                &format!("owner-retry-{suffix}"),
+                &format!("owner-retry-{suffix}@example.com"),
+            );
+            let renter = session(
+                &format!("renter-retry-{suffix}"),
+                &format!("renter-retry-{suffix}@example.com"),
+            );
+            if paid {
+                configure_payment_profile(&store, &owner, "refund-account", "profile-v1").await;
+            }
+            let share_id = format!("share-retry-{suffix}");
+            insert_share(&store, &share_id, &owner.email, &[ShareTokenPeriod::Day]).await;
+            let (_, seat_id) = create_listing(
+                &store,
+                &owner,
+                &share_id,
+                if paid { paid_seat() } else { free_seat() },
+            )
+            .await;
+            let subscription_id = store
+                .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+                .await
+                .expect("rent recoverable seat");
+            let (operation_id, edit_ids) =
+                exhaust_control_operation(&store, &subscription_id, "upsert", Utc::now()).await;
+            assert_eq!(
+                subscription_status(&store, &subscription_id).await,
+                SUB_GRANT_FAILED
+            );
+            assert!(matches!(
+                store
+                    .share_market_requeue_control_dead_letter(&owner, &operation_id)
+                    .await,
+                Err(AppError::Conflict(_))
+            ));
+
+            let terminated_contract = if paid {
+                Some(
+                    store
+                        .conn
+                        .lock()
+                        .await
+                        .query_row(
+                            "SELECT id FROM market_service_contracts
+                             WHERE product_kind = 'share' AND product_ref = ?1
+                               AND status = 'terminated'",
+                            params![subscription_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .expect("read terminated initial billing reservation"),
+                )
+            } else {
+                None
+            };
+
+            store
+                .share_market_retry_grant(&owner, &subscription_id)
+                .await
+                .expect("retry failed grant");
+            store
+                .share_market_retry_grant(&owner, &subscription_id)
+                .await
+                .expect("repeat grant retry idempotently");
+
+            let state: (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
+            ) = store
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT sub.status, seat.status, seat.current_subscription_id,
+                            seat.retired_subscription_id, operation.status,
+                            operation.attempts, operation.edit_id, operation.dead_lettered_at
+                     FROM share_market_subscriptions sub
+                     JOIN share_market_seats seat ON seat.id = sub.seat_id
+                     JOIN share_control_operations operation
+                       ON operation.subscription_id = sub.id AND operation.action = 'upsert'
+                     WHERE sub.id = ?1",
+                    params![subscription_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .expect("read restored grant state");
+            assert_eq!(state.0, SUB_GRANT_PENDING);
+            assert_eq!(state.1, SEAT_RESERVED);
+            assert_eq!(state.2.as_deref(), Some(subscription_id.as_str()));
+            assert!(state.3.is_none());
+            assert_eq!(state.4, "pending");
+            assert_eq!(state.5, 0);
+            assert!(state.6.is_none());
+            assert!(state.7.is_none());
+
+            let final_old_edit = edit_ids.last().expect("final failed edit");
+            let old_edit: (String, Option<String>) = store
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT status, dead_lettered_at FROM share_edit_requests WHERE id = ?1",
+                    params![final_old_edit],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read retained failed edit audit");
+            assert_eq!(old_edit.0, "rejected");
+            assert!(old_edit.1.is_none());
+
+            let contracts: Vec<(String, String, Option<String>)> = store
+                .conn
+                .lock()
+                .await
+                .prepare(
+                    "SELECT id, status, replacement_of FROM market_service_contracts
+                     WHERE product_kind = 'share' AND product_ref = ?1 ORDER BY created_at, id",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params![subscription_id], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })?
+                        .collect()
+                })
+                .expect("read retried billing contracts");
+            if let Some(terminated_contract) = terminated_contract {
+                assert_eq!(contracts.len(), 2);
+                assert!(contracts.iter().any(|contract| {
+                    contract.0 == terminated_contract && contract.1 == "terminated"
+                }));
+                let replacement = contracts
+                    .iter()
+                    .find(|contract| contract.1 != "terminated")
+                    .expect("active replacement billing reservation");
+                assert_eq!(replacement.1, "pending_activation");
+                assert_eq!(replacement.2.as_deref(), Some(terminated_contract.as_str()));
+            } else {
+                assert!(contracts.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_grant_retry_rechecks_frozen_contract_and_direct_access_conflicts() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-retry-conflict", "owner-retry-conflict@example.com");
+        let renter = session("renter-retry-conflict", "renter-retry-conflict@example.com");
+        insert_share(
+            &store,
+            "share-retry-conflict",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) =
+            create_listing(&store, &owner, "share-retry-conflict", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent conflict test seat");
+        let (operation_id, _) =
+            exhaust_control_operation(&store, &subscription_id, "upsert", Utc::now()).await;
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET parallel_limit = 1 WHERE share_id = 'share-retry-conflict'",
+                [],
+            )
+            .expect("reduce Share capacity");
+        let incompatible = store
+            .share_market_retry_grant(&owner, &subscription_id)
+            .await
+            .expect_err("incompatible frozen contract must not recover");
+        assert_eq!(
+            incompatible.code(),
+            Some("share_market_contract_incompatible")
+        );
+
+        let direct_grant = ShareUserGrant {
+            email: renter.email.clone(),
+            role: "shareto".into(),
+            active: true,
+            entitlement_id: Some("different-entitlement".into()),
+            ..ShareUserGrant::default()
+        };
+        let grants = serde_json::to_string(&BTreeMap::from([(renter.email.clone(), direct_grant)]))
+            .expect("serialize conflicting direct grant");
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET parallel_limit = 3, user_grants_json = ?2
+                 WHERE share_id = ?1",
+                params!["share-retry-conflict", grants],
+            )
+            .expect("seed conflicting direct grant");
+        assert!(matches!(
+            store
+                .share_market_retry_grant(&owner, &subscription_id)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let unchanged: (String, i64, Option<String>) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, attempts, dead_lettered_at FROM share_control_operations
+                 WHERE id = ?1",
+                params![operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read unchanged failed operation");
+        assert_eq!(unchanged.0, "rejected");
+        assert_eq!(unchanged.1, MAX_CONTROL_ATTEMPTS);
+        assert!(unchanged.2.is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_dead_letter_page_requeues_safely_and_preserves_old_edit_audit() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-requeue", "owner-requeue@example.com");
+        let renter = session("renter-requeue", "renter-requeue@example.com");
+        let admin = session("admin-requeue", "admin-requeue@example.com");
+        insert_share(
+            &store,
+            "share-requeue",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let mut seat = free_seat();
+        seat.service_duration_days = None;
+        let (_, seat_id) = create_listing(&store, &owner, "share-requeue", seat).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent requeue test seat");
+        let base = Utc::now();
+        activate_subscription(&store, &subscription_id, base).await;
+        store
+            .share_market_request_release(&owner, &subscription_id, true, false)
+            .await
+            .expect("request revoke");
+        let dispatched_at = Utc::now() + Duration::seconds(1);
+        let (operation_id, edit_ids) =
+            exhaust_control_operation(&store, &subscription_id, "revoke", dispatched_at).await;
+
+        let page = store
+            .share_market_control_dead_letters(None, 1)
+            .await
+            .expect("read revoke dead letters");
+        assert_eq!(page.summary.dead_lettered, 1);
+        assert_eq!(page.operations.len(), 1);
+        assert_eq!(page.operations[0].id, operation_id);
+        assert!(page.operations[0].can_requeue);
+        assert_eq!(
+            page.operations[0].error_code.as_deref(),
+            Some("temporary_control_failure")
+        );
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE share_market_subscriptions SET status = 'billing_control_failed'
+                 WHERE id = ?1",
+                params![subscription_id],
+            )
+            .expect("seed failed billing suspension state");
+        store
+            .share_market_requeue_control_dead_letter(&admin, &operation_id)
+            .await
+            .expect("requeue revoke dead letter");
+
+        let state: (String, i64, Option<String>, Option<String>, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT operation.status, operation.attempts, operation.edit_id,
+                        operation.dead_lettered_at, sub.status
+                 FROM share_control_operations operation
+                 JOIN share_market_subscriptions sub ON sub.id = operation.subscription_id
+                 WHERE operation.id = ?1",
+                params![operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read requeued revoke");
+        assert_eq!(state.0, "pending");
+        assert_eq!(state.1, 0);
+        assert!(state.2.is_none());
+        assert!(state.3.is_none());
+        assert_eq!(state.4, SUB_BILLING_SUSPEND_PENDING);
+
+        let old_edit: (String, Option<String>) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, dead_lettered_at FROM share_edit_requests WHERE id = ?1",
+                params![edit_ids.last().expect("last rejected revoke edit")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read retained revoke edit");
+        assert_eq!(old_edit.0, "rejected");
+        assert!(old_edit.1.is_some());
+        let resolved_alerts: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE source_event_id = ?1 AND transition = 'resolved'",
+                params![format!("share-control-dead-letter-requeued:{operation_id}")],
+                |row| row.get(0),
+            )
+            .expect("count resolved dead-letter alerts");
+        assert_eq!(resolved_alerts, 1);
+        assert!(matches!(
+            store
+                .share_market_requeue_control_dead_letter(&admin, &operation_id)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscription_history_cursor_keeps_all_active_and_pages_terminal_rows_once() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-history", "owner-history@example.com");
+        let renter = session("renter-history", "renter-history@example.com");
+        let base = Utc::now() - Duration::days(1);
+        let mut expected_terminal = Vec::new();
+        for index in 0..5 {
+            let share_id = format!("share-history-{index}");
+            insert_share(&store, &share_id, &owner.email, &[ShareTokenPeriod::Day]).await;
+            let (_, seat_id) = create_listing(&store, &owner, &share_id, free_seat()).await;
+            let subscription_id = store
+                .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+                .await
+                .expect("rent terminal history seat");
+            let created_at = base - Duration::minutes(i64::from(index / 2));
+            store
+                .conn
+                .lock()
+                .await
+                .execute(
+                    "UPDATE share_market_subscriptions
+                     SET status = 'released', created_at = ?2, updated_at = ?2, released_at = ?2
+                     WHERE id = ?1",
+                    params![subscription_id, created_at.to_rfc3339()],
+                )
+                .expect("seed terminal history subscription");
+            expected_terminal.push((created_at.to_rfc3339(), subscription_id));
+        }
+        insert_share(
+            &store,
+            "share-history-newly-terminal",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, newly_terminal_seat) =
+            create_listing(&store, &owner, "share-history-newly-terminal", free_seat()).await;
+        let newly_terminal_id = store
+            .share_market_rent_seat(
+                &renter,
+                &newly_terminal_seat,
+                RentSeatRequest { offer_revision: 1 },
+            )
+            .await
+            .expect("rent newly terminal history seat");
+        let newly_released_at = base + Duration::hours(1);
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE share_market_subscriptions
+                 SET status = 'released', created_at = ?2, updated_at = ?3, released_at = ?3
+                 WHERE id = ?1",
+                params![
+                    newly_terminal_id,
+                    (base - Duration::days(30)).to_rfc3339(),
+                    newly_released_at.to_rfc3339()
+                ],
+            )
+            .expect("seed old subscription that only recently became terminal");
+        expected_terminal.push((newly_released_at.to_rfc3339(), newly_terminal_id));
+        expected_terminal.sort_by(|left, right| right.cmp(left));
+
+        insert_share(
+            &store,
+            "share-history-active",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, active_seat) =
+            create_listing(&store, &owner, "share-history-active", free_seat()).await;
+        let active_id = store
+            .share_market_rent_seat(&renter, &active_seat, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent active history seat");
+
+        let mut cursor = None;
+        let mut observed_terminal = Vec::new();
+        loop {
+            let page = store
+                .share_market_subscriptions_page(&renter, &[], cursor.as_deref(), 2)
+                .await
+                .expect("read subscription history page");
+            assert_eq!(
+                page.subscriptions
+                    .iter()
+                    .filter(|subscription| subscription.id == active_id)
+                    .count(),
+                1
+            );
+            for subscription in page
+                .subscriptions
+                .iter()
+                .filter(|subscription| subscription.status == SUB_RELEASED)
+            {
+                assert!(!observed_terminal.contains(&subscription.id));
+                observed_terminal.push(subscription.id.clone());
+            }
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        assert_eq!(
+            observed_terminal,
+            expected_terminal
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn supplier_termination_commit_honors_quote_snapshot_and_request_fingerprint() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session(
+            "owner-termination-quote",
+            "owner-termination-quote@example.com",
+        );
+        let renter = session(
+            "renter-termination-quote",
+            "renter-termination-quote@example.com",
+        );
+        let (subscription_id, _, _) = create_active_paid_fixed_subscription(
+            &store,
+            &owner,
+            &renter,
+            "share-termination-quote",
+        )
+        .await;
+        let evaluated_near = Utc::now();
+        let original_start = evaluated_near - Duration::days(2);
+        let original_end = original_start + Duration::days(10);
+        {
+            let conn = store.conn.lock().await;
+            let (contract_id, account_id): (String, String) = conn
+                .query_row(
+                    "SELECT id, account_id FROM market_service_contracts
+                     WHERE product_kind = 'share' AND product_ref = ?1
+                       AND status != 'terminated'",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read quoted termination contract");
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET service_started_at = ?2, activated_at = ?2, expires_at = ?3
+                 WHERE id = ?1",
+                params![
+                    subscription_id,
+                    original_start.to_rfc3339(),
+                    original_end.to_rfc3339()
+                ],
+            )
+            .expect("set quoted termination interval");
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET status = 'billing_suspended', trial_seconds_remaining = 0,
+                     service_started_at = ?2, activated_at = ?2,
+                     last_evaluated_at = ?3, suspended_at = ?3, updated_at = ?3
+                 WHERE id = ?1",
+                params![
+                    contract_id,
+                    original_start.to_rfc3339(),
+                    evaluated_near.to_rfc3339()
+                ],
+            )
+            .expect("freeze quoted termination billing");
+            conn.execute(
+                "INSERT INTO market_accrual_entries (
+                    id, account_id, contract_id, interval_id, currency,
+                    daily_rate_minor, billable_seconds, amount_units, status,
+                    invoice_id, created_at, updated_at, credited_units
+                 ) VALUES ('quoted-termination-accrual', ?1, ?2,
+                           'quoted-termination-interval', 'USD', 1200, 2,
+                           172800, 'unbilled', NULL, ?3, ?3, 0)",
+                params![account_id, contract_id, evaluated_near.to_rfc3339()],
+            )
+            .expect("seed quoted refundable balance");
+            conn.execute(
+                "UPDATE market_credit_accounts SET balance_units = 172800 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("seed quoted account balance");
+        }
+
+        let superseded_quote = store
+            .share_market_create_termination_quote(&owner, &subscription_id)
+            .await
+            .expect("create first termination quote");
+        let quote = store
+            .share_market_create_termination_quote(&owner, &subscription_id)
+            .await
+            .expect("replace termination quote");
+        assert_eq!(quote.calculation.refund_bps, 10_000);
+        assert_eq!(quote.calculation.amount_units, 172_800);
+
+        let crossed_start = evaluated_near - Duration::days(6);
+        let crossed_end = crossed_start + Duration::days(10);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET service_started_at = ?2, activated_at = ?2, expires_at = ?3
+                 WHERE id = ?1",
+                params![
+                    subscription_id,
+                    crossed_start.to_rfc3339(),
+                    crossed_end.to_rfc3339()
+                ],
+            )
+            .expect("cross refund threshold after quote");
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET service_started_at = ?2, activated_at = ?2 WHERE product_ref = ?1",
+                params![subscription_id, crossed_start.to_rfc3339()],
+            )
+            .expect("cross billing refund threshold after quote");
+        }
+
+        let committed = store
+            .share_market_commit_termination(
+                &owner,
+                &subscription_id,
+                &quote.id,
+                "quoted-termination-request",
+                false,
+            )
+            .await
+            .expect("commit quoted supplier termination");
+        assert!(!committed.replayed);
+        assert_eq!(committed.adjustment.calculation, quote.calculation);
+        assert_eq!(committed.adjustment.calculation.refund_bps, 10_000);
+        assert_eq!(committed.adjustment.calculation.amount_units, 172_800);
+
+        let replayed = store
+            .share_market_commit_termination(
+                &owner,
+                &subscription_id,
+                &quote.id,
+                "quoted-termination-request",
+                false,
+            )
+            .await
+            .expect("replay exact supplier termination request");
+        assert!(replayed.replayed);
+        assert_eq!(replayed.adjustment.id, committed.adjustment.id);
+        assert!(matches!(
+            store
+                .share_market_commit_termination(
+                    &owner,
+                    &subscription_id,
+                    &quote.id,
+                    "quoted-termination-request",
+                    true,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            store
+                .share_market_commit_termination(
+                    &owner,
+                    &subscription_id,
+                    &superseded_quote.id,
+                    "quoted-termination-request",
+                    false,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn contract_integrity_drift_suspends_billing_and_repairs_within_window() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session(
+            "owner-integrity-repair",
+            "owner-integrity-repair@example.com",
+        );
+        let renter = session(
+            "renter-integrity-repair",
+            "renter-integrity-repair@example.com",
+        );
+        let (subscription_id, _, base) = create_active_paid_fixed_subscription(
+            &store,
+            &owner,
+            &renter,
+            "share-integrity-repair",
+        )
+        .await;
+        let violated_at = base + Duration::minutes(1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET status = 'active', trial_seconds_remaining = 0,
+                     last_evaluated_at = ?2, updated_at = ?2
+                 WHERE product_kind = 'share' AND product_ref = ?1",
+                params![subscription_id, base.to_rfc3339()],
+            )
+            .expect("prepare billable integrity contract");
+            conn.execute(
+                "UPDATE shares SET parallel_limit = 1
+                 WHERE share_id = 'share-integrity-repair'",
+                [],
+            )
+            .expect("drift Share capacity below frozen contract");
+            reconcile_share_contract_integrity_tx(&conn, "share-integrity-repair", violated_at)
+                .expect("detect Share contract drift");
+            let state: (String, String, String, String) = conn
+                .query_row(
+                    "SELECT sub.status, sub.integrity_state, contract.status,
+                            contract.desired_control_state
+                     FROM share_market_subscriptions sub
+                     JOIN market_service_contracts contract
+                       ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                     WHERE sub.id = ?1",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read integrity suspension state");
+            assert_eq!(state.0, SUB_BILLING_SUSPEND_PENDING);
+            assert_eq!(state.1, "violated");
+            assert_eq!(state.2, "billing_suspended");
+            assert_eq!(state.3, "suspended");
+        }
+
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(violated_at + Duration::seconds(1))
+                .await
+                .expect("dispatch integrity revoke")
+                .len(),
+            1
+        );
+        clear_entitlements(&store, "share-integrity-repair").await;
+        let repair_at = violated_at + Duration::hours(1);
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET parallel_limit = 3
+                 WHERE share_id = 'share-integrity-repair'",
+                [],
+            )
+            .expect("repair Share capacity");
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(repair_at)
+                .await
+                .expect("confirm integrity isolation")
+                .is_empty()
+        );
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_BILLING_SUSPENDED
+        );
+        let resume_at = repair_at + Duration::seconds(1);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(resume_at)
+                .await
+                .expect("dispatch repaired grant")
+                .len(),
+            1
+        );
+        let suspended_before_grant: (String, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT contract.status, contract.last_evaluated_at, account.balance_units
+                 FROM market_service_contracts contract
+                 JOIN market_credit_accounts account ON account.id = contract.account_id
+                 WHERE contract.product_kind = 'share' AND contract.product_ref = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read billing state before restored grant");
+        assert_eq!(suspended_before_grant.0, "billing_suspended");
+        set_entitlement_from_stored_policy(&store, &subscription_id, resume_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(resume_at)
+                .await
+                .expect("confirm repaired grant")
+                .is_empty()
+        );
+        let completed_at = resume_at + Duration::seconds(1);
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(completed_at)
+                .await
+                .expect("complete integrity remediation")
+                .is_empty()
+        );
+
+        let final_state: (String, String, String, String, i64, i64, i64, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, sub.integrity_state, contract.status,
+                        contract.desired_control_state,
+                        (SELECT COUNT(*) FROM market_contract_adjustments adjustment
+                         WHERE adjustment.product_ref = sub.id),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'contract_integrity_violated'),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'contract_integrity_restored'),
+                        contract.last_evaluated_at, account.balance_units
+                 FROM share_market_subscriptions sub
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                  AND contract.status != 'terminated'
+                 JOIN market_credit_accounts account ON account.id = contract.account_id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .expect("read repaired contract state");
+        assert_eq!(final_state.0, SUB_ACTIVE_POSTPAID);
+        assert_eq!(final_state.1, "compatible");
+        assert!(matches!(final_state.2.as_str(), "trial" | "active"));
+        assert_eq!(final_state.3, "active");
+        assert_eq!((final_state.4, final_state.5, final_state.6), (0, 1, 1));
+        assert_eq!(parse_time(&final_state.7).unwrap(), completed_at);
+        assert_eq!(final_state.8, suspended_before_grant.2);
+
+        let billed_at = completed_at + Duration::seconds(10);
+        record_share_health(&store, "share-integrity-repair", billed_at).await;
+        store
+            .market_billing_reconcile(billed_at)
+            .await
+            .expect("bill only service time after integrity restoration");
+        let resumed_balance: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT account.balance_units
+                 FROM market_service_contracts contract
+                 JOIN market_credit_accounts account ON account.id = contract.account_id
+                 WHERE contract.product_kind = 'share' AND contract.product_ref = ?1",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read post-remediation account balance");
+        assert_eq!(
+            resumed_balance - suspended_before_grant.2,
+            1_200_i64 * 10_i64
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_active_entitlement_is_repaired_without_releasing_paid_contract() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session(
+            "owner-integrity-missing-grant",
+            "owner-integrity-missing-grant@example.com",
+        );
+        let renter = session(
+            "renter-integrity-missing-grant",
+            "renter-integrity-missing-grant@example.com",
+        );
+        let (subscription_id, _, base) = create_active_paid_fixed_subscription(
+            &store,
+            &owner,
+            &renter,
+            "share-integrity-missing-grant",
+        )
+        .await;
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE market_service_contracts
+                 SET status = 'active', trial_seconds_remaining = 0,
+                     last_evaluated_at = ?2, updated_at = ?2
+                 WHERE product_kind = 'share' AND product_ref = ?1",
+                params![subscription_id, base.to_rfc3339()],
+            )
+            .expect("prepare billable missing-grant contract");
+        clear_entitlements(&store, "share-integrity-missing-grant").await;
+
+        let violated_at = base + Duration::minutes(1);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(violated_at)
+                .await
+                .expect("isolate missing active entitlement")
+                .len(),
+            1
+        );
+        let isolated: (String, String, String, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, sub.integrity_state, sub.integrity_reason,
+                        contract.status
+                 FROM share_market_subscriptions sub
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read missing-grant isolation");
+        assert_eq!(isolated.0, SUB_BILLING_SUSPEND_PENDING);
+        assert_eq!(isolated.1, "violated");
+        assert!(isolated.2.contains("entitlement_missing"));
+        assert_eq!(isolated.3, "billing_suspended");
+
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(violated_at + Duration::seconds(1))
+                .await
+                .expect("confirm missing-grant isolation")
+                .is_empty()
+        );
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_BILLING_SUSPENDED
+        );
+
+        let restored_at = violated_at + Duration::seconds(2);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(restored_at)
+                .await
+                .expect("dispatch replacement entitlement")
+                .len(),
+            1
+        );
+        set_entitlement_from_stored_policy(&store, &subscription_id, restored_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(restored_at)
+                .await
+                .expect("confirm replacement entitlement")
+                .is_empty()
+        );
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(restored_at + Duration::seconds(1))
+                .await
+                .expect("complete missing-grant repair")
+                .is_empty()
+        );
+
+        let repaired: (String, String, String, i64, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, sub.integrity_state, contract.status,
+                        (SELECT COUNT(*) FROM market_contract_adjustments adjustment
+                         WHERE adjustment.product_ref = sub.id),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'subscription_released'),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'contract_integrity_restored')
+                 FROM share_market_subscriptions sub
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                  AND contract.status != 'terminated'
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read repaired missing-grant contract");
+        assert_eq!(repaired.0, SUB_ACTIVE_POSTPAID);
+        assert_eq!(repaired.1, "compatible");
+        assert_eq!(repaired.2, "active");
+        assert_eq!((repaired.3, repaired.4, repaired.5), (0, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn integrity_repair_does_not_override_a_billing_account_suspension() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session(
+            "owner-integrity-billing-block",
+            "owner-integrity-billing-block@example.com",
+        );
+        let renter = session(
+            "renter-integrity-billing-block",
+            "renter-integrity-billing-block@example.com",
+        );
+        let (subscription_id, _, activated_at) = create_active_paid_fixed_subscription(
+            &store,
+            &owner,
+            &renter,
+            "share-integrity-billing-block",
+        )
+        .await;
+        let violated_at = activated_at + Duration::minutes(1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET parallel_limit = 1
+                 WHERE share_id = 'share-integrity-billing-block'",
+                [],
+            )
+            .expect("violate Share capacity before billing block");
+            reconcile_share_contract_integrity_tx(
+                &conn,
+                "share-integrity-billing-block",
+                violated_at,
+            )
+            .expect("start integrity remediation before billing block");
+        }
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(violated_at + Duration::seconds(1))
+                .await
+                .expect("dispatch integrity isolation before billing block")
+                .len(),
+            1
+        );
+        clear_entitlements(&store, "share-integrity-billing-block").await;
+        let isolation_confirmed_at = violated_at + Duration::hours(1);
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET parallel_limit = 3
+                 WHERE share_id = 'share-integrity-billing-block'",
+                [],
+            )
+            .expect("repair Share capacity before confirming isolation");
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(isolation_confirmed_at)
+                .await
+                .expect("confirm integrity isolation before billing block")
+                .is_empty()
+        );
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_BILLING_SUSPENDED
+        );
+
+        let repaired_at = isolation_confirmed_at + Duration::seconds(1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET status = 'overdue', updated_at = ?2
+                 WHERE id = (SELECT account_id FROM market_service_contracts
+                             WHERE product_kind = 'share' AND product_ref = ?1)",
+                params![subscription_id, repaired_at.to_rfc3339()],
+            )
+            .expect("block billing account during integrity remediation");
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET desired_control_state = 'suspended',
+                     control_error = 'payment_overdue', updated_at = ?2
+                 WHERE product_kind = 'share' AND product_ref = ?1",
+                params![subscription_id, repaired_at.to_rfc3339()],
+            )
+            .expect("retain billing suspension decision");
+        }
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(repaired_at)
+                .await
+                .expect("reconcile repaired integrity with blocked billing")
+                .is_empty()
+        );
+
+        let state: (String, String, String, String, String, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, sub.integrity_state, sub.release_reason,
+                        contract.status, contract.desired_control_state,
+                        (SELECT COUNT(*) FROM share_control_operations operation
+                         WHERE operation.subscription_id = sub.id
+                           AND operation.status IN ('pending', 'dispatched')),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'contract_integrity_restored')
+                 FROM share_market_subscriptions sub
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read integrity repair blocked by billing state");
+        assert_eq!(state.0, SUB_BILLING_SUSPENDED);
+        assert_eq!(state.1, "compatible");
+        assert_eq!(state.2, "billing_resume_blocked");
+        assert_eq!(state.3, "billing_suspended");
+        assert_eq!(state.4, "suspended");
+        assert_eq!((state.5, state.6), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn integrity_resume_rechecks_billing_after_the_grant_is_restored() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session(
+            "owner-integrity-late-block",
+            "owner-integrity-late-block@example.com",
+        );
+        let renter = session(
+            "renter-integrity-late-block",
+            "renter-integrity-late-block@example.com",
+        );
+        let (subscription_id, _, activated_at) = create_active_paid_fixed_subscription(
+            &store,
+            &owner,
+            &renter,
+            "share-integrity-late-block",
+        )
+        .await;
+        let violated_at = activated_at + Duration::minutes(1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET parallel_limit = 1
+                 WHERE share_id = 'share-integrity-late-block'",
+                [],
+            )
+            .expect("violate Share capacity before late billing block");
+            reconcile_share_contract_integrity_tx(&conn, "share-integrity-late-block", violated_at)
+                .expect("start integrity remediation before late billing block");
+        }
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(violated_at + Duration::seconds(1))
+                .await
+                .expect("dispatch isolation before late billing block")
+                .len(),
+            1
+        );
+        clear_entitlements(&store, "share-integrity-late-block").await;
+        let repaired_at = violated_at + Duration::hours(1);
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET parallel_limit = 3
+                 WHERE share_id = 'share-integrity-late-block'",
+                [],
+            )
+            .expect("repair Share before late billing block");
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(repaired_at)
+                .await
+                .expect("confirm isolation before late billing block")
+                .is_empty()
+        );
+        let resume_at = repaired_at + Duration::seconds(1);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(resume_at)
+                .await
+                .expect("dispatch grant before late billing block")
+                .len(),
+            1
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET status = 'overdue', updated_at = ?2
+                 WHERE id = (SELECT account_id FROM market_service_contracts
+                             WHERE product_kind = 'share' AND product_ref = ?1)",
+                params![subscription_id, resume_at.to_rfc3339()],
+            )
+            .expect("block billing after repaired grant dispatch");
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET desired_control_state = 'suspended',
+                     control_error = 'payment_overdue', updated_at = ?2
+                 WHERE product_kind = 'share' AND product_ref = ?1",
+                params![subscription_id, resume_at.to_rfc3339()],
+            )
+            .expect("replace pending integrity resume with billing suspension");
+        }
+        set_entitlement_from_stored_policy(&store, &subscription_id, resume_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(resume_at)
+                .await
+                .expect("confirm repaired grant before late billing recheck")
+                .is_empty()
+        );
+        let revoke_at = resume_at + Duration::seconds(1);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(revoke_at)
+                .await
+                .expect("re-isolate grant after late billing block")
+                .len(),
+            1
+        );
+        let pending: (String, String, String, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, sub.integrity_state, contract.status,
+                        contract.desired_control_state,
+                        (SELECT COUNT(*) FROM share_control_operations operation
+                         WHERE operation.subscription_id = sub.id
+                           AND operation.action = 'revoke'
+                           AND operation.status = 'dispatched')
+                 FROM share_market_subscriptions sub
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read re-isolated late billing block");
+        assert_eq!(pending.0, SUB_BILLING_SUSPEND_PENDING);
+        assert_eq!(pending.1, "compatible");
+        assert_eq!(pending.2, "billing_suspended");
+        assert_eq!(pending.3, "suspended");
+        assert_eq!(pending.4, 1);
+
+        clear_entitlements(&store, "share-integrity-late-block").await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(revoke_at + Duration::hours(1))
+                .await
+                .expect("confirm late billing re-isolation")
+                .is_empty()
+        );
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_BILLING_SUSPENDED
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_market_subscription_is_isolated_until_share_upgrades_to_v3() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-scope-upgrade", "owner-scope-upgrade@example.com");
+        let renter = session("renter-scope-upgrade", "renter-scope-upgrade@example.com");
+        insert_share(
+            &store,
+            "share-scope-upgrade",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) = create_listing(&store, &owner, "share-scope-upgrade", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent scope upgrade seat");
+        let now = Utc::now();
+        activate_subscription(&store, &subscription_id, now).await;
+        {
+            let conn = store.conn.lock().await;
+            let grants_json: String = conn
+                .query_row(
+                    "SELECT user_grants_json FROM shares
+                     WHERE share_id = 'share-scope-upgrade'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read managed grant for v2 downgrade");
+            let mut grants: BTreeMap<String, ShareUserGrant> =
+                serde_json::from_str(&grants_json).expect("decode managed grants");
+            grants
+                .get_mut(&renter.email)
+                .expect("renter grant")
+                .policy
+                .allowed_apps
+                .clear();
+            conn.execute(
+                "UPDATE shares SET share_access_policy_version = 2,
+                    user_grants_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-scope-upgrade",
+                    serde_json::to_string(&grants).expect("encode legacy grant")
+                ],
+            )
+            .expect("seed legacy v2 App scope");
+            reconcile_share_contract_integrity_tx(&conn, "share-scope-upgrade", now)
+                .expect("isolate legacy v2 market grant");
+            let legacy_state: (String, String, String) = conn
+                .query_row(
+                    "SELECT status, integrity_state, integrity_reason
+                     FROM share_market_subscriptions
+                     WHERE id = ?1",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read legacy v2 contract state");
+            assert_eq!(legacy_state.0, SUB_BILLING_SUSPEND_PENDING);
+            assert_eq!(legacy_state.1, "violated");
+            assert!(legacy_state.2.contains("share_contract_upgrade_required"));
+        }
+
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(1))
+                .await
+                .expect("dispatch legacy v2 grant revoke")
+                .len(),
+            1
+        );
+        clear_entitlements(&store, "share-scope-upgrade").await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(2))
+                .await
+                .expect("keep legacy v2 contract isolated")
+                .is_empty()
+        );
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_BILLING_SUSPEND_PENDING
+        );
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET share_access_policy_version = ?2 WHERE share_id = ?1",
+                params!["share-scope-upgrade", i64::from(SHARE_CONTRACT_VERSION)],
+            )
+            .expect("upgrade Share contract version");
+        }
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(3))
+                .await
+                .expect("confirm upgraded contract isolation")
+                .is_empty()
+        );
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_BILLING_SUSPENDED
+        );
+
+        let restored_at = now + Duration::seconds(4);
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(restored_at)
+                .await
+                .expect("dispatch scoped v3 grant")
+                .len(),
+            1
+        );
+        {
+            let conn = store.conn.lock().await;
+            let policy_json: String = conn
+                .query_row(
+                    "SELECT policy_json FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'
+                     ORDER BY share_sequence DESC LIMIT 1",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read restored scoped policy");
+            let policy: ShareUserPolicy =
+                serde_json::from_str(&policy_json).expect("decode restored scoped policy");
+            assert_eq!(policy.allowed_apps, ["codex"]);
+        }
+        set_entitlement_from_stored_policy(&store, &subscription_id, restored_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(restored_at)
+                .await
+                .expect("confirm restored scoped grant")
+                .is_empty()
+        );
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(restored_at + Duration::seconds(1))
+                .await
+                .expect("complete v2 market contract remediation")
+                .is_empty()
+        );
+
+        let final_state: (String, String, Option<String>, Option<String>, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, integrity_state, integrity_reason, app_scope_enforced_at,
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'contract_integrity_violated'),
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.subscription_id = sub.id
+                           AND event.event_type = 'contract_integrity_restored')
+                 FROM share_market_subscriptions sub WHERE id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read remediated v3 contract");
+        assert_eq!(final_state.0, SUB_ACTIVE_FREE);
+        assert_eq!(final_state.1, "compatible");
+        assert!(final_state.2.is_none());
+        assert!(final_state.3.is_some());
+        assert_eq!((final_state.4, final_state.5), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn persistent_integrity_drift_times_out_once_and_refunds_from_violation_time() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session(
+            "owner-integrity-timeout",
+            "owner-integrity-timeout@example.com",
+        );
+        let renter = session(
+            "renter-integrity-timeout",
+            "renter-integrity-timeout@example.com",
+        );
+        let (subscription_id, _, activated_at) = create_active_paid_fixed_subscription(
+            &store,
+            &owner,
+            &renter,
+            "share-integrity-timeout",
+        )
+        .await;
+        let violated_at = activated_at + Duration::minutes(1);
+        let service_started_at = violated_at - Duration::days(2);
+        let service_ends_at = service_started_at + Duration::days(10);
+        {
+            let conn = store.conn.lock().await;
+            let (contract_id, account_id): (String, String) = conn
+                .query_row(
+                    "SELECT id, account_id FROM market_service_contracts
+                     WHERE product_kind = 'share' AND product_ref = ?1
+                       AND status != 'terminated'",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read timeout billing contract");
+            conn.execute(
+                "UPDATE share_market_subscriptions
+                 SET service_started_at = ?2, activated_at = ?2, expires_at = ?3
+                 WHERE id = ?1",
+                params![
+                    subscription_id,
+                    service_started_at.to_rfc3339(),
+                    service_ends_at.to_rfc3339()
+                ],
+            )
+            .expect("set timeout service interval");
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET status = 'active', trial_seconds_remaining = 0,
+                     service_started_at = ?2, activated_at = ?2,
+                     last_evaluated_at = ?3, updated_at = ?3
+                 WHERE id = ?1",
+                params![
+                    contract_id,
+                    service_started_at.to_rfc3339(),
+                    violated_at.to_rfc3339()
+                ],
+            )
+            .expect("set timeout billing interval");
+            conn.execute(
+                "INSERT INTO market_accrual_entries (
+                    id, account_id, contract_id, interval_id, currency,
+                    daily_rate_minor, billable_seconds, amount_units, status,
+                    invoice_id, created_at, updated_at, credited_units
+                 ) VALUES ('timeout-accrual', ?1, ?2, 'timeout-interval', 'USD',
+                           1200, 1, 86400, 'unbilled', NULL, ?3, ?3, 0)",
+                params![account_id, contract_id, violated_at.to_rfc3339()],
+            )
+            .expect("seed refundable timeout accrual");
+            conn.execute(
+                "UPDATE market_credit_accounts SET balance_units = 86400 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("seed timeout account balance");
+            conn.execute(
+                "UPDATE shares SET parallel_limit = 1
+                 WHERE share_id = 'share-integrity-timeout'",
+                [],
+            )
+            .expect("persist timeout contract drift");
+            reconcile_share_contract_integrity_tx(&conn, "share-integrity-timeout", violated_at)
+                .expect("start timeout remediation");
+        }
+
+        let deadline = violated_at + Duration::hours(CONTRACT_REPAIR_WINDOW_HOURS);
+        let _ = store
+            .share_market_reconcile_and_dispatch(deadline)
+            .await
+            .expect("terminate timed-out integrity remediation");
+        let timed_out: (String, String, String, i64, i64, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.integrity_state, sub.release_reason, contract.status,
+                        adjustment.refund_bps, adjustment.amount_minor,
+                        adjustment.unbilled_credit_units, account.balance_units
+                 FROM share_market_subscriptions sub
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share' AND contract.product_ref = sub.id
+                 JOIN market_contract_adjustments adjustment
+                   ON adjustment.contract_id = contract.id
+                 JOIN market_credit_accounts account ON account.id = contract.account_id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read timed-out contract refund");
+        assert_eq!(timed_out.0, "terminated");
+        assert_eq!(timed_out.1, "contract_integrity_repair_timeout");
+        assert_eq!(timed_out.2, "terminated");
+        assert_eq!(timed_out.3, 10_000);
+        assert_eq!(timed_out.4, 1);
+        assert_eq!(timed_out.5, 86_400);
+        assert_eq!(timed_out.6, 0);
+
+        let _ = store
+            .share_market_reconcile_and_dispatch(deadline + Duration::hours(1))
+            .await
+            .expect("repeat timed-out reconciliation idempotently");
+        let adjustment_count: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM market_contract_adjustments WHERE product_ref = ?1",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("count timeout adjustments");
+        assert_eq!(adjustment_count, 1);
+    }
+
+    #[tokio::test]
+    async fn supplier_refund_allocates_all_ledger_states_and_closes_obligation_idempotently() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-refund-ledger", "owner-refund-ledger@example.com");
+        let renter = session("renter-refund-ledger", "renter-refund-ledger@example.com");
+        let outsider = session(
+            "outsider-refund-ledger",
+            "outsider-refund-ledger@example.com",
+        );
+        let (subscription_id, _, now) =
+            create_active_paid_fixed_subscription(&store, &owner, &renter, "share-refund-ledger")
+                .await;
+        let service_started_at = now - Duration::days(2);
+        let service_ends_at = service_started_at + Duration::days(10);
+        let (contract_id, account_id, obligation_id, adjustment_id) = {
+            let conn = store.conn.lock().await;
+            let tx = conn.transaction().expect("begin refund ledger fixture");
+            let (contract_id, account_id): (String, String) = tx
+                .query_row(
+                    "SELECT id, account_id FROM market_service_contracts
+                     WHERE product_kind = 'share' AND product_ref = ?1
+                       AND status != 'terminated'",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read refund ledger contract");
+            tx.execute(
+                "UPDATE share_market_subscriptions
+                 SET service_started_at = ?2, activated_at = ?2, expires_at = ?3
+                 WHERE id = ?1",
+                params![
+                    subscription_id,
+                    service_started_at.to_rfc3339(),
+                    service_ends_at.to_rfc3339()
+                ],
+            )
+            .expect("set refund service interval");
+            tx.execute(
+                "UPDATE market_service_contracts
+                 SET status = 'billing_suspended', service_started_at = ?2,
+                     activated_at = ?2, last_evaluated_at = ?3, updated_at = ?3
+                 WHERE id = ?1",
+                params![
+                    contract_id,
+                    service_started_at.to_rfc3339(),
+                    now.to_rfc3339()
+                ],
+            )
+            .expect("freeze refund contract accrual");
+            for (invoice_id, sequence, units, minor, status) in [
+                ("refund-open-invoice", 1_i64, 172_800_i64, 2_i64, "open"),
+                ("refund-paid-invoice", 2_i64, 259_200_i64, 3_i64, "paid"),
+            ] {
+                tx.execute(
+                    "INSERT INTO market_invoices (
+                        id, account_id, sequence, amount_minor, amount_cny_minor,
+                        usd_cny_rate_micros, amount_units, currency,
+                        payment_methods_json, payment_contacts_json,
+                        payment_profile_updated_at, status, due_at, deadline_at,
+                        opened_at, paid_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 7000000, ?6, 'USD',
+                               '[]', '[]', ?7, ?8, ?9, ?9, ?7,
+                               CASE WHEN ?8 = 'paid' THEN ?7 ELSE NULL END)",
+                    params![
+                        invoice_id,
+                        account_id,
+                        sequence,
+                        minor,
+                        minor * 7,
+                        units,
+                        now.to_rfc3339(),
+                        status,
+                        (now + Duration::days(1)).to_rfc3339(),
+                    ],
+                )
+                .expect("insert refund invoice");
+                tx.execute(
+                    "INSERT INTO market_invoice_lines (
+                        id, invoice_id, contract_id, product_kind, product_ref,
+                        service_ref, service_label, daily_rate_minor,
+                        billable_seconds, amount_minor, amount_cny_minor,
+                        amount_units, service_started_at, service_ended_at,
+                        evidence_json, created_at
+                     ) VALUES (?1, ?2, ?3, 'share', ?4, ?5, ?5, 1200,
+                               1, ?6, ?7, ?8, ?9, ?10, '{}', ?10)",
+                    params![
+                        format!("line-{invoice_id}"),
+                        invoice_id,
+                        contract_id,
+                        subscription_id,
+                        "share-refund-ledger",
+                        minor,
+                        minor * 7,
+                        units,
+                        service_started_at.to_rfc3339(),
+                        now.to_rfc3339(),
+                    ],
+                )
+                .expect("insert refund invoice line");
+            }
+            for (id, interval_id, units, status, invoice_id) in [
+                (
+                    "refund-unbilled-accrual",
+                    "refund-unbilled-interval",
+                    86_400_i64,
+                    "unbilled",
+                    None,
+                ),
+                (
+                    "refund-open-accrual",
+                    "refund-open-interval",
+                    172_800_i64,
+                    "invoiced",
+                    Some("refund-open-invoice"),
+                ),
+                (
+                    "refund-paid-accrual",
+                    "refund-paid-interval",
+                    259_200_i64,
+                    "invoiced",
+                    Some("refund-paid-invoice"),
+                ),
+            ] {
+                tx.execute(
+                    "INSERT INTO market_accrual_entries (
+                        id, account_id, contract_id, interval_id, currency,
+                        daily_rate_minor, billable_seconds, amount_units,
+                        status, invoice_id, created_at, updated_at, credited_units
+                     ) VALUES (?1, ?2, ?3, ?4, 'USD', 1200, 1, ?5,
+                               ?6, ?7, ?8, ?8, 0)",
+                    params![
+                        id,
+                        account_id,
+                        contract_id,
+                        interval_id,
+                        units,
+                        status,
+                        invoice_id,
+                        now.to_rfc3339(),
+                    ],
+                )
+                .expect("insert refundable accrual");
+            }
+            tx.execute(
+                "UPDATE market_credit_accounts
+                 SET balance_units = 259200, open_invoice_id = 'refund-open-invoice'
+                 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("seed refundable account balance");
+
+            let adjustment = crate::market_billing::apply_supplier_early_termination_refund_tx(
+                &tx,
+                "share",
+                &subscription_id,
+                "owner_early_termination",
+                "refund-ledger-key",
+                now,
+            )
+            .expect("apply supplier refund");
+            assert_eq!(adjustment.status, "refund_due");
+            assert_eq!(adjustment.calculation.refund_bps, 10_000);
+            assert_eq!(adjustment.calculation.amount_minor, 6);
+            assert_eq!(adjustment.unbilled_credit_minor, 1);
+            assert_eq!(adjustment.invoice_credit_minor, 2);
+            assert_eq!(adjustment.external_refund_minor, 3);
+            assert_eq!(adjustment.obligations.len(), 1);
+            let replay = crate::market_billing::apply_supplier_early_termination_refund_tx(
+                &tx,
+                "share",
+                &subscription_id,
+                "owner_early_termination",
+                "refund-ledger-key",
+                now + Duration::seconds(1),
+            )
+            .expect("replay supplier refund");
+            assert_eq!(replay.id, adjustment.id);
+            assert!(matches!(
+                crate::market_billing::apply_supplier_early_termination_refund_tx(
+                    &tx,
+                    "share",
+                    "another-contract",
+                    "owner_early_termination",
+                    "refund-ledger-key",
+                    now,
+                ),
+                Err(AppError::Conflict(_))
+            ));
+            let obligation_id = adjustment.obligations[0].id.clone();
+            let adjustment_id = adjustment.id.clone();
+            tx.commit().expect("commit refund ledger fixture");
+            (contract_id, account_id, obligation_id, adjustment_id)
+        };
+
+        let ledger_state: (i64, String, i64, String, i64, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT account.balance_units, open_invoice.status, open_invoice.amount_units,
+                        paid_invoice.status, paid_invoice.amount_units,
+                        (SELECT COUNT(*) FROM market_credit_notes note
+                         WHERE note.adjustment_id = ?3 AND note.kind = 'service_credit'),
+                        (SELECT SUM(credited_units) FROM market_accrual_entries
+                         WHERE contract_id = ?1)
+                 FROM market_credit_accounts account
+                 JOIN market_invoices open_invoice ON open_invoice.id = 'refund-open-invoice'
+                 JOIN market_invoices paid_invoice ON paid_invoice.id = 'refund-paid-invoice'
+                 WHERE account.id = ?2",
+                params![contract_id, account_id, adjustment_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read allocated refund ledger");
+        assert_eq!(ledger_state.0, 0);
+        assert_eq!(ledger_state.1, "void");
+        assert_eq!(ledger_state.2, 0);
+        assert_eq!(ledger_state.3, "paid");
+        assert_eq!(ledger_state.4, 259_200);
+        assert_eq!(ledger_state.5, 1);
+        assert_eq!(ledger_state.6, 518_400);
+
+        let owner_dashboard = store
+            .market_billing_dashboard(&owner)
+            .await
+            .expect("read supplier refund dashboard");
+        let buyer_dashboard = store
+            .market_billing_dashboard(&renter)
+            .await
+            .expect("read buyer refund dashboard");
+        let outsider_dashboard = store
+            .market_billing_dashboard(&outsider)
+            .await
+            .expect("read outsider billing dashboard");
+        assert!(owner_dashboard.refund_obligations[0].can_record);
+        assert!(!buyer_dashboard.refund_obligations[0].can_record);
+        assert!(outsider_dashboard.refund_obligations.is_empty());
+
+        store
+            .market_billing_reconcile(now + Duration::days(8))
+            .await
+            .expect("mark refund obligation overdue");
+        let overdue: (String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT obligation.status,
+                        (SELECT COUNT(*) FROM operator_alert_signal_outbox signal
+                         WHERE signal.source_event_id = 'market-refund-overdue:' || obligation.id
+                           AND signal.transition = 'firing')
+                 FROM market_refund_obligations obligation WHERE obligation.id = ?1",
+                params![obligation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read overdue refund obligation");
+        assert_eq!(overdue, ("overdue".into(), 1));
+        assert!(matches!(
+            store
+                .market_billing_record_refund_obligation(
+                    &renter,
+                    &obligation_id,
+                    "refund-reference-1",
+                )
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+        let recorded = store
+            .market_billing_record_refund_obligation(&owner, &obligation_id, "refund-reference-1")
+            .await
+            .expect("record external refund");
+        assert_eq!(recorded.status, "recorded");
+        assert!(!recorded.can_record);
+        let replay = store
+            .market_billing_record_refund_obligation(&owner, &obligation_id, "refund-reference-1")
+            .await
+            .expect("replay same refund reference");
+        assert_eq!(
+            replay.external_reference.as_deref(),
+            Some("refund-reference-1")
+        );
+        assert!(matches!(
+            store
+                .market_billing_record_refund_obligation(
+                    &owner,
+                    &obligation_id,
+                    "different-reference",
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let settled: (String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT adjustment.status,
+                        (SELECT COUNT(*) FROM operator_alert_signal_outbox signal
+                         WHERE signal.source_event_id = 'market-refund-recorded:' || ?2
+                           AND signal.transition = 'resolved')
+                 FROM market_contract_adjustments adjustment WHERE adjustment.id = ?1",
+                params![adjustment_id, obligation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read settled refund adjustment");
+        assert_eq!(settled, ("settled".into(), 1));
     }
 }

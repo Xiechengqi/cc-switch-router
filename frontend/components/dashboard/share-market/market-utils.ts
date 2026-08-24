@@ -4,7 +4,6 @@ import { formatUsdMoney } from "@/lib/market-money";
 import {
   isApiProviderRuntime,
   providerQuotaStatusLine,
-  providerStatusIdentity,
 } from "@/components/dashboard/share-dashboard-utils";
 import {
   marketProviderHealthTone,
@@ -62,6 +61,19 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
     SHARE_MARKET_PAYMENT_PROFILE_REQUIRED: "shareMarket.error.paymentRequired",
     MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED: "shareMarket.error.settlementRequired",
     DATABASE_UNAVAILABLE: "shareMarket.error.temporarilyUnavailable",
+    share_market_client_upgrade_required: "shareMarket.error.clientUpgradeRequired",
+    share_market_share_tokens_exhausted: "shareMarket.error.shareTokensExhausted",
+    share_market_share_offline: "shareMarket.error.shareOffline",
+    share_market_share_expired: "shareMarket.error.shareExpired",
+    share_market_runtime_stale: "shareMarket.error.runtimeStale",
+    share_market_model_unavailable: "shareMarket.error.modelUnavailable",
+    share_market_contract_incompatible: "shareMarket.error.contractIncompatible",
+    share_market_required_app_unavailable: "shareMarket.error.requiredAppUnavailable",
+    share_market_service_term_unfulfillable: "shareMarket.error.termUnfulfillable",
+    share_market_seat_capacity_invalid: "shareMarket.error.parallelExceedsShare",
+    share_market_contract_settings_protected: "shareMarket.error.settingsProtected",
+    share_market_fixed_term_required: "shareMarket.error.fixedTermRequired",
+    share_market_termination_quote_required: "shareMarket.error.terminationQuoteRequired",
   };
   const codeKey = reason.code ? coded[reason.code] : undefined;
   if (codeKey) return t(codeKey);
@@ -190,6 +202,13 @@ export function primaryMarketCapability(
   );
 }
 
+export function enabledMarketCapabilities(
+  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps">,
+) {
+  const enabledApps = new Set(listing.supportedApps);
+  return listing.appCapabilities.filter((capability) => enabledApps.has(capability.app));
+}
+
 export function marketCapabilityRuntime(
   capability: ShareMarketAppCapability,
 ): ShareUpstreamProvider {
@@ -227,11 +246,12 @@ export function marketCapabilityRuntime(
 }
 
 export function marketProviderStatusView(
-  listing: Pick<ShareMarketListing, "appCapabilities">,
+  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps">,
   locale: AppLocale,
   labels: { unknown: string; passthrough: string },
 ): ShareProviderStatusPanelView {
-  const primary = primaryMarketCapability(listing.appCapabilities);
+  const capabilities = enabledMarketCapabilities(listing);
+  const primary = primaryMarketCapability(capabilities);
   if (!primary) {
     return {
       primaryLine: labels.unknown,
@@ -243,8 +263,13 @@ export function marketProviderStatusView(
   const runtime = marketCapabilityRuntime(primary);
   const isApiProvider =
     primary.providerFamily === "api" || isApiProviderRuntime(runtime);
+  const providerIdentity = [primary.providerName, primary.providerType]
+    .map((value) => value?.trim())
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .join(" · ");
   const modelsLine = CORE_SHARE_APPS.flatMap((app) => {
-    const item = listing.appCapabilities.find((capability) => capability.app === app);
+    const item = capabilities.find((capability) => capability.app === app);
     return item
       ? [`${SHARE_APP_LABELS[app]}: ${capabilityModelLabel(item, labels.passthrough, labels.unknown)}`]
       : [];
@@ -261,7 +286,7 @@ export function marketProviderStatusView(
     primaryLine: isApiProvider
       ? primary.providerName || primary.providerType || labels.unknown
       : providerQuotaStatusLine(runtime, locale),
-    identityLine: isApiProvider ? "-" : providerStatusIdentity(runtime),
+    identityLine: providerIdentity || "-",
     modelsLine:
       modelsLine || capabilityModelLabel(primary, labels.passthrough, labels.unknown),
     toneClassName: marketProviderHealthTone(healthState),
@@ -283,6 +308,53 @@ export function subscriptionStatusKey(status: string): MessageKey | null {
     released: "shareMarket.subscription.released",
   };
   return keys[status] || null;
+}
+
+export function integrityStatusKey(status: string): MessageKey {
+  const keys: Record<string, MessageKey> = {
+    compatible: "shareMarket.integrity.compatible",
+    violated: "shareMarket.integrity.violated",
+    remediating: "shareMarket.integrity.remediating",
+    terminated: "shareMarket.integrity.terminated",
+  };
+  return keys[status] || "shareMarket.integrity.violated";
+}
+
+export function integrityReasonText(reason: string | undefined, t: MarketTranslate) {
+  if (!reason) return "";
+  const keys: Record<string, MessageKey> = {
+    share_missing: "shareMarket.integrity.reason.shareMissing",
+    share_inactive: "shareMarket.integrity.reason.shareInactive",
+    share_contract_upgrade_required: "shareMarket.integrity.reason.clientUpgradeRequired",
+    required_app_disabled: "shareMarket.integrity.reason.requiredAppDisabled",
+    share_parallel_capacity_reduced: "shareMarket.integrity.reason.parallelReduced",
+    fixed_term_not_covered: "shareMarket.integrity.reason.fixedTermNotCovered",
+    upstream_fixed_term_not_covered: "shareMarket.integrity.reason.upstreamTermNotCovered",
+    binding_missing: "shareMarket.integrity.reason.bindingMissing",
+    provider_disabled: "shareMarket.integrity.reason.providerDisabled",
+    binding_unresolved: "shareMarket.integrity.reason.bindingUnresolved",
+    provider_binding_changed: "shareMarket.integrity.reason.providerBindingChanged",
+    provider_model_changed: "shareMarket.integrity.reason.providerModelChanged",
+    required_app_unavailable: "shareMarket.integrity.reason.requiredAppUnavailable",
+    app_scope_not_enforced: "shareMarket.integrity.reason.appScopeNotEnforced",
+    entitlement_missing: "shareMarket.integrity.reason.entitlementMissing",
+    contract_integrity_repair_timeout: "shareMarket.integrity.reason.repairTimeout",
+  };
+  const messages = reason
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => t(keys[item] || "shareMarket.integrity.reason.unknown"));
+  return [...new Set(messages)].join(" · ");
+}
+
+export function refundStatusKey(status: string): MessageKey {
+  const keys: Record<string, MessageKey> = {
+    applied: "shareMarket.refund.status.applied",
+    refund_due: "shareMarket.refund.status.refund_due",
+    settled: "shareMarket.refund.status.settled",
+  };
+  return keys[status] || "shareMarket.refund.status.refund_due";
 }
 
 export function grantFailureMessageKey(code?: string): MessageKey {

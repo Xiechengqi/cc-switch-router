@@ -1892,6 +1892,7 @@ export type MarketBillingDashboard = {
   accounts: MarketCreditAccount[];
   supplierProfiles: MarketBillingSupplierProfile[];
   restrictions: MarketCreditRestriction[];
+  refundObligations: ShareMarketRefundObligation[];
   trialHours: number;
   usdCnyRateMicros: number;
 };
@@ -2211,6 +2212,10 @@ export type ShareMarketSubscription = {
   ownerEmail: string;
   renterEmail?: string;
   status: string;
+  integrityState: "compatible" | "violated" | "remediating" | "terminated" | string;
+  integrityReason?: string;
+  integrityViolatedAt?: string;
+  terminationAdjustment?: ShareMarketTerminationAdjustmentSummary;
   seatPosition: number;
   parallelLimit?: number;
   tokenLimit?: number;
@@ -2226,6 +2231,7 @@ export type ShareMarketSubscription = {
   contacts?: PaymentContact[];
   canRelease: boolean;
   canForceRevoke: boolean;
+  canRetryGrant: boolean;
   canProposePriceChange: boolean;
   priceChange?: ShareMarketPriceChange;
   releaseReason?: string;
@@ -2234,6 +2240,61 @@ export type ShareMarketSubscription = {
   releasedAt?: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type ShareMarketTerminationCalculation = {
+  contractId: string;
+  accountId: string;
+  productKind: string;
+  productRef: string;
+  currency: "USD" | string;
+  serviceStartedAt: string;
+  serviceEndsAt: string;
+  evaluatedAt: string;
+  elapsedBps: number;
+  refundBps: number;
+  refundableBaseUnits: number;
+  amountUnits: number;
+  amountMinor: number;
+};
+
+export type ShareMarketRefundObligation = {
+  id: string;
+  adjustmentId: string;
+  invoiceId: string;
+  amountMinor: number;
+  currency: "USD" | string;
+  status: string;
+  dueAt: string;
+  externalReference?: string;
+  recordedAt?: string;
+  canRecord: boolean;
+};
+
+export type ShareMarketTerminationAdjustmentSummary = {
+  id: string;
+  status: "applied" | "refund_due" | "settled" | string;
+  currency: "USD" | string;
+  elapsedBps: number;
+  refundBps: number;
+  amountMinor: number;
+  unbilledCreditMinor: number;
+  invoiceCreditMinor: number;
+  externalRefundMinor: number;
+  refundObligationStatus?: "pending" | "recorded" | string;
+};
+
+export type ShareMarketTerminationQuote = {
+  id: string;
+  subscriptionId: string;
+  status: "active" | "consumed" | "expired";
+  expiresAt: string;
+  calculation: ShareMarketTerminationCalculation;
+};
+
+export type ShareMarketTerminationAdjustment = ShareMarketTerminationAdjustmentSummary & {
+  calculation: ShareMarketTerminationCalculation;
+  obligations: ShareMarketRefundObligation[];
 };
 
 export type ShareMarketPriceChange = {
@@ -2413,6 +2474,34 @@ export type ShareMarketOwnedListings = {
 
 export type ShareMarketSubscriptions = {
   subscriptions: ShareMarketSubscription[];
+  nextCursor?: string;
+};
+
+export type ShareControlOperationSummary = {
+  pending: number;
+  dispatched: number;
+  deadLettered: number;
+};
+
+export type ShareControlDeadLetter = {
+  id: string;
+  shareId: string;
+  subscriptionId: string;
+  action: "upsert" | "revoke" | string;
+  email: string;
+  attempts: number;
+  lastError?: string;
+  errorCode?: string;
+  createdAt: string;
+  updatedAt: string;
+  deadLetteredAt: string;
+  canRequeue: boolean;
+};
+
+export type ShareControlDeadLetterPage = {
+  operations: ShareControlDeadLetter[];
+  summary: ShareControlOperationSummary;
+  nextCursor?: string;
 };
 
 export type ShareMarketOwnedShare = {
