@@ -47,3 +47,17 @@ test("renders configured quantities with an explicit M suffix", () => {
   );
   assert.equal(formatTokenMillions(1.5, "en"), "-");
 });
+
+test("renders Chinese quantities with 万 and 亿", () => {
+  assert.equal(formatTokenMillions(0, "zh-CN"), "0万");
+  assert.equal(formatTokenMillions(1, "zh-CN"), "0.0001万");
+  assert.equal(formatTokenMillions(12_500, "zh-CN"), "1.25万");
+  assert.equal(formatTokenMillions(1_250_000, "zh-CN"), "125万");
+  assert.equal(formatTokenMillions(99_999_999, "zh-CN"), "9,999.9999万");
+  assert.equal(formatTokenMillions(100_000_000, "zh-CN"), "1亿");
+  assert.equal(formatTokenMillions(150_000_000, "zh-CN"), "1.5亿");
+  assert.equal(
+    formatTokenMillions(Number.MAX_SAFE_INTEGER, "zh-CN"),
+    "90,071,992.54740991亿",
+  );
+});

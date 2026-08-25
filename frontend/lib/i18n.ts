@@ -92,6 +92,7 @@ export const messages = {
     "shareMarket.workspace.selling": "My listings",
     "shareMarket.workspace.rentalsHint":
       "Use, review, or return the exact Share seats you rented.",
+    "shareMarket.rentals.attention": "Needs attention",
     "shareMarket.workspace.sellingHint":
       "Publish Share seats and manage active listings and rentals.",
     "shareMarket.workspace.noListings": "No Share listings yet.",
@@ -217,6 +218,8 @@ export const messages = {
     "shareMarket.col.tokens": "Tokens",
     "shareMarket.col.amount": "Price",
     "shareMarket.col.status": "Status",
+    "shareMarket.col.ended": "Ended",
+    "shareMarket.col.note": "Note",
     "shareMarket.sortBy": "Sort by {column}",
     "shareMarket.sortAsc": "Sorted ascending",
     "shareMarket.sortDesc": "Sorted descending",
@@ -2516,8 +2519,6 @@ export const messages = {
     "dashboard.connectDialog.apiKey": "API Key",
     "dashboard.connectDialog.loginRequired": "Sign in to view the API Key",
     "dashboard.connectDialog.loginAction": "Sign in",
-    "dashboard.connectDialog.forbidden":
-      "No permission — only the Share owner or an authorized user can view the API Key",
     "dashboard.connectDialog.requestAccess": "Request access",
     "dashboard.connectDialog.copy": "Copy",
     "dashboard.connectDialog.copyOk": "Copied",
@@ -2541,7 +2542,8 @@ export const messages = {
     "dashboard.connectDialog.test.schedulingRecovered": "Scheduling recovered",
     "dashboard.connectDialog.test.notBound": "App not bound to this share",
     "dashboard.connectDialog.test.needAuth": "Sign in to test",
-    "dashboard.connectDialog.test.needPermission": "No permission",
+    "dashboard.connectDialog.test.needPermission":
+      "Your account is not authorized to call this Share",
     "dashboard.connectDialog.test.probeUnavailable":
       "Test model unavailable; upgrade or resync cc-switch-server",
     "dashboard.connectDialog.test.modelApiCall": "Model API call",
@@ -3055,6 +3057,7 @@ export const messages = {
     "shareMarket.workspace.rentals": "我的租用",
     "shareMarket.workspace.selling": "我的挂售",
     "shareMarket.workspace.rentalsHint": "使用、核对或归还你明确租用的 Share 拼车位。",
+    "shareMarket.rentals.attention": "需处理",
     "shareMarket.workspace.sellingHint": "发布 Share 拼车位并管理挂售与租约。",
     "shareMarket.workspace.noListings": "暂无 Share 挂售。",
     "shareMarket.catalog.subtitle":
@@ -3178,6 +3181,8 @@ export const messages = {
     "shareMarket.col.tokens": "Token",
     "shareMarket.col.amount": "价格",
     "shareMarket.col.status": "状态",
+    "shareMarket.col.ended": "结束时间",
+    "shareMarket.col.note": "备注",
     "shareMarket.sortBy": "按 {column} 排序",
     "shareMarket.sortAsc": "升序",
     "shareMarket.sortDesc": "降序",
@@ -3224,7 +3229,7 @@ export const messages = {
     "shareMarket.parallel": "并发限制",
     "shareMarket.parallelShort": "并发 {value}",
     "shareMarket.tokens": "Token 限额",
-    "shareMarket.tokensMillions": "Token 限额（M）",
+    "shareMarket.tokensMillions": "Token 限额（百万）",
     "shareMarket.period": "Token 周期",
     "shareMarket.tokenPeriod": "Token 限额周期",
     "shareMarket.rent": "租用",
@@ -3341,7 +3346,7 @@ export const messages = {
       "该失败拼车位会从挂售中隐藏；租用、账务、控制和审计历史都会保留。",
     "shareMarket.error.positiveInteger": "{field} 必须是正整数。",
     "shareMarket.error.positiveMillions":
-      "{field} 必须是正数百万 Token（M），且最多保留 6 位小数。",
+      "{field} 必须是正数百万 Token（百万），且最多保留 6 位小数。",
     "shareMarket.error.price": "价格必须大于 0，且最多保留两位小数。",
     "shareMarket.error.priceRange": "每日价格不能超过 USD 1,000,000.00。",
     "shareMarket.error.currency": "币种仅支持 USD。",
@@ -5403,8 +5408,6 @@ export const messages = {
     "dashboard.connectDialog.apiKey": "API Key",
     "dashboard.connectDialog.loginRequired": "登录后查看 API Key",
     "dashboard.connectDialog.loginAction": "登录",
-    "dashboard.connectDialog.forbidden":
-      "没有权限——仅 Share Owner 或已授权用户可查看 API Key",
     "dashboard.connectDialog.requestAccess": "申请加入",
     "dashboard.connectDialog.copy": "复制",
     "dashboard.connectDialog.copyOk": "已复制",
@@ -5425,7 +5428,7 @@ export const messages = {
     "dashboard.connectDialog.test.schedulingRecovered": "已恢复调度",
     "dashboard.connectDialog.test.notBound": "该 share 未绑定此 app",
     "dashboard.connectDialog.test.needAuth": "登录后可测试",
-    "dashboard.connectDialog.test.needPermission": "没有权限",
+    "dashboard.connectDialog.test.needPermission": "当前账号没有调用该 Share 的权限",
     "dashboard.connectDialog.test.probeUnavailable":
       "测试模型不可用，请升级或重新同步 cc-switch-server",
     "dashboard.connectDialog.test.modelApiCall": "模型 API 调用",

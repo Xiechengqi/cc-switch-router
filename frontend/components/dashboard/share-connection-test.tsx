@@ -85,12 +85,14 @@ export function ShareConnectionTestRow({
   app,
   apiToken,
   baseUrl,
+  authenticated,
   canExecute,
 }: {
   share: ShareView;
   app: TestApp;
   apiToken: string;
   baseUrl: string;
+  authenticated: boolean;
   canExecute: boolean;
 }) {
   const { t } = useLocaleText();
@@ -160,6 +162,7 @@ export function ShareConnectionTestRow({
   let disabledReason: string | null = null;
   if (!isBound) disabledReason = t("dashboard.connectDialog.test.notBound");
   else if (!probe) disabledReason = t("dashboard.connectDialog.test.probeUnavailable");
+  else if (!authenticated) disabledReason = t("dashboard.connectDialog.test.needAuth");
   else if (!canExecute) disabledReason = t("dashboard.connectDialog.test.needPermission");
 
   const statusColor = result?.response
@@ -172,7 +175,7 @@ export function ShareConnectionTestRow({
 
   if (!isBound) {
     return (
-      <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 px-3 py-2 text-sm">
+      <div className="flex items-center justify-between gap-3 py-2.5 text-sm">
         <span className="flex min-w-0 items-center gap-2">
           <ShareAppLogo app={app} size={14} />
           <span className="font-medium text-slate-700">{SHARE_APP_LABELS[app]}</span>
@@ -183,7 +186,7 @@ export function ShareConnectionTestRow({
   }
 
   return (
-    <div className="grid gap-2.5 rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm">
+    <div className="grid gap-2.5 py-3 text-sm">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
           <ShareAppLogo app={app} size={14} />
@@ -238,36 +241,34 @@ export function ShareConnectionTestRow({
       ) : null}
 
       {refreshMsg ? (
-        <div
-          className={`rounded-lg border px-3 py-2 text-xs ${
-            refreshState === "error"
-              ? "border-red-200 bg-red-50 text-red-700"
-              : "border-emerald-200 bg-emerald-50 text-emerald-700"
+        <p
+          className={`text-xs ${
+            refreshState === "error" ? "text-red-700" : "text-emerald-700"
           }`}
         >
           {refreshState === "error"
             ? t("dashboard.connectDialog.test.refreshUsageError", { message: refreshMsg })
             : t("dashboard.connectDialog.test.refreshUsageOk", { target: refreshMsg })}
-        </div>
+        </p>
       ) : null}
 
       {curlCmd ? (
-        <details className="group rounded-lg border border-slate-200 bg-slate-50/60">
-          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
+        <details className="group">
+          <summary className="flex cursor-pointer list-none items-center gap-2 py-1 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
             <ChevronDown className="h-3.5 w-3.5 shrink-0 -rotate-90 text-slate-400 transition-transform group-open:rotate-0" />
             <span className="min-w-0 flex-1 font-mono">{t("dashboard.connectDialog.test.curlLabel")}</span>
             <InlineCopyButton value={curlCmd} t={t} />
           </summary>
-          <pre className="overflow-x-auto whitespace-pre-wrap break-all border-t border-slate-200 px-3 py-2 font-mono text-[11px] leading-relaxed text-slate-800">
+          <pre className="overflow-x-auto whitespace-pre-wrap break-all py-1.5 font-mono text-[11px] leading-relaxed text-slate-800">
             {curlCmd}
           </pre>
         </details>
       ) : null}
 
       {testState === "error" && errorMsg ? (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+        <p className="text-xs text-red-700">
           {t("dashboard.connectDialog.test.networkError", { message: errorMsg })}
-        </div>
+        </p>
       ) : null}
 
       {result ? (
@@ -295,13 +296,13 @@ export function ShareConnectionTestRow({
           ) : null}
 
           {result.response ? (
-            <details className="group rounded-lg border border-slate-200 bg-slate-50/60">
-              <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
+            <details className="group">
+              <summary className="flex cursor-pointer list-none items-center gap-2 py-1 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
                 <ChevronDown className="h-3.5 w-3.5 shrink-0 -rotate-90 text-slate-400 transition-transform group-open:rotate-0" />
                 <span className="min-w-0 flex-1">{t("dashboard.connectDialog.test.responseToggle")}</span>
                 <InlineCopyButton value={result.response.bodyText} t={t} />
               </summary>
-              <div className="grid gap-3 border-t border-slate-200 px-3 py-2">
+              <div className="grid gap-3 py-1.5">
                 <div className="grid gap-0.5">
                   <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                     {t("dashboard.connectDialog.test.headers")}
@@ -319,7 +320,7 @@ export function ShareConnectionTestRow({
                   <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                     {t("dashboard.connectDialog.test.body")}
                   </span>
-                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-slate-100 bg-white px-2 py-1.5 text-[11px] leading-relaxed text-slate-800">
+                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed text-slate-800">
                     {result.response.bodyText || "(empty)"}
                   </pre>
                   {result.response.bodyTruncated ? (

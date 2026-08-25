@@ -305,6 +305,7 @@ export function ShareMarketWorkspace() {
           nextCursor={visibleSubscriptionCursor}
           loadingMore={loadingMoreSubscriptions}
           onLoadMore={loadMoreSubscriptions}
+          showHeading={false}
         />
       ) : null}
       {authed && workspace === "selling" ? (

@@ -17,14 +17,10 @@ import type { ShareView, UserApiTokenStatus } from "@/lib/types";
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 
 /**
- * P18: 让 dashboard ShareTable 行点击「连接」时打开这个弹窗。
+ * Dashboard Share「连接」弹窗。
  *
- * 状态机（按 useAuth().session?.authenticated 与 share.canViewSecret 联动）：
- *   - 未登录   → 提示登录 + 触发 LoginDialog
- *   - 已登录 + canViewSecret 为假 → 「没有权限」 + mailto 申请加入
- *   - 已登录 + canViewSecret 为真 → 拉 /v1/me/api-token，展示前缀脱敏 +
- *     "去账户 → API 密钥 重置" 提示。后端只在 reset 时返回明文，所以这里
- *     不重复 reset 入口，集中在账户页 API 密钥面板。
+ * API Key 是当前登录用户的固定密钥（/v1/me/api-token），与是否为该 Share 的
+ * owner / shareto 无关。canViewSecret 只控制能否对这个 Share 发连接测试。
  */
 export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   share,
@@ -49,17 +45,12 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   }, [share?.subdomain]);
 
   const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
-  // P18.1: 后端 `/v1/me/api-token` 在 user_api_tokens.token_plaintext 列里持久化
-  // 明文（store.rs:10879），任意时刻调用都能拿到 raw token。这里直接展示明文，
-  // 不再加遮罩——share owner 已经过 canViewSecret 校验，复制即用。
   const [apiTokenPlain, setApiTokenPlain] = React.useState<string>("");
   const [tokenError, setTokenError] = React.useState<string>("");
   const [tokenBusy, setTokenBusy] = React.useState(false);
 
-  // 拉一次 token 明文；若后端因为是老库没有 plaintext，apiToken 为空，回落到
-  // prefix 提示去重置。
   React.useEffect(() => {
-    if (!open || !authenticated || !canViewSecret) {
+    if (!open || !authenticated) {
       setToken(null);
       setApiTokenPlain("");
       setTokenError("");
@@ -84,7 +75,7 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, authenticated, canViewSecret]);
+  }, [open, authenticated]);
 
   const apiKeyDisplay = React.useMemo(() => {
     // 优先明文；缺明文（老库没补 plaintext 列）才回落到 prefix + 遮罩 + 提示。
@@ -143,36 +134,51 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                 <ApiKeyRow
                   t={t}
                   state={
-                    loading
+                    loading || (authenticated && tokenBusy)
                       ? "loading"
                       : !authenticated
                         ? "unauth"
-                        : !canViewSecret
-                          ? "forbidden"
-                          : tokenBusy
-                            ? "loading"
-                            : tokenError
-                              ? "error"
-                              : "revealable"
+                        : tokenError
+                          ? "error"
+                          : "revealable"
                   }
                   apiKeyDisplay={apiKeyDisplay}
                   apiKeyIsPlaintext={apiKeyIsPlaintext}
                   tokenError={tokenError}
                   requestLogin={requestLogin}
-                  requestAccessHref={requestAccessHref}
                 />
               </ConnectSection>
               <ConnectSection title={t("dashboard.connectDialog.test.section")}>
-                {shareApps.map((app) => (
-                  <ShareConnectionTestRow
-                    key={`${share.shareId}:${app}:${share.appRuntimes?.[app]?.modelProbe?.healthFingerprint || "no-probe"}`}
-                    share={share}
-                    app={app}
-                    apiToken={apiTokenPlain}
-                    baseUrl={baseUrl}
-                    canExecute={authenticated && canViewSecret}
-                  />
-                ))}
+                {authenticated && !canViewSecret ? (
+                  <p className="text-xs leading-5 text-slate-500">
+                    {t("dashboard.connectDialog.test.needPermission")}
+                    {requestAccessHref ? (
+                      <>
+                        {" · "}
+                        <a
+                          href={requestAccessHref}
+                          className="inline-flex items-center gap-1 font-medium text-slate-700 underline-offset-4 hover:underline"
+                        >
+                          <Mail className="h-3 w-3" />
+                          {t("dashboard.connectDialog.requestAccess")}
+                        </a>
+                      </>
+                    ) : null}
+                  </p>
+                ) : null}
+                <div className="divide-y divide-slate-100">
+                  {shareApps.map((app) => (
+                    <ShareConnectionTestRow
+                      key={`${share.shareId}:${app}:${share.appRuntimes?.[app]?.modelProbe?.healthFingerprint || "no-probe"}`}
+                      share={share}
+                      app={app}
+                      apiToken={apiTokenPlain}
+                      baseUrl={baseUrl}
+                      authenticated={authenticated}
+                      canExecute={authenticated && canViewSecret}
+                    />
+                  ))}
+                </div>
               </ConnectSection>
             </Modal.Body>
             <Modal.Footer className="sticky bottom-0 shrink-0 border-0 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80">
@@ -197,7 +203,7 @@ function ConnectSection({
   children: React.ReactNode;
 }) {
   return (
-    <section className="grid gap-3 rounded-2xl border border-slate-200/80 bg-white p-4">
+    <section className="grid gap-3">
       <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{title}</h3>
       {children}
     </section>
@@ -229,7 +235,6 @@ function BaseUrlRow({
 type ApiKeyState =
   | "loading"
   | "unauth"
-  | "forbidden"
   | "revealable"
   | "error";
 
@@ -240,7 +245,6 @@ function ApiKeyRow({
   apiKeyIsPlaintext,
   tokenError,
   requestLogin,
-  requestAccessHref,
 }: {
   t: ReturnType<typeof useLocaleText>["t"];
   state: ApiKeyState;
@@ -248,7 +252,6 @@ function ApiKeyRow({
   apiKeyIsPlaintext: boolean;
   tokenError: string;
   requestLogin: () => void;
-  requestAccessHref: string | null;
 }) {
   return (
     <div className="grid gap-1">
@@ -268,19 +271,6 @@ function ApiKeyRow({
               {t("dashboard.connectDialog.loginAction")}
             </Button>
           </div>
-        </div>
-      ) : state === "forbidden" ? (
-        <div className="grid gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-          <span>{t("dashboard.connectDialog.forbidden")}</span>
-          {requestAccessHref ? (
-            <a
-              href={requestAccessHref}
-              className="inline-flex w-fit items-center gap-1 text-xs font-semibold text-red-800 underline-offset-4 hover:underline"
-            >
-              <Mail className="h-3 w-3" />
-              {t("dashboard.connectDialog.requestAccess")}
-            </a>
-          ) : null}
         </div>
       ) : state === "error" ? (
         <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
