@@ -1,11 +1,12 @@
 "use client";
 
 import { Button, Card, Drawer, toast } from "@heroui/react";
-import { ArrowRightLeft, ChevronDown, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
+import { ArrowRightLeft, ChevronDown, Copy, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
+import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
@@ -30,7 +31,9 @@ import {
   clientTotalTokensLabel,
   clientTotalTokensUsed,
   ShareEditDialog,
+  ShareEmailUsagePanel,
   ShareModelHealthChecks,
+  ShareProviderRequestsPanel,
   ShareProvidersPanel,
   shareApiParts,
   sortClients,
@@ -842,6 +845,9 @@ export function ClientBoard({
   const connectShareId = connectShare?.shareId || "";
   const currentConnectShare = connectShareId ? shareById.get(connectShareId) || null : null;
   const selectedClientUrl = clientTunnelDisplayUrl(selectedClient?.clientTunnel?.tunnelUrl);
+  const selectedClientSummary = selectedClient
+    ? clientOperationalSummary(selectedClient, sharesForClient(selectedClient))
+    : null;
   const selectedApi = shareApiParts(selectedShare ?? undefined);
 
   React.useEffect(() => {
@@ -1014,40 +1020,61 @@ export function ClientBoard({
             <Drawer.Dialog className={drawerDialogClassName}>
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
               <Drawer.Header>
-                <div>
-                  <Drawer.Heading className="break-all font-mono text-base">{selectedClientUrl || "-"}</Drawer.Heading>
-                  <p className="mt-1 text-sm text-muted-foreground">{clientOwnerEmail(selectedClient)}</p>
+                <div className="flex min-w-0 items-start gap-2 pr-8">
+                  <Drawer.Heading className="min-w-0 flex-1 break-all font-mono text-base leading-6">{selectedClientUrl || "-"}</Drawer.Heading>
+                  {selectedClientUrl ? (
+                    <button
+                      type="button"
+                      aria-label={t("common.copy")}
+                      title={t("common.copy")}
+                      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(selectedClientUrl).then(
+                          () => toast.success(t("common.copySuccess")),
+                          () => toast.danger(t("common.copyFailed")),
+                        );
+                      }}
+                    >
+                      <Copy className="h-3.5 w-3.5" aria-hidden />
+                    </button>
+                  ) : null}
                 </div>
               </Drawer.Header>
               <Drawer.Body className="overflow-y-auto">
                 {selectedClient ? (
                   <div className="grid gap-5">
-                    <OperationalDiagnosis summary={clientOperationalSummary(selectedClient, sharesForClient(selectedClient))} kind="client" removalAt={selectedClient.removalAt} />
-                    <DrawerSection label={t("dashboard.client")}>
-                      <div className="grid gap-1 text-xs text-muted-foreground">
-                        <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
-                        <span>{t("dashboard.owner")}: <strong className="text-foreground">{clientOwnerEmail(selectedClient)}</strong></span>
-                        <span>{t("dashboard.region")}: <strong className="text-foreground" title={clientRegionIpTitle(selectedClient.installation)}>{clientRegionLabel(selectedClient.installation)}</strong></span>
-                        <span>{t("dashboard.version")}: <strong className="font-mono text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
-                        <span>{t("dashboard.online")}: <strong className="text-foreground">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</strong></span>
-                        {selectedClient.removalAt ? (
-                          <span>
-                            {t("dashboard.removalAt")}:{" "}
-                            <strong className="text-rose-700" title={formatDateTime(selectedClient.removalAt)}>
-                              {formatRelativeTime(selectedClient.removalAt, locale)}
-                            </strong>
-                            <span className="text-muted-foreground"> · {formatDateTime(selectedClient.removalAt)}</span>
-                          </span>
-                        ) : null}
-                        <ClientMarketRentalBanner
-                          rental={marketRentals.get(selectedClient.installation.id)}
-                          onChanged={refreshRentalsAndDashboard}
-                          readOnly
-                          resumeRelease={false}
-                          manageHref={clientMarketMineHref(selectedClient.installation.id)}
-                        />
-                      </div>
-                    </DrawerSection>
+                    {selectedClientSummary && !["online", "available"].includes(selectedClientSummary.state) ? (
+                      <OperationalDiagnosis summary={selectedClientSummary} kind="client" removalAt={selectedClient.removalAt} />
+                    ) : null}
+                    <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-xs">
+                      <dt className="text-slate-500">URL</dt>
+                      <dd className="min-w-0 break-all font-mono font-medium text-slate-900">{selectedClientUrl || "-"}</dd>
+                      <dt className="text-slate-500">{t("dashboard.owner")}</dt>
+                      <dd className="min-w-0 break-all font-medium text-slate-900">{clientOwnerEmail(selectedClient)}</dd>
+                      <dt className="text-slate-500">{t("dashboard.region")}</dt>
+                      <dd className="min-w-0 font-medium text-slate-900" title={clientRegionIpTitle(selectedClient.installation)}>{clientRegionLabel(selectedClient.installation)}</dd>
+                      <dt className="text-slate-500">{t("dashboard.version")}</dt>
+                      <dd className="min-w-0 font-mono font-medium text-slate-900">{clientPlatformLabel(selectedClient)}</dd>
+                      <dt className="text-slate-500">{t("dashboard.online")}</dt>
+                      <dd className="min-w-0 font-medium text-slate-900">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</dd>
+                      {selectedClient.removalAt ? (
+                        <>
+                          <dt className="text-rose-700">{t("dashboard.removalAt")}</dt>
+                          <dd className="min-w-0 font-medium text-rose-700" title={formatDateTime(selectedClient.removalAt)}>
+                            {formatRelativeTime(selectedClient.removalAt, locale)}
+                            <span className="ml-1 font-normal text-slate-500">· {formatDateTime(selectedClient.removalAt)}</span>
+                          </dd>
+                        </>
+                      ) : null}
+                    </dl>
+                    <ClientMarketRentalBanner
+                      rental={marketRentals.get(selectedClient.installation.id)}
+                      onChanged={refreshRentalsAndDashboard}
+                      readOnly
+                      resumeRelease={false}
+                      manageHref={clientMarketMineHref(selectedClient.installation.id)}
+                    />
+                    <ClientOnlineHeatmap installationId={selectedClient.installation.id} />
                     <DrawerSection label={t("dashboard.linkedShares")}>
                       <ClientLinkedSharesPanel shares={sharesForClient(selectedClient)} onEdit={openEditShare} t={t} />
                     </DrawerSection>
@@ -1081,6 +1108,8 @@ export function ClientBoard({
                       <ShareProvidersPanel share={selectedShare} />
                     </DrawerSection>
                     <ShareModelHealthHeatmap shareId={selectedShare.shareId} />
+                    {selectedShare ? <ShareEmailUsagePanel key={selectedShare.shareId} share={selectedShare} /> : null}
+                    {selectedShare ? <ShareProviderRequestsPanel key={`${selectedShare.shareId}:requests`} share={selectedShare} /> : null}
                     <DrawerSection label={t("dashboard.modelHealthChecks")}>
                       <ShareModelHealthChecks checks={selectedShare.recentModelHealthChecks || []} />
                     </DrawerSection>

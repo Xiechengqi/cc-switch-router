@@ -1620,6 +1620,21 @@ export type ShareModelHealthProbeEpoch = {
   evidenceVersion: number;
 };
 
+export type ClientOnlineCalendarDay = {
+  date: string;
+  onlineMinutes: number;
+  observedMinutes: number;
+  onlineRate?: number;
+};
+
+export type ClientOnlineCalendar = {
+  installationId: string;
+  timezone: "UTC" | string;
+  startDate: string;
+  endDate: string;
+  days: ClientOnlineCalendarDay[];
+};
+
 export type ShareModelHealthCalendar = {
   shareId: string;
   timezone: "UTC" | string;

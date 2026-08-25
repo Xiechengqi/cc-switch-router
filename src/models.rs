@@ -3193,6 +3193,26 @@ pub struct ShareModelHealthProbeEpoch {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClientOnlineCalendarDay {
+    pub date: String,
+    pub online_minutes: u32,
+    pub observed_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientOnlineCalendarResponse {
+    pub installation_id: String,
+    pub timezone: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub days: Vec<ClientOnlineCalendarDay>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareModelHealthCalendarResponse {
     pub share_id: String,
     pub timezone: String,

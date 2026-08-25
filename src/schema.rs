@@ -107,6 +107,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         28,
         include_str!("../schema/0028_share_model_health_evidence.sql"),
     ),
+    (
+        29,
+        include_str!("../schema/0029_installation_online_days.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

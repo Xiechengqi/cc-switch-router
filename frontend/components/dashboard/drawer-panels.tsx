@@ -3,7 +3,6 @@
 import { Eye, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
-import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -458,38 +457,6 @@ export function shareAccessLabel(share: ShareView, t: TFn) {
     : t("dashboard.freeAccessDisabled");
 }
 
-export function ShareSummaryItem({
-  share,
-  onEdit,
-  t,
-}: {
-  share: ShareView;
-  onEdit: (share: ShareView) => void;
-  t: TFn;
-}) {
-  const api = shareApiParts(share);
-  const support = shareSupportLabel(share);
-  const owner = share.ownerEmail || "-";
-  return (
-    <li className="grid max-w-full gap-1 rounded-md border border-default/40 bg-white/70 px-2 py-1.5">
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <strong className="min-w-0 break-all font-mono text-xs text-foreground">
-          {api.apiUrl}
-        </strong>
-        <ShareStatusBadge share={share} t={t} />
-        <ShareEditAction share={share} onEdit={onEdit} t={t} />
-      </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
-        <span className="truncate" title={owner}>
-          {owner}
-        </span>
-        <span>{support || t("dashboard.noProviders")}</span>
-        <span>{shareAccessLabel(share, t)}</span>
-      </div>
-    </li>
-  );
-}
-
 export function Info({
   label,
   value,
@@ -546,16 +513,42 @@ export function ClientLinkedSharesPanel({
   if (!shares.length)
     return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
   return (
-    <ul className="grid gap-2">
-      {shares.map((share) => (
-        <ShareSummaryItem
-          key={share.shareId}
-          share={share}
-          onEdit={onEdit}
-          t={t}
-        />
-      ))}
-    </ul>
+    <div className="overflow-hidden rounded-lg border border-slate-200">
+      <table className="w-full table-fixed border-collapse text-xs">
+        <colgroup>
+          <col />
+          <col className="w-[5.5rem]" />
+          <col className="w-16" />
+        </colgroup>
+        <thead className="bg-slate-50 text-left text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-500">
+          <tr>
+            <th className="px-3 py-2">{t("dashboard.publicUrl")}</th>
+            <th className="px-2 py-2">{t("dashboard.status")}</th>
+            <th className="px-2 py-2 text-right">{t("common.actions")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {shares.map((share) => {
+            const api = shareApiParts(share);
+            return (
+              <tr key={share.shareId} className="border-t border-slate-100">
+                <td className="px-3 py-2">
+                  <span className="block min-w-0 break-all font-mono text-[11px] leading-4 text-slate-900">
+                    {api.apiUrl}
+                  </span>
+                </td>
+                <td className="px-2 py-2 align-middle">
+                  <ShareStatusBadge share={share} t={t} />
+                </td>
+                <td className="px-2 py-2 text-right align-middle">
+                  <ShareEditAction share={share} onEdit={onEdit} t={t} />
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -632,96 +625,6 @@ export function providerRuntime(
 
 export function providerMetaLabel(provider: ShareAppProvider) {
   return [provider.kind, provider.providerType].filter(Boolean).join(" · ");
-}
-
-export function ProviderCard({
-  providers,
-  appRuntimes,
-  t,
-  locale,
-  supportedApps,
-}: {
-  providers: Partial<Record<CoreShareApp, ShareAppProvider>>;
-  appRuntimes: ShareAppRuntimes | undefined;
-  t: TFn;
-  locale: AppLocale;
-  supportedApps?: CoreShareApp[];
-}) {
-  const entries = PROVIDER_APPS.flatMap(({ key: app }) => {
-    const provider = providers[app];
-    if (!provider) return [];
-    return [
-      {
-        app,
-        provider,
-        runtime: mergeStandaloneOAuthRuntime(
-          providerRuntime(provider),
-          appRuntimes,
-          provider,
-        ),
-      },
-    ];
-  });
-  const primary = entries[0];
-  if (!primary) return null;
-  const { provider, runtime } = primary;
-  const endpoint = runtimeEndpointSummary(runtime);
-  const meta = providerMetaLabel(provider);
-  const accountLevel = providerAccountLevel(runtime, locale);
-  const accountIdentity = providerAccountIdentity(runtime);
-  const apps = supportedApps?.length
-    ? supportedApps
-    : normalizeProviderApps(provider);
-  const modelLines = entries.map((entry) => ({
-    key: entry.app,
-    label: SHARE_APP_LABELS[entry.app],
-    text: providerModelMap(
-      entry.runtime,
-      t("dashboard.modelPolicyPassthrough"),
-    ),
-  }));
-  return (
-    <div className="rounded-lg border bg-background p-3">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="truncate text-sm font-semibold">
-            {provider.name || provider.id}
-          </div>
-          <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
-            {provider.id}
-          </div>
-        </div>
-        {apps.length ? (
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
-            {apps.map((app) => (
-              <ShareAppLogo key={app} app={app} size={14} />
-            ))}
-          </div>
-        ) : null}
-      </div>
-      <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
-        {meta ? <div className="break-words">{meta}</div> : null}
-        {endpoint ? <div className="break-words">{endpoint}</div> : null}
-        <div className="break-words">{accountLevel}</div>
-        <div className="break-words">{accountIdentity}</div>
-      </div>
-      <div className="mt-2 grid gap-1.5 border-t pt-2 text-xs">
-        {modelLines.map((line) => (
-          <div key={line.key} className="flex min-w-0 items-center gap-2">
-            <span className="shrink-0 font-semibold text-foreground">
-              {line.label}
-            </span>
-            <span
-              className="min-w-0 truncate text-muted-foreground"
-              title={line.text}
-            >
-              {line.text}
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 function shareProviderStatusView({
@@ -826,10 +729,6 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
           })}
         </div>
       )}
-      {share ? <ShareEmailUsagePanel key={share.shareId} share={share} /> : null}
-      {share ? (
-        <ShareProviderRequestsPanel key={share.shareId} share={share} />
-      ) : null}
     </div>
   );
 }
@@ -1701,16 +1600,23 @@ export function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
       ) : (
         <div className="grid gap-2">
           {merged.map((item) => {
-            return (
-              <ProviderCard
-                key={item.key}
-                providers={item.providers}
-                appRuntimes={runtimes}
-                t={t}
-                locale={locale}
-                supportedApps={item.supportedApps}
-              />
+            const share = shares.find((entry) =>
+              PROVIDER_APPS.some(({ key }) => item.providers[key] && entry.appProviders?.[key]),
             );
+            const view = shareProviderStatusView({
+              share,
+              providers: item.providers,
+              appRuntimes: runtimes,
+              t,
+              locale,
+            });
+            return view ? (
+              <ShareProviderStatusPanel
+                key={item.key}
+                view={view}
+                wrapPrimaryLine
+              />
+            ) : null;
           })}
         </div>
       )}

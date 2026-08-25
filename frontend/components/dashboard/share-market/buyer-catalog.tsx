@@ -199,8 +199,29 @@ function SeatPreview({ seat, onSelect }: { seat: ShareMarketSeat; onSelect: () =
   );
 }
 
+function shouldOpenListingCard(
+  event: React.MouseEvent<HTMLElement>,
+  pointerDown: { x: number; y: number } | null,
+) {
+  if (pointerDown) {
+    const deltaX = Math.abs(event.clientX - pointerDown.x);
+    const deltaY = Math.abs(event.clientY - pointerDown.y);
+    if (deltaX > 4 || deltaY > 4) return false;
+  }
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed && selection.toString().trim()) {
+    return false;
+  }
+  const target = event.target as HTMLElement | null;
+  if (target?.closest("button,a,input,textarea,[data-no-row-drawer]")) {
+    return false;
+  }
+  return true;
+}
+
 function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing; focused: boolean; onOpen: (seat?: ShareMarketSeat) => void }) {
   const { locale, t } = useLocaleText();
+  const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
   const idle = listing.seats.filter(isSeatIdle);
   const preview = catalogSeatPreview(listing.seats);
   const ttft = listing.performance.averageTtftMs == null ? "-" : `${(listing.performance.averageTtftMs / 1_000).toFixed(2)}s`;
@@ -214,13 +235,21 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
     <article
       id={`share-market-catalog-${listing.shareId}`}
       className={cn(
-        "grid min-h-[15rem] min-w-0 scroll-mt-20 grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border bg-white p-3 shadow-sm transition-[border-color,box-shadow] hover:border-primary/35",
+        "grid min-h-[15rem] min-w-0 cursor-pointer scroll-mt-20 select-text grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border bg-white p-3 shadow-sm transition-[border-color,box-shadow] hover:border-primary/35",
         focused
           ? "border-primary ring-2 ring-primary/20"
           : listing.shareOnline
             ? "border-slate-200"
             : "border-rose-200",
       )}
+      onMouseDown={(event) => {
+        pointerDownRef.current = { x: event.clientX, y: event.clientY };
+      }}
+      onClick={(event) => {
+        if (!shouldOpenListingCard(event, pointerDownRef.current)) return;
+        pointerDownRef.current = null;
+        onOpen();
+      }}
     >
       <header className="flex min-w-0 items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
@@ -229,16 +258,12 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
             title={listing.shareOnline ? listing.shareStatus : t("shareMarket.blockReason.share_offline")}
           />
           <ListingProviderLogos listing={listing} />
-          <button type="button" className="min-w-0 rounded text-left active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
-            <strong className="block truncate font-mono text-xs font-semibold text-foreground" title={subdomain}>{subdomain}</strong>
-          </button>
+          <strong className="min-w-0 truncate font-mono text-xs font-semibold text-foreground" title={subdomain}>{subdomain}</strong>
           {listing.subdomain ? <SubdomainCopyButton subdomain={listing.subdomain} /> : null}
         </div>
-        <button type="button" className="shrink-0 rounded text-right active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => onOpen()}>
-          <strong className="whitespace-nowrap text-[11px] font-semibold tabular-nums text-slate-700">
-            {t("shareMarket.catalog.occupancy", { idle: idle.length, total: listing.seats.length })}
-          </strong>
-        </button>
+        <strong className="shrink-0 whitespace-nowrap text-[11px] font-semibold tabular-nums text-slate-700">
+          {t("shareMarket.catalog.occupancy", { idle: idle.length, total: listing.seats.length })}
+        </strong>
       </header>
       <ShareProviderStatusPanel view={providerView} wrapPrimaryLine />
       <div className="min-w-0">
@@ -383,6 +408,18 @@ export function ShareMarketBuyerCatalog({
       });
   }, [availability, catalog.listings, family, query, sort]);
 
+  const familyTabs = React.useMemo(
+    () =>
+      PROVIDER_FAMILY_ORDER.map((value) => ({
+        value,
+        idle: catalog.listings.reduce((sum, listing) => {
+          if (listing.providerFamily !== value && !listing.providerFamilies.includes(value)) return sum;
+          return sum + listingIdleCount(listing);
+        }, 0),
+      })).filter((item) => catalog.listings.some((listing) => listing.providerFamily === item.value || listing.providerFamilies.includes(item.value))),
+    [catalog.listings],
+  );
+
   React.useEffect(() => {
     if (!selected) return;
     const listing = catalog.listings.find((item) => item.id === selected.listing.id);
@@ -478,7 +515,7 @@ export function ShareMarketBuyerCatalog({
   const selectedAction = selected?.seat
     ? seatAction(selected.listing, selected.seat, subscriptions, authed)
     : "unavailable";
-  const activeFilterCount = Number(family !== "all") + Number(availability !== "idle") + Number(sort !== "recommended");
+  const activeFilterCount = Number(availability !== "idle") + Number(sort !== "recommended");
   const quoteRemainingSeconds = rentTarget
     ? Math.max(0, Math.ceil((Date.parse(rentTarget.quote.expiresAt) - quoteNowMs) / 1_000))
     : 0;
@@ -487,17 +524,40 @@ export function ShareMarketBuyerCatalog({
   return (
     <div className="grid min-w-0 gap-4">
       <div className="flex min-w-0 items-center gap-2">
-        <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
-          <Search className="h-4 w-4 shrink-0 text-slate-400" />
-          <input aria-label={t("shareMarket.catalog.searchCompact")} value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none" placeholder={t("shareMarket.catalog.searchCompact")} />
-          {query ? <button type="button" aria-label={t("common.reset")} className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => setQuery("")}><X className="h-4 w-4 text-slate-400" /></button> : null}
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto" role="tablist" aria-label={t("shareMarket.catalog.familyFilter")}>
+          {familyTabs.map((item) => {
+            const selectedFamily = family === item.value;
+            return (
+              <button
+                key={item.value}
+                type="button"
+                role="tab"
+                aria-selected={selectedFamily}
+                title={t("shareMarket.catalog.familyIdleHint", { family: t(PROVIDER_FAMILY_KEYS[item.value]), count: item.idle })}
+                className={cn(
+                  "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+                  selectedFamily
+                    ? "bg-slate-900 font-semibold text-white"
+                    : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
+                )}
+                onClick={() => setFamily(selectedFamily ? "all" : item.value)}
+              >
+                <span>{t(PROVIDER_FAMILY_KEYS[item.value])}</span>
+                <span className={cn("tabular-nums", selectedFamily ? "text-white/80" : "text-slate-400")}>{item.idle}</span>
+              </button>
+            );
+          })}
+        </div>
+        <label className="flex h-9 w-44 shrink-0 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
+          <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+          <input aria-label={t("shareMarket.catalog.searchCompact")} value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent text-xs outline-none" placeholder={t("shareMarket.catalog.searchCompact")} />
+          {query ? <button type="button" aria-label={t("common.reset")} className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => setQuery("")}><X className="h-3.5 w-3.5 text-slate-400" /></button> : null}
         </label>
-        <details className="group relative">
-          <summary className="flex h-10 cursor-pointer list-none items-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary">
-            <Filter className="h-4 w-4" />{t("shareMarket.catalog.filters")}{activeFilterCount ? ` ${activeFilterCount}` : ""}<ChevronDown className="h-3.5 w-3.5 group-open:rotate-180" />
+        <details className="group relative shrink-0">
+          <summary className="flex h-9 cursor-pointer list-none items-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 bg-white px-2.5 text-sm font-medium text-slate-700 shadow-sm active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary">
+            <Filter className="h-3.5 w-3.5" />{t("shareMarket.catalog.filters")}{activeFilterCount ? ` ${activeFilterCount}` : ""}<ChevronDown className="h-3.5 w-3.5 group-open:rotate-180" />
           </summary>
           <div className="absolute right-0 z-30 mt-2 grid w-72 gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-xl">
-            <CompactSelect value={family} options={[{ value: "all", label: t("shareMarket.catalog.allFamilies") }, ...PROVIDER_FAMILY_ORDER.map((value) => ({ value, label: t(PROVIDER_FAMILY_KEYS[value]) }))]} onChange={(value) => setFamily(value as ShareMarketProviderFamily | "all")} ariaLabel={t("shareMarket.catalog.familyFilter")} className="w-full" />
             <label className="flex items-center justify-between text-sm text-slate-700">
               {t("shareMarket.catalog.onlyRentable")}
               <input type="checkbox" checked={availability === "idle"} onChange={(event) => setAvailability(event.target.checked ? "idle" : "all")} />
@@ -532,22 +592,13 @@ export function ShareMarketBuyerCatalog({
             <Drawer.Header>
               <div className="min-w-0 pr-10">
                 <Drawer.Heading className="truncate text-base">{selected?.listing.shareName}</Drawer.Heading>
-                <p className="mt-1 truncate font-mono text-xs text-slate-500">{selected?.listing.subdomain}</p>
               </div>
             </Drawer.Header>
             <Drawer.Body className="overflow-y-auto pb-28">
               {selected ? (
                 <div className="grid gap-5">
-                  <ShareModelHealthHeatmap shareId={selected.listing.shareId} />
                   <section className="grid gap-3">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.chooseSeat")}</h3>
-                      <span className="text-xs text-slate-400">{t("shareMarket.catalog.idleSeats", { count: listingIdleCount(selected.listing) })}</span>
-                    </div>
-                    {selected.listing.seats.map((seat) => <SeatChoice key={seat.id} seat={seat} selected={selected.seat?.id === seat.id} onSelect={() => setSelected({ ...selected, seat })} />)}
-                  </section>
-                  <section className="grid gap-3 border-t border-slate-200 pt-4">
-                    <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.appCapabilities")}</h3>
+                    <h3 className="text-xs font-semibold uppercase text-slate-500">{t("dashboard.providers")}</h3>
                     <ShareProviderStatusPanel
                       view={marketProviderStatusView(selected.listing, locale, {
                         unknown: t("shareMarket.catalog.providerUnknown"),
@@ -555,8 +606,7 @@ export function ShareMarketBuyerCatalog({
                       })}
                     />
                   </section>
-                  <section className="grid gap-3 border-t border-slate-200 pt-4">
-                    <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.serviceQuality")}</h3>
+                  <section className="grid gap-3">
                     <dl className="grid grid-cols-3 gap-3">
                       <Metric label="TTFT" value={selected.listing.performance.averageTtftMs == null ? "-" : `${(selected.listing.performance.averageTtftMs / 1_000).toFixed(2)}s`} />
                       <Metric label="TPS" value={selected.listing.performance.averageTps == null ? "-" : selected.listing.performance.averageTps.toFixed(1)} />
@@ -568,7 +618,15 @@ export function ShareMarketBuyerCatalog({
                         : t("shareMarket.catalog.coverageInsufficient", { count: selected.listing.reliability.observedMinutes24h })}
                     </p>
                   </section>
-                  <section className="grid gap-3 border-t border-slate-200 pt-4">
+                  <ShareModelHealthHeatmap shareId={selected.listing.shareId} />
+                  <section className="grid gap-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.chooseSeat")}</h3>
+                      <span className="text-xs text-slate-400">{t("shareMarket.catalog.idleSeats", { count: listingIdleCount(selected.listing) })}</span>
+                    </div>
+                    {selected.listing.seats.map((seat) => <SeatChoice key={seat.id} seat={seat} selected={selected.seat?.id === seat.id} onSelect={() => setSelected({ ...selected, seat })} />)}
+                  </section>
+                  <section className="grid gap-3">
                     <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.seller")}</h3>
                     <div className="flex min-w-0 items-center gap-2 text-sm"><UserRound className="h-4 w-4 text-slate-400" /><span className="min-w-0 break-all font-medium">{selected.listing.ownerEmail}</span><PaymentMethodIcons kinds={selected.listing.paymentMethodKinds} /></div>
                     <ProviderContactsList contacts={selected.listing.contacts} />

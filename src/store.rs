@@ -42,7 +42,8 @@ use crate::models::{
     AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate, AuthSession, AuthUser,
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse, CapacityAppAvailability,
     CapacityAppAvailabilityEntry, ChangeInstallationOwnerEmailRequest,
-    ChangeInstallationOwnerEmailResponse, ClientMetadata, ClientTunnelClaimRequest,
+    ChangeInstallationOwnerEmailResponse, ClientMetadata, ClientOnlineCalendarDay,
+    ClientOnlineCalendarResponse, ClientTunnelClaimRequest,
     ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
     ClientTunnelView, ClientWebRequestEmailCodeRequest, ClientWebVerifyEmailCodeRequest,
     CountryBoard, CountryClientBoard, CountryMapPoint, CountryShareBoard,
@@ -121,6 +122,7 @@ const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
 const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
 const HEALTH_TIMELINE_BUCKETS: usize = 48;
 const HEALTH_TIMELINE_BUCKET_SECS: i64 = 30 * 60;
+const INSTALLATION_ONLINE_DAY_RETENTION_DAYS: i64 = 400;
 const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
 const SHARE_PRUNE_MAX_IDS: usize = 10_000;
 const SHARE_PRUNE_MAX_ID_BYTES: usize = 512;
@@ -11800,12 +11802,260 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("insert installation route health failed: {e}")))?;
+        record_installation_online_day_minute_conn(&conn, installation_id, now, status)?;
         conn.execute(
             "DELETE FROM installation_health_checks WHERE checked_at < ?1",
             params![now - 86_400],
         )
         .map_err(|e| AppError::Internal(format!("prune installation route health failed: {e}")))?;
+        prune_installation_online_days_conn(&conn, now)?;
         Ok(())
+    }
+
+    pub async fn can_view_client_online_calendar(
+        &self,
+        installation_id: &str,
+        viewer_email: Option<&str>,
+        is_admin: bool,
+    ) -> Result<bool, AppError> {
+        if is_admin {
+            return Ok(self.installation_exists(installation_id).await?);
+        }
+        let Some(viewer_email) = viewer_email.map(str::trim).filter(|email| !email.is_empty())
+        else {
+            return Ok(false);
+        };
+        let conn = self.conn.lock().await;
+        let owns_installation = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM installations
+                    WHERE id = ?1
+                      AND owner_email IS NOT NULL
+                      AND LOWER(TRIM(owner_email)) = LOWER(?2)
+                      AND owner_verified_at IS NOT NULL
+                 )",
+                params![installation_id, viewer_email],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read Client online calendar owner failed: {error}"))
+            })?;
+        if owns_installation != 0 {
+            return Ok(true);
+        }
+        let owns_tunnel = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM installation_client_tunnels
+                    WHERE installation_id = ?1
+                      AND LOWER(TRIM(owner_email)) = LOWER(?2)
+                 )",
+                params![installation_id, viewer_email],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read Client online calendar tunnel failed: {error}"))
+            })?;
+        if owns_tunnel != 0 {
+            return Ok(true);
+        }
+        let shares_exist = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM shares WHERE installation_id = ?1)",
+                params![installation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read Client online calendar shares failed: {error}"))
+            })?;
+        if shares_exist == 0 {
+            return Ok(false);
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        let mut statement = conn
+            .prepare(
+                "SELECT COALESCE(owner_email, ''), COALESCE(user_grants_json, '{}')
+                 FROM shares WHERE installation_id = ?1",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare Client online calendar grants failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![installation_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query Client online calendar grants failed: {error}"))
+            })?;
+        for row in rows {
+            let (owner_email, grants_json) = row.map_err(|error| {
+                AppError::Internal(format!("read Client online calendar grant failed: {error}"))
+            })?;
+            let grants = parse_share_user_grants(Some(grants_json)).map_err(|error| {
+                AppError::Internal(format!("parse Client online calendar grants failed: {error}"))
+            })?;
+            if owner_email.eq_ignore_ascii_case(viewer_email) {
+                return Ok(true);
+            }
+            if grants.iter().any(|(email, grant)| {
+                grant.active
+                    && grant.role == "shareto"
+                    && grant
+                        .policy
+                        .expires_at
+                        .is_none_or(|expires_at| expires_at > now_ms)
+                    && (email.eq_ignore_ascii_case(viewer_email)
+                        || grant.email.eq_ignore_ascii_case(viewer_email))
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn client_online_calendar(
+        &self,
+        installation_id: &str,
+        days: u16,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ClientOnlineCalendarResponse>, AppError> {
+        let days = days.clamp(1, 400);
+        let today = now.date_naive();
+        let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
+        let start_day = start_date.to_string();
+        let end_day = today.to_string();
+        let conn = self.conn.lock().await;
+        let created_at = conn
+            .query_row(
+                "SELECT created_at FROM installations WHERE id = ?1",
+                params![installation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read Client online calendar target failed: {error}"))
+            })?;
+        let Some(created_at) = created_at else {
+            return Ok(None);
+        };
+        let created_day = DateTime::parse_from_rfc3339(&created_at)
+            .ok()
+            .map(|value| value.with_timezone(&Utc).date_naive().to_string())
+            .unwrap_or_else(|| start_day.clone());
+        let mut statement = conn
+            .prepare(
+                "SELECT day_utc, online_minutes, observed_minutes
+                 FROM installation_online_days
+                 WHERE installation_id = ?1 AND day_utc >= ?2 AND day_utc <= ?3
+                 ORDER BY day_utc ASC",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare Client online calendar failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![installation_id, start_day, end_day], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query Client online calendar failed: {error}"))
+            })?;
+        let mut by_day = HashMap::<String, (u32, u32)>::new();
+        for row in rows {
+            let (day, online_minutes, observed_minutes) = row.map_err(|error| {
+                AppError::Internal(format!("read Client online calendar day failed: {error}"))
+            })?;
+            by_day.insert(
+                day,
+                (
+                    u32::try_from(online_minutes.max(0)).unwrap_or(0),
+                    u32::try_from(observed_minutes.max(0)).unwrap_or(0),
+                ),
+            );
+        }
+        let mut recent_statement = conn
+            .prepare(
+                "SELECT checked_at / 60 AS minute,
+                        MAX(CASE WHEN status = 'healthy' THEN 1 ELSE 0 END) AS healthy
+                 FROM installation_health_checks
+                 WHERE installation_id = ?1
+                   AND status IN ('healthy', 'unhealthy')
+                 GROUP BY minute",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare recent Client online minutes failed: {error}"))
+            })?;
+        let recent_rows = recent_statement
+            .query_map(params![installation_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query recent Client online minutes failed: {error}"))
+            })?;
+        let mut recent_by_day = HashMap::<String, (u32, u32)>::new();
+        for row in recent_rows {
+            let (minute, healthy) = row.map_err(|error| {
+                AppError::Internal(format!("read recent Client online minute failed: {error}"))
+            })?;
+            let day = utc_day_key(minute * 60);
+            let entry = recent_by_day.entry(day).or_insert((0, 0));
+            entry.1 = entry.1.saturating_add(1);
+            if healthy != 0 {
+                entry.0 = entry.0.saturating_add(1);
+            }
+        }
+        for (day, minutes) in recent_by_day {
+            match by_day.get(&day).copied() {
+                Some(existing) if existing.1 >= minutes.1 => {}
+                _ => {
+                    by_day.insert(day, minutes);
+                }
+            }
+        }
+        let mut calendar_days = Vec::new();
+        let mut cursor = start_date;
+        while cursor <= today {
+            let date = cursor.to_string();
+            if date >= created_day {
+                let (online_minutes, observed_minutes) =
+                    by_day.get(&date).copied().unwrap_or((0, 0));
+                calendar_days.push(ClientOnlineCalendarDay {
+                    date,
+                    online_minutes,
+                    observed_minutes,
+                    online_rate: if observed_minutes > 0 {
+                        Some((f64::from(online_minutes) / f64::from(observed_minutes)) * 100.0)
+                    } else {
+                        None
+                    },
+                });
+            }
+            cursor += Duration::days(1);
+        }
+        Ok(Some(ClientOnlineCalendarResponse {
+            installation_id: installation_id.to_string(),
+            timezone: "UTC".into(),
+            start_date: start_day,
+            end_date: end_day,
+            days: calendar_days,
+        }))
+    }
+
+    async fn installation_exists(&self, installation_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM installations WHERE id = ?1)",
+            params![installation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|error| AppError::Internal(format!("read installation existence failed: {error}")))
     }
 
     pub async fn record_share_model_health_check(
@@ -20622,6 +20872,84 @@ fn list_observed_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>
         map.insert(share_id, observed_minutes.min(ONLINE_WINDOW_MINUTES));
     }
     Ok(map)
+}
+
+fn utc_day_key(timestamp: i64) -> String {
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch"))
+        .date_naive()
+        .to_string()
+}
+
+fn record_installation_online_day_minute_conn(
+    conn: &Connection,
+    installation_id: &str,
+    checked_at: i64,
+    status: RouteHealthStatus,
+) -> Result<(), AppError> {
+    if !matches!(
+        status,
+        RouteHealthStatus::Healthy | RouteHealthStatus::Unhealthy
+    ) {
+        return Ok(());
+    }
+    let day = utc_day_key(checked_at);
+    let minute = checked_at.div_euclid(60);
+    let observed_in_minute: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM installation_health_checks
+             WHERE installation_id = ?1
+               AND checked_at / 60 = ?2
+               AND status IN ('healthy', 'unhealthy')",
+            params![installation_id, minute],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("read Client online minute uniqueness failed: {error}"))
+        })?;
+    let healthy_in_minute: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM installation_health_checks
+             WHERE installation_id = ?1
+               AND checked_at / 60 = ?2
+               AND status = 'healthy'",
+            params![installation_id, minute],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("read Client online minute health failed: {error}"))
+        })?;
+    let first_observation = observed_in_minute == 1;
+    let first_healthy = matches!(status, RouteHealthStatus::Healthy) && healthy_in_minute == 1;
+    if !first_observation && !first_healthy {
+        return Ok(());
+    }
+    let online_delta = i64::from(first_healthy);
+    let observed_delta = i64::from(first_observation);
+    conn.execute(
+        "INSERT INTO installation_online_days (
+            installation_id, day_utc, online_minutes, observed_minutes
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(installation_id, day_utc) DO UPDATE SET
+            online_minutes = installation_online_days.online_minutes + excluded.online_minutes,
+            observed_minutes = installation_online_days.observed_minutes + excluded.observed_minutes",
+        params![installation_id, day, online_delta, observed_delta],
+    )
+    .map_err(|error| AppError::Internal(format!("upsert Client online day failed: {error}")))?;
+    Ok(())
+}
+
+fn prune_installation_online_days_conn(conn: &Connection, now: i64) -> Result<(), AppError> {
+    let cutoff = DateTime::<Utc>::from_timestamp(now, 0)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch"))
+        .date_naive()
+        - Duration::days(INSTALLATION_ONLINE_DAY_RETENTION_DAYS);
+    conn.execute(
+        "DELETE FROM installation_online_days WHERE day_utc < ?1",
+        params![cutoff.to_string()],
+    )
+    .map_err(|error| AppError::Internal(format!("prune Client online days failed: {error}")))?;
+    Ok(())
 }
 
 fn list_installation_health_checks(
@@ -42567,6 +42895,90 @@ mod tests {
         assert_eq!(share.recent_model_health_checks.len(), 1);
         assert_eq!(share.recent_model_health_checks[0].source, source);
         assert_eq!(share.recent_model_health_checks[0].checked_at, now);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_online_calendar_counts_unique_observed_minutes() {
+        let (store, config) = setup_store("client-online-calendar-minutes").await;
+        insert_installation(&store, "inst-online").await;
+        let now = Utc::now();
+        store
+            .record_installation_route_health(
+                "inst-online",
+                RouteHealthStatus::Healthy,
+                "ok",
+                "epoch",
+            )
+            .await
+            .expect("healthy probe");
+        store
+            .record_installation_route_health(
+                "inst-online",
+                RouteHealthStatus::Healthy,
+                "ok",
+                "epoch",
+            )
+            .await
+            .expect("duplicate minute stays unique");
+        store
+            .record_installation_route_health(
+                "inst-online",
+                RouteHealthStatus::Unknown,
+                "reconnecting",
+                "epoch",
+            )
+            .await
+            .expect("unknown probe ignored");
+        let calendar = store
+            .client_online_calendar("inst-online", 2, now)
+            .await
+            .expect("calendar")
+            .expect("calendar present");
+        let today = calendar
+            .days
+            .iter()
+            .find(|day| day.date == now.date_naive().to_string())
+            .expect("today");
+        assert_eq!(today.observed_minutes, 1);
+        assert_eq!(today.online_minutes, 1);
+        assert_eq!(today.online_rate, Some(100.0));
+        assert!(
+            store
+                .can_view_client_online_calendar("inst-online", Some("owner@example.com"), false)
+                .await
+                .expect("owner can view")
+        );
+        assert!(
+            !store
+                .can_view_client_online_calendar("inst-online", Some("stranger@example.com"), false)
+                .await
+                .expect("stranger cannot view")
+        );
+        assert!(
+            store
+                .can_view_client_online_calendar("inst-online", Some("stranger@example.com"), true)
+                .await
+                .expect("admin can view")
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_online_calendar_hides_days_before_install() {
+        let (store, config) = setup_store("client-online-calendar-created").await;
+        insert_installation(&store, "inst-new").await;
+        let now = Utc::now();
+        let calendar = store
+            .client_online_calendar("inst-new", 7, now)
+            .await
+            .expect("calendar")
+            .expect("calendar present");
+        assert_eq!(calendar.days.len(), 1);
+        assert_eq!(calendar.days[0].date, now.date_naive().to_string());
+        assert_eq!(calendar.days[0].observed_minutes, 0);
 
         let _ = std::fs::remove_file(&config.database.path);
     }

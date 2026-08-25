@@ -61,7 +61,7 @@ use crate::models::{
     ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptorBatchSyncResponse,
     ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
-    ShareHeartbeatRequest, ShareModelHealthCalendarResponse, SharePendingEditsRequest,
+    ShareHeartbeatRequest, ClientOnlineCalendarResponse, ShareModelHealthCalendarResponse, SharePendingEditsRequest,
     SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogBatchSyncResponse,
     ShareRequestLogEntry, ShareRuntimeRefreshRequest, ShareSettingsPatch,
     ShareSettingsUpdateRequest, ShareSyncRequest, SubdomainAvailabilityResponse,
@@ -173,6 +173,12 @@ struct ShareUsageByEmailQuery {
 
 #[derive(Debug, Deserialize)]
 struct ShareModelHealthCalendarQuery {
+    #[serde(default)]
+    days: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientOnlineCalendarQuery {
     #[serde(default)]
     days: Option<u16>,
 }
@@ -419,6 +425,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/model-health-calendar",
             get(get_share_model_health_calendar),
+        )
+        .route(
+            "/v1/clients/:installation_id/online-calendar",
+            get(get_client_online_calendar),
         )
         .route(
             "/v1/shares/:share_id/refresh-usage",
@@ -6934,6 +6944,36 @@ async fn get_share_model_health_calendar(
         .share_model_health_calendar(&share_id, query.days.unwrap_or(365), Utc::now())
         .await?
         .ok_or_else(|| AppError::NotFound("Share model health calendar not found".into()))?;
+    Ok(Json(calendar))
+}
+
+async fn get_client_online_calendar(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(installation_id): Path<String>,
+    Query(query): Query<ClientOnlineCalendarQuery>,
+) -> Result<Json<ClientOnlineCalendarResponse>, AppError> {
+    let viewer_email = extract_session_email(&state, &headers).await?;
+    let is_admin = {
+        let dynamic = state.dynamic.read().await;
+        viewer_email
+            .as_deref()
+            .is_some_and(|email| dynamic.is_admin(email))
+    };
+    if !state
+        .store
+        .can_view_client_online_calendar(&installation_id, viewer_email.as_deref(), is_admin)
+        .await?
+    {
+        return Err(AppError::NotFound(
+            "Client online calendar not found".into(),
+        ));
+    }
+    let calendar = state
+        .store
+        .client_online_calendar(&installation_id, query.days.unwrap_or(365), Utc::now())
+        .await?
+        .ok_or_else(|| AppError::NotFound("Client online calendar not found".into()))?;
     Ok(Json(calendar))
 }
 
