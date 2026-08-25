@@ -18,6 +18,8 @@ import type {
   ShareUserLimitStatusResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
+  UserModelRoutingResponse,
+  ReplaceUserModelRoutingRequest,
   NotificationSettings,
   TelegramBindLink,
   AccountUsagePeriod,
@@ -372,6 +374,22 @@ export async function getUserApiToken() {
 export async function resetUserApiToken() {
   return parseJson<UserApiTokenResetResponse>(
     await authFetch("/v1/me/api-token/reset", { method: "POST" }),
+  );
+}
+
+export async function getUserModelRouting() {
+  return parseJson<UserModelRoutingResponse>(
+    await authFetch("/v1/me/model-routing", { cache: "no-store" }),
+  );
+}
+
+export async function replaceUserModelRouting(input: ReplaceUserModelRoutingRequest) {
+  return parseJson<UserModelRoutingResponse>(
+    await authFetch("/v1/me/model-routing", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
   );
 }
 

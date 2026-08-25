@@ -57,26 +57,30 @@ use crate::models::{
     PublicNetworkStatsResponse, RefreshSessionRequest, RegisterAuthDeviceRequest,
     RegisterAuthDeviceResponse, RegisterGatewayRequest, RegisterGatewayResponse,
     RegisterInstallationRequest, RegisterInstallationResponse, RenewLeaseRequest,
-    RenewLeaseResponse, ReportInstallationStatusRequest, ReportInstallationStatusResponse,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse,
-    ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptorBatchSyncResponse,
-    ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
-    ShareHeartbeatRequest, ShareModelHealthCalendarResponse, SharePendingEditsRequest,
-    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogBatchSyncResponse,
-    ShareRequestLogEntry, ShareRuntimeRefreshRequest, ShareSettingsPatch,
-    ShareSettingsUpdateRequest, ShareSyncRequest, SubdomainAvailabilityResponse,
-    TelegramBindLinkResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
-    UpdateNotificationSettingsRequest, UpdateUsageCardSettingsRequest, UpgradeInstallationRequest,
-    UpgradeInstallationResponse, UpgradeInstallationStatusResponse, UsageCardSettingsResponse,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
+    RenewLeaseResponse, ReplaceUserModelRoutingRequest, ReportInstallationStatusRequest,
+    ReportInstallationStatusResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
+    ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareDescriptorBatchSyncResponse, ShareEditAckRequest, ShareEditAvailableEvent,
+    ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareModelHealthCalendarResponse,
+    SharePendingEditsRequest, SharePruneRequest, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogBatchSyncResponse, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
+    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
+    SubdomainAvailabilityResponse, TelegramBindLinkResponse, TunnelActivateRequest,
+    TunnelStateRequest, TunnelStateResponse, UpdateNotificationSettingsRequest,
+    UpdateUsageCardSettingsRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
+    UpgradeInstallationStatusResponse, UsageCardSettingsResponse, UserApiTokenResetResponse,
+    UserApiTokenResponse, UserModelRoutingResponse, UserSharesResponse, VerifyEmailCodeRequest,
     VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
     route_reconnect_grace, validate_notification_cleanup_window,
 };
-use crate::proxy::{ReleasedShareRequest, RouteAvailability, gateway_proxy_handler, proxy_handler};
+use crate::proxy::{
+    ReleasedShareRequest, RouteAvailability, gateway_proxy_handler, is_user_model_api_host,
+    proxy_handler, user_model_proxy_handler, with_unified_api_cors,
+};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
@@ -373,6 +377,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/me/api-token", get(get_default_api_token))
         .route("/v1/me/api-token/reset", post(reset_default_api_token))
         .route(
+            "/v1/me/model-routing",
+            get(get_my_model_routing).put(replace_my_model_routing),
+        )
+        .route(
             "/v1/me/usage-card",
             get(get_my_usage_card_settings).patch(update_my_usage_card_settings),
         )
@@ -575,18 +583,37 @@ async fn ip_blacklist_middleware(
     req: Request,
     next: Next,
 ) -> Response {
+    let is_user_model_api =
+        is_user_model_api_host(request_host(&req).as_str(), &state.config.tunnel_domain);
     // Telegram's webhook senders live in ranges the operator does not control
     // and cannot enumerate; a blacklist entry that happens to cover one would
     // break account binding silently. The route carries its own authentication
     // (the `setWebhook` secret header), so exempting it costs nothing.
-    if req.uri().path() == crate::telegram::service::WEBHOOK_PATH {
+    if !is_user_model_api && req.uri().path() == crate::telegram::service::WEBHOOK_PATH {
         return next.run(req).await;
     }
     if let Some(ip) = source_ip_from_request(&req)
         && state.dynamic.read().await.is_ip_blacklisted(ip)
     {
         state.ip_blacklist_stats.record(ip, req.uri().path());
-        return (StatusCode::FORBIDDEN, "IP blacklisted").into_response();
+        let response = (StatusCode::FORBIDDEN, "IP blacklisted").into_response();
+        return if is_user_model_api {
+            with_unified_api_cors(response)
+        } else {
+            response
+        };
+    }
+    if is_user_model_api {
+        if req.uri().path() == "/v1/healthz" && matches!(*req.method(), Method::GET | Method::HEAD)
+        {
+            return with_unified_api_cors(next.run(req).await);
+        }
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0)
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        return user_model_proxy_handler(State(state), ConnectInfo(peer), req).await;
     }
     next.run(req).await
 }
@@ -2687,6 +2714,41 @@ async fn reset_default_api_token(
 ) -> Result<Json<UserApiTokenResetResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
     Ok(Json(state.store.reset_default_api_token(&email).await?))
+}
+
+async fn get_my_model_routing(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<UserModelRoutingResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
+    Ok(Json(
+        state
+            .store
+            .get_user_model_routing(&state.config, &email, &active_subdomains)
+            .await?,
+    ))
+}
+
+async fn replace_my_model_routing(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ReplaceUserModelRoutingRequest>,
+) -> Result<Json<UserModelRoutingResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
+    Ok(Json(
+        state
+            .store
+            .replace_user_model_routing(
+                &state.config,
+                &email,
+                input.expected_revision,
+                input.routes,
+                &active_subdomains,
+            )
+            .await?,
+    ))
 }
 
 async fn my_shares(

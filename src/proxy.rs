@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -32,7 +32,7 @@ use crate::proxy_stream::{
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{
     AppStore, IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE, NewImageGenerationRequestLog,
-    ShareForTest, image_result_path,
+    ShareForTest, UserApiTokenPrincipal, image_result_path,
 };
 
 const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -2387,6 +2387,412 @@ fn gateway_header<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| crate::error::AppError::Unauthorized(format!("missing {name} header")))
+}
+
+pub(crate) fn is_user_model_api_host(host: &str, tunnel_domain: &str) -> bool {
+    subdomain_for_host(host, tunnel_domain).as_deref() == Some("api")
+}
+
+pub async fn user_model_proxy_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    with_unified_api_cors(user_model_proxy_handler_inner(state, peer, req).await)
+}
+
+async fn user_model_proxy_handler_inner(
+    state: ServerState,
+    peer: SocketAddr,
+    req: Request,
+) -> Response {
+    let (mut parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let path = parts.uri.path().to_string();
+
+    if method == axum::http::Method::OPTIONS {
+        return unified_api_preflight_response(&parts.headers);
+    }
+    if path == "/v1/healthz" {
+        return simple_response(StatusCode::METHOD_NOT_ALLOWED, "method-not-allowed");
+    }
+
+    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
+    let user_ip = client_metadata.ip.unwrap_or_else(|| peer.ip().to_string());
+    if let Some(remaining) = state.abuse.ban_remaining(&user_ip).await {
+        let retry_after_secs = remaining.as_secs().max(1);
+        let mut response = unified_api_error_response(
+            StatusCode::FORBIDDEN,
+            "user_model_route_client_banned",
+            "client is temporarily banned",
+            serde_json::json!({ "retryAfterSeconds": retry_after_secs }),
+        );
+        if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+
+    let principal = match authenticate_user_model_request(&state, &parts.headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    if method == axum::http::Method::GET {
+        if let Some(app_type) = unified_model_list_app(&path, &parts.headers) {
+            return match state
+                .store
+                .list_user_model_names(&principal.user_id, app_type)
+                .await
+            {
+                Ok(models) => unified_model_list_response(app_type, models),
+                Err(error) => error.into_response(),
+            };
+        }
+    }
+
+    let Some(app_type) = infer_user_model_request_app(&path) else {
+        return unified_api_error_response(
+            StatusCode::NOT_FOUND,
+            "user_model_route_path_unsupported",
+            "this path is not available on the unified API host",
+            serde_json::json!({ "path": path }),
+        );
+    };
+    if method != axum::http::Method::POST {
+        return unified_api_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "user_model_route_method_not_allowed",
+            "this inference endpoint requires POST",
+            serde_json::json!({ "path": path }),
+        );
+    }
+
+    let body_bytes = match read_proxy_request_body(
+        body,
+        proxy_request_body_limit(&path, &state.config.proxy_stream),
+        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(ProxyRequestBodyReadError::Timeout) => {
+            state.metrics.record_proxy_request_body_timeout();
+            return unified_api_error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "user_model_route_request_body_timeout",
+                "request body timed out",
+                serde_json::json!({}),
+            );
+        }
+        Err(ProxyRequestBodyReadError::Rejected(_)) => {
+            return unified_api_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "user_model_route_request_body_too_large",
+                "request body is too large",
+                serde_json::json!({}),
+            );
+        }
+    };
+    let requested_model = match extract_user_model_request_model(&app_type, &path, &body_bytes) {
+        Some(model) => model,
+        None => {
+            return unified_api_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "user_model_route_model_required",
+                "a non-empty model is required",
+                serde_json::json!({ "appType": app_type }),
+            );
+        }
+    };
+
+    let resolution = match state
+        .store
+        .resolve_user_model_route(
+            &principal.user_id,
+            &principal.email,
+            &app_type,
+            &requested_model,
+        )
+        .await
+    {
+        Ok(Some(resolution)) => resolution,
+        Ok(None) => {
+            return unified_api_error_response(
+                StatusCode::NOT_FOUND,
+                "user_model_route_not_configured",
+                "no Share is configured for this app and model",
+                serde_json::json!({
+                    "appType": app_type,
+                    "requestedModel": requested_model,
+                }),
+            );
+        }
+        Err(crate::error::AppError::Coded {
+            status,
+            code,
+            message,
+            details,
+        }) => {
+            return unified_api_error_response(status, code, &message, details);
+        }
+        Err(error) => return error.into_response(),
+    };
+
+    let target_active = state
+        .proxy
+        .route_by_share_id(&resolution.target_share_id)
+        .await
+        .is_some_and(|route| route.subdomain() == resolution.subdomain);
+    if !target_active {
+        return unified_api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "user_model_route_target_unavailable",
+            "configured target Share is offline or reconnecting",
+            serde_json::json!({ "targetShareId": resolution.target_share_id }),
+        );
+    }
+
+    let selected_host = format!("{}.{}", resolution.subdomain, state.config.tunnel_domain);
+    let Ok(selected_host) = HeaderValue::from_str(&selected_host) else {
+        return unified_api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "user_model_route_target_unavailable",
+            "configured target Share has an invalid host",
+            serde_json::json!({ "targetShareId": resolution.target_share_id }),
+        );
+    };
+    parts.headers.insert(header::HOST, selected_host);
+    // The regional Router session cookie is scoped to the tunnel domain. The
+    // unified inference host is API-key-only, so never let an explicitly
+    // credentialed browser request carry that session into a selected Share.
+    parts.headers.remove(header::COOKIE);
+    let request = Request::from_parts(parts, Body::from(body_bytes));
+    proxy_handler(State(state), ConnectInfo(peer), request).await
+}
+
+async fn authenticate_user_model_request(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<UserApiTokenPrincipal, Response> {
+    let Some(token) = crate::api::extract_router_api_token(headers) else {
+        return Err(unified_api_error_response(
+            StatusCode::UNAUTHORIZED,
+            "user_api_token_invalid",
+            "a valid user API key is required",
+            serde_json::json!({}),
+        ));
+    };
+    match state
+        .store
+        .resolve_user_api_token(token, "share:invoke")
+        .await
+    {
+        Ok(Some(principal)) => Ok(principal),
+        Ok(None) | Err(crate::error::AppError::Unauthorized(_)) => Err(unified_api_error_response(
+            StatusCode::UNAUTHORIZED,
+            "user_api_token_invalid",
+            "a valid user API key is required",
+            serde_json::json!({}),
+        )),
+        Err(error) => Err(error.into_response()),
+    }
+}
+
+fn extract_user_model_request_model(app_type: &str, path: &str, body: &[u8]) -> Option<String> {
+    if app_type == "gemini" {
+        let encoded_model = path
+            .split('?')
+            .next()
+            .unwrap_or(path)
+            .split_once("/models/")?
+            .1
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let model = percent_encoding::percent_decode_str(encoded_model)
+            .decode_utf8()
+            .ok()?;
+        return normalize_extracted_user_model(&model);
+    }
+    let payload = serde_json::from_slice::<Value>(body).ok()?;
+    let model = payload.get("model")?.as_str()?;
+    normalize_extracted_user_model(model)
+}
+
+fn normalize_extracted_user_model(model: &str) -> Option<String> {
+    let model = model.trim();
+    (!model.is_empty() && model.chars().count() <= 200 && !model.chars().any(char::is_control))
+        .then(|| model.to_string())
+}
+
+fn infer_user_model_request_app(path: &str) -> Option<String> {
+    let path = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    match path {
+        "v1/messages" => return Some("claude".to_string()),
+        "v1/responses" | "v1/chat/completions" | "v1/completions" | "v1/images/generations" => {
+            return Some("codex".to_string());
+        }
+        _ => {}
+    }
+    let model_action = ["v1beta/models/", "gemini/v1beta/models/", "v1/models/"]
+        .into_iter()
+        .find_map(|prefix| path.strip_prefix(prefix))?;
+    let (model, action) = model_action.rsplit_once(':')?;
+    if model.is_empty()
+        || !matches!(
+            action,
+            "generateContent"
+                | "streamGenerateContent"
+                | "countTokens"
+                | "embedContent"
+                | "batchEmbedContents"
+        )
+    {
+        return None;
+    }
+    Some("gemini".to_string())
+}
+
+fn unified_model_list_app<'a>(path: &str, headers: &'a HeaderMap) -> Option<&'a str> {
+    match path.trim_end_matches('/') {
+        "/v1/models" if headers.contains_key("anthropic-version") => Some("claude"),
+        "/v1/models" => Some("codex"),
+        "/v1beta/models" | "/gemini/v1beta/models" => Some("gemini"),
+        _ => None,
+    }
+}
+
+fn unified_model_list_response(app_type: &str, models: Vec<String>) -> Response {
+    if app_type == "gemini" {
+        return json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "models": models.into_iter().map(|model| serde_json::json!({
+                    "name": format!("models/{model}"),
+                    "displayName": model,
+                    "supportedGenerationMethods": [
+                        "generateContent",
+                        "streamGenerateContent",
+                        "countTokens",
+                        "embedContent",
+                        "batchEmbedContents",
+                    ],
+                })).collect::<Vec<_>>()
+            }),
+        );
+    }
+    if app_type == "claude" {
+        let first_id = models.first().cloned();
+        let last_id = models.last().cloned();
+        return json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "data": models.into_iter().map(|model| serde_json::json!({
+                    "type": "model",
+                    "id": model,
+                    "display_name": model,
+                    "created_at": "1970-01-01T00:00:00Z",
+                })).collect::<Vec<_>>(),
+                "has_more": false,
+                "first_id": first_id,
+                "last_id": last_id,
+            }),
+        );
+    }
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "object": "list",
+            "data": models.into_iter().map(|model| serde_json::json!({
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai-via-cc-switch-router",
+            })).collect::<Vec<_>>()
+        }),
+    )
+}
+
+fn unified_api_error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &str,
+    details: Value,
+) -> Response {
+    let mut response = json_response(
+        status,
+        serde_json::json!({
+            "message": message,
+            "code": code,
+            "details": details,
+            "error": {
+                "message": message,
+                "type": code,
+                "code": code,
+            }
+        }),
+    );
+    response
+        .headers_mut()
+        .insert("x-share-router-error", HeaderValue::from_static("true"));
+    response
+}
+
+pub(crate) fn with_unified_api_cors(mut response: Response) -> Response {
+    response.headers_mut().remove(header::SET_COOKIE);
+    response
+        .headers_mut()
+        .remove(header::ACCESS_CONTROL_ALLOW_CREDENTIALS);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static(
+            "x-request-id, x-cc-switch-request-id, x-cc-switch-error-code, x-cc-switch-error-scope, x-share-router-error",
+        ),
+    );
+    response
+}
+
+fn unified_api_preflight_response(request_headers: &HeaderMap) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    let allow_headers = request_headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .cloned()
+        .unwrap_or_else(|| {
+            HeaderValue::from_static(
+                "authorization, content-type, x-api-key, x-goog-api-key, anthropic-version",
+            )
+        });
+    response
+        .headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
+    );
+    response.headers_mut().append(
+        header::VARY,
+        HeaderValue::from_static("Access-Control-Request-Headers"),
+    );
+    response
 }
 
 pub async fn proxy_handler(
@@ -4999,6 +5405,8 @@ fn infer_share_request_app(path: &str) -> Option<String> {
         || path.starts_with("backend-api/codex/")
         || path.starts_with("v1/chat/")
         || path.starts_with("v1/v1/chat/")
+        || path.starts_with("v1/completions")
+        || path.starts_with("v1/v1/completions")
         || path.starts_with("v1/responses")
         || path.starts_with("v1/v1/responses")
         || path.starts_with("v1/images/generations")
@@ -6751,6 +7159,7 @@ mod tests {
             "/v1/chat/completions",
             "/v1/v1/chat/completions",
             "/chat/completions",
+            "/v1/completions",
             "/v1/responses",
             "/responses",
             "/codex/v1/responses",
@@ -6767,6 +7176,279 @@ mod tests {
             assert_eq!(infer_share_request_app(path).as_deref(), Some("gemini"));
         }
         assert_eq!(infer_share_request_app("/v1/models").as_deref(), None);
+    }
+
+    #[test]
+    fn unified_user_api_host_matching_is_exact() {
+        assert!(is_user_model_api_host("api.example.com", "example.com"));
+        assert!(is_user_model_api_host(
+            "api.example.com:8787",
+            "example.com:8787"
+        ));
+        assert!(!is_user_model_api_host("share.example.com", "example.com"));
+        assert!(!is_user_model_api_host(
+            "api.example.com:8788",
+            "example.com:8787"
+        ));
+        assert!(!is_user_model_api_host(
+            "api.example.com.evil.test",
+            "example.com"
+        ));
+        assert!(!is_user_model_api_host(
+            "nested.api.example.com",
+            "example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unified_user_api_honors_existing_client_bans_before_authentication() {
+        let config = proxy_test_config("unified-client-ban");
+        let state = proxy_test_state(&config, Arc::new(ProxyRegistry::default()));
+        for _ in 0..10 {
+            let _ = state.abuse.record_invalid_auth("127.0.0.1").await;
+        }
+        let response = user_model_proxy_handler(
+            State(state),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345)),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("host", format!("api.{}", config.tunnel_domain))
+                .body(Body::from(r#"{"model":"gpt-5.6"}"#))
+                .expect("build unified request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read unified ban response");
+        let payload: Value = serde_json::from_slice(&body).expect("parse unified ban response");
+        assert_eq!(payload["code"], "user_model_route_client_banned");
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[test]
+    fn unified_user_api_extracts_exact_json_and_gemini_path_models() {
+        assert_eq!(
+            extract_user_model_request_model(
+                "codex",
+                "/v1/responses",
+                br#"{"model":" GPT-5.6 ","input":"hello"}"#,
+            )
+            .as_deref(),
+            Some("GPT-5.6")
+        );
+        assert_eq!(
+            extract_user_model_request_model(
+                "claude",
+                "/v1/messages",
+                br#"{"model":"claude-sonnet","messages":[]}"#,
+            )
+            .as_deref(),
+            Some("claude-sonnet")
+        );
+        assert_eq!(
+            extract_user_model_request_model(
+                "gemini",
+                "/v1beta/models/gemini-3-pro:streamGenerateContent",
+                b"{}",
+            )
+            .as_deref(),
+            Some("gemini-3-pro")
+        );
+        assert_eq!(
+            extract_user_model_request_model(
+                "gemini",
+                "/v1beta/models/publishers%2Fgoogle%2Fgemini%3Apro%3Fx:generateContent",
+                b"{}",
+            )
+            .as_deref(),
+            Some("publishers/google/gemini:pro?x")
+        );
+        assert!(
+            extract_user_model_request_model("codex", "/v1/responses", br#"{"model":"   "}"#,)
+                .is_none()
+        );
+        assert!(
+            extract_user_model_request_model("codex", "/v1/responses", br#"{"model":42}"#,)
+                .is_none()
+        );
+        assert!(
+            extract_user_model_request_model("gemini", "/v1beta/models/:generateContent", b"{}",)
+                .is_none()
+        );
+        assert!(
+            extract_user_model_request_model(
+                "gemini",
+                "/v1beta/models/%FF:generateContent",
+                b"{}",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unified_user_api_accepts_only_explicit_inference_paths() {
+        for (path, expected) in [
+            ("/v1/messages", "claude"),
+            ("/v1/responses", "codex"),
+            ("/v1/chat/completions", "codex"),
+            ("/v1/completions", "codex"),
+            ("/v1/images/generations", "codex"),
+            (
+                "/v1beta/models/gemini-3-pro:streamGenerateContent",
+                "gemini",
+            ),
+            ("/gemini/v1beta/models/gemini-3-pro:countTokens", "gemini"),
+            ("/v1/models/text-embedding-004:embedContent", "gemini"),
+        ] {
+            assert_eq!(
+                infer_user_model_request_app(path).as_deref(),
+                Some(expected),
+                "explicit inference path must stay available: {path}"
+            );
+        }
+        for path in [
+            "/v1/responses-anything",
+            "/v1/messages-batch",
+            "/v1/chat/internal",
+            "/v1beta/admin",
+            "/v1beta/models/gemini-3-pro:unknownAction",
+            "/anthropic/v1/messages",
+            "/share-api/context",
+        ] {
+            assert_eq!(
+                infer_user_model_request_app(path),
+                None,
+                "non-inference path must stay isolated: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unified_model_lists_select_protocol_without_exposing_other_paths() {
+        let mut anthropic = HeaderMap::new();
+        anthropic.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        assert_eq!(
+            unified_model_list_app("/v1/models", &anthropic),
+            Some("claude")
+        );
+        assert_eq!(
+            unified_model_list_app("/v1/models/", &HeaderMap::new()),
+            Some("codex")
+        );
+        assert_eq!(
+            unified_model_list_app("/v1beta/models", &HeaderMap::new()),
+            Some("gemini")
+        );
+        assert_eq!(
+            unified_model_list_app("/v1/me/model-routing", &HeaderMap::new()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_model_lists_use_provider_native_envelopes() {
+        async fn response_json(response: Response) -> Value {
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("read model list response");
+            serde_json::from_slice(&body).expect("parse model list response")
+        }
+
+        let claude = response_json(unified_model_list_response(
+            "claude",
+            vec!["claude-sonnet".to_string()],
+        ))
+        .await;
+        assert_eq!(claude["data"][0]["type"], "model");
+        assert_eq!(claude["data"][0]["display_name"], "claude-sonnet");
+        assert_eq!(claude["has_more"], false);
+        assert_eq!(claude["first_id"], "claude-sonnet");
+        assert!(claude.get("object").is_none());
+
+        let codex = response_json(unified_model_list_response(
+            "codex",
+            vec!["gpt-5.6".to_string()],
+        ))
+        .await;
+        assert_eq!(codex["object"], "list");
+        assert_eq!(codex["data"][0]["object"], "model");
+        assert_eq!(codex["data"][0]["owned_by"], "openai-via-cc-switch-router");
+        assert!(codex.get("has_more").is_none());
+
+        let gemini = response_json(unified_model_list_response(
+            "gemini",
+            vec!["text-embedding-004".to_string()],
+        ))
+        .await;
+        assert_eq!(gemini["models"][0]["name"], "models/text-embedding-004");
+        assert!(
+            gemini["models"][0]["supportedGenerationMethods"]
+                .as_array()
+                .is_some_and(|methods| methods.iter().any(|method| method == "embedContent"))
+        );
+    }
+
+    #[test]
+    fn unified_api_cors_is_consistent_for_preflight_and_actual_responses() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static("authorization, x-stainless-lang"),
+        );
+        let preflight = with_unified_api_cors(unified_api_preflight_response(&request_headers));
+        assert_eq!(
+            preflight.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            Some(&HeaderValue::from_static("authorization, x-stainless-lang"))
+        );
+
+        let mut actual = unified_api_error_response(
+            StatusCode::NOT_FOUND,
+            "user_model_route_not_configured",
+            "not configured",
+            serde_json::json!({}),
+        );
+        actual.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("should-not-cross=1"),
+        );
+        actual.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+        let actual = with_unified_api_cors(actual);
+        assert_eq!(
+            actual.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+        assert!(
+            actual
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        );
+        assert_eq!(
+            actual.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert!(!actual.headers().contains_key(header::SET_COOKIE));
+        assert!(
+            !actual
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        );
     }
 
     #[test]

@@ -462,7 +462,77 @@ Server 通过签名接口 `POST /v1/share-request-logs/batch-sync` 上送同一 
 
 ---
 
-## 9. 身份注入:IngressContext
+## 9. 用户统一模型入口
+
+每个 Router 区域保留 `api.<tunnel_domain>` 作为所有用户共用的可选推理入口。它与 `<share-subdomain>.<tunnel_domain>` 直连并存，不创建第三种 tunnel，也不改变 Server 协议。`api` 是 namespace 保留标签，不能被 Client / Share claim。
+
+### 9.1 配置控制面
+
+`GET /v1/me/model-routing` 与 `PUT /v1/me/model-routing` 只接受 Router 用户 Session，不接受普通 API Key 代替浏览器 Session。响应包含：
+
+| 字段 | 语义 |
+|---|---|
+| `apiBaseUrl` | 当前区域统一入口，例如 `https://api.example.com` |
+| `enabled` | 当前用户是否至少配置一条 route；它不是区域 host 的部署开关 |
+| `revision` / `updatedAt` | 用户 profile 的乐观并发版本与最后修改时间 |
+| `routes[]` | 当前精确映射及稳定 route ID / 时间戳 |
+| `eligibleShares[]` | 当前用户可选的 Owner、有效 ShareTo 或 Free Share，以及其已开启 App、直连 URL 和在线状态 |
+
+`PUT` body 是 `{ expectedRevision, routes }`，整组 routes 在一个 Immediate 事务中原子替换；revision 不匹配返回 `409 model_routing_revision_conflict`，不会部分保存。最多 100 条。映射键固定为 `(appType, requestedModel)`，其中 `appType` 只允许 `claude | codex | gemini`，模型名 trim 后长度为 1–200、禁止控制字符并按 Unicode 字符串精确区分大小写。同一键只能指向一个 Share。每次有效替换保存完整审计快照，并按用户只保留最近 100 个 revision，避免控制面反复保存造成无界存储增长。
+
+创建或改变目标时，Router 要求调用方当前对 Share 具备 Owner、active 且未过期的 canonical `role=shareto` grant，或 Share 已开启 `freeAccess`，同时目标必须绑定并开启所选 App。原封不动保留的旧映射允许随整组草稿保存，即使其 Share 已删除、权限已撤销或 App 已关闭；这是为了让用户删除或修复其他映射，不代表失效目标仍可调用。Share 删除不会级联删除映射。
+
+### 9.2 推理与模型列表
+
+统一 host 接受以下用户 API Key 形式，三者按 `Authorization`、`x-api-key`、`x-goog-api-key` 的顺序解析，Token 必须带 `share:invoke` scope：
+
+```text
+Authorization: Bearer <router-user-api-key>
+x-api-key: <router-user-api-key>
+x-goog-api-key: <router-user-api-key>
+```
+
+公开 `GET/HEAD /v1/healthz` 不要求 Key。除 CORS `OPTIONS` 外，其余统一入口能力必须先通过 API Key 鉴权：
+
+| App | 统一 Host 允许的完整推理路径白名单 | requested model 来源 | 模型列表 |
+|---|---|---|---|
+| Claude | `POST /v1/messages` | JSON body 的非空字符串 `model` | `GET /v1/models` 且带 `anthropic-version` |
+| Codex/OpenAI | `POST /v1/responses`、`POST /v1/chat/completions`、`POST /v1/completions`、`POST /v1/images/generations` | JSON body 的非空字符串 `model` | `GET /v1/models`，不带 `anthropic-version` |
+| Gemini | `POST /v1beta/models/:model:{action}`、`POST /gemini/v1beta/models/:model:{action}`、`POST /v1/models/:model:{action}`；`action` 仅允许 `generateContent`、`streamGenerateContent`、`countTokens`、`embedContent`、`batchEmbedContents` | URL 中 `/models/` 后、动作冒号前的模型段做 UTF-8 percent decode 后得到的非空值 | `GET /v1beta/models` 或 `/gemini/v1beta/models` |
+
+上述表格是穷举白名单，不是示例或前缀匹配规则。即使某条路径可在 Share 直连入口使用，只要没有列在这里，也不能经统一 Host 转发。
+
+Router 先从协议路径确定 App，再用 `(user_id, app, exact requested model)` 查询唯一目标。没有映射直接失败；绝不做模型改写、默认 Share、按在线状态选 Share、模糊/大小写匹配、fallback 或跨 Share retry。找到映射后仍在当前数据库快照中重新检查 Share 存在性、App 开启状态和用户 ACL，再确认相同 Share ID 的活动内存路由，最后把请求交给既有 `proxy_handler`。后者会再次执行 Share edge ACL、并发、请求体限制、IngressContext、流式生命周期和响应清洗。
+
+模型列表只枚举该用户为对应 App 配置的 requested model 名称并使用供应商兼容 envelope；它不汇总 Share 的上游模型 catalog，也不代表目标此刻在线或仍获授权。真正调用始终按上一段重新校验并 fail closed。
+
+选中 Share 后，请求与直连走同一 Share 数据路径。Server 和日志不获得独立的“统一入口资源”身份；请求记录、usage、并发、地图归因、模型健康、限额及市场账务仍落在目标 Share。首页地图和 Share 侧边栏因此保持 Share 粒度。
+
+### 9.3 错误、Host 隔离与 CORS
+
+路由选择层的错误使用稳定 JSON envelope：顶层 `message` / `code` / `details`，并同时提供 OpenAI 兼容的 `error.message` / `error.type` / `error.code`。响应带 `x-share-router-error: true`。目标 Share 一旦选中，真实上游响应和既有 Share 本地错误继续按第 10.2 节原样返回，不按状态码重写。
+
+| HTTP | 稳定 code | 条件 |
+|---:|---|---|
+| 401 | `user_api_token_invalid` | Key 缺失、失效或 scope 不足 |
+| 403 | `user_model_route_client_banned` | 调用 IP 已被 Router 的短期滥用防护封禁；按 `Retry-After` 重试 |
+| 404 | `user_model_route_path_unsupported` | 统一 host 上的非白名单路径 |
+| 405 | `user_model_route_method_not_allowed` | 推理路径不是 POST |
+| 408 | `user_model_route_request_body_timeout` | 请求体读取超时 |
+| 413 | `user_model_route_request_body_too_large` | 命中 Router 对应请求体上限 |
+| 422 | `user_model_route_model_required` | 无法取得非空 requested model |
+| 404 | `user_model_route_not_configured` | 精确键没有映射 |
+| 403 | `user_model_route_unauthorized` | 映射目标的用户权限已失效 |
+| 409 | `user_model_route_app_unavailable` | 目标不再绑定或开启该 App |
+| 503 | `user_model_route_target_unavailable` | Share 记录、subdomain 或活动路由不可用 |
+
+Host 判断必须精确匹配 `api.<tunnel_domain>`（含配置中的端口语义），`nested.api...`、后缀拼接域名或不同端口都不能进入该分支。该 host 不提供 Dashboard、Session 控制面、Share Web、Client Web、`/_ctl/*` 或 `/_share-router/*`；未知路径不得落回静态 UI/catch-all。
+
+所有统一入口实际响应带 `Access-Control-Allow-Origin: *`、`Cache-Control: no-store` 并暴露公开 request/error headers。`OPTIONS` 无需 Key，返回 `204`、`GET, POST, OPTIONS`，并回显浏览器请求的 `Access-Control-Request-Headers`；不启用 credentialed cookies。DNS/证书必须覆盖 `api.<tunnel_domain>`，部署约束见 [README.md](README.md)。
+
+---
+
+## 10. 身份注入:IngressContext
 
 Router 转发到 Server 的每个请求都会剥离客户端可伪造的凭据头(`authorization`、`x-api-key`、`cookie`,见 `src/proxy.rs:2580-2596`),改为注入一个签名的身份上下文。
 
@@ -492,7 +562,7 @@ Router 对所有上游响应无条件剥离 `x-cc-switch-internal-*`。带 typed
 
 滚动发布必须先部署剥离/识别这些内部头的 Router,再部署发送诊断头的 Server；回滚先 Server 后 Router。
 
-### 9.0 请求体上限声明:`x-cc-switch-ingress-body-limit`
+### 10.1 请求体上限声明:`x-cc-switch-ingress-body-limit`
 
 与签名上下文同批注入,但**不参与签名**:值是十进制字节数,等于 Router 为本次请求命中的档位上限(普通 / 视频 / 图片,见 `src/proxy.rs` `proxy_request_body_limit()`)。
 
@@ -505,9 +575,9 @@ Server 侧契约:生效上限取 `min(本地上限, 声明值)`。因此该头�
 
 Server 的本地上限默认取 Router 允许的最大档位,使 Router settings 成为默认的唯一天花板;Server owner 可用 `requestBodyLimits` / `CC_SWITCH_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 主动收紧。
 
-### 9.1 推理身份与本地并发错误
+### 10.2 推理身份与本地并发错误
 
-- Direct Share 使用 Router API Token 解析出的规范化邮箱作为 `IngressContext.userEmail`。
+- Direct Share 与统一模型入口都使用 Router API Token 解析出的规范化邮箱作为 `IngressContext.userEmail`；统一入口选中目标后不创造另一种终端用户身份。
 - Gateway 请求不会伪造终端用户邮箱；Router 仅注入 `dataSource=gateway`、Share/route/request identity 和可信地域字段。不得把 Gateway owner email 当成终端用户身份，也不得只在 Router 做授权后向 Server 签发空用户身份。
 - Gateway 不伪造终端用户邮箱。非免费 Share 缺少 `userEmail` 时由 Server fail closed,返回 `cc_switch_user_identity_required`；`/_share-router/*` 健康探测不进入 Share 用户授权与并发校验。
 - Router 必须剥离调用方提供的 `x-user-email` / `x-user-country*` 等旧身份头；Server 推理上下文只接受签名上下文重新注入的 `x-cc-switch-user-*` 头。
@@ -529,7 +599,7 @@ Router 原样转发 Server 的公开错误头与响应体,不得按状态码重�
 
 ---
 
-## 10. 边界策略
+## 11. 边界策略
 
 Client web 隧道上的路径可达性(`src/proxy.rs`):
 
@@ -547,7 +617,7 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 
 ---
 
-## 11. 协议严格性
+## 12. 协议严格性
 
 - **Epoch 不匹配硬失败**,不降级
 - Client installation 注册只接受 `register_installation` 规范串;auth device 注册只接受 `register_auth_device` 规范串

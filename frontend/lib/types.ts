@@ -511,6 +511,45 @@ export type UserApiTokenResetResponse = {
   token: UserApiTokenStatus;
 };
 
+export type ModelRoutingApp = "claude" | "codex" | "gemini";
+
+export type UserModelRouteInput = {
+  appType: ModelRoutingApp;
+  requestedModel: string;
+  targetShareId: string;
+};
+
+export type UserModelRoute = UserModelRouteInput & {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type UserModelRoutingShare = {
+  shareId: string;
+  shareName: string;
+  subdomain: string;
+  directApiUrl: string;
+  access: "owner" | "shared" | "free" | string;
+  freeAccess: boolean;
+  apps: ModelRoutingApp[];
+  isOnline: boolean;
+};
+
+export type UserModelRoutingResponse = {
+  enabled: boolean;
+  apiBaseUrl: string;
+  revision: number;
+  routes: UserModelRoute[];
+  eligibleShares: UserModelRoutingShare[];
+  updatedAt?: string;
+};
+
+export type ReplaceUserModelRoutingRequest = {
+  expectedRevision: number;
+  routes: UserModelRouteInput[];
+};
+
 export type NotificationChannelSettings = {
   channel: string;
   enabled: boolean;

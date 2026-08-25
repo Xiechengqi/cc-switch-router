@@ -1,7 +1,7 @@
 "use client";
 
-import { Card } from "@heroui/react";
-import { Eye, Link2, Pencil } from "lucide-react";
+import { Card, toast } from "@heroui/react";
+import { Copy, Eye, Link2, Pencil, Plus, Route } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -48,6 +48,7 @@ import { recordDashboardUxEvent } from "@/lib/api";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
+import type { DraftModelRoute } from "@/lib/model-routing";
 
 function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
   const appType = (request.appType || "").trim().toLowerCase();
@@ -87,11 +88,17 @@ export const ShareCard = React.memo(function ShareCard({
   onOpen,
   onEdit,
   onConnect,
+  directApiUrl,
+  modelRoutes = [],
+  onAddModelRoute,
 }: {
   share: ShareView;
   onOpen: (share: ShareView) => void;
   onEdit: (share: ShareView) => void;
   onConnect: (share: ShareView) => void;
+  directApiUrl?: string;
+  modelRoutes?: DraftModelRoute[];
+  onAddModelRoute?: (shareId: string) => void;
 }) {
   const { locale, t } = useLocaleText();
   const focus = useDashboardFocus();
@@ -348,6 +355,71 @@ export const ShareCard = React.memo(function ShareCard({
         </div>
 
         <ShareProviderStatusPanel view={providerPanelView} />
+
+        {directApiUrl ? (
+          <div className="grid min-w-0 gap-1.5 border-t border-slate-100 pt-2">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
+                {t("modelHub.directEndpoint")}
+              </span>
+              <code
+                className="min-w-0 flex-1 truncate text-[10px] text-foreground"
+                title={directApiUrl}
+              >
+                {directApiUrl}
+              </code>
+              <button
+                type="button"
+                data-no-row-drawer
+                className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-slate-100 hover:text-foreground"
+                title={t("common.copy")}
+                aria-label={t("common.copy")}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void navigator.clipboard.writeText(directApiUrl).then(
+                    () => toast.success(t("common.copySuccess")),
+                    () => toast.danger(t("common.copyFailed")),
+                  );
+                }}
+              >
+                <Copy className="h-3 w-3" />
+              </button>
+            </div>
+            <div className="flex min-w-0 items-center gap-1.5">
+              <Route className="h-3 w-3 shrink-0 text-primary" aria-hidden />
+              <div className="flex min-w-0 flex-1 flex-wrap gap-1">
+                {modelRoutes.length ? modelRoutes.map((route) => (
+                  <span
+                    key={route.clientId}
+                    className="max-w-full truncate rounded-md border border-primary/15 bg-primary/5 px-1.5 py-0.5 text-[9px] font-medium text-primary"
+                    title={`${SHARE_APP_LABELS[route.appType]} · ${route.requestedModel || t("modelHub.modelPending")}`}
+                  >
+                    {SHARE_APP_LABELS[route.appType]} · {route.requestedModel || t("modelHub.modelPending")}
+                  </span>
+                )) : (
+                  <span className="truncate text-[10px] text-muted-foreground">
+                    {t("modelHub.noRoutesForShare")}
+                  </span>
+                )}
+              </div>
+              {onAddModelRoute ? (
+                <button
+                  type="button"
+                  data-no-row-drawer
+                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[9px] font-semibold text-primary hover:bg-primary/5"
+                  title={t("modelHub.addRouteForShare")}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onAddModelRoute(share.shareId);
+                  }}
+                >
+                  <Plus className="h-3 w-3" />
+                  {t("modelHub.mapModel")}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
 
         <div className="grid gap-2 text-[11px]">
           <div className="grid grid-cols-2 gap-2">

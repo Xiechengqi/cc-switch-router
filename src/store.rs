@@ -79,7 +79,8 @@ use crate::models::{
     ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareUserPolicy, ShareView,
     SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
     TunnelStateResponse, UpgradeInstallationStatusResponse, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserApiTokenStatus, UserShareView, UserSharesResponse,
+    UserApiTokenResponse, UserApiTokenStatus, UserModelRouteInput, UserModelRouteView,
+    UserModelRoutingResponse, UserModelRoutingShareView, UserShareView, UserSharesResponse,
     VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
@@ -654,6 +655,12 @@ pub struct UserApiTokenPrincipal {
     pub user_id: String,
     pub email: String,
     pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserModelRouteResolution {
+    pub target_share_id: String,
+    pub subdomain: String,
 }
 
 #[derive(Debug, Clone)]
@@ -6770,6 +6777,281 @@ impl AppStore {
         })
     }
 
+    pub async fn get_user_model_routing(
+        &self,
+        config: &Config,
+        current_user_email: &str,
+        active_subdomains: &HashSet<String>,
+    ) -> Result<UserModelRoutingResponse, AppError> {
+        let email = normalize_email(current_user_email)?;
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let user = upsert_user_by_email(&conn, &email, now)?;
+        load_user_model_routing_response(&conn, config, &user.id, &email, active_subdomains)
+    }
+
+    pub async fn replace_user_model_routing(
+        &self,
+        config: &Config,
+        current_user_email: &str,
+        expected_revision: u64,
+        routes: Vec<UserModelRouteInput>,
+        active_subdomains: &HashSet<String>,
+    ) -> Result<UserModelRoutingResponse, AppError> {
+        let email = normalize_email(current_user_email)?;
+        let expected_revision = i64::try_from(expected_revision)
+            .map_err(|_| AppError::BadRequest("model routing revision is too large".into()))?;
+        let routes = normalize_user_model_routes(routes)?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| AppError::Internal(format!("begin model routing update failed: {e}")))?;
+        let user = upsert_user_by_email(&tx, &email, now)?;
+        let (current_revision, profile_created_at) = tx
+            .query_row(
+                "SELECT revision, created_at FROM user_model_routing_profiles WHERE user_id = ?1",
+                params![user.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query model routing profile failed: {e}")))?
+            .map(|(revision, created_at)| (revision, Some(created_at)))
+            .unwrap_or((0, None));
+        if current_revision != expected_revision {
+            return Err(AppError::coded_conflict(
+                "model_routing_revision_conflict",
+                "model routing changed in another session",
+                serde_json::json!({ "currentRevision": current_revision }),
+            ));
+        }
+
+        let existing = list_user_model_routes(&tx, &user.id)?;
+        let current_routes = existing
+            .iter()
+            .map(|route| UserModelRouteInput {
+                app_type: route.app_type.clone(),
+                requested_model: route.requested_model.clone(),
+                target_share_id: route.target_share_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if current_routes == routes {
+            tx.commit().map_err(|e| {
+                AppError::Internal(format!("commit unchanged model routing update failed: {e}"))
+            })?;
+            return load_user_model_routing_response(
+                &conn,
+                config,
+                &user.id,
+                &email,
+                active_subdomains,
+            );
+        }
+        let existing_by_key = existing
+            .into_iter()
+            .map(|route| {
+                (
+                    (route.app_type.clone(), route.requested_model.clone()),
+                    route,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for route in &routes {
+            let unchanged_target = existing_by_key
+                .get(&(route.app_type.clone(), route.requested_model.clone()))
+                .is_some_and(|existing| existing.target_share_id == route.target_share_id);
+            if unchanged_target {
+                continue;
+            }
+            match inspect_model_route_target(&tx, &email, &route.target_share_id, &route.app_type)?
+            {
+                ModelRouteTargetAccess::Eligible { .. } => {}
+                ModelRouteTargetAccess::Missing => {
+                    return Err(model_routing_error(
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        "user_model_route_target_unavailable",
+                        "target Share does not exist",
+                        serde_json::json!({ "targetShareId": route.target_share_id }),
+                    ));
+                }
+                ModelRouteTargetAccess::AppUnavailable => {
+                    return Err(model_routing_error(
+                        axum::http::StatusCode::CONFLICT,
+                        "user_model_route_app_unavailable",
+                        "target Share does not support this app",
+                        serde_json::json!({
+                            "targetShareId": route.target_share_id,
+                            "appType": route.app_type,
+                        }),
+                    ));
+                }
+                ModelRouteTargetAccess::Unauthorized => {
+                    return Err(model_routing_error(
+                        axum::http::StatusCode::FORBIDDEN,
+                        "user_model_route_unauthorized",
+                        "target Share is not authorized for this user",
+                        serde_json::json!({ "targetShareId": route.target_share_id }),
+                    ));
+                }
+            }
+        }
+
+        let next_revision = current_revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::Internal("model routing revision overflow".into()))?;
+        tx.execute(
+            "INSERT INTO user_model_routing_profiles (user_id, revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id) DO UPDATE SET
+                revision = excluded.revision,
+                updated_at = excluded.updated_at",
+            params![
+                user.id,
+                next_revision,
+                profile_created_at.as_deref().unwrap_or(&now_text),
+                now_text,
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("update model routing profile failed: {e}")))?;
+
+        tx.execute(
+            "DELETE FROM user_model_routes WHERE user_id = ?1",
+            params![user.id],
+        )
+        .map_err(|e| AppError::Internal(format!("replace model routes failed: {e}")))?;
+        for route in &routes {
+            let existing =
+                existing_by_key.get(&(route.app_type.clone(), route.requested_model.clone()));
+            tx.execute(
+                "INSERT INTO user_model_routes (
+                    id, user_id, app_type, requested_model, target_share_id, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    existing
+                        .map(|record| record.id.clone())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    user.id,
+                    route.app_type,
+                    route.requested_model,
+                    route.target_share_id,
+                    existing
+                        .map(|record| record.created_at.to_rfc3339())
+                        .unwrap_or_else(|| now_text.clone()),
+                    now_text,
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("insert model route failed: {e}")))?;
+        }
+        let routes_json = serde_json::to_string(&routes)
+            .map_err(|e| AppError::Internal(format!("serialize model routes failed: {e}")))?;
+        tx.execute(
+            "INSERT INTO user_model_route_events (id, user_id, revision, action, routes_json, created_at)
+             VALUES (?1, ?2, ?3, 'replace', ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                user.id,
+                next_revision,
+                routes_json,
+                now_text,
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("audit model routing update failed: {e}")))?;
+        tx.execute(
+            "DELETE FROM user_model_route_events
+             WHERE id IN (
+                SELECT id FROM user_model_route_events
+                WHERE user_id = ?1
+                ORDER BY revision DESC
+                LIMIT -1 OFFSET ?2
+             )",
+            params![user.id, MAX_USER_MODEL_ROUTE_EVENTS_PER_USER as i64],
+        )
+        .map_err(|e| AppError::Internal(format!("prune model routing audit failed: {e}")))?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit model routing update failed: {e}")))?;
+
+        load_user_model_routing_response(&conn, config, &user.id, &email, active_subdomains)
+    }
+
+    pub async fn resolve_user_model_route(
+        &self,
+        user_id: &str,
+        user_email: &str,
+        app_type: &str,
+        requested_model: &str,
+    ) -> Result<Option<UserModelRouteResolution>, AppError> {
+        let email = normalize_email(user_email)?;
+        let app_type = normalize_share_app(app_type)?;
+        let requested_model = normalize_requested_model(requested_model)?;
+        let conn = self.conn.lock().await;
+        let target_share_id = conn
+            .query_row(
+                "SELECT target_share_id
+                 FROM user_model_routes
+                 WHERE user_id = ?1 AND app_type = ?2 AND requested_model = ?3",
+                params![user_id, app_type, requested_model],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("resolve user model route failed: {e}")))?;
+        let Some(target_share_id) = target_share_id else {
+            return Ok(None);
+        };
+        match inspect_model_route_target(&conn, &email, &target_share_id, &app_type)? {
+            ModelRouteTargetAccess::Eligible { subdomain } => Ok(Some(UserModelRouteResolution {
+                target_share_id,
+                subdomain,
+            })),
+            ModelRouteTargetAccess::Missing => Err(model_routing_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "user_model_route_target_unavailable",
+                "configured target Share is unavailable",
+                serde_json::json!({ "targetShareId": target_share_id }),
+            )),
+            ModelRouteTargetAccess::AppUnavailable => Err(model_routing_error(
+                axum::http::StatusCode::CONFLICT,
+                "user_model_route_app_unavailable",
+                "configured target Share no longer supports this app",
+                serde_json::json!({
+                    "targetShareId": target_share_id,
+                    "appType": app_type,
+                }),
+            )),
+            ModelRouteTargetAccess::Unauthorized => Err(model_routing_error(
+                axum::http::StatusCode::FORBIDDEN,
+                "user_model_route_unauthorized",
+                "configured target Share is no longer authorized for this user",
+                serde_json::json!({ "targetShareId": target_share_id }),
+            )),
+        }
+    }
+
+    pub async fn list_user_model_names(
+        &self,
+        user_id: &str,
+        app_type: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let app_type = normalize_share_app(app_type)?;
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT requested_model
+                 FROM user_model_routes
+                 WHERE user_id = ?1 AND app_type = ?2
+                 ORDER BY requested_model ASC",
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("prepare configured model list failed: {e}"))
+            })?;
+        statement
+            .query_map(params![user_id, app_type], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Internal(format!("query configured model list failed: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Internal(format!("read configured model list failed: {e}")))
+    }
+
     /// P18: テスト接続用 — Share owner、canonical grants、接続情報を一度に返す。
     pub async fn get_share_for_test(
         &self,
@@ -7296,79 +7578,10 @@ impl AppStore {
         };
         let app_type = normalize_share_app(app_type)?;
         let conn = self.conn.lock().await;
-        let Some((
-            owner_email,
-            user_grants_json,
-            free_access,
-            enabled_claude,
-            enabled_codex,
-            enabled_gemini,
-        )): Option<(
-            Option<String>,
-            String,
-            bool,
-            i64,
-            i64,
-            i64,
-        )> = conn
-            .query_row(
-                "SELECT owner_email, COALESCE(user_grants_json, '{}'), COALESCE(free_access, 0),
-                        COALESCE(enabled_claude, 0), COALESCE(enabled_codex, 0), COALESCE(enabled_gemini, 0)
-                 FROM shares
-                 WHERE share_id = ?1
-                   AND EXISTS (
-                       SELECT 1 FROM share_bindings
-                       WHERE share_id = ?1 AND app_type = ?2
-                   )",
-                params![share_id, app_type],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| AppError::Internal(format!("query share invoke acl failed: {e}")))?
-        else {
-            return Ok(false);
-        };
-        let app_enabled = match app_type.as_str() {
-            "claude" => enabled_claude != 0,
-            "codex" => enabled_codex != 0,
-            "gemini" => enabled_gemini != 0,
-            _ => false,
-        };
-        if !app_enabled {
-            return Ok(false);
-        }
-        if free_access {
-            return Ok(true);
-        }
-        if owner_email
-            .as_deref()
-            .is_some_and(|owner| owner.eq_ignore_ascii_case(&email))
-        {
-            return Ok(true);
-        }
-        let user_grants: BTreeMap<String, ShareUserGrant> = serde_json::from_str(&user_grants_json)
-            .map_err(|error| {
-                AppError::Internal(format!("parse canonical Share user grants failed: {error}"))
-            })?;
-        let now_ms = Utc::now().timestamp_millis();
-        Ok(user_grants.iter().any(|(key, grant)| {
-            grant.active
-                && grant.role == "shareto"
-                && grant
-                    .policy
-                    .expires_at
-                    .is_none_or(|expires_at| expires_at > now_ms)
-                && (key.eq_ignore_ascii_case(&email) || grant.email.eq_ignore_ascii_case(&email))
-        }))
+        Ok(matches!(
+            inspect_model_route_target(&conn, &email, share_id, &app_type)?,
+            ModelRouteTargetAccess::Eligible { .. }
+        ))
     }
 
     pub async fn share_usage_by_email(
@@ -24226,6 +24439,281 @@ fn user_api_token_status(record: UserApiTokenRecord) -> UserApiTokenStatus {
     }
 }
 
+const MAX_USER_MODEL_ROUTES: usize = 100;
+const MAX_USER_MODEL_ROUTE_EVENTS_PER_USER: usize = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelRouteTargetAccess {
+    Eligible { subdomain: String },
+    Missing,
+    AppUnavailable,
+    Unauthorized,
+}
+
+fn model_routing_error(
+    status: axum::http::StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+    details: serde_json::Value,
+) -> AppError {
+    AppError::Coded {
+        status,
+        code,
+        message: message.into(),
+        details,
+    }
+}
+
+fn normalize_requested_model(value: &str) -> Result<String, AppError> {
+    let model = value.trim();
+    if model.is_empty() {
+        return Err(model_routing_error(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "user_model_route_model_required",
+            "model is required",
+            serde_json::json!({}),
+        ));
+    }
+    if model.chars().count() > 200 || model.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "model must be 200 characters or fewer and contain no control characters".into(),
+        ));
+    }
+    Ok(model.to_string())
+}
+
+fn normalize_user_model_routes(
+    routes: Vec<UserModelRouteInput>,
+) -> Result<Vec<UserModelRouteInput>, AppError> {
+    if routes.len() > MAX_USER_MODEL_ROUTES {
+        return Err(AppError::BadRequest(format!(
+            "at most {MAX_USER_MODEL_ROUTES} model routes may be configured"
+        )));
+    }
+    let mut normalized = Vec::with_capacity(routes.len());
+    let mut keys = HashSet::with_capacity(routes.len());
+    for route in routes {
+        let app_type = normalize_share_app(&route.app_type)?;
+        let requested_model = normalize_requested_model(&route.requested_model)?;
+        let target_share_id = route.target_share_id.trim().to_string();
+        if target_share_id.is_empty() || target_share_id.chars().count() > 200 {
+            return Err(AppError::BadRequest("invalid target Share id".into()));
+        }
+        if !keys.insert((app_type.clone(), requested_model.clone())) {
+            return Err(AppError::Conflict(format!(
+                "duplicate model route for {app_type}/{requested_model}"
+            )));
+        }
+        normalized.push(UserModelRouteInput {
+            app_type,
+            requested_model,
+            target_share_id,
+        });
+    }
+    normalized.sort_by(|left, right| {
+        left.app_type
+            .cmp(&right.app_type)
+            .then_with(|| left.requested_model.cmp(&right.requested_model))
+    });
+    Ok(normalized)
+}
+
+fn list_user_model_routes(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Vec<UserModelRouteView>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, app_type, requested_model, target_share_id, created_at, updated_at
+             FROM user_model_routes
+             WHERE user_id = ?1
+             ORDER BY app_type ASC, requested_model ASC",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare model routes failed: {e}")))?;
+    statement
+        .query_map(params![user_id], |row| {
+            Ok(UserModelRouteView {
+                id: row.get(0)?,
+                app_type: row.get(1)?,
+                requested_model: row.get(2)?,
+                target_share_id: row.get(3)?,
+                created_at: parse_dt_sql(&row.get::<_, String>(4)?)?,
+                updated_at: parse_dt_sql(&row.get::<_, String>(5)?)?,
+            })
+        })
+        .map_err(|e| AppError::Internal(format!("query model routes failed: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| AppError::Internal(format!("read model routes failed: {e}")))
+}
+
+fn active_share_grant_for_email(
+    grants: &BTreeMap<String, ShareUserGrant>,
+    email: &str,
+    now_ms: i64,
+) -> bool {
+    grants.iter().any(|(key, grant)| {
+        grant.active
+            && grant.role == "shareto"
+            && grant
+                .policy
+                .expires_at
+                .is_none_or(|expires_at| expires_at > now_ms)
+            && (key.eq_ignore_ascii_case(email) || grant.email.eq_ignore_ascii_case(email))
+    })
+}
+
+fn share_model_routing_access(
+    share: &ShareDescriptor,
+    email: &str,
+    now_ms: i64,
+) -> Option<&'static str> {
+    if share
+        .owner_email
+        .as_deref()
+        .is_some_and(|owner| owner.eq_ignore_ascii_case(email))
+    {
+        Some("owner")
+    } else if active_share_grant_for_email(&share.user_grants, email, now_ms) {
+        Some("shared")
+    } else if share.free_access {
+        Some("free")
+    } else {
+        None
+    }
+}
+
+fn load_user_model_routing_response(
+    conn: &Connection,
+    config: &Config,
+    user_id: &str,
+    email: &str,
+    active_subdomains: &HashSet<String>,
+) -> Result<UserModelRoutingResponse, AppError> {
+    let profile = conn
+        .query_row(
+            "SELECT revision, updated_at FROM user_model_routing_profiles WHERE user_id = ?1",
+            params![user_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    parse_dt_sql(&row.get::<_, String>(1)?)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("query model routing profile failed: {e}")))?;
+    let routes = list_user_model_routes(conn, user_id)?;
+    let now_ms = Utc::now().timestamp_millis();
+    let mut eligible_shares = Vec::new();
+    for (_, share) in list_shares(conn)? {
+        let Some(access) = share_model_routing_access(&share, email, now_ms) else {
+            continue;
+        };
+        let apps = ["claude", "codex", "gemini"]
+            .into_iter()
+            .filter(|app| {
+                share.bindings.contains_key(*app) && share_supports_app(&share.support, app)
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if apps.is_empty() {
+            continue;
+        }
+        eligible_shares.push(UserModelRoutingShareView {
+            share_id: share.share_id,
+            share_name: share.share_name,
+            subdomain: share.subdomain.clone(),
+            direct_api_url: config.tunnel_url(&share.subdomain),
+            access: access.to_string(),
+            free_access: share.free_access,
+            apps,
+            is_online: active_subdomains.contains(&share.subdomain),
+        });
+    }
+    eligible_shares.sort_by(|left, right| {
+        left.share_name
+            .cmp(&right.share_name)
+            .then_with(|| left.share_id.cmp(&right.share_id))
+    });
+    Ok(UserModelRoutingResponse {
+        enabled: !routes.is_empty(),
+        api_base_url: config.tunnel_url("api"),
+        revision: profile
+            .as_ref()
+            .and_then(|(revision, _)| u64::try_from(*revision).ok())
+            .unwrap_or_default(),
+        routes,
+        eligible_shares,
+        updated_at: profile.map(|(_, updated_at)| updated_at),
+    })
+}
+
+fn inspect_model_route_target(
+    conn: &Connection,
+    email: &str,
+    share_id: &str,
+    app_type: &str,
+) -> Result<ModelRouteTargetAccess, AppError> {
+    let record = conn
+        .query_row(
+            "SELECT COALESCE(subdomain, ''), owner_email, COALESCE(user_grants_json, '{}'),
+                    COALESCE(free_access, 0), COALESCE(enabled_claude, 0),
+                    COALESCE(enabled_codex, 0), COALESCE(enabled_gemini, 0),
+                    EXISTS (
+                        SELECT 1 FROM share_bindings
+                        WHERE share_id = shares.share_id AND app_type = ?2
+                    )
+             FROM shares
+             WHERE share_id = ?1",
+            params![share_id, app_type],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    parse_share_user_grants(row.get(2)?)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? != 0,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("inspect model route target failed: {e}")))?;
+    let Some((
+        subdomain,
+        owner_email,
+        user_grants,
+        free_access,
+        enabled_claude,
+        enabled_codex,
+        enabled_gemini,
+        has_binding,
+    )) = record
+    else {
+        return Ok(ModelRouteTargetAccess::Missing);
+    };
+    let app_enabled = match app_type {
+        "claude" => enabled_claude,
+        "codex" => enabled_codex,
+        "gemini" => enabled_gemini,
+        _ => false,
+    };
+    if !has_binding || !app_enabled {
+        return Ok(ModelRouteTargetAccess::AppUnavailable);
+    }
+    let authorized = free_access
+        || owner_email
+            .as_deref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(email))
+        || active_share_grant_for_email(&user_grants, email, Utc::now().timestamp_millis());
+    if !authorized {
+        return Ok(ModelRouteTargetAccess::Unauthorized);
+    }
+    Ok(ModelRouteTargetAccess::Eligible { subdomain })
+}
+
 fn get_default_user_api_token(
     conn: &Connection,
     user_id: &str,
@@ -25747,6 +26235,31 @@ mod tests {
         .expect("expire ShareTo grant");
     }
 
+    async fn revoke_shareto_user(store: &AppStore, share_id: &str, email: &str) {
+        let conn = store.conn.lock().await;
+        let grants_json: String = conn
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .expect("read Share grants");
+        let mut grants: BTreeMap<String, ShareUserGrant> =
+            serde_json::from_str(&grants_json).expect("parse Share grants");
+        grants
+            .get_mut(&email.to_ascii_lowercase())
+            .expect("ShareTo grant")
+            .active = false;
+        conn.execute(
+            "UPDATE shares SET user_grants_json = ?2 WHERE share_id = ?1",
+            params![
+                share_id,
+                serde_json::to_string(&grants).expect("serialize revoked Share grants")
+            ],
+        )
+        .expect("revoke ShareTo grant");
+    }
+
     #[tokio::test]
     async fn default_user_api_token_is_unique_resolvable_and_resettable() {
         let (store, config) = setup_store("user-api-token-lifecycle").await;
@@ -25830,6 +26343,528 @@ mod tests {
                 .expect("new token principal")
                 .email,
             "owner@example.com"
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn user_model_routing_replaces_atomically_and_uses_exact_revisioned_keys() {
+        let (store, config) = setup_store("user-model-routing-replace").await;
+        insert_installation(&store, "inst-routing").await;
+        insert_share(
+            &store,
+            "inst-routing",
+            "share-routing-a",
+            "route-a",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-routing",
+            "share-routing-b",
+            "route-b",
+            "active",
+        )
+        .await;
+        let active_subdomains = HashSet::from(["route-a".to_string(), "route-b".to_string()]);
+
+        let initial = store
+            .get_user_model_routing(&config, "Owner@Example.com", &active_subdomains)
+            .await
+            .expect("load empty model routing profile");
+        assert_eq!(initial.revision, 0);
+        assert!(!initial.enabled);
+        assert!(initial.routes.is_empty());
+        assert_eq!(initial.eligible_shares.len(), 2);
+        assert!(initial.api_base_url.contains("api."));
+
+        let first = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "GPT-5.6".into(),
+                    target_share_id: "share-routing-a".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("create first exact model route");
+        assert_eq!(first.revision, 1);
+        assert!(first.enabled);
+        assert_eq!(first.routes.len(), 1);
+        let first_route = first.routes[0].clone();
+        let first_updated_at = first.updated_at.expect("profile update timestamp");
+
+        let unchanged = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: " GPT-5.6 ".into(),
+                    target_share_id: "share-routing-a".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("idempotent replacement");
+        assert_eq!(unchanged.revision, 1);
+        assert_eq!(unchanged.updated_at, Some(first_updated_at));
+
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let moved = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "GPT-5.6".into(),
+                    target_share_id: "share-routing-b".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("atomically move exact model route");
+        assert_eq!(moved.revision, 2);
+        assert_eq!(moved.routes.len(), 1);
+        assert_eq!(moved.routes[0].id, first_route.id);
+        assert_eq!(moved.routes[0].created_at, first_route.created_at);
+        assert_eq!(moved.routes[0].target_share_id, "share-routing-b");
+        assert!(moved.updated_at.expect("second update timestamp") > first_updated_at);
+
+        let stale_revision = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                Vec::new(),
+                &active_subdomains,
+            )
+            .await
+            .expect_err("stale profile revision must fail");
+        assert_eq!(
+            stale_revision.code(),
+            Some("model_routing_revision_conflict")
+        );
+
+        let duplicate = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                2,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "same".into(),
+                        target_share_id: "share-routing-a".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: " same ".into(),
+                        target_share_id: "share-routing-b".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect_err("duplicate exact route key must fail");
+        assert!(matches!(duplicate, AppError::Conflict(_)));
+
+        let case_sensitive = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                2,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "GPT-5.6".into(),
+                        target_share_id: "share-routing-a".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "gpt-5.6".into(),
+                        target_share_id: "share-routing-b".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect("case-distinct model keys are allowed");
+        assert_eq!(case_sensitive.revision, 3);
+        let user_id = {
+            let conn = store.conn.lock().await;
+            let (created_at, updated_at): (String, String) = conn
+                .query_row(
+                    "SELECT created_at, updated_at
+                     FROM user_model_routing_profiles
+                     WHERE user_id = (
+                        SELECT id FROM users WHERE email_normalized = 'owner@example.com'
+                     )",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read routing profile timestamps");
+            assert_ne!(created_at, updated_at);
+            let event_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM user_model_route_events", [], |row| {
+                    row.get(0)
+                })
+                .expect("count routing audit events");
+            assert_eq!(event_count, 3);
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read routing user id")
+        };
+        assert_eq!(
+            store
+                .list_user_model_names(&user_id, "codex")
+                .await
+                .expect("list configured model names"),
+            vec!["GPT-5.6".to_string(), "gpt-5.6".to_string()]
+        );
+        assert_eq!(
+            store
+                .resolve_user_model_route(&user_id, "owner@example.com", "codex", "GPT-5.6",)
+                .await
+                .expect("resolve uppercase model")
+                .expect("uppercase route")
+                .target_share_id,
+            "share-routing-a"
+        );
+        assert!(
+            store
+                .resolve_user_model_route(&user_id, "owner@example.com", "codex", "Gpt-5.6",)
+                .await
+                .expect("resolve unmatched model case")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn user_model_routing_audit_retains_only_the_latest_bounded_snapshots() {
+        let (store, config) = setup_store("user-model-routing-audit-retention").await;
+        insert_installation(&store, "inst-routing-audit").await;
+        insert_share(
+            &store,
+            "inst-routing-audit",
+            "share-routing-audit",
+            "route-audit",
+            "active",
+        )
+        .await;
+        let active_subdomains = HashSet::from(["route-audit".to_string()]);
+        let mut revision = 0_u64;
+
+        for update in 0..(MAX_USER_MODEL_ROUTE_EVENTS_PER_USER + 2) {
+            let routes = if update % 2 == 0 {
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "gpt-audit".into(),
+                    target_share_id: "share-routing-audit".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            revision = store
+                .replace_user_model_routing(
+                    &config,
+                    "owner@example.com",
+                    revision,
+                    routes,
+                    &active_subdomains,
+                )
+                .await
+                .expect("replace model routing while exercising audit retention")
+                .revision;
+        }
+
+        let expected_last_revision = (MAX_USER_MODEL_ROUTE_EVENTS_PER_USER + 2) as u64;
+        assert_eq!(revision, expected_last_revision);
+        let conn = store.conn.lock().await;
+        let (count, first_revision, last_revision): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(revision), MAX(revision)
+                 FROM user_model_route_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read bounded model routing audit");
+        assert_eq!(count, MAX_USER_MODEL_ROUTE_EVENTS_PER_USER as i64);
+        assert_eq!(first_revision, 3);
+        assert_eq!(last_revision, expected_last_revision as i64);
+        drop(conn);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn user_model_routing_rechecks_share_acl_app_and_target_on_every_resolution() {
+        let (store, config) = setup_store("user-model-routing-runtime-acl").await;
+        insert_installation(&store, "inst-routing-acl").await;
+        insert_share(
+            &store,
+            "inst-routing-acl",
+            "share-private",
+            "route-private",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-routing-acl",
+            "share-shared",
+            "route-shared",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-routing-acl",
+            "share-free",
+            "route-free",
+            "active",
+        )
+        .await;
+        set_shareto_users(&store, "share-shared", &["shared@example.com"]).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET free_access = 1 WHERE share_id = 'share-free'",
+                [],
+            )
+            .expect("make test Share free");
+        }
+        let active_subdomains = HashSet::from([
+            "route-private".to_string(),
+            "route-shared".to_string(),
+            "route-free".to_string(),
+        ]);
+
+        let shared_profile = store
+            .get_user_model_routing(&config, "shared@example.com", &active_subdomains)
+            .await
+            .expect("load ShareTo routing profile");
+        let shared_eligible = shared_profile
+            .eligible_shares
+            .iter()
+            .map(|share| share.share_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(shared_eligible.contains("share-shared"));
+        assert!(shared_eligible.contains("share-free"));
+        assert!(!shared_eligible.contains("share-private"));
+
+        let shared_route = store
+            .replace_user_model_routing(
+                &config,
+                "shared@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "shared-model".into(),
+                    target_share_id: "share-shared".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("ShareTo user configures route");
+        let shared_user_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'shared@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read ShareTo user id")
+        };
+        assert_eq!(shared_route.revision, 1);
+        assert!(
+            store
+                .resolve_user_model_route(
+                    &shared_user_id,
+                    "shared@example.com",
+                    "codex",
+                    "shared-model",
+                )
+                .await
+                .expect("resolve active ShareTo route")
+                .is_some()
+        );
+
+        expire_shareto_user(&store, "share-shared", "shared@example.com").await;
+        let expired = store
+            .resolve_user_model_route(
+                &shared_user_id,
+                "shared@example.com",
+                "codex",
+                "shared-model",
+            )
+            .await
+            .expect_err("expired ShareTo grant must not route");
+        assert_eq!(expired.code(), Some("user_model_route_unauthorized"));
+
+        set_shareto_users(&store, "share-shared", &["shared@example.com"]).await;
+        revoke_shareto_user(&store, "share-shared", "shared@example.com").await;
+        let revoked = store
+            .resolve_user_model_route(
+                &shared_user_id,
+                "shared@example.com",
+                "codex",
+                "shared-model",
+            )
+            .await
+            .expect_err("revoked ShareTo grant must not route");
+        assert_eq!(revoked.code(), Some("user_model_route_unauthorized"));
+
+        let owner_profile = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "gemini".into(),
+                    requested_model: "gemini-exact".into(),
+                    target_share_id: "share-private".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("owner configures Gemini route");
+        let owner_user_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read owner user id")
+        };
+        assert_eq!(owner_profile.revision, 1);
+        set_share_bindings(&store, "share-private", &["claude", "codex"]).await;
+        let app_unavailable = store
+            .resolve_user_model_route(
+                &owner_user_id,
+                "owner@example.com",
+                "gemini",
+                "gemini-exact",
+            )
+            .await
+            .expect_err("removed app binding must not route");
+        assert_eq!(
+            app_unavailable.code(),
+            Some("user_model_route_app_unavailable")
+        );
+
+        let free_profile = store
+            .replace_user_model_routing(
+                &config,
+                "free-user@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "claude".into(),
+                    requested_model: "free-model".into(),
+                    target_share_id: "share-free".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("free user configures free Share route");
+        let free_user_id = {
+            let conn = store.conn.lock().await;
+            let user_id = conn
+                .query_row(
+                    "SELECT id FROM users WHERE email_normalized = 'free-user@example.com'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read free user id");
+            conn.execute(
+                "UPDATE user_model_routes
+                 SET target_share_id = 'removed-share'
+                 WHERE user_id = ?1",
+                params![user_id],
+            )
+            .expect("preserve a stale route target");
+            user_id
+        };
+        assert_eq!(free_profile.revision, 1);
+        let stale = store
+            .resolve_user_model_route(
+                &free_user_id,
+                "free-user@example.com",
+                "claude",
+                "free-model",
+            )
+            .await
+            .expect_err("removed Share target must remain explicitly unavailable");
+        assert_eq!(stale.code(), Some("user_model_route_target_unavailable"));
+        let still_visible = store
+            .get_user_model_routing(&config, "free-user@example.com", &active_subdomains)
+            .await
+            .expect("load profile with stale target");
+        assert_eq!(still_visible.routes.len(), 1);
+        assert_eq!(still_visible.routes[0].target_share_id, "removed-share");
+
+        let preserved = store
+            .replace_user_model_routing(
+                &config,
+                "free-user@example.com",
+                1,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "claude".into(),
+                        requested_model: "free-model".into(),
+                        target_share_id: "removed-share".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "new-free-model".into(),
+                        target_share_id: "share-free".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect("unchanged stale route can coexist with a valid profile edit");
+        assert_eq!(preserved.revision, 2);
+        assert_eq!(preserved.routes.len(), 2);
+
+        let unauthorized_retarget = store
+            .replace_user_model_routing(
+                &config,
+                "free-user@example.com",
+                2,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "claude".into(),
+                        requested_model: "free-model".into(),
+                        target_share_id: "share-private".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "new-free-model".into(),
+                        target_share_id: "share-free".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect_err("changing a stale route still requires current authorization");
+        assert_eq!(
+            unauthorized_retarget.code(),
+            Some("user_model_route_unauthorized")
         );
 
         let _ = std::fs::remove_file(&config.database.path);

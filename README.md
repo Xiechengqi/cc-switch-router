@@ -61,6 +61,14 @@ Clients 页的每个 client 条目提供「控制台」和「终端」两个入�
 
 Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余 `/web-api/*` 默认要求 owner/admin 身份,Router 鉴权后向 client 注入可信身份头。`/api/*`、`/v1/*`、`/_ctl/*` 和 `/_share-router/*` 不通过 client web tunnel 暴露。流式管理接口必须使用 `Authorization` header,不接受 query-string token。
 
+## 用户统一模型入口
+
+每个区域额外提供一个可选的共享入口 `https://api.<TUNNEL_DOMAIN>`。用户在 Clients 页「我的」分页的「模型中枢」中维护精确的 `(App, 请求模型) → Share` 映射，同一把 Router API Key 可据此调用多个当前有权限的 Share。App 固定为 Claude、Codex、Gemini；模型名区分大小写且不会被 Router 改写。
+
+该入口不会替代 Share 子域名。`https://<share-subdomain>.<TUNNEL_DOMAIN>` 的直连调用继续生效，用户不配置任何模型路由时也不受影响。统一入口不存在默认 Share、隐式选择、fallback 或跨 Share 重试；映射只负责选择目标，不能授予权限。每次调用仍重新检查目标 Share 的 Owner / ShareTo / Free 权限、App 开启状态与在线路由，并复用原有 Share 代理链，所以地图、Share 侧边栏、请求日志、用量、限额和账务仍全部归属目标 Share。
+
+配置控制面为 Session 鉴权的 `GET/PUT /v1/me/model-routing`，推理面接受同一用户 API Key 的 `Authorization: Bearer`、`x-api-key` 或 `x-goog-api-key`。完整路径与错误契约见 [PROTOCOL.md](PROTOCOL.md)。
+
 ## API 端点
 
 API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
@@ -84,7 +92,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/account/*` | 2 | Session | `payment-profile`、`payment-assets/:id` |
 | `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
-| `/v1/dashboard/*`、`/v1/me/*` | 13 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link` |
+| `/v1/dashboard/*`、`/v1/me/*` | 14 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link` |
 | 其余单例 | 约 16 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`integrations/telegram/webhook`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
 
 ## 管理设置与运维
@@ -130,7 +138,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 |------|--------|------|
 | `CC_SWITCH_ROUTER_API_ADDR` | `0.0.0.0:80` | HTTP 监听地址 |
 | `CC_SWITCH_ROUTER_SSH_ADDR` | `0.0.0.0:2222` | SSH 监听地址 |
-| `CC_SWITCH_ROUTER_TUNNEL_DOMAIN` | `0.0.0.0:8787` | 公共 tunnel 域名 |
+| `CC_SWITCH_ROUTER_TUNNEL_DOMAIN` | `0.0.0.0:8787` | 公共 tunnel 域名；统一模型入口固定使用其中的保留标签 `api` |
 | `CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR` | `{TUNNEL_DOMAIN}:{SSH_PORT}` | 下发给客户端的 SSH 地址(Cloudflare 代理时填源站 IP:端口) |
 | `CC_SWITCH_ROUTER_SSH_INACTIVITY_TIMEOUT_SECS` | `300` | 入站 SSH 无流量超时，范围 30-3600 秒；必须覆盖完整 keepalive 失败窗口 |
 | `CC_SWITCH_ROUTER_SSH_KEEPALIVE_INTERVAL_SECS` | `30` | 入站 SSH 无流量时的 keepalive 周期，范围 5-300 秒 |
@@ -235,6 +243,22 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `free_access = 1` 的公开免费 Share 共用的单真实用户 IP 并发上限；v1 `forSale=Free` 只在 migration 20 的持久化迁移边界识别，不属于 active contract；设为 `0` 可关闭 |
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
+
+### 统一入口 DNS 与 TLS
+
+生产环境必须让 `api.<CC_SWITCH_ROUTER_TUNNEL_DOMAIN>` 与 Share 子域名一样解析到当前 Router HTTP 入口，并由边缘代理或源站证书覆盖该主机名。已有 `*.<TUNNEL_DOMAIN>` DNS 和通配符证书的部署通常无需新增规则；只逐条登记 Share 域名的部署必须额外添加 `api` 记录和证书 SAN。`api` 是 Router 保留标签，不能分配给 Client 或 Share。
+
+部署后至少验证：
+
+```bash
+curl https://api.example.com/v1/healthz
+curl -i -X OPTIONS https://api.example.com/v1/responses \
+  -H 'Origin: https://console.example.com' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: authorization,content-type'
+```
+
+第一条应返回 Router 健康状态；第二条应返回 `204` 及匹配的 CORS 许可头。不要把 `api.<TUNNEL_DOMAIN>` 指向某个具体 Client 或 Share。
 
 ### Server 日志
 

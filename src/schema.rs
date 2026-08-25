@@ -111,6 +111,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         29,
         include_str!("../schema/0029_installation_online_days.sql"),
     ),
+    (30, include_str!("../schema/0030_user_model_routing.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -638,7 +639,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 125);
+        assert_eq!(table_count, 128);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -713,6 +714,8 @@ mod tests {
         assert_eq!(versions[25], (26, migration_checksum(MIGRATIONS[24].1)));
         assert_eq!(versions[26], (27, migration_checksum(MIGRATIONS[25].1)));
         assert_eq!(versions[27], (28, migration_checksum(MIGRATIONS[26].1)));
+        assert_eq!(versions[28], (29, migration_checksum(MIGRATIONS[27].1)));
+        assert_eq!(versions[29], (30, migration_checksum(MIGRATIONS[28].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1041,7 +1044,8 @@ mod tests {
     }
 
     fn install_schema_through(conn: &Connection, version: i64) {
-        assert!((1..=28).contains(&version));
+        let latest = MIGRATIONS.last().map(|(version, _)| *version).unwrap_or(1);
+        assert!((1..=latest).contains(&version));
         install_baseline(conn, &migration_checksum(BASELINE_SQL)).expect("install baseline");
         for (migration_version, sql) in MIGRATIONS.iter().copied().take((version - 1) as usize) {
             if migration_version == LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION {
@@ -1066,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_29_upgrade_a_version_26_database() {
+    fn migrations_27_through_30_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1115,8 +1119,70 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 29);
-        check_compatibility(&conn).expect("upgraded version 29 is compatible");
+        assert_eq!(latest_version, 30);
+        check_compatibility(&conn).expect("upgraded version 30 is compatible");
+    }
+
+    #[test]
+    fn migration_30_installs_user_model_routing_without_a_share_foreign_key() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 29);
+        conn.execute_batch(
+            "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+             VALUES ('route-user', 'route@example.com', 'now', 'now');",
+        )
+        .expect("seed routing user before upgrade");
+
+        apply(&conn).expect("upgrade version 29 through user model routing schema");
+
+        let table_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                    'user_model_routing_profiles',
+                    'user_model_routes',
+                    'user_model_route_events'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count user model routing tables");
+        assert_eq!(table_count, 3);
+
+        let route_foreign_keys = conn
+            .prepare("PRAGMA foreign_key_list('user_model_routes')")
+            .expect("prepare route foreign keys")
+            .query_map([], |row| row.get::<_, String>(2))
+            .expect("query route foreign keys")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read route foreign keys");
+        assert_eq!(route_foreign_keys, vec!["users".to_string()]);
+
+        conn.execute_batch(
+            "INSERT INTO user_model_routing_profiles
+                (user_id, revision, created_at, updated_at)
+             VALUES ('route-user', 1, 'now', 'now');
+             INSERT INTO user_model_routes
+                (id, user_id, app_type, requested_model, target_share_id, created_at, updated_at)
+             VALUES ('route-stale', 'route-user', 'codex', 'gpt-exact',
+                     'removed-share', 'now', 'now');",
+        )
+        .expect("stale Share target remains representable");
+        let duplicate = conn.execute(
+            "INSERT INTO user_model_routes
+                (id, user_id, app_type, requested_model, target_share_id, created_at, updated_at)
+             VALUES ('route-duplicate', 'route-user', 'codex', 'gpt-exact',
+                     'another-share', 'now', 'now')",
+            [],
+        );
+        assert!(duplicate.is_err(), "exact route keys must remain unique");
+
+        let latest_version = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("read upgraded schema version");
+        assert_eq!(latest_version, 30);
     }
 
     #[test]

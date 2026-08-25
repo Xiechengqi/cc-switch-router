@@ -297,6 +297,57 @@ pub struct UserApiTokenResetResponse {
     pub token: UserApiTokenStatus,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserModelRouteInput {
+    pub app_type: String,
+    pub requested_model: String,
+    pub target_share_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserModelRouteView {
+    pub id: String,
+    pub app_type: String,
+    pub requested_model: String,
+    pub target_share_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserModelRoutingShareView {
+    pub share_id: String,
+    pub share_name: String,
+    pub subdomain: String,
+    pub direct_api_url: String,
+    pub access: String,
+    pub free_access: bool,
+    pub apps: Vec<String>,
+    pub is_online: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserModelRoutingResponse {
+    pub enabled: bool,
+    pub api_base_url: String,
+    pub revision: u64,
+    pub routes: Vec<UserModelRouteView>,
+    pub eligible_shares: Vec<UserModelRoutingShareView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReplaceUserModelRoutingRequest {
+    pub expected_revision: u64,
+    pub routes: Vec<UserModelRouteInput>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareApiAuthUser {

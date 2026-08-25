@@ -51,6 +51,23 @@ import { clientMarketMineHref } from "@/lib/dashboard-nav";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ClientSubdomainTakeoverDialog } from "@/components/dashboard/client-subdomain-takeover-dialog";
 import { ClientLogsDialog } from "@/components/dashboard/client-logs-dialog";
+import {
+  ModelHubPanel,
+  useModelRoutingController,
+} from "@/components/dashboard/model-hub-panel";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  clientBelongsToViewer,
+  clientListTabFromQuery,
+  configuredEligibleRouteShareIds,
+  consumeModelRouteDeepLink,
+  MAX_USER_MODEL_ROUTES,
+  modelRouteDeepLinkShareId,
+  searchForClientListTab,
+  type ClientListTab,
+  type DraftModelRoute,
+} from "@/lib/model-routing";
+import type { UserModelRoutingShare } from "@/lib/types";
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -66,31 +83,9 @@ function sortShares(shares: ShareView[]) {
 }
 
 const CLIENT_EXPANDED_STORAGE_KEY = "cc_switch_router_client_expanded_v2";
-const CLIENT_LIST_TABS = ["mine", "all", "online", "reconnecting", "degraded", "offline"] as const;
-
-type ClientListTab = (typeof CLIENT_LIST_TABS)[number];
 
 function normalizeEmail(value?: string) {
   return value?.trim().toLowerCase() || "";
-}
-
-function normalizeClientListTab(value: unknown, hasViewerIdentity: boolean): ClientListTab {
-  if (typeof value !== "string" || !(CLIENT_LIST_TABS as readonly string[]).includes(value)) return "all";
-  return value === "mine" && !hasViewerIdentity ? "all" : value as ClientListTab;
-}
-
-function clientBelongsToViewer(
-  client: DashboardClient,
-  shareById: ReadonlyMap<string, ShareView>,
-  viewerEmail: string,
-) {
-  if (!viewerEmail) return false;
-  const ownerEmail = normalizeEmail(client.clientTunnel?.ownerEmail || client.installation.ownerEmail);
-  if (ownerEmail === viewerEmail) return true;
-  return (client.shareIds || []).some((shareId) => {
-    const grant = shareById.get(shareId)?.userGrants?.[viewerEmail];
-    return grant?.role === "shareto" && grant.active === true;
-  });
 }
 
 function includesQuery(values: Array<string | undefined>, query: string) {
@@ -314,12 +309,18 @@ const ShareScroller = React.memo(function ShareScroller({
   onOpenShare,
   onEditShare,
   onConnectShare,
+  routingShareById,
+  modelRoutesByShareId,
+  onAddModelRoute,
 }: {
   shares: ShareView[];
   totalCount?: number;
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
+  routingShareById?: ReadonlyMap<string, UserModelRoutingShare>;
+  modelRoutesByShareId?: ReadonlyMap<string, DraftModelRoute[]>;
+  onAddModelRoute?: (shareId: string) => void;
 }) {
   const { t } = useLocaleText();
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
@@ -351,7 +352,16 @@ const ShareScroller = React.memo(function ShareScroller({
       </div>
         <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4" aria-label={t("dashboard.shares")}>
           {shares.map((share) => (
-            <ShareCard key={share.shareId} share={share} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
+            <ShareCard
+              key={share.shareId}
+              share={share}
+              onOpen={onOpenShare}
+              onEdit={onEditShare}
+              onConnect={onConnectShare}
+              directApiUrl={routingShareById?.get(share.shareId)?.directApiUrl}
+              modelRoutes={modelRoutesByShareId?.get(share.shareId)}
+              onAddModelRoute={onAddModelRoute}
+            />
           ))}
         </div>
     </div>
@@ -366,6 +376,9 @@ function ClientCard({
   onOpenShare,
   onEditShare,
   onConnectShare,
+  routingShareById,
+  modelRoutesByShareId,
+  onAddModelRoute,
   rental,
   onRentalChanged,
   collapsed,
@@ -380,6 +393,9 @@ function ClientCard({
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
+  routingShareById?: ReadonlyMap<string, UserModelRoutingShare>;
+  modelRoutesByShareId?: ReadonlyMap<string, DraftModelRoute[]>;
+  onAddModelRoute?: (shareId: string) => void;
   rental?: ClientMarketRental;
   onRentalChanged: () => Promise<void> | void;
   collapsed: boolean;
@@ -541,7 +557,18 @@ function ClientCard({
           </div>
         </div>
 
-        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
+        {!collapsed ? (
+          <ShareScroller
+            shares={shares}
+            totalCount={allShares.length}
+            onOpenShare={onOpenShare}
+            onEditShare={onEditShare}
+            onConnectShare={onConnectShare}
+            routingShareById={routingShareById}
+            modelRoutesByShareId={modelRoutesByShareId}
+            onAddModelRoute={onAddModelRoute}
+          />
+        ) : null}
       </Card.Content>
     </Card>
   );
@@ -571,6 +598,10 @@ export function ClientBoard({
   const authed = !!session?.authenticated;
   const sessionEmail = normalizeEmail(session?.user?.email);
   const hasViewerIdentity = authed && !!sessionEmail;
+  const pathname = usePathname() || "/clients/";
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const searchString = searchParams.toString();
   const focus = useDashboardFocus();
   const { issuesOnly, setIssuesOnly, regionFilters, setRegionFilters, clearRegionFilters } = useDashboardViewState();
   const { trackOperation } = useOperationVerification();
@@ -585,7 +616,14 @@ export function ClientBoard({
   const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
   const [statusFilterRaw, setStatusFilter] = usePersistentState<ClientListTab>("cc_switch_router_client_status_v1", "all");
-  const statusFilter = normalizeClientListTab(statusFilterRaw, hasViewerIdentity);
+  const statusFilter = clientListTabFromQuery(
+    statusFilterRaw,
+    searchParams.get("tab"),
+    hasViewerIdentity,
+  );
+  const modelRouting = useModelRoutingController(
+    hasViewerIdentity && statusFilter === "mine",
+  );
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "tokens");
   const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
     CLIENT_EXPANDED_STORAGE_KEY,
@@ -593,6 +631,14 @@ export function ClientBoard({
   );
   const [marketRentals, setMarketRentals] = React.useState<Map<string, ClientMarketRental>>(new Map());
   const lastLocatedFocusRef = React.useRef("");
+  const consumedModelRouteDeepLinkRef = React.useRef("");
+
+  const selectClientListTab = React.useCallback((tab: ClientListTab) => {
+    if (tab !== "mine") setStatusFilter(tab);
+    const nextSearch = searchForClientListTab(searchString, tab);
+    const href = `${pathname}${nextSearch ? `?${nextSearch}` : ""}`;
+    router.replace(href, { scroll: false });
+  }, [pathname, router, searchString, setStatusFilter]);
 
   const loadMarketRentals = React.useCallback(async () => {
     if (!authed) {
@@ -623,12 +669,14 @@ export function ClientBoard({
   }, [setSortOrder, sortOrder]);
 
   React.useEffect(() => {
-    if (statusFilterRaw !== statusFilter) setStatusFilter(statusFilter);
-  }, [setStatusFilter, statusFilter, statusFilterRaw]);
+    if (searchParams.get("tab") !== "mine" && statusFilterRaw !== statusFilter) {
+      setStatusFilter(statusFilter);
+    }
+  }, [searchParams, setStatusFilter, statusFilter, statusFilterRaw]);
 
   React.useEffect(() => {
-    if (issuesOnly) setStatusFilter("all");
-  }, [issuesOnly, setStatusFilter]);
+    if (issuesOnly) selectClientListTab("all");
+  }, [issuesOnly, selectClientListTab]);
 
   const sortedClients = React.useMemo(() => sortClients(clients), [clients]);
   const defaultExpandedClientId = sortedClients.reduce<DashboardClient | undefined>((best, client) => {
@@ -639,14 +687,23 @@ export function ClientBoard({
     [defaultExpandedClientId, expandedClientIds],
   );
   const shareById = React.useMemo(() => new Map(shares.map((share) => [share.shareId, share])), [shares]);
+  const routedEligibleShareIds = React.useMemo(
+    () => configuredEligibleRouteShareIds(modelRouting.profile),
+    [modelRouting.profile],
+  );
   const mineClientIds = React.useMemo(() => {
     if (!hasViewerIdentity) return new Set<string>();
     return new Set(
       sortedClients
-        .filter((client) => clientBelongsToViewer(client, shareById, sessionEmail))
+        .filter((client) => clientBelongsToViewer(
+          client,
+          shareById,
+          sessionEmail,
+          routedEligibleShareIds,
+        ))
         .map((client) => client.installation.id),
     );
-  }, [hasViewerIdentity, sessionEmail, shareById, sortedClients]);
+  }, [hasViewerIdentity, routedEligibleShareIds, sessionEmail, shareById, sortedClients]);
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
   const canViewClientLogs = React.useCallback(
     (client: DashboardClient) => Boolean(client.logCollectionEnabled),
@@ -872,6 +929,71 @@ export function ClientBoard({
     return () => window.removeEventListener("pointerdown", onPointerDown);
   }, [filtersOpen]);
 
+  const addModelRouteForShare = React.useCallback((shareId: string) => {
+    if (modelRouting.routes.length >= MAX_USER_MODEL_ROUTES) {
+      toast.danger(t("modelHub.validationTooMany"));
+      return;
+    }
+    modelRouting.addRouteForShare(shareId);
+    window.requestAnimationFrame(() => {
+      document.getElementById("model-hub")?.scrollIntoView({
+        behavior: preferredScrollBehavior(),
+        block: "start",
+      });
+    });
+  }, [modelRouting.addRouteForShare, modelRouting.routes.length, t]);
+
+  React.useEffect(() => {
+    const shareId = modelRouteDeepLinkShareId(searchString);
+    if (!shareId) {
+      consumedModelRouteDeepLinkRef.current = "";
+      return;
+    }
+    if (!modelRouting.profile) return;
+    const actionKey = `${shareId}:${searchString}`;
+    if (consumedModelRouteDeepLinkRef.current === actionKey) return;
+    consumedModelRouteDeepLinkRef.current = actionKey;
+    if (
+      modelRouting.profile.eligibleShares.some(
+        (share) => share.shareId === shareId,
+      )
+    ) {
+      addModelRouteForShare(shareId);
+    } else {
+      toast.danger(t("modelHub.targetUnavailable"));
+    }
+    const nextSearch = consumeModelRouteDeepLink(searchString);
+    router.replace(
+      `${pathname}${nextSearch ? `?${nextSearch}` : ""}`,
+      { scroll: false },
+    );
+  }, [
+    addModelRouteForShare,
+    modelRouting.profile,
+    pathname,
+    router,
+    searchString,
+    t,
+  ]);
+
+  const routingShareById = React.useMemo(
+    () => new Map(
+      (modelRouting.profile?.eligibleShares || []).map((share) => [
+        share.shareId,
+        share,
+      ]),
+    ),
+    [modelRouting.profile?.eligibleShares],
+  );
+  const modelRoutesByShareId = React.useMemo(() => {
+    const byShare = new Map<string, DraftModelRoute[]>();
+    for (const route of modelRouting.routes) {
+      const current = byShare.get(route.targetShareId) || [];
+      byShare.set(route.targetShareId, [...current, route]);
+    }
+    return byShare;
+  }, [modelRouting.routes]);
+
   const activeFilterCount = regionFilters.length;
   const clientTabs: Array<{ value: ClientListTab; label: string; count: number }> = [
     ...(hasViewerIdentity ? [{ value: "mine" as const, label: t("dashboard.mine"), count: clientSummary.mine }] : []),
@@ -889,7 +1011,7 @@ export function ClientBoard({
         <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
             {clientTabs.map(({ value, label, count }) => (
-              <button key={value} type="button" aria-pressed={statusFilter === value} onClick={() => { setStatusFilter(value); if (value === "mine" || value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+              <button key={value} type="button" aria-pressed={statusFilter === value} onClick={() => { selectClientListTab(value); if (value === "mine" || value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
           <Button variant="outline" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
@@ -989,14 +1111,18 @@ export function ClientBoard({
         </div>
       </div>
 
+      {statusFilter === "mine" ? (
+        <ModelHubPanel controller={modelRouting} />
+      ) : null}
+
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} routingShareById={statusFilter === "mine" ? routingShareById : undefined} modelRoutesByShareId={statusFilter === "mine" ? modelRoutesByShareId : undefined} onAddModelRoute={statusFilter === "mine" ? addModelRouteForShare : undefined} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
               <span>{sortedClients.length ? mineIsEmpty ? t("dashboard.noMyClients") : t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
-              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); clearRegionFilters(); setIssuesOnly(false); }}>{mineIsEmpty ? t("dashboard.showAll") : t("dashboard.clearFilters")}</button> : null}
+              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); selectClientListTab("all"); clearRegionFilters(); setIssuesOnly(false); }}>{mineIsEmpty ? t("dashboard.showAll") : t("dashboard.clearFilters")}</button> : null}
             </div>
           </EmptyBlock>
         )}

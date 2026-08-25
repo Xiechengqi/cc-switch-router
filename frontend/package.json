@@ -15,6 +15,7 @@
     "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts components/dashboard/share-market/owner-workspace-utils.test.ts",
     "test:token-units": "tsx --test lib/token-units.test.ts",
     "test:share-model-probe": "tsx --test lib/share-model-probe.test.ts",
+    "test:model-routing": "tsx --test lib/model-routing.test.ts",
     "test:share-model-health-heatmap": "tsx --test components/dashboard/share-model-health-heatmap.test.ts components/dashboard/client-online-heatmap.test.ts",
     "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check",
     "audit:settings-contract": "node ../scripts/audit/audit-settings-contract.mjs --check",

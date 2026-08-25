@@ -25,6 +25,7 @@
 | `share descriptor` | Server 同步给 Router 的 share 配置与运行时快照;一个 descriptor 可绑定 Claude/Codex/Gemini 中的 1 到 3 个 app |
 | `account` | 绑定在 Upstream Provider 上的凭据(OAuth token 或 API key),存于 Server |
 | `capacity pool` | 同一物理账号或 API key 的匿名容量标识;可跨多个独立 Share URL 复用，在凭据源变化时重派生 |
+| `统一模型入口` | 区域级 `api.<tunnel_domain>`；按用户的精确 App/模型映射选择 Share，不拥有独立容量或授权 |
 | `control_secret` | 注册时下发的对称 HMAC 密钥,用于 Router → Server 方向认证 |
 | `ingress context` | Router 注入转发请求的签名身份上下文 |
 | `pending share edit` | Router 侧排队的 share 变更,由 Server 拉取并 ack |
@@ -63,6 +64,26 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
 ## 2. Client + Router 的能力边界
 
 两类内建市场共用同一套隧道、Share descriptor、准入和账户级后付费账务；它们都不依赖旧 `router_markets` 注册或 bearer session：
+
+### 可选的用户统一模型入口
+
+Router 同时支持两条并存的用户推理入口：
+
+```text
+Direct Share:
+  API Key + <share>.region.example/v1/...
+    -> Share ACL/App 检查 -> 原 Share 代理链
+
+统一模型入口:
+  同一 API Key + api.region.example/v1/... + requested model
+    -> (user, app, exact model) 查映射
+    -> 映射目标的 Share ACL/App/在线状态检查
+    -> 原 Share 代理链
+```
+
+统一入口是薄选择层，不是新的 Share、市场或计量主体。它不分配每用户子域名，不改写模型，不从用户可见 Share 中自动挑选，也不在失败时 fallback / 重试其他 Share。映射不授予访问权；Owner、有效 ShareTo grant 或 Free 权限及目标 App 可用性在每次请求时重新判定。选中后请求继续走 `proxy_handler`、IngressContext、并发和流式生命周期，因此请求日志、usage、地图归因、限额和账务都只记录在目标 Share 层。直接 Share URL 始终保留，用户没有配置映射时系统行为与此前一致。
+
+控制面使用 `user_model_routing_profiles` 的 revision 做乐观并发控制，`user_model_routes` 保存区分大小写的精确键，`user_model_route_events` 按用户保留最近 100 次原子替换审计。Share 删除不级联删除 route：失效目标必须在 UI 中保持可见并在运行时 fail closed，不能静默变成未配置或换到其他 Share。
 
 ### ① Share Market —— 固定拼车位租用
 
@@ -138,7 +159,9 @@ idle ──► locked ──► allocated ──► draining ──► idle
 ```
 浏览器 / CLI
   → Cloudflare
-  → axum (:80) → proxy_handler                     src/proxy.rs:2141
+  → axum (:80)
+      ├─ <share> host → proxy_handler
+      └─ api host → user_model_proxy_handler → proxy_handler
   → subdomain_for_host()  剥离 tunnel_domain 后缀    src/proxy.rs:5746
   → ProxyRegistry.routes 查表
   → reqwest 请求 127.0.0.1:<临时端口>
@@ -210,7 +233,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 
 ## 5. 数据层
 
-业务库与 metrics 库分离。最终 schema 当前有 116 张非 SQLite 内部表（包含 `schema_migrations`）；数量由 fresh-schema 测试固定。
+业务库与 metrics 库分离。最终 schema 当前有 128 张非 SQLite 内部表（包含 `schema_migrations`）；数量由 fresh-schema 测试固定。
 
 **数据库模式**:
 
@@ -240,6 +263,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 | 运维告警信号 | `operator_alert_signal_outbox` |
 | 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
 | 认证 | `users`（含用量卡片公开开关）、`user_sessions`、`user_api_tokens`、`email_login_challenges` |
+| 用户模型路由 | `user_model_routing_profiles`、`user_model_routes`、`user_model_route_events` |
 
 ### 账户用量（Provider / Consumer）
 
@@ -355,6 +379,7 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 - **Settings 控制面**(`/settings/`):受管环境变量按 7 个稳定配置域组织。后端 schema 是字段类型、约束、依赖、风险和重启边界的唯一来源，前端 i18n catalog 只覆盖文案。`GET /v1/admin/settings` 在一个快照中返回 schema、持久化值、进程有效值、来源和 SHA-256 revision；validate/PATCH 都要求 `expectedRevision`。进程启动前已有的环境变量被标记为只读 override，Secret 只暴露 `hasValue`。静态字段以启动快照计算 durable pending-restart，动态字段保存后直接更新 `DynamicSettings`；快照从当前 `DynamicSettings` 反向生成热更新字段的运行值，因此手工修改 `.env` 也不会被误报为已经生效
 - **持久化边界**:`PATCH /v1/admin/settings` 在 `DynamicSettings` 写锁内完成 revision 校验、整组关系校验、`.env.new` 写入与 fsync、旧文件备份、原子 rename、目录 fsync，再发布动态快照。通知 lifecycle 同步失败会回写旧 `.env`。地图和公告使用独立 revision，前端在 409 时加载最新版本并保留用户草稿供复核
 - **Operations 控制面**(`/operations/`):版本/服务操作、Router 日志、通知投递历史和 admin audit 从 Settings 中独立出来，避免配置编辑与即时运维动作混在同一导航和保存状态机中
+- **模型中枢**(`/clients/?tab=mine`):作为 Clients「我的」分页内的可选能力展示区域统一入口、用户 API Key 和 revision 化模型映射；同页 Share 卡片继续显示直连 URL，并只在该上下文附加映射摘要和快捷新增入口。它不是独立一级导航，不改变首页地图或 Share 侧边栏的信息层级
 - **配置契约审计**:`cargo test admin::settings` 覆盖后端 schema、来源、关系和文件权限；`npm run audit:settings-i18n` 保证所有字段与分组都有中英文文案；`npm run audit:settings-contract` 保证 Rust schema、默认 `.env` 和前端字段 catalog 精确一致，且旧 Settings API 不会回流
 - **账户 → 通知设置**(`/account/notifications`):邮件与 Telegram 使用独立开关,至少启用一个渠道；Telegram 未绑定或 Bot 未就绪时不可开启,服务端执行相同约束。绑定按钮在 `await` 前先 `window.open("about:blank")` 保留用户手势,失败则回落为可复制深链与 `/start <token>`。绑定完成发生在 Telegram 侧,页面以 3 秒间隔轮询 `GET /v1/me/notifications`,并以 `verifiedAt` 变化识别重新绑定而不是误用旧绑定状态；5 分钟后自动停止
 - 设计 token 以 `--router-*` CSS 自定义属性承载,dark mode 经 `.dark` class 整体切换

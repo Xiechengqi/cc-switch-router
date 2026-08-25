@@ -64,6 +64,7 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 | 界面 | 匿名 | 普通 | 供给方 | 租客 | 管理员 |
 |---|:--:|:--:|:--:|:--:|:--:|
 | `/clients` 总览 + 地图 | ✅ 只读 | ✅ | ✅ | ✅ | ✅ |
+| `/clients/?tab=mine` 模型中枢 | ❌ | ✅ 可配置 | ✅ 可配置 | ✅ 可配置 | ✅ 无额外 Share 权限 |
 | `/markets` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` | ↪ 跳转 `/share-market` |
 | `/share-market` | ✅ 只读 catalog | ✅ 租用/挂售 | ✅ | ✅ | ✅ 无特权 |
 | `/account/share` | ❌ | ✅ 只读监控 | ✅ | ✅ | ✅ 无特权 |
@@ -177,6 +178,35 @@ location.reload();
 | C-21 | 有可升级 client | 点升级按钮 | 弹二次确认后开始升级 |
 | C-22 | 任意 | 保持页面 30 秒 | 数据自动刷新,展开态/筛选态不被重置 |
 | C-23 | 配置了 Telegram | 观察页脚 | 显示 Telegram 链接,新标签打开 |
+
+---
+
+## 5.1 模型中枢(MH)
+
+覆盖 `client-board.tsx`、`model-hub-panel.tsx`、`share-card.tsx` 与 `lib/model-routing.ts`。统一入口是可选增强；所有用例都必须同时确认 Share 直连未被替代。
+
+| ID | 前置 | 步骤 | 预期 |
+|---|---|---|---|
+| MH-01 | 已登录 | 打开 `/clients/?tab=mine` | URL 保留 `tab=mine`；「模型中枢」出现；切到其他状态分页时 URL 移除 `tab/shareId/action`，目标分页不被异步状态覆盖成「全部」 |
+| MH-02 | 匿名且关闭鉴权旁路 | 打开 `/clients/?tab=mine` | 降级到公开 Clients 视图，不加载用户 Key / 路由，不显示「我的」或模型中枢 |
+| MH-03 | 用户没有 route | 查看模型中枢和有权限的 Share 卡片 | 显示区域统一 URL、API Key、revision 0、空路由；Share 直连 URL 仍可复制且调用行为不变 |
+| MH-04 | 同时拥有 Owner、有效 ShareTo、Free、已过期/撤销 grant 的 Shares | 打开「我的」 | Owner 与有效 ShareTo Client 属于「我的」；Free Share 只有被该用户显式映射时才扩展「我的」集合；失效 grant 和不可访问 route 不扩展集合 |
+| MH-05 | 至少一个可选 Share | 新增 route，选择 App、填写模型并保存 | 保存整组草稿，revision +1；刷新后精确恢复 `(App, model) → Share`，对应 Share 卡片出现映射摘要 |
+| MH-06 | 多个 Share 支持不同 App | 修改 route 的 App | 目标 Share 同步切到支持新 App 的可选项；下拉只列出当前有权限且开启该 App 的 Share，不留下不兼容目标 |
+| MH-07 | 已有 `codex/GPT-X` | 再添加 `codex/GPT-X` 与 `codex/gpt-x` | 完全相同键在前端阻止保存；仅大小写不同允许保存并保持两个独立 route |
+| MH-08 | 任意 | 输入空白模型/空目标、超过 200 字符或尝试第 101 条 | 前后端分别拒绝；已保存配置不发生部分更新 |
+| MH-09 | 两个浏览器窗口载入同一 revision | A 保存后 B 保存 | B 收到 revision conflict，本地草稿保留；revision 标签提示版本，可显式重新加载最新配置 |
+| MH-10 | route 的 Share 被删除、ACL 撤销或 App 关闭 | 重新打开并编辑其他 route 后保存 | 旧目标以「不可用」保持可见且可删除；不允许把新/变更 route 指向它；原样保留旧 route 时其他修改仍可原子保存 |
+| MH-11 | 有 eligible Share ID | 打开 `/clients/?tab=mine&shareId=<id>&action=add-route` | 自动新增指向该 Share 的草稿、滚动到模型中枢，并只消费 `shareId/action`；其他 query 参数和 `tab=mine` 保留 |
+| MH-12 | Key 可见 | 显示/隐藏、复制并执行重置 | 默认脱敏；复制值可调用；重置前明确提示统一和所有 Share 直连都会失效，确认后旧 Key 立即 401、新 Key 生效，route 不变化 |
+| MH-13 | 分别配置 Claude/Codex/Gemini route | 查看并复制 curl | 示例使用区域统一 URL、对应认证 header/path/body 和精确模型；切换/新增 route 后示例与首条完整 route 一致 |
+| MH-14 | 无任何 route，但用户仍有 Share 权限 | 分别调用统一 URL 与 Share 直连 URL | 统一入口返回 `404 user_model_route_not_configured`；Share 直连继续成功，不创建隐式 route |
+| MH-15 | route 指向在线 Share | 用 bearer、`x-api-key`、`x-goog-api-key` 分别调用适配协议 | 三种 Key 形式均解析为同一用户；请求进入精确目标 Share，模型名不被 Router 改写 |
+| MH-16 | 同模型在多个有权限 Share 上可用，但只映射 A | 让 A 离线/限流/上游失败后调用 | 返回 A 对应失败；不请求 B，不 fallback，不跨 Share retry；恢复 A 后仍走 A |
+| MH-17 | route 保存后撤销 ShareTo、关闭 Free 或关闭目标 App | 再次调用 | 每次请求重新检查 ACL/App 并分别返回稳定 403/409；历史映射不形成授权 |
+| MH-18 | 三个 App 都有 route | 调用各模型列表路径及未知 GET/POST 路径 | 模型列表只返回该 App 已配置模型的供应商兼容 envelope；未知路径不落回 Dashboard/Client/Share Web，返回统一入口 typed error |
+| MH-19 | 浏览器 Origin 跨域 | 对推理路径发 OPTIONS，再发成功与失败请求 | 预检 204 并允许请求 headers；成功、路由错误和目标 Share 响应均有一致 CORS origin，公开 request/error headers 可读 |
+| MH-20 | 完成一次统一调用 | 查看首页地图、Share 侧边栏、request log、usage/账务 | 只在目标 Share 层出现一次记录和归因；没有独立“统一入口 Share”、重复计量或用户级地图节点 |
 
 ---
 
@@ -803,8 +833,9 @@ location.reload();
 | `auth/login-dialog.tsx`, `auth-provider.tsx` | A-02~A-06, A-12, A-21~A-26 |
 | `announcement/*` | A-16~A-19 |
 | `dashboard/live-map.tsx` | C-02~C-06 |
-| `dashboard/client-board.tsx` | C-07~C-16, C-22 |
-| `dashboard/share-card.tsx` | C-17~C-20 |
+| `dashboard/client-board.tsx` | C-07~C-16, C-22, MH-01~MH-06, MH-11 |
+| `dashboard/model-hub-panel.tsx` | MH-01~MH-13 |
+| `dashboard/share-card.tsx` | C-17~C-20, MH-03~MH-06 |
 | `dashboard/drawer-panels.tsx` | C-13, C-18, D-05 |
 | `app/(dashboard)/markets/page.tsx` | L-01 |
 | `dashboard/share-market/*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10 |
@@ -849,6 +880,7 @@ location.reload();
 | `lib/client-market-refresh.ts` | H-23(数据刷新不丢状态), C-22, R-12 |
 | `lib/i18n.ts` | G-01, G-10 + 改动键所属界面 |
 | `lib/dashboard-nav.ts` | A-20 |
+| `lib/model-routing.ts` | MH-01, MH-04~MH-11 |
 | `lib/use-persistent-state.ts` | §3 全部持久化用例, G-12 |
 | `lib/api.ts` | 见 §19 覆盖核对表 |
 
@@ -872,6 +904,7 @@ location.reload();
 | Dashboard | `getDashboard`、`getMapDisplay` | C-01, C-22 |
 | Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
 | 用户 API Token | `getUserApiToken`、`resetUserApiToken` | A-10, A-11 |
+| 用户模型路由 | `getUserModelRouting`、`replaceUserModelRouting` | MH-01~MH-20 |
 | Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10 |
 | 其他(regions / 公告读取) | `getRegions`、`getAnnouncement` | A-14, A-16 |
 
@@ -887,20 +920,20 @@ location.reload();
 
 ## 20. 一轮完整回归的建议顺序
 
-共 **386 条用例**。单人跑完约需 5–6 小时。按角色分轮次,减少环境切换:
+共 **406 条用例**。单人跑完约需 5–6 小时。按角色分轮次,减少环境切换:
 
 | 轮次 | 环境 | 用例 | 约计 |
 |---|---|---|---|
 | 1. 匿名 | `DEV_AUTH_BYPASS=0`,不登录 | A-01, C-01~C-06, L-01~L-04, H-06, H-32, S-40, S-41, S-46, CH-02, N-01, X-01 | 25 分钟 |
-| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, H-51, SM-16, R-01, R-02, C-07~C-23 | 60 分钟 |
+| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, H-51, SM-16, R-01, R-02, C-07~C-23, MH-01~MH-13 | 70 分钟 |
 | 3. 供给方 | 名下有多状态主机 | H-03~H-05, H-07, H-10~H-18, H-20~H-29, H-40~H-50, H-60~H-84, T-01, T-04~T-19, T-30~T-36, Q-01~Q-14, D-10 | 120 分钟 |
 | 4. 租客 | 有租用中 Client | R-03~R-12, R-20~R-35, T-02, H-30, S-42~S-45, D-01~D-04 | 55 分钟 |
 | 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-38, N-02~N-14, L-01~L-05, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |
-| 6. 跨界面 | 任意角色 | G-01~G-12 | 30 分钟 |
+| 6. 跨界面 | 任意角色 | G-01~G-12, MH-14~MH-20 | 40 分钟 |
 
 **冒烟子集**(每次提交前跑,约 15 分钟):
 
-`A-04`(登录)· `C-01`(总览渲染)· `H-01`(默认只看自己 + 故障优先排序)· `H-11`(严重度序)· `H-51`(白名单引导)· `SM-16`(聊天室引导)· `H-60`(选择模式)· `R-03`(租用列表)· `R-23`(释放与数据丢失确认)· `MB-04`(聚合账户)· `MB-09`(付款声明)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
+`A-04`(登录)· `C-01`(总览渲染)· `MH-01`(我的分页)· `MH-05`(保存精确路由)· `MH-14`(直连兼容)· `H-01`(默认只看自己 + 故障优先排序)· `H-11`(严重度序)· `H-51`(白名单引导)· `SM-16`(聊天室引导)· `H-60`(选择模式)· `R-03`(租用列表)· `R-23`(释放与数据丢失确认)· `MB-04`(聚合账户)· `MB-09`(付款声明)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
 
 **建议按轮次记录结果**,而不是逐条打勾——失败项记 用例 ID + 实际现象 + 截图,便于回归定位。
 
@@ -920,3 +953,4 @@ location.reload();
 | 2026-07-31 | 免费与付费准入拆为四个独立作用域，免费默认黑名单、付费默认白名单；免费 Share/Host 新增 1–365 天或永久期限、报价快照、临期事件和到期安全回收，扩展 SM/H/AS/MA 回归用例。 |
 | 2026-07-31 | 可信买家管理改为可搜索表格和统一草稿保存；新增全局重置/保存门控以及多买家批量编辑回归用例 MA-14~MA-15。 |
 | 2026-08-10 | Share 下拉补充 subdomain、owner 与支持应用；Token 不限额时隐藏并归一周期；免费/付费统一独立服务期限并从租用成功起算，补齐到期状态机、聊天室事件和 SM/AS 回归用例。 |
+| 2026-08-25 | 新增区域统一模型入口与 Clients「我的」中的模型中枢；补齐精确路由、直连兼容、ACL 重检、无 fallback、CORS、日志归因和 URL 深链 MH-01~MH-20，总数 406。 |
