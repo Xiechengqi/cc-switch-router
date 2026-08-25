@@ -1,7 +1,9 @@
 "use client";
 
-import type { CoreShareApp } from "@/lib/share-app";
+import { resolveShareAppRuntime } from "@/components/dashboard/share-dashboard-utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { shareEnabledApps, type CoreShareApp } from "@/lib/share-app";
+import type { ShareView } from "@/lib/types";
 
 type ShareProviderIdentity = {
   providerName?: string;
@@ -133,6 +135,29 @@ function KimiProviderLogo({ size }: { size: number }) {
       />
     </svg>
   );
+}
+
+export type ShareProviderLogoEntry = {
+  app: CoreShareApp;
+  provider: ShareProviderIdentity;
+  key: string;
+};
+
+export function shareProviderLogoEntries(share: ShareView): ShareProviderLogoEntry[] {
+  return shareEnabledApps(share).reduce<ShareProviderLogoEntry[]>((entries, entryApp) => {
+    const entryRuntime = resolveShareAppRuntime(share, entryApp) || { app: entryApp };
+    const resolvedLogo = resolveShareProviderLogo(entryRuntime);
+    const key =
+      resolvedLogo?.key ||
+      [entryRuntime.providerType, entryRuntime.kind, entryRuntime.providerName]
+        .filter(Boolean)
+        .join(":") ||
+      entryApp;
+    if (!entries.some((entry) => entry.key === key)) {
+      entries.push({ app: entryApp, provider: entryRuntime, key });
+    }
+    return entries;
+  }, []);
 }
 
 export function resolveShareProviderLogo(

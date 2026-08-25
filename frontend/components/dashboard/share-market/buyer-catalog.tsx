@@ -537,13 +537,13 @@ export function ShareMarketBuyerCatalog({
                 className={cn(
                   "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
                   selectedFamily
-                    ? "bg-slate-900 font-semibold text-white"
+                    ? "bg-sky-100 font-semibold text-sky-800"
                     : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
                 )}
                 onClick={() => setFamily(selectedFamily ? "all" : item.value)}
               >
                 <span>{t(PROVIDER_FAMILY_KEYS[item.value])}</span>
-                <span className={cn("tabular-nums", selectedFamily ? "text-white/80" : "text-slate-400")}>{item.idle}</span>
+                <span className={cn("tabular-nums", selectedFamily ? "text-sky-600" : "text-slate-400")}>{item.idle}</span>
               </button>
             );
           })}

@@ -59,20 +59,33 @@ export function buildCalendarHeatmapCells<T extends CalendarHeatmapDay>(
   return cells;
 }
 
-function monthLabels(cells: Array<{ date: Date }>, locale: string) {
+const MIN_MONTH_LABEL_GAP_WEEKS = 3;
+
+export function calendarHeatmapMonthLabels(cells: Array<{ date: Date }>, locale: string) {
   const formatter = new Intl.DateTimeFormat(locale, { month: "short", timeZone: "UTC" });
-  const starts = new Map<number, Date>();
-  if (cells[0]) starts.set(0, cells[0].date);
+  const candidates: MonthLabel[] = [];
+  let lastMonthKey = "";
   cells.forEach((cell, index) => {
-    if (cell.date.getUTCDate() === 1) starts.set(Math.floor(index / 7), cell.date);
-  });
-  return [...starts.entries()]
-    .sort(([left], [right]) => left - right)
-    .map<MonthLabel>(([week, date]) => ({
-      key: `${week}:${date.getUTCFullYear()}-${date.getUTCMonth()}`,
+    const monthKey = `${cell.date.getUTCFullYear()}-${cell.date.getUTCMonth()}`;
+    if (monthKey === lastMonthKey) return;
+    lastMonthKey = monthKey;
+    const week = Math.floor(index / 7);
+    candidates.push({
+      key: `${week}:${monthKey}`,
       week,
-      label: formatter.format(date),
-    }));
+      label: formatter.format(cell.date),
+    });
+  });
+  const labels: MonthLabel[] = [];
+  for (const candidate of candidates) {
+    const previous = labels[labels.length - 1];
+    if (previous && candidate.week - previous.week < MIN_MONTH_LABEL_GAP_WEEKS) {
+      labels[labels.length - 1] = candidate;
+      continue;
+    }
+    labels.push(candidate);
+  }
+  return labels;
 }
 
 export function heatmapRateColor(rate?: number | null) {
@@ -108,7 +121,7 @@ export function CalendarHeatmapGrid<T extends CalendarHeatmapDay>({
     () => buildCalendarHeatmapCells(startDate, endDate, days),
     [startDate, endDate, days],
   );
-  const labels = React.useMemo(() => monthLabels(cells, locale), [cells, locale]);
+  const labels = React.useMemo(() => calendarHeatmapMonthLabels(cells, locale), [cells, locale]);
   const weekCount = Math.ceil(cells.length / 7);
   const weekdayFormatter = React.useMemo(
     () => new Intl.DateTimeFormat(locale, { weekday: "short", timeZone: "UTC" }),
@@ -159,14 +172,18 @@ export function CalendarHeatmapGrid<T extends CalendarHeatmapDay>({
               }}
             >
               {cells.map((cell) => {
-                const title = cellTitle(cell);
+                const inRange = cell.key >= startDate && cell.key <= endDate;
+                const title = inRange ? cellTitle(cell) : undefined;
                 return (
                   <span
                     key={cell.key}
                     title={title}
                     role={title ? "img" : undefined}
                     aria-label={title}
-                    className={cn("block rounded-[2px]", cell.day ? cellClassName(cell.day) : "bg-transparent")}
+                    className={cn(
+                      "block rounded-[2px]",
+                      inRange ? cellClassName(cell.day) : "bg-transparent",
+                    )}
                     style={{ width: HEATMAP_CELL_SIZE, height: HEATMAP_CELL_SIZE }}
                   />
                 );

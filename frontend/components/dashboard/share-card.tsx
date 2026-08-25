@@ -36,8 +36,8 @@ import {
   preferredScrollBehavior,
 } from "@/lib/utils";
 import {
-  resolveShareProviderLogo,
   ShareProviderLogo,
+  shareProviderLogoEntries,
 } from "@/components/dashboard/share-provider-logo";
 import {
   resolveShareCoreApp,
@@ -115,28 +115,7 @@ export const ShareCard = React.memo(function ShareCard({
   const averageLatency = averageRecentLatencyMs(appRequests);
   const performance = recentSharePerformance(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
-  const providerLogos = apps.reduce<
-    Array<{
-      app: CoreShareApp;
-      provider: NonNullable<ReturnType<typeof resolveShareAppRuntime>>;
-      key: string;
-    }>
-  >((entries, entryApp) => {
-    const entryRuntime = resolveShareAppRuntime(share, entryApp) || {
-      app: entryApp,
-    };
-    const resolvedLogo = resolveShareProviderLogo(entryRuntime);
-    const key =
-      resolvedLogo?.key ||
-      [entryRuntime.providerType, entryRuntime.kind, entryRuntime.providerName]
-        .filter(Boolean)
-        .join(":") ||
-      entryApp;
-    if (!entries.some((entry) => entry.key === key)) {
-      entries.push({ app: entryApp, provider: entryRuntime, key });
-    }
-    return entries;
-  }, []);
+  const providerLogos = shareProviderLogoEntries(share);
   const modelPolicyEntries = apps.flatMap((entryApp) => {
     const entryRuntime = resolveShareAppRuntime(share, entryApp);
     if (!entryRuntime) return [];

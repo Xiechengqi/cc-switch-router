@@ -78,8 +78,7 @@ export function ClientOnlineHeatmap({ installationId }: { installationId: string
           cellClassName={clientOnlineColor}
           cellTitle={(cell) => {
             const day = cell.day;
-            if (!day) return undefined;
-            if (day.observedMinutes === 0 || day.onlineRate == null) {
+            if (!day || day.observedMinutes === 0 || day.onlineRate == null) {
               return t("dashboard.clientOnlineCalendar.unobservedDay", {
                 date: dayFormatter.format(cell.date),
               });

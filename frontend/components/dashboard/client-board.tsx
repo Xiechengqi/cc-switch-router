@@ -1020,25 +1020,7 @@ export function ClientBoard({
             <Drawer.Dialog className={drawerDialogClassName}>
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
               <Drawer.Header>
-                <div className="flex min-w-0 items-start gap-2 pr-8">
-                  <Drawer.Heading className="min-w-0 flex-1 break-all font-mono text-base leading-6">{selectedClientUrl || "-"}</Drawer.Heading>
-                  {selectedClientUrl ? (
-                    <button
-                      type="button"
-                      aria-label={t("common.copy")}
-                      title={t("common.copy")}
-                      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
-                      onClick={() => {
-                        void navigator.clipboard.writeText(selectedClientUrl).then(
-                          () => toast.success(t("common.copySuccess")),
-                          () => toast.danger(t("common.copyFailed")),
-                        );
-                      }}
-                    >
-                      <Copy className="h-3.5 w-3.5" aria-hidden />
-                    </button>
-                  ) : null}
-                </div>
+                <Drawer.Heading className="pr-8 text-base">{t("dashboard.client")}</Drawer.Heading>
               </Drawer.Header>
               <Drawer.Body className="overflow-y-auto">
                 {selectedClient ? (
@@ -1048,7 +1030,25 @@ export function ClientBoard({
                     ) : null}
                     <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-xs">
                       <dt className="text-slate-500">URL</dt>
-                      <dd className="min-w-0 break-all font-mono font-medium text-slate-900">{selectedClientUrl || "-"}</dd>
+                      <dd className="flex min-w-0 items-start gap-1.5">
+                        <span className="min-w-0 break-all font-mono font-medium text-slate-900">{selectedClientUrl || "-"}</span>
+                        {selectedClientUrl ? (
+                          <button
+                            type="button"
+                            aria-label={t("common.copy")}
+                            title={t("common.copy")}
+                            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+                            onClick={() => {
+                              void navigator.clipboard.writeText(selectedClientUrl).then(
+                                () => toast.success(t("common.copySuccess")),
+                                () => toast.danger(t("common.copyFailed")),
+                              );
+                            }}
+                          >
+                            <Copy className="h-3.5 w-3.5" aria-hidden />
+                          </button>
+                        ) : null}
+                      </dd>
                       <dt className="text-slate-500">{t("dashboard.owner")}</dt>
                       <dd className="min-w-0 break-all font-medium text-slate-900">{clientOwnerEmail(selectedClient)}</dd>
                       <dt className="text-slate-500">{t("dashboard.region")}</dt>

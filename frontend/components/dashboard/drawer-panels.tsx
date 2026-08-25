@@ -4,6 +4,10 @@ import { Eye, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
+import {
+  ShareProviderLogo,
+  shareProviderLogoEntries,
+} from "@/components/dashboard/share-provider-logo";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -279,18 +283,20 @@ export function ShareEditAction({
       </button>
     );
   }
+  const label = share.canManage ? t("common.edit") : t("common.view");
   return (
     <button
       type="button"
       onClick={handle}
-      className="inline-flex h-[22px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2.5 text-[11px] font-medium text-primary transition-colors hover:border-primary/30 hover:bg-primary/15"
+      title={label}
+      aria-label={label}
+      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900"
     >
       {share.canManage ? (
-        <Pencil className="h-3 w-3" />
+        <Pencil className="h-3.5 w-3.5" />
       ) : (
-        <Eye className="h-3 w-3" />
+        <Eye className="h-3.5 w-3.5" />
       )}
-      {share.canManage ? t("common.edit") : t("common.view")}
     </button>
   );
 }
@@ -516,12 +522,16 @@ export function ClientLinkedSharesPanel({
     <div className="overflow-hidden rounded-lg border border-slate-200">
       <table className="w-full table-fixed border-collapse text-xs">
         <colgroup>
+          <col className="w-16" />
           <col />
           <col className="w-[5.5rem]" />
-          <col className="w-16" />
+          <col className="w-10" />
         </colgroup>
         <thead className="bg-slate-50 text-left text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-500">
           <tr>
+            <th className="px-2 py-2">
+              <span className="sr-only">{t("dashboard.providers")}</span>
+            </th>
             <th className="px-3 py-2">{t("dashboard.publicUrl")}</th>
             <th className="px-2 py-2">{t("dashboard.status")}</th>
             <th className="px-2 py-2 text-right">{t("common.actions")}</th>
@@ -530,8 +540,25 @@ export function ClientLinkedSharesPanel({
         <tbody>
           {shares.map((share) => {
             const api = shareApiParts(share);
+            const providerLogos = shareProviderLogoEntries(share);
             return (
               <tr key={share.shareId} className="border-t border-slate-100">
+                <td className="px-2 py-2 align-middle">
+                  {providerLogos.length ? (
+                    <span className="inline-flex items-center gap-1">
+                      {providerLogos.map((entry) => (
+                        <ShareProviderLogo
+                          key={entry.key}
+                          provider={entry.provider}
+                          fallbackApp={entry.app}
+                          size={16}
+                        />
+                      ))}
+                    </span>
+                  ) : (
+                    <span className="text-slate-300">-</span>
+                  )}
+                </td>
                 <td className="px-3 py-2">
                   <span className="block min-w-0 break-all font-mono text-[11px] leading-4 text-slate-900">
                     {api.apiUrl}
@@ -540,7 +567,7 @@ export function ClientLinkedSharesPanel({
                 <td className="px-2 py-2 align-middle">
                   <ShareStatusBadge share={share} t={t} />
                 </td>
-                <td className="px-2 py-2 text-right align-middle">
+                <td className="px-1 py-2 text-right align-middle">
                   <ShareEditAction share={share} onEdit={onEdit} t={t} />
                 </td>
               </tr>
