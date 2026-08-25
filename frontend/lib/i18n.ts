@@ -100,6 +100,7 @@ export const messages = {
     "shareMarket.listings.reopenableSeats": "{count} seats can be restored",
     "shareMarket.listings.activeRentals": "{count} rentals still active",
     "shareMarket.listings.closedEmpty": "No closed listings.",
+    "shareMarket.listings.full": "Full",
     "shareMarket.workspace.noListings": "No Share listings yet.",
     "shareMarket.catalog.subtitle":
       "Compare Shares by provider, occupancy, supported apps, terms, and service quality.",
@@ -3108,6 +3109,7 @@ export const messages = {
     "shareMarket.listings.reopenableSeats": "可恢复 {count} 个车位",
     "shareMarket.listings.activeRentals": "仍有 {count} 个租用中",
     "shareMarket.listings.closedEmpty": "暂无已停止的挂售。",
+    "shareMarket.listings.full": "已满",
     "shareMarket.workspace.noListings": "暂无 Share 挂售。",
     "shareMarket.catalog.subtitle":
       "按供应商、空闲车位、支持的 App、使用条款和服务质量比较 Share。",

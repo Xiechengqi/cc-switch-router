@@ -128,12 +128,42 @@ export function listingLiveSeats<T extends Pick<ShareMarketSeat, "position" | "s
     .sort(bySeatPosition);
 }
 
+export function listingIdleSeats<T extends Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription">>(
+  listing: { seats: T[] },
+) {
+  return listingLiveSeats(listing).filter(isSeatIdle);
+}
+
+export function listingLowestIdleSeat<
+  T extends Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription" | "isFree" | "dailyRateMinor">,
+>(listing: { seats: T[] }) {
+  const idle = listingIdleSeats(listing);
+  if (!idle.length) return null;
+  const amount = (seat: T) => seat.isFree ? 0 : seat.dailyRateMinor ?? 0;
+  const lowest = Math.min(...idle.map(amount));
+  return idle.find((seat) => amount(seat) === lowest) || idle[0];
+}
+
 export function listingClosedRentalSeats<T extends Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription">>(
   listing: { seats: T[] },
 ) {
   return listingLiveSeats(listing).filter((seat) =>
     !isSeatIdle(seat) && ACTIVE_SEAT_STATUSES.has(seat.status),
   );
+}
+
+export function listingExpandableSeats<
+  T extends Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription">,
+>(listing: { status: string; seats: T[] }) {
+  return listing.status === "closed"
+    ? listingClosedRentalSeats(listing)
+    : listingLiveSeats(listing);
+}
+
+export function listingCanExpand(
+  listing: { status: string; seats: Array<Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription">> },
+) {
+  return listingExpandableSeats(listing).length > 0;
 }
 
 export function listingLiveSeatCount(

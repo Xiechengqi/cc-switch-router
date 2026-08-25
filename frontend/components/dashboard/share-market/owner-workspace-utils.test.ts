@@ -13,9 +13,13 @@ import {
   isPriceOnlySeatAttention,
   listingAttentionSeats,
   listingBlockedFromReopen,
+  listingCanExpand,
   listingClosedRentalSeats,
+  listingExpandableSeats,
+  listingIdleSeats,
   listingLiveSeatCount,
   listingLiveSeats,
+  listingLowestIdleSeat,
   needsOwnedSeatAttention,
   ownedShareBlockedReasonKey,
   ownedShareReopenListingId,
@@ -186,6 +190,61 @@ test("partitions grant_failed into attention and released out of live seats", ()
 function occupiedSeat() {
   return rentedSeat("rent", "occupied", { subscriptionStatus: "active_free" });
 }
+
+test("lowest idle price never falls back to occupied seats", () => {
+  const idle = rentedSeat("idle", "available", {
+    position: 1,
+    isFree: false,
+    dailyRateMinor: 200,
+  });
+  const occupied = rentedSeat("rent", "occupied", {
+    position: 2,
+    subscriptionStatus: "active_postpaid",
+    isFree: false,
+    dailyRateMinor: 100,
+  });
+  const current = listing("live", "active", [idle, occupied]);
+  assert.equal(listingLowestIdleSeat(current)?.id, "idle");
+  assert.deepEqual(listingIdleSeats(current).map((item) => item.id), ["idle"]);
+
+  const full = listing("full", "active", [occupied]);
+  assert.equal(listingLowestIdleSeat(full), null);
+  assert.deepEqual(listingIdleSeats(full), []);
+});
+
+test("free idle seats beat paid idle seats for the collapsed price", () => {
+  const paid = rentedSeat("paid", "available", {
+    position: 1,
+    isFree: false,
+    dailyRateMinor: 50,
+  });
+  const free = rentedSeat("free", "available", {
+    position: 2,
+    isFree: true,
+  });
+  assert.equal(listingLowestIdleSeat(listing("mix", "active", [paid, free]))?.id, "free");
+});
+
+test("expandable seats are live seats on active listings and remaining rentals when closed", () => {
+  const failed = rentedSeat("failed", "occupied", { position: 2, subscriptionStatus: "grant_failed" });
+  const idle = rentedSeat("idle", "available", { position: 1 });
+  const live = listing("live", "active", [failed, idle]);
+  assert.deepEqual(listingExpandableSeats(live).map((item) => item.id), ["idle"]);
+  assert.equal(listingCanExpand(live), true);
+
+  const attentionOnly = listing("busy", "active", [failed]);
+  assert.deepEqual(listingExpandableSeats(attentionOnly).map((item) => item.id), []);
+  assert.equal(listingCanExpand(attentionOnly), false);
+
+  const occupied = rentedSeat("rent", "occupied", { position: 2, subscriptionStatus: "active_free" });
+  const idleStopped = rentedSeat("stopped-idle", "available", { position: 1, canRepublish: true });
+  const stopped = listing("stopped", "closed", [idleStopped, occupied], { canReopen: true });
+  assert.deepEqual(listingExpandableSeats(stopped).map((item) => item.id), ["rent"]);
+  assert.equal(listingCanExpand(stopped), true);
+
+  const closedEmpty = listing("done", "closed", [idleStopped], { canReopen: true });
+  assert.equal(listingCanExpand(closedEmpty), false);
+});
 
 test("reopen API conflicts are localized by stable error code", () => {
   const translate = (key: string) => key;
