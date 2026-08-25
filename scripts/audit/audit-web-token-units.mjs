@@ -27,10 +27,14 @@ function lineNumber(source, index) {
 const tokenUnitSource = fs.readFileSync(path.join(frontendRoot, "lib/token-units.ts"), "utf8");
 for (const marker of [
   "TOKENS_PER_MILLION = 1_000_000",
+  "TOKENS_PER_WAN = 10_000",
+  "TOKENS_PER_YI = 100_000_000",
   "MILLION_INPUT_PATTERN",
   "millionsInputToTokens",
   "tokensToMillionsInput",
   "Number.isSafeInteger(tokens)",
+  '"万"',
+  '"亿"',
 ]) {
   if (!tokenUnitSource.includes(marker)) errors.push(`frontend/lib/token-units.ts is missing ${marker}`);
 }
@@ -42,6 +46,8 @@ for (const marker of [
   "9007199254.740992",
   "1.25 M",
   "9,007,199,254.740991 M",
+  "125万",
+  "1亿",
 ]) {
   if (!tokenUnitTests.includes(marker)) errors.push(`frontend/lib/token-units.test.ts is missing ${marker}`);
 }
@@ -71,7 +77,7 @@ for (const relativePath of [
 const messages = fs.readFileSync(path.join(frontendRoot, "lib/i18n.ts"), "utf8");
 for (const marker of [
   '"shareMarket.tokensMillions": "Token limit (M)"',
-  '"shareMarket.tokensMillions": "Token 限额（M）"',
+  '"shareMarket.tokensMillions": "Token 限额（百万）"',
   '"dashboard.field.tokenLimit": "Token limit (M)"',
   '"dashboard.field.tokenLimit": "Token 限制（M）"',
   '"dashboard.userLimit.consumedTokens": "Consumed tokens (M, current period)"',
