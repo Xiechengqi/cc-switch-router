@@ -78,6 +78,8 @@ import type {
   ShareMarketSubscriptions,
   ShareMarketOwnedShare,
   ShareMarketSeatInput,
+  ShareMarketReopenListingInput,
+  ShareMarketReopenListingResponse,
   ShareMarketRentQuote,
   ShareMarketTerminationQuote,
   ShareMarketTerminationAdjustment,
@@ -1625,6 +1627,19 @@ export async function addShareMarketSeat(listingId: string, seat: ShareMarketSea
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(seat),
+    }),
+  );
+}
+
+export async function reopenShareMarketListing(
+  listingId: string,
+  input: ShareMarketReopenListingInput,
+) {
+  return parseJson<ShareMarketReopenListingResponse>(
+    await authFetch(`/v1/share-market/listings/${encodeURIComponent(listingId)}/reopen`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
     }),
   );
 }

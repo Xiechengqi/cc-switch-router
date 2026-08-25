@@ -79,8 +79,8 @@ Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 
 - 供应商可随时永久关闭某个买方的赊账关系；即使已有待处理账单,关闭意图也会立即锁定并终止服务,清账或作废后不会恢复,未来也禁止双方再次建立付费租约。
 - 买家点击租用先经过交易确认，确认内容固定展示 Owner、服务、在线状态、USD 日费或免费报价、独立服务期限，以及付费服务的 12 小时健康时长试用和按供应商聚合账单语义；提交继续携带 `offerRevision` 防止确认后报价被替换。
 - 租用后,Router 才通过 pending Share edit 在 Server 上创建 `routerShareMarket` 管理的 `shareto` entitlement。普通 Share 编辑不能修改或删除这类 entitlement。
-- Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
-- **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
+- Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约；同时递增这些车位的报价 revision 并失效未提交 quote,阻止停止前报价在恢复后被消费。
+- **恢复挂售**:停止挂售是可逆状态,始终恢复原 listing,不创建替代 listing。Owner 可勾选全部或部分未出租、未退休的 disabled 旧车位,复核并修改条款,也可在同一操作中添加新车位；进行中的租约不阻止恢复且不受影响。恢复在 Immediate 事务中完成全部校验、旧车位更新、新车位插入和 listing 激活,任一失败完整回滚。「添加 Share」只用于从未挂售或已删除旧 listing 的 Share；存在 closed listing 时直接引导「恢复挂售」。
 - 普通 Share 的 `freeAccess` 是独立的公开免费策略：默认私有，开启后任意持有效 Router 用户 API Token 的已登录用户可调用，匿名仍拒绝。它与 Share Market listing/subscription 严格互斥；候选列表排除 Free Share，业务事务和数据库 trigger 双向阻止“公开免费 + 活跃市场 entitlement”，尚未应用的“开启 Free”控制面编辑也会阻止新建或重新打开 listing。
 
 市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `service_duration_days`，Subscription 另存从租用成功时计算的绝对 `expires_at`，`activated_at` 只记录授权实际生效时间。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。

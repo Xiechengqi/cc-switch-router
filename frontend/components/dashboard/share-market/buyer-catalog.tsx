@@ -396,7 +396,7 @@ export function ShareMarketBuyerCatalog({
           listing.subdomain,
           listing.ownerEmail,
           ...listing.supportedApps,
-          ...listing.appCapabilities.flatMap((item) => [item.providerName, item.providerType, item.subscriptionLevel, item.upstreamModel, ...item.models]),
+          ...listing.appCapabilities.flatMap((item) => [item.providerName, item.providerType, item.subscriptionLevel, item.upstreamModel, ...(item.models ?? [])]),
         ].filter(Boolean).join(" ").toLocaleLowerCase().includes(needle);
       })
       .sort((left, right) => {

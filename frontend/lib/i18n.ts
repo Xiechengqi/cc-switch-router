@@ -95,6 +95,11 @@ export const messages = {
     "shareMarket.rentals.attention": "Needs attention",
     "shareMarket.workspace.sellingHint":
       "Publish Share seats and manage active listings and rentals.",
+    "shareMarket.listings.active": "Listed",
+    "shareMarket.listings.closed": "Closed",
+    "shareMarket.listings.reopenableSeats": "{count} seats can be restored",
+    "shareMarket.listings.activeRentals": "{count} rentals still active",
+    "shareMarket.listings.closedEmpty": "No closed listings.",
     "shareMarket.workspace.noListings": "No Share listings yet.",
     "shareMarket.catalog.subtitle":
       "Compare Shares by provider, occupancy, supported apps, terms, and service quality.",
@@ -186,7 +191,33 @@ export const messages = {
     "shareMarket.unavailable": "Unavailable",
     "shareMarket.closed": "Closed",
     "shareMarket.closedHint":
-      "Available seats are disabled. Active rentals continue. After all rentals end, use Add Share to list this Share again. You can still add seats here to reopen the listing.",
+      "Available seats are disabled, while active rentals continue unchanged. Restore this listing to republish eligible seats or add new ones.",
+    "shareMarket.reopen.action": "Restore listing",
+    "shareMarket.reopen.title": "Restore Share listing",
+    "shareMarket.reopen.hint":
+      "Review the stopped seats before publishing. Restoring this listing does not change active rentals.",
+    "shareMarket.reopen.activeSeatsHint":
+      "{count} active or pending seats remain attached and are not changed by this action.",
+    "shareMarket.reopen.existingSeats": "Stopped seats",
+    "shareMarket.reopen.existingSeatsHint":
+      "Selected seats will be republished with the terms shown below. Clear a seat to keep it stopped.",
+    "shareMarket.reopen.noExistingSeats":
+      "No stopped seat can be republished. Add at least one new seat to restore the listing.",
+    "shareMarket.reopen.newSeats": "New seats",
+    "shareMarket.reopen.newSeat": "New seat {position}",
+    "shareMarket.reopen.addNewSeat": "Add new seat",
+    "shareMarket.reopen.selectSeat": "Select a stopped seat or add a new seat.",
+    "shareMarket.reopen.confirm": "Restore listing",
+    "shareMarket.reopen.blocked.ownerOnly": "Only the listing owner can restore it.",
+    "shareMarket.reopen.blocked.shareMissing": "The underlying Share no longer exists.",
+    "shareMarket.reopen.blocked.ownerChanged": "The Share owner has changed.",
+    "shareMarket.reopen.blocked.shareInactive": "Activate the Share before restoring this listing.",
+    "shareMarket.reopen.blocked.freeAccess": "Turn off public free access before restoring this listing.",
+    "shareMarket.reopen.blocked.pendingShareEdit": "Wait for the pending public-access change to finish.",
+    "shareMarket.reopen.blocked.clientUpgrade": "Upgrade cc-switch-server before restoring this listing.",
+    "shareMarket.reopen.blocked.anotherListing": "Another listing for this Share is already active.",
+    "shareMarket.reopen.blocked.seatLimit": "This listing already has 20 active or pending seats.",
+    "shareMarket.reopen.blocked.unknown": "This listing cannot currently be restored.",
     "shareMarket.openShare": "Open Share",
     "shareMarket.groupChat": "Group chat",
     "shareMarket.openGroupChat": "Open the corresponding Client chat",
@@ -407,7 +438,15 @@ export const messages = {
       "Wait for the pending public-access change to finish before listing this Share.",
     "shareMarket.error.alreadyListed": "This Share is already listed.",
     "shareMarket.error.activeRentals":
-      "This Share still has active market rentals and cannot be relisted yet.",
+      "This Share still has active market rentals, so a separate new listing cannot be created.",
+    "shareMarket.error.reopenRequired":
+      "This Share has a stopped listing. Restore that listing instead of creating another one.",
+    "shareMarket.error.otherActiveListing":
+      "Another listing for this Share is already active. Reload the page to manage it.",
+    "shareMarket.error.listingNotClosed":
+      "This listing is no longer stopped. Reload and review its current state.",
+    "shareMarket.error.seatNotReopenable":
+      "One of the selected seats can no longer be republished. Reload and review the seats.",
     "shareMarket.error.unsupportedPeriod":
       "This Client does not support the selected Token period.",
     "shareMarket.error.parallelExceedsShare":
@@ -459,7 +498,7 @@ export const messages = {
     "shareMarket.dialog.title": "Add Share to market",
     "shareMarket.dialog.selectShare": "Share",
     "shareMarket.dialog.noShares":
-      "You have no active, unlisted Share available. Closed listings with active rentals must finish before Add Share can list them again.",
+      "You have no active Share that is ready for a new listing. Stopped listings can be restored below.",
     "shareMarket.dialog.seats": "Seats",
     "shareMarket.dialog.addSeat": "Add another seat",
     "shareMarket.dialog.create": "Publish listing",
@@ -473,8 +512,13 @@ export const messages = {
     "shareMarket.dialog.capacityTokens": "Token {value}",
     "shareMarket.dialog.blockedTitle": "Shares that cannot be listed",
     "shareMarket.dialog.blocked.alreadyListed": "Already listed or still rented",
+    "shareMarket.dialog.blocked.activeListing": "Already listed",
+    "shareMarket.dialog.blocked.reopenRequired": "Restore the stopped listing",
+    "shareMarket.dialog.blocked.activeRentals": "Active rentals remain",
     "shareMarket.dialog.blocked.freeAccess": "Public free access is enabled",
     "shareMarket.dialog.blocked.inactive": "Share is not active",
+    "shareMarket.dialog.blocked.pendingShareEdit": "Public-access change is pending",
+    "shareMarket.dialog.blocked.clientUpgrade": "cc-switch-server upgrade required",
     "shareMarket.dialog.blocked.unknown": "Share is not currently eligible",
     "shareMarket.dialog.manageShare": "Manage Share",
     "shareMarket.paidReadiness.checking": "Checking paid-offer setup…",
@@ -3059,6 +3103,11 @@ export const messages = {
     "shareMarket.workspace.rentalsHint": "使用、核对或归还你明确租用的 Share 拼车位。",
     "shareMarket.rentals.attention": "需处理",
     "shareMarket.workspace.sellingHint": "发布 Share 拼车位并管理挂售与租约。",
+    "shareMarket.listings.active": "挂售中",
+    "shareMarket.listings.closed": "已停止",
+    "shareMarket.listings.reopenableSeats": "可恢复 {count} 个车位",
+    "shareMarket.listings.activeRentals": "仍有 {count} 个租用中",
+    "shareMarket.listings.closedEmpty": "暂无已停止的挂售。",
     "shareMarket.workspace.noListings": "暂无 Share 挂售。",
     "shareMarket.catalog.subtitle":
       "按供应商、空闲车位、支持的 App、使用条款和服务质量比较 Share。",
@@ -3150,7 +3199,33 @@ export const messages = {
     "shareMarket.unavailable": "不可用",
     "shareMarket.closed": "已停止挂售",
     "shareMarket.closedHint":
-      "空闲拼车位已停用，进行中的租约不受影响。全部租约结束后可用「添加 Share」重新挂售；也可在此添加拼车位以重新打开挂售。",
+      "空闲拼车位已停用，进行中的租约不受影响。恢复此挂售可重新发布符合条件的旧车位，也可同时添加新车位。",
+    "shareMarket.reopen.action": "恢复挂售",
+    "shareMarket.reopen.title": "恢复 Share 挂售",
+    "shareMarket.reopen.hint":
+      "发布前请复核已停用车位的条款。恢复挂售不会改变进行中的租约。",
+    "shareMarket.reopen.activeSeatsHint":
+      "仍有 {count} 个租用中或处理中车位，本次操作不会修改它们。",
+    "shareMarket.reopen.existingSeats": "已停用车位",
+    "shareMarket.reopen.existingSeatsHint":
+      "勾选的车位会按下方条款重新发布；取消勾选可让该车位继续停用。",
+    "shareMarket.reopen.noExistingSeats":
+      "没有可重新发布的旧车位，请至少添加一个新车位后恢复挂售。",
+    "shareMarket.reopen.newSeats": "新车位",
+    "shareMarket.reopen.newSeat": "新车位 {position}",
+    "shareMarket.reopen.addNewSeat": "添加新车位",
+    "shareMarket.reopen.selectSeat": "请勾选一个已停用车位，或添加一个新车位。",
+    "shareMarket.reopen.confirm": "恢复挂售",
+    "shareMarket.reopen.blocked.ownerOnly": "只有挂售 Owner 可以恢复挂售。",
+    "shareMarket.reopen.blocked.shareMissing": "对应的 Share 已不存在。",
+    "shareMarket.reopen.blocked.ownerChanged": "该 Share 的 Owner 已发生变化。",
+    "shareMarket.reopen.blocked.shareInactive": "请先启用该 Share，再恢复挂售。",
+    "shareMarket.reopen.blocked.freeAccess": "请先关闭公开免费使用，再恢复挂售。",
+    "shareMarket.reopen.blocked.pendingShareEdit": "请等待公开访问设置变更完成。",
+    "shareMarket.reopen.blocked.clientUpgrade": "请先升级 cc-switch-server，再恢复挂售。",
+    "shareMarket.reopen.blocked.anotherListing": "该 Share 已有另一个生效中的挂售。",
+    "shareMarket.reopen.blocked.seatLimit": "该挂售已有 20 个租用中或处理中车位。",
+    "shareMarket.reopen.blocked.unknown": "该挂售当前无法恢复。",
     "shareMarket.openShare": "打开 Share",
     "shareMarket.groupChat": "群聊",
     "shareMarket.openGroupChat": "打开对应 Client 聊天室",
@@ -3367,7 +3442,15 @@ export const messages = {
       "公开访问设置仍在应用中，请等待完成后再发布挂售。",
     "shareMarket.error.alreadyListed": "该 Share 已经挂售。",
     "shareMarket.error.activeRentals":
-      "该 Share 仍有进行中的市场租用，暂时不能重新挂售。",
+      "该 Share 仍有进行中的市场租用，不能另行创建新的挂售。",
+    "shareMarket.error.reopenRequired":
+      "该 Share 存在已停止的挂售，请恢复原挂售，不要重复创建。",
+    "shareMarket.error.otherActiveListing":
+      "该 Share 已有另一个生效中的挂售，请刷新后管理该挂售。",
+    "shareMarket.error.listingNotClosed":
+      "该挂售已不再是停止状态，请刷新并检查当前状态。",
+    "shareMarket.error.seatNotReopenable":
+      "选中的某个车位已无法重新发布，请刷新后重新检查。",
     "shareMarket.error.unsupportedPeriod":
       "该 Client 不支持所选 Token 周期。",
     "shareMarket.error.parallelExceedsShare":
@@ -3417,7 +3500,7 @@ export const messages = {
     "shareMarket.dialog.title": "添加 Share 到市场",
     "shareMarket.dialog.selectShare": "选择 Share",
     "shareMarket.dialog.noShares":
-      "暂无可挂售的活跃 Share。若已停止挂售但仍有进行中的租约，需等租约结束后才能通过「添加 Share」重新挂售。",
+      "当前没有可新建挂售的 active Share；已停止的挂售可在下方直接恢复。",
     "shareMarket.dialog.seats": "拼车位",
     "shareMarket.dialog.addSeat": "再添加一个拼车位",
     "shareMarket.dialog.create": "发布挂售",
@@ -3431,8 +3514,13 @@ export const messages = {
     "shareMarket.dialog.capacityTokens": "Token {value}",
     "shareMarket.dialog.blockedTitle": "暂时无法挂售的 Share",
     "shareMarket.dialog.blocked.alreadyListed": "已经挂售或仍有租用",
+    "shareMarket.dialog.blocked.activeListing": "已经挂售",
+    "shareMarket.dialog.blocked.reopenRequired": "请恢复已停止的挂售",
+    "shareMarket.dialog.blocked.activeRentals": "仍有进行中的租用",
     "shareMarket.dialog.blocked.freeAccess": "已开启公开免费使用",
     "shareMarket.dialog.blocked.inactive": "Share 未启用",
+    "shareMarket.dialog.blocked.pendingShareEdit": "公开访问设置正在变更",
+    "shareMarket.dialog.blocked.clientUpgrade": "需要升级 cc-switch-server",
     "shareMarket.dialog.blocked.unknown": "当前不满足挂售条件",
     "shareMarket.dialog.manageShare": "管理 Share",
     "shareMarket.paidReadiness.checking": "正在检查付费挂售配置…",

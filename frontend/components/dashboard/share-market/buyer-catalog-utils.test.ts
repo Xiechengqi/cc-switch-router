@@ -178,6 +178,52 @@ test("provider panel excludes bound apps whose Share API is disabled", () => {
   assert.doesNotMatch(view.modelsLine, /Claude:/);
 });
 
+test("provider panel survives omitted models on passthrough listings", () => {
+  const view = marketProviderStatusView(
+    {
+      supportedApps: ["claude"],
+      appCapabilities: [
+        capability({
+          app: "claude",
+          providerFamily: "anthropic",
+          providerName: "Claude OAuth",
+          providerType: "claude_oauth",
+          subscriptionLevel: "Claude Pro",
+          modelMode: "passthrough",
+          upstreamModel: undefined,
+          models: undefined,
+        }),
+      ],
+    },
+    "en",
+    { unknown: "Unknown", passthrough: "Passthrough" },
+  );
+
+  assert.equal(view.modelsLine, "Claude: Passthrough");
+  assert.equal(view.identityLine, "Claude OAuth · claude_oauth");
+  assert.equal(view.primaryLine, "Claude Pro");
+});
+
+test("provider panel survives omitted models on fixed listings without an upstream model", () => {
+  const view = marketProviderStatusView(
+    {
+      supportedApps: ["codex"],
+      appCapabilities: [
+        capability({
+          modelMode: "fixed",
+          upstreamModel: undefined,
+          models: undefined,
+        }),
+      ],
+    },
+    "en",
+    { unknown: "Unknown", passthrough: "Passthrough" },
+  );
+
+  assert.equal(view.modelsLine, "Codex: Unknown");
+  assert.equal(view.identityLine, "OpenAI Official · codex_oauth");
+});
+
 test("contract integrity reasons are localized without exposing internal codes", () => {
   const text = integrityReasonText(
     "share_contract_upgrade_required,contract_apps_missing,contract_apps_changed,app_scope_not_enforced,entitlement_missing,unknown_reason",

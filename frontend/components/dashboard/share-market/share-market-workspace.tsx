@@ -316,6 +316,7 @@ export function ShareMarketWorkspace() {
           focusedShareId={focusedShareId}
           onChanged={() => load({ scope: "selling", silent: true })}
           onInteractionChange={setPausePolling}
+          showHeading={false}
         />
       ) : null}
     </main>

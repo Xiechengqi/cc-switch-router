@@ -12,7 +12,7 @@
     "test:flags": "node scripts/raster-flags.mjs && node --test scripts/raster-flags.test.mjs",
     "typecheck": "tsc --noEmit",
     "test:operational-status": "tsx --test components/dashboard/operational-status.test.ts",
-    "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts",
+    "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts components/dashboard/share-market/owner-workspace-utils.test.ts",
     "test:token-units": "tsx --test lib/token-units.test.ts",
     "test:share-model-probe": "tsx --test lib/share-model-probe.test.ts",
     "test:share-model-health-heatmap": "tsx --test components/dashboard/share-model-health-heatmap.test.ts components/dashboard/client-online-heatmap.test.ts",

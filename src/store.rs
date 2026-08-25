@@ -43,17 +43,17 @@ use crate::models::{
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse, CapacityAppAvailability,
     CapacityAppAvailabilityEntry, ChangeInstallationOwnerEmailRequest,
     ChangeInstallationOwnerEmailResponse, ClientMetadata, ClientOnlineCalendarDay,
-    ClientOnlineCalendarResponse, ClientTunnelClaimRequest,
-    ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
-    ClientTunnelView, ClientWebRequestEmailCodeRequest, ClientWebVerifyEmailCodeRequest,
-    CountryBoard, CountryClientBoard, CountryMapPoint, CountryShareBoard,
-    DashboardClientTunnelView, DashboardClientView, DashboardMap, DashboardMapPoint,
-    DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
-    DashboardUxEventRequest, GatewayRegistryRecord, GatewayRequestObservation,
-    GatewayRequestObservationBatch, GatewayShareAppView, GatewayShareView,
-    GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
-    HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
-    InstallationHeartbeatRequest, InstallationHeartbeatResponse, InstallationSetupCompletedPayload,
+    ClientOnlineCalendarResponse, ClientTunnelClaimRequest, ClientTunnelConfig, ClientTunnelQuery,
+    ClientTunnelResponse, ClientTunnelUpdateRequest, ClientTunnelView,
+    ClientWebRequestEmailCodeRequest, ClientWebVerifyEmailCodeRequest, CountryBoard,
+    CountryClientBoard, CountryMapPoint, CountryShareBoard, DashboardClientTunnelView,
+    DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
+    DashboardResponse, DashboardStats, DashboardTickerShare, DashboardUxEventRequest,
+    GatewayRegistryRecord, GatewayRequestObservation, GatewayRequestObservationBatch,
+    GatewayShareAppView, GatewayShareView, GetInstallationOwnerEmailQuery,
+    GetInstallationOwnerEmailResponse, HealthCheckEntry, HealthTimelineBucket,
+    ImageGenerationRequestLogEntry, Installation, InstallationHeartbeatRequest,
+    InstallationHeartbeatResponse, InstallationSetupCompletedPayload,
     InstallationSetupCompletedRequest, InstallationSetupCompletedResponse,
     InstallationSetupCompletedStatus, InstallationUpgradeTaskReportPayload,
     InstallationUpgradeTaskReportRequest, InstallationUpgradeTaskReportResponse,
@@ -11821,7 +11821,9 @@ impl AppStore {
         if is_admin {
             return Ok(self.installation_exists(installation_id).await?);
         }
-        let Some(viewer_email) = viewer_email.map(str::trim).filter(|email| !email.is_empty())
+        let Some(viewer_email) = viewer_email
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
         else {
             return Ok(false);
         };
@@ -11855,7 +11857,9 @@ impl AppStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| {
-                AppError::Internal(format!("read Client online calendar tunnel failed: {error}"))
+                AppError::Internal(format!(
+                    "read Client online calendar tunnel failed: {error}"
+                ))
             })?;
         if owns_tunnel != 0 {
             return Ok(true);
@@ -11867,7 +11871,9 @@ impl AppStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| {
-                AppError::Internal(format!("read Client online calendar shares failed: {error}"))
+                AppError::Internal(format!(
+                    "read Client online calendar shares failed: {error}"
+                ))
             })?;
         if shares_exist == 0 {
             return Ok(false);
@@ -11888,14 +11894,18 @@ impl AppStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| {
-                AppError::Internal(format!("query Client online calendar grants failed: {error}"))
+                AppError::Internal(format!(
+                    "query Client online calendar grants failed: {error}"
+                ))
             })?;
         for row in rows {
             let (owner_email, grants_json) = row.map_err(|error| {
                 AppError::Internal(format!("read Client online calendar grant failed: {error}"))
             })?;
             let grants = parse_share_user_grants(Some(grants_json)).map_err(|error| {
-                AppError::Internal(format!("parse Client online calendar grants failed: {error}"))
+                AppError::Internal(format!(
+                    "parse Client online calendar grants failed: {error}"
+                ))
             })?;
             if owner_email.eq_ignore_ascii_case(viewer_email) {
                 return Ok(true);
@@ -11936,7 +11946,9 @@ impl AppStore {
             )
             .optional()
             .map_err(|error| {
-                AppError::Internal(format!("read Client online calendar target failed: {error}"))
+                AppError::Internal(format!(
+                    "read Client online calendar target failed: {error}"
+                ))
             })?;
         let Some(created_at) = created_at else {
             return Ok(None);
@@ -11989,14 +12001,18 @@ impl AppStore {
                  GROUP BY minute",
             )
             .map_err(|error| {
-                AppError::Internal(format!("prepare recent Client online minutes failed: {error}"))
+                AppError::Internal(format!(
+                    "prepare recent Client online minutes failed: {error}"
+                ))
             })?;
         let recent_rows = recent_statement
             .query_map(params![installation_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|error| {
-                AppError::Internal(format!("query recent Client online minutes failed: {error}"))
+                AppError::Internal(format!(
+                    "query recent Client online minutes failed: {error}"
+                ))
             })?;
         let mut recent_by_day = HashMap::<String, (u32, u32)>::new();
         for row in recent_rows {
@@ -20905,7 +20921,9 @@ fn record_installation_online_day_minute_conn(
             |row| row.get(0),
         )
         .map_err(|error| {
-            AppError::Internal(format!("read Client online minute uniqueness failed: {error}"))
+            AppError::Internal(format!(
+                "read Client online minute uniqueness failed: {error}"
+            ))
         })?;
     let healthy_in_minute: i64 = conn
         .query_row(

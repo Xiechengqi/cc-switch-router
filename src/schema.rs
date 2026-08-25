@@ -638,7 +638,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 124);
+        assert_eq!(table_count, 125);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_and_28_upgrade_a_version_26_database() {
+    fn migrations_27_through_29_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1115,8 +1115,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 28);
-        check_compatibility(&conn).expect("upgraded version 28 is compatible");
+        assert_eq!(latest_version, 29);
+        check_compatibility(&conn).expect("upgraded version 29 is compatible");
     }
 
     #[test]

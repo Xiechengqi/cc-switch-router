@@ -2398,6 +2398,7 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   readOnly: boolean;
   canDelete: boolean;
   deleteBlockedReason?: string;
+  canRepublish: boolean;
   retiredAt?: string;
   subscription?: ShareMarketSubscription;
 };
@@ -2442,7 +2443,7 @@ export type ShareMarketAppCapability = {
   subscriptionLevel?: string;
   modelMode: "fixed" | "passthrough" | "unknown";
   upstreamModel?: string;
-  models: string[];
+  models?: string[];
   available?: boolean;
   healthState: ShareMarketProviderHealthState;
   accountHint?: string;
@@ -2485,6 +2486,9 @@ export type ShareMarketListing = {
   isOwner: boolean;
   canDelete: boolean;
   deleteBlockedReason?: string;
+  canReopen: boolean;
+  reopenBlockedReason?: string;
+  reopenableSeatCount: number;
   contacts?: PaymentContact[];
   paymentMethodKinds: string[];
   performance: ShareMarketPerformance;
@@ -2591,6 +2595,30 @@ export type ShareMarketOwnedShare = {
   parallelLimit?: number;
   tokenLimit?: number;
   alreadyListed: boolean;
+  activeListingId?: string;
+  reopenListingId?: string;
+  hasActiveRentals: boolean;
+  marketState: "listed" | "stopped" | "rented" | "public_access" | "inactive" | "available";
+  canCreateListing: boolean;
+  createBlockedReason?: string;
   freeAccess: boolean;
   supportedUserTokenPeriods: ShareTokenPeriod[];
+};
+
+export type ShareMarketReopenExistingSeatInput = {
+  seatId: string;
+  offerRevision: number;
+  seat: ShareMarketSeatInput;
+};
+
+export type ShareMarketReopenListingInput = {
+  existingSeats: ShareMarketReopenExistingSeatInput[];
+  newSeats: ShareMarketSeatInput[];
+};
+
+export type ShareMarketReopenListingResponse = {
+  ok: true;
+  listingId: string;
+  reopenedSeatIds: string[];
+  newSeatIds: string[];
 };

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration as StdDuration;
 
 use crate::db::{
@@ -65,6 +65,12 @@ const SEAT_REVOKING: &str = "revoking";
 const SEAT_DISABLED: &str = "disabled";
 const SEAT_DELETED: &str = "deleted";
 const SEAT_RETIRED_VIEW: &str = "retired";
+
+const ERROR_REOPEN_REQUIRED: &str = "share_market_reopen_required";
+const ERROR_OTHER_ACTIVE_LISTING: &str = "share_market_other_active_listing";
+const ERROR_LISTING_NOT_CLOSED: &str = "share_market_listing_not_closed";
+const ERROR_SEAT_NOT_REOPENABLE: &str = "share_market_seat_not_reopenable";
+const ERROR_OFFER_CHANGED: &str = "share_market_offer_changed";
 
 const SUB_GRANT_PENDING: &str = "grant_pending";
 const SUB_ACTIVE_FREE: &str = "active_free";
@@ -279,6 +285,10 @@ pub struct ListingView {
     pub can_delete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_blocked_reason: Option<String>,
+    pub can_reopen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopen_blocked_reason: Option<String>,
+    pub reopenable_seat_count: u32,
     #[serde(skip)]
     pub publicly_listed: bool,
     #[serde(default)]
@@ -323,6 +333,7 @@ pub struct SeatView {
     pub can_delete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_blocked_reason: Option<String>,
+    pub can_republish: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -437,6 +448,15 @@ pub struct OwnedShareView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<u64>,
     pub already_listed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_listing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopen_listing_id: Option<String>,
+    pub has_active_rentals: bool,
+    pub market_state: String,
+    pub can_create_listing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_blocked_reason: Option<String>,
     pub free_access: bool,
     pub supported_user_token_periods: Vec<ShareTokenPeriod>,
 }
@@ -459,6 +479,32 @@ pub struct SeatInput {
 pub struct CreateListingRequest {
     pub share_id: String,
     pub seats: Vec<SeatInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReopenExistingSeatRequest {
+    pub seat_id: String,
+    pub offer_revision: i64,
+    pub seat: SeatInput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReopenListingRequest {
+    #[serde(default)]
+    pub existing_seats: Vec<ReopenExistingSeatRequest>,
+    #[serde(default)]
+    pub new_seats: Vec<SeatInput>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReopenListingResponse {
+    pub ok: bool,
+    pub listing_id: String,
+    pub reopened_seat_ids: Vec<String>,
+    pub new_seat_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -736,6 +782,7 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/share-market/owned-shares", get(list_owned_shares))
         .route("/v1/share-market/listings/:id", delete(close_listing))
         .route("/v1/share-market/listings/:id/delete", post(delete_listing))
+        .route("/v1/share-market/listings/:id/reopen", post(reopen_listing))
         .route("/v1/share-market/listings/:id/seats", post(add_seat))
         .route(
             "/v1/share-market/seats/:id",
@@ -4138,6 +4185,87 @@ impl DeleteCapability {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ReopenCapability {
+    can_reopen: bool,
+    blocked_reason: Option<&'static str>,
+    reopenable_seat_count: u32,
+}
+
+fn listing_reopen_capability_tx(
+    conn: &Connection,
+    listing_id: &str,
+    listing_status: &str,
+    is_owner: bool,
+) -> Result<ReopenCapability, AppError> {
+    let state = conn
+        .query_row(
+            "SELECT listing.share_id, listing.owner_email, share.owner_email,
+                    share.share_status, COALESCE(share.free_access, 0),
+                    COALESCE(share.share_access_policy_version, 0),
+                    (SELECT COUNT(*) FROM share_market_seats seat
+                     WHERE seat.listing_id = listing.id AND seat.status = 'disabled'
+                       AND seat.retired_at IS NULL
+                       AND seat.current_subscription_id IS NULL),
+                    (SELECT COUNT(*) FROM share_market_seats seat
+                     WHERE seat.listing_id = listing.id AND seat.retired_at IS NULL
+                       AND seat.status IN ('available', 'reserved', 'occupied', 'revoking')),
+                    (SELECT id FROM share_market_listings active
+                     WHERE active.share_id = listing.share_id AND active.id != listing.id
+                       AND active.status = 'active' AND active.deleted_at IS NULL
+                     ORDER BY active.updated_at DESC LIMIT 1)
+             FROM share_market_listings listing
+             JOIN shares share ON share.share_id = listing.share_id
+             WHERE listing.id = ?1 AND listing.deleted_at IS NULL",
+            params![listing_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read Share listing reopen capability"))?;
+    let reopenable_seat_count = state
+        .as_ref()
+        .and_then(|state| u32::try_from(state.6.max(0)).ok())
+        .unwrap_or_default();
+    let blocked_reason = if !is_owner {
+        Some("owner_only")
+    } else if listing_status != "closed" {
+        Some("listing_not_closed")
+    } else {
+        match state.as_ref() {
+            None => Some("share_missing"),
+            Some(state) if !state.1.eq_ignore_ascii_case(&state.2) => Some("owner_changed"),
+            Some(state) if state.3 != "active" => Some("share_inactive"),
+            Some(state) if state.4 => Some("public_access_enabled"),
+            Some(state) if pending_edit_enables_free_access_tx(conn, &state.0)? => {
+                Some("pending_share_edit")
+            }
+            Some(state) if state.5 < i64::from(SHARE_CONTRACT_VERSION) => {
+                Some("client_upgrade_required")
+            }
+            Some(state) if state.8.is_some() => Some("another_listing_active"),
+            Some(state) if state.7 >= MAX_SEATS_PER_LISTING as i64 => Some("seat_limit"),
+            Some(_) => None,
+        }
+    };
+    Ok(ReopenCapability {
+        can_reopen: blocked_reason.is_none(),
+        blocked_reason,
+        reopenable_seat_count,
+    })
+}
+
 fn seat_delete_capability(
     is_owner: bool,
     seat_status: &str,
@@ -4872,23 +5000,87 @@ impl AppStore {
                         COALESCE(s.free_access, 0),
                         COALESCE(s.supported_user_token_periods_json, '[]'),
                         COALESCE(s.enabled_claude, 0), COALESCE(s.enabled_codex, 0),
-                        COALESCE(s.enabled_gemini, 0)
+                        COALESCE(s.enabled_gemini, 0),
+                        (SELECT listing.id FROM share_market_listings listing
+                         WHERE listing.share_id = s.share_id
+                           AND listing.owner_user_id = ?2
+                           AND lower(listing.owner_email) = lower(s.owner_email)
+                           AND listing.status = 'active' AND listing.deleted_at IS NULL
+                         ORDER BY listing.updated_at DESC LIMIT 1),
+                        (SELECT listing.id FROM share_market_listings listing
+                         WHERE listing.share_id = s.share_id
+                           AND listing.owner_user_id = ?2
+                           AND lower(listing.owner_email) = lower(s.owner_email)
+                           AND listing.status = 'closed' AND listing.deleted_at IS NULL
+                         ORDER BY listing.updated_at DESC, listing.created_at DESC LIMIT 1),
+                        EXISTS (
+                            SELECT 1 FROM share_market_subscriptions sub
+                            WHERE sub.share_id = s.share_id
+                              AND sub.status NOT IN ('released', 'grant_failed')
+                        ),
+                        COALESCE(s.share_access_policy_version, 0),
+                        (SELECT edit.patch_json FROM share_edit_requests edit
+                         WHERE edit.share_id = s.share_id AND edit.status = 'pending'
+                           AND edit.retired_at IS NULL
+                         ORDER BY edit.revision DESC LIMIT 1)
                  FROM shares s
                  WHERE lower(s.owner_email) = lower(?1)
                  ORDER BY s.share_name, s.share_id",
             )
             .map_err(map_db("prepare owned Share list"))?;
         let rows = statement
-            .query_map(params![session.email], |row| {
+            .query_map(params![session.email, session.user_id], |row| {
                 let app_type: String = row.get(2)?;
                 let bindings_json: String = row.get(5)?;
+                let share_status: String = row.get(6)?;
                 let parallel_limit: i64 = row.get(7)?;
                 let token_limit: i64 = row.get(8)?;
                 let periods_json: String = row.get(11)?;
+                let free_access = row.get::<_, i64>(10)? != 0;
+                let active_listing_id: Option<String> = row.get(15)?;
+                let reopen_listing_id: Option<String> = row.get(16)?;
+                let has_active_rentals = row.get::<_, i64>(17)? != 0;
+                let contract_version: i64 = row.get(18)?;
+                let pending_free_access = row
+                    .get::<_, Option<String>>(19)?
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<ShareSettingsPatch>(value).ok())
+                    .and_then(|patch| patch.free_access)
+                    .unwrap_or(false);
                 let support = ShareSupport {
                     claude: row.get::<_, i64>(12)? != 0,
                     codex: row.get::<_, i64>(13)? != 0,
                     gemini: row.get::<_, i64>(14)? != 0,
+                };
+                let create_blocked_reason = if active_listing_id.is_some() {
+                    Some("active_listing")
+                } else if reopen_listing_id.is_some() {
+                    Some("reopen_required")
+                } else if has_active_rentals {
+                    Some("active_rentals")
+                } else if free_access {
+                    Some("public_access_enabled")
+                } else if share_status != "active" {
+                    Some("share_inactive")
+                } else if pending_free_access {
+                    Some("pending_share_edit")
+                } else if contract_version < i64::from(SHARE_CONTRACT_VERSION) {
+                    Some("client_upgrade_required")
+                } else {
+                    None
+                };
+                let market_state = if active_listing_id.is_some() {
+                    "listed"
+                } else if reopen_listing_id.is_some() {
+                    "stopped"
+                } else if has_active_rentals {
+                    "rented"
+                } else if free_access {
+                    "public_access"
+                } else if share_status != "active" {
+                    "inactive"
+                } else {
+                    "available"
                 };
                 Ok(OwnedShareView {
                     share_id: row.get(0)?,
@@ -4897,7 +5089,7 @@ impl AppStore {
                     subdomain: row.get(3)?,
                     owner_email: row.get(4)?,
                     supported_apps: enabled_share_apps(&bindings_json, &app_type, &support),
-                    share_status: row.get(6)?,
+                    share_status,
                     parallel_limit: (parallel_limit >= 0)
                         .then(|| u32::try_from(parallel_limit).ok())
                         .flatten(),
@@ -4905,7 +5097,13 @@ impl AppStore {
                         .then(|| u64::try_from(token_limit).ok())
                         .flatten(),
                     already_listed: row.get::<_, i64>(9)? != 0,
-                    free_access: row.get::<_, i64>(10)? != 0,
+                    active_listing_id,
+                    reopen_listing_id,
+                    has_active_rentals,
+                    market_state: market_state.into(),
+                    can_create_listing: create_blocked_reason.is_none(),
+                    create_blocked_reason: create_blocked_reason.map(str::to_string),
+                    free_access,
                     supported_user_token_periods: serde_json::from_str(&periods_json)
                         .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]),
                 })
@@ -5319,6 +5517,11 @@ impl AppStore {
                     Some("unavailable".to_string())
                 };
                 let read_only = seat.retired_at.is_some();
+                let can_republish = is_owner
+                    && status == "closed"
+                    && seat.status == SEAT_DISABLED
+                    && seat.retired_at.is_none()
+                    && seat.current_subscription_id.is_none();
                 seats.push(SeatView {
                     id: seat.id,
                     position: seat.position,
@@ -5348,6 +5551,7 @@ impl AppStore {
                     read_only,
                     can_delete: delete_capability.can_delete,
                     delete_blocked_reason: delete_capability.blocked_reason.map(str::to_string),
+                    can_republish,
                     retired_at: seat.retired_at,
                     subscription,
                 });
@@ -5362,6 +5566,7 @@ impl AppStore {
             let performance = performance_by_share.remove(&share_id).unwrap_or_default();
             let reliability = reliability_view(reliability_by_share.get(&share_id).copied());
             let delete_capability = listing_delete_capability_tx(&conn, &id, &status, is_owner)?;
+            let reopen_capability = listing_reopen_capability_tx(&conn, &id, &status, is_owner)?;
             listings.push(ListingView {
                 id,
                 share_id,
@@ -5382,6 +5587,9 @@ impl AppStore {
                 is_owner,
                 can_delete: delete_capability.can_delete,
                 delete_blocked_reason: delete_capability.blocked_reason.map(str::to_string),
+                can_reopen: reopen_capability.can_reopen,
+                reopen_blocked_reason: reopen_capability.blocked_reason.map(str::to_string),
+                reopenable_seat_count: reopen_capability.reopenable_seat_count,
                 publicly_listed,
                 contacts,
                 payment_method_kinds,
@@ -5681,7 +5889,7 @@ fn close_reclaimable_stale_listings_tx(
     .map_err(map_db("close stale Share listings"))?;
     tx.execute(
         "UPDATE share_market_seats
-         SET status = 'disabled', updated_at = ?3
+         SET status = 'disabled', offer_revision = offer_revision + 1, updated_at = ?3
          WHERE listing_id IN (
              SELECT id FROM share_market_listings
              WHERE share_id = ?1 AND lower(owner_email) != lower(?2) AND status = 'closed'
@@ -5689,6 +5897,18 @@ fn close_reclaimable_stale_listings_tx(
         params![share_id, current_owner_email, now],
     )
     .map_err(map_db("disable stale Share listing seats"))?;
+    tx.execute(
+        "UPDATE share_market_rent_quotes
+         SET status = 'expired', updated_at = ?3
+         WHERE status = 'active' AND seat_id IN (
+             SELECT seat.id FROM share_market_seats seat
+             JOIN share_market_listings listing ON listing.id = seat.listing_id
+             WHERE listing.share_id = ?1
+               AND lower(listing.owner_email) != lower(?2)
+         )",
+        params![share_id, current_owner_email, now],
+    )
+    .map_err(map_db("expire stale Share listing quotes"))?;
     Ok(())
 }
 
@@ -5696,6 +5916,18 @@ fn ensure_no_pending_free_access_edit_tx(
     conn: &Connection,
     share_id: &str,
 ) -> Result<(), AppError> {
+    if pending_edit_enables_free_access_tx(conn, share_id)? {
+        return Err(AppError::Conflict(
+            "wait for the pending public free access edit before listing this Share".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn pending_edit_enables_free_access_tx(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<bool, AppError> {
     let patch_json = conn
         .query_row(
             "SELECT patch_json FROM share_edit_requests
@@ -5707,18 +5939,149 @@ fn ensure_no_pending_free_access_edit_tx(
         .optional()
         .map_err(map_db("read pending Share access edit"))?;
     let Some(patch_json) = patch_json else {
-        return Ok(());
+        return Ok(false);
     };
     let patch: ShareSettingsPatch = serde_json::from_str(&patch_json).map_err(|error| {
         AppError::Internal(format!("decode pending Share edit failed: {error}"))
     })?;
-    let enables_free_access = patch.free_access.unwrap_or(false);
-    if enables_free_access {
-        return Err(AppError::Conflict(
-            "wait for the pending public free access edit before listing this Share".into(),
+    Ok(patch.free_access.unwrap_or(false))
+}
+
+#[derive(Debug)]
+struct ListingPublishContext {
+    share_id: String,
+    listing_status: String,
+    supported_periods: Vec<ShareTokenPeriod>,
+    share_parallel_limit: i64,
+}
+
+fn listing_publish_context_tx(
+    tx: &Transaction<'_>,
+    session: &AuthSession,
+    listing_id: &str,
+) -> Result<ListingPublishContext, AppError> {
+    let listing = tx
+        .query_row(
+            "SELECT listing.owner_user_id, listing.owner_email, share.owner_email,
+                    share.share_status,
+                    COALESCE(share.supported_user_token_periods_json, '[]'),
+                    listing.share_id, listing.status, COALESCE(share.free_access, 0),
+                    share.parallel_limit
+             FROM share_market_listings listing
+             JOIN shares share ON share.share_id = listing.share_id
+             WHERE listing.id = ?1 AND listing.deleted_at IS NULL",
+            params![listing_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read Share listing publish context"))?
+        .ok_or_else(|| AppError::NotFound("listing not found".into()))?;
+    if listing.0 != session.user_id {
+        return Err(AppError::Forbidden(
+            "only listing owner can publish seats".into(),
         ));
     }
+    if listing.3 != "active" || !listing.1.eq_ignore_ascii_case(&listing.2) {
+        return Err(AppError::Conflict(
+            "listing Share is no longer active or owned by this account".into(),
+        ));
+    }
+    ensure_share_market_app_scope_supported_tx(tx, &listing.5)?;
+    if listing.7 {
+        return Err(AppError::Conflict(
+            "disable public free access before adding or reopening Share Market seats".into(),
+        ));
+    }
+    ensure_no_pending_free_access_edit_tx(tx, &listing.5)?;
+    Ok(ListingPublishContext {
+        share_id: listing.5,
+        listing_status: listing.6,
+        supported_periods: serde_json::from_str(&listing.4)
+            .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]),
+        share_parallel_limit: listing.8,
+    })
+}
+
+fn validate_publish_seats_tx(
+    tx: &Transaction<'_>,
+    session: &AuthSession,
+    context: &ListingPublishContext,
+    seats: &[NormalizedSeat],
+) -> Result<(), AppError> {
+    if seats.iter().any(|seat| {
+        seat.token_limit.is_some() && !context.supported_periods.contains(&seat.token_period)
+    }) {
+        return Err(AppError::BadRequest(
+            "a seat uses a token period unsupported by this Server".into(),
+        ));
+    }
+    for seat in seats {
+        validate_seat_share_capacity(seat, context.share_parallel_limit)?;
+    }
+    if seats.iter().any(|seat| !seat.is_free()) {
+        ensure_payment_profile_tx(tx, &session.user_id)?;
+        for currency in seats
+            .iter()
+            .filter_map(|seat| seat.currency.as_deref())
+            .collect::<BTreeSet<_>>()
+        {
+            crate::market_billing::require_supplier_profile_tx(tx, &session.user_id, currency)?;
+        }
+    }
     Ok(())
+}
+
+fn other_active_listing_tx(
+    tx: &Transaction<'_>,
+    share_id: &str,
+    listing_id: &str,
+) -> Result<Option<String>, AppError> {
+    tx.query_row(
+        "SELECT id FROM share_market_listings
+         WHERE share_id = ?1 AND id != ?2 AND status = 'active'
+           AND deleted_at IS NULL
+         ORDER BY updated_at DESC LIMIT 1",
+        params![share_id, listing_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(map_db("check other active Share listing"))
+}
+
+fn other_active_listing_error(listing_id: &str) -> AppError {
+    AppError::coded_conflict(
+        ERROR_OTHER_ACTIVE_LISTING,
+        "another listing for this Share is already active",
+        serde_json::json!({ "listingId": listing_id }),
+    )
+}
+
+fn expire_listing_rent_quotes_tx(
+    tx: &Transaction<'_>,
+    listing_id: &str,
+    now: &str,
+) -> Result<usize, AppError> {
+    tx.execute(
+        "UPDATE share_market_rent_quotes
+         SET status = 'expired', updated_at = ?2
+         WHERE status = 'active' AND seat_id IN (
+             SELECT id FROM share_market_seats WHERE listing_id = ?1
+         )",
+        params![listing_id, now],
+    )
+    .map_err(map_db("expire Share listing rent quotes"))
 }
 
 impl AppStore {
@@ -5744,7 +6107,7 @@ impl AppStore {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Share Market listing"))?;
         let share: Option<(String, String, String, String, bool, i64)> = tx
             .query_row(
@@ -5794,6 +6157,39 @@ impl AppStore {
             ));
         }
         ensure_no_pending_free_access_edit_tx(&tx, share_id)?;
+        close_reclaimable_stale_listings_tx(&tx, share_id, &session.email, &now)?;
+        let active_listing_id = tx
+            .query_row(
+                "SELECT id FROM share_market_listings
+                 WHERE share_id = ?1 AND status = 'active' AND deleted_at IS NULL
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![share_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("check active Share listing"))?;
+        if let Some(active_listing_id) = active_listing_id {
+            return Err(other_active_listing_error(&active_listing_id));
+        }
+        let reopen_listing_id = tx
+            .query_row(
+                "SELECT id FROM share_market_listings
+                 WHERE share_id = ?1 AND owner_user_id = ?2
+                   AND lower(owner_email) = lower(?3)
+                   AND status = 'closed' AND deleted_at IS NULL
+                 ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+                params![share_id, session.user_id, session.email],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("check stopped Share listing"))?;
+        if let Some(reopen_listing_id) = reopen_listing_id {
+            return Err(AppError::coded_conflict(
+                ERROR_REOPEN_REQUIRED,
+                "this Share has a stopped listing that must be reopened",
+                serde_json::json!({ "listingId": reopen_listing_id }),
+            ));
+        }
         let supported: Vec<ShareTokenPeriod> = serde_json::from_str(&periods_json)
             .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]);
         if seats
@@ -5812,7 +6208,7 @@ impl AppStore {
             for currency in seats
                 .iter()
                 .filter_map(|seat| seat.currency.as_deref())
-                .collect::<std::collections::BTreeSet<_>>()
+                .collect::<BTreeSet<_>>()
             {
                 crate::market_billing::require_supplier_profile_tx(
                     &tx,
@@ -5820,22 +6216,6 @@ impl AppStore {
                     currency,
                 )?;
             }
-        }
-        close_reclaimable_stale_listings_tx(&tx, share_id, &session.email, &now)?;
-        let active_listing_exists = tx
-            .query_row(
-                "SELECT 1 FROM share_market_listings
-                 WHERE share_id = ?1 AND status = 'active' AND deleted_at IS NULL LIMIT 1",
-                params![share_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(map_db("check active Share listing"))?
-            .is_some();
-        if active_listing_exists {
-            return Err(AppError::Conflict(
-                "Share is already listed in Share Market".into(),
-            ));
         }
         let active_subscription_exists = tx
             .query_row(
@@ -5872,7 +6252,11 @@ impl AppStore {
         )
         .map_err(|error| {
             if error.to_string().contains("UNIQUE constraint failed") {
-                AppError::Conflict("Share is already listed in Share Market".into())
+                AppError::coded_conflict(
+                    ERROR_OTHER_ACTIVE_LISTING,
+                    "another listing for this Share is already active",
+                    serde_json::json!({}),
+                )
             } else {
                 AppError::Internal(format!("insert Share Market listing failed: {error}"))
             }
@@ -5903,75 +6287,10 @@ impl AppStore {
         let seat = normalize_seat(input)?;
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(map_db("begin add Share seat"))?;
-        let owner: Option<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            bool,
-            i64,
-        )> = tx
-            .query_row(
-                "SELECT listing.owner_user_id, listing.owner_email, s.owner_email,
-                        s.share_status,
-                        COALESCE(s.supported_user_token_periods_json, '[]'), listing.share_id,
-                        listing.status, COALESCE(s.free_access, 0), s.parallel_limit
-                 FROM share_market_listings listing
-                 JOIN shares s ON s.share_id = listing.share_id
-                 WHERE listing.id = ?1",
-                params![listing_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get::<_, i64>(7)? != 0,
-                        row.get(8)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(map_db("read Share listing owner"))?;
-        let Some((
-            owner_user_id,
-            listing_owner_email,
-            share_owner_email,
-            share_status,
-            periods_json,
-            share_id,
-            listing_status,
-            free_access,
-            share_parallel_limit,
-        )) = owner
-        else {
-            return Err(AppError::NotFound("listing not found".into()));
-        };
-        if owner_user_id != session.user_id {
-            return Err(AppError::Forbidden(
-                "only listing owner can add seats".into(),
-            ));
-        }
-        if share_status != "active" || !listing_owner_email.eq_ignore_ascii_case(&share_owner_email)
-        {
-            return Err(AppError::Conflict(
-                "listing Share is no longer active or owned by this account".into(),
-            ));
-        }
-        ensure_share_market_app_scope_supported_tx(&tx, &share_id)?;
-        if free_access {
-            return Err(AppError::Conflict(
-                "disable public free access before adding or reopening Share Market seats".into(),
-            ));
-        }
-        ensure_no_pending_free_access_edit_tx(&tx, &share_id)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin add Share seat"))?;
+        let context = listing_publish_context_tx(&tx, session, listing_id)?;
         let count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM share_market_seats
@@ -5985,25 +6304,41 @@ impl AppStore {
         if count >= MAX_SEATS_PER_LISTING as i64 {
             return Err(AppError::Conflict("listing seat limit reached".into()));
         }
-        let supported: Vec<ShareTokenPeriod> = serde_json::from_str(&periods_json)
-            .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]);
-        if seat.token_limit.is_some() && !supported.contains(&seat.token_period) {
-            return Err(AppError::BadRequest(
-                "token period is unsupported by this Server".into(),
-            ));
+        validate_publish_seats_tx(&tx, session, &context, std::slice::from_ref(&seat))?;
+        close_reclaimable_stale_listings_tx(&tx, &context.share_id, &session.email, &now)?;
+        if let Some(active_listing_id) =
+            other_active_listing_tx(&tx, &context.share_id, listing_id)?
+        {
+            return Err(other_active_listing_error(&active_listing_id));
         }
-        validate_seat_share_capacity(&seat, share_parallel_limit)?;
-        if !seat.is_free() {
-            ensure_payment_profile_tx(&tx, &session.user_id)?;
-            crate::market_billing::require_supplier_profile_tx(
-                &tx,
-                &session.user_id,
-                seat.currency
-                    .as_deref()
-                    .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?,
-            )?;
+        if context.listing_status != "active" {
+            let changed = tx
+                .execute(
+                    "UPDATE share_market_listings
+                     SET status = 'active', updated_at = ?2
+                     WHERE id = ?1 AND status = 'closed' AND deleted_at IS NULL",
+                    params![listing_id, now],
+                )
+                .map_err(|error| {
+                    if error.to_string().contains("UNIQUE constraint failed") {
+                        AppError::coded_conflict(
+                            ERROR_OTHER_ACTIVE_LISTING,
+                            "another listing for this Share is already active",
+                            serde_json::json!({}),
+                        )
+                    } else {
+                        AppError::Internal(format!("reopen Share listing failed: {error}"))
+                    }
+                })?;
+            if changed != 1 {
+                return Err(AppError::coded_conflict(
+                    ERROR_LISTING_NOT_CLOSED,
+                    "listing is no longer stopped",
+                    serde_json::json!({ "listingId": listing_id }),
+                ));
+            }
+            expire_listing_rent_quotes_tx(&tx, listing_id, &now)?;
         }
-        close_reclaimable_stale_listings_tx(&tx, &share_id, &session.email, &now)?;
         let position: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(position), 0) + 1 FROM share_market_seats WHERE listing_id = ?1",
@@ -6012,12 +6347,7 @@ impl AppStore {
             )
             .map_err(map_db("choose Share seat position"))?;
         let seat_id = insert_seat_tx(&tx, listing_id, position, &seat, &now)?;
-        tx.execute(
-            "UPDATE share_market_listings SET status = 'active', updated_at = ?2 WHERE id = ?1",
-            params![listing_id, now],
-        )
-        .map_err(map_db("reopen Share listing"))?;
-        if listing_status != "active" {
+        if context.listing_status != "active" {
             event_tx(
                 &tx,
                 Some(listing_id),
@@ -6025,7 +6355,10 @@ impl AppStore {
                 None,
                 Some(session),
                 "listing_relisted",
-                serde_json::json!({}),
+                serde_json::json!({
+                    "reopenedSeatIds": [],
+                    "newSeatIds": [&seat_id],
+                }),
                 &now,
             )?;
         }
@@ -6041,6 +6374,226 @@ impl AppStore {
         )?;
         tx.commit().map_err(map_db("commit add Share seat"))?;
         Ok(seat_id)
+    }
+
+    pub async fn share_market_reopen_listing(
+        &self,
+        session: &AuthSession,
+        listing_id: &str,
+        input: ReopenListingRequest,
+    ) -> Result<ReopenListingResponse, AppError> {
+        let requested_count = input.existing_seats.len() + input.new_seats.len();
+        if requested_count == 0 || requested_count > MAX_SEATS_PER_LISTING {
+            return Err(AppError::BadRequest(format!(
+                "reopening requires 1-{MAX_SEATS_PER_LISTING} existing or new seats"
+            )));
+        }
+        let mut seen_seat_ids = HashSet::new();
+        let existing_seats = input
+            .existing_seats
+            .into_iter()
+            .map(|item| {
+                let seat_id = item.seat_id.trim().to_string();
+                if seat_id.is_empty() {
+                    return Err(AppError::BadRequest("seatId is required".into()));
+                }
+                if !seen_seat_ids.insert(seat_id.clone()) {
+                    return Err(AppError::BadRequest(
+                        "a seat can be selected only once when reopening".into(),
+                    ));
+                }
+                Ok((seat_id, item.offer_revision, normalize_seat(item.seat)?))
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let new_seats = input
+            .new_seats
+            .into_iter()
+            .map(normalize_seat)
+            .collect::<Result<Vec<_>, _>>()?;
+        let all_seats = existing_seats
+            .iter()
+            .map(|(_, _, seat)| seat.clone())
+            .chain(new_seats.iter().cloned())
+            .collect::<Vec<_>>();
+
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin reopen Share listing"))?;
+        let context = listing_publish_context_tx(&tx, session, listing_id)?;
+        if context.listing_status != "closed" {
+            return Err(AppError::coded_conflict(
+                ERROR_LISTING_NOT_CLOSED,
+                "only a stopped listing can be reopened",
+                serde_json::json!({ "listingId": listing_id }),
+            ));
+        }
+        validate_publish_seats_tx(&tx, session, &context, &all_seats)?;
+        close_reclaimable_stale_listings_tx(&tx, &context.share_id, &session.email, &now)?;
+        if let Some(active_listing_id) =
+            other_active_listing_tx(&tx, &context.share_id, listing_id)?
+        {
+            return Err(other_active_listing_error(&active_listing_id));
+        }
+        let active_seat_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM share_market_seats
+                 WHERE listing_id = ?1 AND retired_at IS NULL
+                   AND status IN ('available', 'reserved', 'occupied', 'revoking')",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .map_err(map_db("count active Share seats before reopen"))?;
+        if active_seat_count + i64::try_from(requested_count).unwrap_or(i64::MAX)
+            > MAX_SEATS_PER_LISTING as i64
+        {
+            return Err(AppError::Conflict("listing seat limit reached".into()));
+        }
+
+        for (seat_id, expected_revision, _) in &existing_seats {
+            let state = tx
+                .query_row(
+                    "SELECT status, offer_revision, retired_at, current_subscription_id
+                     FROM share_market_seats
+                     WHERE id = ?1 AND listing_id = ?2",
+                    params![seat_id, listing_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db("read stopped Share seat"))?;
+            let Some((status, revision, retired_at, subscription_id)) = state else {
+                return Err(AppError::coded_conflict(
+                    ERROR_SEAT_NOT_REOPENABLE,
+                    "seat does not belong to this listing",
+                    serde_json::json!({ "seatId": seat_id, "reason": "not_found" }),
+                ));
+            };
+            if revision != *expected_revision {
+                return Err(AppError::coded_conflict(
+                    ERROR_OFFER_CHANGED,
+                    "seat offer changed; reload and retry",
+                    serde_json::json!({
+                        "seatId": seat_id,
+                        "expectedOfferRevision": expected_revision,
+                        "currentOfferRevision": revision,
+                    }),
+                ));
+            }
+            if status != SEAT_DISABLED || retired_at.is_some() || subscription_id.is_some() {
+                return Err(AppError::coded_conflict(
+                    ERROR_SEAT_NOT_REOPENABLE,
+                    "seat is not eligible to be republished",
+                    serde_json::json!({ "seatId": seat_id, "reason": "seat_not_reopenable" }),
+                ));
+            }
+        }
+
+        expire_listing_rent_quotes_tx(&tx, listing_id, &now)?;
+        let mut reopened_seat_ids = Vec::with_capacity(existing_seats.len());
+        for (seat_id, expected_revision, seat) in &existing_seats {
+            let token_period_json = serde_json::to_string(&seat.token_period).map_err(|error| {
+                AppError::Internal(format!("encode reopened seat token period failed: {error}"))
+            })?;
+            let changed = tx
+                .execute(
+                    "UPDATE share_market_seats
+                     SET status = 'available', parallel_limit = ?3, token_limit = ?4,
+                         token_period_json = ?5, daily_rate_minor = ?6, currency = ?7,
+                         service_duration_days = ?8, offer_revision = offer_revision + 1,
+                         updated_at = ?9
+                     WHERE id = ?1 AND listing_id = ?2 AND status = 'disabled'
+                       AND retired_at IS NULL AND current_subscription_id IS NULL
+                       AND offer_revision = ?10",
+                    params![
+                        seat_id,
+                        listing_id,
+                        seat.parallel_limit.map(i64::from),
+                        seat.token_limit.and_then(|value| i64::try_from(value).ok()),
+                        token_period_json,
+                        seat.daily_rate_minor,
+                        seat.currency,
+                        seat.service_duration_days.map(i64::from),
+                        now,
+                        expected_revision,
+                    ],
+                )
+                .map_err(map_db("republish stopped Share seat"))?;
+            if changed != 1 {
+                return Err(AppError::coded_conflict(
+                    ERROR_OFFER_CHANGED,
+                    "seat offer changed; reload and retry",
+                    serde_json::json!({ "seatId": seat_id }),
+                ));
+            }
+            reopened_seat_ids.push(seat_id.clone());
+        }
+
+        let mut next_position: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(position), 0) + 1 FROM share_market_seats
+                 WHERE listing_id = ?1",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .map_err(map_db("choose reopened Share seat position"))?;
+        let mut new_seat_ids = Vec::with_capacity(new_seats.len());
+        for seat in &new_seats {
+            new_seat_ids.push(insert_seat_tx(&tx, listing_id, next_position, seat, &now)?);
+            next_position += 1;
+        }
+        let activated = tx
+            .execute(
+                "UPDATE share_market_listings
+                 SET status = 'active', updated_at = ?2
+                 WHERE id = ?1 AND status = 'closed' AND deleted_at IS NULL",
+                params![listing_id, now],
+            )
+            .map_err(|error| {
+                if error.to_string().contains("UNIQUE constraint failed") {
+                    AppError::coded_conflict(
+                        ERROR_OTHER_ACTIVE_LISTING,
+                        "another listing for this Share is already active",
+                        serde_json::json!({}),
+                    )
+                } else {
+                    AppError::Internal(format!("activate reopened Share listing failed: {error}"))
+                }
+            })?;
+        if activated != 1 {
+            return Err(AppError::coded_conflict(
+                ERROR_LISTING_NOT_CLOSED,
+                "listing is no longer stopped",
+                serde_json::json!({ "listingId": listing_id }),
+            ));
+        }
+        event_tx(
+            &tx,
+            Some(listing_id),
+            None,
+            None,
+            Some(session),
+            "listing_relisted",
+            serde_json::json!({
+                "reopenedSeatIds": reopened_seat_ids,
+                "newSeatIds": new_seat_ids,
+            }),
+            &now,
+        )?;
+        tx.commit().map_err(map_db("commit reopen Share listing"))?;
+        Ok(ReopenListingResponse {
+            ok: true,
+            listing_id: listing_id.to_string(),
+            reopened_seat_ids,
+            new_seat_ids,
+        })
     }
 
     pub async fn share_market_update_seat(
@@ -6119,8 +6672,14 @@ impl AppStore {
             ));
         }
         if offer_revision != input.offer_revision {
-            return Err(AppError::Conflict(
-                "seat offer changed; reload and retry".into(),
+            return Err(AppError::coded_conflict(
+                ERROR_OFFER_CHANGED,
+                "seat offer changed; reload and retry",
+                serde_json::json!({
+                    "seatId": seat_id,
+                    "expectedOfferRevision": input.offer_revision,
+                    "currentOfferRevision": offer_revision,
+                }),
             ));
         }
         let supported: Vec<ShareTokenPeriod> = serde_json::from_str(&periods_json)
@@ -6143,25 +6702,33 @@ impl AppStore {
         }
         let token_period_json = serde_json::to_string(&seat.token_period)
             .map_err(|error| AppError::Internal(format!("encode token period failed: {error}")))?;
-        tx.execute(
-            "UPDATE share_market_seats
+        let changed = tx
+            .execute(
+                "UPDATE share_market_seats
              SET parallel_limit = ?2, token_limit = ?3, token_period_json = ?4,
                  daily_rate_minor = ?5, currency = ?6, service_duration_days = ?7,
                  offer_revision = offer_revision + 1, updated_at = ?8
              WHERE id = ?1 AND status = 'available' AND offer_revision = ?9",
-            params![
-                seat_id,
-                seat.parallel_limit.map(i64::from),
-                seat.token_limit.and_then(|value| i64::try_from(value).ok()),
-                token_period_json,
-                seat.daily_rate_minor,
-                seat.currency,
-                seat.service_duration_days.map(i64::from),
-                now,
-                input.offer_revision,
-            ],
-        )
-        .map_err(map_db("update Share seat"))?;
+                params![
+                    seat_id,
+                    seat.parallel_limit.map(i64::from),
+                    seat.token_limit.and_then(|value| i64::try_from(value).ok()),
+                    token_period_json,
+                    seat.daily_rate_minor,
+                    seat.currency,
+                    seat.service_duration_days.map(i64::from),
+                    now,
+                    input.offer_revision,
+                ],
+            )
+            .map_err(map_db("update Share seat"))?;
+        if changed != 1 {
+            return Err(AppError::coded_conflict(
+                ERROR_OFFER_CHANGED,
+                "seat offer changed; reload and retry",
+                serde_json::json!({ "seatId": seat_id }),
+            ));
+        }
         event_tx(
             &tx,
             None,
@@ -6631,18 +7198,18 @@ impl AppStore {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin close Share listing"))?;
-        let owner_user_id: Option<String> = tx
+        let listing: Option<(String, String)> = tx
             .query_row(
-                "SELECT owner_user_id FROM share_market_listings
+                "SELECT owner_user_id, status FROM share_market_listings
                  WHERE id = ?1 AND deleted_at IS NULL",
                 params![listing_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(map_db("read Share listing"))?;
-        let Some(owner_user_id) = owner_user_id else {
+        let Some((owner_user_id, listing_status)) = listing else {
             return Err(AppError::NotFound("listing not found".into()));
         };
         if owner_user_id != session.user_id {
@@ -6650,17 +7217,30 @@ impl AppStore {
                 "only listing owner can close listing".into(),
             ));
         }
-        tx.execute(
-            "UPDATE share_market_listings SET status = 'closed', updated_at = ?2 WHERE id = ?1",
-            params![listing_id, now],
-        )
-        .map_err(map_db("close Share listing"))?;
-        tx.execute(
-            "UPDATE share_market_seats SET status = 'disabled', updated_at = ?2
+        if listing_status == "closed" {
+            return Ok(());
+        }
+        let disabled_seat_count = tx
+            .execute(
+                "UPDATE share_market_seats
+             SET status = 'disabled', offer_revision = offer_revision + 1, updated_at = ?2
              WHERE listing_id = ?1 AND status = 'available'",
-            params![listing_id, now],
-        )
-        .map_err(map_db("disable open Share seats"))?;
+                params![listing_id, now],
+            )
+            .map_err(map_db("disable open Share seats"))?;
+        let expired_quote_count = expire_listing_rent_quotes_tx(&tx, listing_id, &now)?;
+        let changed = tx
+            .execute(
+                "UPDATE share_market_listings SET status = 'closed', updated_at = ?2
+                 WHERE id = ?1 AND status = 'active' AND deleted_at IS NULL",
+                params![listing_id, now],
+            )
+            .map_err(map_db("close Share listing"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "listing state changed while stopping it".into(),
+            ));
+        }
         event_tx(
             &tx,
             Some(listing_id),
@@ -6668,7 +7248,10 @@ impl AppStore {
             None,
             Some(session),
             "listing_closed",
-            serde_json::json!({}),
+            serde_json::json!({
+                "disabledSeatCount": disabled_seat_count,
+                "expiredQuoteCount": expired_quote_count,
+            }),
             &now,
         )?;
         tx.commit().map_err(map_db("commit close Share listing"))?;
@@ -6772,6 +7355,21 @@ async fn add_seat(
         .share_market_add_seat(&session, &listing_id, input)
         .await?;
     Ok(Json(serde_json::json!({ "ok": true, "seatId": id })))
+}
+
+async fn reopen_listing(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<String>,
+    Json(input): Json<ReopenListingRequest>,
+) -> Result<Json<ReopenListingResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .share_market_reopen_listing(&session, &listing_id, input)
+            .await?,
+    ))
 }
 
 async fn update_seat(
@@ -12244,6 +12842,41 @@ mod tests {
             )
             .expect("read listing seat");
         (listing_id, seat_id)
+    }
+
+    fn reopen_existing_request(
+        seat_id: &str,
+        offer_revision: i64,
+        seat: SeatInput,
+    ) -> ReopenListingRequest {
+        ReopenListingRequest {
+            existing_seats: vec![ReopenExistingSeatRequest {
+                seat_id: seat_id.into(),
+                offer_revision,
+                seat,
+            }],
+            new_seats: Vec::new(),
+        }
+    }
+
+    async fn stopped_listing_state(
+        store: &AppStore,
+        listing_id: &str,
+        seat_id: &str,
+    ) -> (String, String, i64) {
+        store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT listing.status, seat.status, seat.offer_revision
+                 FROM share_market_listings listing
+                 JOIN share_market_seats seat ON seat.listing_id = listing.id
+                 WHERE listing.id = ?1 AND seat.id = ?2",
+                params![listing_id, seat_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read stopped listing state")
     }
 
     async fn subscription_entitlement(store: &AppStore, subscription_id: &str) -> String {
@@ -18273,7 +18906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_listing_without_active_rentals_can_relist_via_add_share() {
+    async fn stopped_listing_must_reopen_the_original_listing() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-relist", "owner-relist@example.com");
         insert_share(
@@ -18283,7 +18916,7 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
-        let (listing_id, _seat_id) =
+        let (listing_id, seat_id) =
             create_listing(&store, &owner, "share-relist", free_seat()).await;
         store
             .share_market_close_listing(&owner, &listing_id)
@@ -18296,36 +18929,591 @@ mod tests {
             .expect("owned shares after close");
         assert_eq!(owned.len(), 1);
         assert!(!owned[0].already_listed);
+        assert_eq!(owned[0].market_state, "stopped");
+        assert!(!owned[0].can_create_listing);
+        assert_eq!(
+            owned[0].reopen_listing_id.as_deref(),
+            Some(listing_id.as_str())
+        );
 
-        let replacement = store
+        let error = store
             .share_market_create_listing(
                 &owner,
                 CreateListingRequest {
                     share_id: "share-relist".into(),
-                    seats: vec![free_seat()],
+                    seats: vec![paid_seat()],
                 },
             )
             .await
-            .expect("relist after close with no active rentals");
-        assert_ne!(replacement, listing_id);
+            .expect_err("a stopped listing must be selected before paid-offer validation");
+        assert_eq!(error.code(), Some(ERROR_REOPEN_REQUIRED));
+
+        let mut revised = free_seat();
+        revised.parallel_limit = Some(1);
+        let response = store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                ReopenListingRequest {
+                    existing_seats: vec![ReopenExistingSeatRequest {
+                        seat_id: seat_id.clone(),
+                        offer_revision: 2,
+                        seat: revised,
+                    }],
+                    new_seats: vec![free_seat()],
+                },
+            )
+            .await
+            .expect("reopen original listing with old and new seats");
+        assert_eq!(response.listing_id, listing_id);
+        assert_eq!(
+            response.reopened_seat_ids.as_slice(),
+            std::slice::from_ref(&seat_id)
+        );
+        assert_eq!(response.new_seat_ids.len(), 1);
+
+        let state: (String, i64, i64, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT listing.status,
+                        (SELECT COUNT(*) FROM share_market_seats current
+                         WHERE current.listing_id = listing.id),
+                        seat.offer_revision, seat.parallel_limit,
+                        (SELECT COUNT(*) FROM share_market_events event
+                         WHERE event.listing_id = listing.id
+                           AND event.event_type = 'listing_relisted')
+                 FROM share_market_listings listing
+                 JOIN share_market_seats seat ON seat.id = ?2
+                 WHERE listing.id = ?1",
+                params![listing_id, seat_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read reopened listing");
+        assert_eq!(state, ("active".into(), 2, 3, 1, 1));
 
         let owned_after = store
             .share_market_owned_shares(&owner)
             .await
             .expect("owned shares after relist");
         assert!(owned_after[0].already_listed);
-        assert!(matches!(
+        assert_eq!(
+            owned_after[0].active_listing_id.as_deref(),
+            Some(listing_id.as_str())
+        );
+        assert!(owned_after[0].reopen_listing_id.is_none());
+        assert_eq!(owned_after[0].market_state, "listed");
+    }
+
+    #[tokio::test]
+    async fn stopping_listing_expires_quotes_bumps_revision_and_is_idempotent() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-stop-quote", "owner-stop-quote@example.com");
+        let renter = session("renter-stop-quote", "renter-stop-quote@example.com");
+        insert_share(
+            &store,
+            "share-stop-quote",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-stop-quote", free_seat()).await;
+        let quote = store
+            .share_market_create_rent_quote(&renter, &seat_id, None)
+            .await
+            .expect("create quote before stopping listing");
+
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("stop listing");
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            ("closed".into(), SEAT_DISABLED.into(), 2),
+        );
+        let quote_status: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status FROM share_market_rent_quotes WHERE id = ?1",
+                params![quote.id],
+                |row| row.get(0),
+            )
+            .expect("read expired quote");
+        assert_eq!(quote_status, "expired");
+
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("stopping an already stopped listing is idempotent");
+        let (status, seat_status, revision) =
+            stopped_listing_state(&store, &listing_id, &seat_id).await;
+        assert_eq!(
+            (status.as_str(), seat_status.as_str(), revision),
+            ("closed", SEAT_DISABLED, 2)
+        );
+        let close_events: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM share_market_events
+                 WHERE listing_id = ?1 AND event_type = 'listing_closed'",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .expect("count close events");
+        assert_eq!(close_events, 1);
+    }
+
+    #[tokio::test]
+    async fn reopening_listing_preserves_active_rentals() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-reopen-rented", "owner-reopen-rented@example.com");
+        let renter = session("renter-reopen-rented", "renter-reopen-rented@example.com");
+        insert_share(
+            &store,
+            "share-reopen-rented",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, rented_seat_id) =
+            create_listing(&store, &owner, "share-reopen-rented", free_seat()).await;
+        let idle_seat_id = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect("add idle seat");
+        let subscription_id = store
+            .share_market_rent_seat(
+                &renter,
+                &rented_seat_id,
+                RentSeatRequest { offer_revision: 1 },
+            )
+            .await
+            .expect("rent first seat");
+        let before: (String, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, seat.status
+                 FROM share_market_subscriptions sub
+                 JOIN share_market_seats seat ON seat.id = sub.seat_id
+                 WHERE sub.id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read active rental before stop");
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("stop listing with active rental");
+        store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                reopen_existing_request(&idle_seat_id, 2, free_seat()),
+            )
+            .await
+            .expect("restore idle seat around active rental");
+        let after: (String, String, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT sub.status, rented.status, idle.status, idle.offer_revision
+                 FROM share_market_subscriptions sub
+                 JOIN share_market_seats rented ON rented.id = sub.seat_id
+                 JOIN share_market_seats idle ON idle.id = ?2
+                 WHERE sub.id = ?1",
+                params![subscription_id, idle_seat_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read active rental after reopen");
+        assert_eq!((after.0, after.1), before);
+        assert_eq!((after.2.as_str(), after.3), (SEAT_AVAILABLE, 3));
+    }
+
+    #[tokio::test]
+    async fn reopen_validation_failures_leave_the_listing_fully_stopped() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-reopen-rollback", "owner-reopen-rollback@example.com");
+        insert_share(
+            &store,
+            "share-reopen-rollback",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-reopen-rollback", free_seat()).await;
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("stop listing before validation tests");
+        let expected_state = ("closed".into(), SEAT_DISABLED.into(), 2);
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET free_access = 1 WHERE share_id = 'share-reopen-rollback'",
+                [],
+            )
+            .expect("enable public access");
+        assert!(
             store
-                .share_market_create_listing(
+                .share_market_reopen_listing(
                     &owner,
-                    CreateListingRequest {
-                        share_id: "share-relist".into(),
-                        seats: vec![free_seat()],
-                    },
+                    &listing_id,
+                    reopen_existing_request(&seat_id, 2, free_seat()),
                 )
-                .await,
-            Err(AppError::Conflict(_))
-        ));
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET free_access = 0, share_status = 'paused'
+                 WHERE share_id = 'share-reopen-rollback'",
+                [],
+            )
+            .expect("make Share inactive");
+        assert!(
+            store
+                .share_market_reopen_listing(
+                    &owner,
+                    &listing_id,
+                    reopen_existing_request(&seat_id, 2, free_seat()),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET share_status = 'active', owner_email = 'other@example.com'
+                 WHERE share_id = 'share-reopen-rollback'",
+                [],
+            )
+            .expect("change Share owner");
+        assert!(
+            store
+                .share_market_reopen_listing(
+                    &owner,
+                    &listing_id,
+                    reopen_existing_request(&seat_id, 2, free_seat()),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET owner_email = ?2, share_access_policy_version = 0
+                 WHERE share_id = ?1",
+                params!["share-reopen-rollback", owner.email],
+            )
+            .expect("downgrade Share contract");
+        let upgrade_error = store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                reopen_existing_request(&seat_id, 2, free_seat()),
+            )
+            .await
+            .expect_err("old Share contract must block reopen");
+        assert_eq!(
+            upgrade_error.code(),
+            Some("share_market_client_upgrade_required")
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET share_access_policy_version = ?2 WHERE share_id = ?1",
+                params!["share-reopen-rollback", i64::from(SHARE_CONTRACT_VERSION)],
+            )
+            .expect("restore Share contract");
+
+        let now = Utc::now().to_rfc3339();
+        let patch_json = serde_json::to_string(&ShareSettingsPatch {
+            free_access: Some(true),
+            ..ShareSettingsPatch::default()
+        })
+        .expect("encode pending public access edit");
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO share_edit_requests (
+                    id, share_id, installation_id, owner_email, revision, status,
+                    patch_json, created_by_email, created_at, updated_at,
+                    applied_at, error_message, retired_at
+                 ) VALUES ('reopen-pending-edit', 'share-reopen-rollback',
+                           'installation-share-reopen-rollback', ?1, 1, 'pending',
+                           ?2, ?1, ?3, ?3, NULL, NULL, NULL)",
+                params![owner.email, patch_json, now],
+            )
+            .expect("insert pending public access edit");
+        assert!(
+            store
+                .share_market_reopen_listing(
+                    &owner,
+                    &listing_id,
+                    reopen_existing_request(&seat_id, 2, free_seat()),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "DELETE FROM share_edit_requests WHERE id = 'reopen-pending-edit'",
+                [],
+            )
+            .expect("remove pending edit");
+
+        let mut unsupported_period = free_seat();
+        unsupported_period.token_period = ShareTokenPeriod::Week;
+        assert!(
+            store
+                .share_market_reopen_listing(
+                    &owner,
+                    &listing_id,
+                    reopen_existing_request(&seat_id, 2, unsupported_period),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+        let mut over_capacity = free_seat();
+        over_capacity.parallel_limit = Some(4);
+        assert!(
+            store
+                .share_market_reopen_listing(
+                    &owner,
+                    &listing_id,
+                    reopen_existing_request(&seat_id, 2, over_capacity),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+        let payment_error = store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                reopen_existing_request(&seat_id, 2, paid_seat()),
+            )
+            .await
+            .expect_err("paid reopen without payment profile must fail");
+        assert_eq!(
+            payment_error.code(),
+            Some(ERROR_SHARE_MARKET_PAYMENT_PROFILE_REQUIRED)
+        );
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            expected_state
+        );
+
+        store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                reopen_existing_request(&seat_id, 2, free_seat()),
+            )
+            .await
+            .expect("valid reopen still succeeds after rejected attempts");
+    }
+
+    #[tokio::test]
+    async fn retired_seat_cannot_be_republished() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-retired-reopen", "owner-retired-reopen@example.com");
+        insert_share(
+            &store,
+            "share-retired-reopen",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-retired-reopen", free_seat()).await;
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("stop listing");
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE share_market_seats SET retired_at = ?2 WHERE id = ?1",
+                params![seat_id, Utc::now().to_rfc3339()],
+            )
+            .expect("retire stopped seat");
+        let error = store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                reopen_existing_request(&seat_id, 2, free_seat()),
+            )
+            .await
+            .expect_err("retired seat must not be republished");
+        assert_eq!(error.code(), Some(ERROR_SEAT_NOT_REOPENABLE));
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            ("closed".into(), SEAT_DISABLED.into(), 2),
+        );
+    }
+
+    #[tokio::test]
+    async fn old_listing_reopen_and_add_seat_return_coded_conflict_when_another_is_active() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-reopen-conflict", "owner-reopen-conflict@example.com");
+        insert_share(
+            &store,
+            "share-reopen-conflict",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-reopen-conflict", free_seat()).await;
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("stop old listing");
+        let now = Utc::now().to_rfc3339();
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO share_market_listings (
+                    id, share_id, installation_id, owner_user_id, owner_email,
+                    status, created_at, updated_at
+                 ) VALUES ('replacement-active', 'share-reopen-conflict',
+                           'installation-share-reopen-conflict', ?1, ?2,
+                           'active', ?3, ?3)",
+                params![owner.user_id, owner.email, now],
+            )
+            .expect("seed replacement active listing");
+
+        let reopen_error = store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                reopen_existing_request(&seat_id, 2, free_seat()),
+            )
+            .await
+            .expect_err("old listing must not collide with active replacement");
+        assert_eq!(reopen_error.code(), Some(ERROR_OTHER_ACTIVE_LISTING));
+        let add_error = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect_err("legacy add-seat reopen must return a coded conflict");
+        assert_eq!(add_error.code(), Some(ERROR_OTHER_ACTIVE_LISTING));
+        assert_eq!(
+            stopped_listing_state(&store, &listing_id, &seat_id).await,
+            ("closed".into(), SEAT_DISABLED.into(), 2),
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reopen_attempts_activate_the_listing_once() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-reopen-race", "owner-reopen-race@example.com");
+        insert_share(
+            &store,
+            "share-reopen-race",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-reopen-race", free_seat()).await;
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("stop listing before concurrent reopen");
+
+        let left = store.share_market_reopen_listing(
+            &owner,
+            &listing_id,
+            reopen_existing_request(&seat_id, 2, free_seat()),
+        );
+        let right = store.share_market_reopen_listing(
+            &owner,
+            &listing_id,
+            reopen_existing_request(&seat_id, 2, free_seat()),
+        );
+        let (left, right) = tokio::join!(left, right);
+        assert_ne!(left.is_ok(), right.is_ok());
+        let error = left.err().or_else(|| right.err()).expect("one conflict");
+        assert_eq!(error.code(), Some(ERROR_LISTING_NOT_CLOSED));
+        let relisted_events: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM share_market_events
+                 WHERE listing_id = ?1 AND event_type = 'listing_relisted'",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .expect("count relist events");
+        assert_eq!(relisted_events, 1);
     }
 
     #[tokio::test]
@@ -18489,7 +19677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_listing_with_active_rental_blocks_relist() {
+    async fn closed_listing_with_active_rental_requires_reopen_and_blocks_delete() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-hold", "owner-hold@example.com");
         let renter = session("renter-hold", "renter-hold@example.com");
@@ -18526,18 +19714,40 @@ mod tests {
             .await
             .expect("owned shares while rental active");
         assert!(owned[0].already_listed);
-        assert!(matches!(
-            store
-                .share_market_create_listing(
-                    &owner,
-                    CreateListingRequest {
-                        share_id: "share-hold".into(),
-                        seats: vec![free_seat()],
-                    },
-                )
-                .await,
-            Err(AppError::Conflict(_))
-        ));
+        assert!(owned[0].has_active_rentals);
+        assert_eq!(
+            owned[0].reopen_listing_id.as_deref(),
+            Some(listing_id.as_str())
+        );
+        let create_error = store
+            .share_market_create_listing(
+                &owner,
+                CreateListingRequest {
+                    share_id: "share-hold".into(),
+                    seats: vec![free_seat()],
+                },
+            )
+            .await
+            .expect_err("active rental must not allow a replacement listing");
+        assert_eq!(create_error.code(), Some(ERROR_REOPEN_REQUIRED));
+
+        let reopened = store
+            .share_market_reopen_listing(
+                &owner,
+                &listing_id,
+                ReopenListingRequest {
+                    existing_seats: Vec::new(),
+                    new_seats: vec![free_seat()],
+                },
+            )
+            .await
+            .expect("active rental does not block restoring the original listing");
+        assert_eq!(reopened.listing_id, listing_id);
+        assert_eq!(reopened.new_seat_ids.len(), 1);
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_ACTIVE_FREE
+        );
     }
 
     #[tokio::test]

@@ -297,16 +297,21 @@ Server 要求:
 |---|---|---|
 | `GET` | `/v1/share-market/listings` | 公开 catalog(含统一准入与授信计算后的 `canRent`) |
 | `POST` | `/v1/share-market/listings` | 添加 Share 挂牌(1–20 座位) |
-| `DELETE` | `/v1/share-market/listings/:id` | 停止挂售 |
-| `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选(`alreadyListed`、`subdomain`、`ownerEmail`、`supportedApps`) |
-| `POST` | `/v1/share-market/listings/:id/seats` | 添加拼车位(可 reopen closed listing) |
+| `DELETE` | `/v1/share-market/listings/:id` | 停止挂售；空闲车位报价 revision 递增，未提交 quote 立即失效 |
+| `POST` | `/v1/share-market/listings/:id/reopen` | 原子恢复原 listing，可修改并重新发布旧车位，同时添加新车位 |
+| `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选与挂售状态(`canCreateListing`、`activeListingId`、`reopenListingId`、`hasActiveRentals`) |
+| `POST` | `/v1/share-market/listings/:id/seats` | 为 active listing 添加拼车位；兼容旧调用方在 closed listing 上添加并恢复 |
 | `PATCH`/`DELETE` | `/v1/share-market/seats/:id` | 编辑/删除空闲座位 |
 | `POST` | `/v1/share-market/seats/:id/quote` | 冻结车位及 Share 全部已启用 App 的服务条款 |
 | `POST` | `/v1/share-market/seats/:id/rent` | 租用 |
 | `POST` | `/v1/share-market/subscriptions/:id/release` | 租客归还 |
 | `POST` | `/v1/share-market/subscriptions/:id/force-revoke` | Owner 强制回收,可同时拒绝该买家后续 Share 租用 |
 
-`alreadyListed` 为 true 当且仅当:当前 owner 对该 Share 有 `active` listing,或该 Share 上仍有非终态订阅。停止挂售且租约全部结束后可再次 `POST /listings`。
+`alreadyListed` 作为兼容字段,在当前 owner 有 active listing 或 Share 仍有非终态订阅时为 true；新 UI 以 `canCreateListing`、`activeListingId` 与 `reopenListingId` 决定动作。只要存在未删除的 closed listing,`POST /listings` 返回 `share_market_reopen_required` 及原 `listingId`,不得创建重复 listing。
+
+恢复请求至少包含一个 `existingSeats[]` 或 `newSeats[]`。旧车位项提交 `seatId`、当前 `offerRevision` 和完整 `seat` 条款；只有 `disabled`、未退休、无当前订阅且属于该 listing 的车位可重新发布。Router 使用 Immediate 事务校验 owner、Share 状态/归属、公开免费策略、待应用编辑、Client contract 版本、Token 周期、Share 并发上限、付费资料、20 车位上限及其他 active listing,再统一更新旧车位、插入新车位并激活原 listing。任何失败都会完整回滚。进行中的租约既不阻止恢复,也不会被恢复操作修改。
+
+停止挂售是幂等且可逆的。首次停止将 `available` 车位改为 `disabled` 并递增 `offerRevision`,同时把该 listing 下所有 active rent quote 改为 `expired`；重复停止不会再次递增 revision 或重复写审计事件。恢复旧车位时再次递增 revision,因此停止前生成的 quote 即使仍在客户端内存中也不能在恢复后提交。
 
 免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription，固定期限从租用事务提交成功时计算，并以同一绝对 `expiresAt` 写入 managed grant policy，授权延迟和账单暂停均不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
 

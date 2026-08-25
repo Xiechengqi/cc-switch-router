@@ -202,17 +202,17 @@ location.reload();
 |---|---|---|---|
 | SM-01 | 任意 | 打开 `/share-market` | 顶部只显示 Share Market / Client Market；空 catalog 正常显示，不能出现旧 Token Market tab |
 | SM-02 | 未登录 | 点租用或添加 Share | 打开登录弹窗,不提交写请求 |
-| SM-03 | 已登录且拥有 active 私有 Share | 点添加 Share | 只列出未挂售且未开启“公开免费使用”的 Share；下拉每项展示 Share 名称、subdomain、owner 邮箱和全部已绑定应用；可一次添加 1-20 个拼车位 |
+| SM-03 | 已登录且拥有 active 私有 Share | 点添加 Share | 只列出允许新建 listing、未开启“公开免费使用”且没有 closed listing 的 Share；下拉每项展示 Share 名称、subdomain、owner 邮箱和全部已绑定应用；可一次添加 1-20 个拼车位 |
 | SM-04 | 添加拼车位 | 保持价格模式为免费 | 默认固定服务期限 1 天；请求中日费率和币种均为空，`serviceDurationDays=1` |
 | SM-05 | 添加付费拼车位 | 切到付费后输入三位以上小数、经 API 提交非 USD 币种,或未配置 USD 收款资料/付款宽限 | 切到付费时默认无固定期限；UI 固定使用 USD；非法报价被前后端阻止 |
 | SM-06 | 有可用拼车位 | 可信买家租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；已有 direct grant 的用户不显示租用按钮 |
 | SM-07 | 付费租约 | 查看商品与租约 | 只显示收款方式种类和联系方式；不显示账号、地址、二维码或单商品付款按钮 |
 | SM-08 | owner 查看已租座位 | 强制回收 / 回收并拒绝后续访问 | 二次确认后进入回收状态；拒绝后该买家不能新租该 owner 的 Share 座位 |
 | SM-09 | owner 打开市场准入 | 将该买家的 Share 规则改回允许 | 保存后买家可再次新租 Share；Client Host 规则不受影响 |
-| SM-10 | listing 有活跃租约 | 停止挂售 | 空闲座位关闭,活跃租约继续显示且可正常使用；「添加 Share」仍不可选该 Share |
+| SM-10 | listing 有活跃租约和空闲车位，且空闲车位已有未提交 quote | 停止挂售 | 空闲座位关闭且 revision 递增，quote 失效；活跃租约继续显示且可正常使用；「添加 Share」不把该 Share 当作新 listing 候选 |
 | SM-11 | 已释放的座位 | 删除座位 | 座位从 catalog 消失,历史订阅和账单仍保留 |
 | SM-12 | 窄屏 | 检查导航、弹窗和座位表 | 导航和表格可横向滚动；弹窗纵向滚动；文字和操作不重叠 |
-| SM-13 | 停止挂售、无活跃租约且 Share 为私有 | 点添加 Share | 该 Share 重新出现在候选列表；可新建 listing |
+| SM-13 | 停止挂售且 Share 为 active 私有状态 | 在「我的挂售」点恢复挂售 | 默认勾选全部可复用旧车位；可取消、修改条款并同时添加新车位；提交后恢复原 listing ID，进行中的租约不受影响 |
 | SM-14 | 离线 Share 的可用座位 | 观察并直接调用租用接口 | 已登录用户不显示租用按钮；直接请求返回离线冲突,不创建订阅或账务合约 |
 | SM-15 | 租约非终态 | My rentals / owner 嵌套订阅 | 有 subdomain 时显示「打开 Share」并可跳转 |
 | SM-16 | 已登录买家不在 owner 白名单,Share 在线且座位可用 | 点「租用」 | 保留租用按钮；弹出中性授权引导而非红色英文错误，明确只有白名单用户可租用并显示当前登录邮箱；点主操作打开该 Share 对应的 Client 聊天室 |
@@ -224,6 +224,9 @@ location.reload();
 | SM-22 | 打开确认框后 Share 下线或报价 revision 改变 | 点击确认 | 后端拒绝且确认框保留可理解的内联错误，不创建订阅、不直接展示红色英文 toast |
 | SM-23 | Token 不限额的现有座位 | 查看 All / Mine 表格 | 只显示“不限”，不再拼接“累计”周期；设置限额的座位显示数值与周期 |
 | SM-24 | Share 已开启“公开免费使用” | 点添加 Share，并直接调用创建 listing / 添加或重开 seat 接口 | Share 不出现在候选列表；绕过 UI 的写请求返回可理解的冲突，且不创建或恢复任何 listing/seat/subscription |
+| SM-25 | Share 有 closed listing | 点添加 Share，并直接调用 `POST /listings` | blocked Share 行提供「恢复挂售」入口；直接新建返回 `share_market_reopen_required` 和原 listing ID，不生成重复 listing |
+| SM-26 | closed listing 的旧车位已退休、Owner 已变化、Share inactive、Client 版本过低或已有另一 active listing | 查看并尝试恢复 | 卡片显示本地化阻断原因；直接请求返回稳定 409 code，listing/seat/revision 均不发生部分更新 |
+| SM-27 | 同一 closed listing | 两个窗口同时提交恢复 | 仅一个请求成功；另一个收到 listing 状态已变化的本地化冲突，只产生一次 `listing_relisted` 事件 |
 
 ### 6.1.1 Share Market ↔ Server 联调(SM-E2E)
 

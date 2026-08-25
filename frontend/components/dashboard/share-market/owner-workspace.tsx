@@ -12,6 +12,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  RotateCcw,
   Trash2,
   UserRoundX,
   X,
@@ -25,6 +26,7 @@ import {
   usePaidOfferReadiness,
 } from "@/components/dashboard/share-market/paid-offer-readiness";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   addShareMarketSeat,
@@ -37,6 +39,7 @@ import {
   getShareMarketOwnedShares,
   proposeShareMarketPriceChange,
   quoteShareMarketSubscriptionTermination,
+  reopenShareMarketListing,
   retryShareMarketSubscriptionGrant,
   terminateShareMarketSubscription,
   updateShareMarketSeat,
@@ -72,10 +75,23 @@ import {
   integrityReasonText,
   integrityStatusKey,
   isCoreShareApp,
+  isSeatIdle,
+  listingIdleCount,
   refundStatusKey,
   shareMarketMutationError,
   subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
+import {
+  activeListingSeatCount,
+  canCreateOwnedShareListing,
+  isPriceOnlySeatAttention,
+  listingClosedRentalSeats,
+  listingLiveSeats,
+  ownedShareBlockedReasonKey,
+  partitionOwnedListings,
+  reopenableListingSeats,
+  reopenBlockedReasonKey,
+} from "@/components/dashboard/share-market/owner-workspace-utils";
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
 type SeatDraft = {
@@ -396,19 +412,22 @@ function ShareCapacitySummary({
   );
 }
 
-function ownedShareBlockReason(share: ShareMarketOwnedShare, t: TFn) {
-  if (share.alreadyListed) return t("shareMarket.dialog.blocked.alreadyListed");
-  if (share.freeAccess) return t("shareMarket.dialog.blocked.freeAccess");
-  if (share.shareStatus !== "active") return t("shareMarket.dialog.blocked.inactive");
-  return t("shareMarket.dialog.blocked.unknown");
-}
-
 function shareSettingsHref(shareId: string) {
   const params = new URLSearchParams({ drawerKind: "share", drawerId: shareId });
   return buildDashboardHref(DASHBOARD_CLIENTS_PATH, params);
 }
 
-export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { open: boolean; onOpenChange: (open: boolean) => void; onSaved: () => void }) {
+export function ShareMarketAddListingDialog({
+  open,
+  onOpenChange,
+  onSaved,
+  onReopenListing,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+  onReopenListing?: (listingId: string) => void;
+}) {
   const { t } = useLocaleText();
   const [shares, setShares] = React.useState<ShareMarketOwnedShare[]>([]);
   const [shareId, setShareId] = React.useState("");
@@ -432,9 +451,7 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
     getShareMarketOwnedShares(controller.signal)
       .then((items) => {
         if (!active) return;
-        const eligible = items.filter(
-          (item) => !item.alreadyListed && !item.freeAccess && item.shareStatus === "active",
-        );
+        const eligible = items.filter(canCreateOwnedShareListing);
         setShares(items);
         setShareId(eligible[0]?.shareId || "");
         setSeats([emptySeat(eligible[0]?.supportedUserTokenPeriods)]);
@@ -453,9 +470,7 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
     };
   }, [loadRevision, open, t]);
 
-  const eligibleShares = shares.filter(
-    (item) => !item.alreadyListed && !item.freeAccess && item.shareStatus === "active",
-  );
+  const eligibleShares = shares.filter(canCreateOwnedShareListing);
   const blockedShares = shares.filter((item) => !eligibleShares.includes(item));
   const selected = eligibleShares.find((share) => share.shareId === shareId);
   const seatErrors = seats.map((seat) => seatDraftValidation(seat, t, selected?.parallelLimit));
@@ -541,7 +556,21 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
                   {blockedShares.map((share) => (
                     <div key={share.shareId} className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
                       <span className="min-w-[10rem] flex-1 truncate font-medium text-slate-700">{share.shareName}</span>
-                      <span>{ownedShareBlockReason(share, t)}</span>
+                      <span>{t(ownedShareBlockedReasonKey(share.createBlockedReason))}</span>
+                      {share.reopenListingId && onReopenListing ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="whitespace-nowrap"
+                          onClick={() => {
+                            onOpenChange(false);
+                            onReopenListing(share.reopenListingId!);
+                          }}
+                        >
+                          <RotateCcw className="h-4 w-4" />
+                          {t("shareMarket.reopen.action")}
+                        </Button>
+                      ) : null}
                       <Link className="whitespace-nowrap font-medium text-accent hover:underline" href={shareSettingsHref(share.shareId)}>{t("shareMarket.dialog.manageShare")}</Link>
                     </div>
                   ))}
@@ -553,6 +582,193 @@ export function ShareMarketAddListingDialog({ open, onOpenChange, onSaved }: { o
           <Modal.Footer>
             <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
             <Button variant="primary" isDisabled={busy || loading || !shareId || formInvalid} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}{t("shareMarket.dialog.create")}</Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+  );
+}
+
+type ReopenExistingDraft = {
+  seat: ShareMarketSeat;
+  selected: boolean;
+  draft: SeatDraft;
+};
+
+function ReopenListingDialog({
+  listing,
+  onOpenChange,
+  onSaved,
+}: {
+  listing: ShareMarketListing | null;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const { t } = useLocaleText();
+  const [existing, setExisting] = React.useState<ReopenExistingDraft[]>([]);
+  const [newSeats, setNewSeats] = React.useState<SeatDraft[]>([]);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    if (!listing) return;
+    const reusable = reopenableListingSeats(listing);
+    setExisting(reusable.map((seat) => ({ seat, selected: true, draft: seatDraft(seat) })));
+    setNewSeats(reusable.length ? [] : [emptySeat(listing.supportedUserTokenPeriods)]);
+    setBusy(false);
+    setError("");
+  }, [listing]);
+
+  const selectedExisting = existing.filter((item) => item.selected);
+  const activeSeatCount = listing ? activeListingSeatCount(listing) : 0;
+  const requestedSeatCount = selectedExisting.length + newSeats.length;
+  const existingErrors = existing.map((item) =>
+    item.selected && listing
+      ? seatDraftValidation(item.draft, t, listing.parallelLimit)
+      : { message: "" },
+  );
+  const newSeatErrors = newSeats.map((seat) =>
+    listing ? seatDraftValidation(seat, t, listing.parallelLimit) : { message: "" },
+  );
+  const hasPaidSeat = selectedExisting.some((item) => item.draft.paid)
+    || newSeats.some((item) => item.paid);
+  const paidReadiness = usePaidOfferReadiness(!!listing && hasPaidSeat);
+  const atSeatLimit = activeSeatCount + requestedSeatCount >= 20;
+  const formInvalid = requestedSeatCount === 0
+    || !listing?.canReopen
+    || activeSeatCount + requestedSeatCount > 20
+    || existingErrors.some((validation) => !!validation.message)
+    || newSeatErrors.some((validation) => !!validation.message)
+    || (hasPaidSeat && paidReadiness.blocked);
+
+  const save = async () => {
+    if (!listing || busy || formInvalid) return;
+    setBusy(true);
+    setError("");
+    try {
+      await reopenShareMarketListing(listing.id, {
+        existingSeats: selectedExisting.map((item) => ({
+          seatId: item.seat.id,
+          offerRevision: item.seat.offerRevision,
+          seat: normalizedSeat(item.draft, t),
+        })),
+        newSeats: newSeats.map((seat) => normalizedSeat(seat, t)),
+      });
+      onOpenChange(false);
+      onSaved();
+    } catch (reason) {
+      setError(shareMarketMutationError(reason, t));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal.Backdrop isOpen={!!listing} onOpenChange={(next) => !next && !busy && onOpenChange(false)}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light w-[min(760px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{t("shareMarket.reopen.title")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid max-h-[75vh] gap-4 overflow-y-auto">
+            {listing ? (
+              <>
+                <div className="grid gap-1 text-sm text-slate-600">
+                  <strong className="text-slate-900">{listing.shareName}</strong>
+                  <span>{t("shareMarket.reopen.hint")}</span>
+                </div>
+                <ShareCapacitySummary parallelLimit={listing.parallelLimit} tokenLimit={listing.tokenLimit} />
+                {!listing.canReopen ? (
+                  <p role="alert" className="border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+                    {t(reopenBlockedReasonKey(listing.reopenBlockedReason))}
+                  </p>
+                ) : null}
+                {activeSeatCount ? (
+                  <p className="border-l-2 border-emerald-400 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+                    {t("shareMarket.reopen.activeSeatsHint", { count: activeSeatCount })}
+                  </p>
+                ) : null}
+
+                {existing.length ? (
+                  <section className="grid gap-3">
+                    <div>
+                      <strong className="text-sm text-slate-900">{t("shareMarket.reopen.existingSeats")}</strong>
+                      <p className="mt-0.5 text-xs text-slate-500">{t("shareMarket.reopen.existingSeatsHint")}</p>
+                    </div>
+                    {existing.map((item, index) => (
+                      <section key={item.seat.id} className="grid gap-3 border-t border-slate-200 pt-4">
+                        <div className="flex min-w-0 items-center justify-between gap-3">
+                          <label className="flex min-w-0 items-center gap-2 text-sm font-medium text-slate-900">
+                            <input
+                              type="checkbox"
+                              className="h-4 w-4 accent-emerald-600"
+                              checked={item.selected}
+                              disabled={busy}
+                              onChange={(event) => setExisting((items) => items.map((current, itemIndex) =>
+                                itemIndex === index ? { ...current, selected: event.target.checked } : current
+                              ))}
+                            />
+                            {t("shareMarket.seat", { position: item.seat.position })}
+                          </label>
+                          <Button
+                            isIconOnly
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t("shareMarket.copySeat")}
+                            isDisabled={busy || atSeatLimit}
+                            onClick={() => setNewSeats((items) => [...items, { ...item.draft }])}
+                          >
+                            <Copy className="h-4 w-4" />
+                          </Button>
+                        </div>
+                        <SeatFields
+                          draft={item.draft}
+                          supportedPeriods={listing.supportedUserTokenPeriods}
+                          disabled={busy || !item.selected}
+                          validation={existingErrors[index]}
+                          onChange={(next) => setExisting((items) => items.map((current, itemIndex) =>
+                            itemIndex === index ? { ...current, draft: next } : current
+                          ))}
+                        />
+                      </section>
+                    ))}
+                  </section>
+                ) : (
+                  <p className="text-sm text-slate-500">{t("shareMarket.reopen.noExistingSeats")}</p>
+                )}
+
+                {newSeats.length ? (
+                  <section className="grid gap-3">
+                    <strong className="text-sm text-slate-900">{t("shareMarket.reopen.newSeats")}</strong>
+                    {newSeats.map((seat, index) => (
+                      <section key={index} className="grid gap-3 border-t border-slate-200 pt-4">
+                        <div className="flex items-center justify-between gap-2">
+                          <strong className="text-sm">{t("shareMarket.reopen.newSeat", { position: index + 1 })}</strong>
+                          <div className="flex gap-1">
+                            <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.copySeat")} isDisabled={busy || atSeatLimit} onClick={() => setNewSeats((items) => [...items.slice(0, index + 1), { ...items[index] }, ...items.slice(index + 1)])}><Copy className="h-4 w-4" /></Button>
+                            <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={busy} onClick={() => setNewSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X className="h-4 w-4" /></Button>
+                          </div>
+                        </div>
+                        <SeatFields draft={seat} supportedPeriods={listing.supportedUserTokenPeriods} disabled={busy} validation={newSeatErrors[index]} onChange={(next) => setNewSeats((items) => items.map((current, itemIndex) => itemIndex === index ? next : current))} />
+                      </section>
+                    ))}
+                  </section>
+                ) : null}
+                {!atSeatLimit ? (
+                  <Button variant="outline" isDisabled={busy} onClick={() => setNewSeats((items) => [...items, emptySeat(listing.supportedUserTokenPeriods)])}>
+                    <Plus className="h-4 w-4" />{t("shareMarket.reopen.addNewSeat")}
+                  </Button>
+                ) : null}
+                {requestedSeatCount === 0 ? <p role="alert" className="text-xs text-rose-700">{t("shareMarket.reopen.selectSeat")}</p> : null}
+                {hasPaidSeat ? <PaidOfferReadinessNotice readiness={paidReadiness} /> : null}
+              </>
+            ) : null}
+            {error ? <p role="alert" className="text-sm text-rose-700">{error}</p> : null}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
+            <Button variant="primary" isDisabled={busy || !listing || formInvalid} onClick={() => void save()}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+              {t("shareMarket.reopen.confirm")}
+            </Button>
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
@@ -830,18 +1046,53 @@ function TerminationDialog({
   );
 }
 
-function AppSummary({ listing }: { listing: ShareMarketListing }) {
-  const { t } = useLocaleText();
+function ListingApps({ listing, size = 16 }: { listing: ShareMarketListing; size?: number }) {
+  const apps = listing.supportedApps.filter(isCoreShareApp);
+  if (!apps.length) return null;
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
-      {enabledMarketCapabilities(listing).map((capability) => (
-        <span key={capability.app} className="inline-flex min-w-0 items-center gap-1.5">
-          {isCoreShareApp(capability.app) ? <ShareAppLogo app={capability.app} size={14} /> : null}
-          <span className="truncate">{capabilityModelLabel(capability, t("shareMarket.modelPassthrough"), t("shareMarket.catalog.modelUnknown"))}</span>
-        </span>
-      ))}
-    </div>
+    <span className="inline-flex shrink-0 items-center gap-1" title={apps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}>
+      {apps.map((app) => <ShareAppLogo key={app} app={app} size={size} />)}
+    </span>
   );
+}
+
+function listingModelSummary(listing: ShareMarketListing, t: TFn) {
+  return enabledMarketCapabilities(listing)
+    .map((capability) => {
+      const appLabel = isCoreShareApp(capability.app) ? SHARE_APP_LABELS[capability.app] : capability.app;
+      return `${appLabel}: ${capabilityModelLabel(capability, t("shareMarket.modelPassthrough"), t("shareMarket.catalog.modelUnknown"))}`;
+    })
+    .join(" · ");
+}
+
+function seatQuotaLabel(seat: ShareMarketSeat, locale: string, t: TFn) {
+  return [
+    t("shareMarket.parallelShort", { value: seat.parallelLimit == null ? "∞" : seat.parallelLimit }),
+    formatTokenLimit(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`)),
+  ].join(" · ");
+}
+
+function listingPriceLabel(listing: ShareMarketListing, locale: string, t: TFn) {
+  const seats = listingLiveSeats(listing);
+  if (!seats.length) return t("shareMarket.free");
+  const idle = seats.filter(isSeatIdle);
+  const pool = idle.length ? idle : seats;
+  const amount = (seat: ShareMarketSeat) => seat.isFree ? 0 : seat.dailyRateMinor ?? 0;
+  const lowest = Math.min(...pool.map(amount));
+  const seat = pool.find((item) => amount(item) === lowest) || pool[0];
+  return formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"));
+}
+
+function listingQuotaLabel(listing: ShareMarketListing, locale: string, t: TFn) {
+  const seats = listingLiveSeats(listing);
+  const idle = seats.filter(isSeatIdle);
+  const seat = (idle.length ? idle : seats)[0];
+  return seat ? seatQuotaLabel(seat, locale, t) : "";
+}
+
+function seatStatusLabel(seat: ShareMarketSeat, t: TFn) {
+  const statusKey = subscriptionStatusKey(seat.subscription?.status || "");
+  return statusKey ? t(statusKey) : isSeatIdle(seat) ? t("shareMarket.available") : seat.status;
 }
 
 export function ShareMarketOwnerWorkspace({
@@ -850,16 +1101,19 @@ export function ShareMarketOwnerWorkspace({
   focusedShareId,
   onChanged,
   onInteractionChange,
+  showHeading = true,
 }: {
   listings: ShareMarketListing[];
   loading: boolean;
   focusedShareId?: string;
   onChanged: () => Promise<void> | void;
   onInteractionChange?: (active: boolean) => void;
+  showHeading?: boolean;
 }) {
   const { locale, t } = useLocaleText();
   const chat = useClientChat();
   const [addOpen, setAddOpen] = React.useState(false);
+  const [reopenListing, setReopenListing] = React.useState<ShareMarketListing | null>(null);
   const [seatDialog, setSeatDialog] = React.useState<{ listing: ShareMarketListing; seat?: ShareMarketSeat; template?: ShareMarketSeat } | null>(null);
   const [priceDialog, setPriceDialog] = React.useState<ShareMarketSubscription | null>(null);
   const [terminationTarget, setTerminationTarget] = React.useState<{ subscription: ShareMarketSubscription; denyFutureAccess: boolean } | null>(null);
@@ -867,7 +1121,11 @@ export function ShareMarketOwnerWorkspace({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const focusedRef = React.useRef("");
-  const interactionActive = addOpen || !!seatDialog || !!priceDialog || !!terminationTarget || !!confirm || busy;
+  const interactionActive = addOpen || !!reopenListing || !!seatDialog || !!priceDialog || !!terminationTarget || !!confirm || busy;
+  const { attentionSeats, attentionListings, active, closed } = React.useMemo(
+    () => partitionOwnedListings(listings),
+    [listings],
+  );
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
@@ -898,12 +1156,12 @@ export function ShareMarketOwnerWorkspace({
     }
   };
 
-  const seatStatusLabel = (seat: ShareMarketSeat) => {
-    const statusKey = subscriptionStatusKey(seat.subscription?.status || "");
-    return statusKey ? t(statusKey) : seat.status === "available" ? t("shareMarket.available") : seat.status;
+  const openReopenListing = (listingId: string) => {
+    const listing = listings.find((item) => item.id === listingId);
+    if (listing) setReopenListing(listing);
   };
 
-  const renderSeatStatusDetails = (seat: ShareMarketSeat, mobile = false) => {
+  const renderSeatStatusDetails = (seat: ShareMarketSeat, tone: "rose" | "amber" | "plain" = "rose") => {
     const subscription = seat.subscription;
     const grantFailed = subscription?.status === "grant_failed";
     const grantContractViolation = subscription?.failureCode === "share_market_grant_contract_violation";
@@ -914,26 +1172,40 @@ export function ShareMarketOwnerWorkspace({
       || subscription.grantAttempts != null
       || subscription.integrityState !== "compatible"
       || !!subscription.terminationAdjustment
+      || subscription.priceChange?.status === "pending"
     );
-
     if (!subscription || !hasStatusDetail) return null;
+    const priceChange = subscription.priceChange;
     return (
       <div className={cn(
-        "grid gap-0.5 text-xs text-slate-600",
-        mobile && "border-l-2 border-rose-300 bg-rose-50 px-3 py-2 text-left",
-        !mobile && "mt-1",
+        "grid gap-0.5 px-3 py-2 text-xs leading-5",
+        tone === "amber"
+          ? "border-l-2 border-amber-400 bg-amber-50 text-amber-950"
+          : tone === "rose"
+            ? "border-l-2 border-rose-400 bg-rose-50 text-rose-900"
+            : "text-slate-600",
       )}>
-        {grantFailed || grantContractViolation ? <p>{t(grantFailureMessageKey(subscription.failureCode))}</p> : null}
-        {subscription.failureCode ? <p className="break-all font-mono text-[10px] text-slate-500">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
+        {grantFailed || grantContractViolation ? <p className="font-medium">{t(grantFailureMessageKey(subscription.failureCode))}</p> : null}
+        {subscription.failureCode ? <p className="break-all font-mono text-[10px] opacity-70">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
         {subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
-        {subscription.releaseReason ? <p className="break-words text-slate-500">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
+        {subscription.releaseReason ? <p className="break-words opacity-80">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
         {subscription.integrityState !== "compatible" ? <p>{t(integrityStatusKey(subscription.integrityState))}{subscription.integrityReason ? ` · ${integrityReasonText(subscription.integrityReason, t)}` : ""}</p> : null}
         {subscription.terminationAdjustment ? <p>{t("shareMarket.refund.summary", { amount: formatUsdMoney(subscription.terminationAdjustment.amountMinor, locale), status: t(refundStatusKey(subscription.terminationAdjustment.status)) })}</p> : null}
+        {priceChange ? (
+          <p>
+            {t(`shareMarket.priceChange.status.${priceChange.status}`)}
+            {" · "}
+            {t("shareMarket.priceChange.summary", {
+              previous: formatUsdMoney(priceChange.previousDailyRateMinor, locale),
+              proposed: formatUsdMoney(priceChange.proposedDailyRateMinor, locale),
+            })}
+          </p>
+        ) : null}
       </div>
     );
   };
 
-  const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat, mobile = false) => {
+  const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) => {
     const subscription = seat.subscription;
     const grantFailed = subscription?.status === "grant_failed";
     const actions: Array<{
@@ -949,14 +1221,14 @@ export function ShareMarketOwnerWorkspace({
         {
           key: "edit",
           label: t("shareMarket.manage"),
-          icon: <Pencil className="h-4 w-4" />,
+          icon: <Pencil className="h-3.5 w-3.5" />,
           iconOnly: true,
           onClick: () => setSeatDialog({ listing, seat }),
         },
         {
           key: "copy",
           label: t("shareMarket.copySeat"),
-          icon: <Copy className="h-4 w-4" />,
+          icon: <Copy className="h-3.5 w-3.5" />,
           iconOnly: true,
           onClick: () => setSeatDialog({ listing, template: seat }),
         },
@@ -966,7 +1238,7 @@ export function ShareMarketOwnerWorkspace({
       actions.push({
         key: "delete",
         label: t("shareMarket.deleteSeat"),
-        icon: <Trash2 className="h-4 w-4" />,
+        icon: <Trash2 className="h-3.5 w-3.5" />,
         iconOnly: true,
         onClick: () => setConfirm({
           title: t(grantFailed ? "shareMarket.confirm.deleteFailedTitle" : "shareMarket.confirm.deleteTitle"),
@@ -983,7 +1255,7 @@ export function ShareMarketOwnerWorkspace({
       actions.push({
         key: "retry-grant",
         label: t("shareMarket.authorizationFailure.retry"),
-        icon: <RefreshCw className="h-4 w-4" />,
+        icon: <RefreshCw className="h-3.5 w-3.5" />,
         onClick: () => setConfirm({
           title: t("shareMarket.authorizationFailure.retryTitle"),
           description: t("shareMarket.authorizationFailure.retryDescription", {
@@ -1017,7 +1289,7 @@ export function ShareMarketOwnerWorkspace({
         {
           key: "revoke",
           label: t("shareMarket.forceRevoke"),
-          icon: <RefreshCw className="h-4 w-4" />,
+          icon: <RefreshCw className="h-3.5 w-3.5" />,
           iconOnly: true,
           onClick: () => requiresRefundConfirmation
             ? setTerminationTarget({ subscription, denyFutureAccess: false })
@@ -1032,8 +1304,7 @@ export function ShareMarketOwnerWorkspace({
         {
           key: "deny",
           label: t("shareMarket.denyAndRevoke"),
-          icon: <UserRoundX className="h-4 w-4" />,
-          iconOnly: true,
+          icon: <UserRoundX className="h-3.5 w-3.5" />,
           onClick: () => requiresRefundConfirmation
             ? setTerminationTarget({ subscription, denyFutureAccess: true })
             : setConfirm({
@@ -1049,156 +1320,328 @@ export function ShareMarketOwnerWorkspace({
 
     if (!actions.length) return null;
     return (
-      <div className={cn("flex flex-wrap gap-1", mobile ? "justify-start" : "justify-end")}>
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
         {actions.map((action) => (
-          <Button
-            key={action.key}
-            isIconOnly={!mobile && action.iconOnly}
-            size="sm"
-            variant={mobile ? "outline" : "ghost"}
-            className="whitespace-nowrap"
-            aria-label={action.label}
-            isDisabled={busy}
-            onClick={action.onClick}
-          >
-            {action.icon}
-            {mobile || !action.iconOnly ? action.label : null}
-          </Button>
+          <span key={action.key} title={action.label}>
+            <Button
+              isIconOnly={action.iconOnly}
+              size="sm"
+              variant="ghost"
+              className={cn("h-7 min-w-0", action.iconOnly ? "w-7 px-0" : "px-2 text-xs")}
+              aria-label={action.label}
+              isDisabled={busy}
+              onClick={action.onClick}
+            >
+              {action.icon}
+              {action.iconOnly ? null : action.label}
+            </Button>
+          </span>
         ))}
       </div>
     );
   };
 
-  return (
-    <div className="grid min-w-0 gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
-        <div>
-          <h2 className="text-sm font-semibold text-slate-900">{t("shareMarket.workspace.selling")}</h2>
-          <p className="mt-0.5 text-xs text-slate-500">{t("shareMarket.workspace.sellingHint")}</p>
-        </div>
-        <div className="flex gap-2">
-          <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void onChanged()}><RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} /></Button>
-          <Button size="sm" variant="primary" onClick={() => setAddOpen(true)}><Plus className="h-4 w-4" />{t("shareMarket.addShare")}</Button>
-        </div>
-      </div>
-      {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
-      {listings.map((listing) => (
-        <section
-          key={listing.id}
-          id={`share-market-listing-${listing.shareId}`}
-          tabIndex={-1}
-          className={cn(
-            "grid min-w-0 scroll-mt-20 gap-3 border-b border-slate-200 pb-5 outline-none last:border-0",
-            focusedShareId === listing.shareId && "border-l-2 border-l-accent pl-3",
-          )}
+  const renderListingActions = (listing: ShareMarketListing) => (
+    <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+      <span title={t("shareMarket.groupChat")}>
+        <Button
+          isIconOnly
+          size="sm"
+          variant="ghost"
+          className="h-7 w-7"
+          aria-label={t("shareMarket.groupChat")}
+          isDisabled={busy}
+          onClick={() => void chat.openClientChat(listing.installationId)}
         >
-          <header className="flex min-w-0 flex-wrap items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <strong className="truncate text-sm text-slate-900">{listing.shareName}</strong>
-                <span className={listing.shareOnline ? "text-xs font-medium text-emerald-700" : "text-xs font-medium text-rose-700"}>{listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</span>
-                <span className="text-xs text-slate-500">{listing.status === "closed" ? t("shareMarket.closed") : t("account.share.listingActive")}</span>
-              </div>
-              <p className="mt-1 break-all font-mono text-[11px] text-slate-400">{listing.subdomain}</p>
-              <div className="mt-2"><AppSummary listing={listing} /></div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" variant="outline" onClick={() => void chat.openClientChat(listing.installationId)}><MessageCircle className="h-4 w-4" />{t("shareMarket.groupChat")}</Button>
-              <Button size="sm" variant="outline" onClick={() => setSeatDialog({ listing })}><Plus className="h-4 w-4" />{t("shareMarket.addSeat")}</Button>
-              {listing.status === "active" ? (
-                <Button size="sm" variant="outline" onClick={() => setConfirm({ title: t("shareMarket.confirm.closeTitle"), description: t("shareMarket.confirm.closeDescription", { share: listing.shareName }), label: t("shareMarket.closeListing"), tone: "warning", run: () => closeShareMarketListing(listing.id) })}><Ban className="h-4 w-4" />{t("shareMarket.closeListing")}</Button>
-              ) : listing.canDelete ? (
-                <Button size="sm" variant="outline" onClick={() => setConfirm({ title: t("shareMarket.confirm.deleteListingTitle"), description: t("shareMarket.confirm.deleteListingDescription", { share: listing.shareName }), label: t("shareMarket.deleteListing"), tone: "danger", run: () => deleteShareMarketListing(listing.id) })}><Trash2 className="h-4 w-4" />{t("shareMarket.deleteListing")}</Button>
+          <MessageCircle className="h-3.5 w-3.5" />
+        </Button>
+      </span>
+      {listing.status === "active" ? (
+        <>
+          <span title={t("shareMarket.addSeat")}>
+            <Button
+              isIconOnly
+              size="sm"
+              variant="ghost"
+              className="h-7 w-7"
+              aria-label={t("shareMarket.addSeat")}
+              isDisabled={busy}
+              onClick={() => setSeatDialog({ listing })}
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+          </span>
+          <span title={t("shareMarket.closeListing")}>
+            <Button
+              isIconOnly
+              size="sm"
+              variant="ghost"
+              className="h-7 w-7"
+              aria-label={t("shareMarket.closeListing")}
+              isDisabled={busy}
+              onClick={() => setConfirm({
+                title: t("shareMarket.confirm.closeTitle"),
+                description: t("shareMarket.confirm.closeDescription", { share: listing.shareName }),
+                label: t("shareMarket.closeListing"),
+                tone: "warning",
+                run: () => closeShareMarketListing(listing.id),
+              })}
+            >
+              <Ban className="h-3.5 w-3.5" />
+            </Button>
+          </span>
+        </>
+      ) : (
+        <>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 min-w-0 px-2 text-xs"
+            isDisabled={busy || !listing.canReopen}
+            onClick={() => setReopenListing(listing)}
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            {t("shareMarket.reopen.action")}
+          </Button>
+          {listing.canDelete ? (
+            <span title={t("shareMarket.deleteListing")}>
+              <Button
+                isIconOnly
+                size="sm"
+                variant="ghost"
+                className="h-7 w-7"
+                aria-label={t("shareMarket.deleteListing")}
+                isDisabled={busy}
+                onClick={() => setConfirm({
+                  title: t("shareMarket.confirm.deleteListingTitle"),
+                  description: t("shareMarket.confirm.deleteListingDescription", { share: listing.shareName }),
+                  label: t("shareMarket.deleteListing"),
+                  tone: "danger",
+                  run: () => deleteShareMarketListing(listing.id),
+                })}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </span>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+
+  const renderListingIdentity = (listing: ShareMarketListing, statusLabel: string) => (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+      <ListingApps listing={listing} />
+      <strong className="min-w-0 truncate text-sm text-slate-900">{listing.shareName}</strong>
+      <span className={cn("shrink-0 text-[11px] font-medium", listing.shareOnline ? "text-emerald-700" : "text-rose-700")}>
+        {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+      </span>
+      <span className="min-w-0 truncate text-[11px] text-slate-500">{statusLabel}</span>
+      {listing.subdomain ? (
+        <span className="inline-flex min-w-0 items-center gap-1 font-mono text-[11px] text-slate-400">
+          <span className="min-w-0 truncate">{listing.subdomain}</span>
+          <SubdomainCopyButton subdomain={listing.subdomain} />
+        </span>
+      ) : null}
+    </div>
+  );
+
+  const renderSeatRow = (listing: ShareMarketListing, seat: ShareMarketSeat, attention = false) => {
+    const subscription = seat.subscription;
+    const priceOnly = attention && isPriceOnlySeatAttention(seat);
+    return (
+      <article
+        key={seat.id}
+        aria-busy={busy}
+        className={cn(
+          "grid gap-2 px-3 py-2.5",
+          attention && (priceOnly
+            ? "rounded-md border border-amber-200 bg-amber-50/40"
+            : "rounded-md border border-rose-200 bg-rose-50/40"),
+        )}
+      >
+        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+              {attention ? <ListingApps listing={listing} size={14} /> : null}
+              {attention ? <strong className="min-w-0 truncate text-sm text-slate-900">{listing.shareName}</strong> : null}
+              <strong className="shrink-0 text-sm tabular-nums text-slate-900">#{seat.position}</strong>
+              <span className="min-w-0 truncate text-[11px] text-slate-500">{seatStatusLabel(seat, t)}</span>
+              {subscription?.renterEmail ? (
+                <span className="min-w-0 truncate text-[11px] text-slate-500" title={subscription.renterEmail}>
+                  {subscription.renterEmail}
+                </span>
               ) : null}
             </div>
-          </header>
-
-          <div className="grid gap-2 lg:hidden">
-            {listing.seats.map((seat) => {
-              const subscription = seat.subscription;
-              const actions = renderSeatActions(listing, seat, true);
-              const statusDetails = renderSeatStatusDetails(seat, true);
-              return (
-                <article key={seat.id} className="grid min-w-0 gap-3 rounded-lg border border-slate-200 bg-white p-3">
-                  <div className="flex min-w-0 items-start justify-between gap-3">
-                    <strong className="shrink-0 text-sm text-slate-900">#{seat.position}</strong>
-                    <span className="min-w-0 text-right text-xs font-medium text-slate-700">{seatStatusLabel(seat)}</span>
-                  </div>
-                  {statusDetails}
-                  <dl className="grid min-w-0 grid-cols-2 gap-x-4 gap-y-3 border-t border-slate-100 pt-3 text-sm sm:grid-cols-4">
-                    <div className="min-w-0">
-                      <dt className="text-[11px] text-slate-500">{t("shareMarket.col.amount")}</dt>
-                      <dd className="mt-0.5 break-words text-slate-900">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</dd>
-                    </div>
-                    <div className="min-w-0">
-                      <dt className="text-[11px] text-slate-500">{t("shareMarket.col.parallel")}</dt>
-                      <dd className="mt-0.5 break-words text-slate-900">{seat.parallelLimit ?? t("common.unlimited")}</dd>
-                    </div>
-                    <div className="col-span-2 min-w-0">
-                      <dt className="text-[11px] text-slate-500">{t("shareMarket.col.tokens")}</dt>
-                      <dd className="mt-0.5 break-words text-slate-900">{formatTokenLimit(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}</dd>
-                    </div>
-                    <div className="col-span-2 min-w-0">
-                      <dt className="text-[11px] text-slate-500">{t("shareMarket.renter")}</dt>
-                      <dd className="mt-0.5 break-all text-slate-900">{subscription?.renterEmail || "-"}</dd>
-                    </div>
-                  </dl>
-                  {actions ? (
-                    <div className="border-t border-slate-100 pt-2">{actions}</div>
-                  ) : null}
-                </article>
-              );
-            })}
+            <p className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-slate-500">
+              <strong className="font-medium tabular-nums text-slate-800">
+                {formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}
+              </strong>
+              <span className="min-w-0 truncate">{seatQuotaLabel(seat, locale, t)}</span>
+            </p>
           </div>
+          {renderSeatActions(listing, seat)}
+        </div>
+        {attention ? renderSeatStatusDetails(seat, priceOnly ? "amber" : "rose") : null}
+      </article>
+    );
+  };
 
-          <div className="hidden overflow-x-auto rounded-md border border-slate-200 lg:block">
-            <table className="w-full min-w-[760px] border-collapse text-left text-sm">
-              <thead className="bg-slate-50 text-xs text-slate-500">
-                <tr>
-                  <th className="px-3 py-2 font-medium">{t("shareMarket.col.seat")}</th>
-                  <th className="px-3 py-2 font-medium">{t("shareMarket.col.amount")}</th>
-                  <th className="px-3 py-2 font-medium">{t("shareMarket.col.parallel")}</th>
-                  <th className="px-3 py-2 font-medium">{t("shareMarket.col.tokens")}</th>
-                  <th className="px-3 py-2 font-medium">{t("shareMarket.renter")}</th>
-                  <th className="px-3 py-2 font-medium">{t("shareMarket.col.status")}</th>
-                  <th className="px-3 py-2 text-right font-medium">{t("common.actions")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {listing.seats.map((seat) => {
-                  const subscription = seat.subscription;
-                  return (
-                    <tr key={seat.id} className="border-t border-slate-100 align-top">
-                      <td className="px-3 py-3 font-medium">#{seat.position}</td>
-                      <td className="px-3 py-3">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</td>
-                      <td className="px-3 py-3">{seat.parallelLimit ?? t("common.unlimited")}</td>
-                      <td className="max-w-[15rem] px-3 py-3">{formatTokenLimit(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}</td>
-                      <td className="max-w-[14rem] px-3 py-3"><span className="block truncate" title={subscription?.renterEmail}>{subscription?.renterEmail || "-"}</span></td>
-                      <td className="max-w-[20rem] px-3 py-3">
-                        <span>{seatStatusLabel(seat)}</span>
-                        {renderSeatStatusDetails(seat)}
-                      </td>
-                      <td className="px-3 py-2">
-                        {renderSeatActions(listing, seat)}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      ))}
-      {!listings.length && !loading ? (
-        <div className="grid min-h-48 place-items-center border-y border-dashed border-slate-200 text-center text-sm text-slate-500">
-          <div className="grid gap-3">
-            <span>{t("shareMarket.workspace.noListings")}</span>
-            <Button size="sm" variant="primary" onClick={() => setAddOpen(true)}><Plus className="h-4 w-4" />{t("shareMarket.addShare")}</Button>
+  const renderActiveListing = (listing: ShareMarketListing) => {
+    const liveSeats = listingLiveSeats(listing);
+    const idle = listingIdleCount({ seats: liveSeats });
+    const models = listingModelSummary(listing, t);
+    return (
+      <section
+        key={listing.id}
+        id={`share-market-listing-${listing.shareId}`}
+        tabIndex={-1}
+        className={cn(
+          "scroll-mt-20 outline-none",
+          focusedShareId === listing.shareId && "rounded-md ring-2 ring-primary/20",
+        )}
+      >
+        <div className="grid gap-2 px-3 py-2.5">
+          <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              {renderListingIdentity(listing, t("shareMarket.catalog.occupancy", { idle, total: liveSeats.length }))}
+              <p className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-slate-500">
+                <strong className="font-medium tabular-nums text-slate-800">{listingPriceLabel(listing, locale, t)}</strong>
+                <span>{listingQuotaLabel(listing, locale, t)}</span>
+                {models ? <span className="min-w-0 truncate">{models}</span> : null}
+              </p>
+            </div>
+            {renderListingActions(listing)}
           </div>
         </div>
-      ) : null}
+        {liveSeats.length ? (
+          <div className="divide-y divide-slate-100 border-t border-slate-100">
+            {liveSeats.map((seat) => renderSeatRow(listing, seat))}
+          </div>
+        ) : null}
+      </section>
+    );
+  };
 
-      <ShareMarketAddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void onChanged()} />
+  const renderClosedListing = (listing: ShareMarketListing, attention = false) => {
+    const remaining = listingClosedRentalSeats(listing);
+    const reopenable = reopenableListingSeats(listing).length;
+    return (
+      <section
+        key={listing.id}
+        id={`share-market-listing-${listing.shareId}`}
+        tabIndex={-1}
+        className={cn(
+          "scroll-mt-20 outline-none",
+          attention && "rounded-md border border-amber-200 bg-amber-50/40",
+          focusedShareId === listing.shareId && "rounded-md ring-2 ring-primary/20",
+        )}
+      >
+        <div className="grid gap-2 px-3 py-2.5">
+          <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              {renderListingIdentity(listing, t("shareMarket.closed"))}
+              <p className="mt-1 flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 text-xs text-slate-500">
+                {reopenable ? <span>{t("shareMarket.listings.reopenableSeats", { count: reopenable })}</span> : null}
+                {remaining.length ? <span>{t("shareMarket.listings.activeRentals", { count: remaining.length })}</span> : null}
+                {!reopenable && !remaining.length ? <span>{t("shareMarket.closedHint")}</span> : null}
+              </p>
+            </div>
+            {renderListingActions(listing)}
+          </div>
+          {attention && !listing.canReopen ? (
+            <p className="border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+              {t(reopenBlockedReasonKey(listing.reopenBlockedReason))}
+            </p>
+          ) : null}
+        </div>
+        {remaining.length ? (
+          <div className="divide-y divide-slate-100 border-t border-slate-100">
+            {remaining.map((seat) => renderSeatRow(listing, seat))}
+          </div>
+        ) : null}
+      </section>
+    );
+  };
+
+  const hasAttention = attentionSeats.length > 0 || attentionListings.length > 0;
+
+  return (
+    <div className="grid min-w-0 gap-5">
+      <div className={cn("flex flex-wrap items-center gap-3", showHeading ? "justify-between" : "justify-end")}>
+        {showHeading ? (
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900">{t("shareMarket.workspace.selling")}</h2>
+            <p className="mt-0.5 text-xs text-slate-500">{t("shareMarket.workspace.sellingHint")}</p>
+          </div>
+        ) : null}
+        <Button size="sm" variant="primary" onClick={() => setAddOpen(true)}>
+          <Plus className="h-4 w-4" />
+          {t("shareMarket.addShare")}
+        </Button>
+      </div>
+      {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
+
+      {loading && !listings.length ? (
+        <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-500">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          {t("shareMarket.loading")}
+        </div>
+      ) : (
+        <>
+          {hasAttention ? (
+            <section className="grid gap-2" aria-labelledby="share-listings-attention">
+              <h3 id="share-listings-attention" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                {t("shareMarket.rentals.attention")}
+                <span className="ml-1.5 tabular-nums text-slate-400">{attentionSeats.length + attentionListings.length}</span>
+              </h3>
+              <div className="grid gap-2">
+                {attentionSeats.map(({ listing, seat }) => renderSeatRow(listing, seat, true))}
+                {attentionListings.map((listing) => renderClosedListing(listing, true))}
+              </div>
+            </section>
+          ) : null}
+
+          {active.length || (!hasAttention && !closed.length) ? (
+            <section className="grid gap-2" aria-labelledby="share-listings-active">
+              <h3 id="share-listings-active" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                {t("shareMarket.listings.active")}
+                {active.length ? <span className="ml-1.5 tabular-nums text-slate-400">{active.length}</span> : null}
+              </h3>
+              {active.length ? (
+                <div className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white">
+                  {active.map(renderActiveListing)}
+                </div>
+              ) : (
+                <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-500">
+                  <span>{t("shareMarket.workspace.noListings")}</span>
+                  <Button size="sm" variant="primary" onClick={() => setAddOpen(true)}>
+                    <Plus className="h-4 w-4" />
+                    {t("shareMarket.addShare")}
+                  </Button>
+                </div>
+              )}
+            </section>
+          ) : null}
+
+          <section className="grid gap-2 border-t border-slate-200 pt-5" aria-labelledby="share-listings-closed">
+            <h3 id="share-listings-closed" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+              {t("shareMarket.listings.closed")}
+              {closed.length ? <span className="ml-1.5 tabular-nums text-slate-400">{closed.length}</span> : null}
+            </h3>
+            {closed.length ? (
+              <div className="divide-y divide-slate-100">
+                {closed.map((listing) => renderClosedListing(listing))}
+              </div>
+            ) : (
+              <p className="py-1 text-sm text-slate-400">{t("shareMarket.listings.closedEmpty")}</p>
+            )}
+          </section>
+        </>
+      )}
+
+      <ShareMarketAddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void onChanged()} onReopenListing={openReopenListing} />
+      <ReopenListingDialog listing={reopenListing} onOpenChange={(open) => !open && setReopenListing(null)} onSaved={() => void onChanged()} />
       <SeatDialog key={seatDialog ? `${seatDialog.listing.id}:${seatDialog.seat?.id || `copy:${seatDialog.template?.id || "new"}`}` : "closed"} listing={seatDialog?.listing || null} seat={seatDialog?.seat} template={seatDialog?.template} onOpenChange={(open) => !open && setSeatDialog(null)} onSaved={() => void onChanged()} />
       <PriceDialog subscription={priceDialog} onOpenChange={(open) => !open && setPriceDialog(null)} onSaved={() => void onChanged()} />
       <TerminationDialog target={terminationTarget} onOpenChange={(open) => !open && setTerminationTarget(null)} onSaved={() => void onChanged()} />

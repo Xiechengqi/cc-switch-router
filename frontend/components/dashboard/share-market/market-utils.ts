@@ -74,6 +74,11 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
     share_market_contract_settings_protected: "shareMarket.error.settingsProtected",
     share_market_fixed_term_required: "shareMarket.error.fixedTermRequired",
     share_market_termination_quote_required: "shareMarket.error.terminationQuoteRequired",
+    share_market_reopen_required: "shareMarket.error.reopenRequired",
+    share_market_other_active_listing: "shareMarket.error.otherActiveListing",
+    share_market_listing_not_closed: "shareMarket.error.listingNotClosed",
+    share_market_seat_not_reopenable: "shareMarket.error.seatNotReopenable",
+    share_market_offer_changed: "shareMarket.error.offerChanged",
   };
   const codeKey = reason.code ? coded[reason.code] : undefined;
   if (codeKey) return t(codeKey);
@@ -164,16 +169,21 @@ export function formatTokenLimit(
   return `${formatTokenMillions(seat.tokenLimit, locale)} · ${periodLabel(seat.tokenPeriod)}`;
 }
 
+export function capabilityModels(capability: Pick<ShareMarketAppCapability, "models">) {
+  return capability.models ?? [];
+}
+
 export function capabilityModelLabel(
   capability: ShareMarketAppCapability,
   passthroughLabel: string,
   unknownLabel: string,
 ) {
+  const models = capabilityModels(capability);
   if (capability.modelMode === "passthrough") return passthroughLabel;
   if (capability.modelMode === "fixed") {
-    return capability.upstreamModel || capability.models[0] || unknownLabel;
+    return capability.upstreamModel || models[0] || unknownLabel;
   }
-  return capability.models.join(" / ") || unknownLabel;
+  return models.join(" / ") || unknownLabel;
 }
 
 function capabilityDetailScore(capability: ShareMarketAppCapability) {
@@ -212,8 +222,8 @@ export function enabledMarketCapabilities(
 export function marketCapabilityRuntime(
   capability: ShareMarketAppCapability,
 ): ShareUpstreamProvider {
-  const upstreamModel =
-    capability.upstreamModel || capability.models[0] || "";
+  const models = capabilityModels(capability);
+  const upstreamModel = capability.upstreamModel || models[0] || "";
   return {
     app: capability.app,
     kind: capability.providerType,
@@ -235,7 +245,7 @@ export function marketCapabilityRuntime(
             tiers: [],
           }
         : undefined,
-    models: capability.models.map((actualModel) => ({ actualModel })),
+    models: models.map((actualModel) => ({ actualModel })),
     modelPolicy:
       capability.modelMode === "passthrough"
         ? { mode: "passthrough" }

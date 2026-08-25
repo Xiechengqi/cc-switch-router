@@ -3,23 +3,17 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Button, Chip } from "@heroui/react";
+import { Button } from "@heroui/react";
 import {
   ArrowUpRight,
-  ExternalLink,
   Loader2,
   RefreshCw,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
-import {
-  ShareMarketBuyerRentals,
-  ShareMarketSubscriptionCard,
-  sortShareMarketSubscriptions,
-} from "@/components/dashboard/share-market/buyer-rentals";
+import { ShareMarketBuyerRentals } from "@/components/dashboard/share-market/buyer-rentals";
 import { mergeShareMarketSubscriptionPage } from "@/components/dashboard/share-market/subscription-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -30,50 +24,68 @@ import {
   DASHBOARD_ACCOUNT_SHARE_PATH,
   shareMarketHref,
 } from "@/lib/dashboard-nav";
+import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import {
   isCoreShareApp,
+  listingIdleCount,
   shareMarketMutationError,
 } from "@/components/dashboard/share-market/market-utils";
+import {
+  listingAttentionSeats,
+  listingClosedRentalSeats,
+  listingLiveSeats,
+  partitionOwnedListings,
+} from "@/components/dashboard/share-market/owner-workspace-utils";
 
 type ShareMonitorTab = "user" | "provider";
-function isAnomalous(status: string) {
-  return [
-    "grant_pending",
-    "billing_suspend_pending",
-    "billing_suspended",
-    "billing_resume_pending",
-    "billing_control_failed",
-    "revoke_pending",
-    "revoke_failed",
-    "grant_failed",
-  ].includes(status);
+
+function ListingApps({ listing }: { listing: ShareMarketListing }) {
+  const apps = listing.supportedApps.filter(isCoreShareApp);
+  if (!apps.length) return null;
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1" title={apps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}>
+      {apps.map((app) => <ShareAppLogo key={app} app={app} size={16} />)}
+    </span>
+  );
 }
 
-function ListingSummaryCard({ listing }: { listing: ShareMarketListing }) {
+function AccountListingRow({ listing }: { listing: ShareMarketListing }) {
   const { t } = useLocaleText();
-  const available = listing.seats.filter((seat) => seat.status === "available").length;
-  const occupied = listing.seats.filter((seat) => ["occupied", "reserved", "revoking"].includes(seat.status)).length;
-  const attention = listing.seats.filter((seat) => seat.subscription && isAnomalous(seat.subscription.status)).length;
-  const openUrl = subdomainTunnelUrl(listing.subdomain);
+  const closed = listing.status === "closed";
+  const liveSeats = listingLiveSeats(listing);
+  const idle = listingIdleCount({ seats: liveSeats });
+  const remaining = listingClosedRentalSeats(listing).length;
+  const attention = listingAttentionSeats(listing).length;
+  const statusLabel = closed
+    ? t("shareMarket.closed")
+    : t("shareMarket.catalog.occupancy", { idle, total: liveSeats.length });
   return (
-    <section className="grid gap-3 rounded-md border border-border bg-card p-4 shadow-sm sm:p-5">
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        {listing.supportedApps.filter(isCoreShareApp).map((app) => <ShareAppLogo key={app} app={app} size={18} />)}
-        <strong className="truncate text-sm">{listing.shareName}</strong>
-        <Chip size="sm" variant="tertiary">{listing.status === "closed" ? t("shareMarket.closed") : t("account.share.listingActive")}</Chip>
-        <Chip size="sm" variant="tertiary">{listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</Chip>
+    <article className="flex min-w-0 flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+          <ListingApps listing={listing} />
+          <strong className="min-w-0 truncate text-sm text-slate-900">{listing.shareName}</strong>
+          <span className={cn("shrink-0 text-[11px] font-medium", listing.shareOnline ? "text-emerald-700" : "text-rose-700")}>
+            {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+          </span>
+          <span className="min-w-0 truncate text-[11px] text-slate-500">{statusLabel}</span>
+        </div>
+        <p className="mt-1 flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 text-xs text-slate-500">
+          {attention ? <span className="font-medium text-rose-700">{t("account.share.seatsAttention")} · {attention}</span> : null}
+          {closed && remaining ? <span>{t("shareMarket.listings.activeRentals", { count: remaining })}</span> : null}
+          {listing.subdomain ? <span className="min-w-0 truncate font-mono text-[11px] text-slate-400">{listing.subdomain}</span> : null}
+        </p>
       </div>
-      <dl className="grid grid-cols-3 gap-3 text-sm">
-        <div><dt className="text-xs text-muted-foreground">{t("account.share.seatsAvailable")}</dt><dd className="font-medium">{available}</dd></div>
-        <div><dt className="text-xs text-muted-foreground">{t("account.share.seatsOccupied")}</dt><dd className="font-medium">{occupied}</dd></div>
-        <div><dt className="text-xs text-muted-foreground">{t("account.share.seatsAttention")}</dt><dd className={attention ? "font-medium text-rose-600" : "font-medium"}>{attention}</dd></div>
-      </dl>
-      <div className="flex flex-wrap justify-end gap-2 border-t border-border/70 pt-3">
-        {openUrl ? <a href={openUrl} target="_blank" rel="noopener noreferrer" className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">{t("account.share.openShare")}<ExternalLink className="h-3.5 w-3.5" /></a> : null}
-        <Link href={shareMarketHref({ workspace: "selling", shareId: listing.shareId })} className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">{t("account.share.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link>
-      </div>
-    </section>
+      <Link
+        href={shareMarketHref({ workspace: "selling", shareId: listing.shareId })}
+        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-xs font-medium text-slate-700 hover:bg-slate-100 hover:text-slate-900"
+      >
+        {t("account.share.manageInMarket")}
+        <ArrowUpRight className="h-3.5 w-3.5" />
+      </Link>
+    </article>
   );
 }
 
@@ -210,12 +222,11 @@ export function AccountSharePage() {
     return () => window.clearInterval(timer);
   }, [authed, load, pausePolling]);
 
-  const providerSubscriptions = React.useMemo(
-    () => ownedListings
-      .flatMap((listing) => listing.seats.flatMap((seat) => seat.subscription ? [seat.subscription] : []))
-      .sort(sortShareMarketSubscriptions),
+  const { attentionListings, active, closed } = React.useMemo(
+    () => partitionOwnedListings(ownedListings),
     [ownedListings],
   );
+  const providerListings = [...attentionListings, ...active, ...closed];
 
   if (!authed) return <p className="py-6 text-sm text-muted-foreground">{t("shareMarket.loginRequired")}</p>;
   if (loading || (loadedActorKey !== actorKey && failedActorKey !== actorKey)) return <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div>;
@@ -246,14 +257,13 @@ export function AccountSharePage() {
           loadingMore={loadingMoreSubscriptions}
           onLoadMore={loadMoreSubscriptions}
         />
-      ) : ownedListings.length || providerSubscriptions.length ? (
-        <div className="grid gap-3">
-          {ownedListings.map((listing) => <ListingSummaryCard key={`${actorKey}:${listing.id}`} listing={listing} />)}
-          {providerSubscriptions.map((subscription) => (
-            <ShareMarketSubscriptionCard key={`${actorKey}:${subscription.id}`} subscription={subscription} perspective="provider" busy={false} />
+      ) : providerListings.length ? (
+        <div className="divide-y divide-slate-100 rounded-md border border-slate-200 bg-white">
+          {providerListings.map((listing) => (
+            <AccountListingRow key={`${actorKey}:${listing.id}`} listing={listing} />
           ))}
         </div>
-      ) : <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground"><span>{t("account.share.providerEmpty")}</span><Link href={shareMarketHref()} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">{t("account.share.openMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link></div>}
+      ) : <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground"><span>{t("account.share.providerEmpty")}</span><Link href={shareMarketHref({ workspace: "selling" })} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">{t("account.share.openMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link></div>}
     </div>
   );
 }
