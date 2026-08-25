@@ -12033,7 +12033,12 @@ impl AppStore {
             record_share_model_health_check_conn(
                 &tx,
                 &ShareModelHealthCheckEntry {
-                    request_id: format!("router-model-health:{share_id}:{slot_start}"),
+                    request_id: share_model_health_check_request_id(
+                        share_id,
+                        &result.app_type,
+                        &requested_model,
+                        result.checked_at,
+                    ),
                     share_id: share_id.to_string(),
                     subdomain: result.subdomain,
                     app_type: result.app_type,
@@ -18957,9 +18962,11 @@ fn record_runtime_model_health_snapshot_conn(
             summary.actual_model.clone()
         };
         let check = ShareModelHealthCheckEntry {
-            request_id: format!(
-                "cc-switch-health:{}:{}:{}:{}",
-                snapshot.share_id, summary.app_type, requested_model, checked_at
+            request_id: share_model_health_check_request_id(
+                &snapshot.share_id,
+                &summary.app_type,
+                &requested_model,
+                checked_at,
             ),
             share_id: snapshot.share_id.clone(),
             subdomain: subdomain.clone(),
@@ -19263,6 +19270,32 @@ fn record_share_model_probe_observation_tx(
         ));
     }
     Ok(())
+}
+
+fn share_model_health_check_request_id(
+    share_id: &str,
+    app_type: &str,
+    requested_model: &str,
+    checked_at: i64,
+) -> String {
+    format!("share-model-health:{share_id}:{app_type}:{requested_model}:{checked_at}")
+}
+
+fn recent_model_health_check_fingerprint(check: &ShareModelHealthCheckEntry) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        check.share_id, check.app_type, check.requested_model, check.source, check.checked_at
+    )
+}
+
+fn deduplicate_recent_share_model_health_checks(
+    checks: Vec<ShareModelHealthCheckEntry>,
+) -> Vec<ShareModelHealthCheckEntry> {
+    let mut seen = HashSet::<String>::new();
+    checks
+        .into_iter()
+        .filter(|check| seen.insert(recent_model_health_check_fingerprint(check)))
+        .collect()
 }
 
 fn record_share_model_health_check_conn(
@@ -20419,7 +20452,7 @@ fn list_recent_share_model_health_checks(
             row.map_err(|e| AppError::Internal(format!("read model health check failed: {e}")))?,
         );
     }
-    Ok(checks)
+    Ok(deduplicate_recent_share_model_health_checks(checks))
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -42492,6 +42525,48 @@ mod tests {
         assert_eq!(share.recent_model_health_checks.len(), 10);
         assert_eq!(share.recent_model_health_checks[0].checked_at, now);
         assert_eq!(share.recent_model_health_checks[9].checked_at, now - 9);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn recent_model_health_checks_hide_duplicate_cycle_rows() {
+        let (store, config) = setup_store("recent-model-health-duplicates").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+
+        let now = Utc::now().timestamp();
+        let source = "cc-switch-router-cycle:utc-1787621400";
+        let conn = store.conn.lock().await;
+        for request_id in [
+            "router-model-health:share-1:1787621400",
+            "cc-switch-health:share-1:codex:grok-4.6:1787621400",
+        ] {
+            conn.execute(
+                "INSERT INTO share_model_health_checks (
+                    request_id, share_id, subdomain, app_type, requested_model, actual_model,
+                    status, status_code, latency_ms, first_token_ms, error_message, checked_at, source
+                 ) VALUES (?1, 'share-1', 'share-sub', 'codex', 'grok-4.6', 'grok-4.6',
+                           'success', 200, 411, NULL, NULL, ?2, ?3)",
+                params![request_id, now, source],
+            )
+            .expect("insert duplicate model health check");
+        }
+        drop(conn);
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard snapshot");
+        let share = snapshot.shares.first().expect("share view");
+        assert_eq!(share.recent_model_health_checks.len(), 1);
+        assert_eq!(share.recent_model_health_checks[0].source, source);
+        assert_eq!(share.recent_model_health_checks[0].checked_at, now);
 
         let _ = std::fs::remove_file(&config.database.path);
     }

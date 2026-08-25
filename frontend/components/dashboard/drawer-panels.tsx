@@ -4,6 +4,7 @@ import { Eye, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -55,13 +56,18 @@ import {
   formatShareStatus,
   hasObservedShareUsage,
   HealthDots,
+  isApiProviderRuntime,
   isUnlimited,
   mergeStandaloneOAuthRuntime,
   modelHealthTitle,
   modelHealthTone,
   providerAccountIdentity,
   providerAccountLevel,
+  providerActualModelNames,
+  providerApiEndpoint,
   providerModelMap,
+  providerQuotaStatusLine,
+  providerStatusIdentity,
   requestBelongsToApp,
   requestModelRoute,
   resolveShareAppRuntime,
@@ -553,29 +559,6 @@ export function ClientLinkedSharesPanel({
   );
 }
 
-export function ShareAccess({ share, t }: { share?: ShareView; t: TFn }) {
-  if (!share) return <EmptyBlock>{t("dashboard.noShare")}</EmptyBlock>;
-  if (share.freeAccess)
-    return <EmptyBlock>{t("dashboard.publicFreeShare")}</EmptyBlock>;
-  const emails = Array.from(
-    new Set(
-      Object.values(share.userGrants || {})
-        .filter((grant) => grant.active !== false && grant.role === "shareto")
-        .map((grant) => grant.email),
-    ),
-  ).filter(Boolean);
-  if (!emails.length) {
-    return <EmptyBlock>{t("dashboard.freeAccessDisabled")}</EmptyBlock>;
-  }
-  return (
-    <div className="grid gap-2">
-      <div className="flex flex-wrap gap-1.5">
-        {emails.map((email) => <Chip key={email} size="sm" variant="soft">{email}</Chip>)}
-      </div>
-    </div>
-  );
-}
-
 const PROVIDER_APPS: Array<{ key: CoreShareApp; label: string }> = [
   { key: "claude", label: "Claude" },
   { key: "codex", label: "Codex" },
@@ -741,6 +724,68 @@ export function ProviderCard({
   );
 }
 
+function shareProviderStatusView({
+  share,
+  providers,
+  appRuntimes,
+  t,
+  locale,
+}: {
+  share?: ShareView;
+  providers: Partial<Record<CoreShareApp, ShareAppProvider>>;
+  appRuntimes: ShareAppRuntimes | undefined;
+  t: TFn;
+  locale: AppLocale;
+}) {
+  const entries = PROVIDER_APPS.flatMap(({ key: app }) => {
+    const provider = providers[app];
+    if (!provider) return [];
+    return [
+      {
+        app,
+        runtime: mergeStandaloneOAuthRuntime(
+          providerRuntime(provider),
+          appRuntimes,
+          provider,
+        ),
+      },
+    ];
+  });
+  const primary = entries[0];
+  if (!primary) return null;
+  const { runtime } = primary;
+  const quotaStatusLine = providerQuotaStatusLine(runtime, locale);
+  const accountLine = providerStatusIdentity(runtime);
+  const modelsLine =
+    entries
+      .map(
+        (entry) =>
+          `${SHARE_APP_LABELS[entry.app]}: ${providerActualModelNames(
+            entry.runtime,
+            t("dashboard.modelPolicyPassthrough"),
+          )}`,
+      )
+      .join(" · ") || "-";
+  const isApiProvider = isApiProviderRuntime(runtime);
+  const apiEndpoint = providerApiEndpoint(runtime);
+  const healthTone = share
+    ? modelHealthTone(share, primary.app)
+    : { className: "bg-slate-50 text-muted-foreground", label: "" };
+  return {
+    primaryLine: isApiProvider ? apiEndpoint : quotaStatusLine,
+    identityLine: isApiProvider ? "-" : accountLine,
+    modelsLine,
+    primaryTitle: isApiProvider
+      ? `${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`
+      : quotaStatusLine,
+    identityTitle: isApiProvider ? "-" : accountLine,
+    modelsTitle: modelsLine,
+    panelTitle: share ? modelHealthTitle(share, primary.app) : undefined,
+    primaryMonospace: isApiProvider,
+    toneClassName: healthTone.className,
+  };
+}
+
 export function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const { locale, t } = useLocaleText();
   const runtimes = share?.appRuntimes;
@@ -764,19 +809,20 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
       ) : (
         <div className="grid gap-2">
           {currentProviders.map((item) => {
-            const enabledApps = PROVIDER_APPS.map(({ key }) => key).filter(
-              (app): app is CoreShareApp => Boolean(item.providers[app]),
-            );
-            return (
-              <ProviderCard
+            const view = shareProviderStatusView({
+              share,
+              providers: item.providers,
+              appRuntimes: runtimes,
+              t,
+              locale,
+            });
+            return view ? (
+              <ShareProviderStatusPanel
                 key={item.key}
-                providers={item.providers}
-                appRuntimes={runtimes}
-                t={t}
-                locale={locale}
-                supportedApps={enabledApps}
+                view={view}
+                wrapPrimaryLine
               />
-            );
+            ) : null;
           })}
         </div>
       )}
@@ -2018,17 +2064,34 @@ export function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
   );
 }
 
+function uniqueShareModelHealthChecks(checks: ShareModelHealthCheck[]) {
+  const seen = new Set<string>();
+  return checks.filter((check) => {
+    const key = [
+      check.shareId,
+      check.appType,
+      check.requestedModel,
+      check.source,
+      String(check.checkedAt),
+    ].join("|");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export function ShareModelHealthChecks({
   checks,
 }: {
   checks: ShareModelHealthCheck[];
 }) {
   const { locale, t } = useLocaleText();
-  if (!checks.length)
+  const uniqueChecks = uniqueShareModelHealthChecks(checks);
+  if (!uniqueChecks.length)
     return <EmptyBlock>{t("dashboard.noModelHealthChecks")}</EmptyBlock>;
   return (
     <div className="grid gap-2">
-      {checks.slice(0, 10).map((check) => {
+      {uniqueChecks.slice(0, 10).map((check) => {
         const success = check.status === "success";
         const model = check.actualModel || check.requestedModel || "-";
         return (

@@ -30,7 +30,6 @@ import {
   clientTotalTokensLabel,
   clientTotalTokensUsed,
   ShareEditDialog,
-  ShareAccess,
   ShareModelHealthChecks,
   ShareProvidersPanel,
   shareApiParts,
@@ -1078,13 +1077,10 @@ export function ClientBoard({
                     {!["online", "available"].includes(shareOperationalSummary(selectedShare).state) ? (
                       <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
                     ) : null}
-                    <ShareModelHealthHeatmap shareId={selectedShare.shareId} />
-                    <DrawerSection label={t("shareMarket.title")}>
-                      <ShareAccess share={selectedShare} t={t} />
-                    </DrawerSection>
                     <DrawerSection label={t("dashboard.providers")}>
                       <ShareProvidersPanel share={selectedShare} />
                     </DrawerSection>
+                    <ShareModelHealthHeatmap shareId={selectedShare.shareId} />
                     <DrawerSection label={t("dashboard.modelHealthChecks")}>
                       <ShareModelHealthChecks checks={selectedShare.recentModelHealthChecks || []} />
                     </DrawerSection>
