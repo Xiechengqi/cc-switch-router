@@ -24868,7 +24868,28 @@ fn user_model_routing_share_capability(
         runtime.map(|value| value.kind.clone()),
         bound_provider.and_then(|provider| provider.kind.clone()),
     ]);
-    if provider_name.is_none() && provider_type.is_none() && kind.is_none() {
+    let api_url = first_nonempty_owned([
+        runtime.and_then(|value| value.api_url.clone()),
+        bound_provider.and_then(|provider| provider.api_url.clone()),
+    ]);
+    let subscription_level = first_nonempty_owned([
+        runtime.and_then(|value| value.subscription_level.clone()),
+        bound_provider.and_then(|provider| provider.subscription_level.clone()),
+        runtime.and_then(|value| value.quota.as_ref().and_then(|quota| quota.plan.clone())),
+        bound_provider.and_then(|provider| {
+            provider.quota.as_ref().and_then(|quota| quota.plan.clone())
+        }),
+    ]);
+    let quota = runtime
+        .and_then(|value| value.quota.clone())
+        .or_else(|| bound_provider.and_then(|provider| provider.quota.clone()));
+    if provider_name.is_none()
+        && provider_type.is_none()
+        && kind.is_none()
+        && api_url.is_none()
+        && subscription_level.is_none()
+        && quota.is_none()
+    {
         return None;
     }
     Some(UserModelRoutingShareCapability {
@@ -24876,6 +24897,9 @@ fn user_model_routing_share_capability(
         provider_name,
         provider_type,
         kind,
+        api_url,
+        subscription_level,
+        quota,
     })
 }
 
@@ -26745,7 +26769,7 @@ mod tests {
                 "UPDATE shares SET app_runtimes_json = ?2 WHERE share_id = ?1",
                 params![
                     "share-routing-a",
-                    r#"{"codex":{"kind":"codex_oauth","app":"codex","providerName":"OpenAI Official","providerType":"codex_oauth"}}"#,
+                    r#"{"codex":{"kind":"codex_oauth","app":"codex","providerName":"OpenAI Official","providerType":"codex_oauth","quota":{"status":"ok","plan":"Plus","tiers":[{"label":"weekly","utilization":0.55}]}}}"#,
                 ],
             )
             .expect("set routing share runtime identity");
@@ -26769,6 +26793,14 @@ mod tests {
             identified.app_capabilities[0].provider_name.as_deref(),
             Some("OpenAI Official")
         );
+        assert_eq!(
+            identified.app_capabilities[0]
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.plan.as_deref()),
+            Some("Plus")
+        );
+        assert_eq!(identified.app_capabilities[0].api_url, None);
 
         let first = store
             .replace_user_model_routing(

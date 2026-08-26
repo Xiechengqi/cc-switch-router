@@ -302,7 +302,7 @@ function shareSelectOptions(
   const eligible = shares.map((share) => ({
     value: share.shareId,
     label: share.subdomain || share.shareName,
-    content: <MarketShareIdentity source={share} />,
+    content: <MarketShareIdentity source={share} showStatusLine />,
   }));
   const options = includeUnset
     ? [{ value: includeUnset.value, label: includeUnset.label }, ...eligible]
@@ -620,7 +620,7 @@ export function ModelHubPanel({
                   ariaLabel={t("modelHub.passthrough")}
                   disabled={controller.busy}
                   className="w-full"
-                  triggerClassName="min-h-9 w-full"
+                  triggerClassName="min-h-11 w-full py-1.5"
                 />
                 {activeSlot?.passthrough ? (
                   <span>{t(activeSlot.exact.length ? "modelHub.passthroughHint.mixed" : "modelHub.passthroughHint.none")}</span>
@@ -659,7 +659,7 @@ export function ModelHubPanel({
                         ariaLabel={t("modelHub.targetShare")}
                         disabled={controller.busy || !options.length}
                         className="w-full"
-                        triggerClassName="min-h-9 w-full"
+                        triggerClassName="min-h-11 w-full py-1.5"
                       />
                       <button
                         type="button"

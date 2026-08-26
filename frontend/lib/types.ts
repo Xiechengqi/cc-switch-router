@@ -530,6 +530,9 @@ export type UserModelRoutingShareCapability = {
   providerName?: string;
   providerType?: string;
   kind?: string;
+  apiUrl?: string;
+  subscriptionLevel?: string;
+  quota?: ShareUpstreamProvider["quota"];
 };
 
 export type UserModelRoutingShare = {

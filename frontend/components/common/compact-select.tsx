@@ -51,7 +51,7 @@ export function CompactSelect({
       >
         <Select.Value className="min-w-0 flex-1 pr-2 text-left text-xs text-foreground">
           {selected?.content ? (
-            <span className="block min-w-0 truncate">{selected.content}</span>
+            <span className="block min-w-0">{selected.content}</span>
           ) : (
             <span className="grid min-w-0 gap-0.5">
               <span className="truncate font-medium">{selected?.label || value}</span>
@@ -75,7 +75,7 @@ export function CompactSelect({
               className={option.description && !option.content ? "py-2" : undefined}
             >
               {option.content ? (
-                <span className="block min-w-0 truncate">{option.content}</span>
+                <span className="block min-w-0">{option.content}</span>
               ) : (
                 <span className="grid min-w-0 gap-0.5">
                   <span className="truncate text-xs font-medium">{option.label}</span>

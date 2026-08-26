@@ -316,7 +316,7 @@ pub struct UserModelRouteView {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserModelRoutingShareView {
     pub share_id: String,
@@ -331,7 +331,7 @@ pub struct UserModelRoutingShareView {
     pub is_online: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserModelRoutingShareCapability {
     pub app: String,
@@ -341,6 +341,12 @@ pub struct UserModelRoutingShareCapability {
     pub provider_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<ShareUpstreamQuota>,
 }
 
 #[derive(Debug, Clone, Serialize)]

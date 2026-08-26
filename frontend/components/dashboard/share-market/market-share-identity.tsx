@@ -5,14 +5,25 @@ import {
   ShareProviderLogo,
 } from "@/components/dashboard/share-provider-logo";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { SHARE_APP_LABELS } from "@/lib/share-app";
+import { CORE_SHARE_APPS, SHARE_APP_LABELS } from "@/lib/share-app";
 import { isCoreShareApp } from "@/components/dashboard/share-market/market-utils";
+import {
+  isApiProviderRuntime,
+  providerApiEndpoint,
+  providerQuotaStatusLine,
+} from "@/components/dashboard/share-dashboard-utils";
+import { useLocaleText } from "@/components/i18n/locale-provider";
+import type { AppLocale } from "@/lib/i18n";
+import type { ShareUpstreamProvider } from "@/lib/types";
 
 type ShareIdentityProvider = {
   app: string;
   providerName?: string;
   providerType?: string;
   kind?: string;
+  apiUrl?: string;
+  subscriptionLevel?: string;
+  quota?: ShareUpstreamProvider["quota"];
 };
 
 type ShareIdentitySource = {
@@ -22,6 +33,32 @@ type ShareIdentitySource = {
   apps?: string[];
   appCapabilities?: ShareIdentityProvider[];
 };
+
+function capabilityRuntime(capability: ShareIdentityProvider): ShareUpstreamProvider {
+  return {
+    app: capability.app,
+    kind: capability.kind || capability.providerType,
+    providerType: capability.providerType || capability.kind,
+    providerName: capability.providerName,
+    apiUrl: capability.apiUrl,
+    subscriptionLevel: capability.subscriptionLevel,
+    quota: capability.quota,
+  };
+}
+
+function providerStatusPrimaryLine(source: ShareIdentitySource, locale: AppLocale) {
+  const enabledApps = source.supportedApps || source.apps || [];
+  const preferredApp = CORE_SHARE_APPS.find((app) => enabledApps.includes(app)) || enabledApps[0];
+  const capability =
+    (source.appCapabilities || []).find((item) => item.app === preferredApp)
+    || uniqueProviderCapabilities(source)[0];
+  if (!capability) return "";
+  const runtime = capabilityRuntime(capability);
+  const line = isApiProviderRuntime(runtime)
+    ? providerApiEndpoint(runtime)
+    : providerQuotaStatusLine(runtime, locale);
+  return line && line !== "-" ? line : "";
+}
 
 function uniqueProviderCapabilities(source: ShareIdentitySource) {
   const enabledApps = new Set(source.supportedApps || source.apps || []);
@@ -82,21 +119,32 @@ export function MarketShareApps({
 export function MarketShareIdentity({
   source,
   size = 16,
+  showStatusLine = false,
 }: {
   source: ShareIdentitySource;
   size?: number;
+  showStatusLine?: boolean;
 }) {
+  const { locale } = useLocaleText();
   const subdomain = source.subdomain?.trim() || source.shareName || "";
   const apps = source.supportedApps || source.apps;
+  const statusLine = showStatusLine ? providerStatusPrimaryLine(source, locale) : "";
   return (
-    <span className="inline-flex min-w-0 items-center gap-1.5">
-      <MarketProviderLogos source={source} size={size} />
-      {subdomain ? (
-        <strong className="min-w-0 truncate font-mono text-xs font-semibold text-slate-800" title={subdomain}>
-          {subdomain}
-        </strong>
+    <span className="grid min-w-0 gap-0.5">
+      <span className="inline-flex min-w-0 items-center gap-1.5">
+        <MarketProviderLogos source={source} size={size} />
+        {subdomain ? (
+          <strong className="min-w-0 truncate font-mono text-xs font-semibold text-slate-800" title={subdomain}>
+            {subdomain}
+          </strong>
+        ) : null}
+        <MarketShareApps apps={apps} size={Math.max(12, size - 2)} />
+      </span>
+      {statusLine ? (
+        <span className="min-w-0 truncate text-[11px] font-normal text-slate-400" title={statusLine}>
+          {statusLine}
+        </span>
       ) : null}
-      <MarketShareApps apps={apps} size={Math.max(12, size - 2)} />
     </span>
   );
 }
