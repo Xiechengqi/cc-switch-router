@@ -384,6 +384,60 @@ function shareGrantAllowsViewer(
   });
 }
 
+export function clientOwnedByViewer(
+  client: DashboardClient,
+  viewerEmailValue: string,
+) {
+  const viewerEmail = normalizeEmail(viewerEmailValue);
+  if (!viewerEmail) return false;
+  return (
+    normalizeEmail(
+      client.clientTunnel?.ownerEmail || client.installation.ownerEmail,
+    ) === viewerEmail
+  );
+}
+
+export function shareBelongsToViewer(
+  share: ShareView,
+  viewerEmailValue: string,
+  explicitlyRoutedShareIds: ReadonlySet<string> = new Set<string>(),
+  nowMs = Date.now(),
+) {
+  const viewerEmail = normalizeEmail(viewerEmailValue);
+  if (!viewerEmail) return false;
+  if (explicitlyRoutedShareIds.has(share.shareId)) return true;
+  return (
+    normalizeEmail(share.ownerEmail) === viewerEmail ||
+    shareGrantAllowsViewer(share, viewerEmail, nowMs)
+  );
+}
+
+export function listViewerShares(
+  shares: ShareView[],
+  clients: DashboardClient[],
+  viewerEmailValue: string,
+  explicitlyRoutedShareIds: ReadonlySet<string> = new Set<string>(),
+  nowMs = Date.now(),
+) {
+  const viewerEmail = normalizeEmail(viewerEmailValue);
+  if (!viewerEmail) return [];
+  const hostedShareIds = new Set(
+    clients
+      .filter((client) => clientOwnedByViewer(client, viewerEmail))
+      .flatMap((client) => client.shareIds || []),
+  );
+  const seen = new Set<string>();
+  return shares.filter((share) => {
+    if (seen.has(share.shareId)) return false;
+    const mine =
+      hostedShareIds.has(share.shareId) ||
+      shareBelongsToViewer(share, viewerEmail, explicitlyRoutedShareIds, nowMs);
+    if (!mine) return false;
+    seen.add(share.shareId);
+    return true;
+  });
+}
+
 export function clientBelongsToViewer(
   client: DashboardClient,
   shareById: ReadonlyMap<string, ShareView>,
@@ -391,19 +445,11 @@ export function clientBelongsToViewer(
   explicitlyRoutedShareIds: ReadonlySet<string> = new Set<string>(),
   nowMs = Date.now(),
 ) {
-  const viewerEmail = normalizeEmail(viewerEmailValue);
-  if (!viewerEmail) return false;
-  const ownerEmail = normalizeEmail(
-    client.clientTunnel?.ownerEmail || client.installation.ownerEmail,
-  );
-  if (ownerEmail === viewerEmail) return true;
+  if (clientOwnedByViewer(client, viewerEmailValue)) return true;
   return (client.shareIds || []).some((shareId) => {
-    if (explicitlyRoutedShareIds.has(shareId)) return true;
     const share = shareById.get(shareId);
-    if (!share) return false;
-    return (
-      normalizeEmail(share.ownerEmail) === viewerEmail ||
-      shareGrantAllowsViewer(share, viewerEmail, nowMs)
-    );
+    return share
+      ? shareBelongsToViewer(share, viewerEmailValue, explicitlyRoutedShareIds, nowMs)
+      : explicitlyRoutedShareIds.has(shareId);
   });
 }

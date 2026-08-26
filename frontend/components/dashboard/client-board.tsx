@@ -57,10 +57,10 @@ import {
 } from "@/components/dashboard/model-hub-panel";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
-  clientBelongsToViewer,
   clientListTabFromQuery,
   configuredEligibleRouteShareIds,
   consumeModelRouteDeepLink,
+  listViewerShares,
   MAX_USER_MODEL_ROUTES,
   modelRouteDeepLinkShareId,
   searchForClientListTab,
@@ -292,6 +292,8 @@ function ClientCollapseIndicator({ collapsed }: { collapsed: boolean }) {
 }
 
 function shareMatchesQuery(share: ShareView, query: string) {
+  const runtimes = Object.values(share.appRuntimes || {});
+  const providers = Object.values(share.appProviders || {}).flat();
   return includesQuery([
     share.shareName,
     share.shareId,
@@ -299,8 +301,19 @@ function shareMatchesQuery(share: ShareView, query: string) {
     share.ownerEmail,
     share.appType,
     share.providerId,
+    share.description,
     ...Object.keys(share.bindings || {}),
     ...Object.values(share.bindings || {}),
+    ...runtimes.flatMap((runtime) => [
+      runtime?.providerName,
+      runtime?.providerType,
+      runtime?.kind,
+    ]),
+    ...providers.flatMap((provider) => [
+      provider?.name,
+      provider?.providerType,
+      provider?.kind,
+    ]),
   ], query);
 }
 
@@ -692,19 +705,15 @@ export function ClientBoard({
     () => configuredEligibleRouteShareIds(modelRouting.profile),
     [modelRouting.profile],
   );
-  const mineClientIds = React.useMemo(() => {
-    if (!hasViewerIdentity) return new Set<string>();
-    return new Set(
-      sortedClients
-        .filter((client) => clientBelongsToViewer(
-          client,
-          shareById,
-          sessionEmail,
-          routedEligibleShareIds,
-        ))
-        .map((client) => client.installation.id),
-    );
-  }, [hasViewerIdentity, routedEligibleShareIds, sessionEmail, shareById, sortedClients]);
+  const mineShares = React.useMemo(() => {
+    if (!hasViewerIdentity) return [];
+    return sortShares(listViewerShares(
+      shares,
+      sortedClients,
+      sessionEmail,
+      routedEligibleShareIds,
+    ));
+  }, [hasViewerIdentity, routedEligibleShareIds, sessionEmail, shares, sortedClients]);
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
   const canViewClientLogs = React.useCallback(
     (client: DashboardClient) => Boolean(client.logCollectionEnabled),
@@ -744,6 +753,7 @@ export function ClientBoard({
   })));
 
   const clientRows = React.useMemo(() => {
+    if (statusFilter === "mine") return [];
     const normalizedQuery = query.trim().toLocaleLowerCase();
     const stableOrder = new Map(sortedClients.map((client, index) => [client.installation.id, index]));
     const rows = sortedClients.map((client) => {
@@ -773,8 +783,7 @@ export function ClientBoard({
       if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
       const region = row.client.installation.countryCode || row.client.installation.region || "";
       if (regionFilters.length > 0 && !regionFilters.includes(region)) return false;
-      if (statusFilter === "mine" && !mineClientIds.has(row.client.installation.id)) return false;
-      if (statusFilter !== "mine" && statusFilter !== "all" && row.state !== statusFilter) return false;
+      if (statusFilter !== "all" && row.state !== statusFilter) return false;
       if (issuesOnly && row.state === "online") return false;
       return true;
     });
@@ -804,19 +813,54 @@ export function ClientBoard({
       return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
     return rows;
-  }, [focus.target, issuesOnly, mineClientIds, query, regionFilters, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
+  }, [focus.target, issuesOnly, query, regionFilters, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
 
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
     return {
-      mine: mineClientIds.size,
+      mine: mineShares.length,
       online: states.filter((state) => state === "online").length,
       reconnecting: states.filter((state) => state === "reconnecting").length,
       degraded: states.filter((state) => state === "degraded").length,
       offline: states.filter((state) => state === "offline").length,
       issues: states.filter((state) => state !== "online").length,
     };
-  }, [mineClientIds, sharesForClient, sortedClients]);
+  }, [mineShares.length, sharesForClient, sortedClients]);
+
+  const visibleMineShares = React.useMemo(() => {
+    if (statusFilter !== "mine") return [];
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    const hostByShareId = new Map<string, DashboardClient>();
+    for (const client of sortedClients) {
+      for (const shareId of client.shareIds || []) {
+        if (!hostByShareId.has(shareId)) hostByShareId.set(shareId, client);
+      }
+    }
+    const filtered = mineShares.filter((share) => {
+      if (normalizedQuery && !shareMatchesQuery(share, normalizedQuery)) return false;
+      if (regionFilters.length > 0) {
+        const host = hostByShareId.get(share.shareId);
+        const region = host?.installation.countryCode || host?.installation.region || "";
+        if (!regionFilters.includes(region)) return false;
+      }
+      return true;
+    });
+    const order = new Map(mineShares.map((share, index) => [share.shareId, index]));
+    return [...filtered].sort((left, right) => {
+      if (sortOrder === "name") {
+        const leftName = left.subdomain || left.shareName || left.shareId;
+        const rightName = right.subdomain || right.shareName || right.shareId;
+        return leftName.localeCompare(rightName, undefined, { sensitivity: "base" });
+      }
+      if (sortOrder === "recent" || sortOrder === "running") {
+        return (Date.parse(right.createdAt) || 0) - (Date.parse(left.createdAt) || 0);
+      }
+      if (sortOrder === "tokens") {
+        return (right.tokensUsed || 0) - (left.tokensUsed || 0);
+      }
+      return (order.get(left.shareId) || 0) - (order.get(right.shareId) || 0);
+    });
+  }, [mineShares, query, regionFilters, sortOrder, sortedClients, statusFilter]);
 
   const visibleOrphanShares = React.useMemo(() => {
     if (statusFilter === "mine") return [];
@@ -1008,7 +1052,8 @@ export function ClientBoard({
     { value: "degraded", label: t("dashboard.degraded"), count: clientSummary.degraded },
     { value: "offline", label: t("common.offline"), count: clientSummary.offline },
   ];
-  const mineIsEmpty = statusFilter === "mine" && mineClientIds.size === 0;
+  const mineIsEmpty = statusFilter === "mine" && mineShares.length === 0;
+  const mineFilterEmpty = statusFilter === "mine" && !mineIsEmpty && visibleMineShares.length === 0;
 
   return (
     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
@@ -1019,15 +1064,17 @@ export function ClientBoard({
               <button key={value} type="button" aria-pressed={statusFilter === value} onClick={() => { selectClientListTab(value); if (value === "mine" || value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
-          <Button variant="outline" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
-            <Plus className="h-3.5 w-3.5" />
-            {t("createClient.newClient")}
-          </Button>
+          {statusFilter === "mine" ? null : (
+            <Button variant="outline" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
+              <Plus className="h-3.5 w-3.5" />
+              {t("createClient.newClient")}
+            </Button>
+          )}
         </div>
         <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto">
           <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 sm:min-w-64">
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t(statusFilter === "mine" ? "dashboard.searchShares" : "dashboard.searchClients")} aria-label={t(statusFilter === "mine" ? "dashboard.searchShares" : "dashboard.searchClients")} />
             {query ? (
               <button
                 type="button"
@@ -1121,13 +1168,46 @@ export function ClientBoard({
       ) : null}
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
-        {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} routingShareById={statusFilter === "mine" ? routingShareById : undefined} modelRoutesByShareId={statusFilter === "mine" ? modelRoutesByShareId : undefined} onAddModelRoute={statusFilter === "mine" ? addModelRouteForShare : undefined} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
+        {statusFilter === "mine" ? (
+          visibleMineShares.length ? (
+            <ShareScroller
+              shares={visibleMineShares}
+              totalCount={mineShares.length}
+              onOpenShare={openShare}
+              onEditShare={openEditShare}
+              onConnectShare={openConnectShare}
+              routingShareById={routingShareById}
+              modelRoutesByShareId={modelRoutesByShareId}
+              onAddModelRoute={addModelRouteForShare}
+            />
+          ) : (
+            <EmptyBlock>
+              <div className="grid justify-items-center gap-2">
+                <span>{mineIsEmpty ? t("dashboard.noMyShares") : t("dashboard.noFilterResults")}</span>
+                {mineFilterEmpty || mineIsEmpty ? (
+                  <button
+                    type="button"
+                    className="text-xs font-medium text-primary hover:underline"
+                    onClick={() => {
+                      setQuery("");
+                      if (mineIsEmpty) selectClientListTab("all");
+                      clearRegionFilters();
+                      setIssuesOnly(false);
+                    }}
+                  >
+                    {mineIsEmpty ? t("dashboard.showAll") : t("dashboard.clearFilters")}
+                  </button>
+                ) : null}
+              </div>
+            </EmptyBlock>
+          )
+        ) : clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
-              <span>{sortedClients.length ? mineIsEmpty ? t("dashboard.noMyClients") : t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
-              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); selectClientListTab("all"); clearRegionFilters(); setIssuesOnly(false); }}>{mineIsEmpty ? t("dashboard.showAll") : t("dashboard.clearFilters")}</button> : null}
+              <span>{sortedClients.length ? t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
+              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); selectClientListTab("all"); clearRegionFilters(); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
             </div>
           </EmptyBlock>
         )}

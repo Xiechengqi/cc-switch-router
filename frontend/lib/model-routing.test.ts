@@ -4,6 +4,8 @@ import {
   buildUnifiedModelCurl,
   canonicalModelRoutes,
   clientBelongsToViewer,
+  listViewerShares,
+  shareBelongsToViewer,
   defaultModelRoutingProtocol,
   defaultTestModelForProtocol,
   firstShareForProtocol,
@@ -242,6 +244,33 @@ test("mine membership accepts owners, live ShareTo grants, and explicitly routed
   assert.equal(
     clientBelongsToViewer(client, shareById, "free-user@example.com", new Set(["free"]), 3_000),
     true,
+  );
+
+  assert.equal(shareBelongsToViewer(shareById.get("owned")!, "owner@example.com"), true);
+  assert.equal(shareBelongsToViewer(shareById.get("shared")!, "viewer@example.com", new Set(), 1_000), true);
+  assert.equal(shareBelongsToViewer(shareById.get("shared")!, "viewer@example.com", new Set(), 3_000), false);
+  assert.equal(shareBelongsToViewer(shareById.get("free")!, "free-user@example.com"), false);
+  assert.equal(
+    shareBelongsToViewer(shareById.get("free")!, "free-user@example.com", new Set(["free"])),
+    true,
+  );
+
+  const hosted = {
+    installation: { id: "host-1", ownerEmail: "host@example.com" },
+    shareIds: ["sibling"],
+  } as DashboardClient;
+  const sibling = { ...baseShare, shareId: "sibling", ownerEmail: "other@example.com" };
+  const orphanOwned = { ...baseShare, shareId: "orphan", ownerEmail: "host@example.com" };
+  const listed = listViewerShares(
+    [shareById.get("owned")!, shareById.get("shared")!, shareById.get("free")!, sibling, orphanOwned],
+    [client, hosted],
+    "host@example.com",
+    new Set(["free"]),
+    1_000,
+  );
+  assert.deepEqual(
+    listed.map((share) => share.shareId),
+    ["owned", "shared", "free", "sibling", "orphan"],
   );
 });
 
