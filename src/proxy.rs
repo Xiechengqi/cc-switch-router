@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use bytes::Bytes;
@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::ServerState;
 use crate::config::{Config, ProxyStreamConfig};
+use crate::error::AppError;
 use crate::metrics::models::LlmRequestMetric;
 use crate::metrics::{MetricsPermit, MetricsRegistry};
 use crate::proxy_stream::{
@@ -2782,6 +2783,271 @@ fn unified_model_list_response(app_type: &str, models: Vec<String>) -> Response 
             })).collect::<Vec<_>>()
         }),
     )
+}
+
+const USER_MODEL_ROUTE_TEST_BODY_LIMIT: usize = 16 * 1024;
+const USER_MODEL_ROUTE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub struct UserModelRouteTestProbe {
+    pub app_type: String,
+    pub requested_model: String,
+    pub path: String,
+    pub body: String,
+}
+
+pub fn build_user_model_route_test_probe(
+    app_type: &str,
+    requested_model: &str,
+) -> Result<UserModelRouteTestProbe, AppError> {
+    let app_type = match app_type.trim().to_ascii_lowercase().as_str() {
+        "claude" | "codex" | "gemini" => app_type.trim().to_ascii_lowercase(),
+        _ => return Err(AppError::BadRequest("unsupported Share App".into())),
+    };
+    let requested_model = requested_model.trim();
+    if requested_model.is_empty() {
+        return Err(AppError::BadRequest("a non-empty model is required".into()));
+    }
+    if requested_model == "*" {
+        return Err(AppError::BadRequest(
+            "test model must be a callable model name, not *".into(),
+        ));
+    }
+    if requested_model.chars().count() > 200 || requested_model.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "model must be 200 characters or fewer and contain no control characters".into(),
+        ));
+    }
+    let requested_model = requested_model.to_string();
+    let (path, body) = match app_type.as_str() {
+        "claude" => (
+            "/v1/messages".to_string(),
+            serde_json::json!({
+                "model": requested_model,
+                "max_tokens": 32,
+                "messages": [{ "role": "user", "content": "Hello" }],
+            })
+            .to_string(),
+        ),
+        "gemini" => {
+            let encoded = percent_encoding::utf8_percent_encode(
+                &requested_model,
+                percent_encoding::NON_ALPHANUMERIC,
+            )
+            .to_string();
+            (
+                format!("/v1beta/models/{encoded}:generateContent"),
+                serde_json::json!({
+                    "contents": [{ "parts": [{ "text": "Hello" }] }],
+                })
+                .to_string(),
+            )
+        }
+        _ => (
+            "/v1/responses".to_string(),
+            serde_json::json!({
+                "model": requested_model,
+                "input": "Hello",
+            })
+            .to_string(),
+        ),
+    };
+    Ok(UserModelRouteTestProbe {
+        app_type,
+        requested_model,
+        path,
+        body,
+    })
+}
+
+fn shell_quote_for_curl(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+pub fn unified_model_test_curl(base_url: &str, probe: &UserModelRouteTestProbe) -> String {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), probe.path);
+    let auth = match probe.app_type.as_str() {
+        "claude" => "x-api-key: <YOUR_API_KEY>",
+        "gemini" => "x-goog-api-key: <YOUR_API_KEY>",
+        _ => "Authorization: Bearer <YOUR_API_KEY>",
+    };
+    let mut lines = vec![
+        "curl -sS \\".to_string(),
+        format!("  {} \\", shell_quote_for_curl(&url)),
+        format!("  -H {} \\", shell_quote_for_curl(auth)),
+    ];
+    if probe.app_type == "claude" {
+        lines.push(format!(
+            "  -H {} \\",
+            shell_quote_for_curl("anthropic-version: 2023-06-01")
+        ));
+    }
+    lines.push(format!(
+        "  -H {} \\",
+        shell_quote_for_curl("content-type: application/json")
+    ));
+    lines.push(format!("  -d {}", shell_quote_for_curl(&probe.body)));
+    lines.join("\n")
+}
+
+pub async fn execute_user_model_route_test(
+    state: ServerState,
+    peer: SocketAddr,
+    user_id: &str,
+    user_email: &str,
+    probe: &UserModelRouteTestProbe,
+) -> Result<UserModelRouteTestOutcome, AppError> {
+    let resolution = match state
+        .store
+        .resolve_user_model_route(user_id, user_email, &probe.app_type, &probe.requested_model)
+        .await?
+    {
+        Some(resolution) => resolution,
+        None => {
+            return Err(AppError::Coded {
+                status: StatusCode::NOT_FOUND,
+                code: "user_model_route_not_configured",
+                message: "no Share is configured for this app and model".into(),
+                details: serde_json::json!({
+                    "appType": probe.app_type,
+                    "requestedModel": probe.requested_model,
+                }),
+            });
+        }
+    };
+    let target_active = state
+        .proxy
+        .route_by_share_id(&resolution.target_share_id)
+        .await
+        .is_some_and(|route| route.subdomain() == resolution.subdomain);
+    if !target_active {
+        return Err(AppError::Coded {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "user_model_route_target_unavailable",
+            message: "configured target Share is offline or reconnecting".into(),
+            details: serde_json::json!({ "targetShareId": resolution.target_share_id }),
+        });
+    }
+
+    let api_token = state
+        .store
+        .get_default_api_token(user_email)
+        .await?
+        .api_token
+        .ok_or_else(|| {
+            AppError::Internal("api token plaintext not available; reset your token first".into())
+        })?;
+    let mut parts = axum::http::Request::new(Body::from(probe.body.clone()))
+        .into_parts()
+        .0;
+    parts.method = axum::http::Method::POST;
+    parts.uri = probe
+        .path
+        .parse()
+        .map_err(|_| AppError::Internal("invalid unified model test path".into()))?;
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let (auth_name, auth_value) = match probe.app_type.as_str() {
+        "claude" => ("x-api-key", api_token.clone()),
+        "gemini" => ("x-goog-api-key", api_token.clone()),
+        _ => ("authorization", format!("Bearer {api_token}")),
+    };
+    parts.headers.insert(
+        HeaderName::from_static(auth_name),
+        HeaderValue::from_str(&auth_value)
+            .map_err(|_| AppError::Internal("invalid unified model test auth header".into()))?,
+    );
+    if probe.app_type == "claude" {
+        parts.headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+    }
+
+    let started = Instant::now();
+    let forwarded = forward_to_selected_share(
+        state,
+        peer,
+        parts,
+        Body::from(probe.body.clone()),
+        &resolution,
+    );
+    let response = match tokio::time::timeout(USER_MODEL_ROUTE_TEST_TIMEOUT, forwarded).await {
+        Ok(response) => response,
+        Err(_) => {
+            return Err(AppError::Coded {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                code: "user_model_route_test_timeout",
+                message: "unified model test timed out".into(),
+                details: serde_json::json!({
+                    "appType": probe.app_type,
+                    "requestedModel": probe.requested_model,
+                    "targetShareId": resolution.target_share_id,
+                }),
+            });
+        }
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let status = response.status();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            Some([
+                name.as_str().to_string(),
+                value.to_str().ok()?.to_string(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let (raw, body_truncated) = match axum::body::to_bytes(
+        response.into_body(),
+        USER_MODEL_ROUTE_TEST_BODY_LIMIT + 1,
+    )
+    .await
+    {
+        Ok(raw) => {
+            let truncated = raw.len() > USER_MODEL_ROUTE_TEST_BODY_LIMIT;
+            (raw, truncated)
+        }
+        Err(_) => (Bytes::new(), true),
+    };
+    let preview_len = raw.len().min(USER_MODEL_ROUTE_TEST_BODY_LIMIT);
+    let body_text = String::from_utf8_lossy(&raw[..preview_len]).into_owned();
+    Ok(UserModelRouteTestOutcome {
+        success: status.is_success(),
+        target_share_id: resolution.target_share_id,
+        matched_wildcard: resolution.matched_wildcard,
+        status_code: status.as_u16(),
+        status_text: status.canonical_reason().unwrap_or("").to_string(),
+        headers,
+        body_text,
+        body_truncated,
+        duration_ms,
+        error: if status.is_success() {
+            None
+        } else {
+            Some(format!(
+                "upstream returned {status} {}",
+                status.canonical_reason().unwrap_or("")
+            ))
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct UserModelRouteTestOutcome {
+    pub success: bool,
+    pub target_share_id: String,
+    pub matched_wildcard: bool,
+    pub status_code: u16,
+    pub status_text: String,
+    pub headers: Vec<[String; 2]>,
+    pub body_text: String,
+    pub body_truncated: bool,
+    pub duration_ms: u64,
+    pub error: Option<String>,
 }
 
 fn unified_api_error_response(
@@ -9513,6 +9779,45 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
     fn direct_share_proxy_path_still_rejects_unknown_paths() {
         assert!(!is_allowed_direct_share_proxy_path("/health"));
         assert!(!is_allowed_direct_share_proxy_path("/settings"));
+    }
+
+    #[test]
+    fn unified_model_test_probe_rejects_wildcard_and_encodes_gemini_paths() {
+        assert!(build_user_model_route_test_probe("codex", "*").is_err());
+        assert!(build_user_model_route_test_probe("claude", " ").is_err());
+        assert!(build_user_model_route_test_probe("palm", "gemini-pro").is_err());
+
+        let gemini = build_user_model_route_test_probe(
+            "gemini",
+            "publishers/google/gemini:pro?mode#one",
+        )
+        .expect("gemini probe");
+        assert_eq!(
+            gemini.path,
+            "/v1beta/models/publishers%2Fgoogle%2Fgemini%3Apro%3Fmode%23one:generateContent"
+        );
+        assert!(gemini.body.contains("Hello"));
+
+        let curl = unified_model_test_curl("https://api.example.com/", &gemini);
+        assert!(curl.contains("https://api.example.com/v1beta/models/"));
+        assert!(curl.contains("x-goog-api-key: <YOUR_API_KEY>"));
+        assert!(!curl.contains("\"https://api.example.com/"));
+        assert!(curl.contains(" -d '"));
+    }
+
+    #[test]
+    fn unified_model_test_curl_shell_quotes_the_json_body() {
+        let probe = build_user_model_route_test_probe("codex", "owner's-model").expect("codex");
+        let curl = unified_model_test_curl("https://api.example.com", &probe);
+        assert!(curl.contains("/v1/responses"));
+        assert!(curl.contains("Authorization: Bearer <YOUR_API_KEY>"));
+        assert!(curl.contains("owner's-model") || curl.contains("owner'\"'\"'s-model"));
+        assert!(!curl.contains(r#"-d "{\"model\""#));
+
+        let claude = build_user_model_route_test_probe("claude", "claude-opus-4").expect("claude");
+        let claude_curl = unified_model_test_curl("https://api.example.com", &claude);
+        assert!(claude_curl.contains("anthropic-version: 2023-06-01"));
+        assert!(claude_curl.contains("x-api-key: <YOUR_API_KEY>"));
     }
 }
 

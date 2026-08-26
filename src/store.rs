@@ -6781,6 +6781,16 @@ impl AppStore {
         })
     }
 
+    pub async fn ensure_user_by_email(
+        &self,
+        current_user_email: &str,
+    ) -> Result<AuthUser, AppError> {
+        let email = normalize_email(current_user_email)?;
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        upsert_user_by_email(&conn, &email, now)
+    }
+
     pub async fn get_user_model_routing(
         &self,
         config: &Config,

@@ -18,12 +18,16 @@ import {
 import * as React from "react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { SegmentedControl } from "@/components/common/segmented-control";
+import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getUserApiToken,
   getUserModelRouting,
   replaceUserModelRouting,
   resetUserApiToken,
+  testUserModelRouting,
 } from "@/lib/api";
 import type {
   ModelRoutingApp,
@@ -31,10 +35,13 @@ import type {
   UserModelRouteInput,
   UserModelRoutingResponse,
   UserModelRoutingShare,
+  UserModelRoutingTestResponse,
 } from "@/lib/types";
 import {
   buildUnifiedModelCurl,
   canonicalModelRoutes,
+  defaultModelRoutingProtocol,
+  defaultTestModelForProtocol,
   firstShareForProtocol,
   groupModelRoutesByProtocol,
   isWildcardModel,
@@ -42,6 +49,7 @@ import {
   newDraftModelRoute,
   patchDraftModelRoute,
   preferredModelRoutingApp,
+  protocolHasAttention,
   protocolSlotMode,
   sharesForProtocol,
   validateModelRoutes,
@@ -86,27 +94,12 @@ export type ModelRoutingController = {
   load: () => Promise<void>;
   save: () => Promise<void>;
   resetToken: () => Promise<boolean>;
-  addRouteForShare: (shareId: string) => void;
+  addRouteForShare: (shareId: string) => ModelRoutingApp | undefined;
   addExactRoute: (appType: ModelRoutingApp, shareId?: string) => void;
   setPassthroughShare: (appType: ModelRoutingApp, shareId: string) => void;
   updateRoute: (clientId: string, patch: Partial<UserModelRouteInput>) => void;
   removeRoute: (clientId: string) => void;
 };
-
-function protocolHasAttention(
-  routes: DraftModelRoute[],
-  eligibleShares: UserModelRoutingShare[],
-  appType: ModelRoutingApp,
-) {
-  const eligibleIds = new Set(
-    sharesForProtocol(eligibleShares, appType).map((share) => share.shareId),
-  );
-  return routes.some((route) =>
-    route.appType === appType
-    && route.targetShareId
-    && !eligibleIds.has(route.targetShareId),
-  );
-}
 
 function toDraftRoutes(profile: UserModelRoutingResponse): DraftModelRoute[] {
   return profile.routes.map((route) => ({
@@ -188,7 +181,9 @@ export function useModelRoutingController(active: boolean): ModelRoutingControll
   const addRouteForShare = React.useCallback((shareId: string) => {
     const share = profile?.eligibleShares.find((candidate) => candidate.shareId === shareId);
     if (!share) return;
-    addExactRoute(preferredModelRoutingApp(share), shareId);
+    const appType = preferredModelRoutingApp(share);
+    addExactRoute(appType, shareId);
+    return appType;
   }, [addExactRoute, profile]);
 
   const setPassthroughShare = React.useCallback((appType: ModelRoutingApp, shareId: string) => {
@@ -302,19 +297,26 @@ function shareSelectOptions(
   shares: UserModelRoutingShare[],
   currentId: string,
   t: ReturnType<typeof useLocaleText>["t"],
-  includeUnset?: { value: string; label: string; description?: string },
+  includeUnset?: { value: string; label: string },
 ) {
   const eligible = shares.map((share) => ({
     value: share.shareId,
-    label: share.shareName || share.subdomain,
-    description: `${share.subdomain} · ${share.isOnline ? t("common.online") : t("common.offline")}`,
+    label: share.subdomain || share.shareName,
+    content: <MarketShareIdentity source={share} />,
   }));
-  const options = includeUnset ? [includeUnset, ...eligible] : eligible;
+  const options = includeUnset
+    ? [{ value: includeUnset.value, label: includeUnset.label }, ...eligible]
+    : eligible;
   if (currentId && !options.some((option) => option.value === currentId)) {
     options.splice(includeUnset ? 1 : 0, 0, {
       value: currentId,
       label: currentId,
-      description: t("modelHub.targetUnavailable"),
+      content: (
+        <span className="inline-flex min-w-0 items-center gap-1.5 text-amber-800">
+          <span className="min-w-0 truncate font-mono text-xs">{currentId}</span>
+          <span className="shrink-0 text-[11px]">{t("modelHub.targetUnavailable")}</span>
+        </span>
+      ),
     });
   }
   return options;
@@ -334,38 +336,88 @@ function protocolStatusLabel(
 export function ModelHubPanel({
   controller,
   forceExpanded = false,
+  focusProtocol = null,
 }: {
   controller: ModelRoutingController;
   forceExpanded?: boolean;
+  focusProtocol?: ModelRoutingProtocol | null;
 }) {
   const { t } = useLocaleText();
   const [copied, setCopied] = React.useState<"endpoint" | "token" | "curl" | "">("");
   const [resetConfirmOpen, setResetConfirmOpen] = React.useState(false);
   const [leaveConfirmOpen, setLeaveConfirmOpen] = React.useState(false);
   const [expanded, setExpanded] = React.useState(controller.dirty || forceExpanded);
+  const [activeProtocol, setActiveProtocol] = React.useState<ModelRoutingProtocol>("codex");
+  const [testModels, setTestModels] = React.useState<Record<ModelRoutingProtocol, string>>({
+    claude: "",
+    codex: "",
+    gemini: "",
+  });
+  const [testState, setTestState] = React.useState<"idle" | "running" | "done" | "error">("idle");
+  const [testResult, setTestResult] = React.useState<UserModelRoutingTestResponse | null>(null);
+  const [testError, setTestError] = React.useState("");
+  const protocolInitializedRef = React.useRef(false);
+  const lastFocusProtocolRef = React.useRef<ModelRoutingProtocol | null>(null);
   const profile = controller.profile;
   const slots = React.useMemo(
     () => groupModelRoutesByProtocol(controller.routes),
     [controller.routes],
   );
+  const savedSlots = React.useMemo(
+    () => (profile ? groupModelRoutesByProtocol(toDraftRoutes(profile)) : []),
+    [profile],
+  );
+  const activeSlot = slots.find((slot) => slot.appType === activeProtocol) || slots[1];
+  const savedSlot = savedSlots.find((slot) => slot.appType === activeProtocol);
   const maskedToken = controller.rawToken
     ? `${controller.rawToken.slice(0, 8)}${"*".repeat(16)}${controller.rawToken.slice(-4)}`
     : controller.token?.prefix
       ? `${controller.token.prefix}${"*".repeat(16)}`
       : "-";
-  const firstCompleteRoute =
-    controller.routes.find(
-      (route) => route.requestedModel.trim() && !isWildcardModel(route.requestedModel),
-    ) || controller.routes.find((route) => route.requestedModel.trim());
+  const testModel = testModels[activeProtocol] || "";
   const curl = buildUnifiedModelCurl(
     profile?.apiBaseUrl || "https://api.example.com",
     controller.rawToken,
-    firstCompleteRoute,
+    { appType: activeProtocol, requestedModel: testModel || WILDCARD_MODEL },
   );
 
   React.useEffect(() => {
     if (controller.dirty || forceExpanded) setExpanded(true);
   }, [controller.dirty, forceExpanded]);
+
+  React.useEffect(() => {
+    if (focusProtocol && lastFocusProtocolRef.current !== focusProtocol) {
+      setActiveProtocol(focusProtocol);
+      lastFocusProtocolRef.current = focusProtocol;
+      protocolInitializedRef.current = true;
+      return;
+    }
+    if (!profile || protocolInitializedRef.current) return;
+    setActiveProtocol(defaultModelRoutingProtocol(controller.routes, profile.eligibleShares));
+    protocolInitializedRef.current = true;
+  }, [controller.routes, focusProtocol, profile]);
+
+  React.useEffect(() => {
+    if (!profile) {
+      protocolInitializedRef.current = false;
+      return;
+    }
+    const saved = groupModelRoutesByProtocol(toDraftRoutes(profile));
+    const draft = groupModelRoutesByProtocol(controller.routes);
+    setTestModels((current) => {
+      const next = { ...current };
+      for (const slot of [...saved, ...draft]) {
+        if (!next[slot.appType]) next[slot.appType] = defaultTestModelForProtocol(slot);
+      }
+      return next;
+    });
+  }, [controller.routes, profile]);
+
+  React.useEffect(() => {
+    setTestState("idle");
+    setTestResult(null);
+    setTestError("");
+  }, [activeProtocol, profile?.revision]);
 
   const copy = React.useCallback(async (kind: "endpoint" | "token" | "curl", value: string) => {
     if (!value) return;
@@ -378,6 +430,27 @@ export function ModelHubPanel({
       toast.danger(t("common.copyFailed"));
     }
   }, [t]);
+
+  const runTest = React.useCallback(async () => {
+    if (testState === "running") return;
+    const model = testModel.trim();
+    if (controller.dirty || !savedSlot || protocolSlotMode(savedSlot) === "empty") return;
+    if (!model || isWildcardModel(model)) return;
+    setTestState("running");
+    setTestResult(null);
+    setTestError("");
+    try {
+      const response = await testUserModelRouting({
+        appType: activeProtocol,
+        requestedModel: model,
+      });
+      setTestResult(response);
+      setTestState(response.success ? "done" : "error");
+    } catch (err) {
+      setTestError(err instanceof Error ? err.message : String(err));
+      setTestState("error");
+    }
+  }, [activeProtocol, controller.dirty, savedSlot, testModel, testState]);
 
   if (controller.loading && !profile) {
     return (
@@ -393,6 +466,27 @@ export function ModelHubPanel({
     const attention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], slot.appType);
     return `${t(PROTOCOL_TITLE_KEYS[slot.appType])} ${attention ? t("modelHub.status.attention") : protocolStatusLabel(mode, slot.exact.length, t)}`;
   }).join(" · ");
+  const mode = activeSlot ? protocolSlotMode(activeSlot) : "empty";
+  const shares = sharesForProtocol(profile?.eligibleShares || [], activeProtocol);
+  const attention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], activeProtocol);
+  const passthroughOptions = shareSelectOptions(
+    shares,
+    activeSlot?.passthrough?.targetShareId || "",
+    t,
+    { value: PASSTHROUGH_UNSET, label: t("modelHub.passthroughUnset") },
+  );
+  const savedMode = savedSlot ? protocolSlotMode(savedSlot) : "empty";
+  const canTest = !controller.dirty && savedMode !== "empty" && !!testModel.trim() && !isWildcardModel(testModel);
+  const testDisabledReason = controller.dirty
+    ? t("modelHub.test.saveFirst")
+    : savedMode === "empty"
+      ? t("modelHub.test.empty")
+      : !testModel.trim() || isWildcardModel(testModel)
+        ? t("modelHub.test.needModel")
+        : null;
+  const targetShare = testResult?.targetShareId
+    ? (profile?.eligibleShares || []).find((share) => share.shareId === testResult.targetShareId)
+    : undefined;
 
   return (
     <section id="model-hub" className="grid min-w-0 gap-4 border-y border-border bg-white px-4 py-4 sm:px-5">
@@ -405,7 +499,6 @@ export function ModelHubPanel({
           <p className="mt-1 min-w-0 truncate text-xs text-muted-foreground" title={summary}>{summary}</p>
         </div>
         <div className="flex items-center gap-2">
-          <span className="font-mono text-[10px] text-muted-foreground">r{profile?.revision || 0}</span>
           <button
             type="button"
             className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-slate-100 hover:text-foreground disabled:opacity-40"
@@ -472,115 +565,238 @@ export function ModelHubPanel({
 
       {expanded ? (
         <div className="grid min-w-0 gap-3">
-          {slots.map((slot) => {
-            const mode = protocolSlotMode(slot);
-            const shares = sharesForProtocol(profile?.eligibleShares || [], slot.appType);
-            const attention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], slot.appType);
-            const passthroughOptions = shareSelectOptions(
-              shares,
-              slot.passthrough?.targetShareId || "",
-              t,
-              { value: PASSTHROUGH_UNSET, label: t("modelHub.passthroughUnset") },
-            );
-            return (
-              <section
-                key={slot.appType}
-                className={cn(
-                  "grid min-w-0 gap-3 rounded-lg border bg-slate-50/60 p-3",
-                  attention ? "border-amber-200" : "border-border",
-                )}
-              >
-                <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <h3 className="text-sm font-semibold text-foreground">{t(PROTOCOL_TITLE_KEYS[slot.appType])}</h3>
+          <SegmentedControl
+            value={activeProtocol}
+            onChange={setActiveProtocol}
+            ariaLabel={t("modelHub.protocolTabs")}
+            fullWidth
+            items={slots.map((slot) => {
+              const slotMode = protocolSlotMode(slot);
+              const slotAttention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], slot.appType);
+              return {
+                id: slot.appType,
+                label: (
+                  <span className="inline-flex min-w-0 items-center justify-center gap-1.5">
+                    <ShareAppLogo app={slot.appType} size={12} />
+                    <span className="truncate">{t(PROTOCOL_TITLE_KEYS[slot.appType])}</span>
                     <span className={cn(
-                      "rounded-md px-1.5 py-0.5 text-[11px] font-medium",
-                      attention ? "bg-amber-100 text-amber-800" : mode === "empty" ? "bg-slate-200 text-slate-600" : "bg-sky-100 text-sky-800",
+                      "hidden rounded px-1 py-px text-[10px] font-medium sm:inline",
+                      slotAttention ? "bg-amber-100 text-amber-800" : slotMode === "empty" ? "text-slate-400" : "text-sky-700",
                     )}>
-                      {attention ? t("modelHub.status.attention") : protocolStatusLabel(mode, slot.exact.length, t)}
+                      {slotAttention ? t("modelHub.status.attention") : protocolStatusLabel(slotMode, slot.exact.length, t)}
                     </span>
-                  </div>
-                </div>
-                {mode === "empty" ? (
-                  <p className="text-xs text-muted-foreground">{t("modelHub.emptyProtocol")}</p>
+                  </span>
+                ),
+                title: `${t(PROTOCOL_TITLE_KEYS[slot.appType])} · ${slotAttention ? t("modelHub.status.attention") : protocolStatusLabel(slotMode, slot.exact.length, t)}`,
+                className: slotAttention ? "text-amber-700" : undefined,
+              };
+            })}
+          />
+
+          <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1.15fr)_minmax(280px,0.85fr)]">
+            <section className={cn(
+              "grid min-w-0 content-start gap-3 rounded-lg border bg-slate-50/60 p-3",
+              attention ? "border-amber-200" : "border-border",
+            )}>
+              <div className="flex min-w-0 items-center gap-2">
+                <ShareAppLogo app={activeProtocol} size={14} />
+                <h3 className="text-sm font-semibold text-foreground">{t("modelHub.configTitle")}</h3>
+                <span className={cn(
+                  "rounded-md px-1.5 py-0.5 text-[11px] font-medium",
+                  attention ? "bg-amber-100 text-amber-800" : mode === "empty" ? "bg-slate-200 text-slate-600" : "bg-sky-100 text-sky-800",
+                )}>
+                  {attention ? t("modelHub.status.attention") : protocolStatusLabel(mode, activeSlot?.exact.length || 0, t)}
+                </span>
+              </div>
+              {mode === "empty" ? (
+                <p className="text-xs text-muted-foreground">{t("modelHub.emptyProtocol")}</p>
+              ) : null}
+              <label className="grid min-w-0 gap-1.5 text-xs text-muted-foreground">
+                {t("modelHub.passthrough")}
+                <CompactSelect
+                  value={activeSlot?.passthrough?.targetShareId || PASSTHROUGH_UNSET}
+                  options={passthroughOptions}
+                  onChange={(value) => controller.setPassthroughShare(activeProtocol, value === PASSTHROUGH_UNSET ? "" : value)}
+                  ariaLabel={t("modelHub.passthrough")}
+                  disabled={controller.busy}
+                  className="w-full"
+                  triggerClassName="min-h-9 w-full"
+                />
+                {activeSlot?.passthrough ? (
+                  <span>{t(activeSlot.exact.length ? "modelHub.passthroughHint.mixed" : "modelHub.passthroughHint.none")}</span>
                 ) : null}
-                <label className="grid min-w-0 gap-1.5 text-xs text-muted-foreground">
-                  {t("modelHub.passthrough")}
-                  <CompactSelect
-                    value={slot.passthrough?.targetShareId || PASSTHROUGH_UNSET}
-                    options={passthroughOptions}
-                    onChange={(value) => controller.setPassthroughShare(slot.appType, value === PASSTHROUGH_UNSET ? "" : value)}
-                    ariaLabel={t("modelHub.passthrough")}
-                    disabled={controller.busy}
-                    className="w-full max-w-md"
-                  />
-                  {slot.passthrough ? (
-                    <span>{t(slot.exact.length ? "modelHub.passthroughHint.mixed" : "modelHub.passthroughHint.none")}</span>
-                  ) : null}
-                </label>
-                <div className="grid min-w-0 gap-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-medium text-slate-600">{t("modelHub.exactModels")}</span>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      isDisabled={controller.busy || controller.routes.length >= MAX_USER_MODEL_ROUTES}
-                      onClick={() => controller.addExactRoute(slot.appType)}
-                    >
-                      <Plus className="h-3.5 w-3.5" />
-                      {t("modelHub.addRoute")}
-                    </Button>
-                  </div>
-                  {slot.exact.length ? slot.exact.map((route) => {
-                    const options = shareSelectOptions(shares, route.targetShareId, t);
-                    return (
-                      <div key={route.clientId} className="grid min-w-0 items-center gap-2 sm:grid-cols-[minmax(160px,1fr)_minmax(200px,1.3fr)_32px]">
-                        <input
-                          value={route.requestedModel}
-                          maxLength={200}
-                          disabled={controller.busy}
-                          onChange={(event) => controller.updateRoute(route.clientId, { requestedModel: event.target.value })}
-                          className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10"
-                          aria-label={t("modelHub.model")}
-                          placeholder={t("modelHub.modelPlaceholder")}
-                        />
-                        <CompactSelect
-                          value={route.targetShareId}
-                          options={options}
-                          onChange={(value) => controller.updateRoute(route.clientId, { targetShareId: value })}
-                          ariaLabel={t("modelHub.targetShare")}
-                          disabled={controller.busy || !options.length}
-                          className="w-full"
-                        />
-                        <button
-                          type="button"
-                          disabled={controller.busy}
-                          className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-rose-50 hover:text-rose-700 disabled:opacity-40"
-                          title={t("modelHub.removeRoute")}
-                          aria-label={t("modelHub.removeRoute")}
-                          onClick={() => controller.removeRoute(route.clientId)}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                      </div>
-                    );
-                  }) : (
-                    <p className="text-xs text-muted-foreground">{t("modelHub.exactEmpty")}</p>
-                  )}
+              </label>
+              <div className="grid min-w-0 gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-600">{t("modelHub.exactModels")}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    isDisabled={controller.busy || controller.routes.length >= MAX_USER_MODEL_ROUTES}
+                    onClick={() => controller.addExactRoute(activeProtocol)}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    {t("modelHub.addRoute")}
+                  </Button>
                 </div>
-                <p className="text-[11px] leading-5 text-slate-500">{t(LIST_MODE_KEYS[mode])}</p>
-              </section>
-            );
-          })}
-          <div className="grid min-w-0 gap-2">
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-[11px] font-medium text-muted-foreground">curl</span>
-              <button type="button" className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground hover:bg-slate-100 hover:text-foreground" onClick={() => void copy("curl", curl)}>
-                <Copy className="h-3.5 w-3.5" />
-                {copied === "curl" ? t("account.apiKeys.copied") : t("common.copy")}
-              </button>
-            </div>
-            <pre className="max-w-full overflow-x-auto rounded-md border border-border bg-slate-950 px-3 py-3 font-mono text-[11px] leading-5 text-slate-100">{curl}</pre>
+                {activeSlot?.exact.length ? activeSlot.exact.map((route) => {
+                  const options = shareSelectOptions(shares, route.targetShareId, t);
+                  return (
+                    <div key={route.clientId} className="grid min-w-0 items-center gap-2 sm:grid-cols-[minmax(140px,1fr)_minmax(160px,1.3fr)_32px]">
+                      <input
+                        value={route.requestedModel}
+                        maxLength={200}
+                        disabled={controller.busy}
+                        onChange={(event) => controller.updateRoute(route.clientId, { requestedModel: event.target.value })}
+                        className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10"
+                        aria-label={t("modelHub.model")}
+                        placeholder={t("modelHub.modelPlaceholder")}
+                      />
+                      <CompactSelect
+                        value={route.targetShareId}
+                        options={options}
+                        onChange={(value) => controller.updateRoute(route.clientId, { targetShareId: value })}
+                        ariaLabel={t("modelHub.targetShare")}
+                        disabled={controller.busy || !options.length}
+                        className="w-full"
+                        triggerClassName="min-h-9 w-full"
+                      />
+                      <button
+                        type="button"
+                        disabled={controller.busy}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-rose-50 hover:text-rose-700 disabled:opacity-40"
+                        title={t("modelHub.removeRoute")}
+                        aria-label={t("modelHub.removeRoute")}
+                        onClick={() => controller.removeRoute(route.clientId)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  );
+                }) : (
+                  <p className="text-xs text-muted-foreground">{t("modelHub.exactEmpty")}</p>
+                )}
+              </div>
+              <p className="text-[11px] leading-5 text-slate-500">{t(LIST_MODE_KEYS[mode])}</p>
+            </section>
+
+            <section className="grid min-w-0 content-start gap-3 rounded-lg border border-border bg-white p-3">
+              <div className="flex min-w-0 items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-foreground">{t("modelHub.test.title")}</h3>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  isDisabled={!canTest || testState === "running"}
+                  onClick={() => void runTest()}
+                >
+                  {testState === "running" ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      {t("modelHub.test.running")}
+                    </>
+                  ) : t("modelHub.test.run")}
+                </Button>
+              </div>
+              {testDisabledReason ? (
+                <p className="text-xs text-amber-800">{testDisabledReason}</p>
+              ) : savedMode === "passthrough" || savedMode === "mixed" ? (
+                <p className="text-xs text-muted-foreground">{t("modelHub.test.wildcardHint")}</p>
+              ) : null}
+              <label className="grid min-w-0 gap-1.5 text-xs text-muted-foreground">
+                {t("modelHub.test.model")}
+                <input
+                  value={testModel}
+                  maxLength={200}
+                  disabled={savedMode === "empty"}
+                  onChange={(event) => setTestModels((current) => ({
+                    ...current,
+                    [activeProtocol]: event.target.value,
+                  }))}
+                  className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10 disabled:bg-slate-50"
+                  placeholder={t("modelHub.modelPlaceholder")}
+                />
+              </label>
+              <div className="grid min-w-0 gap-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-muted-foreground">{t("modelHub.test.curl")}</span>
+                  <button type="button" className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground hover:bg-slate-100 hover:text-foreground" onClick={() => void copy("curl", curl)}>
+                    <Copy className="h-3.5 w-3.5" />
+                    {copied === "curl" ? t("account.apiKeys.copied") : t("common.copy")}
+                  </button>
+                </div>
+                <pre className="max-h-36 max-w-full overflow-auto rounded-md border border-border bg-slate-950 px-3 py-2 font-mono text-[11px] leading-5 text-slate-100">{curl}</pre>
+              </div>
+              {testState === "error" && testError ? (
+                <p className="text-xs text-rose-700">{t("modelHub.test.networkError", { message: testError })}</p>
+              ) : null}
+              {testResult ? (
+                <div className="grid min-w-0 gap-2">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                    <span className={cn(
+                      "font-semibold",
+                      testResult.success ? "text-emerald-700" : "text-rose-700",
+                    )}>
+                      {testResult.response
+                        ? `${testResult.response.statusCode} ${testResult.response.statusText}`
+                        : testResult.error || t("modelHub.test.needRoute")}
+                    </span>
+                    <span className="text-slate-400">·</span>
+                    <span className="text-slate-500">{t("modelHub.test.durationMs", { ms: String(testResult.durationMs) })}</span>
+                    {testResult.targetShareId ? (
+                      <>
+                        <span className="text-slate-400">·</span>
+                        <span className="text-slate-600">
+                          {t("modelHub.test.target")}: {targetShare?.subdomain || testResult.targetShareId}
+                        </span>
+                      </>
+                    ) : null}
+                    {testResult.response ? (
+                      <>
+                        <span className="text-slate-400">·</span>
+                        <span className="text-slate-600">
+                          {testResult.matchedWildcard
+                            ? t("modelHub.test.matchedPassthrough")
+                            : t("modelHub.test.matchedExact")}
+                        </span>
+                      </>
+                    ) : null}
+                  </div>
+                  {testResult.error && testResult.response ? (
+                    <p className="text-xs text-rose-700">{testResult.error}</p>
+                  ) : null}
+                  {testResult.response ? (
+                    <details className="group min-w-0">
+                      <summary className="flex cursor-pointer list-none items-center gap-2 py-1 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
+                        <ChevronDown className="h-3.5 w-3.5 shrink-0 -rotate-90 text-slate-400 transition-transform group-open:rotate-0" />
+                        {t("modelHub.test.response")}
+                      </summary>
+                      <div className="grid gap-2 py-1.5">
+                        <div className="grid gap-0.5">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{t("modelHub.test.headers")}</span>
+                          <div className="max-h-24 overflow-y-auto font-mono text-[11px] text-slate-700">
+                            {testResult.response.headers.map(([key, value], index) => (
+                              <div key={`${key}:${index}`} className="flex gap-2 leading-relaxed">
+                                <span className="shrink-0 text-slate-400">{key}:</span>
+                                <span className="min-w-0 break-all">{value}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="grid gap-0.5">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{t("modelHub.test.body")}</span>
+                          <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed text-slate-800">
+                            {testResult.response.bodyText || "(empty)"}
+                          </pre>
+                          {testResult.response.bodyTruncated ? (
+                            <span className="text-[10px] text-slate-400">{t("modelHub.test.bodyTruncated")}</span>
+                          ) : null}
+                        </div>
+                      </div>
+                    </details>
+                  ) : null}
+                </div>
+              ) : null}
+            </section>
           </div>
         </div>
       ) : null}

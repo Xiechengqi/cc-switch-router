@@ -19,6 +19,8 @@ import type {
   UserApiTokenResponse,
   UserApiTokenResetResponse,
   UserModelRoutingResponse,
+  UserModelRoutingTestRequest,
+  UserModelRoutingTestResponse,
   ReplaceUserModelRoutingRequest,
   NotificationSettings,
   TelegramBindLink,
@@ -387,6 +389,16 @@ export async function replaceUserModelRouting(input: ReplaceUserModelRoutingRequ
   return parseJson<UserModelRoutingResponse>(
     await authFetch("/v1/me/model-routing", {
       method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function testUserModelRouting(input: UserModelRoutingTestRequest) {
+  return parseJson<UserModelRoutingTestResponse>(
+    await authFetch("/v1/me/model-routing/test", {
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
     }),

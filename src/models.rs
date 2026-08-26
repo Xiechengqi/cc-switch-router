@@ -348,6 +348,42 @@ pub struct ReplaceUserModelRoutingRequest {
     pub routes: Vec<UserModelRouteInput>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserModelRoutingTestRequest {
+    pub app_type: String,
+    pub requested_model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserModelRoutingTestResponse {
+    pub success: bool,
+    pub app_type: String,
+    pub requested_model: String,
+    pub curl: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_share_id: Option<String>,
+    pub matched_wildcard: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<UserModelRoutingTestHttp>,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserModelRoutingTestHttp {
+    pub status_code: u16,
+    pub status_text: String,
+    pub headers: Vec<[String; 2]>,
+    pub body_text: String,
+    pub body_truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareApiAuthUser {

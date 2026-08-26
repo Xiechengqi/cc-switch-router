@@ -4,8 +4,11 @@ import {
   buildUnifiedModelCurl,
   canonicalModelRoutes,
   clientBelongsToViewer,
+  defaultModelRoutingProtocol,
+  defaultTestModelForProtocol,
   firstShareForProtocol,
   groupModelRoutesByProtocol,
+  protocolHasAttention,
   hasWildcardForApp,
   isWildcardModel,
   isPassthroughOnlyApp,
@@ -52,6 +55,12 @@ const shares: UserModelRoutingShare[] = [
 ];
 
 test("unified curl examples shell-quote values and encode Gemini model paths", () => {
+  const claude = buildUnifiedModelCurl("https://api.example.com", "key", {
+    appType: "claude",
+    requestedModel: "claude-opus-4",
+  });
+  assert.match(claude, /anthropic-version: 2023-06-01/);
+
   const codex = buildUnifiedModelCurl(
     "https://api.example.com/",
     "key-with-'quote",
@@ -366,6 +375,54 @@ test("protocol slots keep one passthrough and many exact models without emitting
     saved.map((route) => `${route.appType}:${route.requestedModel}`),
     ["claude:opus", "codex:*", "codex:gpt-5.5"],
   );
+});
+
+test("the first protocol tab prefers attention, then a configured protocol, then OpenAI", () => {
+  const mixed: UserModelRoutingShare[] = [
+    shares[0],
+    shares[1],
+    {
+      shareId: "share-gemini",
+      shareName: "Gemini",
+      subdomain: "gemini-share",
+      directApiUrl: "https://gemini-share.example.com",
+      access: "owner",
+      freeAccess: false,
+      apps: ["gemini"],
+      isOnline: true,
+    },
+  ];
+  assert.equal(defaultModelRoutingProtocol([], mixed), "codex");
+  assert.equal(
+    defaultModelRoutingProtocol(
+      [{ appType: "gemini", requestedModel: "gemini-pro", targetShareId: "share-gemini" }],
+      mixed,
+    ),
+    "gemini",
+  );
+  assert.equal(
+    defaultModelRoutingProtocol(
+      [
+        { appType: "claude", requestedModel: "opus", targetShareId: "share-claude" },
+        { appType: "codex", requestedModel: "gpt-5.6", targetShareId: "missing" },
+      ],
+      mixed,
+    ),
+    "codex",
+  );
+  assert.equal(
+    protocolHasAttention(
+      [{ appType: "codex", requestedModel: "gpt-5.6", targetShareId: "missing" }],
+      mixed,
+      "codex",
+    ),
+    true,
+  );
+  const slots = groupModelRoutesByProtocol([
+    { clientId: "1", appType: "codex", requestedModel: "gpt-5.6", targetShareId: "share-codex" },
+    { clientId: "2", appType: "codex", requestedModel: "*", targetShareId: "share-codex" },
+  ]);
+  assert.equal(defaultTestModelForProtocol(slots[1]), "gpt-5.6");
 });
 
 test("protocol share pickers stay inside the enabled app and prefer the first eligible Share", () => {

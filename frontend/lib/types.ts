@@ -550,6 +550,32 @@ export type ReplaceUserModelRoutingRequest = {
   routes: UserModelRouteInput[];
 };
 
+export type UserModelRoutingTestRequest = {
+  appType: ModelRoutingApp;
+  requestedModel: string;
+};
+
+export type UserModelRoutingTestHttp = {
+  statusCode: number;
+  statusText: string;
+  headers: [string, string][];
+  bodyText: string;
+  bodyTruncated: boolean;
+};
+
+export type UserModelRoutingTestResponse = {
+  success: boolean;
+  appType: ModelRoutingApp;
+  requestedModel: string;
+  curl: string;
+  targetShareId?: string;
+  matchedWildcard: boolean;
+  response?: UserModelRoutingTestHttp;
+  durationMs: number;
+  error?: string;
+  code?: string;
+};
+
 export type NotificationChannelSettings = {
   channel: string;
   enabled: boolean;

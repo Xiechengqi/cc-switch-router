@@ -13,11 +13,12 @@ type ShareIdentitySource = {
   subdomain?: string;
   shareName?: string;
   supportedApps?: string[];
+  apps?: string[];
   appCapabilities?: ShareMarketAppCapability[];
 };
 
 function uniqueProviderCapabilities(source: ShareIdentitySource) {
-  const enabledApps = new Set(source.supportedApps || []);
+  const enabledApps = new Set(source.supportedApps || source.apps || []);
   const capabilities = (source.appCapabilities || []).filter(
     (item) => isCoreShareApp(item.app) && (!enabledApps.size || enabledApps.has(item.app)),
   );
@@ -79,6 +80,7 @@ export function MarketShareIdentity({
   size?: number;
 }) {
   const subdomain = source.subdomain?.trim() || source.shareName || "";
+  const apps = source.supportedApps || source.apps;
   return (
     <span className="inline-flex min-w-0 items-center gap-1.5">
       <MarketProviderLogos source={source} size={size} />
@@ -87,7 +89,7 @@ export function MarketShareIdentity({
           {subdomain}
         </strong>
       ) : null}
-      <MarketShareApps apps={source.supportedApps} size={Math.max(12, size - 2)} />
+      <MarketShareApps apps={apps} size={Math.max(12, size - 2)} />
     </span>
   );
 }

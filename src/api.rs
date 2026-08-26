@@ -70,8 +70,9 @@ use crate::models::{
     TunnelStateRequest, TunnelStateResponse, UpdateNotificationSettingsRequest,
     UpdateUsageCardSettingsRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
     UpgradeInstallationStatusResponse, UsageCardSettingsResponse, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserModelRoutingResponse, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    UserApiTokenResponse, UserModelRoutingResponse, UserModelRoutingTestHttp,
+    UserModelRoutingTestRequest, UserModelRoutingTestResponse, UserSharesResponse,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -79,7 +80,8 @@ use crate::notifications::{
 };
 use crate::proxy::{
     ReleasedShareRequest, RouteAvailability, gateway_proxy_handler, is_user_model_api_host,
-    proxy_handler, user_model_proxy_handler, with_unified_api_cors,
+    build_user_model_route_test_probe, execute_user_model_route_test, proxy_handler,
+    unified_model_test_curl, user_model_proxy_handler, with_unified_api_cors,
 };
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
@@ -380,6 +382,7 @@ pub fn router(state: ServerState) -> Router {
             "/v1/me/model-routing",
             get(get_my_model_routing).put(replace_my_model_routing),
         )
+        .route("/v1/me/model-routing/test", post(test_my_model_routing))
         .route(
             "/v1/me/usage-card",
             get(get_my_usage_card_settings).patch(update_my_usage_card_settings),
@@ -2749,6 +2752,57 @@ async fn replace_my_model_routing(
             )
             .await?,
     ))
+}
+
+async fn test_my_model_routing(
+    State(state): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(input): Json<UserModelRoutingTestRequest>,
+) -> Result<Json<UserModelRoutingTestResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let user = state.store.ensure_user_by_email(&email).await?;
+    let probe = build_user_model_route_test_probe(&input.app_type, &input.requested_model)?;
+    let curl = unified_model_test_curl(&state.config.tunnel_url("api"), &probe);
+    let started = std::time::Instant::now();
+    match execute_user_model_route_test(state, peer, &user.id, &email, &probe).await {
+        Ok(outcome) => Ok(Json(UserModelRoutingTestResponse {
+            success: outcome.success,
+            app_type: probe.app_type,
+            requested_model: probe.requested_model,
+            curl,
+            target_share_id: Some(outcome.target_share_id),
+            matched_wildcard: outcome.matched_wildcard,
+            response: Some(UserModelRoutingTestHttp {
+                status_code: outcome.status_code,
+                status_text: outcome.status_text,
+                headers: outcome.headers,
+                body_text: outcome.body_text,
+                body_truncated: outcome.body_truncated,
+            }),
+            duration_ms: outcome.duration_ms,
+            error: outcome.error,
+            code: None,
+        })),
+        Err(AppError::Coded {
+            status: _,
+            code,
+            message,
+            details: _,
+        }) => Ok(Json(UserModelRoutingTestResponse {
+            success: false,
+            app_type: probe.app_type,
+            requested_model: probe.requested_model,
+            curl,
+            target_share_id: None,
+            matched_wildcard: false,
+            response: None,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error: Some(message),
+            code: Some(code.to_string()),
+        })),
+        Err(error) => Err(error),
+    }
 }
 
 async fn my_shares(

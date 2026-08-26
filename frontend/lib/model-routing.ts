@@ -56,6 +56,53 @@ export function protocolSlotMode(
   return "empty";
 }
 
+export function protocolHasAttention(
+  routes: Array<UserModelRouteInput | DraftModelRoute>,
+  eligibleShares: UserModelRoutingShare[],
+  appType: ModelRoutingApp,
+) {
+  const eligibleIds = new Set(
+    sharesForProtocol(eligibleShares, appType).map((share) => share.shareId),
+  );
+  return routes.some(
+    (route) =>
+      route.appType === appType &&
+      route.targetShareId &&
+      !eligibleIds.has(route.targetShareId),
+  );
+}
+
+/**
+ * Pick the protocol tab to open first: anything that needs attention, else the
+ * first protocol that already has a route, else OpenAI. OpenAI is the default
+ * empty-state tab because it is the most common unified-entry protocol.
+ */
+export function defaultModelRoutingProtocol(
+  routes: Array<UserModelRouteInput | DraftModelRoute>,
+  eligibleShares: UserModelRoutingShare[],
+): ModelRoutingProtocol {
+  const slots = groupModelRoutesByProtocol(
+    routes.map((route, index) =>
+      "clientId" in route
+        ? (route as DraftModelRoute)
+        : { ...route, clientId: `saved:${index}` },
+    ),
+  );
+  const attention = slots.find((slot) =>
+    protocolHasAttention(routes, eligibleShares, slot.appType),
+  );
+  if (attention) return attention.appType;
+  const configured = slots.find((slot) => protocolSlotMode(slot) !== "empty");
+  if (configured) return configured.appType;
+  return "codex";
+}
+
+export function defaultTestModelForProtocol(
+  slot: Pick<ModelRoutingProtocolSlot, "exact">,
+) {
+  return slot.exact.find((route) => route.requestedModel.trim())?.requestedModel.trim() || "";
+}
+
 export function groupModelRoutesByProtocol(
   routes: DraftModelRoute[],
 ): ModelRoutingProtocolSlot[] {
@@ -138,9 +185,11 @@ export function buildUnifiedModelCurl(
   let authHeader = `Authorization: Bearer ${apiKey}`;
   let body: unknown = { model, input: "Hello" };
 
+  const extraHeaders: string[] = [];
   if (route?.appType === "claude") {
     url = `${baseUrl}/v1/messages`;
     authHeader = `x-api-key: ${apiKey}`;
+    extraHeaders.push("anthropic-version: 2023-06-01");
     body = {
       model,
       max_tokens: 32,
@@ -157,6 +206,7 @@ export function buildUnifiedModelCurl(
     "curl -sS \\",
     `  ${shellQuote(url)} \\`,
     `  -H ${shellQuote(authHeader)} \\`,
+    ...extraHeaders.map((header) => `  -H ${shellQuote(header)} \\`),
     `  -H ${shellQuote("content-type: application/json")} \\`,
     `  -d ${shellQuote(JSON.stringify(body))}`,
   ].join("\n");

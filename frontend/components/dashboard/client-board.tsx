@@ -66,6 +66,7 @@ import {
   searchForClientListTab,
   type ClientListTab,
   type DraftModelRoute,
+  type ModelRoutingProtocol,
 } from "@/lib/model-routing";
 import type { UserModelRoutingShare } from "@/lib/types";
 
@@ -930,12 +931,14 @@ export function ClientBoard({
   }, [filtersOpen]);
 
   const [hubForceExpanded, setHubForceExpanded] = React.useState(false);
+  const [hubFocusProtocol, setHubFocusProtocol] = React.useState<ModelRoutingProtocol | null>(null);
   const addModelRouteForShare = React.useCallback((shareId: string) => {
     if (modelRouting.routes.length >= MAX_USER_MODEL_ROUTES) {
       toast.danger(t("modelHub.validationTooMany"));
       return;
     }
-    modelRouting.addRouteForShare(shareId);
+    const appType = modelRouting.addRouteForShare(shareId);
+    if (appType) setHubFocusProtocol(appType);
     setHubForceExpanded(true);
     window.requestAnimationFrame(() => {
       document.getElementById("model-hub")?.scrollIntoView({
@@ -1114,7 +1117,7 @@ export function ClientBoard({
       </div>
 
       {statusFilter === "mine" ? (
-        <ModelHubPanel controller={modelRouting} forceExpanded={hubForceExpanded} />
+        <ModelHubPanel controller={modelRouting} forceExpanded={hubForceExpanded} focusProtocol={hubFocusProtocol} />
       ) : null}
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
