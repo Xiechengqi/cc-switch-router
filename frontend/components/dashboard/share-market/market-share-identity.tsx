@@ -6,28 +6,35 @@ import {
 } from "@/components/dashboard/share-provider-logo";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
-import type { ShareMarketAppCapability } from "@/lib/types";
 import { isCoreShareApp } from "@/components/dashboard/share-market/market-utils";
+
+type ShareIdentityProvider = {
+  app: string;
+  providerName?: string;
+  providerType?: string;
+  kind?: string;
+};
 
 type ShareIdentitySource = {
   subdomain?: string;
   shareName?: string;
   supportedApps?: string[];
   apps?: string[];
-  appCapabilities?: ShareMarketAppCapability[];
+  appCapabilities?: ShareIdentityProvider[];
 };
 
 function uniqueProviderCapabilities(source: ShareIdentitySource) {
   const enabledApps = new Set(source.supportedApps || source.apps || []);
-  const capabilities = (source.appCapabilities || []).filter(
-    (item) => isCoreShareApp(item.app) && (!enabledApps.size || enabledApps.has(item.app)),
-  );
-  return capabilities.reduce<ShareMarketAppCapability[]>((result, capability) => {
+  const capabilities = (source.appCapabilities || []).filter((item) => {
+    const hasProvider = !!(item.providerName?.trim() || item.providerType?.trim() || item.kind?.trim());
+    return hasProvider && isCoreShareApp(item.app) && (!enabledApps.size || enabledApps.has(item.app));
+  });
+  return capabilities.reduce<ShareIdentityProvider[]>((result, capability) => {
     const logo = resolveShareProviderLogo(capability);
-    const key = logo?.key || capability.providerType || capability.providerName || capability.app;
+    const key = logo?.key || capability.providerType || capability.kind || capability.providerName || capability.app;
     if (!result.some((item) => {
       const itemLogo = resolveShareProviderLogo(item);
-      return (itemLogo?.key || item.providerType || item.providerName || item.app) === key;
+      return (itemLogo?.key || item.providerType || item.kind || item.providerName || item.app) === key;
     })) result.push(capability);
     return result;
   }, []);

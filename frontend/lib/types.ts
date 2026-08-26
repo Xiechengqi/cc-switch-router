@@ -525,6 +525,13 @@ export type UserModelRoute = UserModelRouteInput & {
   updatedAt: string;
 };
 
+export type UserModelRoutingShareCapability = {
+  app: ModelRoutingApp | string;
+  providerName?: string;
+  providerType?: string;
+  kind?: string;
+};
+
 export type UserModelRoutingShare = {
   shareId: string;
   shareName: string;
@@ -533,6 +540,7 @@ export type UserModelRoutingShare = {
   access: "owner" | "shared" | "free" | string;
   freeAccess: boolean;
   apps: ModelRoutingApp[];
+  appCapabilities?: UserModelRoutingShareCapability[];
   isOnline: boolean;
 };
 

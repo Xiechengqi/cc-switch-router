@@ -80,7 +80,8 @@ use crate::models::{
     SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
     TunnelStateResponse, UpgradeInstallationStatusResponse, UserApiTokenResetResponse,
     UserApiTokenResponse, UserApiTokenStatus, UserModelRouteInput, UserModelRouteView,
-    UserModelRoutingResponse, UserModelRoutingShareView, UserShareView, UserSharesResponse,
+    UserModelRoutingResponse, UserModelRoutingShareCapability, UserModelRoutingShareView,
+    UserShareView, UserSharesResponse,
     VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
@@ -24829,6 +24830,64 @@ fn share_model_routing_access(
     }
 }
 
+fn user_model_routing_share_capability(
+    share: &crate::models::ShareDescriptor,
+    app: &str,
+) -> Option<UserModelRoutingShareCapability> {
+    let runtime = match app {
+        "claude" => share.app_runtimes.claude.as_ref(),
+        "codex" => share.app_runtimes.codex.as_ref(),
+        "gemini" => share.app_runtimes.gemini.as_ref(),
+        _ => None,
+    };
+    let bound_id = share
+        .bindings
+        .get(app)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let bound_provider = bound_id.and_then(|provider_id| {
+        let candidates = match app {
+            "claude" => share.app_providers.claude.as_slice(),
+            "codex" => share.app_providers.codex.as_slice(),
+            "gemini" => share.app_providers.gemini.as_slice(),
+            _ => &[],
+        };
+        candidates
+            .iter()
+            .find(|provider| provider.id == provider_id)
+    });
+    let provider_name = first_nonempty_owned([
+        runtime.and_then(|value| value.provider_name.clone()),
+        bound_provider.map(|provider| provider.name.clone()),
+    ]);
+    let provider_type = first_nonempty_owned([
+        runtime.and_then(|value| value.provider_type.clone()),
+        bound_provider.and_then(|provider| provider.provider_type.clone()),
+    ]);
+    let kind = first_nonempty_owned([
+        runtime.map(|value| value.kind.clone()),
+        bound_provider.and_then(|provider| provider.kind.clone()),
+    ]);
+    if provider_name.is_none() && provider_type.is_none() && kind.is_none() {
+        return None;
+    }
+    Some(UserModelRoutingShareCapability {
+        app: app.to_string(),
+        provider_name,
+        provider_type,
+        kind,
+    })
+}
+
+fn first_nonempty_owned<const N: usize>(values: [Option<String>; N]) -> Option<String> {
+    values.into_iter().find_map(|value| {
+        value.and_then(|item| {
+            let trimmed = item.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+    })
+}
+
 fn load_user_model_routing_response(
     conn: &Connection,
     config: &Config,
@@ -24866,6 +24925,10 @@ fn load_user_model_routing_response(
         if apps.is_empty() {
             continue;
         }
+        let app_capabilities = apps
+            .iter()
+            .filter_map(|app| user_model_routing_share_capability(&share, app))
+            .collect();
         eligible_shares.push(UserModelRoutingShareView {
             share_id: share.share_id,
             share_name: share.share_name,
@@ -24874,6 +24937,7 @@ fn load_user_model_routing_response(
             access: access.to_string(),
             free_access: share.free_access,
             apps,
+            app_capabilities,
             is_online: active_subdomains.contains(&share.subdomain),
         });
     }
@@ -26667,6 +26731,44 @@ mod tests {
         assert!(initial.routes.is_empty());
         assert_eq!(initial.eligible_shares.len(), 2);
         assert!(initial.api_base_url.contains("api."));
+        assert!(
+            initial
+                .eligible_shares
+                .iter()
+                .all(|share| share.app_capabilities.is_empty()),
+            "shares without runtime or provider identity should omit logos"
+        );
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET app_runtimes_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-routing-a",
+                    r#"{"codex":{"kind":"codex_oauth","app":"codex","providerName":"OpenAI Official","providerType":"codex_oauth"}}"#,
+                ],
+            )
+            .expect("set routing share runtime identity");
+        }
+        let with_identity = store
+            .get_user_model_routing(&config, "owner@example.com", &active_subdomains)
+            .await
+            .expect("reload routing shares with provider identity");
+        let identified = with_identity
+            .eligible_shares
+            .iter()
+            .find(|share| share.share_id == "share-routing-a")
+            .expect("owner share remains eligible");
+        assert_eq!(identified.app_capabilities.len(), 1);
+        assert_eq!(identified.app_capabilities[0].app, "codex");
+        assert_eq!(
+            identified.app_capabilities[0].provider_type.as_deref(),
+            Some("codex_oauth")
+        );
+        assert_eq!(
+            identified.app_capabilities[0].provider_name.as_deref(),
+            Some("OpenAI Official")
+        );
 
         let first = store
             .replace_user_model_routing(

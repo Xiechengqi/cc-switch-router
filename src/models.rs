@@ -326,7 +326,21 @@ pub struct UserModelRoutingShareView {
     pub access: String,
     pub free_access: bool,
     pub apps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_capabilities: Vec<UserModelRoutingShareCapability>,
     pub is_online: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserModelRoutingShareCapability {
+    pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
