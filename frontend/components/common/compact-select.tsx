@@ -1,5 +1,6 @@
 "use client";
 
+import * as React from "react";
 import { ListBox, Select } from "@heroui/react";
 import { cn } from "@/lib/utils";
 
@@ -7,6 +8,7 @@ type CompactSelectOption = {
   value: string;
   label: string;
   description?: string;
+  content?: React.ReactNode;
 };
 
 const EMPTY_KEY = "__router_empty_select_value__";
@@ -43,19 +45,23 @@ export function CompactSelect({
       <Select.Trigger
         className={cn(
           "min-h-9 rounded-lg border bg-white px-3 text-xs shadow-sm",
-          selected?.description && "py-2",
+          selected?.content ? undefined : selected?.description && "py-2",
           triggerClassName,
         )}
       >
         <Select.Value className="min-w-0 flex-1 pr-2 text-left text-xs text-foreground">
-          <span className="grid min-w-0 gap-0.5">
-            <span className="truncate font-medium">{selected?.label || value}</span>
-            {selected?.description ? (
-              <span className="truncate text-[11px] font-normal text-muted-foreground">
-                {selected.description}
-              </span>
-            ) : null}
-          </span>
+          {selected?.content ? (
+            <span className="block min-w-0 truncate">{selected.content}</span>
+          ) : (
+            <span className="grid min-w-0 gap-0.5">
+              <span className="truncate font-medium">{selected?.label || value}</span>
+              {selected?.description ? (
+                <span className="truncate text-[11px] font-normal text-muted-foreground">
+                  {selected.description}
+                </span>
+              ) : null}
+            </span>
+          )}
         </Select.Value>
         <Select.Indicator className="text-muted-foreground" />
       </Select.Trigger>
@@ -66,16 +72,20 @@ export function CompactSelect({
               key={option.value || EMPTY_KEY}
               id={option.value || EMPTY_KEY}
               textValue={[option.label, option.description].filter(Boolean).join(" ")}
-              className={option.description ? "py-2" : undefined}
+              className={option.description && !option.content ? "py-2" : undefined}
             >
-              <span className="grid min-w-0 gap-0.5">
-                <span className="truncate text-xs font-medium">{option.label}</span>
-                {option.description ? (
-                  <span className="truncate text-[11px] text-muted-foreground">
-                    {option.description}
-                  </span>
-                ) : null}
-              </span>
+              {option.content ? (
+                <span className="block min-w-0 truncate">{option.content}</span>
+              ) : (
+                <span className="grid min-w-0 gap-0.5">
+                  <span className="truncate text-xs font-medium">{option.label}</span>
+                  {option.description ? (
+                    <span className="truncate text-[11px] text-muted-foreground">
+                      {option.description}
+                    </span>
+                  ) : null}
+                </span>
+              )}
             </ListBox.Item>
           ))}
         </ListBox>

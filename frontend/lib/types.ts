@@ -2630,7 +2630,9 @@ export type ShareMarketOwnedShare = {
   subdomain: string;
   ownerEmail: string;
   supportedApps: string[];
+  appCapabilities?: ShareMarketAppCapability[];
   shareStatus: string;
+  expiresAt?: string;
   parallelLimit?: number;
   tokenLimit?: number;
   alreadyListed: boolean;

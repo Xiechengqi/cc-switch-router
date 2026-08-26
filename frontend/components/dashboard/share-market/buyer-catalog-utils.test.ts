@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  DEFAULT_CATALOG_AVAILABILITY,
   catalogSeatPreview,
   initialCatalogSeat,
   preserveCatalogSeat,
@@ -18,10 +17,6 @@ import type {
 } from "@/lib/types";
 
 const seat = (id: string, status = "available", readOnly = false) => ({ id, status, readOnly });
-
-test("catalog defaults to idle seats", () => {
-  assert.equal(DEFAULT_CATALOG_AVAILABILITY, "idle");
-});
 
 test("multiple idle seats require an explicit selection", () => {
   assert.equal(initialCatalogSeat([seat("a"), seat("b")]), undefined);

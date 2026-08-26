@@ -5,9 +5,7 @@ import { Button, Drawer, Modal } from "@heroui/react";
 import {
   CalendarClock,
   Check,
-  ChevronDown,
   Clock3,
-  Filter,
   Info,
   Loader2,
   LogIn,
@@ -21,18 +19,14 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
-import { CompactSelect } from "@/components/common/compact-select";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import {
   MarketAccessDialog,
   marketEligibilityFromError,
 } from "@/components/common/seller-approval-dialog";
-import {
-  resolveShareProviderLogo,
-  ShareProviderLogo,
-} from "@/components/dashboard/share-provider-logo";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
+import { MarketProviderLogos } from "@/components/dashboard/share-market/market-share-identity";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
@@ -61,12 +55,10 @@ import {
   isCoreShareApp,
   isSeatIdle,
   listingIdleCount,
-  listingLowestDailyRate,
   marketProviderStatusView,
   shareMarketMutationError,
 } from "@/components/dashboard/share-market/market-utils";
 import {
-  DEFAULT_CATALOG_AVAILABILITY,
   catalogSeatPreview,
   initialCatalogSeat,
   preserveCatalogSeat,
@@ -74,17 +66,12 @@ import {
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
 type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat };
-type AvailabilityFilter = "idle" | "all";
-type CatalogSort = "recommended" | "price" | "uptime";
 type SeatAction = "rent" | "approval" | "login" | "rented" | "granting" | "selling" | "unavailable";
 type RentTarget = SeatCard & { quote: ShareMarketRentQuote; idempotencyKey: string };
 
-function compareReliability(left: ShareMarketListing, right: ShareMarketListing) {
-  const coverage = Number(right.reliability.sufficientCoverage) - Number(left.reliability.sufficientCoverage);
-  if (coverage) return coverage;
-  const rate = (right.reliability.onlineRate24h ?? -1) - (left.reliability.onlineRate24h ?? -1);
-  if (rate) return rate;
-  return right.reliability.observationCoverage24h - left.reliability.observationCoverage24h;
+function listingCreatedAtMs(listing: ShareMarketListing) {
+  const timestamp = Date.parse(listing.createdAt);
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function uptimeValue(listing: ShareMarketListing) {
@@ -148,34 +135,6 @@ function Metric({ label, value, title }: { label: string; value: string; title?:
   );
 }
 
-function ListingProviderLogos({ listing }: { listing: ShareMarketListing }) {
-  const enabledApps = new Set(listing.supportedApps);
-  const capabilities = listing.appCapabilities.filter(
-    (item) => isCoreShareApp(item.app) && enabledApps.has(item.app),
-  );
-  const entries = capabilities.reduce<typeof capabilities>((result, capability) => {
-    const logo = resolveShareProviderLogo(capability);
-    const key = logo?.key || capability.providerType || capability.providerName || capability.app;
-    if (!result.some((item) => {
-      const itemLogo = resolveShareProviderLogo(item);
-      return (itemLogo?.key || item.providerType || item.providerName || item.app) === key;
-    })) result.push(capability);
-    return result;
-  }, []);
-  return (
-    <span className="inline-flex shrink-0 items-center gap-1">
-      {entries.slice(0, 3).map((capability) => (
-        <ShareProviderLogo
-          key={`${capability.app}:${capability.providerType || capability.providerName || "provider"}`}
-          provider={capability}
-          fallbackApp={capability.app as "claude" | "codex" | "gemini"}
-          size={16}
-        />
-      ))}
-    </span>
-  );
-}
-
 function compactSeatTerms(seat: ShareMarketSeat, locale: string, unlimited: string, t: ReturnType<typeof useLocaleText>["t"]) {
   const parallel = seat.parallelLimit == null ? "P∞" : `P${seat.parallelLimit}`;
   const tokens = seat.tokenLimit == null
@@ -235,7 +194,8 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
     <article
       id={`share-market-catalog-${listing.shareId}`}
       className={cn(
-        "grid min-h-[15rem] min-w-0 cursor-pointer scroll-mt-20 select-text grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border bg-white p-3 shadow-sm transition-[border-color,box-shadow] hover:border-primary/35",
+        "grid min-h-[15rem] min-w-0 cursor-pointer scroll-mt-20 select-text grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border p-3 shadow-sm transition-[border-color,box-shadow,background-color] hover:border-primary/35",
+        idle.length ? "bg-white" : "bg-slate-50",
         focused
           ? "border-primary ring-2 ring-primary/20"
           : listing.shareOnline
@@ -257,7 +217,7 @@ function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing
             className={cn("h-2 w-2 shrink-0 rounded-full", listing.shareOnline ? "bg-emerald-500" : "bg-rose-500")}
             title={listing.shareOnline ? listing.shareStatus : t("shareMarket.blockReason.share_offline")}
           />
-          <ListingProviderLogos listing={listing} />
+          <MarketProviderLogos source={listing} />
           <strong className="min-w-0 truncate font-mono text-xs font-semibold text-foreground" title={subdomain}>{subdomain}</strong>
           {listing.subdomain ? <SubdomainCopyButton subdomain={listing.subdomain} /> : null}
         </div>
@@ -361,8 +321,6 @@ export function ShareMarketBuyerCatalog({
   const chat = useClientChat();
   const [query, setQuery] = React.useState("");
   const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
-  const [availability, setAvailability] = React.useState<AvailabilityFilter>(DEFAULT_CATALOG_AVAILABILITY);
-  const [sort, setSort] = React.useState<CatalogSort>("recommended");
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
   const [rentTarget, setRentTarget] = React.useState<RentTarget | null>(null);
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
@@ -388,7 +346,6 @@ export function ShareMarketBuyerCatalog({
     const needle = query.trim().toLocaleLowerCase();
     return catalog.listings
       .filter((listing) => family === "all" || listing.providerFamily === family || listing.providerFamilies.includes(family))
-      .filter((listing) => availability === "all" || listingIdleCount(listing) > 0)
       .filter((listing) => {
         if (!needle) return true;
         return [
@@ -399,14 +356,8 @@ export function ShareMarketBuyerCatalog({
           ...listing.appCapabilities.flatMap((item) => [item.providerName, item.providerType, item.subscriptionLevel, item.upstreamModel, ...(item.models ?? [])]),
         ].filter(Boolean).join(" ").toLocaleLowerCase().includes(needle);
       })
-      .sort((left, right) => {
-        const online = Number(right.shareOnline) - Number(left.shareOnline);
-        if (online) return online;
-        if (sort === "price") return listingLowestDailyRate(left) - listingLowestDailyRate(right) || left.shareName.localeCompare(right.shareName);
-        if (sort === "uptime") return compareReliability(left, right) || left.shareName.localeCompare(right.shareName);
-        return listingIdleCount(right) - listingIdleCount(left) || compareReliability(left, right) || listingLowestDailyRate(left) - listingLowestDailyRate(right);
-      });
-  }, [availability, catalog.listings, family, query, sort]);
+      .sort((left, right) => listingCreatedAtMs(right) - listingCreatedAtMs(left) || right.id.localeCompare(left.id));
+  }, [catalog.listings, family, query]);
 
   const familyTabs = React.useMemo(
     () =>
@@ -435,7 +386,6 @@ export function ShareMarketBuyerCatalog({
     const listing = catalog.listings.find((item) => item.shareId === focusedShareId);
     if (!listing) return;
     focusedRef.current = focusedShareId;
-    setAvailability("all");
     setSelected({ listing });
     window.requestAnimationFrame(() => document.getElementById(`share-market-catalog-${focusedShareId}`)?.scrollIntoView({ block: "start" }));
   }, [catalog.listings, focusedShareId]);
@@ -515,7 +465,6 @@ export function ShareMarketBuyerCatalog({
   const selectedAction = selected?.seat
     ? seatAction(selected.listing, selected.seat, subscriptions, authed)
     : "unavailable";
-  const activeFilterCount = Number(availability !== "idle") + Number(sort !== "recommended");
   const quoteRemainingSeconds = rentTarget
     ? Math.max(0, Math.ceil((Date.parse(rentTarget.quote.expiresAt) - quoteNowMs) / 1_000))
     : 0;
@@ -553,30 +502,6 @@ export function ShareMarketBuyerCatalog({
           <input aria-label={t("shareMarket.catalog.searchCompact")} value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent text-xs outline-none" placeholder={t("shareMarket.catalog.searchCompact")} />
           {query ? <button type="button" aria-label={t("common.reset")} className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => setQuery("")}><X className="h-3.5 w-3.5 text-slate-400" /></button> : null}
         </label>
-        <details className="group relative shrink-0">
-          <summary className="flex h-9 cursor-pointer list-none items-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 bg-white px-2.5 text-sm font-medium text-slate-700 shadow-sm active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary">
-            <Filter className="h-3.5 w-3.5" />{t("shareMarket.catalog.filters")}{activeFilterCount ? ` ${activeFilterCount}` : ""}<ChevronDown className="h-3.5 w-3.5 group-open:rotate-180" />
-          </summary>
-          <div className="absolute right-0 z-30 mt-2 grid w-72 gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-xl">
-            <label className="flex items-center justify-between text-sm text-slate-700">
-              {t("shareMarket.catalog.onlyRentable")}
-              <input type="checkbox" checked={availability === "idle"} onChange={(event) => setAvailability(event.target.checked ? "idle" : "all")} />
-            </label>
-            <div className="border-t border-slate-100 pt-3">
-              <CompactSelect
-                value={sort}
-                options={[
-                  { value: "recommended", label: t("shareMarket.catalog.sort.recommended") },
-                  { value: "price", label: t("shareMarket.catalog.sort.price") },
-                  { value: "uptime", label: t("shareMarket.catalog.sort.uptime") },
-                ]}
-                onChange={(value) => setSort(value as CatalogSort)}
-                ariaLabel={t("shareMarket.catalog.sort")}
-                className="w-full"
-              />
-            </div>
-          </div>
-        </details>
       </div>
 
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}

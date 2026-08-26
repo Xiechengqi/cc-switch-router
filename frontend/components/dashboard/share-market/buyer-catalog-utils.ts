@@ -2,8 +2,6 @@ import type { ShareMarketSeat } from "@/lib/types";
 
 type SelectableSeat = Pick<ShareMarketSeat, "id" | "status" | "readOnly">;
 
-export const DEFAULT_CATALOG_AVAILABILITY = "idle" as const;
-
 function isIdle(seat: SelectableSeat) {
   return seat.status === "available" && !seat.readOnly;
 }

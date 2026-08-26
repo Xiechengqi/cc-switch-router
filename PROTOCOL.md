@@ -299,7 +299,7 @@ Server 要求:
 | `POST` | `/v1/share-market/listings` | 添加 Share 挂牌(1–20 座位) |
 | `DELETE` | `/v1/share-market/listings/:id` | 停止挂售；空闲车位报价 revision 递增，未提交 quote 立即失效 |
 | `POST` | `/v1/share-market/listings/:id/reopen` | 原子恢复原 listing，可修改并重新发布旧车位，同时添加新车位 |
-| `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选与挂售状态(`canCreateListing`、`activeListingId`、`reopenListingId`、`hasActiveRentals`) |
+| `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选与挂售状态(`canCreateListing`、`activeListingId`、`reopenListingId`、`hasActiveRentals`、`expiresAt`、`appCapabilities`) |
 | `POST` | `/v1/share-market/listings/:id/seats` | 为 active listing 添加拼车位；兼容旧调用方在 closed listing 上添加并恢复 |
 | `PATCH`/`DELETE` | `/v1/share-market/seats/:id` | 编辑/删除空闲座位 |
 | `POST` | `/v1/share-market/seats/:id/quote` | 冻结车位及 Share 全部已启用 App 的服务条款 |

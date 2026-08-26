@@ -16,6 +16,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getShareMarketCatalog,
   getShareMarketOwnedListings,
+  getShareMarketOwnedShares,
   getShareMarketSubscriptions,
 } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
@@ -53,6 +54,7 @@ export function ShareMarketWorkspace() {
     : "anonymous";
   const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(null);
   const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
+  const [ownedShareCount, setOwnedShareCount] = React.useState<number | null>(null);
   const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
   const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
   const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
@@ -109,6 +111,7 @@ export function ShareMarketWorkspace() {
         if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setCatalog(nextCatalog);
         setOwnedListings([]);
+        setOwnedShareCount(0);
         setSubscriptions([]);
         setSubscriptionCursor(null);
         setLoadedActorKey(actorKey);
@@ -116,23 +119,27 @@ export function ShareMarketWorkspace() {
       }
 
       if (scope === "all") {
-        const [nextCatalog, nextOwned, nextSubscriptions] = await Promise.all([
+        const [nextCatalog, nextOwned, nextShares, nextSubscriptions] = await Promise.all([
           getShareMarketCatalog(controller.signal),
           getShareMarketOwnedListings(controller.signal),
+          getShareMarketOwnedShares(controller.signal),
           getShareMarketSubscriptions(controller.signal),
         ]);
         if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setCatalog(nextCatalog);
         setOwnedListings(nextOwned.listings);
+        setOwnedShareCount(nextShares.length);
         applySubscriptionPage(nextSubscriptions);
         setLoadedActorKey(actorKey);
       } else if (scope === "catalog") {
-        const [nextCatalog, nextSubscriptions] = await Promise.all([
+        const [nextCatalog, nextShares, nextSubscriptions] = await Promise.all([
           getShareMarketCatalog(controller.signal),
+          getShareMarketOwnedShares(controller.signal),
           getShareMarketSubscriptions(controller.signal),
         ]);
         if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setCatalog(nextCatalog);
+        setOwnedShareCount(nextShares.length);
         applySubscriptionPage(nextSubscriptions);
         setLoadedActorKey(actorKey);
       } else if (scope === "rentals") {
@@ -141,9 +148,13 @@ export function ShareMarketWorkspace() {
         applySubscriptionPage(nextSubscriptions);
         setLoadedActorKey(actorKey);
       } else {
-        const nextOwned = await getShareMarketOwnedListings(controller.signal);
+        const [nextOwned, nextShares] = await Promise.all([
+          getShareMarketOwnedListings(controller.signal),
+          getShareMarketOwnedShares(controller.signal),
+        ]);
         if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setOwnedListings(nextOwned.listings);
+        setOwnedShareCount(nextShares.length);
         setLoadedActorKey(actorKey);
       }
     } catch (reason) {
@@ -234,8 +245,26 @@ export function ShareMarketWorkspace() {
   const actorDataCurrent = loadedActorKey === actorKey;
   const visibleCatalog = actorDataCurrent ? catalog : null;
   const visibleOwnedListings = actorDataCurrent ? ownedListings : [];
+  const visibleOwnedShareCount = actorDataCurrent ? ownedShareCount : null;
   const visibleSubscriptions = actorDataCurrent ? subscriptions : [];
   const visibleSubscriptionCursor = actorDataCurrent ? subscriptionCursor : null;
+  const hasOwnedShares = (visibleOwnedShareCount ?? 0) > 0 || visibleOwnedListings.length > 0;
+  const showSellingTab = authed && (workspace === "selling" || hasOwnedShares);
+
+  React.useEffect(() => {
+    if (workspace !== "selling" || visibleOwnedShareCount == null || hasOwnedShares) return;
+    setWorkspaceState("catalog");
+    replaceWorkspaceQuery("catalog");
+  }, [hasOwnedShares, visibleOwnedShareCount, workspace]);
+
+  const workspaceItems = [
+    { id: "catalog" as const, label: t("shareMarket.workspace.catalog") },
+    { id: "rentals" as const, label: t("shareMarket.workspace.rentals") },
+    ...(showSellingTab
+      ? [{ id: "selling" as const, label: t("shareMarket.workspace.selling") }]
+      : []),
+  ];
+  const workspaceValue = workspace === "selling" && !showSellingTab ? "catalog" : workspace;
 
   return (
     <main className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
@@ -243,15 +272,11 @@ export function ShareMarketWorkspace() {
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
         {authed ? (
           <SegmentedControl
-            value={workspace}
+            value={workspaceValue}
             onChange={setWorkspace}
             ariaLabel={t("shareMarket.workspace.label")}
             size="sm"
-            items={[
-              { id: "catalog", label: t("shareMarket.workspace.catalog") },
-              { id: "rentals", label: t("shareMarket.workspace.rentals") },
-              { id: "selling", label: t("shareMarket.workspace.selling") },
-            ]}
+            items={workspaceItems}
           />
         ) : (
           <div className="min-w-0">

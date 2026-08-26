@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
-import Link from "next/link";
 import {
   ChevronDown,
   ChevronRight,
@@ -25,7 +24,8 @@ import {
   PaidOfferReadinessNotice,
   usePaidOfferReadiness,
 } from "@/components/dashboard/share-market/paid-offer-readiness";
-import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { expiryTitle } from "@/components/dashboard/share-dashboard-utils";
+import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   addShareMarketSeat,
@@ -45,11 +45,6 @@ import {
   ApiError,
 } from "@/lib/api";
 import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
-import {
-  buildDashboardHref,
-  DASHBOARD_CLIENTS_PATH,
-} from "@/lib/dashboard-nav";
-import { SHARE_APP_LABELS } from "@/lib/share-app";
 import {
   formatTokenMillions,
   millionsInputToTokens,
@@ -71,7 +66,6 @@ import {
   grantFailureMessageKey,
   integrityReasonText,
   integrityStatusKey,
-  isCoreShareApp,
   isSeatIdle,
   refundStatusKey,
   shareMarketMutationError,
@@ -393,9 +387,11 @@ function SeatFields({
 function ShareCapacitySummary({
   parallelLimit,
   tokenLimit,
+  expiresAt,
 }: {
   parallelLimit?: number;
   tokenLimit?: number;
+  expiresAt?: string;
 }) {
   const { locale, t } = useLocaleText();
   return (
@@ -407,13 +403,13 @@ function ShareCapacitySummary({
       <span>{t("shareMarket.dialog.capacityTokens", {
         value: tokenLimit == null ? t("common.unlimited") : formatTokenMillions(tokenLimit, locale),
       })}</span>
+      {expiresAt ? (
+        <span>{t("shareMarket.dialog.capacityExpires", {
+          value: expiryTitle(expiresAt) === "∞" ? t("common.unlimited") : expiryTitle(expiresAt),
+        })}</span>
+      ) : null}
     </div>
   );
-}
-
-function shareSettingsHref(shareId: string) {
-  const params = new URLSearchParams({ drawerKind: "share", drawerId: shareId });
-  return buildDashboardHref(DASHBOARD_CLIENTS_PATH, params);
 }
 
 export function ShareMarketAddListingDialog({
@@ -516,8 +512,8 @@ export function ShareMarketAddListingDialog({
                     value={shareId}
                     options={eligibleShares.map((share) => ({
                       value: share.shareId,
-                      label: share.subdomain ? `${share.shareName} · ${share.subdomain}` : share.shareName,
-                      description: `${share.ownerEmail} · ${share.supportedApps.map((app) => app in SHARE_APP_LABELS ? SHARE_APP_LABELS[app as keyof typeof SHARE_APP_LABELS] : app).join(" / ")}`,
+                      label: share.subdomain || share.shareName,
+                      content: <MarketShareIdentity source={share} />,
                     }))}
                     onChange={(value) => {
                       const next = eligibleShares.find((share) => share.shareId === value);
@@ -526,10 +522,10 @@ export function ShareMarketAddListingDialog({
                     }}
                     ariaLabel={t("shareMarket.dialog.selectShare")}
                     className="w-full"
-                    triggerClassName="min-h-12 w-full text-sm"
+                    triggerClassName="min-h-9 w-full text-sm"
                   />
                 </label>
-                {selected ? <ShareCapacitySummary parallelLimit={selected.parallelLimit} tokenLimit={selected.tokenLimit} /> : null}
+                {selected ? <ShareCapacitySummary parallelLimit={selected.parallelLimit} tokenLimit={selected.tokenLimit} expiresAt={selected.expiresAt} /> : null}
                 <div className="grid gap-4">
                   {seats.map((seat, index) => (
                     <section key={index} className="grid gap-3 border-t border-slate-200 pt-4 first:border-0 first:pt-0">
@@ -554,7 +550,9 @@ export function ShareMarketAddListingDialog({
                 <div className="grid gap-2">
                   {blockedShares.map((share) => (
                     <div key={share.shareId} className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-                      <span className="min-w-[10rem] flex-1 truncate font-medium text-slate-700">{share.shareName}</span>
+                      <span className="min-w-0 flex-1">
+                        <MarketShareIdentity source={share} />
+                      </span>
                       <span>{t(ownedShareBlockedReasonKey(share.createBlockedReason))}</span>
                       {share.reopenListingId && onReopenListing ? (
                         <Button
@@ -570,7 +568,6 @@ export function ShareMarketAddListingDialog({
                           {t("shareMarket.reopen.action")}
                         </Button>
                       ) : null}
-                      <Link className="whitespace-nowrap font-medium text-accent hover:underline" href={shareSettingsHref(share.shareId)}>{t("shareMarket.dialog.manageShare")}</Link>
                     </div>
                   ))}
                 </div>
@@ -1045,16 +1042,6 @@ function TerminationDialog({
   );
 }
 
-function ListingApps({ listing, size = 16 }: { listing: ShareMarketListing; size?: number }) {
-  const apps = listing.supportedApps.filter(isCoreShareApp);
-  if (!apps.length) return null;
-  return (
-    <span className="inline-flex shrink-0 items-center gap-1" title={apps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}>
-      {apps.map((app) => <ShareAppLogo key={app} app={app} size={size} />)}
-    </span>
-  );
-}
-
 function seatQuotaLabel(seat: ShareMarketSeat, locale: string, t: TFn) {
   return [
     t("shareMarket.parallelShort", { value: seat.parallelLimit == null ? "∞" : seat.parallelLimit }),
@@ -1484,8 +1471,7 @@ export function ShareMarketOwnerWorkspace({
 
   const renderListingIdentity = (listing: ShareMarketListing, statusLabel: string) => (
     <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-      <ListingApps listing={listing} />
-      <strong className="min-w-0 truncate text-sm text-slate-900">{listing.shareName}</strong>
+      <MarketShareIdentity source={listing} />
       <span className={cn("shrink-0 text-[11px] font-medium", listing.shareOnline ? "text-emerald-700" : "text-rose-700")}>
         {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
       </span>
@@ -1510,8 +1496,7 @@ export function ShareMarketOwnerWorkspace({
         <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-              {attention ? <ListingApps listing={listing} size={14} /> : null}
-              {attention ? <strong className="min-w-0 truncate text-sm text-slate-900">{listing.shareName}</strong> : null}
+              {attention ? <MarketShareIdentity source={listing} size={14} /> : null}
               <strong className="shrink-0 text-sm tabular-nums text-slate-900">#{seat.position}</strong>
               <span className="min-w-0 truncate text-[11px] text-slate-500">{seatStatusLabel(seat, t)}</span>
               {subscription?.renterEmail ? (
@@ -1653,15 +1638,10 @@ export function ShareMarketOwnerWorkspace({
 
   return (
     <div className="grid min-w-0 gap-5">
-      {showHeading || hasListings ? (
-        <div className={cn("flex flex-wrap items-center gap-3", showHeading ? "justify-between" : "justify-end")}>
-          {showHeading ? (
-            <div>
-              <h2 className="text-sm font-semibold text-slate-900">{t("shareMarket.workspace.selling")}</h2>
-              <p className="mt-0.5 text-xs text-slate-500">{t("shareMarket.workspace.sellingHint")}</p>
-            </div>
-          ) : null}
-          {hasListings ? addShareButton("outline") : null}
+      {showHeading ? (
+        <div>
+          <h2 className="text-sm font-semibold text-slate-900">{t("shareMarket.workspace.selling")}</h2>
+          <p className="mt-0.5 text-xs text-slate-500">{t("shareMarket.workspace.sellingHint")}</p>
         </div>
       ) : null}
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
@@ -1687,10 +1667,13 @@ export function ShareMarketOwnerWorkspace({
           ) : null}
 
           <section className="grid gap-2" aria-labelledby="share-listings-active">
-            <h3 id="share-listings-active" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              {t("shareMarket.listings.active")}
-              {active.length ? <span className="ml-1.5 tabular-nums text-slate-400">{active.length}</span> : null}
-            </h3>
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+              <h3 id="share-listings-active" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                {t("shareMarket.listings.active")}
+                {active.length ? <span className="ml-1.5 tabular-nums text-slate-400">{active.length}</span> : null}
+              </h3>
+              {addShareButton(hasListings ? "outline" : "primary")}
+            </div>
             {active.length ? (
               <div className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white">
                 {active.map(renderActiveListing)}
@@ -1699,10 +1682,7 @@ export function ShareMarketOwnerWorkspace({
               <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-500">
                 <span>{t("shareMarket.workspace.noListings")}</span>
                 {!hasListings ? (
-                  <>
-                    <p className="text-xs text-slate-400">{t("shareMarket.workspace.sellingHint")}</p>
-                    {addShareButton("primary")}
-                  </>
+                  <p className="text-xs text-slate-400">{t("shareMarket.workspace.sellingHint")}</p>
                 ) : null}
               </div>
             )}

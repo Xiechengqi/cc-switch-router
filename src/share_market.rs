@@ -442,7 +442,11 @@ pub struct OwnedShareView {
     pub subdomain: String,
     pub owner_email: String,
     pub supported_apps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_capabilities: Vec<ShareMarketAppCapability>,
     pub share_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5022,7 +5026,8 @@ impl AppStore {
                         (SELECT edit.patch_json FROM share_edit_requests edit
                          WHERE edit.share_id = s.share_id AND edit.status = 'pending'
                            AND edit.retired_at IS NULL
-                         ORDER BY edit.revision DESC LIMIT 1)
+                         ORDER BY edit.revision DESC LIMIT 1),
+                        s.expires_at, s.app_runtimes_json, s.app_providers_json
                  FROM shares s
                  WHERE lower(s.owner_email) = lower(?1)
                  ORDER BY s.share_name, s.share_id",
@@ -5047,11 +5052,21 @@ impl AppStore {
                     .and_then(|value| serde_json::from_str::<ShareSettingsPatch>(value).ok())
                     .and_then(|patch| patch.free_access)
                     .unwrap_or(false);
+                let expires_at: String = row.get(20)?;
+                let app_runtimes_json: Option<String> = row.get(21)?;
+                let app_providers_json: Option<String> = row.get(22)?;
                 let support = ShareSupport {
                     claude: row.get::<_, i64>(12)? != 0,
                     codex: row.get::<_, i64>(13)? != 0,
                     gemini: row.get::<_, i64>(14)? != 0,
                 };
+                let app_capabilities = enabled_public_app_capabilities(
+                    &bindings_json,
+                    app_runtimes_json.as_deref(),
+                    app_providers_json.as_deref(),
+                    &app_type,
+                    &support,
+                );
                 let create_blocked_reason = if active_listing_id.is_some() {
                     Some("active_listing")
                 } else if reopen_listing_id.is_some() {
@@ -5089,7 +5104,9 @@ impl AppStore {
                     subdomain: row.get(3)?,
                     owner_email: row.get(4)?,
                     supported_apps: enabled_share_apps(&bindings_json, &app_type, &support),
+                    app_capabilities,
                     share_status,
+                    expires_at: (!expires_at.trim().is_empty()).then_some(expires_at),
                     parallel_limit: (parallel_limit >= 0)
                         .then(|| u32::try_from(parallel_limit).ok())
                         .flatten(),
@@ -15115,6 +15132,8 @@ mod tests {
         assert_eq!(shares[0].supported_apps, vec!["claude", "gemini"]);
         assert_eq!(shares[0].parallel_limit, Some(3));
         assert_eq!(shares[0].token_limit, None);
+        assert_eq!(shares[0].expires_at.as_deref(), Some("9999-12-31T23:59:59Z"));
+        assert!(!shares[0].app_capabilities.is_empty());
         assert!(!shares[0].free_access);
     }
 
