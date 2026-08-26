@@ -17,6 +17,8 @@ import {
   clientListTabFromQuery,
   configuredEligibleRouteShareIds,
   consumeModelRouteDeepLink,
+  hrefWithClientListTab,
+  hrefWithConsumedModelRouteDeepLink,
   modelRouteDeepLinkShareId,
   patchDraftModelRoute,
   protocolSlotMode,
@@ -156,6 +158,22 @@ test("mine tab query state preserves unrelated dashboard parameters", () => {
   assert.equal(params.get("shareId"), null);
   assert.equal(params.get("action"), null);
   assert.equal(params.get("region"), "jp");
+
+  assert.equal(new URLSearchParams(searchForClientListTab("tab=mine", "all")).get("tab"), null);
+  assert.equal(searchForClientListTab("tab=mine", "online"), "");
+  assert.equal(
+    hrefWithClientListTab("https://router.example/clients/?tab=mine&focusId=s-1", "offline"),
+    "/clients/?focusId=s-1",
+  );
+  assert.equal(
+    hrefWithClientListTab("/clients/?region=jp", "mine"),
+    "/clients/?region=jp&tab=mine",
+  );
+  assert.equal(
+    clientListTabFromQuery("offline", null, true),
+    "offline",
+    "leaving mine must keep the stored status tab, not collapse to all",
+  );
 });
 
 test("add-route deep links are consumed without removing the mine tab", () => {
@@ -166,6 +184,12 @@ test("add-route deep links are consumed without removing the mine tab", () => {
   assert.equal(consumed.get("region"), "jp");
   assert.equal(consumed.get("shareId"), null);
   assert.equal(consumed.get("action"), null);
+  assert.equal(
+    hrefWithConsumedModelRouteDeepLink(
+      "https://router.example/clients/?tab=mine&shareId=share-claude&action=add-route&region=jp",
+    ),
+    "/clients/?tab=mine&region=jp",
+  );
 });
 
 test("only currently eligible configured targets extend the mine view", () => {

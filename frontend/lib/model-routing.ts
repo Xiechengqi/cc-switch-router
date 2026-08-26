@@ -331,6 +331,37 @@ export function searchForClientListTab(
   return params.toString();
 }
 
+function hrefWithSearch(href: string, nextSearch: string): string {
+  const url = new URL(href, "https://cc-switch.local");
+  url.search = nextSearch;
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+/** Same-path query update for static export: do not wait on `useSearchParams`. */
+export function hrefWithClientListTab(href: string, tab: ClientListTab): string {
+  const url = new URL(href, "https://cc-switch.local");
+  return hrefWithSearch(href, searchForClientListTab(url.searchParams.toString(), tab));
+}
+
+export function replaceClientListTabQuery(tab: ClientListTab) {
+  if (typeof window === "undefined") return;
+  window.history.replaceState(
+    window.history.state,
+    "",
+    hrefWithClientListTab(window.location.href, tab),
+  );
+}
+
+export function windowHasMineClientListTab(): boolean {
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("tab") === "mine";
+}
+
+export function windowSearchString(): string {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).toString();
+}
+
 export function modelRouteDeepLinkShareId(
   currentSearch: string,
 ): string | null {
@@ -346,6 +377,20 @@ export function consumeModelRouteDeepLink(currentSearch: string): string {
   params.delete("shareId");
   params.delete("action");
   return params.toString();
+}
+
+export function hrefWithConsumedModelRouteDeepLink(href: string): string {
+  const url = new URL(href, "https://cc-switch.local");
+  return hrefWithSearch(href, consumeModelRouteDeepLink(url.searchParams.toString()));
+}
+
+export function replaceConsumedModelRouteDeepLink() {
+  if (typeof window === "undefined") return;
+  window.history.replaceState(
+    window.history.state,
+    "",
+    hrefWithConsumedModelRouteDeepLink(window.location.href),
+  );
 }
 
 export function configuredEligibleRouteShareIds(

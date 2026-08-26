@@ -55,15 +55,16 @@ import {
   ModelHubPanel,
   useModelRoutingController,
 } from "@/components/dashboard/model-hub-panel";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   clientListTabFromQuery,
   configuredEligibleRouteShareIds,
-  consumeModelRouteDeepLink,
   listViewerShares,
   MAX_USER_MODEL_ROUTES,
   modelRouteDeepLinkShareId,
-  searchForClientListTab,
+  replaceClientListTabQuery,
+  replaceConsumedModelRouteDeepLink,
+  windowHasMineClientListTab,
+  windowSearchString,
   type ClientListTab,
   type DraftModelRoute,
   type ModelRoutingProtocol,
@@ -612,10 +613,6 @@ export function ClientBoard({
   const authed = !!session?.authenticated;
   const sessionEmail = normalizeEmail(session?.user?.email);
   const hasViewerIdentity = authed && !!sessionEmail;
-  const pathname = usePathname() || "/clients/";
-  const router = useRouter();
-  const searchParams = useSearchParams();
-  const searchString = searchParams.toString();
   const focus = useDashboardFocus();
   const { issuesOnly, setIssuesOnly, regionFilters, setRegionFilters, clearRegionFilters } = useDashboardViewState();
   const { trackOperation } = useOperationVerification();
@@ -630,9 +627,10 @@ export function ClientBoard({
   const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
   const [statusFilterRaw, setStatusFilter] = usePersistentState<ClientListTab>("cc_switch_router_client_status_v1", "all");
+  const [urlMine, setUrlMine] = React.useState(false);
   const statusFilter = clientListTabFromQuery(
     statusFilterRaw,
-    searchParams.get("tab"),
+    urlMine ? "mine" : null,
     hasViewerIdentity,
   );
   const modelRouting = useModelRoutingController(
@@ -649,10 +647,9 @@ export function ClientBoard({
 
   const selectClientListTab = React.useCallback((tab: ClientListTab) => {
     if (tab !== "mine") setStatusFilter(tab);
-    const nextSearch = searchForClientListTab(searchString, tab);
-    const href = `${pathname}${nextSearch ? `?${nextSearch}` : ""}`;
-    router.replace(href, { scroll: false });
-  }, [pathname, router, searchString, setStatusFilter]);
+    setUrlMine(tab === "mine");
+    replaceClientListTabQuery(tab);
+  }, [setStatusFilter]);
 
   const loadMarketRentals = React.useCallback(async () => {
     if (!authed) {
@@ -683,10 +680,8 @@ export function ClientBoard({
   }, [setSortOrder, sortOrder]);
 
   React.useEffect(() => {
-    if (searchParams.get("tab") !== "mine" && statusFilterRaw !== statusFilter) {
-      setStatusFilter(statusFilter);
-    }
-  }, [searchParams, setStatusFilter, statusFilter, statusFilterRaw]);
+    setUrlMine(windowHasMineClientListTab());
+  }, []);
 
   React.useEffect(() => {
     if (issuesOnly) selectClientListTab("all");
@@ -993,6 +988,7 @@ export function ClientBoard({
   }, [modelRouting.addRouteForShare, modelRouting.routes.length, t]);
 
   React.useEffect(() => {
+    const searchString = windowSearchString();
     const shareId = modelRouteDeepLinkShareId(searchString);
     if (!shareId) {
       consumedModelRouteDeepLinkRef.current = "";
@@ -1011,17 +1007,10 @@ export function ClientBoard({
     } else {
       toast.danger(t("modelHub.targetUnavailable"));
     }
-    const nextSearch = consumeModelRouteDeepLink(searchString);
-    router.replace(
-      `${pathname}${nextSearch ? `?${nextSearch}` : ""}`,
-      { scroll: false },
-    );
+    replaceConsumedModelRouteDeepLink();
   }, [
     addModelRouteForShare,
     modelRouting.profile,
-    pathname,
-    router,
-    searchString,
     t,
   ]);
 
