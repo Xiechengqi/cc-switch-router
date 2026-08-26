@@ -112,6 +112,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0029_installation_online_days.sql"),
     ),
     (30, include_str!("../schema/0030_user_model_routing.sql")),
+    (
+        31,
+        include_str!("../schema/0031_user_model_routing_wildcard.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1070,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_30_upgrade_a_version_26_database() {
+    fn migrations_27_through_31_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1119,8 +1123,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 30);
-        check_compatibility(&conn).expect("upgraded version 30 is compatible");
+        assert_eq!(latest_version, 31);
+        check_compatibility(&conn).expect("upgraded version 31 is compatible");
     }
 
     #[test]
@@ -1182,7 +1186,100 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 30);
+        assert_eq!(latest_version, 31);
+    }
+
+    #[test]
+    fn migration_31_preserves_exact_routes_and_admits_only_the_standalone_wildcard() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 30);
+        conn.execute_batch(
+            "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+             VALUES ('wildcard-user', 'wildcard@example.com', 'now', 'now');
+             INSERT INTO user_model_routes
+                (id, user_id, app_type, requested_model, target_share_id, created_at, updated_at)
+             VALUES ('route-kept', 'wildcard-user', 'codex', 'gpt-5.6-sol',
+                     'share-a', 'then', 'then');",
+        )
+        .expect("seed an exact route before the wildcard upgrade");
+
+        apply(&conn).expect("upgrade version 30 through the wildcard schema");
+
+        // The table is rebuilt to add the CHECK; existing rows must survive intact,
+        // identity and timestamps included, or saved routes would silently vanish.
+        let kept = conn
+            .query_row(
+                "SELECT requested_model, target_share_id, created_at
+                 FROM user_model_routes WHERE id = 'route-kept'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("exact route survives the rebuild");
+        assert_eq!(
+            kept,
+            (
+                "gpt-5.6-sol".to_string(),
+                "share-a".to_string(),
+                "then".to_string()
+            )
+        );
+
+        let route_foreign_keys = conn
+            .prepare("PRAGMA foreign_key_list('user_model_routes')")
+            .expect("prepare route foreign keys")
+            .query_map([], |row| row.get::<_, String>(2))
+            .expect("query route foreign keys")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read route foreign keys");
+        assert_eq!(route_foreign_keys, vec!["users".to_string()]);
+
+        conn.execute_batch(
+            "INSERT INTO user_model_routes
+                (id, user_id, app_type, requested_model, target_share_id, created_at, updated_at)
+             VALUES ('route-wildcard', 'wildcard-user', 'codex', '*',
+                     'share-c', 'now', 'now');",
+        )
+        .expect("the standalone wildcard is a valid route key");
+
+        let second_wildcard = conn.execute(
+            "INSERT INTO user_model_routes
+                (id, user_id, app_type, requested_model, target_share_id, created_at, updated_at)
+             VALUES ('route-wildcard-2', 'wildcard-user', 'codex', '*',
+                     'share-d', 'now', 'now')",
+            [],
+        );
+        assert!(
+            second_wildcard.is_err(),
+            "the existing unique key must cap each (user, app) at one wildcard"
+        );
+
+        conn.execute_batch(
+            "INSERT INTO user_model_routes
+                (id, user_id, app_type, requested_model, target_share_id, created_at, updated_at)
+             VALUES ('route-wildcard-claude', 'wildcard-user', 'claude', '*',
+                     'share-e', 'now', 'now');",
+        )
+        .expect("wildcards are scoped per app, not per user");
+
+        for pattern in ["gpt-*", "*-turbo", "a*b"] {
+            let partial = conn.execute(
+                "INSERT INTO user_model_routes
+                    (id, user_id, app_type, requested_model, target_share_id, created_at, updated_at)
+                 VALUES ('route-pattern', 'wildcard-user', 'gemini', ?1,
+                         'share-f', 'now', 'now')",
+                params![pattern],
+            );
+            assert!(
+                partial.is_err(),
+                "`{pattern}` must be rejected so `*` cannot decay into pattern matching"
+            );
+        }
     }
 
     #[test]

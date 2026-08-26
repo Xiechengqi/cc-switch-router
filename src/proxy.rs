@@ -32,7 +32,7 @@ use crate::proxy_stream::{
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{
     AppStore, IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE, NewImageGenerationRequestLog,
-    ShareForTest, UserApiTokenPrincipal, image_result_path,
+    ShareForTest, UserApiTokenPrincipal, UserModelRouteResolution, image_result_path,
 };
 
 const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -2406,7 +2406,7 @@ async fn user_model_proxy_handler_inner(
     peer: SocketAddr,
     req: Request,
 ) -> Response {
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let path = parts.uri.path().to_string();
 
@@ -2440,9 +2440,35 @@ async fn user_model_proxy_handler_inner(
 
     if method == axum::http::Method::GET {
         if let Some(app_type) = unified_model_list_app(&path, &parts.headers) {
+            // When this app is a pure passthrough to one Share, the entry point is
+            // just a forwarding layer, so the catalog is forwarded too and the
+            // client gets that Share's real list — identical to connecting to it
+            // directly. Any other routing shape has no single upstream to speak
+            // for it and falls through to the synthesised list. PROTOCOL.md 9.2.
+            match state
+                .store
+                .resolve_passthrough_model_list_route(
+                    &principal.user_id,
+                    &principal.email,
+                    app_type,
+                )
+                .await
+            {
+                Ok(Some(resolution)) => {
+                    debug!(
+                        user_id = %principal.user_id,
+                        app_type = %app_type,
+                        target_share_id = %resolution.target_share_id,
+                        "unified API forwards model catalog to passthrough target"
+                    );
+                    return forward_to_selected_share(state, peer, parts, body, &resolution).await;
+                }
+                Ok(None) => {}
+                Err(error) => return error.into_response(),
+            }
             return match state
                 .store
-                .list_user_model_names(&principal.user_id, app_type)
+                .list_user_model_names(&principal.user_id, &principal.email, app_type)
                 .await
             {
                 Ok(models) => unified_model_list_response(app_type, models),
@@ -2553,6 +2579,36 @@ async fn user_model_proxy_handler_inner(
         );
     }
 
+    // Distinguishes "the user mapped this exact model" from "the wildcard route
+    // absorbed it" when diagnosing an upstream unknown-model error. The forwarded
+    // request is identical in both cases; only the reason for picking this Share
+    // differs.
+    debug!(
+        user_id = %principal.user_id,
+        app_type = %app_type,
+        requested_model = %requested_model,
+        target_share_id = %resolution.target_share_id,
+        wildcard = resolution.matched_wildcard,
+        "unified API resolved model route"
+    );
+
+    forward_to_selected_share(state, peer, parts, Body::from(body_bytes), &resolution).await
+}
+
+/// Hands a request to the selected Share exactly as a direct connection would.
+///
+/// The inference path and the passthrough catalog path both go through here, so
+/// the two cannot drift apart: same Host rewrite, same cookie strip, same
+/// `proxy_handler`. Past this point nothing distinguishes the request from one
+/// that arrived on the Share's own subdomain — same route, same backend, same
+/// edge ACL, same IngressContext, same response scrubbing.
+async fn forward_to_selected_share(
+    state: ServerState,
+    peer: SocketAddr,
+    mut parts: axum::http::request::Parts,
+    body: Body,
+    resolution: &UserModelRouteResolution,
+) -> Response {
     let selected_host = format!("{}.{}", resolution.subdomain, state.config.tunnel_domain);
     let Ok(selected_host) = HeaderValue::from_str(&selected_host) else {
         return unified_api_error_response(
@@ -2567,7 +2623,7 @@ async fn user_model_proxy_handler_inner(
     // unified inference host is API-key-only, so never let an explicitly
     // credentialed browser request carry that session into a selected Share.
     parts.headers.remove(header::COOKIE);
-    let request = Request::from_parts(parts, Body::from(body_bytes));
+    let request = Request::from_parts(parts, body);
     proxy_handler(State(state), ConnectInfo(peer), request).await
 }
 
@@ -2635,8 +2691,16 @@ fn infer_user_model_request_app(path: &str) -> Option<String> {
         .trim_start_matches('/')
         .trim_end_matches('/');
     match path {
-        "v1/messages" => return Some("claude".to_string()),
-        "v1/responses" | "v1/chat/completions" | "v1/completions" | "v1/images/generations" => {
+        // count_tokens carries a mandatory `model` in its body, so it routes by
+        // exactly the same rule as an inference call. Claude CLIs call it before
+        // sending a request; leaving it out made the unified host 404 where a
+        // direct Share connection succeeds.
+        "v1/messages" | "v1/messages/count_tokens" => return Some("claude".to_string()),
+        "v1/responses"
+        | "v1/chat/completions"
+        | "v1/completions"
+        | "v1/images/generations"
+        | "v1/embeddings" => {
             return Some("codex".to_string());
         }
         _ => {}
@@ -7201,6 +7265,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_model_catalog_forwards_only_for_a_pure_passthrough_app() {
+        use crate::models::UserModelRouteInput;
+
+        let config = proxy_test_config("unified-passthrough-catalog");
+        let state = proxy_test_state(&config, Arc::new(ProxyRegistry::default()));
+        {
+            let conn = state.store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO shares (
+                    share_id, capacity_pool_id, installation_id, share_name, owner_email,
+                    subdomain, app_type, enabled_claude, enabled_codex, enabled_gemini,
+                    token_limit, parallel_limit, tokens_used, requests_count, share_status,
+                    created_at, expires_at, updated_at
+                 ) VALUES (
+                    'share-pt', 'pool-pt', 'installation-pt', 'Passthrough Share',
+                    'owner@example.com', 'pt-wild', 'proxy', 1, 1, 1,
+                    -1, -1, 0, 0, 'active',
+                    '2026-01-01T00:00:00Z', '2099-12-31T23:59:59Z', '2026-01-01T00:00:00Z'
+                 )",
+                [],
+            )
+            .expect("insert passthrough share");
+            conn.execute(
+                "INSERT INTO share_bindings (share_id, app_type, provider_id)
+                 VALUES ('share-pt', 'codex', 'provider-test')",
+                [],
+            )
+            .expect("bind codex on the passthrough share");
+        }
+        let token = state
+            .store
+            .get_default_api_token("owner@example.com")
+            .await
+            .expect("issue api token")
+            .api_token
+            .expect("default api token plaintext");
+        let active_subdomains = HashSet::from(["pt-wild".to_string()]);
+        let catalog_request = || {
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .header("host", format!("api.{}", config.tunnel_domain))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("build catalog request")
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+
+        // A lone wildcard makes this entry point a pure forwarding layer, so the
+        // catalog request is handed to `proxy_handler` like any inference call.
+        // The tunnel is not registered here, so it ends in the routing layer's own
+        // error — which is exactly what a direct connection to that Share would
+        // return, and proves the request was forwarded rather than synthesised.
+        state
+            .store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-pt".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("save wildcard-only routing");
+        let response =
+            user_model_proxy_handler(State(state.clone()), ConnectInfo(peer), catalog_request())
+                .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read forwarded catalog response");
+        assert_eq!(&body[..], b"unregistered-subdomain");
+
+        // Add one exact route and no single upstream speaks for this entry point
+        // any more: the very same request is now answered from the synthesised
+        // list instead of being forwarded.
+        state
+            .store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "*".into(),
+                        target_share_id: "share-pt".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "gpt-5.6-sol".into(),
+                        target_share_id: "share-pt".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect("save mixed routing");
+        let response =
+            user_model_proxy_handler(State(state), ConnectInfo(peer), catalog_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read synthesised catalog response");
+        let payload: Value = serde_json::from_slice(&body).expect("parse synthesised catalog");
+        assert_eq!(payload["object"], "list");
+        assert_eq!(payload["data"][0]["id"], "gpt-5.6-sol");
+        assert_eq!(payload["data"].as_array().map(|rows| rows.len()), Some(1));
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn unified_user_api_honors_existing_client_bans_before_authentication() {
         let config = proxy_test_config("unified-client-ban");
         let state = proxy_test_state(&config, Arc::new(ProxyRegistry::default()));
@@ -7297,7 +7477,9 @@ mod tests {
     fn unified_user_api_accepts_only_explicit_inference_paths() {
         for (path, expected) in [
             ("/v1/messages", "claude"),
+            ("/v1/messages/count_tokens", "claude"),
             ("/v1/responses", "codex"),
+            ("/v1/embeddings", "codex"),
             ("/v1/chat/completions", "codex"),
             ("/v1/completions", "codex"),
             ("/v1/images/generations", "codex"),
@@ -7317,6 +7499,12 @@ mod tests {
         for path in [
             "/v1/responses-anything",
             "/v1/messages-batch",
+            // Adjacent to the newly allowed helpers, but not themselves allowed:
+            // no extractable model name, so there is nothing to route on.
+            "/v1/messages/count_tokens/extra",
+            "/v1/embeddings/batch",
+            "/v1/audio/transcriptions",
+            "/v1/moderations",
             "/v1/chat/internal",
             "/v1beta/admin",
             "/v1beta/models/gemini-3-pro:unknownAction",

@@ -661,6 +661,10 @@ pub struct UserApiTokenPrincipal {
 pub struct UserModelRouteResolution {
     pub target_share_id: String,
     pub subdomain: String,
+    /// True when the request fell through to the user's explicit `*` route for
+    /// this app instead of matching an exact model name. Observability only —
+    /// the forwarded request is byte-identical either way.
+    pub matched_wildcard: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -6986,23 +6990,65 @@ impl AppStore {
         let app_type = normalize_share_app(app_type)?;
         let requested_model = normalize_requested_model(requested_model)?;
         let conn = self.conn.lock().await;
-        let target_share_id = conn
+        // One statement covers route selection *and* the target's current Share
+        // state. Every inference request takes the single global connection lock,
+        // so halving the round trips under it halves the serialized work on the
+        // hot path. The target state deliberately is not cached: PROTOCOL.md 9.2
+        // requires re-checking existence, app state and ACL against the current
+        // snapshot on every call, so a revoked grant must stop working at once.
+        //
+        // Fixed two-level precedence: an exact model match wins, otherwise the
+        // user's explicit `*` route for this app. Deterministic selection, not a
+        // fallback — the ORDER BY picks the winner up front, so there is never a
+        // "try then retry" step. Both levels missing still fails closed.
+        //
+        // LEFT JOIN, not an inner join: a route whose Share was deleted must still
+        // surface as a route (503 target unavailable) rather than disappearing
+        // into "not configured" (404) or, worse, sliding onto the wildcard.
+        let matched = conn
             .query_row(
-                "SELECT target_share_id
-                 FROM user_model_routes
-                 WHERE user_id = ?1 AND app_type = ?2 AND requested_model = ?3",
-                params![user_id, app_type, requested_model],
-                |row| row.get::<_, String>(0),
+                "SELECT r.requested_model,
+                        r.target_share_id,
+                        s.share_id IS NOT NULL,
+                        COALESCE(s.subdomain, ''),
+                        s.owner_email,
+                        COALESCE(s.user_grants_json, '{}'),
+                        COALESCE(s.free_access, 0),
+                        COALESCE(s.enabled_claude, 0),
+                        COALESCE(s.enabled_codex, 0),
+                        COALESCE(s.enabled_gemini, 0),
+                        EXISTS (
+                            SELECT 1 FROM share_bindings b
+                            WHERE b.share_id = r.target_share_id AND b.app_type = ?2
+                        )
+                 FROM user_model_routes r
+                 LEFT JOIN shares s ON s.share_id = r.target_share_id
+                 WHERE r.user_id = ?1 AND r.app_type = ?2
+                   AND r.requested_model IN (?3, ?4)
+                 ORDER BY CASE r.requested_model WHEN ?4 THEN 1 ELSE 0 END
+                 LIMIT 1",
+                params![user_id, app_type, requested_model, WILDCARD_REQUESTED_MODEL],
+                |row| {
+                    let matched_model = row.get::<_, String>(0)?;
+                    let target_share_id = row.get::<_, String>(1)?;
+                    let target = read_model_route_target(row, 2)?;
+                    Ok((matched_model, target_share_id, target))
+                },
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("resolve user model route failed: {e}")))?;
-        let Some(target_share_id) = target_share_id else {
+        let Some((matched_model, target_share_id, target)) = matched else {
             return Ok(None);
         };
-        match inspect_model_route_target(&conn, &email, &target_share_id, &app_type)? {
+        // A client asking literally for `*` matches the wildcard row by exact
+        // equality; that is the same target the wildcard would have selected, so
+        // report it as a wildcard hit rather than an exact one.
+        let matched_wildcard = matched_model == WILDCARD_REQUESTED_MODEL;
+        match classify_model_route_target(target, &email, &app_type) {
             ModelRouteTargetAccess::Eligible { subdomain } => Ok(Some(UserModelRouteResolution {
                 target_share_id,
                 subdomain,
+                matched_wildcard,
             })),
             ModelRouteTargetAccess::Missing => Err(model_routing_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -7028,28 +7074,194 @@ impl AppStore {
         }
     }
 
+    /// Resolves the target of a *pure passthrough* app, if this is one.
+    ///
+    /// Returns `Some` only when the user configured exactly one route for this
+    /// app and that route is the `*` wildcard — no exact routes alongside it —
+    /// and the target passes the same live check the inference path applies.
+    /// Under that configuration the unified host is nothing but a forwarding
+    /// layer in front of that one Share, so `GET /v1/models` can be forwarded
+    /// verbatim instead of synthesised: the client then sees the Share's real
+    /// catalog, byte for byte, exactly as a direct connection would.
+    ///
+    /// Any other shape returns `None`. With even one exact route in play no
+    /// single upstream represents this entry point, and a forwarded catalog
+    /// would advertise models that the exact routes actually send elsewhere.
+    ///
+    /// Deliberately *not* sensitive to whether the target is online: the mode is
+    /// a function of configuration alone. Falling back to synthesis on a
+    /// reconnecting tunnel would make one configuration return two semantically
+    /// different lists depending on upstream jitter.
+    pub async fn resolve_passthrough_model_list_route(
+        &self,
+        user_id: &str,
+        user_email: &str,
+        app_type: &str,
+    ) -> Result<Option<UserModelRouteResolution>, AppError> {
+        let email = normalize_email(user_email)?;
+        let app_type = normalize_share_app(app_type)?;
+        let conn = self.conn.lock().await;
+        let matched = conn
+            .query_row(
+                "SELECT r.target_share_id,
+                        s.share_id IS NOT NULL,
+                        COALESCE(s.subdomain, ''),
+                        s.owner_email,
+                        COALESCE(s.user_grants_json, '{}'),
+                        COALESCE(s.free_access, 0),
+                        COALESCE(s.enabled_claude, 0),
+                        COALESCE(s.enabled_codex, 0),
+                        COALESCE(s.enabled_gemini, 0),
+                        EXISTS (
+                            SELECT 1 FROM share_bindings b
+                            WHERE b.share_id = r.target_share_id AND b.app_type = ?2
+                        )
+                 FROM user_model_routes r
+                 LEFT JOIN shares s ON s.share_id = r.target_share_id
+                 WHERE r.user_id = ?1 AND r.app_type = ?2 AND r.requested_model = ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM user_model_routes x
+                       WHERE x.user_id = ?1 AND x.app_type = ?2
+                         AND x.requested_model != ?3
+                   )",
+                params![user_id, app_type, WILDCARD_REQUESTED_MODEL],
+                |row| {
+                    let target_share_id = row.get::<_, String>(0)?;
+                    let target = read_model_route_target(row, 1)?;
+                    Ok((target_share_id, target))
+                },
+            )
+            .optional()
+            .map_err(|e| {
+                AppError::Internal(format!("resolve passthrough model list route failed: {e}"))
+            })?;
+        let Some((target_share_id, target)) = matched else {
+            return Ok(None);
+        };
+        // A target that fails the live check falls back to synthesis rather than
+        // erroring: the catalog endpoint stays best-effort, while the inference
+        // path still fails closed with the precise reason.
+        match classify_model_route_target(target, &email, &app_type) {
+            ModelRouteTargetAccess::Eligible { subdomain } => Ok(Some(UserModelRouteResolution {
+                target_share_id,
+                subdomain,
+                matched_wildcard: true,
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Model names to advertise on the unified host for one app.
+    ///
+    /// Exact route keys always appear. When the user also configured a `*` route,
+    /// the model names that target Share was actually probed with are appended, so
+    /// a passthrough-only setup still lists something useful. The reserved `*`
+    /// token itself is never emitted — it is not a callable model name, and a CLI
+    /// that picked it from this list would send `model: "*"` upstream.
+    ///
+    /// The wildcard target is re-checked against the current snapshot exactly like
+    /// the inference path does, and contributes nothing unless it is still
+    /// reachable for this user right now. Exact keys are the user's own strings and
+    /// reveal nothing, but the probed names belong to the target Share — listing
+    /// them after a grant was revoked would leak that Share's catalog.
+    ///
+    /// Best-effort by design: an unprobed or no-longer-authorized wildcard target
+    /// contributes nothing and the list may come back empty. That is not an error,
+    /// and it does not limit which model names the wildcard route will forward.
     pub async fn list_user_model_names(
         &self,
         user_id: &str,
+        user_email: &str,
         app_type: &str,
     ) -> Result<Vec<String>, AppError> {
+        let email = normalize_email(user_email)?;
         let app_type = normalize_share_app(app_type)?;
         let conn = self.conn.lock().await;
         let mut statement = conn
             .prepare(
                 "SELECT requested_model
                  FROM user_model_routes
-                 WHERE user_id = ?1 AND app_type = ?2
-                 ORDER BY requested_model ASC",
+                 WHERE user_id = ?1 AND app_type = ?2 AND requested_model != ?3",
             )
             .map_err(|e| {
                 AppError::Internal(format!("prepare configured model list failed: {e}"))
             })?;
-        statement
-            .query_map(params![user_id, app_type], |row| row.get::<_, String>(0))
+        let mut models = statement
+            .query_map(
+                params![user_id, app_type, WILDCARD_REQUESTED_MODEL],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|e| AppError::Internal(format!("query configured model list failed: {e}")))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| AppError::Internal(format!("read configured model list failed: {e}")))
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| AppError::Internal(format!("read configured model list failed: {e}")))?;
+
+        let wildcard_target = conn
+            .query_row(
+                "SELECT r.target_share_id,
+                        s.share_id IS NOT NULL,
+                        COALESCE(s.subdomain, ''),
+                        s.owner_email,
+                        COALESCE(s.user_grants_json, '{}'),
+                        COALESCE(s.free_access, 0),
+                        COALESCE(s.enabled_claude, 0),
+                        COALESCE(s.enabled_codex, 0),
+                        COALESCE(s.enabled_gemini, 0),
+                        EXISTS (
+                            SELECT 1 FROM share_bindings b
+                            WHERE b.share_id = r.target_share_id AND b.app_type = ?2
+                        )
+                 FROM user_model_routes r
+                 LEFT JOIN shares s ON s.share_id = r.target_share_id
+                 WHERE r.user_id = ?1 AND r.app_type = ?2 AND r.requested_model = ?3",
+                params![user_id, app_type, WILDCARD_REQUESTED_MODEL],
+                |row| {
+                    let target_share_id = row.get::<_, String>(0)?;
+                    let target = read_model_route_target(row, 1)?;
+                    Ok((target_share_id, target))
+                },
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query wildcard model route failed: {e}")))?;
+        let reachable_wildcard_target = wildcard_target.and_then(|(target_share_id, target)| {
+            matches!(
+                classify_model_route_target(target, &email, &app_type),
+                ModelRouteTargetAccess::Eligible { .. }
+            )
+            .then_some(target_share_id)
+        });
+        if let Some(target_share_id) = reachable_wildcard_target {
+            let mut probed = conn
+                .prepare(
+                    "SELECT DISTINCT requested_model
+                     FROM share_model_health_slots
+                     WHERE share_id = ?1 AND app_type = ?2
+                       AND status IN ('success', 'degraded')
+                       AND requested_model != ''",
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("prepare wildcard model catalog failed: {e}"))
+                })?;
+            let discovered = probed
+                .query_map(params![target_share_id, app_type], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| {
+                    AppError::Internal(format!("query wildcard model catalog failed: {e}"))
+                })?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|e| {
+                    AppError::Internal(format!("read wildcard model catalog failed: {e}"))
+                })?;
+            models.extend(
+                discovered
+                    .into_iter()
+                    .filter(|model| model != WILDCARD_REQUESTED_MODEL),
+            );
+        }
+
+        models.sort();
+        models.dedup();
+        Ok(models)
     }
 
     /// P18: テスト接続用 — Share owner、canonical grants、接続情報を一度に返す。
@@ -24482,6 +24694,31 @@ fn normalize_requested_model(value: &str) -> Result<String, AppError> {
     Ok(model.to_string())
 }
 
+/// The reserved `requested_model` value meaning "every model for this app".
+pub(crate) const WILDCARD_REQUESTED_MODEL: &str = "*";
+
+/// Normalize a model name that a user is *configuring* as a route key.
+///
+/// Stricter than [`normalize_requested_model`], which validates the model name an
+/// inbound inference request carries: a configured key may be the reserved `*`
+/// wildcard, but must not contain `*` in any other position. Rejecting `gpt-*`
+/// here is what keeps `*` a single all-or-nothing route instead of degrading into
+/// the prefix/regex matching PROTOCOL.md forbids. Inbound request model names stay
+/// unrestricted — a client is free to ask for a model literally named `gpt-*`; it
+/// simply misses every exact route and lands on the wildcard, like any other name.
+fn normalize_configured_model(value: &str) -> Result<String, AppError> {
+    let model = normalize_requested_model(value)?;
+    if model != WILDCARD_REQUESTED_MODEL && model.contains('*') {
+        return Err(model_routing_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "user_model_route_model_pattern_unsupported",
+            "model name may contain `*` only as the standalone wildcard route",
+            serde_json::json!({ "requestedModel": model }),
+        ));
+    }
+    Ok(model)
+}
+
 fn normalize_user_model_routes(
     routes: Vec<UserModelRouteInput>,
 ) -> Result<Vec<UserModelRouteInput>, AppError> {
@@ -24494,7 +24731,7 @@ fn normalize_user_model_routes(
     let mut keys = HashSet::with_capacity(routes.len());
     for route in routes {
         let app_type = normalize_share_app(&route.app_type)?;
-        let requested_model = normalize_requested_model(&route.requested_model)?;
+        let requested_model = normalize_configured_model(&route.requested_model)?;
         let target_share_id = route.target_share_id.trim().to_string();
         if target_share_id.is_empty() || target_share_id.chars().count() > 200 {
             return Err(AppError::BadRequest("invalid target Share id".into()));
@@ -24648,6 +24885,77 @@ fn load_user_model_routing_response(
     })
 }
 
+/// The Share columns a model route target is judged on.
+///
+/// Read either on its own (config path) or as the joined half of the inference
+/// path's single lookup; [`classify_model_route_target`] is the one place that
+/// turns them into a verdict, so the two paths cannot drift apart.
+struct ModelRouteTargetRow {
+    subdomain: String,
+    owner_email: Option<String>,
+    user_grants: BTreeMap<String, ShareUserGrant>,
+    free_access: bool,
+    enabled_claude: bool,
+    enabled_codex: bool,
+    enabled_gemini: bool,
+    has_binding: bool,
+}
+
+/// Reads the target-Share column block of a model-route join, starting at `first`.
+///
+/// `None` means the LEFT JOIN found no Share — a deleted target. The inference
+/// path and the model-catalog path select this same block; one reader keeps
+/// their column orders from drifting apart.
+fn read_model_route_target(
+    row: &Row<'_>,
+    first: usize,
+) -> Result<Option<ModelRouteTargetRow>, crate::db::Error> {
+    if row.get::<_, i64>(first)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(ModelRouteTargetRow {
+        subdomain: row.get(first + 1)?,
+        owner_email: row.get(first + 2)?,
+        user_grants: parse_share_user_grants(row.get(first + 3)?)?,
+        free_access: row.get::<_, i64>(first + 4)? != 0,
+        enabled_claude: row.get::<_, i64>(first + 5)? != 0,
+        enabled_codex: row.get::<_, i64>(first + 6)? != 0,
+        enabled_gemini: row.get::<_, i64>(first + 7)? != 0,
+        has_binding: row.get::<_, i64>(first + 8)? != 0,
+    }))
+}
+
+fn classify_model_route_target(
+    row: Option<ModelRouteTargetRow>,
+    email: &str,
+    app_type: &str,
+) -> ModelRouteTargetAccess {
+    let Some(row) = row else {
+        return ModelRouteTargetAccess::Missing;
+    };
+    let app_enabled = match app_type {
+        "claude" => row.enabled_claude,
+        "codex" => row.enabled_codex,
+        "gemini" => row.enabled_gemini,
+        _ => false,
+    };
+    if !row.has_binding || !app_enabled {
+        return ModelRouteTargetAccess::AppUnavailable;
+    }
+    let authorized = row.free_access
+        || row
+            .owner_email
+            .as_deref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(email))
+        || active_share_grant_for_email(&row.user_grants, email, Utc::now().timestamp_millis());
+    if !authorized {
+        return ModelRouteTargetAccess::Unauthorized;
+    }
+    ModelRouteTargetAccess::Eligible {
+        subdomain: row.subdomain,
+    }
+}
+
 fn inspect_model_route_target(
     conn: &Connection,
     email: &str,
@@ -24667,51 +24975,21 @@ fn inspect_model_route_target(
              WHERE share_id = ?1",
             params![share_id, app_type],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    parse_share_user_grants(row.get(2)?)?,
-                    row.get::<_, i64>(3)? != 0,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)? != 0,
-                    row.get::<_, i64>(6)? != 0,
-                    row.get::<_, i64>(7)? != 0,
-                ))
+                Ok(ModelRouteTargetRow {
+                    subdomain: row.get(0)?,
+                    owner_email: row.get(1)?,
+                    user_grants: parse_share_user_grants(row.get(2)?)?,
+                    free_access: row.get::<_, i64>(3)? != 0,
+                    enabled_claude: row.get::<_, i64>(4)? != 0,
+                    enabled_codex: row.get::<_, i64>(5)? != 0,
+                    enabled_gemini: row.get::<_, i64>(6)? != 0,
+                    has_binding: row.get::<_, i64>(7)? != 0,
+                })
             },
         )
         .optional()
         .map_err(|e| AppError::Internal(format!("inspect model route target failed: {e}")))?;
-    let Some((
-        subdomain,
-        owner_email,
-        user_grants,
-        free_access,
-        enabled_claude,
-        enabled_codex,
-        enabled_gemini,
-        has_binding,
-    )) = record
-    else {
-        return Ok(ModelRouteTargetAccess::Missing);
-    };
-    let app_enabled = match app_type {
-        "claude" => enabled_claude,
-        "codex" => enabled_codex,
-        "gemini" => enabled_gemini,
-        _ => false,
-    };
-    if !has_binding || !app_enabled {
-        return Ok(ModelRouteTargetAccess::AppUnavailable);
-    }
-    let authorized = free_access
-        || owner_email
-            .as_deref()
-            .is_some_and(|owner| owner.eq_ignore_ascii_case(email))
-        || active_share_grant_for_email(&user_grants, email, Utc::now().timestamp_millis());
-    if !authorized {
-        return Ok(ModelRouteTargetAccess::Unauthorized);
-    }
-    Ok(ModelRouteTargetAccess::Eligible { subdomain })
+    Ok(classify_model_route_target(record, email, app_type))
 }
 
 fn get_default_user_api_token(
@@ -26528,7 +26806,7 @@ mod tests {
         };
         assert_eq!(
             store
-                .list_user_model_names(&user_id, "codex")
+                .list_user_model_names(&user_id, "owner@example.com", "codex")
                 .await
                 .expect("list configured model names"),
             vec!["GPT-5.6".to_string(), "gpt-5.6".to_string()]
@@ -26547,6 +26825,639 @@ mod tests {
                 .resolve_user_model_route(&user_id, "owner@example.com", "codex", "Gpt-5.6",)
                 .await
                 .expect("resolve unmatched model case")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn wildcard_route_absorbs_unmapped_models_without_shadowing_exact_routes() {
+        let (store, config) = setup_store("user-model-routing-wildcard").await;
+        insert_installation(&store, "inst-wildcard").await;
+        for (share_id, subdomain) in [
+            ("share-wild-a", "wild-a"),
+            ("share-wild-b", "wild-b"),
+            ("share-wild-c", "wild-c"),
+            ("share-wild-d", "wild-d"),
+        ] {
+            insert_share(&store, "inst-wildcard", share_id, subdomain, "active").await;
+        }
+        let active_subdomains = HashSet::from([
+            "wild-a".to_string(),
+            "wild-b".to_string(),
+            "wild-c".to_string(),
+            "wild-d".to_string(),
+        ]);
+
+        // The scenario from the requirement: two exact maps plus a catch-all.
+        let saved = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "gpt-5.6-sol".into(),
+                        target_share_id: "share-wild-a".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "gpt-5.5".into(),
+                        target_share_id: "share-wild-b".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "*".into(),
+                        target_share_id: "share-wild-c".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect("save exact routes alongside a wildcard");
+        assert_eq!(saved.revision, 1);
+        assert_eq!(saved.routes.len(), 3);
+
+        let user_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read routing user id")
+        };
+
+        let resolve = |model: &'static str, app: &'static str| {
+            let store = &store;
+            let user_id = user_id.clone();
+            async move {
+                store
+                    .resolve_user_model_route(&user_id, "owner@example.com", app, model)
+                    .await
+                    .expect("resolve model route")
+            }
+        };
+
+        // Exact wins, and reports itself as exact.
+        let exact = resolve("gpt-5.6-sol", "codex").await.expect("exact route");
+        assert_eq!(exact.target_share_id, "share-wild-a");
+        assert!(!exact.matched_wildcard);
+        assert_eq!(
+            resolve("gpt-5.5", "codex")
+                .await
+                .expect("second exact route")
+                .target_share_id,
+            "share-wild-b"
+        );
+
+        // Anything unmapped lands on the wildcard, flagged as such.
+        for unmapped in ["claude-opus-5", "o3-mini", "totally-unknown"] {
+            let hit = resolve(unmapped, "codex")
+                .await
+                .unwrap_or_else(|| panic!("wildcard must absorb {unmapped}"));
+            assert_eq!(hit.target_share_id, "share-wild-c");
+            assert!(hit.matched_wildcard);
+        }
+
+        // Case still matters for exact routes; a near-miss falls to the wildcard
+        // rather than being fuzzily matched onto share-wild-a.
+        let near_miss = resolve("GPT-5.6-SOL", "codex")
+            .await
+            .expect("case near miss");
+        assert_eq!(near_miss.target_share_id, "share-wild-c");
+        assert!(near_miss.matched_wildcard);
+
+        // Wildcards are per app: codex has one, claude does not, so claude fails closed.
+        assert!(
+            resolve("anything", "claude").await.is_none(),
+            "a codex wildcard must not leak into claude"
+        );
+
+        let with_claude = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "gpt-5.6-sol".into(),
+                        target_share_id: "share-wild-a".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "gpt-5.5".into(),
+                        target_share_id: "share-wild-b".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "*".into(),
+                        target_share_id: "share-wild-c".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "claude".into(),
+                        requested_model: "*".into(),
+                        target_share_id: "share-wild-d".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect("each app may carry its own wildcard");
+        assert_eq!(with_claude.revision, 2);
+        assert_eq!(
+            resolve("anything", "claude")
+                .await
+                .expect("claude wildcard")
+                .target_share_id,
+            "share-wild-d"
+        );
+        assert_eq!(
+            resolve("anything", "codex")
+                .await
+                .expect("codex wildcard is unchanged")
+                .target_share_id,
+            "share-wild-c"
+        );
+
+        // A client literally asking for `*` gets the wildcard target it names —
+        // the same Share, reported as a wildcard hit rather than an exact one.
+        let literal = resolve("*", "codex").await.expect("literal star");
+        assert_eq!(literal.target_share_id, "share-wild-c");
+        assert!(literal.matched_wildcard);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn wildcard_routes_reject_patterns_and_stay_fail_closed_on_target_loss() {
+        let (store, config) = setup_store("user-model-routing-wildcard-guards").await;
+        insert_installation(&store, "inst-wildcard-guard").await;
+        insert_share(
+            &store,
+            "inst-wildcard-guard",
+            "share-guard",
+            "guard",
+            "active",
+        )
+        .await;
+        let active_subdomains = HashSet::from(["guard".to_string()]);
+
+        // `*` is the only accepted use of the character. Prefix/suffix/infix
+        // patterns must be refused so the wildcard cannot decay into the fuzzy
+        // matching PROTOCOL.md 9.2 forbids.
+        for pattern in ["gpt-*", "*-turbo", "a*b", "**"] {
+            let rejected = store
+                .replace_user_model_routing(
+                    &config,
+                    "owner@example.com",
+                    0,
+                    vec![UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: pattern.into(),
+                        target_share_id: "share-guard".into(),
+                    }],
+                    &active_subdomains,
+                )
+                .await
+                .expect_err("pattern model keys must be refused");
+            match rejected {
+                AppError::Coded { status, code, .. } => {
+                    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+                    assert_eq!(code, "user_model_route_model_pattern_unsupported");
+                }
+                other => panic!("`{pattern}` produced an unexpected error: {other:?}"),
+            }
+        }
+
+        // A user with no claim on the Share cannot point a wildcard at it either.
+        let unauthorized = store
+            .replace_user_model_routing(
+                &config,
+                "stranger@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-guard".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect_err("wildcards obey the same ACL as exact routes");
+        assert!(matches!(
+            unauthorized,
+            AppError::Coded {
+                code: "user_model_route_unauthorized",
+                ..
+            }
+        ));
+
+        store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-guard".into(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("owner may configure a wildcard");
+        let user_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read routing user id")
+        };
+
+        // Turning the app off must surface as a hard 409, never as a silent
+        // downgrade to "not configured".
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET enabled_codex = 0 WHERE share_id = 'share-guard'",
+                [],
+            )
+            .expect("disable codex on the wildcard target");
+        }
+        let app_off = store
+            .resolve_user_model_route(&user_id, "owner@example.com", "codex", "anything")
+            .await
+            .expect_err("disabled app must fail loudly");
+        assert!(matches!(
+            app_off,
+            AppError::Coded {
+                code: "user_model_route_app_unavailable",
+                ..
+            }
+        ));
+
+        // Same for a deleted Share: 503, not a fallback to some other target.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM shares WHERE share_id = 'share-guard'", [])
+                .expect("remove the wildcard target");
+        }
+        let gone = store
+            .resolve_user_model_route(&user_id, "owner@example.com", "codex", "anything")
+            .await
+            .expect_err("missing target must fail loudly");
+        assert!(matches!(
+            gone,
+            AppError::Coded {
+                code: "user_model_route_target_unavailable",
+                ..
+            }
+        ));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn wildcard_model_catalog_hides_the_token_and_adds_probed_models() {
+        let (store, config) = setup_store("user-model-routing-wildcard-catalog").await;
+        insert_installation(&store, "inst-wildcard-catalog").await;
+        insert_share(
+            &store,
+            "inst-wildcard-catalog",
+            "share-catalog-exact",
+            "catalog-exact",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-wildcard-catalog",
+            "share-catalog-wild",
+            "catalog-wild",
+            "active",
+        )
+        .await;
+        let active_subdomains =
+            HashSet::from(["catalog-exact".to_string(), "catalog-wild".to_string()]);
+
+        store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "gpt-5.6-sol".into(),
+                        target_share_id: "share-catalog-exact".into(),
+                    },
+                    UserModelRouteInput {
+                        app_type: "codex".into(),
+                        requested_model: "*".into(),
+                        target_share_id: "share-catalog-wild".into(),
+                    },
+                ],
+                &active_subdomains,
+            )
+            .await
+            .expect("save an exact route plus a wildcard");
+        let user_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read routing user id")
+        };
+
+        // With nothing probed yet the catalog is just the exact key — and never `*`.
+        assert_eq!(
+            store
+                .list_user_model_names(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("catalog before probes"),
+            vec!["gpt-5.6-sol".to_string()]
+        );
+
+        {
+            let conn = store.conn.lock().await;
+            let rows: [(&str, &str, &str, &str, i64); 4] = [
+                // Probed on the wildcard target: these should surface.
+                ("share-catalog-wild", "codex", "gpt-5.4", "success", 1800),
+                ("share-catalog-wild", "codex", "gpt-5.9", "degraded", 3600),
+                // Failed probe on the wildcard target: not advertised.
+                ("share-catalog-wild", "codex", "gpt-dead", "failed", 5400),
+                // Probed on a Share that is not the wildcard target: irrelevant.
+                (
+                    "share-catalog-exact",
+                    "codex",
+                    "gpt-elsewhere",
+                    "success",
+                    7200,
+                ),
+            ];
+            for (index, (share_id, app, model, status, slot_start)) in rows.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO share_model_health_slots (
+                        share_id, slot_start, claim_token, claimed_at, app_type, api_type,
+                        requested_model, status, latency_ms, source, checked_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 0, ?4, 'openai', ?5, ?6, 10, 'test', 1, 1)",
+                    params![
+                        share_id,
+                        slot_start,
+                        format!("claim-{index}"),
+                        app,
+                        model,
+                        status
+                    ],
+                )
+                .expect("insert probe slot");
+            }
+        }
+
+        // Exact keys plus the wildcard target's healthy probes, deduped and sorted.
+        assert_eq!(
+            store
+                .list_user_model_names(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("catalog after probes"),
+            vec![
+                "gpt-5.4".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.9".to_string(),
+            ]
+        );
+        // Another app shares neither the exact key nor the probes.
+        assert!(
+            store
+                .list_user_model_names(&user_id, "owner@example.com", "claude")
+                .await
+                .expect("claude catalog")
+                .is_empty()
+        );
+
+        // Revoking access to the wildcard target withdraws its probed names from
+        // the catalog at once — those names are the target Share's information,
+        // not the user's. The exact key is the user's own string and stays.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares
+                    SET owner_email = 'someone-else@example.com',
+                        free_access = 0,
+                        user_grants_json = '{}'
+                  WHERE share_id = 'share-catalog-wild'",
+                [],
+            )
+            .expect("revoke the wildcard target grant");
+        }
+        assert_eq!(
+            store
+                .list_user_model_names(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("catalog after revocation"),
+            vec!["gpt-5.6-sol".to_string()]
+        );
+
+        // A deleted wildcard target contributes nothing either, and still does not
+        // turn the catalog lookup into an error.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "DELETE FROM shares WHERE share_id = 'share-catalog-wild'",
+                [],
+            )
+            .expect("delete the wildcard target");
+        }
+        assert_eq!(
+            store
+                .list_user_model_names(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("catalog after target deletion"),
+            vec!["gpt-5.6-sol".to_string()]
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn passthrough_model_list_route_needs_a_lone_wildcard_and_a_reachable_target() {
+        let (store, config) = setup_store("user-model-routing-passthrough-list").await;
+        insert_installation(&store, "inst-passthrough").await;
+        insert_share(
+            &store,
+            "inst-passthrough",
+            "share-pt-wild",
+            "pt-wild",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-passthrough",
+            "share-pt-exact",
+            "pt-exact",
+            "active",
+        )
+        .await;
+        let active_subdomains = HashSet::from(["pt-wild".to_string(), "pt-exact".to_string()]);
+        let wildcard_only = vec![UserModelRouteInput {
+            app_type: "codex".into(),
+            requested_model: "*".into(),
+            target_share_id: "share-pt-wild".into(),
+        }];
+        let save = |routes: Vec<UserModelRouteInput>, revision: u64| {
+            let store = &store;
+            let config = &config;
+            let active_subdomains = &active_subdomains;
+            async move {
+                store
+                    .replace_user_model_routing(
+                        config,
+                        "owner@example.com",
+                        revision,
+                        routes,
+                        active_subdomains,
+                    )
+                    .await
+                    .expect("save routing")
+            }
+        };
+
+        save(wildcard_only.clone(), 0).await;
+        let user_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read routing user id")
+        };
+
+        // A lone wildcard: the entry point is a pure forwarding layer for codex.
+        let resolved = store
+            .resolve_passthrough_model_list_route(&user_id, "owner@example.com", "codex")
+            .await
+            .expect("resolve lone wildcard")
+            .expect("lone wildcard is passthrough");
+        assert_eq!(resolved.target_share_id, "share-pt-wild");
+        assert_eq!(resolved.subdomain, "pt-wild");
+        // An app with no routes at all is not passthrough — nothing to forward to.
+        assert!(
+            store
+                .resolve_passthrough_model_list_route(&user_id, "owner@example.com", "claude")
+                .await
+                .expect("resolve empty app")
+                .is_none()
+        );
+
+        // One exact route alongside the wildcard and no single upstream speaks for
+        // this entry point any more: forwarding the target's catalog would
+        // advertise models the exact route actually sends to a different Share.
+        save(
+            vec![
+                UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-pt-wild".into(),
+                },
+                UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "gpt-5.6-sol".into(),
+                    target_share_id: "share-pt-exact".into(),
+                },
+            ],
+            1,
+        )
+        .await;
+        assert!(
+            store
+                .resolve_passthrough_model_list_route(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("resolve mixed shape")
+                .is_none()
+        );
+
+        // Exact routes only: also not passthrough.
+        save(
+            vec![UserModelRouteInput {
+                app_type: "codex".into(),
+                requested_model: "gpt-5.6-sol".into(),
+                target_share_id: "share-pt-exact".into(),
+            }],
+            2,
+        )
+        .await;
+        assert!(
+            store
+                .resolve_passthrough_model_list_route(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("resolve exact-only shape")
+                .is_none()
+        );
+
+        // The shape is judged per app: another app's exact route must not drag
+        // codex out of passthrough mode.
+        save(
+            vec![
+                UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-pt-wild".into(),
+                },
+                UserModelRouteInput {
+                    app_type: "claude".into(),
+                    requested_model: "claude-opus-5".into(),
+                    target_share_id: "share-pt-exact".into(),
+                },
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(
+            store
+                .resolve_passthrough_model_list_route(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("resolve per-app shape")
+                .expect("codex stays passthrough")
+                .subdomain,
+            "pt-wild"
+        );
+        assert!(
+            store
+                .resolve_passthrough_model_list_route(&user_id, "owner@example.com", "claude")
+                .await
+                .expect("resolve claude shape")
+                .is_none()
+        );
+
+        // Revoking the target falls back to synthesis instead of erroring: the
+        // catalog stays best-effort while inference still fails closed.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares
+                    SET owner_email = 'someone-else@example.com',
+                        free_access = 0,
+                        user_grants_json = '{}'
+                  WHERE share_id = 'share-pt-wild'",
+                [],
+            )
+            .expect("revoke passthrough target");
+        }
+        assert!(
+            store
+                .resolve_passthrough_model_list_route(&user_id, "owner@example.com", "codex")
+                .await
+                .expect("resolve revoked target")
                 .is_none()
         );
 

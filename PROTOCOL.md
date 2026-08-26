@@ -475,10 +475,12 @@ Server 通过签名接口 `POST /v1/share-request-logs/batch-sync` 上送同一 
 | `apiBaseUrl` | 当前区域统一入口，例如 `https://api.example.com` |
 | `enabled` | 当前用户是否至少配置一条 route；它不是区域 host 的部署开关 |
 | `revision` / `updatedAt` | 用户 profile 的乐观并发版本与最后修改时间 |
-| `routes[]` | 当前精确映射及稳定 route ID / 时间戳 |
+| `routes[]` | 当前映射（精确或 `*` 全量）及稳定 route ID / 时间戳 |
 | `eligibleShares[]` | 当前用户可选的 Owner、有效 ShareTo 或 Free Share，以及其已开启 App、直连 URL 和在线状态 |
 
-`PUT` body 是 `{ expectedRevision, routes }`，整组 routes 在一个 Immediate 事务中原子替换；revision 不匹配返回 `409 model_routing_revision_conflict`，不会部分保存。最多 100 条。映射键固定为 `(appType, requestedModel)`，其中 `appType` 只允许 `claude | codex | gemini`，模型名 trim 后长度为 1–200、禁止控制字符并按 Unicode 字符串精确区分大小写。同一键只能指向一个 Share。每次有效替换保存完整审计快照，并按用户只保留最近 100 个 revision，避免控制面反复保存造成无界存储增长。
+`PUT` body 是 `{ expectedRevision, routes }`，整组 routes 在一个 Immediate 事务中原子替换；revision 不匹配返回 `409 model_routing_revision_conflict`，不会部分保存。最多 100 条。映射键固定为 `(appType, requestedModel)`，其中 `appType` 只允许 `claude | codex | gemini`，模型名 trim 后长度为 1–200、禁止控制字符并按 Unicode 字符串精确区分大小写。同一键只能指向一个 Share。
+
+`requestedModel` 另接受保留值 `*`，表示该 `appType` 下**用户显式声明的全量路由**：任何未被精确映射命中的模型名都转发到该 Share。每个 `appType` 至多一条 `*`（由 `(appType, requestedModel)` 唯一键天然保证），`*` 与精确映射共用同一份 100 条上限。除恰好等于 `*` 外，`requestedModel` 不得包含 `*` 字符——`gpt-*`、`*-turbo`、`a*b` 一律返回 `400 user_model_route_model_pattern_unsupported`。Router 不提供前缀、后缀、通配段或正则匹配，`*` 是全量路由的唯一表示法。每次有效替换保存完整审计快照，并按用户只保留最近 100 个 revision，避免控制面反复保存造成无界存储增长。
 
 创建或改变目标时，Router 要求调用方当前对 Share 具备 Owner、active 且未过期的 canonical `role=shareto` grant，或 Share 已开启 `freeAccess`，同时目标必须绑定并开启所选 App。原封不动保留的旧映射允许随整组草稿保存，即使其 Share 已删除、权限已撤销或 App 已关闭；这是为了让用户删除或修复其他映射，不代表失效目标仍可调用。Share 删除不会级联删除映射。
 
@@ -496,15 +498,39 @@ x-goog-api-key: <router-user-api-key>
 
 | App | 统一 Host 允许的完整推理路径白名单 | requested model 来源 | 模型列表 |
 |---|---|---|---|
-| Claude | `POST /v1/messages` | JSON body 的非空字符串 `model` | `GET /v1/models` 且带 `anthropic-version` |
-| Codex/OpenAI | `POST /v1/responses`、`POST /v1/chat/completions`、`POST /v1/completions`、`POST /v1/images/generations` | JSON body 的非空字符串 `model` | `GET /v1/models`，不带 `anthropic-version` |
+| Claude | `POST /v1/messages`、`POST /v1/messages/count_tokens` | JSON body 的非空字符串 `model` | `GET /v1/models` 且带 `anthropic-version` |
+| Codex/OpenAI | `POST /v1/responses`、`POST /v1/chat/completions`、`POST /v1/completions`、`POST /v1/images/generations`、`POST /v1/embeddings` | JSON body 的非空字符串 `model` | `GET /v1/models`，不带 `anthropic-version` |
 | Gemini | `POST /v1beta/models/:model:{action}`、`POST /gemini/v1beta/models/:model:{action}`、`POST /v1/models/:model:{action}`；`action` 仅允许 `generateContent`、`streamGenerateContent`、`countTokens`、`embedContent`、`batchEmbedContents` | URL 中 `/models/` 后、动作冒号前的模型段做 UTF-8 percent decode 后得到的非空值 | `GET /v1beta/models` 或 `/gemini/v1beta/models` |
 
 上述表格是穷举白名单，不是示例或前缀匹配规则。即使某条路径可在 Share 直连入口使用，只要没有列在这里，也不能经统一 Host 转发。
 
-Router 先从协议路径确定 App，再用 `(user_id, app, exact requested model)` 查询唯一目标。没有映射直接失败；绝不做模型改写、默认 Share、按在线状态选 Share、模糊/大小写匹配、fallback 或跨 Share retry。找到映射后仍在当前数据库快照中重新检查 Share 存在性、App 开启状态和用户 ACL，再确认相同 Share ID 的活动内存路由，最后把请求交给既有 `proxy_handler`。后者会再次执行 Share edge ACL、并发、请求体限制、IngressContext、流式生命周期和响应清洗。
+白名单的收录标准是**能否确定性地提取出模型名**，因为统一 Host 靠模型名选路——提取不到就无从决定转发给哪个 Share。据此：
 
-模型列表只枚举该用户为对应 App 配置的 requested model 名称并使用供应商兼容 envelope；它不汇总 Share 的上游模型 catalog，也不代表目标此刻在线或仍获授权。真正调用始终按上一段重新校验并 fail closed。
+- 推理与其辅助端点只要请求体带必填 `model`（如 `count_tokens`、`embeddings`），就应当收录，它们在直连入口可用、在统一入口也必须可用；
+- 模型名可选或根本不存在的端点（`multipart` 音频与图像编辑、`model` 可省略的审核端点）不收录。强行收录只会把直连能成功的请求变成统一入口的 400，反而扩大而非缩小两个入口的差距；
+- Share 的 Web 路径与 `/_share-router/**` 控制面**永不**收录。它们不是推理端点，且统一 Host 是纯 API Key 入口，不得从这里暴露控制面。
+
+Router 先从协议路径确定 App，再用 `(user_id, app, requested model)` 在单次查询内按固定优先级取唯一目标：
+
+1. `requested_model` 精确相等的映射；
+2. 该 App 下用户显式配置的 `*` 全量路由。
+
+优先级是静态的、一次查询即定终局的确定性选路，不是失败后的回退：第 1 级命中时第 2 级不参与，第 1 级未命中时也不存在“先试再退”的过程。两级都没有映射直接失败。
+
+无论命中哪一级，转发给 Share 的模型名**恒等于**客户端请求的模型名——Router 不改写请求体中的 `model`，由目标 Share 自行决定固定上游或继续透传。除用户显式写入的 `*` 记录外，绝不做模型改写、系统推断的默认 Share、按在线状态选 Share、前缀/后缀/正则/大小写不敏感匹配、fallback 或跨 Share retry。`*` 命中的请求与精确命中走完全相同的 Share 存在性、App 开启状态、用户 ACL 与活动路由校验，同样 fail closed。找到映射后仍在当前数据库快照中重新检查 Share 存在性、App 开启状态和用户 ACL，再确认相同 Share ID 的活动内存路由，最后把请求交给既有 `proxy_handler`。后者会再次执行 Share edge ACL、并发、请求体限制、IngressContext、流式生命周期和响应清洗。
+
+模型列表分两种模式，取决于该用户在该 App 下的路由配置形态。
+
+**透传模式**——当该 App 下**有且仅有**一条 `*` 全量路由（没有任何精确路由），且该目标 Share 通过与上一段**完全相同**的实时校验时，这个入口在该 App 上就是目标 Share 的纯转发层。此时模型列表请求按推理请求同样的方式改写 Host 并交给 `proxy_handler`，由目标 Share 返回其真实 catalog，Router 不解析、不重排、不合成 envelope。客户端因此拿到与直连该 Share 完全一致的响应，包括供应商自有字段。目标 Share 离线或隧道重连时，返回的错误也与直连该 Share 时一致。
+
+**合成模式**——其余所有情况（存在精确路由，或没有 `*` 路由，或 `*` 目标未通过实时校验）。此时没有任何单一上游能代表这个入口，Router 使用供应商兼容 envelope，按下列规则枚举并去重后按名称升序：
+
+1. 该用户为对应 App 配置的**精确** requested model 名称；
+2. 若该 App 存在 `*` 全量路由且其目标通过实时校验，追加该 Share 在模型健康探测中记录过的模型名。
+
+保留值 `*` **绝不出现在模型列表中**——它不是可调用的模型名，客户端不得将其选中。第 1 类是用户自己写下的字符串，不泄漏任何信息；第 2 类属于目标 Share，因此撤权、关闭该 App 或删除 Share 后必须立即从列表中消失。第 2 类同时是尽力而为：目标从未被探测时该部分为空，列表可能只含第 1 类甚至为空，这不是错误，也不影响 `*` 路由对任意模型名的实际转发能力。合成模式下的列表不汇总 Share 的完整上游 catalog，也不代表目标此刻在线。
+
+两种模式下真正调用都始终按上一段重新校验并 fail closed。模式的选择只取决于路由配置形态，不取决于目标此刻是否在线——透传模式不会因为目标离线就退回合成模式，否则同一份配置会因为上游抖动而返回两种语义不同的列表。
 
 选中 Share 后，请求与直连走同一 Share 数据路径。Server 和日志不获得独立的“统一入口资源”身份；请求记录、usage、并发、地图归因、模型健康、限额及市场账务仍落在目标 Share。首页地图和 Share 侧边栏因此保持 Share 粒度。
 
@@ -521,7 +547,8 @@ Router 先从协议路径确定 App，再用 `(user_id, app, exact requested mod
 | 408 | `user_model_route_request_body_timeout` | 请求体读取超时 |
 | 413 | `user_model_route_request_body_too_large` | 命中 Router 对应请求体上限 |
 | 422 | `user_model_route_model_required` | 无法取得非空 requested model |
-| 404 | `user_model_route_not_configured` | 精确键没有映射 |
+| 400 | `user_model_route_model_pattern_unsupported` | 配置的模型名含 `*` 但不等于 `*`；Router 不支持模式匹配 |
+| 404 | `user_model_route_not_configured` | 精确键与该 App 的 `*` 全量路由都没有映射 |
 | 403 | `user_model_route_unauthorized` | 映射目标的用户权限已失效 |
 | 409 | `user_model_route_app_unavailable` | 目标不再绑定或开启该 App |
 | 503 | `user_model_route_target_unavailable` | Share 记录、subdomain 或活动路由不可用 |

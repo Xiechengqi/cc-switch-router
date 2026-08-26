@@ -4,13 +4,21 @@ import {
   buildUnifiedModelCurl,
   canonicalModelRoutes,
   clientBelongsToViewer,
+  firstShareForProtocol,
+  groupModelRoutesByProtocol,
+  hasWildcardForApp,
+  isWildcardModel,
+  isPassthroughOnlyApp,
   clientListTabFromQuery,
   configuredEligibleRouteShareIds,
   consumeModelRouteDeepLink,
   modelRouteDeepLinkShareId,
   patchDraftModelRoute,
+  protocolSlotMode,
   searchForClientListTab,
+  sharesForProtocol,
   validateModelRoutes,
+  WILDCARD_MODEL,
   type DraftModelRoute,
 } from "@/lib/model-routing";
 import type {
@@ -226,4 +234,150 @@ test("mine membership accepts owners, live ShareTo grants, and explicitly routed
     clientBelongsToViewer(client, shareById, "free-user@example.com", new Set(["free"]), 3_000),
     true,
   );
+});
+
+test("the standalone wildcard is accepted but partial patterns are not", () => {
+  assert.equal(
+    validateModelRoutes([
+      { appType: "codex", requestedModel: "gpt-5.6-sol", targetShareId: "share-codex" },
+      { appType: "codex", requestedModel: WILDCARD_MODEL, targetShareId: "share-claude" },
+    ]),
+    null,
+  );
+
+  // Anything else containing `*` must be refused, otherwise the catch-all would
+  // read as prefix/suffix matching the Router deliberately does not implement.
+  for (const pattern of ["gpt-*", "*-turbo", "a*b", "**"]) {
+    assert.equal(
+      validateModelRoutes([
+        { appType: "codex", requestedModel: pattern, targetShareId: "share-codex" },
+      ]),
+      "pattern",
+      `${pattern} must be rejected`,
+    );
+  }
+
+  // One wildcard per app: a second one for the same app is an ordinary duplicate.
+  assert.equal(
+    validateModelRoutes([
+      { appType: "codex", requestedModel: WILDCARD_MODEL, targetShareId: "share-codex" },
+      { appType: "codex", requestedModel: WILDCARD_MODEL, targetShareId: "share-claude" },
+    ]),
+    "duplicate",
+  );
+  assert.equal(
+    validateModelRoutes([
+      { appType: "codex", requestedModel: WILDCARD_MODEL, targetShareId: "share-codex" },
+      { appType: "claude", requestedModel: WILDCARD_MODEL, targetShareId: "share-claude" },
+    ]),
+    null,
+  );
+});
+
+test("wildcard helpers ignore surrounding whitespace and stay per-app", () => {
+  assert.equal(isWildcardModel(" * "), true);
+  assert.equal(isWildcardModel("gpt-*"), false);
+  assert.equal(isWildcardModel(""), false);
+
+  const routes = [
+    { appType: "codex" as const, requestedModel: "*", targetShareId: "share-codex" },
+    { appType: "claude" as const, requestedModel: "opus", targetShareId: "share-claude" },
+  ];
+  assert.equal(hasWildcardForApp(routes, "codex"), true);
+  assert.equal(hasWildcardForApp(routes, "claude"), false);
+  assert.equal(hasWildcardForApp(routes, "gemini"), false);
+});
+
+test("wildcard routes render curl with a placeholder instead of the reserved token", () => {
+  // `model: "*"` would be forwarded verbatim and rejected upstream, so the
+  // sample must never suggest it as a callable model name.
+  const codex = buildUnifiedModelCurl("https://api.example.com", "sk-test", {
+    appType: "codex",
+    requestedModel: WILDCARD_MODEL,
+  });
+  assert.match(codex, /"model":"<MODEL>"/);
+  assert.ok(!codex.includes('"model":"*"'));
+
+  const gemini = buildUnifiedModelCurl("https://api.example.com", "sk-test", {
+    appType: "gemini",
+    requestedModel: WILDCARD_MODEL,
+  });
+  assert.match(gemini, /\/v1beta\/models\/<MODEL>:generateContent/);
+
+  // Exact routes keep percent-encoding their real model name.
+  const exact = buildUnifiedModelCurl("https://api.example.com", "sk-test", {
+    appType: "gemini",
+    requestedModel: "gemini/pro",
+  });
+  assert.match(exact, /gemini%2Fpro:generateContent/);
+});
+
+test("wildcards sort ahead of exact keys so canonical drafts stay stable", () => {
+  const canonical = canonicalModelRoutes([
+    { appType: "codex", requestedModel: "gpt-5.6-sol", targetShareId: "share-a" },
+    { appType: "codex", requestedModel: " * ", targetShareId: "share-c" },
+    { appType: "claude", requestedModel: "*", targetShareId: "share-d" },
+  ]);
+  assert.deepEqual(
+    canonical.map((route) => `${route.appType}:${route.requestedModel}`),
+    ["claude:*", "codex:*", "codex:gpt-5.6-sol"],
+  );
+});
+
+test("pure passthrough is a lone wildcard, and any exact route ends it", () => {
+  const wildcard = { appType: "codex" as const, requestedModel: "*", targetShareId: "share-c", clientId: "1" };
+  const exact = { appType: "codex" as const, requestedModel: "gpt-5.6-sol", targetShareId: "share-a", clientId: "2" };
+  const otherApp = { appType: "claude" as const, requestedModel: "claude-opus-5", targetShareId: "share-b", clientId: "3" };
+
+  assert.equal(isPassthroughOnlyApp([wildcard], "codex"), true);
+  // Another app's routes are irrelevant to this app's shape.
+  assert.equal(isPassthroughOnlyApp([wildcard, otherApp], "codex"), true);
+  // One exact route alongside it and no single upstream represents the entry point.
+  assert.equal(isPassthroughOnlyApp([wildcard, exact], "codex"), false);
+  assert.equal(isPassthroughOnlyApp([exact], "codex"), false);
+  assert.equal(isPassthroughOnlyApp([], "codex"), false);
+  // The app with no wildcard is never passthrough, even when another one is.
+  assert.equal(isPassthroughOnlyApp([wildcard, otherApp], "claude"), false);
+});
+
+test("protocol slots keep one passthrough and many exact models without emitting empty apps", () => {
+  const routes: DraftModelRoute[] = [
+    { clientId: "w", appType: "codex", requestedModel: "*", targetShareId: "share-a" },
+    { clientId: "e", appType: "codex", requestedModel: "gpt-5.5", targetShareId: "share-b" },
+    { clientId: "c", appType: "claude", requestedModel: "opus", targetShareId: "share-c" },
+  ];
+  const slots = groupModelRoutesByProtocol(routes);
+  assert.deepEqual(slots.map((slot) => slot.appType), ["claude", "codex", "gemini"]);
+  assert.equal(protocolSlotMode(slots[0]), "exact");
+  assert.equal(protocolSlotMode(slots[1]), "mixed");
+  assert.equal(protocolSlotMode(slots[2]), "empty");
+  assert.equal(slots[1].passthrough?.targetShareId, "share-a");
+  assert.deepEqual(slots[1].exact.map((route) => route.requestedModel), ["gpt-5.5"]);
+  assert.equal(slots[2].passthrough, null);
+  assert.deepEqual(slots[2].exact, []);
+
+  const saved = canonicalModelRoutes([
+    ...slots.flatMap((slot) => [
+      ...(slot.passthrough ? [slot.passthrough] : []),
+      ...slot.exact,
+    ]),
+  ]);
+  assert.deepEqual(
+    saved.map((route) => `${route.appType}:${route.requestedModel}`),
+    ["claude:opus", "codex:*", "codex:gpt-5.5"],
+  );
+});
+
+test("protocol share pickers stay inside the enabled app and prefer the first eligible Share", () => {
+  const mixed: UserModelRoutingShare[] = [
+    { ...shares[1], shareId: "share-multi", apps: ["claude", "codex"] },
+    shares[0],
+    shares[1],
+  ];
+  assert.deepEqual(
+    sharesForProtocol(mixed, "codex").map((share) => share.shareId),
+    ["share-multi", "share-codex"],
+  );
+  assert.equal(firstShareForProtocol(mixed, "gemini"), null);
+  assert.equal(firstShareForProtocol(mixed, "claude")?.shareId, "share-multi");
 });

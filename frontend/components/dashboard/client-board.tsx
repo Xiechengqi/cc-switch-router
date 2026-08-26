@@ -929,12 +929,14 @@ export function ClientBoard({
     return () => window.removeEventListener("pointerdown", onPointerDown);
   }, [filtersOpen]);
 
+  const [hubForceExpanded, setHubForceExpanded] = React.useState(false);
   const addModelRouteForShare = React.useCallback((shareId: string) => {
     if (modelRouting.routes.length >= MAX_USER_MODEL_ROUTES) {
       toast.danger(t("modelHub.validationTooMany"));
       return;
     }
     modelRouting.addRouteForShare(shareId);
+    setHubForceExpanded(true);
     window.requestAnimationFrame(() => {
       document.getElementById("model-hub")?.scrollIntoView({
         behavior: preferredScrollBehavior(),
@@ -1112,7 +1114,7 @@ export function ClientBoard({
       </div>
 
       {statusFilter === "mine" ? (
-        <ModelHubPanel controller={modelRouting} />
+        <ModelHubPanel controller={modelRouting} forceExpanded={hubForceExpanded} />
       ) : null}
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">

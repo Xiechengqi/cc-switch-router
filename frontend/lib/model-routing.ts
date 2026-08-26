@@ -9,6 +9,14 @@ import type {
 import { shellQuote } from "@/lib/share-model-probe";
 
 export const MAX_USER_MODEL_ROUTES = 100;
+/**
+ * Reserved `requestedModel` value meaning "every model for this app".
+ *
+ * Deliberately all-or-nothing: the Router accepts `*` on its own but rejects any
+ * other model name containing `*`, so a catch-all can never degrade into prefix
+ * or regex matching. Exact routes always win over it.
+ */
+export const WILDCARD_MODEL = "*";
 export const CLIENT_LIST_TABS = [
   "mine",
   "all",
@@ -23,7 +31,97 @@ export type DraftModelRoute = UserModelRouteInput & { clientId: string };
 export type ModelRouteValidationError =
   | "required"
   | "duplicate"
-  | "too_many";
+  | "too_many"
+  | "pattern";
+export const MODEL_ROUTING_PROTOCOLS = ["claude", "codex", "gemini"] as const;
+export type ModelRoutingProtocol = (typeof MODEL_ROUTING_PROTOCOLS)[number];
+export type ModelRoutingProtocolMode =
+  | "empty"
+  | "passthrough"
+  | "exact"
+  | "mixed";
+
+export type ModelRoutingProtocolSlot = {
+  appType: ModelRoutingProtocol;
+  passthrough: DraftModelRoute | null;
+  exact: DraftModelRoute[];
+};
+
+export function protocolSlotMode(
+  slot: Pick<ModelRoutingProtocolSlot, "passthrough" | "exact">,
+): ModelRoutingProtocolMode {
+  if (slot.passthrough && slot.exact.length) return "mixed";
+  if (slot.passthrough) return "passthrough";
+  if (slot.exact.length) return "exact";
+  return "empty";
+}
+
+export function groupModelRoutesByProtocol(
+  routes: DraftModelRoute[],
+): ModelRoutingProtocolSlot[] {
+  return MODEL_ROUTING_PROTOCOLS.map((appType) => {
+    const forApp = routes.filter((route) => route.appType === appType);
+    const passthrough = forApp.find((route) => isWildcardModel(route.requestedModel)) || null;
+    const exact = forApp.filter((route) => !isWildcardModel(route.requestedModel));
+    return { appType, passthrough, exact };
+  });
+}
+
+export function sharesForProtocol(
+  shares: UserModelRoutingShare[],
+  appType: ModelRoutingApp,
+) {
+  return shares.filter((share) => share.apps.includes(appType));
+}
+
+export function firstShareForProtocol(
+  shares: UserModelRoutingShare[],
+  appType: ModelRoutingApp,
+) {
+  return sharesForProtocol(shares, appType)[0] || null;
+}
+
+export function newDraftModelRoute(
+  appType: ModelRoutingApp,
+  requestedModel: string,
+  targetShareId: string,
+): DraftModelRoute {
+  const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  return {
+    clientId: `new:${id}`,
+    appType,
+    requestedModel,
+    targetShareId,
+  };
+}
+
+export function isWildcardModel(requestedModel: string) {
+  return requestedModel.trim() === WILDCARD_MODEL;
+}
+
+/**
+ * True when this app is a *pure passthrough*: a single `*` route and nothing
+ * else. The Router treats that shape specially — the unified entry point becomes
+ * a plain forwarding layer for that Share, so `GET /v1/models` is forwarded to
+ * it and returns its real catalog instead of a synthesised list. Adding any
+ * exact route takes the app out of this mode. See PROTOCOL.md 9.2.
+ */
+export function isPassthroughOnlyApp(
+  routes: Array<UserModelRouteInput | DraftModelRoute>,
+  appType: ModelRoutingApp,
+) {
+  const forApp = routes.filter((route) => route.appType === appType);
+  return forApp.length === 1 && isWildcardModel(forApp[0].requestedModel);
+}
+
+export function hasWildcardForApp(
+  routes: Array<UserModelRouteInput | DraftModelRoute>,
+  appType: ModelRoutingApp,
+) {
+  return routes.some(
+    (route) => route.appType === appType && isWildcardModel(route.requestedModel),
+  );
+}
 
 export function buildUnifiedModelCurl(
   baseUrlValue: string,
@@ -32,7 +130,10 @@ export function buildUnifiedModelCurl(
 ) {
   const baseUrl = baseUrlValue.replace(/\/+$/, "");
   const apiKey = token || "<YOUR_API_KEY>";
-  const model = route?.requestedModel.trim() || "<MODEL>";
+  // A wildcard route has no callable model name of its own — it forwards
+  // whatever the client asks for — so the sample stays a placeholder.
+  const requested = route?.requestedModel.trim() || "";
+  const model = !requested || requested === WILDCARD_MODEL ? "<MODEL>" : requested;
   let url = `${baseUrl}/v1/responses`;
   let authHeader = `Authorization: Bearer ${apiKey}`;
   let body: unknown = { model, input: "Hello" };
@@ -46,9 +147,7 @@ export function buildUnifiedModelCurl(
       messages: [{ role: "user", content: "Hello" }],
     };
   } else if (route?.appType === "gemini") {
-    const wireModel = route.requestedModel.trim()
-      ? encodeURIComponent(model)
-      : model;
+    const wireModel = model === "<MODEL>" ? model : encodeURIComponent(model);
     url = `${baseUrl}/v1beta/models/${wireModel}:generateContent`;
     authHeader = `x-goog-api-key: ${apiKey}`;
     body = { contents: [{ parts: [{ text: "Hello" }] }] };
@@ -92,6 +191,15 @@ export function validateModelRoutes(
     )
   ) {
     return "required";
+  }
+  if (
+    normalized.some(
+      (route) =>
+        route.requestedModel !== WILDCARD_MODEL &&
+        route.requestedModel.includes(WILDCARD_MODEL),
+    )
+  ) {
+    return "pattern";
   }
   const keys = new Set(
     normalized.map(
