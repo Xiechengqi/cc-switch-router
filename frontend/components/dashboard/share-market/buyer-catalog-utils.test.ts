@@ -97,7 +97,7 @@ test("provider panel reproduces quota, provider identity and enabled app model r
   );
   assert.match(view.primaryLine, /Plus/);
   assert.match(view.primaryLine, /weekly 55%/i);
-  assert.equal(view.identityLine, "OpenAI Official · codex_oauth");
+  assert.equal(view.identityLine, "p***@example.com");
   assert.match(view.modelsLine, /Claude: grok-4\.6/);
   assert.match(view.modelsLine, /Codex: gpt-5/);
   assert.match(view.toneClassName, /emerald/);
@@ -121,7 +121,7 @@ test("provider panel keeps degraded and API providers safe", () => {
     { unknown: "Unknown", passthrough: "Passthrough" },
   );
   assert.equal(view.primaryLine, "Private API");
-  assert.equal(view.identityLine, "Private API · openai_compatible");
+  assert.equal(view.identityLine, "-");
   assert.match(view.toneClassName, /amber/);
   assert.doesNotMatch(JSON.stringify(view), /https?:\/\//);
 });
@@ -195,7 +195,7 @@ test("provider panel survives omitted models on passthrough listings", () => {
   );
 
   assert.equal(view.modelsLine, "Claude: Passthrough");
-  assert.equal(view.identityLine, "Claude OAuth · claude_oauth");
+  assert.equal(view.identityLine, "Claude OAuth");
   assert.equal(view.primaryLine, "Claude Pro");
 });
 
@@ -216,7 +216,7 @@ test("provider panel survives omitted models on fixed listings without an upstre
   );
 
   assert.equal(view.modelsLine, "Codex: Unknown");
-  assert.equal(view.identityLine, "OpenAI Official · codex_oauth");
+  assert.equal(view.identityLine, "OpenAI Official");
 });
 
 test("contract integrity reasons are localized without exposing internal codes", () => {

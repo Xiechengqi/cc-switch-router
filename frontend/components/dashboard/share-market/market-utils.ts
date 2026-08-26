@@ -4,6 +4,7 @@ import { formatUsdMoney } from "@/lib/market-money";
 import {
   isApiProviderRuntime,
   providerQuotaStatusLine,
+  providerStatusIdentity,
 } from "@/components/dashboard/share-dashboard-utils";
 import {
   marketProviderHealthTone,
@@ -273,11 +274,7 @@ export function marketProviderStatusView(
   const runtime = marketCapabilityRuntime(primary);
   const isApiProvider =
     primary.providerFamily === "api" || isApiProviderRuntime(runtime);
-  const providerIdentity = [primary.providerName, primary.providerType]
-    .map((value) => value?.trim())
-    .filter((value): value is string => Boolean(value))
-    .filter((value, index, values) => values.indexOf(value) === index)
-    .join(" · ");
+  const accountLine = providerStatusIdentity(runtime);
   const modelsLine = CORE_SHARE_APPS.flatMap((app) => {
     const item = capabilities.find((capability) => capability.app === app);
     return item
@@ -296,7 +293,7 @@ export function marketProviderStatusView(
     primaryLine: isApiProvider
       ? primary.providerName || primary.providerType || labels.unknown
       : providerQuotaStatusLine(runtime, locale),
-    identityLine: providerIdentity || "-",
+    identityLine: isApiProvider ? "-" : accountLine,
     modelsLine:
       modelsLine || capabilityModelLabel(primary, labels.passthrough, labels.unknown),
     toneClassName: marketProviderHealthTone(healthState),
