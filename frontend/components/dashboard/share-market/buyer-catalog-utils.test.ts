@@ -53,7 +53,7 @@ const capability = (
 test("provider panel prefers a capability with public account status", () => {
   const detailed = capability({
     app: "codex",
-    accountHint: "p***@example.com",
+    accountHint: "private@example.com",
     quota: {
       status: "ok",
       plan: "Plus",
@@ -75,7 +75,7 @@ test("provider panel reproduces quota, provider identity and enabled app model r
       supportedApps: ["claude", "codex"],
       appCapabilities: [
         capability({
-          accountHint: "p***@example.com",
+          accountHint: "private@example.com",
           quota: {
             status: "ok",
             plan: "Plus",
@@ -97,7 +97,7 @@ test("provider panel reproduces quota, provider identity and enabled app model r
   );
   assert.match(view.primaryLine, /Plus/);
   assert.match(view.primaryLine, /weekly 55%/i);
-  assert.equal(view.identityLine, "p***@example.com");
+  assert.equal(view.identityLine, "private@example.com");
   assert.match(view.modelsLine, /Claude: grok-4\.6/);
   assert.match(view.modelsLine, /Codex: gpt-5/);
   assert.match(view.toneClassName, /emerald/);

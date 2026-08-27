@@ -2412,20 +2412,6 @@ fn first_nonempty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Opti
         .map(str::to_string)
 }
 
-fn public_account_hint<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
-    let account = values
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|value| !value.is_empty())?;
-    let (local, domain) = account.split_once('@')?;
-    let first = local.chars().next()?;
-    if domain.trim().is_empty() {
-        return None;
-    }
-    Some(format!("{first}***@{domain}"))
-}
-
 fn public_provider_quota(
     quota: Option<&crate::models::ShareUpstreamQuota>,
     subscription_period_end: Option<&str>,
@@ -2797,7 +2783,7 @@ fn public_app_capabilities(
                             ),
                     )
                 },
-                account_hint: public_account_hint([
+                account_hint: first_nonempty([
                     runtime.and_then(|value| value.account_email.as_deref()),
                     bound_provider.and_then(|value| value.account_email.as_deref()),
                 ]),
@@ -13439,17 +13425,20 @@ mod tests {
         assert_eq!(capability.models, ["gpt-secret"]);
         assert_eq!(capability.available, Some(true));
         assert_eq!(capability.health_state, "healthy");
-        assert_eq!(capability.account_hint.as_deref(), Some("s***@example.com"));
+        assert_eq!(
+            capability.account_hint.as_deref(),
+            Some("secret-account@example.com")
+        );
 
         let public_json = serde_json::to_string(&capabilities).expect("encode public capability");
-        assert!(!public_json.contains("secret-account@example.com"));
+        assert!(public_json.contains("secret-account@example.com"));
         assert!(!public_json.contains("https://secret.invalid/v1"));
         assert!(!public_json.contains("accountEmail"));
         assert!(!public_json.contains("apiUrl"));
     }
 
     #[test]
-    fn public_capabilities_include_structured_quota_without_exposing_full_identity() {
+    fn public_capabilities_include_structured_quota_and_full_account_email() {
         let bindings = serde_json::json!({ "codex": "openai-provider" }).to_string();
         let runtimes_json = serde_json::json!({
             "codex": {
@@ -13479,7 +13468,7 @@ mod tests {
         let capabilities = public_app_capabilities(&bindings, Some(&runtimes_json), None, "codex");
         let capability = &capabilities[0];
         let quota = capability.quota.as_ref().expect("public quota");
-        assert_eq!(capability.account_hint.as_deref(), Some("p***@example.com"));
+        assert_eq!(capability.account_hint.as_deref(), Some("private@example.com"));
         assert_eq!(capability.health_state, "healthy");
         assert_eq!(quota.status.as_deref(), Some("ok"));
         assert_eq!(quota.plan.as_deref(), Some("Plus"));
@@ -13487,7 +13476,7 @@ mod tests {
         assert_eq!(quota.tiers[0].utilization, 0.55);
 
         let public_json = serde_json::to_string(capability).expect("encode public capability");
-        assert!(!public_json.contains("private@example.com"));
+        assert!(public_json.contains("private@example.com"));
         assert!(!public_json.contains("accountEmail"));
         assert!(!public_json.contains("apiUrl"));
     }
