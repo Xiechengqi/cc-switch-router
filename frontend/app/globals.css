@@ -37,6 +37,8 @@
 
 :root {
   --font-inter: "Segoe UI", "Helvetica Neue", Arial;
+  /* System CJK fallbacks by default. next/font injects the real Noto Sans SC
+     face as --font-noto-sans-sc-face on <html>; Chinese locale activates it. */
   --font-noto-sans-sc: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei";
   --font-jetbrains: "SFMono-Regular", Menlo, Monaco, Consolas;
   --font-source-code-pro: "SFMono-Regular", Menlo, Monaco, Consolas;
@@ -94,6 +96,15 @@
   outline-offset: 2px;
 }
 
+/* Chinese locale: put the loaded Noto Sans SC face first. English keeps the
+   Latin stack; mixed CJK still falls through to system fonts. Mono is unchanged. */
+html[lang="zh-CN"] {
+  --font-noto-sans-sc: var(--font-noto-sans-sc-face), "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei";
+  --font-sans: var(--font-noto-sans-sc), var(--font-inter), system-ui, sans-serif;
+  --font-display: var(--font-noto-sans-sc), var(--font-inter), system-ui, sans-serif;
+}
+
 * {
   border-color: rgb(var(--router-border));
 }
@@ -111,8 +122,7 @@ body {
   background: rgb(var(--router-background));
   color: rgb(var(--router-foreground));
   color-scheme: light;
-  font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
-    "Microsoft YaHei", system-ui, sans-serif;
+  font-family: var(--font-sans);
   font-synthesis: none;
   font-variant-numeric: tabular-nums;
   text-rendering: optimizeLegibility;
@@ -217,7 +227,7 @@ button,
 input,
 textarea,
 select {
-  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-family: var(--font-sans);
   font-variant-numeric: tabular-nums;
 }
 
@@ -389,8 +399,7 @@ textarea:-webkit-autofill:focus {
 
 
 .font-display {
-  font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
-    "Microsoft YaHei", system-ui, sans-serif !important;
+  font-family: var(--font-display) !important;
   font-weight: 700;
   letter-spacing: 0;
 }
@@ -493,8 +502,7 @@ textarea:-webkit-autofill:focus {
   background: transparent !important;
   box-shadow: none !important;
   padding: 0 !important;
-  font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
-    "Microsoft YaHei", system-ui, sans-serif !important;
+  font-family: var(--font-display) !important;
   font-size: 1.25rem !important;
   font-weight: 600 !important;
   letter-spacing: 0;
@@ -523,7 +531,7 @@ textarea:-webkit-autofill:focus {
   border-radius: 0.375rem;
   background: rgb(var(--router-card));
   color: rgb(var(--router-foreground));
-  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-family: var(--font-sans);
   font-size: 0.75rem;
   font-weight: 500;
   box-shadow: none;
@@ -544,7 +552,7 @@ textarea:-webkit-autofill:focus {
 
 .select__value {
   color: rgb(var(--router-foreground));
-  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-family: var(--font-sans);
   font-weight: 500;
 }
 
@@ -563,7 +571,7 @@ textarea:-webkit-autofill:focus {
 
 .select__popover .listbox {
   padding: 0.3rem;
-  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-family: var(--font-sans);
   font-size: 0.75rem;
 }
 
