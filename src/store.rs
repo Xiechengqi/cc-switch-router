@@ -81,8 +81,7 @@ use crate::models::{
     TunnelStateResponse, UpgradeInstallationStatusResponse, UserApiTokenResetResponse,
     UserApiTokenResponse, UserApiTokenStatus, UserModelRouteInput, UserModelRouteView,
     UserModelRoutingResponse, UserModelRoutingShareCapability, UserModelRoutingShareView,
-    UserShareView, UserSharesResponse,
-    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -19575,6 +19574,25 @@ fn parse_share_bindings(
     })
 }
 
+#[derive(Debug)]
+struct CanonicalShareUserGrantsDecodeError(serde_json::Error);
+
+impl std::fmt::Display for CanonicalShareUserGrantsDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "parse canonical Share user grants failed: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CanonicalShareUserGrantsDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 fn parse_share_user_grants(
     value: Option<String>,
 ) -> Result<BTreeMap<String, ShareUserGrant>, crate::db::Error> {
@@ -19585,7 +19603,11 @@ fn parse_share_user_grants(
         return Ok(BTreeMap::new());
     }
     serde_json::from_str(&value).map_err(|err| {
-        crate::db::Error::FromSqlConversionFailure(0, crate::db::types::Type::Text, Box::new(err))
+        crate::db::Error::FromSqlConversionFailure(
+            0,
+            crate::db::types::Type::Text,
+            Box::new(CanonicalShareUserGrantsDecodeError(err)),
+        )
     })
 }
 
@@ -24876,9 +24898,8 @@ fn user_model_routing_share_capability(
         runtime.and_then(|value| value.subscription_level.clone()),
         bound_provider.and_then(|provider| provider.subscription_level.clone()),
         runtime.and_then(|value| value.quota.as_ref().and_then(|quota| quota.plan.clone())),
-        bound_provider.and_then(|provider| {
-            provider.quota.as_ref().and_then(|quota| quota.plan.clone())
-        }),
+        bound_provider
+            .and_then(|provider| provider.quota.as_ref().and_then(|quota| quota.plan.clone())),
     ]);
     let quota = runtime
         .and_then(|value| value.quota.clone())
@@ -28079,6 +28100,66 @@ mod tests {
             .await
             .expect("list canonical user's Shares");
         assert_eq!(buyer_visible.shares.len(), 1);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn malformed_canonical_user_grants_fail_closed_without_legacy_acl_fallback() {
+        let (store, config) = setup_store("malformed-canonical-user-grants").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-malformed-grants",
+            "malformed-grants-sub",
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares
+                 SET user_grants_json = '{',
+                     shared_with_emails_json = '[\"attacker@example.com\"]'
+                 WHERE share_id = ?1",
+                params!["share-malformed-grants"],
+            )
+            .expect("seed malformed canonical grants and stale legacy ACL");
+        }
+
+        let invoke_error = store
+            .user_can_invoke_share(
+                "attacker@example.com",
+                "share-malformed-grants",
+                Some("codex"),
+            )
+            .await
+            .expect_err("malformed canonical grants must not authorize invocation");
+        assert!(
+            invoke_error
+                .to_string()
+                .contains("parse canonical Share user grants failed"),
+            "unexpected invoke error: {invoke_error}"
+        );
+
+        let active_subdomains = HashSet::new();
+        let inflight_by_share = HashMap::new();
+        let list_error = store
+            .list_user_shares(
+                &config,
+                "attacker@example.com",
+                &active_subdomains,
+                &inflight_by_share,
+            )
+            .await
+            .expect_err("malformed canonical grants must fail Share listing closed");
+        assert!(
+            list_error
+                .to_string()
+                .contains("parse canonical Share user grants failed"),
+            "unexpected list error: {list_error}"
+        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }
