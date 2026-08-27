@@ -15,7 +15,11 @@ import type {
   ShareUserPolicy,
   ShareUserUsageEditMap,
 } from "@/lib/types";
-import { routerShareMarketManagedEmails } from "@/lib/share-settings";
+import {
+  isRevokedRouterShareMarketGrant,
+  ordinaryShareUserGrant,
+  routerShareMarketManagedEmails,
+} from "@/lib/share-settings";
 import {
   formatTokenMillions,
   millionsInputToTokens,
@@ -383,7 +387,7 @@ export function ShareUserGrantsEditor({
       (editingEmail && shareMarketManagedEmails.has(editingEmail)) ||
       (!editingEmail && shareMarketManagedEmails.has(email))
     ) {
-      setError(t("dashboard.userLimit.duplicateEmail"));
+      setError(t("dashboard.userLimit.marketManagedEmail"));
       return;
     }
     if (!editingEmail && value[email]?.active !== false && value[email]) {
@@ -404,10 +408,11 @@ export function ShareUserGrantsEditor({
       return;
     }
     const previous = value[editingEmail || email];
+    const reuseMarketTombstone = isRevokedRouterShareMarketGrant(previous);
     const consumedTokens = grantDraft.consumedTokens.trim()
       ? millionsInputToTokens(grantDraft.consumedTokens)
       : undefined;
-    const observedTokens = previous ? observedGrantTokens(previous) : 0;
+    const observedTokens = previous && !reuseMarketTombstone ? observedGrantTokens(previous) : 0;
     const usageInvalid =
       grantDraft.usageAction === "set" &&
       (consumedTokens == null ||
@@ -423,19 +428,13 @@ export function ShareUserGrantsEditor({
       );
       return;
     }
-    const next: ShareUserGrant = {
-      ...previous,
-      email,
-      role: email === normalizedOwner ? "owner" : "shareto",
-      active: true,
-      policy: {
-        parallelLimit,
-        tokenLimit: tokenLimit ?? undefined,
-        tokenPeriod: grantDraft.tokenPeriod,
-        tokenPeriodAnchorAtMs,
-        expiresAt,
-      },
-    };
+    const next: ShareUserGrant = ordinaryShareUserGrant(email, normalizedOwner, previous, {
+      parallelLimit,
+      tokenLimit: tokenLimit ?? undefined,
+      tokenPeriod: grantDraft.tokenPeriod,
+      tokenPeriodAnchorAtMs,
+      expiresAt,
+    });
     if (grantDraft.usageAction === "set" && consumedTokens != null) {
       const previousQuota = previous?.usageQuota;
       next.usageQuota = {

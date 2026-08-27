@@ -6,7 +6,7 @@ import type {
   ShareUserUsageEditMap,
   ShareView,
 } from "@/lib/types";
-import { isRouterShareMarketManagedGrant } from "@/lib/share-settings";
+import { buildOrdinaryUserGrantsPatch } from "@/lib/share-settings";
 import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 import {
   DEFAULT_PARALLEL_LIMIT,
@@ -43,10 +43,6 @@ export type ShareEditDraft = {
   userUsageEdits: ShareUserUsageEditMap;
   enabledApps: Record<PriceApp, boolean>;
 };
-
-export function normalizedUniqueEmails(values: string[]) {
-  return Array.from(new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean))).sort();
-}
 
 export function toLocalDateTimeValue(value?: string) {
   if (!value) return "";
@@ -115,29 +111,17 @@ export function buildShareEditPatch(draft: ShareEditDraft, share: ShareView, act
   const parallelLimit = draft.parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : Number.parseInt(draft.parallelLimitInput, 10);
   const expiresIso = draft.expiresPermanent ? PERMANENT_EXPIRES_AT_ISO : fromLocalDateTimeValue(draft.expiresAtInput);
   const ownerEmail = (share.ownerEmail || "").trim().toLowerCase();
-  const accessEmails = normalizedUniqueEmails(
-    Object.values(draft.userGrants)
-      .filter((grant) => grant.active !== false && grant.role === "shareto")
-      .map((grant) => grant.email),
-  );
-  const activeGrantEmails = new Set([ownerEmail, ...accessEmails].filter(Boolean));
   const defaultPolicy: ShareUserPolicy = {
     parallelLimit: parallelLimit >= 0 ? parallelLimit : undefined,
     tokenLimit: tokenLimit >= 0 ? tokenLimit : undefined,
     tokenPeriod: "lifetime",
     expiresAt: !draft.expiresPermanent && expiresIso ? new Date(expiresIso).getTime() : undefined,
   };
-  const userGrants: ShareUserGrantMap = {};
-  for (const [key, grant] of Object.entries(draft.userGrants)) {
-    if (!isRouterShareMarketManagedGrant(grant)) continue;
-    const email = (grant.email || key).trim().toLowerCase();
-    if (email) userGrants[email] = grant;
-  }
-  for (const email of activeGrantEmails) {
-    const previous = draft.userGrants[email];
-    if (isRouterShareMarketManagedGrant(previous)) continue;
-    userGrants[email] = { ...previous, email, role: email === ownerEmail ? "owner" : "shareto", active: true, policy: previous?.policy ?? { ...defaultPolicy } };
-  }
+  const userGrants = buildOrdinaryUserGrantsPatch(
+    draft.userGrants,
+    ownerEmail,
+    defaultPolicy,
+  );
   const patch: ShareSettingsPatch = {
     description: draft.description.trim() || null,
     freeAccess: draft.freeAccess,

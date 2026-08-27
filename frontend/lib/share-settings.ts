@@ -25,7 +25,13 @@ export type ShareSettingsDraft = {
 export function isRouterShareMarketManagedGrant(
   grant: ShareUserGrant | undefined,
 ): boolean {
-  return grant?.manager === "routerShareMarket";
+  return grant?.manager === "routerShareMarket" && grant.active !== false;
+}
+
+export function isRevokedRouterShareMarketGrant(
+  grant: ShareUserGrant | undefined,
+): boolean {
+  return grant?.manager === "routerShareMarket" && grant.active === false;
 }
 
 export function routerShareMarketManagedEmails(
@@ -37,6 +43,59 @@ export function routerShareMarketManagedEmails(
       .map(([key, grant]) => (grant.email || key).trim().toLowerCase())
       .filter(Boolean),
   );
+}
+
+export function ordinaryShareUserGrant(
+  email: string,
+  ownerEmail: string,
+  previous: ShareUserGrant | undefined,
+  policy: ShareUserPolicy,
+): ShareUserGrant {
+  const normalizedEmail = email.trim().toLowerCase();
+  const isOwner = normalizedEmail === ownerEmail.trim().toLowerCase();
+  return {
+    ...(isRevokedRouterShareMarketGrant(previous) ? undefined : previous),
+    email: normalizedEmail,
+    role: isOwner ? "owner" : "shareto",
+    active: true,
+    manager: isOwner ? "owner" : "manual",
+    entitlementId: undefined,
+    revokedAtMs: undefined,
+    policy,
+  };
+}
+
+export function buildOrdinaryUserGrantsPatch(
+  grants: ShareUserGrantMap | undefined,
+  ownerEmail: string,
+  defaultPolicy: ShareUserPolicy,
+): ShareUserGrantMap {
+  const userGrants: ShareUserGrantMap = {};
+  for (const [key, grant] of Object.entries(grants ?? {})) {
+    if (!isRouterShareMarketManagedGrant(grant)) continue;
+    const email = (grant.email || key).trim().toLowerCase();
+    if (email) userGrants[email] = grant;
+  }
+  const owner = ownerEmail.trim().toLowerCase();
+  const activeEmails = new Set(
+    [
+      owner,
+      ...Object.values(grants ?? {})
+        .filter((grant) => grant.active !== false && grant.role === "shareto")
+        .map((grant) => (grant.email || "").trim().toLowerCase()),
+    ].filter(Boolean),
+  );
+  for (const email of activeEmails) {
+    const previous = grants?.[email];
+    if (isRouterShareMarketManagedGrant(previous)) continue;
+    userGrants[email] = ordinaryShareUserGrant(
+      email,
+      owner,
+      previous,
+      previous?.policy ?? { ...defaultPolicy },
+    );
+  }
+  return userGrants;
 }
 
 export function normalizeEmailList(value: string | string[]) {
@@ -113,7 +172,11 @@ export function buildShareSettingsPatch(
     tokenLimit: draft.tokenLimit,
     parallelLimit: draft.parallelLimit,
     expiresAt: draft.expiresAt,
-    userGrants: draft.userGrants,
+    userGrants: buildOrdinaryUserGrantsPatch(
+      draft.userGrants,
+      share.ownerEmail || "",
+      defaultUserPolicy(share),
+    ),
   };
 }
 

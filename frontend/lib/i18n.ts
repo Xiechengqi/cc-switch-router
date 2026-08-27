@@ -2989,6 +2989,8 @@ export const messages = {
       "Resets at fixed intervals from this UTC time. It cannot be in the future.",
     "dashboard.userLimit.invalidEmail": "Enter a valid email address.",
     "dashboard.userLimit.duplicateEmail": "This user already exists.",
+    "dashboard.userLimit.marketManagedEmail":
+      "This user is managed by Share Market and cannot be edited here.",
     "dashboard.userLimit.invalidPolicy":
       "Parallel limits must be positive integers; Token limits use M with at most six decimal places; expiration must be valid.",
     "dashboard.userLimit.consumedTokens": "Consumed tokens (M, current period)",
@@ -5983,6 +5985,7 @@ export const messages = {
       "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",
     "dashboard.userLimit.invalidEmail": "请输入有效邮箱。",
     "dashboard.userLimit.duplicateEmail": "该用户已存在。",
+    "dashboard.userLimit.marketManagedEmail": "该用户由 Share Market 管理，不能在这里修改。",
     "dashboard.userLimit.invalidPolicy":
       "并发限制必须是正整数；Token 限制以 M 填写且最多保留 6 位小数；到期时间必须有效。",
     "dashboard.userLimit.consumedTokens": "已消耗 Token（M，当前周期）",

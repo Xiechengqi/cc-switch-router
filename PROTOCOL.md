@@ -287,7 +287,7 @@ Server 要求:
 
 1. 普通 `share/settings` 入口拒绝带 `managedGrant` 的补丁。
 2. pending-edit 应用路径接受 managed grant,写入/移除 `routerShareMarket` grant。
-3. 普通用户编辑不得修改或删除 `manager=routerShareMarket` 的 grant。
+3. 普通用户编辑不得修改或删除 **仍为 active** 且 `manager=routerShareMarket` 的 grant。撤销后的 tombstone（`active=false`）保留作历史/用量 deprecated 标记，不再占用该邮箱；普通编辑可将同一邮箱写成新的 Manual `shareto`。不得把 tombstone 重新点亮为市场授权；再次出租仍只走 `managedGrant.upsert`。
 4. edit-ack(`POST /v1/shares/edit-ack`)成功后,Router 将订阅从 `grant_pending` 推进到 `active_free` 或 `active_postpaid`,或完成 revoke 后释放座位。
 
 一个拼车位授权整个 Share,不出售单一 App。报价会冻结当时全部已启用 App 的供应商与模型条款(`service.apps[]`),租客不能再通过 `requiredApp` 收窄授权；该旧请求字段仅作为兼容输入保留并被忽略。Router-managed grant 对三个核心 App 显式下发 `allowedApps=[claude,codex,gemini]`,Server 再以目标 App 当前是否已绑定且启用作为实际可调用边界，因此 Share 后续启用的核心 App 无需重建租约即可使用。升级前的单 App 活跃 grant 通过幂等 upsert 原地扩权,不 revoke、不暂停服务或账单；迁移时已经在途的 v1 初次授权或恢复授权可完成一次旧范围确认，但不会标记为扩权完成，下一轮立即原地扩权。v2 租约不接受该兼容行为。

@@ -19316,21 +19316,31 @@ fn normalize_share_user_grants_preserving(
             ));
         }
         validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
-        if let Some(previous) = existing
-            .and_then(|map| map.get(&email))
-            .filter(|grant| grant.manager == crate::models::ShareGrantManager::RouterShareMarket)
-        {
-            if grant.active != previous.active
-                || grant.policy != previous.policy
-                || grant.manager != crate::models::ShareGrantManager::RouterShareMarket
-                || grant.entitlement_id != previous.entitlement_id
+        if let Some(previous) = existing.and_then(|map| map.get(&email)) {
+            if previous.active
+                && previous.manager == crate::models::ShareGrantManager::RouterShareMarket
+            {
+                if grant.active != previous.active
+                    || grant.policy != previous.policy
+                    || grant.manager != crate::models::ShareGrantManager::RouterShareMarket
+                    || grant.entitlement_id != previous.entitlement_id
+                {
+                    return Err(AppError::Conflict(
+                        "Share Market managed users are read-only".into(),
+                    ));
+                }
+                normalized.insert(email, previous.clone());
+                continue;
+            }
+            if !previous.active
+                && previous.manager == crate::models::ShareGrantManager::RouterShareMarket
+                && (grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+                    || grant.entitlement_id.is_some())
             {
                 return Err(AppError::Conflict(
                     "Share Market managed users are read-only".into(),
                 ));
             }
-            normalized.insert(email, previous.clone());
-            continue;
         }
         grant.email = email.clone();
         grant.role = if email == owner_email {
@@ -30054,6 +30064,116 @@ mod tests {
         .expect_err("ordinary edit must not reactivate revoked market grant");
 
         assert!(error.to_string().contains("managed users are read-only"));
+    }
+
+    #[test]
+    fn share_settings_patch_can_add_manual_shareto_over_revoked_market_tombstone() {
+        let owner = test_share_user_grant("owner@example.com", "owner", 1000);
+        let mut revoked = test_share_user_grant("renter@example.com", "shareto", 500);
+        revoked.active = false;
+        revoked.manager = crate::models::ShareGrantManager::RouterShareMarket;
+        revoked.entitlement_id = Some("entitlement-revoked".to_string());
+        let existing = BTreeMap::from([
+            (owner.email.clone(), owner.clone()),
+            (revoked.email.clone(), revoked),
+        ]);
+        let mut manual = test_share_user_grant("renter@example.com", "shareto", 800);
+        manual.manager = crate::models::ShareGrantManager::Manual;
+        manual.entitlement_id = None;
+
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                user_grants: Some(BTreeMap::from([
+                    (owner.email.clone(), owner),
+                    (manual.email.clone(), manual),
+                ])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&BTreeMap::from([(
+                "codex".to_string(),
+                "provider-codex".to_string(),
+            )])),
+            Some(&existing),
+            None,
+        )
+        .expect("manual shareto may reuse a revoked market mailbox");
+        let grants = normalized.user_grants.expect("normalized grants");
+        let restored = &grants["renter@example.com"];
+        assert!(restored.active);
+        assert_eq!(restored.role, "shareto");
+        assert_eq!(restored.manager, crate::models::ShareGrantManager::Manual);
+        assert_eq!(restored.entitlement_id, None);
+        assert_eq!(restored.policy.token_limit, Some(800));
+        assert!(!grants.values().any(|grant| !grant.active
+            && grant.manager == crate::models::ShareGrantManager::RouterShareMarket));
+    }
+
+    #[test]
+    fn share_settings_patch_omitting_revoked_market_tombstone_does_not_keep_it_active() {
+        let owner = test_share_user_grant("owner@example.com", "owner", 1000);
+        let mut revoked = test_share_user_grant("renter@example.com", "shareto", 500);
+        revoked.active = false;
+        revoked.manager = crate::models::ShareGrantManager::RouterShareMarket;
+        revoked.entitlement_id = Some("entitlement-revoked".to_string());
+        let existing = BTreeMap::from([
+            (owner.email.clone(), owner.clone()),
+            (revoked.email.clone(), revoked),
+        ]);
+
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                user_grants: Some(BTreeMap::from([(owner.email.clone(), owner)])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&BTreeMap::from([(
+                "codex".to_string(),
+                "provider-codex".to_string(),
+            )])),
+            Some(&existing),
+            None,
+        )
+        .expect("omitting a tombstone is not a market-grant edit");
+        let grants = normalized.user_grants.expect("normalized grants");
+        assert!(grants.contains_key("owner@example.com"));
+        assert!(!grants.contains_key("renter@example.com"));
+    }
+
+    #[test]
+    fn share_settings_patch_omitting_active_market_grant_keeps_it() {
+        let owner = test_share_user_grant("owner@example.com", "owner", 1000);
+        let mut market = test_share_user_grant("renter@example.com", "shareto", 500);
+        market.manager = crate::models::ShareGrantManager::RouterShareMarket;
+        market.entitlement_id = Some("entitlement-active".to_string());
+        let existing = BTreeMap::from([
+            (owner.email.clone(), owner.clone()),
+            (market.email.clone(), market.clone()),
+        ]);
+
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                user_grants: Some(BTreeMap::from([(owner.email.clone(), owner)])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&BTreeMap::from([(
+                "codex".to_string(),
+                "provider-codex".to_string(),
+            )])),
+            Some(&existing),
+            None,
+        )
+        .expect("ordinary edit must keep active market grants");
+        let grants = normalized.user_grants.expect("normalized grants");
+        let kept = &grants["renter@example.com"];
+        assert!(kept.active);
+        assert_eq!(
+            kept.manager,
+            crate::models::ShareGrantManager::RouterShareMarket
+        );
+        assert_eq!(kept.entitlement_id.as_deref(), Some("entitlement-active"));
+        assert_eq!(kept.policy.token_limit, Some(500));
     }
 
     #[test]
