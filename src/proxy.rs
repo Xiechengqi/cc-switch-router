@@ -1999,7 +1999,6 @@ pub async fn gateway_proxy_handler(
     let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
     let user_asn = trusted_asn_header(&parts.headers, peer);
     let user_agent = header_str(&parts.headers, "user-agent");
-
     let body_bytes = match read_proxy_request_body(
         body,
         proxy_request_body_limit(&path, &state.config.proxy_stream),
@@ -2995,10 +2994,7 @@ pub async fn execute_user_model_route_test(
         .headers()
         .iter()
         .filter_map(|(name, value)| {
-            Some([
-                name.as_str().to_string(),
-                value.to_str().ok()?.to_string(),
-            ])
+            Some([name.as_str().to_string(), value.to_str().ok()?.to_string()])
         })
         .collect::<Vec<_>>();
     let (raw, body_truncated) = match axum::body::to_bytes(
@@ -3160,6 +3156,7 @@ pub async fn proxy_handler(
     let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
     let user_asn = trusted_asn_header(&parts.headers, peer);
     let user_agent = header_str(&parts.headers, "user-agent");
+    let is_dashboard_connection_test = is_trusted_dashboard_connection_test(peer, &parts.headers);
     if let Some(remaining) = state.abuse.ban_remaining(&user_ip).await {
         warn!(
             method = %method,
@@ -3283,7 +3280,7 @@ pub async fn proxy_handler(
         return simple_response(StatusCode::NOT_FOUND, "not-found");
     }
     let backend = route.backend.clone();
-    let is_health_check_request = is_share_router_probe;
+    let is_health_check_request = is_share_router_probe || is_dashboard_connection_test;
     let is_direct_share_web_request = route.is_share() && is_allowed_direct_share_web_path(&path);
     let skips_share_edge_auth =
         share_route_skips_edge_auth(is_internal_share_router_path, is_direct_share_web_request);
@@ -3845,6 +3842,7 @@ pub async fn proxy_handler(
                     .as_ref()
                     .map(|(_, is_admin)| if *is_admin { "admin" } else { "owner" }.to_string()),
                 user_country: client_metadata.country_code.clone(),
+                is_health_check: is_health_check_request,
                 method: method.as_str().to_string(),
                 path_and_query: signed_path_and_query,
                 body_sha256: crate::ingress_context::body_sha256_hex(&body),
@@ -4438,10 +4436,9 @@ async fn handle_image_generation_stream_submit(
         .filter(|value| !value.is_empty())
         .unwrap_or("gpt-5.5")
         .to_string();
-    let prompt_preview = payload
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(|value| compact_prompt_preview(value, 180));
+    // Keep the legacy result-log schema readable, but do not persist prompts
+    // for new image requests. Unified media Usage is intentionally metadata-only.
+    let prompt_preview = None;
     let output_format = payload
         .get("output_format")
         .or_else(|| payload.get("format"))
@@ -4461,7 +4458,7 @@ async fn handle_image_generation_stream_submit(
     };
 
     let log_meta = ImageStreamLogMeta {
-        request_id: format!("imgreq_{}", Uuid::new_v4().simple()),
+        request_id: admission_request_id.clone(),
         share_id: share_id.to_string(),
         installation_id: route.installation_id().unwrap_or_default().to_string(),
         share_name: route
@@ -6069,6 +6066,7 @@ async fn with_signed_ingress_context(
             user_email,
             user_role: None,
             user_country,
+            is_health_check: false,
             method: method.as_str().to_string(),
             path_and_query,
             body_sha256: crate::ingress_context::body_sha256_hex(body),
@@ -6113,6 +6111,15 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .unwrap_or("-")
 }
 
+fn is_trusted_dashboard_connection_test(peer: SocketAddr, headers: &HeaderMap) -> bool {
+    peer.ip().is_loopback()
+        && header_str(headers, "user-agent") == "cc-switch-router/0.1 test-connection"
+        && headers
+            .get("x-cc-switch-dashboard-test")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "1")
+}
+
 fn is_internal_share_context_header(name: &str) -> bool {
     name.starts_with("x-ctl-")
         || name.starts_with("x-cc-gateway-")
@@ -6136,6 +6143,7 @@ fn is_internal_share_context_header(name: &str) -> bool {
                 | "x-user-country-iso3"
                 | "x-share-router-health-check"
                 | "x-share-router-probe"
+                | "x-cc-switch-dashboard-test"
                 | crate::ingress_context::INGRESS_CONTEXT_HEADER
                 | crate::ingress_context::INGRESS_SIGNATURE_HEADER
                 | crate::ingress_context::INGRESS_BODY_LIMIT_HEADER
@@ -8983,6 +8991,7 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
             "x-user-country-iso3",
             "x-share-router-health-check",
             "x-share-router-probe",
+            "x-cc-switch-dashboard-test",
             crate::ingress_context::INGRESS_CONTEXT_HEADER,
             crate::ingress_context::INGRESS_SIGNATURE_HEADER,
             crate::ingress_context::INGRESS_BODY_LIMIT_HEADER,
@@ -9029,6 +9038,33 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
             false,
         ));
         assert!(!is_internal_share_router_path("/_share-router-evil/logs"));
+    }
+
+    #[test]
+    fn dashboard_health_marker_requires_loopback_and_exact_internal_identity() {
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 12345);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("cc-switch-router/0.1 test-connection"),
+        );
+        headers.insert("x-cc-switch-dashboard-test", HeaderValue::from_static("1"));
+
+        assert!(is_trusted_dashboard_connection_test(loopback, &headers));
+        assert!(!is_trusted_dashboard_connection_test(remote, &headers));
+
+        headers.insert("user-agent", HeaderValue::from_static("curl/8.0"));
+        assert!(!is_trusted_dashboard_connection_test(loopback, &headers));
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("cc-switch-router/0.1 test-connection"),
+        );
+        headers.insert(
+            "x-cc-switch-dashboard-test",
+            HeaderValue::from_static("true"),
+        );
+        assert!(!is_trusted_dashboard_connection_test(loopback, &headers));
     }
 
     #[test]
@@ -9787,11 +9823,9 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
         assert!(build_user_model_route_test_probe("claude", " ").is_err());
         assert!(build_user_model_route_test_probe("palm", "gemini-pro").is_err());
 
-        let gemini = build_user_model_route_test_probe(
-            "gemini",
-            "publishers/google/gemini:pro?mode#one",
-        )
-        .expect("gemini probe");
+        let gemini =
+            build_user_model_route_test_probe("gemini", "publishers/google/gemini:pro?mode#one")
+                .expect("gemini probe");
         assert_eq!(
             gemini.path,
             "/v1beta/models/publishers%2Fgoogle%2Fgemini%3Apro%3Fmode%23one:generateContent"

@@ -907,10 +907,16 @@ export async function getShareImageGenerationRequestLogs(
 
 export async function getShareRequestLogs(
   shareId: string,
-  options: { app?: "claude" | "codex" | "gemini"; cursor?: string; limit?: number } = {},
+  options: {
+    app?: "claude" | "codex" | "gemini";
+    requestKind?: "text" | "image" | "video";
+    cursor?: string;
+    limit?: number;
+  } = {},
 ): Promise<ShareRequestLogsPage> {
   const params = new URLSearchParams();
   if (options.app) params.set("app", options.app);
+  if (options.requestKind) params.set("requestKind", options.requestKind);
   if (options.cursor) params.set("cursor", options.cursor);
   params.set("limit", String(options.limit || 50));
   return parseJson<ShareRequestLogsPage>(

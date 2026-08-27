@@ -4,7 +4,7 @@ use serde_json::{Value, value::RawValue};
 use std::collections::BTreeMap;
 
 pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
-pub const SHARE_CONTRACT_VERSION: u16 = 4;
+pub const SHARE_CONTRACT_VERSION: u16 = 5;
 
 pub fn default_share_parallel_limit() -> i64 {
     -1
@@ -976,6 +976,8 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_cache_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_media_policy: Option<GrokMediaPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub support: Option<ShareSupport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
@@ -983,6 +985,17 @@ pub struct ShareSettingsPatch {
     pub user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrokMediaPolicy {
+    #[serde(default)]
+    pub image_generation_enabled: bool,
+    #[serde(default)]
+    pub image_edit_enabled: bool,
+    #[serde(default)]
+    pub video_generation_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1381,6 +1394,12 @@ pub struct ShareRequestLogEntry {
     #[serde(default)]
     pub export_sequence: u64,
     pub request_id: String,
+    #[serde(default = "default_request_kind")]
+    pub request_kind: String,
+    #[serde(default)]
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
     pub share_id: String,
     pub share_name: String,
     pub provider_id: String,
@@ -1408,6 +1427,8 @@ pub struct ShareRequestLogEntry {
     pub stream_status: Option<String>,
     #[serde(default)]
     pub usage_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     pub status_code: u16,
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1427,9 +1448,23 @@ pub struct ShareRequestLogEntry {
     pub user_country_iso3: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_duration_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_aspect_ratio: Option<String>,
     pub created_at: i64,
     #[serde(default)]
     pub is_health_check: bool,
+}
+
+fn default_request_kind() -> String {
+    "text".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2563,6 +2598,8 @@ pub struct ShareDescriptor {
     pub banked_reset_expiry_lead_minutes: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub previous_response_cache_enabled: bool,
+    #[serde(default)]
+    pub grok_media_policy: GrokMediaPolicy,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
@@ -3256,6 +3293,8 @@ pub struct ShareView {
     pub banked_reset_expiry_lead_minutes: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub previous_response_cache_enabled: bool,
+    #[serde(default)]
+    pub grok_media_policy: GrokMediaPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]

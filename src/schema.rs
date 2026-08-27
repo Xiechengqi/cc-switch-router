@@ -116,6 +116,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         31,
         include_str!("../schema/0031_user_model_routing_wildcard.sql"),
     ),
+    (
+        32,
+        include_str!("../schema/0032_grok_media_policy_and_request_kinds.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -720,6 +724,8 @@ mod tests {
         assert_eq!(versions[27], (28, migration_checksum(MIGRATIONS[26].1)));
         assert_eq!(versions[28], (29, migration_checksum(MIGRATIONS[27].1)));
         assert_eq!(versions[29], (30, migration_checksum(MIGRATIONS[28].1)));
+        assert_eq!(versions[30], (31, migration_checksum(MIGRATIONS[29].1)));
+        assert_eq!(versions[31], (32, migration_checksum(MIGRATIONS[30].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1074,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_31_upgrade_a_version_26_database() {
+    fn migrations_27_through_32_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1123,8 +1129,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 31);
-        check_compatibility(&conn).expect("upgraded version 31 is compatible");
+        assert_eq!(latest_version, 32);
+        check_compatibility(&conn).expect("upgraded version 32 is compatible");
     }
 
     #[test]
@@ -1186,7 +1192,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 31);
+        assert_eq!(latest_version, 32);
     }
 
     #[test]
@@ -1280,6 +1286,56 @@ mod tests {
                 "`{pattern}` must be rejected so `*` cannot decay into pattern matching"
             );
         }
+    }
+
+    #[test]
+    fn migration_32_adds_fail_closed_grok_policy_and_typed_media_log_columns() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 31);
+
+        apply(&conn).expect("upgrade version 31 through Grok media schema");
+
+        let share_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('shares')
+                 WHERE name IN (
+                    'grok_image_generation_enabled',
+                    'grok_image_edit_enabled',
+                    'grok_video_generation_enabled'
+                 ) AND [notnull] = 1 AND dflt_value = '0'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count fail-closed Grok Share policy columns");
+        assert_eq!(share_columns, 3);
+
+        let request_log_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('share_request_logs')
+                 WHERE name IN (
+                    'request_kind', 'operation', 'parent_request_id', 'error_message',
+                    'media_task_id', 'media_status', 'video_duration_seconds',
+                    'video_resolution', 'video_aspect_ratio'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count typed media request log columns");
+        assert_eq!(request_log_columns, 9);
+
+        let media_indexes = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                    'idx_share_request_logs_share_kind_created',
+                    'idx_share_request_logs_parent_request',
+                    'idx_share_request_logs_media_task'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count media request log indexes");
+        assert_eq!(media_indexes, 3);
     }
 
     #[test]

@@ -13468,7 +13468,10 @@ mod tests {
         let capabilities = public_app_capabilities(&bindings, Some(&runtimes_json), None, "codex");
         let capability = &capabilities[0];
         let quota = capability.quota.as_ref().expect("public quota");
-        assert_eq!(capability.account_hint.as_deref(), Some("private@example.com"));
+        assert_eq!(
+            capability.account_hint.as_deref(),
+            Some("private@example.com")
+        );
         assert_eq!(capability.health_state, "healthy");
         assert_eq!(quota.status.as_deref(), Some("ok"));
         assert_eq!(quota.plan.as_deref(), Some("Plus"));
@@ -15121,7 +15124,10 @@ mod tests {
         assert_eq!(shares[0].supported_apps, vec!["claude", "gemini"]);
         assert_eq!(shares[0].parallel_limit, Some(3));
         assert_eq!(shares[0].token_limit, None);
-        assert_eq!(shares[0].expires_at.as_deref(), Some("9999-12-31T23:59:59Z"));
+        assert_eq!(
+            shares[0].expires_at.as_deref(),
+            Some("9999-12-31T23:59:59Z")
+        );
         assert!(!shares[0].app_capabilities.is_empty());
         assert!(!shares[0].free_access);
     }

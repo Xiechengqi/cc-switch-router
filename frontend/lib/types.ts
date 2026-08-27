@@ -432,6 +432,13 @@ export type ShareView = {
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;
   previousResponseCacheEnabled?: boolean;
+  grokMediaPolicy?: GrokMediaPolicy;
+};
+
+export type GrokMediaPolicy = {
+  imageGenerationEnabled: boolean;
+  imageEditEnabled: boolean;
+  videoGenerationEnabled: boolean;
 };
 
 export type ShareSettingsPatch = {
@@ -446,6 +453,7 @@ export type ShareSettingsPatch = {
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;
   previousResponseCacheEnabled?: boolean;
+  grokMediaPolicy?: GrokMediaPolicy;
   support?: ShareSupport;
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
@@ -690,6 +698,9 @@ export type UpdateUsageCardSettingsRequest = {
 export type ShareRequestLog = {
   exportSequence?: number;
   requestId: string;
+  requestKind?: "text" | "image" | "video" | string;
+  operation?: string;
+  parentRequestId?: string;
   shareId?: string;
   shareName?: string;
   providerId?: string;
@@ -707,7 +718,7 @@ export type ShareRequestLog = {
   effectiveServiceTier?: string;
   serviceTierDecision?: string;
   usageState?:
-    "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
+    "pending" | "observed" | "missing" | "parse_error" | "interrupted" | "not_applicable" | string;
   streamStatus?: string;
   usageRevision?: number;
   statusCode: number;
@@ -722,6 +733,12 @@ export type ShareRequestLog = {
   userEmail?: string;
   userCountry?: string;
   userCountryIso3?: string;
+  errorMessage?: string;
+  mediaTaskId?: string;
+  mediaStatus?: string;
+  videoDurationSeconds?: number;
+  videoResolution?: string;
+  videoAspectRatio?: string;
   createdAt: number;
 };
 
@@ -1639,6 +1656,7 @@ export type ClientChatVisit = {
 // P18: test-connection types
 export type ShareConnectionTestRequest = {
   app: "claude" | "codex" | "gemini";
+  operation?: "text" | "image_generation" | "image_edit" | "video_generation";
   timeoutMs?: number;
 };
 

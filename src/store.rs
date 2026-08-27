@@ -966,6 +966,7 @@ pub struct ShareForTest {
     pub support: ShareSupport,
     pub app_runtimes: ShareAppRuntimes,
     pub app_providers: ShareAppProviders,
+    pub grok_media_policy: crate::models::GrokMediaPolicy,
 }
 
 impl ShareForTest {
@@ -7285,7 +7286,10 @@ impl AppStore {
                 "SELECT share_access_policy_version, COALESCE(subdomain, '-'), owner_email,
                         COALESCE(user_grants_json, '{}'), bindings_json,
                         enabled_claude, enabled_codex, enabled_gemini,
-                        app_runtimes_json, app_providers_json
+                        app_runtimes_json, app_providers_json,
+                        COALESCE(grok_image_generation_enabled, 0),
+                        COALESCE(grok_image_edit_enabled, 0),
+                        COALESCE(grok_video_generation_enabled, 0)
                  FROM shares WHERE share_id = ?1",
                 params![share_id],
                 |row| {
@@ -7302,6 +7306,11 @@ impl AppStore {
                         },
                         parse_app_runtimes(row.get(8)?)?,
                         parse_app_providers(row.get(9)?)?,
+                        crate::models::GrokMediaPolicy {
+                            image_generation_enabled: row.get::<_, i64>(10)? != 0,
+                            image_edit_enabled: row.get::<_, i64>(11)? != 0,
+                            video_generation_enabled: row.get::<_, i64>(12)? != 0,
+                        },
                     ))
                 },
             )
@@ -7316,6 +7325,7 @@ impl AppStore {
             support,
             app_runtimes,
             app_providers,
+            grok_media_policy,
         )) = row
         else {
             return Ok(None);
@@ -7329,6 +7339,7 @@ impl AppStore {
             support,
             app_runtimes,
             app_providers,
+            grok_media_policy,
         }))
     }
 
@@ -7464,6 +7475,7 @@ impl AppStore {
         &self,
         share_id: &str,
         app_type: Option<&str>,
+        request_kind: Option<&str>,
         user_email: Option<&str>,
         cursor: Option<&str>,
         limit: usize,
@@ -7478,6 +7490,18 @@ impl AppStore {
         {
             return Err(AppError::BadRequest(
                 "unsupported Share request log app".into(),
+            ));
+        }
+        let request_kind = request_kind
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        if request_kind
+            .as_deref()
+            .is_some_and(|kind| !matches!(kind, "text" | "image" | "video"))
+        {
+            return Err(AppError::BadRequest(
+                "unsupported Share request log kind".into(),
             ));
         }
         let user_email = user_email
@@ -7497,19 +7521,22 @@ impl AppStore {
                         effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
                         status_code, latency_ms, first_token_ms, input_tokens,
                         output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
-                        session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
+                        session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
+                        request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
+                        video_duration_seconds, video_resolution, video_aspect_ratio
                  FROM share_request_logs
                  WHERE share_id = ?1
                    AND COALESCE(is_health_check, 0) = 0
                    AND (?2 IS NULL OR lower(app_type) = ?2)
                    AND (?3 IS NULL OR lower(COALESCE(user_email, '')) = ?3)
+                   AND (?4 IS NULL OR lower(request_kind) = ?4)
                    AND (
-                       ?4 IS NULL
-                       OR created_at < ?4
-                       OR (created_at = ?4 AND request_id < ?5)
+                       ?5 IS NULL
+                       OR created_at < ?5
+                       OR (created_at = ?5 AND request_id < ?6)
                    )
                  ORDER BY created_at DESC, request_id DESC
-                 LIMIT ?6",
+                 LIMIT ?7",
             )
             .map_err(|error| {
                 AppError::Internal(format!("prepare Share request log page failed: {error}"))
@@ -7520,6 +7547,7 @@ impl AppStore {
                     share_id,
                     app_type,
                     user_email,
+                    request_kind,
                     cursor_created_at,
                     cursor_request_id,
                     page_limit.saturating_add(1) as i64,
@@ -7782,6 +7810,7 @@ impl AppStore {
             auto_consume_banked_reset: share.auto_consume_banked_reset,
             banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
             previous_response_cache_enabled: share.previous_response_cache_enabled,
+            grok_media_policy: share.grok_media_policy,
         };
         (view.operational_summary, view.service_readiness) =
             share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
@@ -10473,6 +10502,7 @@ impl AppStore {
                     auto_consume_banked_reset: share.auto_consume_banked_reset,
                     banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
                     previous_response_cache_enabled: share.previous_response_cache_enabled,
+                    grok_media_policy: share.grok_media_policy,
                 };
                 (view.operational_summary, view.service_readiness) =
                     share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
@@ -14323,8 +14353,9 @@ fn upsert_share_tx(
             token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at, capacity_pool_id, for_sale_official_price_percent_by_app_json,
             descriptor_generation, descriptor_fingerprint,
             auto_start, allow_personal_credits, auto_consume_banked_reset, banked_reset_expiry_lead_minutes, previous_response_cache_enabled,
+            grok_image_generation_enabled, grok_image_edit_enabled, grok_video_generation_enabled,
             free_access, share_access_policy_version
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -14364,6 +14395,9 @@ fn upsert_share_tx(
             auto_consume_banked_reset = excluded.auto_consume_banked_reset,
             banked_reset_expiry_lead_minutes = excluded.banked_reset_expiry_lead_minutes,
             previous_response_cache_enabled = excluded.previous_response_cache_enabled,
+            grok_image_generation_enabled = excluded.grok_image_generation_enabled,
+            grok_image_edit_enabled = excluded.grok_image_edit_enabled,
+            grok_video_generation_enabled = excluded.grok_video_generation_enabled,
             free_access = excluded.free_access,
             share_access_policy_version = excluded.share_access_policy_version,
             runtime_refreshed_at = shares.runtime_refreshed_at,
@@ -14415,6 +14449,9 @@ fn upsert_share_tx(
             i64::from(share.auto_consume_banked_reset as u8),
             i64::from(share.banked_reset_expiry_lead_minutes),
             i64::from(share.previous_response_cache_enabled as u8),
+            i64::from(share.grok_media_policy.image_generation_enabled as u8),
+            i64::from(share.grok_media_policy.image_edit_enabled as u8),
+            i64::from(share.grok_media_policy.video_generation_enabled as u8),
             i64::from(share.free_access as u8),
             i64::from(share.contract_version),
         ],
@@ -14895,8 +14932,10 @@ fn upsert_share_request_log_tx(
             effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
             status_code, latency_ms, first_token_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens,
-            is_streaming, session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
+            is_streaming, session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
+            request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
+            video_duration_seconds, video_resolution, video_aspect_ratio
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
         ON CONFLICT(request_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_id = excluded.share_id,
@@ -14933,6 +14972,15 @@ fn upsert_share_request_log_tx(
             user_email = COALESCE(excluded.user_email, share_request_logs.user_email),
             is_health_check = excluded.is_health_check,
             created_at = excluded.created_at
+            , request_kind = excluded.request_kind
+            , operation = excluded.operation
+            , parent_request_id = COALESCE(excluded.parent_request_id, share_request_logs.parent_request_id)
+            , error_message = excluded.error_message
+            , media_task_id = COALESCE(excluded.media_task_id, share_request_logs.media_task_id)
+            , media_status = excluded.media_status
+            , video_duration_seconds = COALESCE(excluded.video_duration_seconds, share_request_logs.video_duration_seconds)
+            , video_resolution = COALESCE(excluded.video_resolution, share_request_logs.video_resolution)
+            , video_aspect_ratio = COALESCE(excluded.video_aspect_ratio, share_request_logs.video_aspect_ratio)
         WHERE excluded.usage_revision >= share_request_logs.usage_revision",
         params![
             log.request_id,
@@ -14971,6 +15019,15 @@ fn upsert_share_request_log_tx(
             log.user_email,
             i64::from(log.is_health_check as u8),
             log.created_at,
+            log.request_kind,
+            log.operation,
+            log.parent_request_id,
+            log.error_message,
+            log.media_task_id,
+            log.media_status,
+            log.video_duration_seconds.map(i64::from),
+            log.video_resolution,
+            log.video_aspect_ratio,
         ],
     )
     .map_err(|e| AppError::Internal(format!("upsert share request log failed: {e}")))?;
@@ -18471,6 +18528,9 @@ mod token_period_window_tests {
             ShareRequestLogEntry {
                 export_sequence: 0,
                 request_id: request_id.to_string(),
+                request_kind: "text".into(),
+                operation: "responses".into(),
+                parent_request_id: None,
                 share_id: "share-anchored".into(),
                 share_name: "Anchored".into(),
                 provider_id: "provider".into(),
@@ -18490,6 +18550,7 @@ mod token_period_window_tests {
                 usage_state: "observed".into(),
                 stream_status: None,
                 usage_revision: 0,
+                error_message: None,
                 status_code: 200,
                 latency_ms: 1,
                 first_token_ms: None,
@@ -18503,6 +18564,11 @@ mod token_period_window_tests {
                 user_country: None,
                 user_country_iso3: None,
                 user_email: Some(email.to_string()),
+                media_task_id: None,
+                media_status: None,
+                video_duration_seconds: None,
+                video_resolution: None,
+                video_aspect_ratio: None,
                 created_at,
                 is_health_check: false,
             }
@@ -18762,7 +18828,10 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     COALESCE(s.auto_start, 0), COALESCE(s.allow_personal_credits, 0),
                     COALESCE(s.auto_consume_banked_reset, 0),
                     COALESCE(s.banked_reset_expiry_lead_minutes, 60),
-                    COALESCE(s.previous_response_cache_enabled, 0), COALESCE(s.free_access, 0)
+                    COALESCE(s.previous_response_cache_enabled, 0), COALESCE(s.free_access, 0),
+                    COALESCE(s.grok_image_generation_enabled, 0),
+                    COALESCE(s.grok_image_edit_enabled, 0),
+                    COALESCE(s.grok_video_generation_enabled, 0)
              FROM shares s
              INNER JOIN installations i ON i.id = s.installation_id
              WHERE i.lifecycle = 'active'
@@ -18808,6 +18877,11 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     auto_consume_banked_reset: row.get::<_, i64>(30)? != 0,
                     banked_reset_expiry_lead_minutes: row.get::<_, i64>(31)?.max(0) as u32,
                     previous_response_cache_enabled: row.get::<_, i64>(32)? != 0,
+                    grok_media_policy: crate::models::GrokMediaPolicy {
+                        image_generation_enabled: row.get::<_, i64>(34)? != 0,
+                        image_edit_enabled: row.get::<_, i64>(35)? != 0,
+                        video_generation_enabled: row.get::<_, i64>(36)? != 0,
+                    },
                     config_revision: row.get::<_, i64>(22)?.max(0) as u64,
                     descriptor_generation: row.get::<_, i64>(26)?.max(0) as u64,
                     descriptor_fingerprint: row.get(27)?,
@@ -19001,6 +19075,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.auto_consume_banked_reset.is_none()
         && patch.banked_reset_expiry_lead_minutes.is_none()
         && patch.previous_response_cache_enabled.is_none()
+        && patch.grok_media_policy.is_none()
         && patch.support.is_none()
         && patch.user_grants.is_none()
         && patch.user_usage_edits.is_none()
@@ -19085,6 +19160,11 @@ fn validate_returned_share_against_patch(
     if let Some(previous_response_cache_enabled) = patch.previous_response_cache_enabled {
         if previous_response_cache_enabled != share.previous_response_cache_enabled {
             return Err("previousResponseCacheEnabled");
+        }
+    }
+    if let Some(grok_media_policy) = patch.grok_media_policy {
+        if grok_media_policy != share.grok_media_policy {
+            return Err("grokMediaPolicy");
         }
     }
     if let Some(support) = patch.support.as_ref() {
@@ -19351,6 +19431,7 @@ fn normalize_share_settings_patch(
         auto_consume_banked_reset: patch.auto_consume_banked_reset,
         banked_reset_expiry_lead_minutes: patch.banked_reset_expiry_lead_minutes,
         previous_response_cache_enabled: patch.previous_response_cache_enabled,
+        grok_media_policy: patch.grok_media_policy,
         support,
         user_grants,
         user_usage_edits: patch.user_usage_edits,
@@ -20952,7 +21033,9 @@ fn list_global_recent_share_request_logs(
                     effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
                     status_code, latency_ms, first_token_ms, input_tokens,
                     output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
-                    session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
+                    session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
+                    request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
+                    video_duration_seconds, video_resolution, video_aspect_ratio
              FROM share_request_logs
              WHERE COALESCE(is_health_check, 0) = 0
              ORDER BY created_at DESC, request_id DESC
@@ -20977,7 +21060,9 @@ fn list_recent_share_request_logs(
                     effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
                     status_code, latency_ms, first_token_ms, input_tokens,
                     output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
-                    session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
+                    session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
+                    request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
+                    video_duration_seconds, video_resolution, video_aspect_ratio
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
@@ -20986,6 +21071,8 @@ fn list_recent_share_request_logs(
                         status_code, latency_ms, first_token_ms, input_tokens,
                         output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                         session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
+                        request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
+                        video_duration_seconds, video_resolution, video_aspect_ratio,
                         ROW_NUMBER() OVER (
                             PARTITION BY share_id
                             ORDER BY created_at DESC, request_id DESC
@@ -21044,6 +21131,17 @@ fn map_share_request_log_row(row: &crate::db::Row<'_>) -> crate::db::Result<Shar
         user_email: row.get(32)?,
         is_health_check: row.get::<_, i64>(33)? != 0,
         created_at: row.get(34)?,
+        request_kind: row.get(35)?,
+        operation: row.get(36)?,
+        parent_request_id: row.get(37)?,
+        error_message: row.get(38)?,
+        media_task_id: row.get(39)?,
+        media_status: row.get(40)?,
+        video_duration_seconds: row
+            .get::<_, Option<i64>>(41)?
+            .map(|value| value.max(0) as u32),
+        video_resolution: row.get(42)?,
+        video_aspect_ratio: row.get(43)?,
     })
 }
 
@@ -21182,6 +21280,7 @@ fn list_recent_share_model_health_checks(
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct RecentShareLogFingerprint {
     share_id: String,
+    request_kind: String,
     created_at: i64,
     model: String,
     request_model: String,
@@ -21205,6 +21304,7 @@ fn deduplicate_recent_share_request_logs(
     for log in logs {
         let fingerprint = RecentShareLogFingerprint {
             share_id: log.share_id.clone(),
+            request_kind: log.request_kind.clone(),
             created_at: log.created_at,
             model: log.model.clone(),
             request_model: log.request_model.clone(),
@@ -29537,12 +29637,57 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         }
+    }
+
+    #[tokio::test]
+    async fn grok_media_policy_defaults_closed_and_round_trips_all_permissions() {
+        let (store, config) = setup_store("grok-media-policy-round-trip").await;
+        insert_installation(&store, "inst-grok-media-policy").await;
+        insert_share(
+            &store,
+            "inst-grok-media-policy",
+            "share-grok-media-policy",
+            "grok-media-policy-sub",
+            "active",
+        )
+        .await;
+
+        let initial = store
+            .get_share_for_test("share-grok-media-policy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.grok_media_policy, Default::default());
+
+        let mut descriptor =
+            test_share_descriptor("share-grok-media-policy", "grok-media-policy-sub");
+        descriptor.grok_media_policy = crate::models::GrokMediaPolicy {
+            image_generation_enabled: true,
+            image_edit_enabled: true,
+            video_generation_enabled: true,
+        };
+        {
+            let conn = store.conn.lock().await;
+            upsert_share_tx(&conn, "inst-grok-media-policy", descriptor).unwrap();
+        }
+
+        let stored = store
+            .get_share_for_test("share-grok-media-policy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.grok_media_policy.image_generation_enabled);
+        assert!(stored.grok_media_policy.image_edit_enabled);
+        assert!(stored.grok_media_policy.video_generation_enabled);
+
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     fn test_share_user_grant(email: &str, role: &str, token_limit: u64) -> ShareUserGrant {
@@ -29826,6 +29971,9 @@ mod tests {
         ShareRequestLogEntry {
             export_sequence: 0,
             request_id: request_id.into(),
+            request_kind: "text".into(),
+            operation: "responses".into(),
+            parent_request_id: None,
             share_id: share_id.into(),
             share_name: "Share".into(),
             provider_id: "provider-1".into(),
@@ -29845,6 +29993,7 @@ mod tests {
             usage_state: "observed".into(),
             stream_status: None,
             usage_revision: 0,
+            error_message: None,
             status_code: 200,
             latency_ms: 100,
             first_token_ms: None,
@@ -29858,6 +30007,11 @@ mod tests {
             user_country: None,
             user_country_iso3: None,
             user_email: None,
+            media_task_id: None,
+            media_status: None,
+            video_duration_seconds: None,
+            video_resolution: None,
+            video_aspect_ratio: None,
             created_at,
             is_health_check: false,
         }
@@ -29923,6 +30077,9 @@ mod tests {
         let mut middle = test_share_request_log_entry("req-page-2", "share-page", created_at);
         middle.app_type = "claude".into();
         middle.user_email = Some("other@example.com".into());
+        middle.request_kind = "image".into();
+        middle.operation = "image_generation".into();
+        middle.usage_state = "not_applicable".into();
         let mut oldest = test_share_request_log_entry("req-page-1", "share-page", created_at);
         oldest.app_type = "codex".into();
         oldest.user_email = Some("buyer@example.com".into());
@@ -29935,7 +30092,7 @@ mod tests {
         }
 
         let first = store
-            .list_share_request_logs_page("share-page", None, None, None, 2)
+            .list_share_request_logs_page("share-page", None, None, None, None, 2)
             .await
             .unwrap();
         assert_eq!(
@@ -29948,7 +30105,14 @@ mod tests {
         );
         assert!(first.has_more);
         let second = store
-            .list_share_request_logs_page("share-page", None, None, first.next_cursor.as_deref(), 2)
+            .list_share_request_logs_page(
+                "share-page",
+                None,
+                None,
+                None,
+                first.next_cursor.as_deref(),
+                2,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -29962,7 +30126,7 @@ mod tests {
         assert!(!second.has_more);
 
         let codex_first = store
-            .list_share_request_logs_page("share-page", Some("CoDeX"), None, None, 1)
+            .list_share_request_logs_page("share-page", Some("CoDeX"), None, None, None, 1)
             .await
             .unwrap();
         assert_eq!(codex_first.logs[0].request_id, "req-page-4");
@@ -29971,6 +30135,7 @@ mod tests {
             .list_share_request_logs_page(
                 "share-page",
                 Some("codex"),
+                None,
                 None,
                 codex_first.next_cursor.as_deref(),
                 1,
@@ -29981,7 +30146,14 @@ mod tests {
         assert!(!codex_second.has_more);
 
         let buyer_first = store
-            .list_share_request_logs_page("share-page", None, Some("BUYER@example.com"), None, 1)
+            .list_share_request_logs_page(
+                "share-page",
+                None,
+                None,
+                Some("BUYER@example.com"),
+                None,
+                1,
+            )
             .await
             .unwrap();
         assert_eq!(buyer_first.logs[0].request_id, "req-page-4");
@@ -29989,6 +30161,7 @@ mod tests {
         let buyer_second = store
             .list_share_request_logs_page(
                 "share-page",
+                None,
                 None,
                 Some("buyer@example.com"),
                 buyer_first.next_cursor.as_deref(),
@@ -29998,6 +30171,27 @@ mod tests {
             .unwrap();
         assert_eq!(buyer_second.logs[0].request_id, "req-page-1");
         assert!(!buyer_second.has_more);
+
+        let images = store
+            .list_share_request_logs_page("share-page", None, Some("ImAgE"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(images.logs.len(), 1);
+        assert_eq!(images.logs[0].request_id, "req-page-2");
+        assert_eq!(images.logs[0].operation, "image_generation");
+        assert_eq!(images.logs[0].usage_state, "not_applicable");
+
+        let text = store
+            .list_share_request_logs_page("share-page", None, Some("text"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            text.logs
+                .iter()
+                .map(|log| log.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-page-4", "req-page-1"]
+        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -38975,6 +39169,7 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -39846,6 +40041,7 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -39944,6 +40140,7 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -40038,6 +40235,7 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -40169,6 +40367,7 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -40443,6 +40642,7 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -40559,6 +40759,7 @@ mod tests {
             banked_reset_expiry_lead_minutes:
                 crate::models::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: false,
+            grok_media_policy: Default::default(),
             config_revision: 0,
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
@@ -42031,6 +42232,9 @@ mod tests {
                 ShareRequestLogEntry {
                     export_sequence: 0,
                     request_id: "req-old-share-log".into(),
+                    request_kind: "text".into(),
+                    operation: "responses".into(),
+                    parent_request_id: None,
                     share_id: "share-old".into(),
                     share_name: "Old Share".into(),
                     provider_id: "provider-1".into(),
@@ -42050,6 +42254,7 @@ mod tests {
                     usage_state: "observed".into(),
                     stream_status: None,
                     usage_revision: 0,
+                    error_message: None,
                     status_code: 200,
                     latency_ms: 100,
                     first_token_ms: None,
@@ -42063,6 +42268,11 @@ mod tests {
                     user_country: None,
                     user_country_iso3: None,
                     user_email: None,
+                    media_task_id: None,
+                    media_status: None,
+                    video_duration_seconds: None,
+                    video_resolution: None,
+                    video_aspect_ratio: None,
                     created_at: Utc::now().timestamp(),
                     is_health_check: false,
                 },
@@ -42207,6 +42417,9 @@ mod tests {
         let logs = vec![ShareRequestLogEntry {
             export_sequence: 1,
             request_id: "req-1".into(),
+            request_kind: "text".into(),
+            operation: "responses".into(),
+            parent_request_id: None,
             share_id: "share-log-1".into(),
             share_name: "Log Share".into(),
             provider_id: "provider-1".into(),
@@ -42226,6 +42439,7 @@ mod tests {
             usage_state: "observed".into(),
             stream_status: Some("completed".into()),
             usage_revision: 2,
+            error_message: None,
             status_code: 200,
             latency_ms: 1234,
             first_token_ms: Some(222),
@@ -42239,6 +42453,11 @@ mod tests {
             user_country: None,
             user_country_iso3: None,
             user_email: Some("stale@example.com".into()),
+            media_task_id: None,
+            media_status: None,
+            video_duration_seconds: None,
+            video_resolution: None,
+            video_aspect_ratio: None,
             created_at: Utc::now().timestamp(),
             is_health_check: false,
         }];

@@ -1651,7 +1651,7 @@ export function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
   );
 }
 
-type RequestLogTab = "text" | "image";
+type RequestLogTab = "text" | "image" | "video";
 
 export function ShareProviderRequestsPanel({
   share,
@@ -1660,9 +1660,14 @@ export function ShareProviderRequestsPanel({
 }) {
   const { t } = useLocaleText();
   const [selectedKey, setSelectedKey] = React.useState<RequestLogTab>("text");
-  const [textLogs, setTextLogs] = React.useState<ShareRequestLog[]>(
-    (share.recentRequests || []).slice(0, 10),
+  const [logs, setLogs] = React.useState<ShareRequestLog[]>(
+    (share.recentRequests || [])
+      .filter((log) => (log.requestKind || "text") === "text")
+      .slice(0, 10),
   );
+  const [imagePreviews, setImagePreviews] = React.useState<
+    Record<string, ImageGenerationRequestLog>
+  >({});
   const [error, setError] = React.useState("");
   const requestSequence = React.useRef(0);
   const recentRequestVersion = React.useMemo(
@@ -1672,29 +1677,37 @@ export function ShareProviderRequestsPanel({
     [share.recentRequests],
   );
 
-  const loadTextLogs = React.useCallback(async () => {
+  const loadLogs = React.useCallback(async () => {
     const sequence = ++requestSequence.current;
     setError("");
     try {
-      const page = await getShareRequestLogs(share.shareId, {
-        limit: 10,
-      });
+      const [page, legacyImageLogs] = await Promise.all([
+        getShareRequestLogs(share.shareId, {
+          requestKind: selectedKey,
+          limit: 10,
+        }),
+        selectedKey === "image"
+          ? getShareImageGenerationRequestLogs(share.shareId, 50)
+          : Promise.resolve([]),
+      ]);
       if (sequence !== requestSequence.current) return;
-      setTextLogs((page.logs || []).slice(0, 10));
+      setLogs((page.logs || []).slice(0, 10));
+      setImagePreviews(
+        Object.fromEntries(legacyImageLogs.map((log) => [log.requestId, log])),
+      );
     } catch (err) {
       if (sequence === requestSequence.current) {
         setError(err instanceof Error ? err.message : String(err));
       }
     }
-  }, [share.shareId]);
+  }, [selectedKey, share.shareId]);
 
   React.useEffect(() => {
-    if (selectedKey !== "text") return;
-    void loadTextLogs();
+    void loadLogs();
     return () => {
       requestSequence.current += 1;
     };
-  }, [loadTextLogs, recentRequestVersion, selectedKey]);
+  }, [loadLogs, recentRequestVersion]);
 
   return (
     <div className="grid gap-3">
@@ -1709,7 +1722,7 @@ export function ShareProviderRequestsPanel({
         variant="secondary"
         className="text-foreground"
       >
-        <Tabs.List className="grid w-full grid-cols-2 text-foreground">
+        <Tabs.List className="grid w-full grid-cols-3 text-foreground">
           <Tabs.Tab
             id="text"
             className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
@@ -1722,16 +1735,18 @@ export function ShareProviderRequestsPanel({
           >
             {t("dashboard.imageJobs")}
           </Tabs.Tab>
+          <Tabs.Tab
+            id="video"
+            className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
+          >
+            {t("dashboard.videoJobs")}
+          </Tabs.Tab>
         </Tabs.List>
       </Tabs>
-      {selectedKey === "text" ? (
-        <div className="grid gap-3">
-          <ShareRequestLogs logs={textLogs} />
-          {error ? <EmptyBlock>{error}</EmptyBlock> : null}
-        </div>
-      ) : (
-        <ShareImageRequestLogs shareId={share.shareId} />
-      )}
+      <div className="grid gap-3">
+        <ShareRequestLogs logs={logs} imagePreviews={imagePreviews} />
+        {error ? <EmptyBlock>{error}</EmptyBlock> : null}
+      </div>
     </div>
   );
 }
@@ -1912,13 +1927,21 @@ export function ShareImageRequestLogs({ shareId }: { shareId: string }) {
   );
 }
 
-export function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
+export function ShareRequestLogs({
+  logs,
+  imagePreviews = {},
+}: {
+  logs: ShareRequestLog[];
+  imagePreviews?: Record<string, ImageGenerationRequestLog>;
+}) {
   const { locale, t } = useLocaleText();
   if (!logs.length)
     return <EmptyBlock>{t("dashboard.noRequestLogs")}</EmptyBlock>;
   return (
     <div className="grid gap-2">
-      {logs.slice(0, 10).map((log) => (
+      {logs.slice(0, 10).map((log) => {
+        const imagePreview = imagePreviews[log.requestId];
+        return (
         <Card key={log.requestId} className="rounded-lg border p-0 shadow-none">
           <Card.Content className="gap-3 p-3">
             <div className="flex items-start justify-between gap-3">
@@ -1989,10 +2012,53 @@ export function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
                 <span>{log.latencyMs}ms</span>
               </div>
             </div>
-            <TokenGrid log={log} />
+            {(log.requestKind || "text") === "text" ? (
+              <TokenGrid log={log} />
+            ) : (
+              <div className="flex items-center gap-3 rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground">
+                {imagePreview?.resultUrl ? (
+                  <a
+                    href={imagePreview.resultUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block h-12 w-12 shrink-0 overflow-hidden rounded-md border border-default-200 bg-background"
+                  >
+                    <img
+                      src={imagePreview.resultUrl}
+                      alt=""
+                      className="h-full w-full object-cover"
+                      loading="lazy"
+                    />
+                  </a>
+                ) : null}
+                <div className="flex min-w-0 flex-wrap gap-x-3 gap-y-1">
+                  <span>{log.operation || log.requestKind}</span>
+                  {log.mediaStatus ? <span>{log.mediaStatus}</span> : null}
+                  {log.mediaTaskId ? (
+                    <span className="font-mono">{log.mediaTaskId}</span>
+                  ) : null}
+                  {log.videoDurationSeconds ? (
+                    <span>{log.videoDurationSeconds}s</span>
+                  ) : null}
+                  {log.videoResolution ? <span>{log.videoResolution}</span> : null}
+                  {log.videoAspectRatio ? <span>{log.videoAspectRatio}</span> : null}
+                  {imagePreview?.resultMimeType ? (
+                    <span>{imagePreview.resultMimeType}</span>
+                  ) : null}
+                  {imagePreview?.resultSizeBytes ? (
+                    <span>{formatImageLogSizeMb(imagePreview.resultSizeBytes)}</span>
+                  ) : null}
+                </div>
+              </div>
+            )}
+            {log.errorMessage ? (
+              <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={log.errorMessage}>
+                {log.errorMessage}
+              </div>
+            ) : null}
           </Card.Content>
         </Card>
-      ))}
+      )})}
     </div>
   );
 }

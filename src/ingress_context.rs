@@ -46,10 +46,16 @@ pub struct IngressContext {
     pub user_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_country: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_health_check: bool,
     pub method: String,
     pub path_and_query: String,
     pub body_sha256: String,
     pub issued_at_ms: i64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +179,7 @@ mod tests {
             user_email: Some("owner@example.com".into()),
             user_role: None,
             user_country: Some("JP".into()),
+            is_health_check: false,
             method: "POST".into(),
             path_and_query: "/v1/messages?beta=true".into(),
             body_sha256: body_sha256_hex(br#"{"model":"claude-sonnet-4-6"}"#),

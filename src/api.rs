@@ -11,6 +11,7 @@ use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{MethodRouter, any, delete, get, patch, post, put};
 use axum::{Json, Router};
+use base64::Engine;
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -79,8 +80,8 @@ use crate::notifications::{
     route_reconnect_grace, validate_notification_cleanup_window,
 };
 use crate::proxy::{
-    ReleasedShareRequest, RouteAvailability, gateway_proxy_handler, is_user_model_api_host,
-    build_user_model_route_test_probe, execute_user_model_route_test, proxy_handler,
+    ReleasedShareRequest, RouteAvailability, build_user_model_route_test_probe,
+    execute_user_model_route_test, gateway_proxy_handler, is_user_model_api_host, proxy_handler,
     unified_model_test_curl, user_model_proxy_handler, with_unified_api_cors,
 };
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -1301,6 +1302,7 @@ async fn client_upgrade_target(
             user_email: Some(owner_email),
             user_role: Some("owner".into()),
             user_country: None,
+            is_health_check: false,
             method: method.to_string(),
             path_and_query: path_and_query.to_string(),
             body_sha256: crate::ingress_context::body_sha256_hex(body),
@@ -3727,6 +3729,9 @@ mod tests {
         crate::models::ShareRequestLogEntry {
             export_sequence: 0,
             request_id: request_id.into(),
+            request_kind: "text".into(),
+            operation: "responses".into(),
+            parent_request_id: None,
             share_id: "share-1".into(),
             share_name: "Share".into(),
             provider_id: "provider-1".into(),
@@ -3746,6 +3751,7 @@ mod tests {
             usage_state: "observed".into(),
             stream_status: None,
             usage_revision: 0,
+            error_message: None,
             status_code: 200,
             latency_ms: 1,
             first_token_ms: None,
@@ -3759,6 +3765,11 @@ mod tests {
             user_country: None,
             user_country_iso3: None,
             user_email: None,
+            media_task_id: None,
+            media_status: None,
+            video_duration_seconds: None,
+            video_resolution: None,
+            video_aspect_ratio: None,
             created_at,
             is_health_check: false,
         }
@@ -4030,6 +4041,17 @@ mod tests {
             ProbeResponseMode::GeminiSse
         );
         assert!(probe_response_mode("unknown").is_err());
+        assert_eq!(
+            effective_probe_response_mode(
+                ProbeResponseMode::ImageSse,
+                Some("text/event-stream; charset=utf-8"),
+            ),
+            ProbeResponseMode::ImageSse
+        );
+        assert_eq!(
+            effective_probe_response_mode(ProbeResponseMode::ImageSse, Some("application/json"),),
+            ProbeResponseMode::ImageJson
+        );
     }
 
     #[test]
@@ -4047,6 +4069,7 @@ mod tests {
             },
             app_runtimes: Default::default(),
             app_providers: Default::default(),
+            grok_media_policy: Default::default(),
         };
 
         assert!(share_model_probe_app_enabled(&share, "codex"));
@@ -4133,6 +4156,40 @@ mod tests {
         assert_eq!(body.preview.len(), TEST_BODY_CAP);
         assert!(body.total_bytes > body.preview.len());
         assert_eq!(body.terminal_event.as_deref(), Some("response.completed"));
+        assert!(body.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_probe_accepts_legal_json_larger_than_the_text_probe_cap() {
+        let mut payload = b"\n{\"data\":[{\"b64_json\":\"".to_vec();
+        payload.extend(std::iter::repeat_n(b'a', TEST_JSON_PARSE_CAP + 1_024));
+        payload.extend_from_slice(b"\"}]}\n");
+        let app = Router::new().route(
+            "/probe",
+            get(move || {
+                let payload = payload.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], payload) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind image JSON probe server");
+        let address = listener.local_addr().expect("image JSON probe address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve image JSON probe response");
+        });
+
+        let response = reqwest::get(format!("http://{address}/probe"))
+            .await
+            .expect("request image JSON probe response");
+        let body = read_probe_body(response, ProbeResponseMode::ImageJson).await;
+        server.abort();
+
+        assert_eq!(body.preview.len(), TEST_BODY_CAP);
+        assert!(body.total_bytes > TEST_JSON_PARSE_CAP);
+        assert_eq!(body.terminal_event.as_deref(), Some("image_json.completed"));
         assert!(body.error.is_none());
     }
 }
@@ -6377,6 +6434,9 @@ struct ShareConnectionTestRequest {
     /// Legacy callers may still send "text"; all other old probe kinds are retired.
     #[serde(default)]
     kind: Option<String>,
+    /// text | image_generation | image_edit | video_generation
+    #[serde(default)]
+    operation: Option<String>,
     /// 可选，毫秒；默认 15000，上限 30000
     #[serde(default)]
     timeout_ms: Option<u64>,
@@ -6394,6 +6454,19 @@ struct ShareConnectionTestResponse {
     terminal_event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduling_recovery: Option<crate::store::ShareSchedulingRecovery>,
+}
+
+enum ConnectionTestBody {
+    Json(String),
+    ImageEdit(Vec<u8>),
+}
+
+struct PreparedConnectionTest {
+    method: String,
+    path: String,
+    echo_body: String,
+    body: ConnectionTestBody,
+    response_mode: ProbeResponseMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6420,6 +6493,8 @@ struct ImageGenerationRequestLogsQuery {
 struct ShareRequestLogsQuery {
     #[serde(default)]
     app: Option<String>,
+    #[serde(default, rename = "requestKind", alias = "request_kind")]
+    request_kind: Option<String>,
     #[serde(default)]
     cursor: Option<String>,
     #[serde(default)]
@@ -6505,14 +6580,35 @@ struct TestResponseEcho {
 
 const TEST_BODY_CAP: usize = 64 * 1024;
 const TEST_JSON_PARSE_CAP: usize = 1024 * 1024;
+const TEST_IMAGE_JSON_PARSE_CAP: usize = 16 * 1024 * 1024;
 const TEST_SSE_LINE_SCAN_CAP: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeResponseMode {
     Json,
+    ImageJson,
     AnthropicSse,
     ResponsesSse,
     GeminiSse,
+    ImageSse,
+}
+
+fn effective_probe_response_mode(
+    mode: ProbeResponseMode,
+    content_type: Option<&str>,
+) -> ProbeResponseMode {
+    if mode == ProbeResponseMode::ImageSse
+        && !content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+    {
+        ProbeResponseMode::ImageJson
+    } else {
+        mode
+    }
 }
 
 fn probe_response_mode(value: &str) -> Result<ProbeResponseMode, AppError> {
@@ -6607,7 +6703,8 @@ impl ProbeSseTracker {
             ProbeResponseMode::AnthropicSse => "message_stop",
             ProbeResponseMode::ResponsesSse => "response.completed",
             ProbeResponseMode::GeminiSse => "a Gemini finishReason",
-            ProbeResponseMode::Json => "JSON response",
+            ProbeResponseMode::ImageSse => "an image generation terminal event",
+            ProbeResponseMode::Json | ProbeResponseMode::ImageJson => "JSON response",
         };
         let message = if self.saw_done {
             format!("stream emitted [DONE] before required terminal event {expected}")
@@ -6652,7 +6749,11 @@ impl ProbeSseTracker {
             ProbeResponseMode::AnthropicSse => event == "message_stop",
             ProbeResponseMode::ResponsesSse => event == "response.completed",
             ProbeResponseMode::GeminiSse => event == "gemini.completed",
-            ProbeResponseMode::Json => false,
+            ProbeResponseMode::ImageSse => matches!(
+                event,
+                "image_generation.completed" | "image_edit.completed" | "response.completed"
+            ),
+            ProbeResponseMode::Json | ProbeResponseMode::ImageJson => false,
         };
         let failure = match self.mode {
             ProbeResponseMode::AnthropicSse => event == "error",
@@ -6665,7 +6766,11 @@ impl ProbeSseTracker {
                     | "error"
             ),
             ProbeResponseMode::GeminiSse => event == "error",
-            ProbeResponseMode::Json => false,
+            ProbeResponseMode::ImageSse => matches!(
+                event,
+                "image_generation.failed" | "image_edit.failed" | "response.failed" | "error"
+            ),
+            ProbeResponseMode::Json | ProbeResponseMode::ImageJson => false,
         };
         if failure && self.failure_event.is_none() {
             self.failure_event = Some(event.to_string());
@@ -6733,7 +6838,13 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
     let mut total_bytes = 0_usize;
     let mut json_body = Vec::new();
     let mut json_too_large = false;
-    let mut sse_tracker = (mode != ProbeResponseMode::Json).then(|| ProbeSseTracker::new(mode));
+    let json_parse_cap = if mode == ProbeResponseMode::ImageJson {
+        TEST_IMAGE_JSON_PARSE_CAP
+    } else {
+        TEST_JSON_PARSE_CAP
+    };
+    let mut sse_tracker = (!matches!(mode, ProbeResponseMode::Json | ProbeResponseMode::ImageJson))
+        .then(|| ProbeSseTracker::new(mode));
 
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
@@ -6754,7 +6865,7 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
         }
         if let Some(tracker) = sse_tracker.as_mut() {
             tracker.push(&chunk);
-        } else if json_body.len().saturating_add(chunk.len()) <= TEST_JSON_PARSE_CAP {
+        } else if json_body.len().saturating_add(chunk.len()) <= json_parse_cap {
             json_body.extend_from_slice(&chunk);
         } else {
             json_too_large = true;
@@ -6776,7 +6887,7 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
             total_bytes,
             terminal_event: None,
             error: Some(format!(
-                "JSON response exceeds the {TEST_JSON_PARSE_CAP} byte validation limit"
+                "JSON response exceeds the {json_parse_cap} byte validation limit"
             )),
         };
     }
@@ -6789,7 +6900,13 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
     ProbeBodyRead {
         preview,
         total_bytes,
-        terminal_event: error.is_none().then(|| "json.completed".to_string()),
+        terminal_event: error.is_none().then(|| {
+            if mode == ProbeResponseMode::ImageJson {
+                "image_json.completed".to_string()
+            } else {
+                "json.completed".to_string()
+            }
+        }),
         error,
     }
 }
@@ -6891,6 +7008,7 @@ async fn list_share_request_logs(
         .list_share_request_logs_page(
             &share_id,
             query.app.as_deref(),
+            query.request_kind.as_deref(),
             None,
             query.cursor.as_deref(),
             query.limit.unwrap_or(50),
@@ -7105,14 +7223,20 @@ async fn test_share_connection(
     if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
         return Err(AppError::BadRequest("unsupported Share App".into()));
     }
-    if input
-        .kind
+    let operation = input
+        .operation
         .as_deref()
+        .or(input.kind.as_deref())
         .map(str::trim)
-        .is_some_and(|kind| !kind.is_empty() && kind != "text")
-    {
+        .filter(|value| !value.is_empty())
+        .unwrap_or("text")
+        .to_ascii_lowercase();
+    if !matches!(
+        operation.as_str(),
+        "text" | "image_generation" | "image_edit" | "video_generation"
+    ) {
         return Err(AppError::BadRequest(
-            "only the Server-authoritative model probe is supported".into(),
+            "unsupported Share connection test operation".into(),
         ));
     }
 
@@ -7141,31 +7265,108 @@ async fn test_share_connection(
             "share does not enable the {app} API"
         )));
     }
-    let probe = share_model_probe_for_app(&share, &app)
-        .cloned()
-        .ok_or_else(|| {
-            AppError::Conflict(format!(
-                "Share Contract v4 modelProbe is unavailable (contract version {}); upgrade or resync cc-switch-server",
-                share.contract_version
-            ))
+    let prepared = if operation == "text" {
+        let probe = share_model_probe_for_app(&share, &app)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "Share Contract v5 modelProbe is unavailable (contract version {}); upgrade or resync cc-switch-server",
+                    share.contract_version
+                ))
+            })?;
+        let expected_api_type = match app.as_str() {
+            "claude" => "anthropic",
+            "codex" => "openai",
+            "gemini" => "gemini",
+            _ => unreachable!("Share App was validated above"),
+        };
+        if probe.api_type != expected_api_type
+            || crate::store::validate_provider_model_probe(&app, &probe).is_err()
+        {
+            return Err(AppError::Conflict(
+                "Share modelProbe is incompatible; upgrade or resync cc-switch-server".into(),
+            ));
+        }
+        let body = serde_json::to_string(&probe.body).map_err(|error| {
+            AppError::Internal(format!("encode Share modelProbe body failed: {error}"))
         })?;
-    let expected_api_type = match app.as_str() {
-        "claude" => "anthropic",
-        "codex" => "openai",
-        "gemini" => "gemini",
-        _ => unreachable!("Share App was validated above"),
+        PreparedConnectionTest {
+            method: probe.method,
+            path: probe.path,
+            echo_body: body.clone(),
+            body: ConnectionTestBody::Json(body),
+            response_mode: probe_response_mode(&probe.response_mode)?,
+        }
+    } else {
+        if app != "codex" {
+            return Err(AppError::BadRequest(
+                "Grok media connection tests require the codex Share binding".into(),
+            ));
+        }
+        let enabled = match operation.as_str() {
+            "image_generation" => share.grok_media_policy.image_generation_enabled,
+            "image_edit" => share.grok_media_policy.image_edit_enabled,
+            "video_generation" => share.grok_media_policy.video_generation_enabled,
+            _ => false,
+        };
+        if !enabled {
+            return Err(AppError::Forbidden(format!(
+                "{operation} is disabled by the Share Grok media policy"
+            )));
+        }
+        match operation.as_str() {
+            "image_generation" => {
+                let body = serde_json::json!({
+                    "model": "grok-imagine",
+                    "prompt": "A small blue circle on a plain white background",
+                    "n": 1,
+                    "response_format": "b64_json"
+                })
+                .to_string();
+                PreparedConnectionTest {
+                    method: "POST".into(),
+                    path: "/v1/images/generations".into(),
+                    echo_body: body.clone(),
+                    body: ConnectionTestBody::Json(body),
+                    response_mode: ProbeResponseMode::ImageSse,
+                }
+            }
+            "image_edit" => {
+                const TEST_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+                let image = base64::engine::general_purpose::STANDARD
+                    .decode(TEST_PNG_BASE64)
+                    .map_err(|error| {
+                        AppError::Internal(format!("decode test image failed: {error}"))
+                    })?;
+                PreparedConnectionTest {
+                    method: "POST".into(),
+                    path: "/v1/images/edits".into(),
+                    echo_body: "<multipart: model=grok-imagine, prompt, image=test.png>".into(),
+                    body: ConnectionTestBody::ImageEdit(image),
+                    response_mode: ProbeResponseMode::ImageSse,
+                }
+            }
+            "video_generation" => {
+                let body = serde_json::json!({
+                    "model": "grok-imagine-video",
+                    "prompt": "A blue circle slowly moving from left to right",
+                    "duration": 6,
+                    "resolution": "720p",
+                    "aspect_ratio": "16:9"
+                })
+                .to_string();
+                PreparedConnectionTest {
+                    method: "POST".into(),
+                    path: "/v1/videos/generations".into(),
+                    echo_body: body.clone(),
+                    body: ConnectionTestBody::Json(body),
+                    response_mode: ProbeResponseMode::Json,
+                }
+            }
+            _ => unreachable!("operation was validated"),
+        }
     };
-    if probe.api_type != expected_api_type
-        || crate::store::validate_provider_model_probe(&app, &probe).is_err()
-    {
-        return Err(AppError::Conflict(
-            "Share modelProbe is incompatible; upgrade or resync cc-switch-server".into(),
-        ));
-    }
-    let response_mode = probe_response_mode(&probe.response_mode)?;
-    let probe_body = serde_json::to_string(&probe.body).map_err(|error| {
-        AppError::Internal(format!("encode Share modelProbe body failed: {error}"))
-    })?;
+    let response_mode = prepared.response_mode;
     let subdomain = share.subdomain.clone();
 
     // Fetch the caller's own api token (not the share owner's)
@@ -7184,8 +7385,8 @@ async fn test_share_connection(
     // axum HTTP listener as we're running on, addressed by 127.0.0.1, with a
     // Host header that matches the public subdomain. share proxy routes by
     // Host, so the routing decision is identical.
-    let public_url = format!("{}{}", state.config.tunnel_url(&subdomain), probe.path);
-    let local_url = format!("http://{}{}", state.config.api_addr, probe.path);
+    let public_url = format!("{}{}", state.config.tunnel_url(&subdomain), prepared.path);
+    let local_url = format!("http://{}{}", state.config.api_addr, prepared.path);
     let public_host = format!("{}.{}", subdomain, state.config.tunnel_domain);
 
     // Echo headers with redacted token for response
@@ -7197,7 +7398,15 @@ async fn test_share_connection(
                 &api_token.chars().take(14).collect::<String>()
             ),
         ],
-        ["Content-Type".to_string(), "application/json".to_string()],
+        [
+            "Content-Type".to_string(),
+            if matches!(&prepared.body, ConnectionTestBody::Json(_)) {
+                "application/json"
+            } else {
+                "multipart/form-data"
+            }
+            .to_string(),
+        ],
     ];
 
     let timeout_ms = input.timeout_ms.unwrap_or(15_000).min(30_000);
@@ -7211,19 +7420,37 @@ async fn test_share_connection(
         .map_err(|e| AppError::Internal(format!("create test client failed: {e}")))?;
 
     let request_echo = TestRequestEcho {
-        method: probe.method.clone(),
+        method: prepared.method.clone(),
         url: public_url.clone(),
         headers: echo_headers,
-        body: Some(probe_body.clone()),
+        body: Some(prepared.echo_body.clone()),
     };
 
     let started = std::time::Instant::now();
-    let mut request = client
+    let request = client
         .post(&local_url)
         .header("Host", &public_host)
         .bearer_auth(&api_token)
-        .header("Content-Type", "application/json")
-        .body(probe_body);
+        .header("x-cc-switch-dashboard-test", "1");
+    let mut request = match prepared.body {
+        ConnectionTestBody::Json(body) => request
+            .header("Content-Type", "application/json")
+            .body(body),
+        ConnectionTestBody::ImageEdit(image) => request.multipart(
+            reqwest::multipart::Form::new()
+                .text("model", "grok-imagine")
+                .text("prompt", "Make the dot green")
+                .part(
+                    "image",
+                    reqwest::multipart::Part::bytes(image)
+                        .file_name("test.png")
+                        .mime_str("image/png")
+                        .map_err(|error| {
+                            AppError::Internal(format!("build test image part failed: {error}"))
+                        })?,
+                ),
+        ),
+    };
     if response_mode != ProbeResponseMode::Json {
         request = request.header("Accept", "text/event-stream");
     }
@@ -7252,6 +7479,12 @@ async fn test_share_connection(
         Ok(resp) => {
             let status_code = resp.status().as_u16();
             let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+            let response_mode = effective_probe_response_mode(
+                response_mode,
+                resp.headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+            );
             let resp_headers: Vec<[String; 2]> = resp
                 .headers()
                 .iter()
@@ -7274,7 +7507,7 @@ async fn test_share_connection(
                 semantic_error = body.error.as_deref().unwrap_or("-"),
                 "test-connection completed"
             );
-            let scheduling_recovery = if success {
+            let scheduling_recovery = if success && operation == "text" {
                 let recovery = state
                     .store
                     .recover_share_app_scheduling_after_successful_test(&share_id, &app)

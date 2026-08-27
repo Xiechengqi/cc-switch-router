@@ -175,11 +175,12 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- 当前写出版本是 **Share Contract v4**。Router 为滚动升级仍可读取 v2..v4,但只有 v4 提供本节定义的 `modelProbe`;Share Market 发布、连接测试与半小时模型健康检查均要求当前版本。
+- 当前写出版本是 **Share Contract v5**。Router 为滚动升级仍可读取 v2..v5,但只有 v5 提供本节定义的 `modelProbe` 和 Grok 媒体权限；Share Market 发布、连接测试与半小时模型健康检查均要求当前版本。
 - `capacityPoolId` 是非空匿名标识。同一 Router 下复用相同物理账号或 API key 的不同 Share URL 使用同一值,用于容量与故障域去重；该值在凭据源不变期间稳定，账号绑定或 API key 改变时必须重新派生并同步。
 - `bindings` 必须包含 1 到 3 个不同 app 的 `{ app: providerId }` 绑定,app 仅允许 `claude`、`codex`、`gemini`;顶层 `appType` / `providerId` 必须对应其中一个绑定。
 - `support` 表示当前对外开启的 App API。关闭某个 API 不会删除对应 binding；至少保留一个已绑定 app 为开启。未开启的 app 不接受直连、Share Market 或 Gateway 请求。
 - `appRuntimes`、`appProviders` 与 `appAvailability` 只可声明已绑定 app。访问策略由 Share 级 `freeAccess` 与 `userGrants` 统一定义；v4 延续 v2 的边界,不包含分 app ACL、`appSettings` 或普通 Share 价格字段。
+- v5 的 `grokMediaPolicy` 包含 `imageGenerationEnabled`、`imageEditEnabled`、`videoGenerationEnabled` 三个独立布尔权限，缺失时全部为 `false`。它只授权 Share 使用能力，不能绕过 Server Grok Provider 的对应开关或绑定账号 capability evidence。
 - `userGrants[].usage` 是当前周期的 Server 派生快照；可选的 `usageRebase` 是 Server-owned 的官方额度重置基线。Router 必须原样 round-trip 该字段并使用 descriptor 中的有效 usage 做限制判断，不能通过普通设置补丁伪造或修改基线。
 - `upstreamProvider`、`appRuntimes` 和 `appProviders` 中的 Provider 投影携带有效 `modelPolicy`，并用 `modelPolicyScope=global|per_app` 与 `modelPolicySource=bundle_global|app_independent|profile_fixed` 明确控制来源。`global` 只统一 Bundle 中可配置的 Surface；Profile 固定策略可不同且必须标记为 `profile_fixed`。这些字段属于静态 descriptor 指纹，单独切换 scope 也必须提升投影并同步 Router。
 - v4 的每个可测试 Provider 运行时携带无凭据的 `modelProbe`。它是 Server 供应商测试请求的唯一公开描述,连接示例和 Router 定时测试不得自行维护模型名或请求模板。字段语义如下:
@@ -443,20 +444,26 @@ Client 页和 Share Market 页的 Share 侧边栏使用同一个日历组件:日
 
 模型策略提示同样读取 Provider 投影:`passthrough` 明确说明模型名会透传到具体供应商,调用方应使用该供应商支持的模型名；`single` 明确说明任意请求模型都会映射到固定上游模型。弹窗展示的“测试模型”、Curl 以及半小时周期使用同一个 Server 配置来源。
 
+Grok Share 的手动测试另支持 `image_generation`、`image_edit`、`video_generation`。媒体操作只允许 Codex binding，只在 `grokMediaPolicy` 对应权限开启时展示和执行；Router 使用固定安全 prompt、内置合法 1×1 PNG 和固定 6s/720p/16:9 视频参数。Router 发出的 dashboard 测试只有在 loopback peer、精确内部 User-Agent 和内部 marker 三项同时满足时才把签名 `IngressContext.isHealthCheck` 设为 `true`；公网同名 header 会被剥离，不能伪造 HealthProbe。
+
 ### 8.3 Share 请求日志 usage 生命周期
 
 Server 通过签名接口 `POST /v1/share-request-logs/batch-sync` 上送同一 `requestId` 的创建和终态记录。Token 数字字段为兼容字段，是否已经观测到真实 usage 必须由以下字段判定：
 
 | 字段 | 语义 |
 |---|---|
-| `usageState` | `pending`、`observed`、`missing`、`parse_error` 或 `interrupted` |
+| `usageState` | `pending`、`observed`、`missing`、`parse_error`、`interrupted` 或媒体终态 `not_applicable` |
 | `streamStatus` | 上游流终态或失败原因，例如 `completed`、`client_cancelled`、`timeout` |
 | `usageRevision` | 同一请求内单调递增的 revision |
+| `requestKind` / `operation` | `text|image|video` 及具体入口，例如 `responses`、`image_edit`、`video_status` |
+| `parentRequestId` | 视频状态查询关联创建请求；历史任务可为空 |
+| 媒体字段 | `mediaTaskId`、`mediaStatus`、视频 duration/resolution/aspect ratio 和有界 `errorMessage` |
 
 - `observed` 允许所有 token 字段都为 `0`；这表示上游明确返回零，不能等同于 unknown。
 - `pending`、`missing`、`parse_error` 和 `interrupted` 的数字兼容字段即使为 `0`，Dashboard、ticker、吞吐量和统计采样也不得当作真实零 usage。
 - `share_request_logs` upsert 只接受 `excluded.usage_revision >= share_request_logs.usage_revision`，因此迟到或重放的低 revision pending 不能覆盖更高 revision 终态。
 - 旧 Server 未发送这些字段时，Router 按 `usageState=observed`、`usageRevision=0` 兼容；新 Server 必须发送明确状态。
+- `not_applicable` 不代表 token 为零；Image/Video 卡片不得渲染 token grid。`GET /v1/shares/:id/request-logs?requestKind=text|image|video` 在分页前过滤，并排除 `isHealthCheck=true` 记录。Dashboard 侧边栏以三个 Tab 读取同一接口；Image Tab 可用同一个 canonical `requestId` 关联旧图片结果表中的受控预览 URL。
 
 **该命名空间对公网封闭**:`/_share-router/*` 的入站 GET 必须携带合法控制签名,否则返回 404(`src/proxy.rs:4032-4043`)。`/_ctl/*` 在所有公网入口点一律 404,不经路由(`src/proxy.rs:1459, 1845, 2165`)。
 

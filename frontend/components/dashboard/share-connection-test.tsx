@@ -16,6 +16,7 @@ import type {
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
 type TestApp = "claude" | "codex" | "gemini";
+type TestOperation = "text" | "image_generation" | "image_edit" | "video_generation";
 
 function runtimeForApp(share: ShareView, app: TestApp) {
   return share.appRuntimes?.[app];
@@ -101,6 +102,7 @@ export function ShareConnectionTestRow({
   const [errorMsg, setErrorMsg] = React.useState("");
   const [refreshState, setRefreshState] = React.useState<TestState>("idle");
   const [refreshMsg, setRefreshMsg] = React.useState("");
+  const [operation, setOperation] = React.useState<TestOperation>("text");
 
   const isBound = !!(share.bindings?.[app]);
   const runtime = runtimeForApp(share, app);
@@ -111,13 +113,19 @@ export function ShareConnectionTestRow({
   );
 
   const runTest = React.useCallback(async () => {
-    if (!canExecute || !isBound || !probe || testState === "running") return;
+    if (
+      !canExecute ||
+      !isBound ||
+      (operation === "text" && !probe) ||
+      testState === "running"
+    ) return;
     setTestState("running");
     setResult(null);
     setErrorMsg("");
     try {
       const response = await testShareConnection(share.shareId, {
         app,
+        operation,
         timeoutMs: 30000,
       });
       setResult(response);
@@ -126,7 +134,7 @@ export function ShareConnectionTestRow({
       setErrorMsg(err instanceof Error ? err.message : String(err));
       setTestState("error");
     }
-  }, [canExecute, isBound, probe, testState, share.shareId, app]);
+  }, [canExecute, isBound, probe, testState, share.shareId, app, operation]);
 
   const runUsageRefresh = React.useCallback(async () => {
     if (!canExecute || !isBound || refreshState === "running") return;
@@ -161,7 +169,7 @@ export function ShareConnectionTestRow({
 
   let disabledReason: string | null = null;
   if (!isBound) disabledReason = t("dashboard.connectDialog.test.notBound");
-  else if (!probe) disabledReason = t("dashboard.connectDialog.test.probeUnavailable");
+  else if (operation === "text" && !probe) disabledReason = t("dashboard.connectDialog.test.probeUnavailable");
   else if (!authenticated) disabledReason = t("dashboard.connectDialog.test.needAuth");
   else if (!canExecute) disabledReason = t("dashboard.connectDialog.test.needPermission");
 
@@ -196,6 +204,25 @@ export function ShareConnectionTestRow({
           <span className="text-xs text-slate-400">{disabledReason}</span>
         ) : (
           <div className="flex shrink-0 items-center gap-1.5">
+            {app === "codex" ? (
+              <select
+                value={operation}
+                onChange={(event) => setOperation(event.target.value as TestOperation)}
+                disabled={running}
+                className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700"
+              >
+                <option value="text">{t("dashboard.connectDialog.test.operationText")}</option>
+                {share.grokMediaPolicy?.imageGenerationEnabled ? (
+                  <option value="image_generation">{t("dashboard.connectDialog.test.operationImageGeneration")}</option>
+                ) : null}
+                {share.grokMediaPolicy?.imageEditEnabled ? (
+                  <option value="image_edit">{t("dashboard.connectDialog.test.operationImageEdit")}</option>
+                ) : null}
+                {share.grokMediaPolicy?.videoGenerationEnabled ? (
+                  <option value="video_generation">{t("dashboard.connectDialog.test.operationVideoGeneration")}</option>
+                ) : null}
+              </select>
+            ) : null}
             {canRefreshUsage ? (
               <Button
                 size="sm"
@@ -231,7 +258,7 @@ export function ShareConnectionTestRow({
         )}
       </div>
 
-      {probe ? (
+      {operation === "text" && probe ? (
         <p className="text-xs leading-5 text-slate-500">
           {modelPolicyDescription(runtime, t)}{" "}
           <span className="text-slate-400">·</span>{" "}
@@ -252,7 +279,7 @@ export function ShareConnectionTestRow({
         </p>
       ) : null}
 
-      {curlCmd ? (
+      {operation === "text" && curlCmd ? (
         <details className="group">
           <summary className="flex cursor-pointer list-none items-center gap-2 py-1 text-xs font-medium text-slate-600 marker:content-none [&::-webkit-details-marker]:hidden">
             <ChevronDown className="h-3.5 w-3.5 shrink-0 -rotate-90 text-slate-400 transition-transform group-open:rotate-0" />
