@@ -22,7 +22,7 @@
 | `installation` | 一个运行中的 Server 实例,Router 注册的基本单位 |
 | `client tunnel` | Server 属主自己的管理端点隧道 |
 | `share tunnel` | 对外提供额度共享的隧道,每个启用的 share 一条 |
-| `share descriptor` | Server 同步给 Router 的 share 配置与运行时快照;一个 descriptor 可绑定 Claude/Codex/Gemini 中的 1 到 3 个 app |
+| `share descriptor` | Server 同步给 Router 的 share 配置与运行时快照;一个 descriptor 可绑定 Claude/Codex/Gemini 中的 1 到 3 个 app。Router 对 Server 送来的 `ops`/`share`/edit `ack` JSON 原文验签,claim 通过原文 SHA-256 绑定 descriptor,再用严格解析后的结构校验和落库 |
 | `account` | 绑定在 Upstream Provider 上的凭据(OAuth token 或 API key),存于 Server |
 | `capacity pool` | 同一物理账号或 API key 的匿名容量标识;可跨多个独立 Share URL 复用，在凭据源变化时重派生 |
 | `统一模型入口` | 区域级 `api.<tunnel_domain>`；按用户的精确 App/模型映射选择 Share，不拥有独立容量或授权 |

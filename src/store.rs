@@ -9200,16 +9200,24 @@ impl AppStore {
                     AppError::Conflict("installation owner email is not configured".into())
                 })
                 .and_then(normalize_email)?;
-            verify_signed_share_request(
+            verify_signed_share_request_json(
                 &conn,
                 &installation.public_key,
                 &input.installation_id,
                 "share_sync",
-                &input.share,
+                input.signed_share.get(),
                 input.timestamp_ms,
                 &input.nonce,
                 &input.signature,
-            )?;
+            )
+            .inspect_err(|error| {
+                log_signed_share_request_failure(
+                    &input.installation_id,
+                    "share_sync",
+                    Some(input.share.share_id.as_str()),
+                    error,
+                );
+            })?;
             let should_refresh_geo =
                 should_refresh_installation_geo(&installation, metadata.ip.as_deref());
             touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -9270,11 +9278,21 @@ impl AppStore {
             &installation.public_key,
             &input.installation_id,
             &input.share,
+            input.signed_claim.as_deref().map(|claim| claim.get()),
+            input.signed_share.get(),
             input.claim.as_ref(),
             input.timestamp_ms,
             &input.nonce,
             &input.signature,
-        )?;
+        )
+        .inspect_err(|error| {
+            log_signed_share_request_failure(
+                &input.installation_id,
+                "share_claim_subdomain",
+                Some(input.share.share_id.as_str()),
+                error,
+            );
+        })?;
         let parsed = parse_share_label(&subdomain)
             .map_err(|message| AppError::BadRequest(message.into()))?;
         let client_tunnel = get_client_tunnel_by_installation(&conn, &input.installation_id)?
@@ -9435,16 +9453,29 @@ impl AppStore {
             .as_deref()
             .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
             .and_then(normalize_email)?;
-        verify_signed_share_request(
+        verify_signed_share_request_json(
             &conn,
             &installation.public_key,
             &input.installation_id,
             signature_action,
-            &input.ops,
+            input.signed_ops.get(),
             input.timestamp_ms,
             &input.nonce,
             &input.signature,
-        )?;
+        )
+        .inspect_err(|error| {
+            log_signed_share_request_failure(
+                &input.installation_id,
+                signature_action,
+                input.ops.iter().find_map(|op| {
+                    op.share
+                        .as_ref()
+                        .map(|share| share.share_id.as_str())
+                        .or(op.share_id.as_deref())
+                }),
+                error,
+            );
+        })?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -9908,19 +9939,37 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
-        let payload = ShareEditAckEnvelope {
-            ack: input.ack.clone(),
-        };
-        verify_signed_share_request(
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawAckEnvelope<'a> {
+            ack: &'a serde_json::value::RawValue,
+        }
+        let payload_json = serde_json::to_string(&RawAckEnvelope {
+            ack: input.signed_ack.as_ref(),
+        })
+        .map_err(|_| AppError::Unauthorized("invalid signed payload".into()))?;
+        verify_signed_share_request_json(
             &conn,
             &installation.public_key,
             &input.installation_id,
             "share_edit_ack",
-            &payload,
+            &payload_json,
             input.timestamp_ms,
             &input.nonce,
             &input.signature,
-        )?;
+        )
+        .inspect_err(|error| {
+            log_signed_share_request_failure(
+                &input.installation_id,
+                "share_edit_ack",
+                input
+                    .ack
+                    .current_share
+                    .as_ref()
+                    .map(|share| share.share_id.as_str()),
+                error,
+            );
+        })?;
         touch_installation_activity(&conn, &input.installation_id, &metadata, Utc::now())?;
         let status = match input.ack.status.as_str() {
             "applied" => "applied",
@@ -23639,21 +23688,131 @@ fn verify_signed_share_request<T: Serialize>(
     nonce: &str,
     signature: &str,
 ) -> Result<(), AppError> {
+    let payload_json = serde_json::to_string(payload)
+        .map_err(|_| AppError::Unauthorized("invalid signed payload".into()))?;
+    verify_signed_share_request_json(
+        conn,
+        public_key,
+        installation_id,
+        action,
+        &payload_json,
+        timestamp_ms,
+        nonce,
+        signature,
+    )
+}
+
+fn verify_signed_share_request_json(
+    conn: &Connection,
+    public_key: &str,
+    installation_id: &str,
+    action: &str,
+    payload_json: &str,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
     let now = Utc::now();
     if signed_request_timestamp_is_stale(now, timestamp_ms) {
         return Err(AppError::Unauthorized("stale signed request".into()));
     }
 
-    verify_signed_payload(
+    verify_signed_payload_json(
         public_key,
         installation_id,
         action,
-        payload,
+        payload_json,
         timestamp_ms,
         nonce,
         signature,
     )?;
     consume_authenticated_installation_nonce(conn, installation_id, action, nonce, now)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignedRequestRejectionKind {
+    Stale,
+    Replay,
+    Signature,
+    Integrity,
+    Credential,
+    Internal,
+    Other,
+}
+
+impl SignedRequestRejectionKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::Replay => "replay",
+            Self::Signature => "signature",
+            Self::Integrity => "integrity",
+            Self::Credential => "credential",
+            Self::Internal => "internal",
+            Self::Other => "other",
+        }
+    }
+}
+
+fn signed_request_rejection_kind(error: &AppError) -> SignedRequestRejectionKind {
+    match error {
+        AppError::Unauthorized(message) if message == "stale signed request" => {
+            SignedRequestRejectionKind::Stale
+        }
+        AppError::Unauthorized(message) if message == "nonce already used" => {
+            SignedRequestRejectionKind::Replay
+        }
+        AppError::Unauthorized(message)
+            if matches!(
+                message.as_str(),
+                "invalid signature" | "invalid signature length" | "signature verification failed"
+            ) =>
+        {
+            SignedRequestRejectionKind::Signature
+        }
+        AppError::Unauthorized(message) if message == "share claim descriptor digest mismatch" => {
+            SignedRequestRejectionKind::Integrity
+        }
+        AppError::BadRequest(message) if message.starts_with("share claim shareSha256 must be") => {
+            SignedRequestRejectionKind::Integrity
+        }
+        AppError::Unauthorized(message) if message == "invalid signed payload" => {
+            SignedRequestRejectionKind::Internal
+        }
+        AppError::Unauthorized(_) => SignedRequestRejectionKind::Credential,
+        AppError::Internal(_) | AppError::ServiceUnavailable(_) => {
+            SignedRequestRejectionKind::Internal
+        }
+        _ => SignedRequestRejectionKind::Other,
+    }
+}
+
+fn log_signed_share_request_failure(
+    installation_id: &str,
+    action: &str,
+    share_id: Option<&str>,
+    error: &AppError,
+) {
+    let rejection_kind = signed_request_rejection_kind(error);
+    if rejection_kind == SignedRequestRejectionKind::Internal {
+        tracing::error!(
+            installation_id,
+            action,
+            share_id,
+            rejection_kind = rejection_kind.as_str(),
+            error = %error,
+            "signed Share request verification failed internally"
+        );
+    } else {
+        tracing::warn!(
+            installation_id,
+            action,
+            share_id,
+            rejection_kind = rejection_kind.as_str(),
+            error = %error,
+            "signed Share request rejected"
+        );
+    }
 }
 
 fn verify_signed_tunnel_request<T: Serialize>(
@@ -23715,6 +23874,8 @@ fn verify_share_claim_request(
     public_key: &str,
     installation_id: &str,
     share: &ShareDescriptor,
+    signed_claim_json: Option<&str>,
+    signed_share_json: &str,
     claim: Option<&ShareClaimPayload>,
     timestamp_ms: i64,
     nonce: &str,
@@ -23738,26 +23899,65 @@ fn verify_share_claim_request(
     }
 
     let claim_payload = claim.unwrap_or(&derived_claim);
-    let new_result = verify_signed_payload(
-        public_key,
-        installation_id,
-        "share_claim_subdomain",
-        claim_payload,
-        timestamp_ms,
-        nonce,
-        signature,
-    );
-    if let Err(new_err) = new_result {
+    let new_result = if let Some(signed_claim_json) = signed_claim_json {
+        verify_signed_payload_json(
+            public_key,
+            installation_id,
+            "share_claim_subdomain",
+            signed_claim_json,
+            timestamp_ms,
+            nonce,
+            signature,
+        )
+    } else {
         verify_signed_payload(
             public_key,
             installation_id,
             "share_claim_subdomain",
-            share,
+            claim_payload,
+            timestamp_ms,
+            nonce,
+            signature,
+        )
+    };
+    let claim_signature_verified = new_result.is_ok();
+    if let Err(new_err) = new_result {
+        verify_signed_payload_json(
+            public_key,
+            installation_id,
+            "share_claim_subdomain",
+            signed_share_json,
             timestamp_ms,
             nonce,
             signature,
         )
         .map_err(|_| new_err)?;
+    }
+    if let Some(claim) = claim {
+        if let Some(expected_sha256) = claim.share_sha256.as_deref() {
+            if expected_sha256.len() != 64
+                || !expected_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(AppError::BadRequest(
+                    "share claim shareSha256 must be a lowercase SHA-256 hex digest".into(),
+                ));
+            }
+            let actual_sha256 = hex::encode(Sha256::digest(signed_share_json.as_bytes()));
+            if actual_sha256 != expected_sha256 {
+                return Err(AppError::Unauthorized(
+                    "share claim descriptor digest mismatch".into(),
+                ));
+            }
+        } else {
+            tracing::debug!(
+                installation_id,
+                share_id = %claim.share_id,
+                signature_payload = if claim_signature_verified { "claim" } else { "share" },
+                "accepted legacy Share claim without descriptor digest binding"
+            );
+        }
     }
 
     consume_authenticated_installation_nonce(
@@ -23822,6 +24022,7 @@ fn share_claim_payload(share: &ShareDescriptor) -> ShareClaimPayload {
         share_id: share.share_id.clone(),
         subdomain: share.subdomain.clone(),
         owner_email: share.owner_email.clone(),
+        share_sha256: None,
     }
 }
 
@@ -31149,11 +31350,159 @@ mod tests {
         nonce: &str,
     ) -> String {
         let payload_json = serde_json::to_string(payload).expect("serialize test payload");
+        sign_test_payload_json(
+            signing_key,
+            installation_id,
+            action,
+            &payload_json,
+            timestamp_ms,
+            nonce,
+        )
+    }
+
+    fn sign_test_payload_json(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        action: &str,
+        payload_json: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+    ) -> String {
         let body = format!(
             "{PROTOCOL_EPOCH}\n{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}"
         );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    #[test]
+    fn signed_share_request_rejection_reasons_are_stable() {
+        for (error, expected) in [
+            (
+                AppError::Unauthorized("stale signed request".into()),
+                SignedRequestRejectionKind::Stale,
+            ),
+            (
+                AppError::Unauthorized("nonce already used".into()),
+                SignedRequestRejectionKind::Replay,
+            ),
+            (
+                AppError::Unauthorized("invalid signature length".into()),
+                SignedRequestRejectionKind::Signature,
+            ),
+            (
+                AppError::Unauthorized("share claim descriptor digest mismatch".into()),
+                SignedRequestRejectionKind::Integrity,
+            ),
+            (
+                AppError::BadRequest(
+                    "share claim shareSha256 must be a lowercase SHA-256 hex digest".into(),
+                ),
+                SignedRequestRejectionKind::Integrity,
+            ),
+            (
+                AppError::Unauthorized("invalid stored public key".into()),
+                SignedRequestRejectionKind::Credential,
+            ),
+            (
+                AppError::Unauthorized("invalid signed payload".into()),
+                SignedRequestRejectionKind::Internal,
+            ),
+        ] {
+            assert_eq!(signed_request_rejection_kind(&error), expected);
+        }
+    }
+
+    fn share_batch_sync_request_from_wire(
+        installation_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        ops_json: &str,
+    ) -> ShareBatchSyncRequest {
+        let body = format!(
+            r#"{{"installationId":"{installation_id}","timestampMs":{timestamp_ms},"nonce":"{nonce}","signature":"{signature}","ops":{ops_json}}}"#
+        );
+        serde_json::from_str(&body).expect("parse signed share batch request")
+    }
+
+    fn share_sync_request_from_wire(
+        installation_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        share_json: &str,
+    ) -> ShareSyncRequest {
+        let body = format!(
+            r#"{{"installationId":"{installation_id}","timestampMs":{timestamp_ms},"nonce":"{nonce}","signature":"{signature}","share":{share_json}}}"#
+        );
+        serde_json::from_str(&body).expect("parse signed share sync request")
+    }
+
+    fn share_claim_request_from_wire(
+        installation_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        share_json: &str,
+    ) -> ShareClaimSubdomainRequest {
+        let body = format!(
+            r#"{{"installationId":"{installation_id}","timestampMs":{timestamp_ms},"nonce":"{nonce}","signature":"{signature}","share":{share_json}}}"#
+        );
+        serde_json::from_str(&body).expect("parse signed share claim request")
+    }
+
+    fn share_claim_request_with_claim_from_wire(
+        installation_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        claim_json: &str,
+        share_json: &str,
+    ) -> ShareClaimSubdomainRequest {
+        let body = format!(
+            r#"{{"protocolEpoch":"{PROTOCOL_EPOCH}","installationId":"{installation_id}","timestampMs":{timestamp_ms},"nonce":"{nonce}","signature":"{signature}","claim":{claim_json},"share":{share_json}}}"#
+        );
+        serde_json::from_str(&body).expect("parse digest-bound Share claim request")
+    }
+
+    fn share_edit_ack_request_from_wire(
+        installation_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        ack_json: &str,
+    ) -> ShareEditAckRequest {
+        let body = format!(
+            r#"{{"protocolEpoch":"{PROTOCOL_EPOCH}","installationId":"{installation_id}","timestampMs":{timestamp_ms},"nonce":"{nonce}","signature":"{signature}","ack":{ack_json}}}"#
+        );
+        serde_json::from_str(&body).expect("parse signed Share edit acknowledgement")
+    }
+
+    fn ops_json_with_explicit_omitted_share_defaults(ops: &[ShareSyncOperation]) -> String {
+        let mut value = serde_json::to_value(ops).expect("serialize share batch ops");
+        let share = value
+            .get_mut(0)
+            .and_then(|op| op.get_mut("share"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("upsert op share object");
+        // The Server omits the default policy while the Router's typed
+        // serializer currently materializes it. Keep this production-shaped
+        // drift in the fixture in addition to explicit omitted defaults.
+        share.remove("grokMediaPolicy");
+        share.insert("autoStart".into(), serde_json::Value::Bool(false));
+        if !share.contains_key("userGrants") {
+            share.insert("userGrants".into(), serde_json::json!({}));
+        }
+        let original = serde_json::to_string(&value).expect("serialize original ops JSON");
+        let parsed: Vec<ShareSyncOperation> =
+            serde_json::from_str(&original).expect("parse original ops JSON");
+        let reserialized = serde_json::to_string(&parsed).expect("reserialize parsed ops");
+        assert_ne!(
+            original, reserialized,
+            "fixture must differ from Router reserialization"
+        );
+        original
     }
 
     fn signed_upgrade_task_report_request(
@@ -39188,14 +39537,14 @@ mod tests {
             &nonce,
         );
 
-        let request = ShareClaimSubdomainRequest {
-            installation_id: "inst-signed".into(),
+        let request = ShareClaimSubdomainRequest::from_share(
+            "inst-signed",
             timestamp_ms,
-            nonce: nonce.clone(),
-            signature: signature.clone(),
-            claim: None,
-            share: share.clone(),
-        };
+            &nonce,
+            &signature,
+            None,
+            share.clone(),
+        );
 
         store
             .claim_share_subdomain(
@@ -39213,14 +39562,14 @@ mod tests {
         let replay_err = store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: "inst-signed".into(),
+                ShareClaimSubdomainRequest::from_share(
+                    "inst-signed",
                     timestamp_ms,
-                    nonce: nonce.clone(),
-                    signature: signature.clone(),
-                    claim: None,
-                    share: share.clone(),
-                },
+                    &nonce,
+                    &signature,
+                    None,
+                    share.clone(),
+                ),
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -39238,14 +39587,14 @@ mod tests {
         let tampered_err = store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: "inst-signed".into(),
-                    timestamp_ms: Utc::now().timestamp_millis(),
-                    nonce: Uuid::new_v4().to_string(),
-                    signature,
-                    claim: None,
-                    share: tampered_share,
-                },
+                ShareClaimSubdomainRequest::from_share(
+                    "inst-signed",
+                    Utc::now().timestamp_millis(),
+                    &Uuid::new_v4().to_string(),
+                    &signature,
+                    None,
+                    tampered_share,
+                ),
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -40063,14 +40412,14 @@ mod tests {
         store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: "inst-minimal".into(),
+                ShareClaimSubdomainRequest::from_share(
+                    "inst-minimal",
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    claim: Some(claim),
-                    share: share.clone(),
-                },
+                    &nonce,
+                    &signature,
+                    Some(claim),
+                    share.clone(),
+                ),
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -40165,14 +40514,14 @@ mod tests {
         let err = store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: "inst-mismatch".into(),
+                ShareClaimSubdomainRequest::from_share(
+                    "inst-mismatch",
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    claim: Some(claim),
+                    &nonce,
+                    &signature,
+                    Some(claim),
                     share,
-                },
+                ),
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -40257,14 +40606,14 @@ mod tests {
         let err = store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: "inst-new".into(),
+                ShareClaimSubdomainRequest::from_share(
+                    "inst-new",
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    claim: None,
-                    share: share.clone(),
-                },
+                    &nonce,
+                    &signature,
+                    None,
+                    share.clone(),
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -40389,14 +40738,14 @@ mod tests {
         store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: "inst-heal".into(),
+                ShareClaimSubdomainRequest::from_share(
+                    "inst-heal",
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    claim: None,
+                    &nonce,
+                    &signature,
+                    None,
                     share,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -40460,14 +40809,14 @@ mod tests {
         store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: installation_id.into(),
+                ShareClaimSubdomainRequest::from_share(
+                    &installation_id,
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    claim: None,
+                    &nonce,
+                    &signature,
+                    None,
                     share,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -40554,14 +40903,14 @@ mod tests {
         store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: installation_id.into(),
+                ShareClaimSubdomainRequest::from_share(
+                    &installation_id,
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    claim: None,
+                    &nonce,
+                    &signature,
+                    None,
                     share,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -40664,14 +41013,14 @@ mod tests {
         let error = store
             .claim_share_subdomain(
                 &config,
-                ShareClaimSubdomainRequest {
-                    installation_id: "inst-same".into(),
+                ShareClaimSubdomainRequest::from_share(
+                    "inst-same",
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    claim: None,
-                    share: share.clone(),
-                },
+                    &nonce,
+                    &signature,
+                    None,
+                    share.clone(),
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -40785,13 +41134,13 @@ mod tests {
 
         store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: "inst-batch".into(),
+                ShareBatchSyncRequest::from_ops(
+                    "inst-batch",
                     timestamp_ms,
-                    nonce,
-                    signature,
+                    &nonce,
+                    &signature,
                     ops,
-                },
+                ),
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -40835,11 +41184,11 @@ mod tests {
         }];
         let tampered_err = store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: "inst-batch".into(),
-                    timestamp_ms: Utc::now().timestamp_millis(),
-                    nonce: Uuid::new_v4().to_string(),
-                    signature: sign_test_payload(
+                ShareBatchSyncRequest::from_ops(
+                    "inst-batch",
+                    Utc::now().timestamp_millis(),
+                    &Uuid::new_v4().to_string(),
+                    &sign_test_payload(
                         &signing_key,
                         "inst-batch",
                         "share_batch_sync",
@@ -40854,8 +41203,8 @@ mod tests {
                         Utc::now().timestamp_millis(),
                         &Uuid::new_v4().to_string(),
                     ),
-                    ops: tampered_ops,
-                },
+                    tampered_ops,
+                ),
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -40902,13 +41251,7 @@ mod tests {
                 timestamp_ms,
                 &nonce,
             );
-            ShareBatchSyncRequest {
-                installation_id: installation_id.into(),
-                timestamp_ms,
-                nonce,
-                signature,
-                ops,
-            }
+            ShareBatchSyncRequest::from_ops(&installation_id, timestamp_ms, &nonce, &signature, ops)
         };
         let metadata = || ClientMetadata {
             ip: Some("127.0.0.1".into()),
@@ -41005,6 +41348,585 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_descriptor_sync_accepts_original_signed_json_that_reserializes_differently() {
+        let (store, config) = setup_store("share-descriptor-original-json").await;
+        let installation_id = "inst-original-json";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+
+        let mut share = test_share_descriptor("share-original-json", "original-json");
+        share.config_revision = 2;
+        share.descriptor_generation = 1;
+        share.descriptor_fingerprint = "a".repeat(64);
+        share.user_grants.insert(
+            "router@example.com".into(),
+            ShareUserGrant {
+                email: "router@example.com".into(),
+                role: "shareto".into(),
+                active: true,
+                ..ShareUserGrant::default()
+            },
+        );
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(share),
+            share_id: None,
+        }];
+        let ops_json = ops_json_with_explicit_omitted_share_defaults(&ops);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload_json(
+            &signing_key,
+            installation_id,
+            "share_descriptor_batch_sync",
+            &ops_json,
+            timestamp_ms,
+            &nonce,
+        );
+        let acks = store
+            .batch_sync_share_descriptors(
+                share_batch_sync_request_from_wire(
+                    installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    &ops_json,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("original signed ops JSON must verify");
+        assert_eq!(acks.len(), 1);
+        assert!(acks[0].applied);
+
+        let grants: String = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = 'share-original-json'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read persisted grants")
+        };
+        assert!(grants.contains("router@example.com"));
+
+        let tampered_timestamp_ms = Utc::now().timestamp_millis();
+        let tampered_nonce = Uuid::new_v4().to_string();
+        let tampered_signature = sign_test_payload_json(
+            &signing_key,
+            installation_id,
+            "share_descriptor_batch_sync",
+            &ops_json,
+            tampered_timestamp_ms,
+            &tampered_nonce,
+        );
+        let tampered_ops_json = ops_json.replacen("original-json", "tampered-json", 1);
+        assert_ne!(tampered_ops_json, ops_json);
+        let tampered_err = store
+            .batch_sync_share_descriptors(
+                share_batch_sync_request_from_wire(
+                    installation_id,
+                    tampered_timestamp_ms,
+                    &tampered_nonce,
+                    &tampered_signature,
+                    &tampered_ops_json,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("tampered original JSON must fail signature verification");
+        assert!(
+            tampered_err
+                .to_string()
+                .contains("signature verification failed")
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[test]
+    fn share_descriptor_sync_rejects_unknown_fields_at_every_contract_layer() {
+        let mut share = test_share_descriptor("share-unknown-field", "unknown-field");
+        share.descriptor_generation = 1;
+        share.descriptor_fingerprint = "a".repeat(64);
+        share.upstream_provider = Some(ShareUpstreamProvider {
+            kind: "codex_oauth".into(),
+            app: "codex".into(),
+            model_policy: Some(crate::models::ShareProviderModelPolicy::Passthrough),
+            ..ShareUpstreamProvider::default()
+        });
+        let ops_value = serde_json::to_value(vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(share),
+            share_id: None,
+        }])
+        .expect("serialize ops");
+        for (field, value, expected) in [
+            (
+                "share.futureLeaseMetadata",
+                serde_json::json!({"schema": 2}),
+                "futureLeaseMetadata",
+            ),
+            (
+                "share.grokMediaPolicy.futureAudioGenerationEnabled",
+                serde_json::Value::Bool(true),
+                "futureAudioGenerationEnabled",
+            ),
+            (
+                "share.upstreamProvider.modelPolicy.futurePolicyMetadata",
+                serde_json::json!({"schema": 2}),
+                "futurePolicyMetadata",
+            ),
+            (
+                "operation.futureOperationMetadata",
+                serde_json::json!({"schema": 2}),
+                "futureOperationMetadata",
+            ),
+        ] {
+            let mut candidate = ops_value.clone();
+            match field {
+                "share.futureLeaseMetadata" => {
+                    candidate[0]["share"]["futureLeaseMetadata"] = value;
+                }
+                "share.grokMediaPolicy.futureAudioGenerationEnabled" => {
+                    candidate[0]["share"]["grokMediaPolicy"]["futureAudioGenerationEnabled"] =
+                        value;
+                }
+                "share.upstreamProvider.modelPolicy.futurePolicyMetadata" => {
+                    candidate[0]["share"]["upstreamProvider"]["modelPolicy"]["futurePolicyMetadata"] =
+                        value;
+                }
+                "operation.futureOperationMetadata" => {
+                    candidate[0]["futureOperationMetadata"] = value;
+                }
+                _ => unreachable!(),
+            }
+            let ops_json =
+                serde_json::to_string(&candidate).expect("serialize unknown-field operations");
+            let body = format!(
+                r#"{{"protocolEpoch":"{PROTOCOL_EPOCH}","installationId":"inst-unknown-field","timestampMs":1,"nonce":"n","signature":"s","ops":{ops_json}}}"#
+            );
+            let error = serde_json::from_str::<ShareBatchSyncRequest>(&body)
+                .expect_err("unknown signed fields must fail before signature verification");
+            assert!(error.to_string().contains(expected), "{field}: {error}");
+        }
+
+        let ops_json = serde_json::to_string(&ops_value).expect("serialize valid operations");
+        let wrong_epoch = format!(
+            r#"{{"protocolEpoch":"future-epoch","installationId":"inst-unknown-field","timestampMs":1,"nonce":"n","signature":"s","ops":{ops_json}}}"#
+        );
+        let error = serde_json::from_str::<ShareBatchSyncRequest>(&wrong_epoch)
+            .expect_err("wrong protocolEpoch must fail before signature verification");
+        assert!(error.to_string().contains("unsupported protocolEpoch"));
+
+        let null_epoch = format!(
+            r#"{{"protocolEpoch":null,"installationId":"inst-unknown-field","timestampMs":1,"nonce":"n","signature":"s","ops":{ops_json}}}"#
+        );
+        let error = serde_json::from_str::<ShareBatchSyncRequest>(&null_epoch)
+            .expect_err("null protocolEpoch is not the legacy omitted form");
+        assert!(error.to_string().contains("expected a string"));
+    }
+
+    #[tokio::test]
+    async fn strict_share_descriptor_sync_upgrades_generation_zero_claim_residue() {
+        let (store, config) = setup_store("share-descriptor-gen0-upgrade").await;
+        let installation_id = "inst-gen0-upgrade";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+
+        let claimed = test_share_descriptor("share-gen0-upgrade", "gen0-upgrade");
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &claimed,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_share_subdomain(
+                &config,
+                ShareClaimSubdomainRequest::from_share(
+                    &installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    None,
+                    claimed.clone(),
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("claim generation-zero share");
+
+        let mut next = claimed;
+        next.config_revision = 2;
+        next.descriptor_generation = 1;
+        next.descriptor_fingerprint = "b".repeat(64);
+        next.user_grants.insert(
+            "router@example.com".into(),
+            ShareUserGrant {
+                email: "router@example.com".into(),
+                role: "shareto".into(),
+                active: true,
+                ..ShareUserGrant::default()
+            },
+        );
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(next),
+            share_id: None,
+        }];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_descriptor_batch_sync",
+            &ops,
+            timestamp_ms,
+            &nonce,
+        );
+        let acks = store
+            .batch_sync_share_descriptors(
+                ShareBatchSyncRequest::from_ops(
+                    &installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    ops,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("generation 1 must apply over claimed generation 0");
+        assert_eq!(acks.len(), 1);
+        assert!(acks[0].applied);
+
+        let conn = store.conn.lock().await;
+        let persisted: (i64, String) = conn
+            .query_row(
+                "SELECT descriptor_generation, user_grants_json
+                 FROM shares WHERE share_id = 'share-gen0-upgrade'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read upgraded share");
+        assert_eq!(persisted.0, 1);
+        assert!(persisted.1.contains("router@example.com"));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_sync_accepts_original_signed_share_json_that_reserializes_differently() {
+        let (store, config) = setup_store("share-sync-original-json").await;
+        let installation_id = "inst-share-sync-original";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+
+        let claimed = test_share_descriptor("share-sync-original", "sync-original");
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &claimed,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_share_subdomain(
+                &config,
+                ShareClaimSubdomainRequest::from_share(
+                    &installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    None,
+                    claimed.clone(),
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("claim share before legacy sync");
+
+        let ops_json = ops_json_with_explicit_omitted_share_defaults(&[ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(claimed.clone()),
+            share_id: None,
+        }]);
+        let share_json = serde_json::from_str::<serde_json::Value>(&ops_json)
+            .expect("parse ops json")
+            .get(0)
+            .and_then(|op| op.get("share"))
+            .cloned()
+            .expect("share json");
+        let share_json = serde_json::to_string(&share_json).expect("serialize share json");
+        let parsed: ShareDescriptor =
+            serde_json::from_str(&share_json).expect("parse original share json");
+        let reserialized = serde_json::to_string(&parsed).expect("reserialize share");
+        assert_ne!(share_json, reserialized);
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload_json(
+            &signing_key,
+            installation_id,
+            "share_sync",
+            &share_json,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .sync_share(
+                share_sync_request_from_wire(
+                    installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    &share_json,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("original signed share JSON must verify");
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_claim_fallback_accepts_original_signed_share_json() {
+        let (store, config) = setup_store("share-claim-original-json").await;
+        let installation_id = "inst-claim-original";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+
+        let share = test_share_descriptor("share-claim-original", "claim-original");
+        let share_json = {
+            let mut value = serde_json::to_value(&share).expect("serialize claim share");
+            value
+                .as_object_mut()
+                .expect("share object")
+                .insert("autoStart".into(), serde_json::Value::Bool(false));
+            let original = serde_json::to_string(&value).expect("serialize original share JSON");
+            let parsed: ShareDescriptor =
+                serde_json::from_str(&original).expect("parse original share JSON");
+            assert_ne!(
+                original,
+                serde_json::to_string(&parsed).expect("reserialize parsed share")
+            );
+            original
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload_json(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &share_json,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_share_subdomain(
+                &config,
+                share_claim_request_from_wire(
+                    installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    &share_json,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("claim fallback must verify original share JSON");
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_claim_digest_binds_the_exact_descriptor_json() {
+        let (store, config) = setup_store("share-claim-digest-binding").await;
+        let installation_id = "inst-claim-digest";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+
+        let share = test_share_descriptor("share-claim-digest", "claim-digest");
+        let mut share_value = serde_json::to_value(&share).expect("serialize claim descriptor");
+        share_value
+            .as_object_mut()
+            .expect("Share descriptor object")
+            .remove("grokMediaPolicy");
+        let share_json =
+            serde_json::to_string(&share_value).expect("serialize Server-shaped descriptor");
+        let claim = ShareClaimPayload {
+            share_id: share.share_id.clone(),
+            subdomain: share.subdomain.clone(),
+            owner_email: share.owner_email.clone(),
+            share_sha256: Some(hex::encode(Sha256::digest(share_json.as_bytes()))),
+        };
+        let claim_json = serde_json::to_string(&claim).expect("serialize digest-bound claim");
+
+        let mut tampered_value = share_value.clone();
+        tampered_value["shareName"] = serde_json::Value::String("tampered name".into());
+        let tampered_share_json =
+            serde_json::to_string(&tampered_value).expect("serialize tampered descriptor");
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload_json(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &claim_json,
+            timestamp_ms,
+            &nonce,
+        );
+        let error = store
+            .claim_share_subdomain(
+                &config,
+                share_claim_request_with_claim_from_wire(
+                    installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    &claim_json,
+                    &tampered_share_json,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect_err("a signed claim must reject a modified descriptor");
+        assert!(error.to_string().contains("descriptor digest mismatch"));
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload_json(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &tampered_share_json,
+            timestamp_ms,
+            &nonce,
+        );
+        let error = store
+            .claim_share_subdomain(
+                &config,
+                share_claim_request_with_claim_from_wire(
+                    installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    &claim_json,
+                    &tampered_share_json,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect_err("legacy Share signature fallback must not bypass a supplied digest");
+        assert!(error.to_string().contains("descriptor digest mismatch"));
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload_json(
+            &signing_key,
+            installation_id,
+            "share_claim_subdomain",
+            &claim_json,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_share_subdomain(
+                &config,
+                share_claim_request_with_claim_from_wire(
+                    installation_id,
+                    timestamp_ms,
+                    &nonce,
+                    &signature,
+                    &claim_json,
+                    &share_json,
+                ),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("digest-bound claim accepts the exact descriptor JSON");
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn batch_sync_rejects_raw_share_slugs_and_wrong_client_suffixes() {
         let (store, config) = setup_store("share-batch-namespace-validation").await;
         let installation_id = "inst-batch-namespace";
@@ -41046,13 +41968,13 @@ mod tests {
             );
             let error = store
                 .batch_sync_shares(
-                    ShareBatchSyncRequest {
-                        installation_id: installation_id.into(),
+                    ShareBatchSyncRequest::from_ops(
+                        &installation_id,
                         timestamp_ms,
-                        nonce,
-                        signature,
+                        &nonce,
+                        &signature,
                         ops,
-                    },
+                    ),
                     ClientMetadata {
                         ip: None,
                         country_code: None,
@@ -41204,13 +42126,13 @@ mod tests {
         );
         store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: "inst-legacy-delete-all".into(),
+                ShareBatchSyncRequest::from_ops(
+                    "inst-legacy-delete-all",
                     timestamp_ms,
-                    nonce,
-                    signature,
+                    &nonce,
+                    &signature,
                     ops,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -41356,13 +42278,13 @@ mod tests {
         );
         store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: "inst-protected-upsert".into(),
+                ShareBatchSyncRequest::from_ops(
+                    "inst-protected-upsert",
                     timestamp_ms,
-                    nonce,
-                    signature,
+                    &nonce,
+                    &signature,
                     ops,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -41512,13 +42434,13 @@ mod tests {
         );
         store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: installation_id.into(),
+                ShareBatchSyncRequest::from_ops(
+                    &installation_id,
                     timestamp_ms,
-                    nonce,
-                    signature,
+                    &nonce,
+                    &signature,
                     ops,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -42089,13 +43011,13 @@ mod tests {
 
         store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: "inst-batch-health".into(),
+                ShareBatchSyncRequest::from_ops(
+                    "inst-batch-health",
                     timestamp_ms,
-                    nonce,
-                    signature,
+                    &nonce,
+                    &signature,
                     ops,
-                },
+                ),
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -42376,13 +43298,13 @@ mod tests {
 
         store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: "inst-multi".into(),
+                ShareBatchSyncRequest::from_ops(
+                    "inst-multi",
                     timestamp_ms,
-                    nonce,
-                    signature,
+                    &nonce,
+                    &signature,
                     ops,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -43909,30 +44831,80 @@ mod tests {
             error_code: None,
             retryable: None,
             current_config_revision: None,
-            current_share: None,
+            current_share: Some(test_share_descriptor("share-ack-snapshot", "ack-snapshot")),
             applied_at_ms: None,
             effective_policy: None,
         };
-        let timestamp_ms = Utc::now().timestamp_millis();
-        let nonce = Uuid::new_v4().to_string();
-        let signature = sign_test_payload(
+        let mut ack_value = serde_json::to_value(&ack).expect("serialize Share edit ACK");
+        ack_value["currentShare"]
+            .as_object_mut()
+            .expect("currentShare object")
+            .remove("grokMediaPolicy");
+        let ack_json = serde_json::to_string(&ack_value).expect("serialize Server-shaped ACK");
+        let parsed_ack: ShareEditAckPayload =
+            serde_json::from_str(&ack_json).expect("parse Server-shaped ACK");
+        assert_ne!(
+            ack_json,
+            serde_json::to_string(&parsed_ack).expect("reserialize ACK"),
+            "fixture must exercise descriptor reserialization drift"
+        );
+
+        let tampered_timestamp_ms = Utc::now().timestamp_millis();
+        let tampered_nonce = Uuid::new_v4().to_string();
+        let tampered_payload_json = format!(r#"{{"ack":{ack_json}}}"#);
+        let tampered_signature = sign_test_payload_json(
             &signing_key,
             "inst-1",
             "share_edit_ack",
-            &ShareEditAckEnvelope { ack: ack.clone() },
+            &tampered_payload_json,
+            tampered_timestamp_ms,
+            &tampered_nonce,
+        );
+        let modified_ack_json =
+            ack_json.replacen(r#""status":"applied""#, r#""status":"rejected""#, 1);
+        assert_ne!(
+            modified_ack_json, ack_json,
+            "fixture must modify the signed ACK payload"
+        );
+        let error = store
+            .ack_share_edit(
+                share_edit_ack_request_from_wire(
+                    "inst-1",
+                    tampered_timestamp_ms,
+                    &tampered_nonce,
+                    &tampered_signature,
+                    &modified_ack_json,
+                ),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("tampered raw ACK must fail signature verification");
+        assert!(error.to_string().contains("signature verification failed"));
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let payload_json = format!(r#"{{"ack":{ack_json}}}"#);
+        let signature = sign_test_payload_json(
+            &signing_key,
+            "inst-1",
+            "share_edit_ack",
+            &payload_json,
             timestamp_ms,
             &nonce,
         );
 
         store
             .ack_share_edit(
-                ShareEditAckRequest {
-                    installation_id: "inst-1".into(),
+                share_edit_ack_request_from_wire(
+                    "inst-1",
                     timestamp_ms,
-                    nonce,
-                    signature,
-                    ack,
-                },
+                    &nonce,
+                    &signature,
+                    &ack_json,
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -44417,13 +45389,13 @@ mod tests {
         );
         store
             .batch_sync_shares(
-                ShareBatchSyncRequest {
-                    installation_id: installation_id.into(),
+                ShareBatchSyncRequest::from_ops(
+                    &installation_id,
                     timestamp_ms,
-                    nonce,
-                    signature,
+                    &nonce,
+                    &signature,
                     ops,
-                },
+                ),
                 ClientMetadata {
                     ip: None,
                     country_code: None,

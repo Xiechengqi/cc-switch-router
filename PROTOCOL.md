@@ -79,7 +79,9 @@ Dashboard 和公开 Share Web 生成独立 Ed25519 密钥对并注册 auth devic
 ```
 
 - Client installation 的 `identity_id` 是 `installationId`;auth device 的 `identity_id` 是 `authDeviceId`
-- `payload_json` 是该请求业务载荷的 JSON 序列化结果,字段顺序必须与结构体声明一致
+- `payload_json` 的表示由 action 契约定义。普通结构化 action 使用契约声明的紧凑 JSON；下文明确标记为 raw-signed 的字段必须字节级等于请求体中的 JSON 原文
+- 任何包含 `ShareDescriptor` 的 raw-signed action 都不得为验签把 descriptor 解开后再序列化；Server 必须只序列化一次被签名字段，并把同一份 JSON 原文嵌入请求
+- 业务解析失败(未知字段、类型错误)是 4xx 解码/校验,不是 401
 - `action` 为动作名,例如 `installation_setup_completed_v1`
 - 签名为 Ed25519 签名的标准 base64
 - installation nonce 由 `request_nonces` 拦截;auth device nonce 由 `auth_device_nonces` 拦截
@@ -657,4 +659,8 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 - Client installation 注册只接受 `register_installation` 规范串;auth device 注册只接受 `register_auth_device` 规范串
 - 注册字段全部必填且拒绝未知字段,不存在注册 proof 版本字段、无签名注册或旧签名串分支
 - Client installation 注册响应必须包含 `controlSecret`;Server 不接受缺少该字段的成功响应
-- Share descriptor 同步:Server 优先调用 `POST /v1/shares/descriptor-batch-sync`;收到 404 时回落至 `POST /v1/shares/batch-sync`,并剥离 `descriptorGeneration` / `descriptorFingerprint` 字段
+- Share descriptor 同步:Server 优先调用 `POST /v1/shares/descriptor-batch-sync`;收到 404 时回落至 `POST /v1/shares/batch-sync`,并剥离 `descriptorGeneration` / `descriptorFingerprint` 字段。两条路径都对请求体 `ops` 原文验签;`POST /v1/shares/sync` 对 `share` 原文验签
+- `POST /v1/shares/claim-subdomain` 的新请求签 `claim` 原文；`claim.shareSha256` 必须是同一请求中 `share` 原文的 lowercase SHA-256。Router 暂时兼容没有 digest 的旧 claim，以及直接签 `share` 原文的更旧请求
+- `POST /v1/shares/edit-ack` 对 `{"ack":<请求体 ack 原文>}` 验签，包含 `ack.currentShare` 时不得重序列化 descriptor
+- 上述 Share sync/claim/edit-ack 控制请求为兼容旧 Server 可省略 `protocolEpoch`；一旦出现就必须是当前 epoch 的非空字符串，`null` 与错误 epoch 都拒绝
+- Share descriptor、其嵌套权威对象和 batch operation 都拒绝未知字段；契约扩展必须提升 `contractVersion` 并先部署 Router。Server 的 `shareSha256` 请求必须同样遵循 Router-first 发布顺序

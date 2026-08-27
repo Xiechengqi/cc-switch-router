@@ -1,10 +1,66 @@
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use std::collections::BTreeMap;
 
+use crate::namespace::PROTOCOL_EPOCH;
+
 pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 pub const SHARE_CONTRACT_VERSION: u16 = 5;
+
+#[derive(Debug)]
+struct ParsedRawJson<T> {
+    parsed: T,
+    raw: Box<RawValue>,
+}
+
+impl<'de, T> Deserialize<'de> for ParsedRawJson<T>
+where
+    T: DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let parsed = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        Ok(Self { parsed, raw })
+    }
+}
+
+#[cfg(test)]
+impl<T> ParsedRawJson<T>
+where
+    T: Serialize,
+{
+    fn from_parsed(parsed: T) -> Self {
+        let raw = serde_json::value::to_raw_value(&parsed)
+            .expect("signed value should serialize to JSON");
+        Self { parsed, raw }
+    }
+}
+
+fn ensure_supported_wire_protocol_epoch<E>(protocol_epoch: Option<&str>) -> Result<(), E>
+where
+    E: serde::de::Error,
+{
+    if protocol_epoch.is_none_or(|value| value == PROTOCOL_EPOCH) {
+        return Ok(());
+    }
+    Err(E::custom(format!(
+        "unsupported protocolEpoch; expected {PROTOCOL_EPOCH}"
+    )))
+}
+
+fn deserialize_optional_wire_protocol_epoch<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
 
 pub fn default_share_parallel_limit() -> i64 {
     -1
@@ -654,7 +710,7 @@ impl<'de> Deserialize<'de> for IssueLeaseRequest {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct WireRequest {
             protocol_epoch: String,
             router_id: String,
@@ -669,15 +725,14 @@ impl<'de> Deserialize<'de> for IssueLeaseRequest {
             nonce: String,
             signature: String,
             #[serde(default)]
-            share: Option<Box<RawValue>>,
+            share: Option<ParsedRawJson<ShareDescriptor>>,
         }
 
         let wire = WireRequest::deserialize(deserializer)?;
-        let share = wire
+        let (share, signed_share) = wire
             .share
-            .as_ref()
-            .map(|raw| serde_json::from_str(raw.get()).map_err(serde::de::Error::custom))
-            .transpose()?;
+            .map(|share| (Some(share.parsed), Some(share.raw)))
+            .unwrap_or((None, None));
         Ok(Self {
             protocol_epoch: wire.protocol_epoch,
             router_id: wire.router_id,
@@ -692,7 +747,7 @@ impl<'de> Deserialize<'de> for IssueLeaseRequest {
             nonce: wire.nonce,
             signature: wire.signature,
             share,
-            signed_share: wire.share,
+            signed_share,
         })
     }
 }
@@ -795,35 +850,130 @@ pub struct TunnelStateResponse {
     pub draining_generations: Vec<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct ShareSyncRequest {
     pub installation_id: String,
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: String,
     pub share: ShareDescriptor,
+    pub(crate) signed_share: Box<RawValue>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+impl<'de> Deserialize<'de> for ShareSyncRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct WireRequest {
+            #[serde(default, deserialize_with = "deserialize_optional_wire_protocol_epoch")]
+            protocol_epoch: Option<String>,
+            installation_id: String,
+            timestamp_ms: i64,
+            nonce: String,
+            signature: String,
+            share: ParsedRawJson<ShareDescriptor>,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        ensure_supported_wire_protocol_epoch::<D::Error>(wire.protocol_epoch.as_deref())?;
+        Ok(Self {
+            installation_id: wire.installation_id,
+            timestamp_ms: wire.timestamp_ms,
+            nonce: wire.nonce,
+            signature: wire.signature,
+            share: wire.share.parsed,
+            signed_share: wire.share.raw,
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct ShareClaimSubdomainRequest {
     pub installation_id: String,
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<ShareClaimPayload>,
     pub share: ShareDescriptor,
+    pub(crate) signed_claim: Option<Box<RawValue>>,
+    pub(crate) signed_share: Box<RawValue>,
+}
+
+#[cfg(test)]
+impl ShareClaimSubdomainRequest {
+    pub(crate) fn from_share(
+        installation_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        claim: Option<ShareClaimPayload>,
+        share: ShareDescriptor,
+    ) -> Self {
+        let share = ParsedRawJson::from_parsed(share);
+        let claim = claim.map(ParsedRawJson::from_parsed);
+        Self {
+            installation_id: installation_id.to_string(),
+            timestamp_ms,
+            nonce: nonce.to_string(),
+            signature: signature.to_string(),
+            claim: claim.as_ref().map(|claim| claim.parsed.clone()),
+            share: share.parsed,
+            signed_claim: claim.map(|claim| claim.raw),
+            signed_share: share.raw,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShareClaimSubdomainRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct WireRequest {
+            #[serde(default, deserialize_with = "deserialize_optional_wire_protocol_epoch")]
+            protocol_epoch: Option<String>,
+            installation_id: String,
+            timestamp_ms: i64,
+            nonce: String,
+            signature: String,
+            #[serde(default)]
+            claim: Option<ParsedRawJson<ShareClaimPayload>>,
+            share: ParsedRawJson<ShareDescriptor>,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        ensure_supported_wire_protocol_epoch::<D::Error>(wire.protocol_epoch.as_deref())?;
+        let (claim, signed_claim) = wire
+            .claim
+            .map(|claim| (Some(claim.parsed), Some(claim.raw)))
+            .unwrap_or((None, None));
+        Ok(Self {
+            installation_id: wire.installation_id,
+            timestamp_ms: wire.timestamp_ms,
+            nonce: wire.nonce,
+            signature: wire.signature,
+            claim,
+            share: wire.share.parsed,
+            signed_claim,
+            signed_share: wire.share.raw,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareClaimPayload {
     pub share_id: String,
     pub subdomain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -846,14 +996,65 @@ pub struct SharePruneRequest {
     pub share_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct ShareBatchSyncRequest {
     pub installation_id: String,
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: String,
     pub ops: Vec<ShareSyncOperation>,
+    pub(crate) signed_ops: Box<RawValue>,
+}
+
+#[cfg(test)]
+impl ShareBatchSyncRequest {
+    pub(crate) fn from_ops(
+        installation_id: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+        ops: Vec<ShareSyncOperation>,
+    ) -> Self {
+        let ops = ParsedRawJson::from_parsed(ops);
+        Self {
+            installation_id: installation_id.to_string(),
+            timestamp_ms,
+            nonce: nonce.to_string(),
+            signature: signature.to_string(),
+            ops: ops.parsed,
+            signed_ops: ops.raw,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShareBatchSyncRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct WireRequest {
+            #[serde(default, deserialize_with = "deserialize_optional_wire_protocol_epoch")]
+            protocol_epoch: Option<String>,
+            installation_id: String,
+            timestamp_ms: i64,
+            nonce: String,
+            signature: String,
+            ops: ParsedRawJson<Vec<ShareSyncOperation>>,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        ensure_supported_wire_protocol_epoch::<D::Error>(wire.protocol_epoch.as_deref())?;
+        Ok(Self {
+            installation_id: wire.installation_id,
+            timestamp_ms: wire.timestamp_ms,
+            nonce: wire.nonce,
+            signature: wire.signature,
+            ops: wire.ops.parsed,
+            signed_ops: wire.ops.raw,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -988,7 +1189,7 @@ pub struct ShareSettingsPatch {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrokMediaPolicy {
     #[serde(default)]
     pub image_generation_enabled: bool,
@@ -1087,7 +1288,7 @@ pub enum ShareTokenPeriod {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_limit: Option<u32>,
@@ -1104,7 +1305,7 @@ pub struct ShareUserPolicy {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserUsageBucket {
     #[serde(default)]
     pub started_at_ms: i64,
@@ -1115,7 +1316,7 @@ pub struct ShareUserUsageBucket {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserUsage {
     #[serde(default)]
     pub lifetime: ShareUserUsageBucket,
@@ -1130,7 +1331,7 @@ pub struct ShareUserUsage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserUsageRebase {
     pub period: ShareTokenPeriod,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1177,7 +1378,7 @@ pub struct ShareUserUsageEdit {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserQuotaView {
     #[serde(default)]
     pub period: ShareTokenPeriod,
@@ -1208,7 +1409,7 @@ pub enum ShareUsageRebaseSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareAnchoredUsageBucket {
     pub period: ShareTokenPeriod,
     pub anchor_at_ms: i64,
@@ -1220,7 +1421,7 @@ pub struct ShareAnchoredUsageBucket {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserGrant {
     pub email: String,
     #[serde(default)]
@@ -1323,7 +1524,7 @@ pub struct SharePendingEditsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareEditAckPayload {
     pub edit_id: String,
     pub revision: i64,
@@ -1344,14 +1545,44 @@ pub struct ShareEditAckPayload {
     pub effective_policy: Option<ShareUserPolicy>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct ShareEditAckRequest {
     pub installation_id: String,
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: String,
     pub ack: ShareEditAckPayload,
+    pub(crate) signed_ack: Box<RawValue>,
+}
+
+impl<'de> Deserialize<'de> for ShareEditAckRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct WireRequest {
+            #[serde(default, deserialize_with = "deserialize_optional_wire_protocol_epoch")]
+            protocol_epoch: Option<String>,
+            installation_id: String,
+            timestamp_ms: i64,
+            nonce: String,
+            signature: String,
+            ack: ParsedRawJson<ShareEditAckPayload>,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        ensure_supported_wire_protocol_epoch::<D::Error>(wire.protocol_epoch.as_deref())?;
+        Ok(Self {
+            installation_id: wire.installation_id,
+            timestamp_ms: wire.timestamp_ms,
+            nonce: wire.nonce,
+            signature: wire.signature,
+            ack: wire.ack.parsed,
+            signed_ack: wire.ack.raw,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1376,7 +1607,7 @@ pub struct ShareEditAvailableEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareSyncOperation {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1545,7 +1776,7 @@ pub struct ShareModelHealthCheckEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelHealthSummary {
     pub app_type: String,
     pub requested_model: String,
@@ -1579,7 +1810,7 @@ pub struct ModelHealthSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareModelHealthSummary {
     #[serde(default)]
     pub claude: Vec<ModelHealthSummary>,
@@ -2193,7 +2424,7 @@ pub struct ResendUsageResponse {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareSupport {
     pub claude: bool,
     pub codex: bool,
@@ -2201,7 +2432,7 @@ pub struct ShareSupport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUpstreamQuotaTier {
     #[serde(alias = "name")]
     pub label: String,
@@ -2217,7 +2448,7 @@ pub struct ShareUpstreamQuotaTier {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUpstreamQuota {
     pub status: String,
     #[serde(
@@ -2245,7 +2476,7 @@ pub struct ShareUpstreamQuota {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUpstreamModel {
     pub slot: String,
     pub actual_model: String,
@@ -2270,7 +2501,8 @@ pub enum ShareProviderModelPolicySource {
 #[serde(
     tag = "mode",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum ShareProviderModelPolicy {
     Passthrough,
@@ -2294,7 +2526,7 @@ pub struct ProviderModelProbe {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareProviderHealth {
     pub healthy: bool,
     pub requests: u64,
@@ -2313,7 +2545,7 @@ pub struct ShareProviderHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUpstreamProvider {
     pub kind: String,
     pub app: String,
@@ -2380,7 +2612,7 @@ impl Default for ShareUpstreamProvider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareAppProvider {
     pub id: String,
     pub name: String,
@@ -2464,7 +2696,7 @@ impl Default for ShareAppProvider {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareAppProviders {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claude: Vec<ShareAppProvider>,
@@ -2475,7 +2707,7 @@ pub struct ShareAppProviders {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareAppRuntimes {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude: Option<ShareUpstreamProvider>,
@@ -2494,7 +2726,7 @@ pub struct ShareAppRuntimes {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareAppAvailability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude: Option<ShareProviderAvailability>,
@@ -2505,7 +2737,7 @@ pub struct ShareAppAvailability {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareProviderAvailability {
     pub app: String,
     pub provider_id: String,
