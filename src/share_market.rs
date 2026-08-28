@@ -37,6 +37,7 @@ const MAX_CONTROL_ATTEMPTS: i64 = 8;
 const MAX_SUBSCRIPTIONS_PER_RECONCILE: usize = 200;
 const MARKET_AGGREGATE_BATCH_SIZE: usize = 200;
 const MARKET_PERFORMANCE_MAX_SAMPLES: i64 = 500;
+const MARKET_PERFORMANCE_MIN_GENERATION_MS: i64 = 100;
 const HEALTH_WINDOW_MINUTES: u32 = 24 * 60;
 const CONTROL_DISPATCH_WAKE_RETRY_SECS: i64 = 30;
 const CONTROL_EDIT_TTL_SECS: i64 = 5 * 60;
@@ -2784,7 +2785,9 @@ fn public_app_capabilities(
                     )
                 },
                 account_hint: first_nonempty([
+                    runtime.and_then(|value| value.account_label.as_deref()),
                     runtime.and_then(|value| value.account_email.as_deref()),
+                    bound_provider.and_then(|value| value.account_label.as_deref()),
                     bound_provider.and_then(|value| value.account_email.as_deref()),
                 ]),
                 quota: public_provider_quota(
@@ -4453,6 +4456,13 @@ fn median(samples: &mut [f64]) -> Option<f64> {
     }
 }
 
+fn reliable_generation_window_ms(latency_ms: i64, first_token_ms: i64) -> Option<i64> {
+    let generation_ms = latency_ms.checked_sub(first_token_ms)?;
+    let one_percent_ms = latency_ms.saturating_add(99) / 100;
+    let minimum_ms = MARKET_PERFORMANCE_MIN_GENERATION_MS.max(one_percent_ms);
+    (generation_ms >= minimum_ms).then_some(generation_ms)
+}
+
 fn share_market_performance(
     conn: &Connection,
     share_ids: &[String],
@@ -4551,7 +4561,11 @@ fn share_market_performance_batch(
         }
         entry.ttft_samples_ms.push(first_token_ms as f64);
         if usage_state.eq_ignore_ascii_case("observed") && output_tokens > 0 {
-            let generation_seconds = (latency_ms - first_token_ms) as f64 / 1_000.0;
+            let Some(generation_ms) = reliable_generation_window_ms(latency_ms, first_token_ms)
+            else {
+                continue;
+            };
+            let generation_seconds = generation_ms as f64 / 1_000.0;
             let tps = output_tokens as f64 / generation_seconds;
             if tps.is_finite() && tps > 0.0 {
                 entry.tps_samples.push(tps);
@@ -13924,6 +13938,14 @@ mod tests {
             performance.latest_sample_at,
             DateTime::<Utc>::from_timestamp(now - 1, 0).map(|value| value.to_rfc3339())
         );
+    }
+
+    #[test]
+    fn performance_generation_window_rejects_terminal_flush_timing() {
+        assert_eq!(reliable_generation_window_ms(10_000, 9_999), None);
+        assert_eq!(reliable_generation_window_ms(20_000, 19_850), None);
+        assert_eq!(reliable_generation_window_ms(20_000, 19_800), Some(200));
+        assert_eq!(reliable_generation_window_ms(1_000, 900), Some(100));
     }
 
     #[test]

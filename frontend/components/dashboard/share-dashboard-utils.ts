@@ -161,6 +161,18 @@ export type RecentSharePerformance = {
   tpsSampleCount: number;
 };
 
+const MIN_RELIABLE_GENERATION_MS = 100;
+const MIN_RELIABLE_GENERATION_LATENCY_RATIO = 0.01;
+
+function hasReliableGenerationWindow(latencyMs: number, firstTokenMs: number) {
+  const generationMs = latencyMs - firstTokenMs;
+  const minimumMs = Math.max(
+    MIN_RELIABLE_GENERATION_MS,
+    latencyMs * MIN_RELIABLE_GENERATION_LATENCY_RATIO,
+  );
+  return Number.isFinite(generationMs) && generationMs >= minimumMs;
+}
+
 function isCompletedStreamingRequest(log: ShareRequestLog) {
   const statusCode = Number(log.statusCode || 0);
   const latencyMs = Number(log.latencyMs || 0);
@@ -197,7 +209,9 @@ export function recentSharePerformance(
     if (log.usageState !== "observed") continue;
     const outputTokens = tokenCount(log.outputTokens);
     if (!(outputTokens > 0)) continue;
-    const generationMs = Number(log.latencyMs) - firstTokenMs;
+    const latencyMs = Number(log.latencyMs);
+    if (!hasReliableGenerationWindow(latencyMs, firstTokenMs)) continue;
+    const generationMs = latencyMs - firstTokenMs;
     const tps = outputTokens / (generationMs / 1000);
     if (Number.isFinite(tps) && tps > 0) tpsSamples.push(tps);
   }
@@ -409,6 +423,12 @@ export function hasObservedShareUsage(
   return !log?.usageState || log.usageState === "observed";
 }
 
+export function hasObservedShareCacheUsage(
+  log?: Partial<ShareRequestLog>,
+) {
+  return hasObservedShareUsage(log) && log?.cacheUsageObserved !== false;
+}
+
 export function usageBucketTotalTokens(
   log?: Partial<ShareRequestLog>,
 ) {
@@ -424,7 +444,7 @@ export function usageBucketTotalTokens(
 export function cacheHitRate(
   log?: Partial<ShareRequestLog>,
 ) {
-  if (!hasObservedShareUsage(log)) return 0;
+  if (!hasObservedShareCacheUsage(log)) return 0;
   const input = tokenCount(log?.inputTokens);
   const cacheRead = tokenCount(log?.cacheReadTokens);
   const denominator = input + cacheRead;
@@ -944,7 +964,10 @@ export function mergeStandaloneOAuthRuntime(
   if (!standalone) return runtime;
   return {
     ...runtime,
+    accountLabel: runtime.accountLabel || standalone.accountLabel,
     accountEmail: runtime.accountEmail || standalone.accountEmail,
+    subscriptionLevel:
+      runtime.subscriptionLevel || standalone.subscriptionLevel,
     quota: runtime.quota || standalone.quota,
     models: runtime.models?.length ? runtime.models : standalone.models,
     modelPolicyScope: runtime.modelPolicyScope || standalone.modelPolicyScope,
@@ -962,7 +985,9 @@ export function shareAppProviderRuntime(
     kind: provider.kind,
     app: provider.app,
     providerType: provider.providerType,
+    accountLabel: provider.accountLabel,
     accountEmail: provider.accountEmail,
+    subscriptionLevel: provider.subscriptionLevel,
     apiUrl: provider.apiUrl,
     quota: provider.quota,
     models: provider.models,
@@ -1102,6 +1127,16 @@ export function providerAccountLevel(
   runtime?: ShareUpstreamProvider,
   locale: AppLocale = "en",
 ) {
+  if (isCursorApiKeyRuntime(runtime)) {
+    return (
+      quotaSummary(runtime, locale) ||
+      runtime?.subscriptionLevel ||
+      runtime?.accountLabel ||
+      runtime?.accountEmail ||
+      runtime?.providerName ||
+      "Cursor API Key"
+    );
+  }
   return (
     quotaSummary(runtime, locale) ||
     runtime?.providerName ||
@@ -1115,13 +1150,18 @@ export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
     return "-";
   }
   if (isCursorApiKeyRuntime(runtime)) {
-    const name = String(runtime?.providerName || "").trim();
-    if (name) return name;
+    const account = String(
+      runtime?.accountLabel || runtime?.accountEmail || "",
+    ).trim();
+    if (account && !account.startsWith("cursor_apikey_")) return account;
     const message = String(runtime?.quota?.credentialMessage || "").trim();
     if (message) return message;
-    return "Cursor API Key";
+    const name = String(runtime?.providerName || "").trim();
+    return name || "Cursor API Key";
   }
-  const account = String(runtime?.accountEmail || "").trim();
+  const account = String(
+    runtime?.accountLabel || runtime?.accountEmail || "",
+  ).trim();
   if (!account || account.startsWith("cursor_apikey_")) return "-";
   return account;
 }
@@ -1183,7 +1223,13 @@ export function providerAccountTierLabel(runtime?: ShareUpstreamProvider) {
       const plan = String(quota.plan || quota.credentialMessage || "").trim();
       if (plan) return plan;
     }
-    return runtime.providerName || "Cursor API Key";
+    return (
+      runtime.subscriptionLevel ||
+      runtime.accountLabel ||
+      runtime.accountEmail ||
+      runtime.providerName ||
+      "Cursor API Key"
+    );
   }
   if (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime)) {
     return runtime.providerName || runtime.kind || "-";
@@ -1192,6 +1238,7 @@ export function providerAccountTierLabel(runtime?: ShareUpstreamProvider) {
     runtime.quota?.plan || runtime.quota?.credentialMessage || "",
   ).trim();
   if (plan) return plan;
+  if (runtime.subscriptionLevel?.trim()) return runtime.subscriptionLevel.trim();
   return runtime.providerName || runtime.kind || "-";
 }
 

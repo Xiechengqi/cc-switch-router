@@ -120,6 +120,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         32,
         include_str!("../schema/0032_grok_media_policy_and_request_kinds.sql"),
     ),
+    (
+        33,
+        include_str!("../schema/0033_request_usage_semantics.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -726,6 +730,7 @@ mod tests {
         assert_eq!(versions[29], (30, migration_checksum(MIGRATIONS[28].1)));
         assert_eq!(versions[30], (31, migration_checksum(MIGRATIONS[29].1)));
         assert_eq!(versions[31], (32, migration_checksum(MIGRATIONS[30].1)));
+        assert_eq!(versions[32], (33, migration_checksum(MIGRATIONS[31].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1080,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_32_upgrade_a_version_26_database() {
+    fn migrations_27_through_33_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1129,8 +1134,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 32);
-        check_compatibility(&conn).expect("upgraded version 32 is compatible");
+        assert_eq!(latest_version, 33);
+        check_compatibility(&conn).expect("upgraded version 33 is compatible");
     }
 
     #[test]
@@ -1192,7 +1197,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 32);
+        assert_eq!(latest_version, 33);
     }
 
     #[test]
@@ -1336,6 +1341,43 @@ mod tests {
             )
             .expect("count media request log indexes");
         assert_eq!(media_indexes, 3);
+    }
+
+    #[test]
+    fn migration_33_adds_truthful_request_usage_semantics() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 32);
+        conn.execute_batch(
+            "INSERT INTO share_request_logs (
+                request_id, installation_id, share_id, share_name, provider_id,
+                provider_name, app_type, model, request_model, status_code,
+                latency_ms, input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, is_streaming, created_at
+             ) VALUES (
+                'legacy-request', 'installation', 'share', 'Share', 'provider',
+                'Provider', 'codex', 'gpt-test', 'gpt-test', 200,
+                1000, 10, 2, 0, 0, 1, 1
+             );",
+        )
+        .expect("seed version 32 request log");
+
+        apply(&conn).expect("upgrade request usage semantics");
+
+        let legacy = conn
+            .query_row(
+                "SELECT cache_usage_observed, usage_estimated
+                   FROM share_request_logs WHERE request_id = 'legacy-request'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("read migrated request usage semantics");
+        assert_eq!(legacy, (1, 0));
+        let latest_version = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("read upgraded schema version");
+        assert_eq!(latest_version, 33);
     }
 
     #[test]

@@ -1668,6 +1668,13 @@ pub struct ShareRequestLogEntry {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    /// True when the upstream reported cache-token fields. A false value means the
+    /// numeric cache fields are compatibility placeholders, not observed zeroes.
+    #[serde(default = "default_true")]
+    pub cache_usage_observed: bool,
+    /// True when token counts were estimated locally rather than reported upstream.
+    #[serde(default)]
+    pub usage_estimated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_tokens: Option<u32>,
     pub is_streaming: bool,
@@ -2497,7 +2504,7 @@ pub enum ShareProviderModelPolicySource {
     ProfileFixed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "mode",
     rename_all = "snake_case",
@@ -2507,6 +2514,32 @@ pub enum ShareProviderModelPolicySource {
 pub enum ShareProviderModelPolicy {
     Passthrough,
     Single { upstream_model: String },
+}
+
+impl<'de> Deserialize<'de> for ShareProviderModelPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(
+            tag = "mode",
+            rename_all = "snake_case",
+            rename_all_fields = "camelCase",
+            deny_unknown_fields
+        )]
+        enum StrictModelPolicy {
+            // A struct variant is intentional: serde's internally tagged unit variants
+            // accept extra map fields even with deny_unknown_fields.
+            Passthrough {},
+            Single { upstream_model: String },
+        }
+
+        match StrictModelPolicy::deserialize(deserializer)? {
+            StrictModelPolicy::Passthrough {} => Ok(Self::Passthrough),
+            StrictModelPolicy::Single { upstream_model } => Ok(Self::Single { upstream_model }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2554,6 +2587,8 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_level: Option<String>,
@@ -2592,6 +2627,7 @@ impl Default for ShareUpstreamProvider {
             app: String::new(),
             provider_name: None,
             provider_type: None,
+            account_label: None,
             account_email: None,
             subscription_level: None,
             subscription_expires_at: None,
@@ -2631,6 +2667,8 @@ pub struct ShareAppProvider {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub codex_image_generation_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2676,6 +2714,7 @@ impl Default for ShareAppProvider {
             is_current: false,
             enabled: false,
             codex_image_generation_enabled: false,
+            account_label: None,
             account_email: None,
             subscription_level: None,
             subscription_expires_at: None,

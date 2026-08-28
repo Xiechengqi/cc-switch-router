@@ -213,6 +213,7 @@ export function ShareAppSupportCard({
     ? modelHealthTone(share, app)
     : { className: "bg-slate-50 text-muted-foreground", label: "" };
   const accountEmail = enabled ? providerAccountIdentity(runtime) : "";
+  const accountLevel = enabled ? providerAccountLevel(runtime, locale) : "";
   const modelSummary = enabled
     ? providerModelMap(runtime, t("dashboard.modelPolicyPassthrough"))
     : "";
@@ -225,9 +226,9 @@ export function ShareAppSupportCard({
       <span className="min-w-0 self-start font-mono uppercase">{label}</span>
       <span className="grid min-w-0 gap-0.5 overflow-hidden text-right">
         <span className="min-w-0 whitespace-normal break-words font-semibold">
-          {enabled ? providerAccountLevel(runtime, locale) : ""}
+          {accountLevel}
         </span>
-        {accountEmail && accountEmail !== "-" ? (
+        {accountEmail && accountEmail !== "-" && accountEmail !== accountLevel ? (
           <span className="min-w-0 whitespace-normal break-all text-[10px] font-medium opacity-75">
             {accountEmail}
           </span>
@@ -2157,6 +2158,8 @@ export function ShareModelHealthChecks({
 export function TokenGrid({ log }: { log: ShareRequestLog }) {
   const { t } = useLocaleText();
   const usageObserved = hasObservedShareUsage(log);
+  const cacheUsageObserved = usageObserved && log.cacheUsageObserved !== false;
+  const usageEstimated = usageObserved && log.usageEstimated === true;
   const usageState = log.usageState || "observed";
   const usageStateLabel = (() => {
     switch (usageState) {
@@ -2174,34 +2177,46 @@ export function TokenGrid({ log }: { log: ShareRequestLog }) {
   })();
   const items = [
     [
-      "Input",
+      usageEstimated ? "Input (est.)" : "Input",
       usageObserved ? tokenCount(log.inputTokens) : "-",
-      "Fresh input tokens used for input pricing.",
+      usageEstimated
+        ? "Estimated total prompt tokens; may include reused conversation context because the upstream does not report a cache breakdown."
+        : "Fresh input tokens used for input pricing.",
     ],
     [
-      "Output",
+      usageEstimated ? "Output (est.)" : "Output",
       usageObserved ? tokenCount(log.outputTokens) : "-",
-      "Output tokens used for output pricing.",
+      usageEstimated
+        ? "Estimated output tokens because the upstream did not report token usage."
+        : "Output tokens used for output pricing.",
     ],
     [
       "Cache R",
-      usageObserved ? tokenCount(log.cacheReadTokens) : "-",
-      "Cache read tokens used for cache-read pricing.",
+      cacheUsageObserved ? tokenCount(log.cacheReadTokens) : "-",
+      cacheUsageObserved
+        ? "Cache read tokens used for cache-read pricing."
+        : "Cache read usage was not reported by the upstream.",
     ],
     [
       "Cache W",
-      usageObserved ? tokenCount(log.cacheCreationTokens) : "-",
-      "Cache creation tokens used for cache-write pricing.",
+      cacheUsageObserved ? tokenCount(log.cacheCreationTokens) : "-",
+      cacheUsageObserved
+        ? "Cache creation tokens used for cache-write pricing."
+        : "Cache write usage was not reported by the upstream.",
     ],
     [
-      "Total",
+      usageEstimated ? "Total (est.)" : "Total",
       usageObserved ? usageBucketTotalTokens(log) : "-",
-      "Input + Output + Cache R + Cache W.",
+      usageEstimated
+        ? "Estimated input + output; unavailable cache fields are not inferred."
+        : "Input + Output + Cache R + Cache W.",
     ],
     [
       "Hit",
-      usageObserved ? formatPercent(cacheHitRate(log)) : "-",
-      "Cache R / (Input + Cache R).",
+      cacheUsageObserved ? formatPercent(cacheHitRate(log)) : "-",
+      cacheUsageObserved
+        ? "Cache R / (Input + Cache R)."
+        : "Cache hit rate is unavailable without an upstream cache breakdown.",
     ],
   ];
   return (

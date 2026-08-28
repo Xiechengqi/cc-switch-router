@@ -728,6 +728,8 @@ export type ShareRequestLog = {
   outputTokens: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  cacheUsageObserved?: boolean;
+  usageEstimated?: boolean;
   isStreaming?: boolean;
   isHealthCheck?: boolean;
   userEmail?: string;
@@ -932,6 +934,7 @@ export type ShareUpstreamProvider = {
   kind?: string;
   app?: string;
   providerType?: string;
+  accountLabel?: string;
   accountEmail?: string;
   subscriptionLevel?: string;
   apiUrl?: string;
@@ -977,7 +980,9 @@ export type ShareAppProvider = {
   isCurrent?: boolean;
   enabled?: boolean;
   codexImageGenerationEnabled?: boolean;
+  accountLabel?: string;
   accountEmail?: string;
+  subscriptionLevel?: string;
   apiUrl?: string;
   quota?: ShareUpstreamProvider["quota"];
   models?: ShareUpstreamProvider["models"];

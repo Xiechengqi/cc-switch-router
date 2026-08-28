@@ -7523,7 +7523,8 @@ impl AppStore {
                         output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                         session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                         request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
-                        video_duration_seconds, video_resolution, video_aspect_ratio
+                        video_duration_seconds, video_resolution, video_aspect_ratio,
+                        cache_usage_observed, usage_estimated
                  FROM share_request_logs
                  WHERE share_id = ?1
                    AND COALESCE(is_health_check, 0) = 0
@@ -14981,10 +14982,11 @@ fn upsert_share_request_log_tx(
             effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
             status_code, latency_ms, first_token_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens,
+            cache_usage_observed, usage_estimated,
             is_streaming, session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
             request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
             video_duration_seconds, video_resolution, video_aspect_ratio
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)
         ON CONFLICT(request_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_id = excluded.share_id,
@@ -15013,6 +15015,8 @@ fn upsert_share_request_log_tx(
             output_tokens = excluded.output_tokens,
             cache_read_tokens = excluded.cache_read_tokens,
             cache_creation_tokens = excluded.cache_creation_tokens,
+            cache_usage_observed = excluded.cache_usage_observed,
+            usage_estimated = excluded.usage_estimated,
             quota_tokens = COALESCE(excluded.quota_tokens, share_request_logs.quota_tokens),
             is_streaming = excluded.is_streaming,
             session_id = excluded.session_id,
@@ -15061,6 +15065,8 @@ fn upsert_share_request_log_tx(
             i64::from(log.cache_read_tokens),
             i64::from(log.cache_creation_tokens),
             log.quota_tokens.map(i64::from),
+            i64::from(log.cache_usage_observed as u8),
+            i64::from(log.usage_estimated as u8),
             i64::from(log.is_streaming as u8),
             log.session_id,
             log.user_country,
@@ -18607,6 +18613,8 @@ mod token_period_window_tests {
                 output_tokens: 100,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 25,
+                cache_usage_observed: true,
+                usage_estimated: false,
                 quota_tokens: Some(quota_tokens),
                 is_streaming: false,
                 session_id: None,
@@ -21094,7 +21102,8 @@ fn list_global_recent_share_request_logs(
                     output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                     request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
-                    video_duration_seconds, video_resolution, video_aspect_ratio
+                    video_duration_seconds, video_resolution, video_aspect_ratio,
+                    cache_usage_observed, usage_estimated
              FROM share_request_logs
              WHERE COALESCE(is_health_check, 0) = 0
              ORDER BY created_at DESC, request_id DESC
@@ -21121,7 +21130,8 @@ fn list_recent_share_request_logs(
                     output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                     request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
-                    video_duration_seconds, video_resolution, video_aspect_ratio
+                    video_duration_seconds, video_resolution, video_aspect_ratio,
+                    cache_usage_observed, usage_estimated
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
@@ -21132,6 +21142,7 @@ fn list_recent_share_request_logs(
                         session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                         request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                         video_duration_seconds, video_resolution, video_aspect_ratio,
+                        cache_usage_observed, usage_estimated,
                         ROW_NUMBER() OVER (
                             PARTITION BY share_id
                             ORDER BY created_at DESC, request_id DESC
@@ -21201,6 +21212,8 @@ fn map_share_request_log_row(row: &crate::db::Row<'_>) -> crate::db::Result<Shar
             .map(|value| value.max(0) as u32),
         video_resolution: row.get(42)?,
         video_aspect_ratio: row.get(43)?,
+        cache_usage_observed: row.get::<_, i64>(44)? != 0,
+        usage_estimated: row.get::<_, i64>(45)? != 0,
     })
 }
 
@@ -21350,6 +21363,8 @@ struct RecentShareLogFingerprint {
     output_tokens: u32,
     cache_read_tokens: u32,
     cache_creation_tokens: u32,
+    cache_usage_observed: bool,
+    usage_estimated: bool,
     is_streaming: bool,
     session_id: Option<String>,
 }
@@ -21374,6 +21389,8 @@ fn deduplicate_recent_share_request_logs(
             output_tokens: log.output_tokens,
             cache_read_tokens: log.cache_read_tokens,
             cache_creation_tokens: log.cache_creation_tokens,
+            cache_usage_observed: log.cache_usage_observed,
+            usage_estimated: log.usage_estimated,
             is_streaming: log.is_streaming,
             session_id: log.session_id.clone(),
         };
@@ -25644,6 +25661,7 @@ fn build_gateway_share_apps(
 /// Keep quota/model metadata needed for scheduling while removing credentials'
 /// account identity and endpoint from the external projection.
 fn redact_gateway_provider(mut provider: ShareUpstreamProvider) -> ShareUpstreamProvider {
+    provider.account_label = None;
     provider.account_email = None;
     provider.api_url = None;
     provider
@@ -25718,16 +25736,19 @@ mod tests {
     #[test]
     fn gateway_capacity_projection_redacts_provider_identity_and_endpoint() {
         let provider = ShareUpstreamProvider {
+            account_label: Some("Provider account".into()),
             account_email: Some("provider@example.com".into()),
             api_url: Some("https://provider.example.com/v1".into()),
             ..ShareUpstreamProvider::default()
         };
         let redacted = redact_gateway_provider(provider);
+        assert!(redacted.account_label.is_none());
         assert!(redacted.account_email.is_none());
         assert!(redacted.api_url.is_none());
 
         let runtimes = redact_gateway_app_runtimes(ShareAppRuntimes {
             codex: Some(ShareUpstreamProvider {
+                account_label: Some("Runtime account".into()),
                 account_email: Some("runtime@example.com".into()),
                 api_url: Some("https://runtime.example.com".into()),
                 ..ShareUpstreamProvider::default()
@@ -25735,6 +25756,7 @@ mod tests {
             ..ShareAppRuntimes::default()
         });
         let codex = runtimes.codex.expect("codex runtime");
+        assert!(codex.account_label.is_none());
         assert!(codex.account_email.is_none());
         assert!(codex.api_url.is_none());
 
@@ -30322,6 +30344,8 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_usage_observed: true,
+            usage_estimated: false,
             quota_tokens: None,
             is_streaming: false,
             session_id: None,
@@ -30358,7 +30382,9 @@ mod tests {
         observed.usage_revision = 2;
         observed.input_tokens = 120;
         observed.output_tokens = 30;
-        observed.cache_read_tokens = 80;
+        observed.cache_read_tokens = 0;
+        observed.cache_usage_observed = false;
+        observed.usage_estimated = true;
         observed.requested_reasoning_effort = Some("high".into());
         observed.effective_reasoning_effort = Some("high".into());
         observed.effective_service_tier = Some("priority".into());
@@ -30373,7 +30399,9 @@ mod tests {
         assert_eq!(stored[0].usage_revision, 2);
         assert_eq!(stored[0].input_tokens, 120);
         assert_eq!(stored[0].output_tokens, 30);
-        assert_eq!(stored[0].cache_read_tokens, 80);
+        assert_eq!(stored[0].cache_read_tokens, 0);
+        assert!(!stored[0].cache_usage_observed);
+        assert!(stored[0].usage_estimated);
         assert_eq!(
             stored[0].requested_reasoning_effort.as_deref(),
             Some("high")
@@ -33287,6 +33315,7 @@ mod tests {
             app: "codex".into(),
             provider_name: Some("OpenAI OAuth".into()),
             provider_type: Some("codex_oauth".into()),
+            account_label: Some("OpenAI owner".into()),
             account_email: Some("a@b.c".into()),
             subscription_level: None,
             subscription_expires_at: None,
@@ -33331,6 +33360,11 @@ mod tests {
             available: None,
         };
         let json = serde_json::to_string(&value).expect("serialize provider");
+        let decoded = serde_json::from_str::<ShareUpstreamProvider>(&json)
+            .expect("deserialize provider account presentation");
+        assert_eq!(decoded.account_label.as_deref(), Some("OpenAI owner"));
+        let account_label = json.find("accountLabel").expect("accountLabel");
+        let account_email = json.find("accountEmail").expect("accountEmail");
         let plan = json.find("plan").expect("plan");
         let activity_cost = json.find("activityCost").expect("activityCost");
         let queried_at = json.find("queriedAt").expect("queriedAt");
@@ -33341,6 +33375,10 @@ mod tests {
         assert!(
             plan < activity_cost && activity_cost < queried_at,
             "expected activityCost between plan and queriedAt, got {json}"
+        );
+        assert!(
+            account_label < account_email,
+            "expected accountLabel before accountEmail, got {json}"
         );
         assert!(api < models, "expected apiUrl before models, got {json}");
         assert!(
@@ -43304,6 +43342,8 @@ mod tests {
                     output_tokens: 2,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    cache_usage_observed: true,
+                    usage_estimated: false,
                     quota_tokens: None,
                     is_streaming: false,
                     session_id: None,
@@ -43489,6 +43529,8 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_usage_observed: true,
+            usage_estimated: false,
             quota_tokens: Some(30),
             is_streaming: true,
             session_id: Some("session-1".into()),
