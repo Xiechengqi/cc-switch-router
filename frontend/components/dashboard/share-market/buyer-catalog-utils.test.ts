@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   catalogSeatPreview,
   initialCatalogSeat,
+  marketShareCardSeatPreview,
   preserveCatalogSeat,
 } from "./buyer-catalog-utils";
 import {
@@ -33,6 +34,18 @@ test("compact cards preview at most two idle seats", () => {
     catalogSeatPreview([seat("a"), seat("busy", "occupied"), seat("b"), seat("c")]).map((item) => item.id),
     ["a", "b"],
   );
+});
+
+test("workspace cards keep at most two seat rows and prefer the caller's seats", () => {
+  const seats = [seat("a"), seat("busy", "occupied"), seat("b"), seat("c")];
+  const rented = marketShareCardSeatPreview(seats, ["busy"]);
+  assert.deepEqual(rented.preview.map((item) => item.id), ["busy", "a"]);
+  assert.equal(rented.hiddenCount, 2);
+  assert.equal(rented.idleHiddenCount, 2);
+  const listed = marketShareCardSeatPreview(seats);
+  assert.deepEqual(listed.preview.map((item) => item.id), ["a", "b"]);
+  assert.equal(listed.hiddenCount, 2);
+  assert.equal(listed.idleCount, 3);
 });
 
 const capability = (

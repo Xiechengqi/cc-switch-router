@@ -15,7 +15,7 @@ import {
   listingIdleCount,
   marketProviderStatusView,
 } from "@/components/dashboard/share-market/market-utils";
-import { catalogSeatPreview } from "@/components/dashboard/share-market/buyer-catalog-utils";
+import { marketShareCardSeatPreview } from "@/components/dashboard/share-market/buyer-catalog-utils";
 
 export const MARKET_SHARE_CARD_GRID_CLASS =
   "grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4";
@@ -114,34 +114,45 @@ export function CatalogSeatPreview({
 export function CatalogSeatPreviewList({
   listing,
   onOpen,
+  preferredSeatIds,
+  seats,
 }: {
   listing: ShareMarketListing;
   onOpen: (seat?: ShareMarketSeat) => void;
+  preferredSeatIds?: string[];
+  seats?: ShareMarketSeat[];
 }) {
   const { t } = useLocaleText();
-  const idle = listing.seats.filter(isSeatIdle);
-  const preview = catalogSeatPreview(listing.seats);
+  const source = seats ?? listing.seats.filter(isSeatIdle);
+  const { preview, hiddenCount, idleHiddenCount, idleCount } = marketShareCardSeatPreview(
+    source,
+    preferredSeatIds,
+  );
+  const catalogIdleCount = listing.seats.filter(isSeatIdle).length;
+  const hint = idleHiddenCount > 0
+    ? t("shareMarket.catalog.moreSeats", { count: idleHiddenCount })
+    : hiddenCount > 0
+      ? t("shareMarket.catalog.moreSeatsTotal", { count: hiddenCount })
+      : !catalogIdleCount
+        ? t("shareMarket.catalog.full")
+        : null;
   return (
     <div className="grid content-start gap-0.5 border-t border-slate-100 pt-1.5">
       {preview.map((seat) => (
         <CatalogSeatPreview key={seat.id} seat={seat} onSelect={() => onOpen(seat)} />
       ))}
-      {idle.length > preview.length ? (
+      {hint ? (
         <button
           type="button"
-          className="rounded px-1.5 pt-1 text-left text-[10px] font-medium text-accent hover:underline active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          className={cn(
+            "rounded px-1.5 text-left active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+            idleCount
+              ? "pt-1 text-[10px] font-medium text-accent hover:underline"
+              : "py-2 text-xs text-slate-500",
+          )}
           onClick={() => onOpen()}
         >
-          {t("shareMarket.catalog.moreSeats", { count: idle.length - preview.length })}
-        </button>
-      ) : null}
-      {!idle.length ? (
-        <button
-          type="button"
-          className="rounded px-1.5 py-2 text-left text-xs text-slate-500 active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-          onClick={() => onOpen()}
-        >
-          {t("shareMarket.catalog.full")}
+          {hint}
         </button>
       ) : null}
     </div>

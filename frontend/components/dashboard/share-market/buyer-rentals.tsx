@@ -16,6 +16,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { drawerDialogClassName, subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import {
+  CatalogSeatPreviewList,
   MARKET_SHARE_CARD_GRID_CLASS,
   MarketShareCard,
   listingCardId,
@@ -656,8 +657,22 @@ export function ShareMarketBuyerRentals({
               const listing = listingForRentalShare(listings, group) as ShareMarketListing | undefined;
               const subscription = group.subscription;
               const actions = rowActions(subscription);
-              const occupancy = t("shareMarket.catalog.seatPosition", { position: subscription.seatPosition });
-              const footer = (
+              const occupancy = listing
+                ? undefined
+                : t("shareMarket.catalog.seatPosition", { position: subscription.seatPosition });
+              const footer = listing ? (
+                <div className="grid content-start">
+                  <CatalogSeatPreviewList
+                    listing={listing}
+                    seats={listing.seats}
+                    preferredSeatIds={[subscription.seatId]}
+                    onOpen={() => setSelectedShareId(group.shareId)}
+                  />
+                  <div data-no-card-open>
+                    <RentalActions subscription={subscription} t={t} busy={busyId === subscription.id} onRelease={actions.onRelease} />
+                  </div>
+                </div>
+              ) : (
                 <div className="grid content-start gap-1.5 border-t border-slate-100 pt-1.5">
                   <p className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 px-1.5 text-xs text-slate-500">
                     <strong className="font-medium tabular-nums text-slate-800">{rentalPrice(subscription, locale, t)}</strong>

@@ -25,6 +25,7 @@ import {
 import { drawerDialogClassName, expiryTitle } from "@/components/dashboard/share-dashboard-utils";
 import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import {
+  CatalogSeatPreviewList,
   MARKET_SHARE_CARD_GRID_CLASS,
   MarketShareCard,
   listingCardId,
@@ -80,7 +81,6 @@ import {
   isPriceOnlySeatAttention,
   listingClosedRentalSeats,
   listingLiveSeats,
-  listingLowestIdleSeat,
   listingOccupancyCounts,
   needsOwnedSeatAttention,
   ownedShareBlockedReasonKey,
@@ -1052,12 +1052,6 @@ function seatQuotaLabel(seat: ShareMarketSeat, locale: string, t: TFn) {
   ].join(" · ");
 }
 
-function listingPriceLabel(listing: ShareMarketListing, locale: string, t: TFn) {
-  const seat = listingLowestIdleSeat(listing);
-  if (!seat) return null;
-  return formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"));
-}
-
 function seatStatusLabel(seat: ShareMarketSeat, t: TFn) {
   const statusKey = subscriptionStatusKey(seat.subscription?.status || "");
   return statusKey ? t(statusKey) : isSeatIdle(seat) ? t("shareMarket.available") : seat.status;
@@ -1480,7 +1474,6 @@ export function ShareMarketOwnerWorkspace({
 
   const renderListingCard = (listing: ShareMarketListing, muted = false) => {
     const counts = listingOccupancyCounts(listing);
-    const price = listingPriceLabel(listing, locale, t);
     const reopenable = reopenableListingSeats(listing).length;
     const remaining = listingClosedRentalSeats(listing).length;
     const attention = attentionShareIds.has(listing.id);
@@ -1495,18 +1488,19 @@ export function ShareMarketOwnerWorkspace({
         occupancy={listingOccupancyLabel(listing)}
         onOpen={() => setSelectedId(listing.id)}
         footer={(
-          <div className="grid content-start gap-1.5 border-t border-slate-100 pt-1.5">
-            {listing.status === "active" ? (
-              <p className={cn("px-1.5 text-xs", price ? "font-medium tabular-nums text-slate-800" : "text-slate-500")}>
-                {price || t("shareMarket.listings.full")}
-              </p>
-            ) : (
-              <p className="flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 px-1.5 text-xs text-slate-500">
+          <div className="grid content-start">
+            <CatalogSeatPreviewList
+              listing={listing}
+              seats={listing.seats}
+              onOpen={() => setSelectedId(listing.id)}
+            />
+            {listing.status !== "active" && (reopenable || remaining || counts.attention) ? (
+              <p className="flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 px-1.5 pt-1 text-[10px] text-slate-500">
                 {reopenable ? <span>{t("shareMarket.listings.reopenableSeats", { count: reopenable })}</span> : null}
                 {remaining ? <span>{t("shareMarket.listings.activeRentals", { count: remaining })}</span> : null}
                 {counts.attention ? <span className="font-medium text-rose-700">{t("account.share.seatsAttention")} · {counts.attention}</span> : null}
               </p>
-            )}
+            ) : null}
             {renderListingActions(listing)}
           </div>
         )}
