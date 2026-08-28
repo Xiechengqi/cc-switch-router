@@ -168,6 +168,20 @@ pub struct InstallationAuditEvent {
     pub output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_text: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_function_call: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_custom_tool_call: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_conversation_generation: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1659,6 +1673,8 @@ fn validate_batch(payload: &InstallationAuditBatchPayload) -> Result<(), AppErro
             event.network_error_kind.as_deref(),
             event.retry_decision.as_deref(),
             event.stream_status.as_deref(),
+            event.constraint_source.as_deref(),
+            event.rejection_reason.as_deref(),
         ] {
             if value.is_some_and(|value| {
                 value.len() > 256
@@ -3204,13 +3220,20 @@ mod tests {
                 input_tokens: Some(10),
                 output_tokens: Some(20),
                 total_tokens: Some(30),
+                constraint_source: Some("local_intent".to_string()),
+                rejection_reason: Some("local_tool_missing".to_string()),
+                saw_text: Some(true),
+                saw_reasoning: Some(true),
+                saw_function_call: Some(false),
+                saw_custom_tool_call: Some(false),
+                upstream_conversation_generation: Some(2),
             }],
         };
 
         let encoded = serde_json::to_vec(&payload).unwrap();
         assert_eq!(
             hex::encode(sha2::Sha256::digest(encoded)),
-            "3fb028aa02ae49462857380e25a2c3aedd9ecebc2d56c857193bc58955300640"
+            "4755e0163ca89ca878003aaa74b0e94bf7bb7850783f18ac7e3d39fde369bef2"
         );
     }
 
