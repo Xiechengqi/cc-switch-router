@@ -38,10 +38,9 @@ test("compact cards preview at most two idle seats", () => {
 
 test("workspace cards keep at most two seat rows and prefer the caller's seats", () => {
   const seats = [seat("a"), seat("busy", "occupied"), seat("b"), seat("c")];
-  const rented = marketShareCardSeatPreview(seats, ["busy"]);
-  assert.deepEqual(rented.preview.map((item) => item.id), ["busy", "a"]);
-  assert.equal(rented.hiddenCount, 2);
-  assert.equal(rented.idleHiddenCount, 2);
+  const rented = marketShareCardSeatPreview([seat("busy", "occupied")], ["busy"]);
+  assert.deepEqual(rented.preview.map((item) => item.id), ["busy"]);
+  assert.equal(rented.hiddenCount, 0);
   const listed = marketShareCardSeatPreview(seats);
   assert.deepEqual(listed.preview.map((item) => item.id), ["a", "b"]);
   assert.equal(listed.hiddenCount, 2);

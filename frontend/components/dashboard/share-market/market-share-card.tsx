@@ -89,17 +89,16 @@ function compactSeatTerms(
 export function CatalogSeatPreview({
   seat,
   onSelect,
+  interactive = true,
 }: {
   seat: ShareMarketSeat;
-  onSelect: () => void;
+  onSelect?: () => void;
+  interactive?: boolean;
 }) {
   const { locale, t } = useLocaleText();
-  return (
-    <button
-      type="button"
-      className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded px-1.5 py-1 text-left text-[11px] hover:bg-slate-50 active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-      onClick={onSelect}
-    >
+  const className = "grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded px-1.5 py-1 text-left text-[11px]";
+  const body = (
+    <>
       <span className="font-semibold text-slate-700">#{seat.position}</span>
       <span className="truncate text-slate-500">
         {compactSeatTerms(seat, locale, t("common.unlimited"), t(`shareMarket.period.${seat.tokenPeriod}`))}
@@ -107,6 +106,18 @@ export function CatalogSeatPreview({
       <strong className="shrink-0 tabular-nums text-slate-800">
         {formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}
       </strong>
+    </>
+  );
+  if (!interactive) {
+    return <div className={className}>{body}</div>;
+  }
+  return (
+    <button
+      type="button"
+      className={`${className} hover:bg-slate-50 active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary`}
+      onClick={onSelect}
+    >
+      {body}
     </button>
   );
 }
@@ -116,11 +127,13 @@ export function CatalogSeatPreviewList({
   onOpen,
   preferredSeatIds,
   seats,
+  showHint = true,
 }: {
   listing: ShareMarketListing;
-  onOpen: (seat?: ShareMarketSeat) => void;
+  onOpen?: (seat?: ShareMarketSeat) => void;
   preferredSeatIds?: string[];
   seats?: ShareMarketSeat[];
+  showHint?: boolean;
 }) {
   const { t } = useLocaleText();
   const source = seats ?? listing.seats.filter(isSeatIdle);
@@ -129,31 +142,39 @@ export function CatalogSeatPreviewList({
     preferredSeatIds,
   );
   const catalogIdleCount = listing.seats.filter(isSeatIdle).length;
-  const hint = idleHiddenCount > 0
-    ? t("shareMarket.catalog.moreSeats", { count: idleHiddenCount })
-    : hiddenCount > 0
-      ? t("shareMarket.catalog.moreSeatsTotal", { count: hiddenCount })
-      : !catalogIdleCount
-        ? t("shareMarket.catalog.full")
-        : null;
+  const hint = !showHint
+    ? null
+    : idleHiddenCount > 0
+      ? t("shareMarket.catalog.moreSeats", { count: idleHiddenCount })
+      : hiddenCount > 0
+        ? t("shareMarket.catalog.moreSeatsTotal", { count: hiddenCount })
+        : !catalogIdleCount
+          ? t("shareMarket.catalog.full")
+          : null;
   return (
     <div className="grid content-start gap-0.5 border-t border-slate-100 pt-1.5">
       {preview.map((seat) => (
-        <CatalogSeatPreview key={seat.id} seat={seat} onSelect={() => onOpen(seat)} />
+        <CatalogSeatPreview key={seat.id} seat={seat} onSelect={() => onOpen?.(seat)} interactive={!!onOpen} />
       ))}
       {hint ? (
-        <button
-          type="button"
-          className={cn(
-            "rounded px-1.5 text-left active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
-            idleCount
-              ? "pt-1 text-[10px] font-medium text-accent hover:underline"
-              : "py-2 text-xs text-slate-500",
-          )}
-          onClick={() => onOpen()}
-        >
-          {hint}
-        </button>
+        onOpen ? (
+          <button
+            type="button"
+            className={cn(
+              "rounded px-1.5 text-left active:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+              idleCount
+                ? "pt-1 text-[10px] font-medium text-accent hover:underline"
+                : "py-2 text-xs text-slate-500",
+            )}
+            onClick={() => onOpen()}
+          >
+            {hint}
+          </button>
+        ) : (
+          <p className={cn("px-1.5", idleCount ? "pt-1 text-[10px] font-medium text-slate-500" : "py-2 text-xs text-slate-500")}>
+            {hint}
+          </p>
+        )
       ) : null}
     </div>
   );
@@ -176,7 +197,7 @@ export function MarketShareCard({
   cardId?: string;
   occupancy?: React.ReactNode;
   footer?: React.ReactNode;
-  onOpen: () => void;
+  onOpen?: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
@@ -187,11 +208,15 @@ export function MarketShareCard({
     passthrough: t("shareMarket.modelPassthrough"),
   });
   const subdomain = listing.subdomain?.trim() || listing.shareName;
+  const interactive = !!onOpen;
   return (
     <article
       id={cardId}
       className={cn(
-        "grid min-h-[15rem] min-w-0 cursor-pointer scroll-mt-20 select-text grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border p-3 shadow-sm transition-[border-color,box-shadow,background-color] hover:border-primary/35",
+        "grid min-h-[15rem] min-w-0 scroll-mt-20 select-text grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border p-3 shadow-sm",
+        interactive
+          ? "cursor-pointer transition-[border-color,box-shadow,background-color] hover:border-primary/35"
+          : "cursor-default",
         muted || !idleCount ? "bg-slate-50" : "bg-white",
         focused
           ? "border-primary ring-2 ring-primary/20"
@@ -201,14 +226,14 @@ export function MarketShareCard({
               ? "border-slate-200"
               : "border-rose-200",
       )}
-      onMouseDown={(event) => {
+      onMouseDown={interactive ? (event) => {
         pointerDownRef.current = { x: event.clientX, y: event.clientY };
-      }}
-      onClick={(event) => {
+      } : undefined}
+      onClick={interactive ? (event) => {
         if (!shouldOpenMarketShareCard(event, pointerDownRef.current)) return;
         pointerDownRef.current = null;
         onOpen();
-      }}
+      } : undefined}
     >
       <header className="flex min-w-0 items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">

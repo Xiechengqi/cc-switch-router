@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Button, Drawer, Modal } from "@heroui/react";
+import { Button, Modal } from "@heroui/react";
 import {
   Clock3,
   Copy,
@@ -22,7 +22,7 @@ import {
   PaidOfferReadinessNotice,
   usePaidOfferReadiness,
 } from "@/components/dashboard/share-market/paid-offer-readiness";
-import { drawerDialogClassName, expiryTitle } from "@/components/dashboard/share-dashboard-utils";
+import { expiryTitle } from "@/components/dashboard/share-dashboard-utils";
 import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import {
   CatalogSeatPreviewList,
@@ -1433,45 +1433,6 @@ export function ShareMarketOwnerWorkspace({
     return t("shareMarket.catalog.occupancy", { idle: counts.idle, total: counts.total || listing.seats.length });
   };
 
-  const renderSeatRow = (listing: ShareMarketListing, seat: ShareMarketSeat, attention = false) => {
-    const subscription = seat.subscription;
-    const priceOnly = attention && isPriceOnlySeatAttention(seat);
-    return (
-      <article
-        key={seat.id}
-        aria-busy={busy}
-        className={cn(
-          "grid gap-2 px-3 py-2.5",
-          attention && (priceOnly
-            ? "rounded-md border border-amber-200 bg-amber-50/40"
-            : "rounded-md border border-rose-200 bg-rose-50/40"),
-        )}
-      >
-        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-              <strong className="shrink-0 text-sm tabular-nums text-slate-900">#{seat.position}</strong>
-              <span className="min-w-0 truncate text-[11px] text-slate-500">{seatStatusLabel(seat, t)}</span>
-              {subscription?.renterEmail ? (
-                <span className="min-w-0 break-all text-[11px] text-slate-500" title={subscription.renterEmail}>
-                  {subscription.renterEmail}
-                </span>
-              ) : null}
-            </div>
-            <p className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-slate-500">
-              <strong className="font-medium tabular-nums text-slate-800">
-                {formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}
-              </strong>
-              <span className="min-w-0 truncate">{seatQuotaLabel(seat, locale, t)}</span>
-            </p>
-          </div>
-          {renderSeatActions(listing, seat)}
-        </div>
-        {attention ? renderSeatStatusDetails(seat, priceOnly ? "amber" : "rose") : null}
-      </article>
-    );
-  };
-
   const renderListingCard = (listing: ShareMarketListing, muted = false) => {
     const counts = listingOccupancyCounts(listing);
     const reopenable = reopenableListingSeats(listing).length;
@@ -1575,40 +1536,75 @@ export function ShareMarketOwnerWorkspace({
         </>
       )}
 
-      <Drawer.Backdrop isOpen={!!selected} onOpenChange={(open) => !open && setSelectedId(null)}>
-        <Drawer.Content placement="right">
-          <Drawer.Dialog className={drawerDialogClassName}>
-            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200" />
-            <Drawer.Header>
-              <div className="min-w-0 pr-10">
-                <Drawer.Heading className="truncate text-base">{selected?.shareName}</Drawer.Heading>
-              </div>
-            </Drawer.Header>
-            <Drawer.Body className="overflow-y-auto pb-28">
+      <Modal.Backdrop isOpen={!!selected} onOpenChange={(open) => !open && setSelectedId(null)}>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(860px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading>{t("shareMarket.catalog.shareSeats")}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid max-h-[min(70vh,36rem)] gap-3 overflow-y-auto">
               {selected ? (
-                <div className="grid gap-4">
+                <>
                   {selected.status === "closed" && !selected.canReopen ? (
                     <p className="border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
                       {t(reopenBlockedReasonKey(selected.reopenBlockedReason))}
                     </p>
                   ) : null}
-                  <section className="grid gap-2">
-                    <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.seatsAndRiders")}</h3>
-                    {selectedSeats.length ? selectedSeats.map((seat) => renderSeatRow(selected, seat, needsOwnedSeatAttention(seat))) : (
-                      <p className="text-sm text-slate-500">{t("shareMarket.catalog.noRiders")}</p>
-                    )}
-                  </section>
-                </div>
+                  {selectedSeats.length ? (
+                    <div className="overflow-x-auto rounded-md border border-slate-200">
+                      <table className="w-full min-w-[36rem] table-fixed border-collapse text-left text-xs">
+                        <thead className="bg-slate-50 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-500">
+                          <tr>
+                            <th className="w-16 px-3 py-2">{t("shareMarket.col.seat")}</th>
+                            <th className="w-28 px-2 py-2">{t("shareMarket.col.status")}</th>
+                            <th className="w-28 px-2 py-2">{t("shareMarket.col.amount")}</th>
+                            <th className="px-2 py-2">{t("account.share.quota")}</th>
+                            <th className="w-40 px-2 py-2 text-right">{t("shareMarket.col.actions")}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {selectedSeats.map((seat) => {
+                            const attention = needsOwnedSeatAttention(seat);
+                            const priceOnly = attention && isPriceOnlySeatAttention(seat);
+                            return (
+                              <tr
+                                key={seat.id}
+                                className={cn(
+                                  "border-t border-slate-100 align-top text-slate-700",
+                                  attention && (priceOnly ? "bg-amber-50/60" : "bg-rose-50/60"),
+                                )}
+                              >
+                                <td className="px-3 py-2 font-semibold tabular-nums">#{seat.position}</td>
+                                <td className="px-2 py-2 text-slate-500">
+                                  <div className="grid gap-1">
+                                    <span>{seatStatusLabel(seat, t)}</span>
+                                    {attention ? renderSeatStatusDetails(seat, priceOnly ? "amber" : "rose") : null}
+                                  </div>
+                                </td>
+                                <td className="px-2 py-2 tabular-nums">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</td>
+                                <td className="px-2 py-2 text-slate-500">{seatQuotaLabel(seat, locale, t)}</td>
+                                <td className="px-2 py-2">
+                                  <div className="flex justify-end">{renderSeatActions(selected, seat)}</div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-slate-500">{t("shareMarket.catalog.noRiders")}</p>
+                  )}
+                </>
               ) : null}
-            </Drawer.Body>
-            {selected ? (
-              <div className="absolute inset-x-0 bottom-0 flex items-center justify-end gap-2 border-t border-slate-200 bg-white px-5 py-4">
-                {renderListingActions(selected)}
-              </div>
-            ) : null}
-          </Drawer.Dialog>
-        </Drawer.Content>
-      </Drawer.Backdrop>
+            </Modal.Body>
+            <Modal.Footer>
+              {selected ? renderListingActions(selected) : null}
+              <Button variant="ghost" onClick={() => setSelectedId(null)}>{t("common.close")}</Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
 
       <ShareMarketAddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void onChanged()} onReopenListing={openReopenListing} />
       <ReopenListingDialog listing={reopenListing} onOpenChange={(open) => !open && setReopenListing(null)} onSaved={() => void onChanged()} />

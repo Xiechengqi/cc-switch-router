@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Button, Chip, Drawer } from "@heroui/react";
+import { Button, Chip } from "@heroui/react";
 import {
   ArrowUpRight,
   Check,
@@ -14,13 +14,12 @@ import {
 } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { drawerDialogClassName, subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
+import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import {
   CatalogSeatPreviewList,
   MARKET_SHARE_CARD_GRID_CLASS,
   MarketShareCard,
   listingCardId,
-  shouldOpenMarketShareCard,
 } from "@/components/dashboard/share-market/market-share-card";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -211,13 +210,15 @@ function RentalActions({
   t,
   busy,
   onRelease,
+  showOpenShare = false,
 }: {
   subscription: ShareMarketSubscription;
   t: Translate;
   busy?: boolean;
   onRelease?: () => void;
+  showOpenShare?: boolean;
 }) {
-  const openUrl = subdomainTunnelUrl(subscription.subdomain);
+  const openUrl = showOpenShare ? subdomainTunnelUrl(subscription.subdomain) : "";
   return (
     <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
       {subscription.dailyRateMinor != null ? (
@@ -247,29 +248,6 @@ function RentalActions({
           {t("shareMarket.release")}
         </Button>
       ) : null}
-    </div>
-  );
-}
-
-function RentalIdentity({
-  subscription,
-  statusLabel,
-  online,
-}: {
-  subscription: ShareMarketSubscription;
-  statusLabel: string;
-  online: boolean;
-}) {
-  const { t } = useLocaleText();
-  return (
-    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-      <RentalApps subscription={subscription} />
-      <strong className="min-w-0 truncate text-sm text-slate-900">{subscription.shareName}</strong>
-      <span className="shrink-0 text-xs tabular-nums text-slate-500">#{subscription.seatPosition}</span>
-      <span className={cn("shrink-0 text-[11px] font-medium", online ? "text-emerald-700" : "text-rose-700")}>
-        {online ? t("shareMarket.online") : t("shareMarket.offline")}
-      </span>
-      <span className="min-w-0 truncate text-[11px] text-slate-500">{statusLabel}</span>
     </div>
   );
 }
@@ -378,76 +356,6 @@ export function ShareMarketSubscriptionCard({
         </div>
       </div>
     </section>
-  );
-}
-
-function ActiveRentalRow({
-  subscription,
-  busy,
-  attention,
-  onRelease,
-  onAcceptPrice,
-  onRejectPrice,
-}: {
-  subscription: ShareMarketSubscription;
-  busy: boolean;
-  attention?: boolean;
-  onRelease?: () => void;
-  onAcceptPrice?: () => void;
-  onRejectPrice?: () => void;
-}) {
-  const { locale, t } = useLocaleText();
-  const statusKey = subscriptionStatusKey(subscription.status);
-  const statusLabel = statusKey ? t(statusKey) : subscription.status;
-  const price = rentalPrice(subscription, locale, t);
-  const quota = rentalQuota(subscription, locale, t);
-  const timing = rentalServiceTiming(subscription, locale, t);
-  const owner = t("account.share.provider", { owner: subscription.ownerEmail });
-  const priceOnlyAttention = attention
-    && subscription.priceChange?.status === "pending"
-    && subscription.integrityState === "compatible"
-    && !isAnomalous(subscription.status);
-
-  return (
-    <article
-      aria-busy={busy}
-      title={`${owner} · ${timing}`}
-      className={cn(
-        "grid gap-2 px-3 py-2.5",
-        attention && (priceOnlyAttention
-          ? "rounded-md border border-amber-200 bg-amber-50/40"
-          : "rounded-md border border-rose-200 bg-rose-50/40"),
-      )}
-    >
-      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <RentalIdentity
-            subscription={subscription}
-            statusLabel={statusLabel}
-            online={!!subscription.shareOnline}
-          />
-          <p className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-slate-500">
-            <strong className="font-medium tabular-nums text-slate-800">{price}</strong>
-            <span>{rentalServiceTerm(subscription, t)}</span>
-            <span className="min-w-0 truncate">{quota}</span>
-          </p>
-        </div>
-        <RentalActions subscription={subscription} t={t} busy={busy} onRelease={onRelease} />
-      </div>
-      {attention ? (
-        <>
-          <StatusDetails subscription={subscription} locale={locale} t={t} />
-          <PriceChangeDetails
-            subscription={subscription}
-            locale={locale}
-            t={t}
-            busy={busy}
-            onAcceptPrice={onAcceptPrice}
-            onRejectPrice={onRejectPrice}
-          />
-        </>
-      ) : null}
-    </article>
   );
 }
 
@@ -562,8 +470,7 @@ export function ShareMarketBuyerRentals({
   const [busyId, setBusyId] = React.useState("");
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
-  const [selectedShareId, setSelectedShareId] = React.useState<string | null>(null);
-  const interactionActive = !!busyId || !!action || loadingMore || !!selectedShareId;
+  const interactionActive = !!busyId || !!action || loadingMore;
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
@@ -578,17 +485,6 @@ export function ShareMarketBuyerRentals({
     () => groupActiveRentalsByShare(subscriptions),
     [subscriptions],
   );
-  const selectedGroup = selectedShareId
-    ? activeGroups.find((group) => group.shareId === selectedShareId) || null
-    : null;
-  const selectedListing = selectedGroup
-    ? listingForRentalShare(listings, selectedGroup) as ShareMarketListing | undefined
-    : undefined;
-
-  React.useEffect(() => {
-    if (!selectedShareId) return;
-    if (!activeGroups.some((group) => group.shareId === selectedShareId)) setSelectedShareId(null);
-  }, [activeGroups, selectedShareId]);
 
   const run = async (subscriptionId: string, operation: () => Promise<unknown>) => {
     if (busyId) return;
@@ -657,16 +553,17 @@ export function ShareMarketBuyerRentals({
               const listing = listingForRentalShare(listings, group) as ShareMarketListing | undefined;
               const subscription = group.subscription;
               const actions = rowActions(subscription);
+              const mySeat = listing?.seats.find((seat) => seat.id === subscription.seatId);
               const occupancy = listing
                 ? undefined
                 : t("shareMarket.catalog.seatPosition", { position: subscription.seatPosition });
-              const footer = listing ? (
+              const footer = listing && mySeat ? (
                 <div className="grid content-start">
                   <CatalogSeatPreviewList
                     listing={listing}
-                    seats={listing.seats}
+                    seats={[mySeat]}
                     preferredSeatIds={[subscription.seatId]}
-                    onOpen={() => setSelectedShareId(group.shareId)}
+                    showHint={false}
                   />
                   <div data-no-card-open>
                     <RentalActions subscription={subscription} t={t} busy={busyId === subscription.id} onRelease={actions.onRelease} />
@@ -692,7 +589,6 @@ export function ShareMarketBuyerRentals({
                     attention={group.attention}
                     cardId={listingCardId("rental", group.shareId)}
                     occupancy={occupancy}
-                    onOpen={() => setSelectedShareId(group.shareId)}
                     footer={footer}
                   />
                 );
@@ -702,13 +598,9 @@ export function ShareMarketBuyerRentals({
                   key={group.shareId}
                   id={listingCardId("rental", group.shareId)}
                   className={cn(
-                    "grid min-h-[15rem] min-w-0 cursor-pointer scroll-mt-20 grid-rows-[auto_1fr] gap-2.5 rounded-xl border bg-white p-3 shadow-sm",
+                    "grid min-h-[15rem] min-w-0 scroll-mt-20 grid-rows-[auto_1fr] gap-2.5 rounded-xl border bg-white p-3 shadow-sm",
                     group.attention ? "border-amber-300 ring-1 ring-amber-200" : "border-slate-200",
                   )}
-                  onClick={(event) => {
-                    if (!shouldOpenMarketShareCard(event, null)) return;
-                    setSelectedShareId(group.shareId);
-                  }}
                 >
                   <header className="flex min-w-0 items-center justify-between gap-2">
                     <strong className="min-w-0 truncate font-mono text-xs font-semibold">{subscription.shareName}</strong>
@@ -744,39 +636,6 @@ export function ShareMarketBuyerRentals({
           </>
         ) : <p className="py-1 text-sm text-slate-400">{t("account.share.historyEmpty")}</p>}
       </section>
-
-      <Drawer.Backdrop isOpen={!!selectedGroup} onOpenChange={(open) => !open && setSelectedShareId(null)}>
-        <Drawer.Content placement="right">
-          <Drawer.Dialog className={drawerDialogClassName}>
-            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200" />
-            <Drawer.Header>
-              <div className="min-w-0 pr-10">
-                <Drawer.Heading className="truncate text-base">{selectedGroup?.subscription.shareName}</Drawer.Heading>
-              </div>
-            </Drawer.Header>
-            <Drawer.Body className="overflow-y-auto pb-28">
-              {selectedGroup ? (
-                <div className="grid gap-4">
-                  <ActiveRentalRow
-                    subscription={selectedGroup.subscription}
-                    busy={busyId === selectedGroup.subscription.id}
-                    attention={selectedGroup.attention}
-                    {...rowActions(selectedGroup.subscription)}
-                  />
-                  {selectedListing ? (
-                    <p className="text-xs text-slate-500">
-                      {t("shareMarket.catalog.occupancy", {
-                        idle: selectedListing.seats.filter((seat) => seat.status === "available" && !seat.readOnly).length,
-                        total: selectedListing.seats.length,
-                      })}
-                    </p>
-                  ) : null}
-                </div>
-              ) : null}
-            </Drawer.Body>
-          </Drawer.Dialog>
-        </Drawer.Content>
-      </Drawer.Backdrop>
 
       <ConfirmAlertDialog
         open={!!action}
