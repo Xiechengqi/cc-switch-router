@@ -1521,7 +1521,7 @@ export function ShareMarketOwnerWorkspace({
   };
 
   const addShareButton = (variant: "primary" | "outline") => (
-    <Button size="sm" variant={variant} onClick={() => setAddOpen(true)}>
+    <Button size="sm" variant={variant} className="h-9 shrink-0" onClick={() => setAddOpen(true)}>
       <Plus className="h-4 w-4" />
       {t("shareMarket.addShare")}
     </Button>
@@ -1542,15 +1542,6 @@ export function ShareMarketOwnerWorkspace({
         </div>
       ) : null}
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
-      {listings.length ? (
-        <MarketListingFilters
-          listings={listings}
-          family={family}
-          query={query}
-          onFamilyChange={setFamily}
-          onQueryChange={setQuery}
-        />
-      ) : null}
 
       {loading && !listings.length ? (
         <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-500">
@@ -1559,14 +1550,21 @@ export function ShareMarketOwnerWorkspace({
         </div>
       ) : (
         <>
-          <section className="grid gap-2" aria-labelledby="share-listings-active">
-            <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-              <h3 id="share-listings-active" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          <MarketListingFilters
+            listings={listings}
+            family={family}
+            query={query}
+            onFamilyChange={setFamily}
+            onQueryChange={setQuery}
+            leading={(
+              <h3 id="share-listings-active" className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-slate-500">
                 {t("shareMarket.listings.active")}
                 {active.length ? <span className="ml-1.5 tabular-nums text-slate-400">{active.length}</span> : null}
               </h3>
-              {addShareButton(hasListings ? "outline" : "primary")}
-            </div>
+            )}
+            trailing={addShareButton(hasListings ? "outline" : "primary")}
+          />
+          <section className="grid gap-2" aria-labelledby="share-listings-active">
             {active.length ? (
               <div className={MARKET_SHARE_CARD_GRID_CLASS}>
                 {active.map((listing) => renderListingCard(listing))}

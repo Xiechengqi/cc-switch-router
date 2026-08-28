@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode } from "react";
 import { Search, X } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { ShareMarketListing, ShareMarketProviderFamily } from "@/lib/types";
@@ -15,18 +16,23 @@ export function MarketListingFilters({
   query,
   onFamilyChange,
   onQueryChange,
+  leading,
+  trailing,
 }: {
   listings: ShareMarketListing[];
   family: ShareMarketProviderFamily | "all";
   query: string;
   onFamilyChange: (family: ShareMarketProviderFamily | "all") => void;
   onQueryChange: (query: string) => void;
+  leading?: ReactNode;
+  trailing?: ReactNode;
 }) {
   const { t } = useLocaleText();
   const familyTabs = listingFamilyTabs(listings);
-  if (!familyTabs.length && !query) return null;
+  if (!familyTabs.length && !query && !leading && !trailing) return null;
   return (
     <div className="flex min-w-0 items-center gap-2">
+      {leading}
       <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto" role="tablist" aria-label={t("shareMarket.catalog.familyFilter")}>
         {familyTabs.map((item) => {
           const selectedFamily = family === item.value;
@@ -71,6 +77,7 @@ export function MarketListingFilters({
           </button>
         ) : null}
       </label>
+      {trailing ? <div className="shrink-0">{trailing}</div> : null}
     </div>
   );
 }
