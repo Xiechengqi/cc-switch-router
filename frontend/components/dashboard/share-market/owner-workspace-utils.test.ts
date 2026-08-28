@@ -20,6 +20,7 @@ import {
   listingLiveSeatCount,
   listingLiveSeats,
   listingLowestIdleSeat,
+  listingOccupancyCounts,
   needsOwnedSeatAttention,
   ownedShareBlockedReasonKey,
   ownedShareReopenListingId,
@@ -190,6 +191,17 @@ test("partitions grant_failed into attention and released out of live seats", ()
 function occupiedSeat() {
   return rentedSeat("rent", "occupied", { subscriptionStatus: "active_free" });
 }
+
+test("occupancy counts use live seats and ignore completed history", () => {
+  const idle = rentedSeat("idle", "available", { position: 1 });
+  const occupied = rentedSeat("rent", "occupied", { position: 2, subscriptionStatus: "active_free" });
+  const failed = rentedSeat("failed", "occupied", { position: 3, subscriptionStatus: "grant_failed" });
+  const released = rentedSeat("done", "retired", { position: 4, readOnly: true, subscriptionStatus: "released" });
+  assert.deepEqual(
+    listingOccupancyCounts(listing("live", "active", [idle, occupied, failed, released])),
+    { idle: 1, remaining: 1, attention: 1, total: 2 },
+  );
+});
 
 test("lowest idle price never falls back to occupied seats", () => {
   const idle = rentedSeat("idle", "available", {

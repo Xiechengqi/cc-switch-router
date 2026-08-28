@@ -172,6 +172,18 @@ export function listingLiveSeatCount(
   return listing.seats.filter((seat) => !isCompletedSeat(seat)).length;
 }
 
+export function listingOccupancyCounts(
+  listing: { seats: Array<Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription">> },
+) {
+  const live = listingLiveSeats(listing);
+  return {
+    idle: listingIdleSeats(listing).length,
+    remaining: listingClosedRentalSeats(listing).length,
+    attention: listingAttentionSeats(listing).length,
+    total: live.length,
+  };
+}
+
 export function listingBlockedFromReopen(
   listing: Pick<ShareMarketListing, "status" | "canReopen">,
 ) {

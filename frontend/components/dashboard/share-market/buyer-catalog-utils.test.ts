@@ -57,7 +57,7 @@ test("provider panel prefers a capability with public account status", () => {
     quota: {
       status: "ok",
       plan: "Plus",
-      tiers: [{ label: "weekly", utilization: 0.55 }],
+      tiers: [{ label: "weekly", utilization: 55 }],
     },
   });
   assert.equal(
@@ -79,7 +79,7 @@ test("provider panel reproduces quota, provider identity and enabled app model r
           quota: {
             status: "ok",
             plan: "Plus",
-            tiers: [{ label: "weekly", utilization: 0.55 }],
+            tiers: [{ label: "weekly", utilization: 55 }],
           },
         }),
         capability({

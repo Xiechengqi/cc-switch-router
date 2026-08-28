@@ -3,7 +3,7 @@
 import { Button, toast } from "@heroui/react";
 import { ArrowLeft, Copy, ExternalLink, Globe2, Lock, X } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
-import { chatRoomUrl, maskEmail } from "@/components/chat/client-chat-helpers";
+import { chatRoomUrl } from "@/components/chat/client-chat-helpers";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_CLIENTS_PATH, isClientsRoute } from "@/lib/dashboard-nav";
@@ -67,7 +67,7 @@ export function ClientChatRoomHeader({
             )}
             {ownerEmail ? (
               <span>
-                {t("chat.owner")}: {maskEmail(ownerEmail)}
+                {t("chat.owner")}: {ownerEmail}
               </span>
             ) : null}
             {typeof onlineRate === "number" ? (

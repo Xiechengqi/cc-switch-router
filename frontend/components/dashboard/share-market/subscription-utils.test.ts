@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  groupActiveRentalsByShare,
   isHistorySubscription,
+  listingForRentalShare,
   needsRentalAttention,
   partitionShareMarketSubscriptions,
   sortShareMarketSubscriptions,
@@ -76,5 +78,22 @@ test("sorts failed statuses ahead of healthy rentals", () => {
   assert.deepEqual(
     [healthy, failed].sort(sortShareMarketSubscriptions).map((item) => item.id),
     ["failed", "live"],
+  );
+});
+
+test("active rentals group by share and ignore history", () => {
+  const live = subscription("live", "active_free", { shareId: "share-a", listingId: "listing-a" });
+  const failed = subscription("failed", "grant_failed", { shareId: "share-b", listingId: "listing-b" });
+  const history = subscription("done", "released", { shareId: "share-c", listingId: "listing-c" });
+  const groups = groupActiveRentalsByShare([history, live, failed]);
+  assert.deepEqual(groups.map((item) => item.shareId), ["share-b", "share-a"]);
+  assert.equal(groups[0]?.attention, true);
+  assert.equal(groups[1]?.attention, false);
+  assert.equal(
+    listingForRentalShare(
+      [{ id: "listing-a", shareId: "share-a" }, { id: "listing-b", shareId: "share-b" }],
+      groups[1]!,
+    )?.id,
+    "listing-a",
   );
 });

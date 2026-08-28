@@ -84,15 +84,6 @@ export function initialsForLabel(label: string) {
   return (parts[0].charAt(0) + parts[1].charAt(0)).toUpperCase();
 }
 
-export function maskEmail(email?: string | null) {
-  const value = String(email || "").trim();
-  if (!value || !value.includes("@")) return "-";
-  const [local, domain] = value.split("@");
-  if (!local || !domain) return value;
-  const visible = local.slice(0, Math.min(2, local.length));
-  return `${visible}***@${domain}`;
-}
-
 export function sortRooms(rooms: ClientChatRoom[]) {
   return [...rooms].sort((left, right) => {
     const unreadDelta = right.unreadCount - left.unreadCount;

@@ -63,6 +63,50 @@ export function partitionShareMarketSubscriptions(subscriptions: ShareMarketSubs
   return { attention, active, history };
 }
 
+export type ActiveRentalShareGroup = {
+  shareId: string;
+  listingId?: string;
+  subscription: ShareMarketSubscription;
+  attention: boolean;
+};
+
+export function groupActiveRentalsByShare(
+  subscriptions: ShareMarketSubscription[],
+): ActiveRentalShareGroup[] {
+  const { attention, active } = partitionShareMarketSubscriptions(subscriptions);
+  const groups = new Map<string, ActiveRentalShareGroup>();
+  for (const subscription of [...attention, ...active]) {
+    const existing = groups.get(subscription.shareId);
+    if (!existing) {
+      groups.set(subscription.shareId, {
+        shareId: subscription.shareId,
+        listingId: subscription.listingId,
+        subscription,
+        attention: needsRentalAttention(subscription),
+      });
+      continue;
+    }
+    if (sortShareMarketSubscriptions(subscription, existing.subscription) < 0) {
+      existing.subscription = subscription;
+      existing.listingId = subscription.listingId;
+    }
+    existing.attention = existing.attention || needsRentalAttention(subscription);
+  }
+  return [...groups.values()].sort((left, right) =>
+    Number(right.attention) - Number(left.attention)
+    || sortShareMarketSubscriptions(left.subscription, right.subscription),
+  );
+}
+
+export function listingForRentalShare(
+  listings: Array<{ shareId: string; id: string }>,
+  group: Pick<ActiveRentalShareGroup, "shareId" | "listingId">,
+) {
+  return listings.find((listing) =>
+    (group.listingId && listing.id === group.listingId) || listing.shareId === group.shareId,
+  );
+}
+
 export function mergeShareMarketSubscriptionPage(
   current: ShareMarketSubscription[],
   incoming: ShareMarketSubscription[],

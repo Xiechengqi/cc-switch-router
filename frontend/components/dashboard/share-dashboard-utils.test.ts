@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  formatCompactQuotaTier,
   providerAccountIdentity,
   providerAccountLevel,
   providerAccountTierLabel,
+  providerQuotaStatusLine,
+  quotaSummary,
   recentSharePerformance,
   shareAppProviderRuntime,
+  utilizationPercentForDisplay,
 } from "@/components/dashboard/share-dashboard-utils";
 import type { ShareUpstreamProvider } from "@/lib/types";
 import type { ShareRequestLog } from "@/lib/types";
@@ -103,4 +107,61 @@ test("TPS retains generation windows at the reliability boundary", () => {
 
   assert.equal(performance.tpsSampleCount, 1);
   assert.equal(performance.averageTps, 100);
+});
+
+test("share quota utilization is a 0-100 percent, so 1 stays 1%", () => {
+  assert.equal(utilizationPercentForDisplay(1), 1);
+  assert.equal(utilizationPercentForDisplay(55), 55);
+  assert.equal(utilizationPercentForDisplay(100), 100);
+  assert.equal(utilizationPercentForDisplay(1.4), 1);
+  assert.equal(utilizationPercentForDisplay(0.1, 1), 0.1);
+  assert.equal(formatCompactQuotaTier({ label: "1w", utilization: 1 }), "7d 1%");
+  assert.equal(formatCompactQuotaTier({ label: "1w", utilization: 55 }), "7d 55%");
+  assert.equal(formatCompactQuotaTier({ label: "1w", utilization: 100 }), "7d 100%");
+});
+
+test("ChatGPT provider cards keep a 1% weekly window instead of scaling it to 100%", () => {
+  const now = Date.parse("2026-08-28T00:00:00.000Z");
+  const originalNow = Date.now;
+  Date.now = () => now;
+  try {
+    const runtime: ShareUpstreamProvider = {
+      kind: "codex_oauth",
+      app: "codex",
+      providerName: "OpenAI Official",
+      providerType: "codex_oauth",
+      quota: {
+        status: "ok",
+        plan: "ChatGPT Pro 20x",
+        subscriptionPeriodEnd: "2026-09-24T00:00:00.000Z",
+        tiers: [{
+          label: "1w",
+          utilization: 1,
+          resetsAt: "2026-09-03T12:00:00.000Z",
+        }],
+      },
+    };
+    const line = quotaSummary(runtime, "zh-CN");
+    assert.match(line, /ChatGPT Pro 20x/);
+    assert.match(line, /7d 1%/);
+    assert.doesNotMatch(line, /7d 100%/);
+    assert.equal(providerQuotaStatusLine(runtime, "zh-CN"), line);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("Ollama display-only windows keep one-decimal percents without a second scale", () => {
+  const line = quotaSummary({
+    kind: "official_oauth",
+    app: "codex",
+    providerName: "Ollama Cloud",
+    providerType: "ollama_cloud",
+    quota: {
+      status: "ok",
+      plan: "free",
+      tiers: [{ label: "weekly", utilization: 0.1 }],
+    },
+  }, "en");
+  assert.match(line, /Weekly 0\.1%/);
 });

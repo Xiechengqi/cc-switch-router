@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Button, Chip } from "@heroui/react";
+import { Button, Chip, Drawer } from "@heroui/react";
 import {
   ArrowUpRight,
   Check,
@@ -14,7 +14,13 @@ import {
 } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
+import { drawerDialogClassName, subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
+import {
+  MARKET_SHARE_CARD_GRID_CLASS,
+  MarketShareCard,
+  listingCardId,
+  shouldOpenMarketShareCard,
+} from "@/components/dashboard/share-market/market-share-card";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   acceptShareMarketPriceChange,
@@ -27,7 +33,7 @@ import {
 } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
-import type { ShareMarketSubscription } from "@/lib/types";
+import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
   formatTokenLimit,
@@ -40,6 +46,8 @@ import {
   subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
 import {
+  groupActiveRentalsByShare,
+  listingForRentalShare,
   partitionShareMarketSubscriptions,
   sortShareMarketSubscriptions,
 } from "@/components/dashboard/share-market/subscription-utils";
@@ -530,6 +538,7 @@ function HistoryTable({
 
 export function ShareMarketBuyerRentals({
   subscriptions,
+  listings = [],
   loading,
   onChanged,
   onInteractionChange,
@@ -539,6 +548,7 @@ export function ShareMarketBuyerRentals({
   showHeading = true,
 }: {
   subscriptions: ShareMarketSubscription[];
+  listings?: ShareMarketListing[];
   loading: boolean;
   onChanged: () => Promise<void> | void;
   onInteractionChange?: (active: boolean) => void;
@@ -551,17 +561,33 @@ export function ShareMarketBuyerRentals({
   const [busyId, setBusyId] = React.useState("");
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
-  const interactionActive = !!busyId || !!action || loadingMore;
+  const [selectedShareId, setSelectedShareId] = React.useState<string | null>(null);
+  const interactionActive = !!busyId || !!action || loadingMore || !!selectedShareId;
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
     return () => onInteractionChange?.(false);
   }, [interactionActive, onInteractionChange]);
 
-  const { attention, active, history } = React.useMemo(
+  const { history } = React.useMemo(
     () => partitionShareMarketSubscriptions(subscriptions),
     [subscriptions],
   );
+  const activeGroups = React.useMemo(
+    () => groupActiveRentalsByShare(subscriptions),
+    [subscriptions],
+  );
+  const selectedGroup = selectedShareId
+    ? activeGroups.find((group) => group.shareId === selectedShareId) || null
+    : null;
+  const selectedListing = selectedGroup
+    ? listingForRentalShare(listings, selectedGroup) as ShareMarketListing | undefined
+    : undefined;
+
+  React.useEffect(() => {
+    if (!selectedShareId) return;
+    if (!activeGroups.some((group) => group.shareId === selectedShareId)) setSelectedShareId(null);
+  }, [activeGroups, selectedShareId]);
 
   const run = async (subscriptionId: string, operation: () => Promise<unknown>) => {
     if (busyId) return;
@@ -619,51 +645,72 @@ export function ShareMarketBuyerRentals({
       ) : null}
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
 
-      {attention.length ? (
-        <section className="grid gap-2" aria-labelledby="share-rentals-attention">
-          <h3 id="share-rentals-attention" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            {t("shareMarket.rentals.attention")}
-            <span className="ml-1.5 tabular-nums text-slate-400">{attention.length}</span>
-          </h3>
-          <div className="grid gap-2">
-            {attention.map((subscription) => (
-              <ActiveRentalRow
-                key={subscription.id}
-                subscription={subscription}
-                busy={busyId === subscription.id}
-                attention
-                {...rowActions(subscription)}
-              />
-            ))}
+      <section className="grid gap-2" aria-labelledby="share-rentals-active">
+        <h3 id="share-rentals-active" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          {t("account.share.active")}
+          {activeGroups.length ? <span className="ml-1.5 tabular-nums text-slate-400">{activeGroups.length}</span> : null}
+        </h3>
+        {activeGroups.length ? (
+          <div className={MARKET_SHARE_CARD_GRID_CLASS}>
+            {activeGroups.map((group) => {
+              const listing = listingForRentalShare(listings, group) as ShareMarketListing | undefined;
+              const subscription = group.subscription;
+              const actions = rowActions(subscription);
+              const occupancy = t("shareMarket.catalog.seatPosition", { position: subscription.seatPosition });
+              const footer = (
+                <div className="grid content-start gap-1.5 border-t border-slate-100 pt-1.5">
+                  <p className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 px-1.5 text-xs text-slate-500">
+                    <strong className="font-medium tabular-nums text-slate-800">{rentalPrice(subscription, locale, t)}</strong>
+                    <span>{rentalServiceTerm(subscription, t)}</span>
+                    <span className="min-w-0 truncate">{rentalQuota(subscription, locale, t)}</span>
+                  </p>
+                  <div data-no-card-open>
+                    <RentalActions subscription={subscription} t={t} busy={busyId === subscription.id} onRelease={actions.onRelease} />
+                  </div>
+                </div>
+              );
+              if (listing) {
+                return (
+                  <MarketShareCard
+                    key={group.shareId}
+                    listing={listing}
+                    attention={group.attention}
+                    cardId={listingCardId("rental", group.shareId)}
+                    occupancy={occupancy}
+                    onOpen={() => setSelectedShareId(group.shareId)}
+                    footer={footer}
+                  />
+                );
+              }
+              return (
+                <article
+                  key={group.shareId}
+                  id={listingCardId("rental", group.shareId)}
+                  className={cn(
+                    "grid min-h-[15rem] min-w-0 cursor-pointer scroll-mt-20 grid-rows-[auto_1fr] gap-2.5 rounded-xl border bg-white p-3 shadow-sm",
+                    group.attention ? "border-amber-300 ring-1 ring-amber-200" : "border-slate-200",
+                  )}
+                  onClick={(event) => {
+                    if (!shouldOpenMarketShareCard(event, null)) return;
+                    setSelectedShareId(group.shareId);
+                  }}
+                >
+                  <header className="flex min-w-0 items-center justify-between gap-2">
+                    <strong className="min-w-0 truncate font-mono text-xs font-semibold">{subscription.shareName}</strong>
+                    <span className="shrink-0 text-[11px] font-semibold tabular-nums text-slate-700">{occupancy}</span>
+                  </header>
+                  {footer}
+                </article>
+              );
+            })}
           </div>
-        </section>
-      ) : null}
-
-      {active.length || !attention.length ? (
-        <section className="grid gap-2" aria-labelledby="share-rentals-active">
-          <h3 id="share-rentals-active" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            {t("account.share.active")}
-            {active.length ? <span className="ml-1.5 tabular-nums text-slate-400">{active.length}</span> : null}
-          </h3>
-          {active.length ? (
-            <div className="divide-y divide-slate-100 rounded-md border border-slate-200 bg-white">
-              {active.map((subscription) => (
-                <ActiveRentalRow
-                  key={subscription.id}
-                  subscription={subscription}
-                  busy={busyId === subscription.id}
-                  {...rowActions(subscription)}
-                />
-              ))}
-            </div>
-          ) : (
-            <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
-              <span>{t("account.share.userEmpty")}</span>
-              <Link href={shareMarketHref()} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">{t("account.share.openMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link>
-            </div>
-          )}
-        </section>
-      ) : null}
+        ) : (
+          <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+            <span>{t("account.share.userEmpty")}</span>
+            <Link href={shareMarketHref()} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">{t("account.share.openMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link>
+          </div>
+        )}
+      </section>
 
       <section className="grid gap-2 border-t border-slate-200 pt-5" aria-labelledby="share-rentals-history">
         <h3 id="share-rentals-history" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -682,6 +729,39 @@ export function ShareMarketBuyerRentals({
           </>
         ) : <p className="py-1 text-sm text-slate-400">{t("account.share.historyEmpty")}</p>}
       </section>
+
+      <Drawer.Backdrop isOpen={!!selectedGroup} onOpenChange={(open) => !open && setSelectedShareId(null)}>
+        <Drawer.Content placement="right">
+          <Drawer.Dialog className={drawerDialogClassName}>
+            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200" />
+            <Drawer.Header>
+              <div className="min-w-0 pr-10">
+                <Drawer.Heading className="truncate text-base">{selectedGroup?.subscription.shareName}</Drawer.Heading>
+              </div>
+            </Drawer.Header>
+            <Drawer.Body className="overflow-y-auto pb-28">
+              {selectedGroup ? (
+                <div className="grid gap-4">
+                  <ActiveRentalRow
+                    subscription={selectedGroup.subscription}
+                    busy={busyId === selectedGroup.subscription.id}
+                    attention={selectedGroup.attention}
+                    {...rowActions(selectedGroup.subscription)}
+                  />
+                  {selectedListing ? (
+                    <p className="text-xs text-slate-500">
+                      {t("shareMarket.catalog.occupancy", {
+                        idle: selectedListing.seats.filter((seat) => seat.status === "available" && !seat.readOnly).length,
+                        total: selectedListing.seats.length,
+                      })}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+            </Drawer.Body>
+          </Drawer.Dialog>
+        </Drawer.Content>
+      </Drawer.Backdrop>
 
       <ConfirmAlertDialog
         open={!!action}

@@ -882,7 +882,6 @@ export function formatCompactQuotaTier(
   },
   locale: AppLocale = "en",
   maximumUtilizationFractionDigits = 0,
-  utilizationAlreadyPercent = false,
 ) {
   const label = normalizeCompactTierLabel(tier.label || tier.name, locale);
   const utilization =
@@ -890,7 +889,6 @@ export function formatCompactQuotaTier(
       ? `${utilizationPercentForDisplay(
           tier.utilization,
           maximumUtilizationFractionDigits,
-          utilizationAlreadyPercent,
         )}%`
       : "";
   const countdown = countdownStr(tier.resetsAt);
@@ -1032,14 +1030,12 @@ export function resolveShareAppRuntime(share: ShareView, app: CoreShareApp) {
 export function utilizationPercentForDisplay(
   value: number,
   maximumFractionDigits = 0,
-  valueAlreadyPercent = false,
 ) {
+  // Share descriptor utilization is already 0-100. Do not treat 1 as 100%.
   if (!Number.isFinite(value)) return 0;
-  const percent =
-    !valueAlreadyPercent && value >= 0 && value <= 1 ? value * 100 : value;
   const digits = Math.max(0, Math.min(6, Math.floor(maximumFractionDigits)));
   const factor = 10 ** digits;
-  return Math.round(percent * factor) / factor;
+  return Math.round(value * factor) / factor;
 }
 
 function ollamaQuotaTierLabel(label: string, locale: AppLocale) {
@@ -1089,7 +1085,6 @@ export function quotaSummary(
         { ...tier, label: ollamaQuotaTierLabel(String(tier.label), locale) },
         locale,
         1,
-        true,
       );
     })
     .filter(Boolean)

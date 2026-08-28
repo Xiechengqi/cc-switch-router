@@ -12530,6 +12530,21 @@ mod tests {
     }
 
     #[test]
+    fn installer_pins_and_verifies_router_selected_server_release() {
+        let installer = include_str!("../install-client.sh");
+        assert!(installer.contains("__CC_SWITCH_SERVER_RELEASE__"));
+        assert!(installer.contains("releases/download/${SERVER_RELEASE}"));
+        assert!(installer.contains("x86_64|amd64"));
+        assert!(installer.contains("aarch64|arm64"));
+        assert!(installer.contains("${asset}.sha256"));
+        assert!(installer.contains("expected_checksum="));
+        assert!(installer.contains("actual_checksum_output=$(sha256sum"));
+        assert!(installer.contains("version --json"));
+        assert!(installer.contains("does not match release ${SERVER_RELEASE}"));
+        assert!(!installer.contains("releases/download/latest/cc-switch-server"));
+    }
+
+    #[test]
     fn classify_cleanup_failure_maps_known_cases() {
         assert_eq!(
             classify_cleanup_failure(&AppError::ServiceUnavailable(

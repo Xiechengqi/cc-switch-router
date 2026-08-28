@@ -781,6 +781,10 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/share-market/me/listings", get(list_my_listings))
         .route(
+            "/v1/share-market/me/rented-listings",
+            get(list_my_rented_listings),
+        )
+        .route(
             "/v1/share-market/me/subscriptions",
             get(list_my_subscriptions),
         )
@@ -3782,6 +3786,7 @@ enum ShareMarketCatalogScope {
     Public,
     Owner,
     Renter,
+    RenterListings,
 }
 
 fn catalog_visibility_predicate(scope: ShareMarketCatalogScope, share_alias: &str) -> String {
@@ -3802,6 +3807,14 @@ fn catalog_visibility_predicate(scope: ShareMarketCatalogScope, share_alias: &st
         ShareMarketCatalogScope::Public => format!("?1 = ?1 AND ({public_listing})"),
         ShareMarketCatalogScope::Owner => "listing.owner_user_id = ?1".into(),
         ShareMarketCatalogScope::Renter => "?1 = ?1 AND 0".into(),
+        ShareMarketCatalogScope::RenterListings => format!(
+            "EXISTS (
+                 SELECT 1 FROM share_market_subscriptions viewer_sub
+                 WHERE viewer_sub.listing_id = listing.id
+                   AND viewer_sub.renter_user_id = ?1
+                   AND viewer_sub.status != 'released'
+             )"
+        ),
     }
 }
 
@@ -4004,6 +4017,28 @@ fn catalog_subscription_records(
             "sub.id IN (SELECT id FROM referenced_subscriptions)",
         ),
         ShareMarketCatalogScope::Renter => (String::new(), "?1 != '' AND sub.renter_user_id = ?1"),
+        ShareMarketCatalogScope::RenterListings => (
+            format!(
+                "WITH visible_listings AS (
+            SELECT listing.id
+            FROM share_market_listings listing
+            LEFT JOIN shares share ON share.share_id = listing.share_id
+            WHERE listing.deleted_at IS NULL
+              AND ({visibility})
+         ), referenced_subscriptions AS (
+            SELECT seat.current_subscription_id AS id
+            FROM share_market_seats seat
+            WHERE seat.listing_id IN (SELECT id FROM visible_listings)
+              AND seat.current_subscription_id IS NOT NULL
+            UNION
+            SELECT seat.retired_subscription_id AS id
+            FROM share_market_seats seat
+            WHERE seat.listing_id IN (SELECT id FROM visible_listings)
+              AND seat.retired_subscription_id IS NOT NULL
+         )"
+            ),
+            "sub.id IN (SELECT id FROM referenced_subscriptions)",
+        ),
     };
     let sql = format!(
         "{cte}
@@ -4672,7 +4707,6 @@ fn public_catalog_seat_visible(seat: &SeatView) -> bool {
 }
 
 fn redact_public_subscription(subscription: &mut SubscriptionView) {
-    subscription.renter_email.clear();
     subscription.contacts.clear();
     subscription.payment_method_kinds.clear();
     subscription.can_release = false;
@@ -5318,11 +5352,7 @@ impl AppStore {
             .into_iter()
             .collect::<Vec<_>>();
         let mut seats_by_listing = catalog_seats(&conn, viewer_user_id, scope)?;
-        let subscription_records = if scope == ShareMarketCatalogScope::Public {
-            HashMap::new()
-        } else {
-            catalog_subscription_records(&conn, viewer_user_id, scope)?
-        };
+        let subscription_records = catalog_subscription_records(&conn, viewer_user_id, scope)?;
         let related_user_ids = listing_rows
             .iter()
             .map(|row| row.4.clone())
@@ -5752,6 +5782,28 @@ async fn list_my_listings(
             Some(&session),
             &active_subdomains,
             ShareMarketCatalogScope::Owner,
+        )
+        .await?;
+    private_etag_json(
+        &headers,
+        &ShareMarketOwnedListings {
+            listings: catalog.listings,
+        },
+    )
+}
+
+async fn list_my_rented_listings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let active_subdomains = state.proxy.active_subdomains().await;
+    let catalog = state
+        .store
+        .share_market_catalog_with_scope(
+            Some(&session),
+            &active_subdomains,
+            ShareMarketCatalogScope::RenterListings,
         )
         .await?;
     private_etag_json(
@@ -14143,9 +14195,15 @@ mod tests {
         assert_eq!(idle.status, SEAT_AVAILABLE);
         assert!(idle.subscription.is_none());
         assert_ne!(rented.status, SEAT_AVAILABLE);
-        assert!(rented.subscription.is_none());
+        assert_eq!(
+            rented
+                .subscription
+                .as_ref()
+                .map(|subscription| subscription.renter_email.as_str()),
+            Some("renter-secret@example.com")
+        );
         let public_json = serde_json::to_string(&catalog).expect("encode public catalog");
-        assert!(!public_json.contains("renter-secret@example.com"));
+        assert!(public_json.contains("renter-secret@example.com"));
         assert!(!public_json.contains("mySubscriptions"));
     }
 
@@ -14789,11 +14847,14 @@ mod tests {
             .expect("public scope keeps the Share including occupied seats");
         assert_eq!(renter_share.seats.len(), 2);
         assert!(renter_share.seats.iter().all(|seat| !seat.can_rent));
-        assert!(
+        assert_eq!(
             renter_share
                 .seats
                 .iter()
-                .all(|seat| seat.subscription.is_none())
+                .find(|seat| seat.id == seat_a)
+                .and_then(|seat| seat.subscription.as_ref())
+                .map(|subscription| subscription.renter_email.as_str()),
+            Some(renter.email.as_str())
         );
         retain_public_catalog(&mut public);
         let mut public_share_ids = public
@@ -14829,6 +14890,43 @@ mod tests {
         assert!(rented.listings.is_empty());
         assert_eq!(rented.my_subscriptions.len(), 1);
         assert_eq!(rented.my_subscriptions[0].share_id, "share-scope-a");
+
+        store
+            .share_market_close_listing(&owner_a, &listing_a)
+            .await
+            .expect("close rented listing");
+        let renter_listings = store
+            .share_market_catalog_with_scope(
+                Some(&renter),
+                &active_subdomains,
+                ShareMarketCatalogScope::RenterListings,
+            )
+            .await
+            .expect("read renter listings");
+        assert_eq!(renter_listings.listings.len(), 1);
+        assert_eq!(renter_listings.listings[0].share_id, "share-scope-a");
+        assert_eq!(renter_listings.listings[0].status, "closed");
+        let own_seat = renter_listings.listings[0]
+            .seats
+            .iter()
+            .find(|seat| seat.id == seat_a)
+            .expect("renter still sees the rented seat");
+        assert_eq!(
+            own_seat
+                .subscription
+                .as_ref()
+                .map(|item| item.renter_email.as_str()),
+            Some(renter.email.as_str())
+        );
+        let outsider_listings = store
+            .share_market_catalog_with_scope(
+                Some(&owner_b),
+                &active_subdomains,
+                ShareMarketCatalogScope::RenterListings,
+            )
+            .await
+            .expect("read outsider renter listings");
+        assert!(outsider_listings.listings.is_empty());
     }
 
     async fn subscription_status(store: &AppStore, subscription_id: &str) -> String {

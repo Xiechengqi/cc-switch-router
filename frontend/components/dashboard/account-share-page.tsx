@@ -18,6 +18,7 @@ import { mergeShareMarketSubscriptionPage } from "@/components/dashboard/share-m
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getShareMarketOwnedListings,
+  getShareMarketRentedListings,
   getShareMarketSubscriptions,
 } from "@/lib/api";
 import {
@@ -103,6 +104,7 @@ export function AccountSharePage() {
   const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
   const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
   const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
+  const [rentedListings, setRentedListings] = React.useState<ShareMarketListing[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [failedActorKey, setFailedActorKey] = React.useState<string | null>(null);
@@ -142,9 +144,10 @@ export function AccountSharePage() {
     }
     if (!skipIfBusy) setError("");
     try {
-      const [nextSubscriptions, nextListings] = await Promise.all([
+      const [nextSubscriptions, nextListings, nextRented] = await Promise.all([
         getShareMarketSubscriptions(controller.signal),
         getShareMarketOwnedListings(controller.signal),
+        getShareMarketRentedListings(controller.signal),
       ]);
       if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
       setSubscriptions((current) => silent
@@ -155,6 +158,7 @@ export function AccountSharePage() {
         setSubscriptionCursor(nextSubscriptions.nextCursor || null);
       }
       setOwnedListings(nextListings.listings);
+      setRentedListings(nextRented.listings);
       setLoadedActorKey(requestedActorKey);
       setFailedActorKey(null);
     } catch (reason) {
@@ -250,6 +254,7 @@ export function AccountSharePage() {
         <ShareMarketBuyerRentals
           key={`user:${actorKey}`}
           subscriptions={subscriptions}
+          listings={rentedListings}
           loading={false}
           onChanged={() => load({ silent: true })}
           onInteractionChange={setPausePolling}
