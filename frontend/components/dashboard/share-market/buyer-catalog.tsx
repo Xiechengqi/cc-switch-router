@@ -11,11 +11,9 @@ import {
   LogIn,
   MessageCircle,
   RefreshCw,
-  Search,
   Send,
   ShoppingCart,
   UserRound,
-  X,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
@@ -54,7 +52,6 @@ import { formatTokenMillions } from "@/lib/token-units";
 import { cn } from "@/lib/utils";
 import {
   PROVIDER_FAMILY_KEYS,
-  PROVIDER_FAMILY_ORDER,
   activeSubscriptionForShare,
   formatSeatPrice,
   formatTokenLimit,
@@ -65,9 +62,11 @@ import {
   shareMarketMutationError,
 } from "@/components/dashboard/share-market/market-utils";
 import {
+  filterMarketListings,
   initialCatalogSeat,
   preserveCatalogSeat,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
+import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
 type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat };
@@ -227,33 +226,9 @@ export function ShareMarketBuyerCatalog({
   }, [rentTarget]);
 
   const listings = React.useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase();
-    return catalog.listings
-      .filter((listing) => family === "all" || listing.providerFamily === family || listing.providerFamilies.includes(family))
-      .filter((listing) => {
-        if (!needle) return true;
-        return [
-          listing.shareName,
-          listing.subdomain,
-          listing.ownerEmail,
-          ...listing.supportedApps,
-          ...listing.appCapabilities.flatMap((item) => [item.providerName, item.providerType, item.subscriptionLevel, item.upstreamModel, ...(item.models ?? [])]),
-        ].filter(Boolean).join(" ").toLocaleLowerCase().includes(needle);
-      })
+    return filterMarketListings(catalog.listings, family, query)
       .sort((left, right) => listingCreatedAtMs(right) - listingCreatedAtMs(left) || right.id.localeCompare(left.id));
   }, [catalog.listings, family, query]);
-
-  const familyTabs = React.useMemo(
-    () =>
-      PROVIDER_FAMILY_ORDER.map((value) => ({
-        value,
-        idle: catalog.listings.reduce((sum, listing) => {
-          if (listing.providerFamily !== value && !listing.providerFamilies.includes(value)) return sum;
-          return sum + listingIdleCount(listing);
-        }, 0),
-      })).filter((item) => catalog.listings.some((listing) => listing.providerFamily === item.value || listing.providerFamilies.includes(item.value))),
-    [catalog.listings],
-  );
 
   React.useEffect(() => {
     if (!selected) return;
@@ -356,37 +331,13 @@ export function ShareMarketBuyerCatalog({
 
   return (
     <div className="grid min-w-0 gap-4">
-      <div className="flex min-w-0 items-center gap-2">
-        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto" role="tablist" aria-label={t("shareMarket.catalog.familyFilter")}>
-          {familyTabs.map((item) => {
-            const selectedFamily = family === item.value;
-            return (
-              <button
-                key={item.value}
-                type="button"
-                role="tab"
-                aria-selected={selectedFamily}
-                title={t("shareMarket.catalog.familyIdleHint", { family: t(PROVIDER_FAMILY_KEYS[item.value]), count: item.idle })}
-                className={cn(
-                  "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
-                  selectedFamily
-                    ? "bg-sky-100 font-semibold text-sky-800"
-                    : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
-                )}
-                onClick={() => setFamily(selectedFamily ? "all" : item.value)}
-              >
-                <span>{t(PROVIDER_FAMILY_KEYS[item.value])}</span>
-                <span className={cn("tabular-nums", selectedFamily ? "text-sky-600" : "text-slate-400")}>{item.idle}</span>
-              </button>
-            );
-          })}
-        </div>
-        <label className="flex h-9 w-44 shrink-0 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
-          <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-          <input aria-label={t("shareMarket.catalog.searchCompact")} value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent text-xs outline-none" placeholder={t("shareMarket.catalog.searchCompact")} />
-          {query ? <button type="button" aria-label={t("common.reset")} className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" onClick={() => setQuery("")}><X className="h-3.5 w-3.5 text-slate-400" /></button> : null}
-        </label>
-      </div>
+      <MarketListingFilters
+        listings={catalog.listings}
+        family={family}
+        query={query}
+        onFamilyChange={setFamily}
+        onQueryChange={setQuery}
+      />
 
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
       <div className={MARKET_SHARE_CARD_GRID_CLASS}>

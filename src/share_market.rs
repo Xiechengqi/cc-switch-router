@@ -4298,18 +4298,19 @@ fn seat_delete_capability(
     is_owner: bool,
     seat_status: &str,
     retired_at: Option<&str>,
-    subscription_count: i64,
+    _subscription_count: i64,
     subscription: Option<&SubscriptionRecord>,
 ) -> DeleteCapability {
     if !is_owner {
         return DeleteCapability::blocked("owner_only");
     }
-    if subscription_count == 0 && retired_at.is_none() {
-        return if matches!(seat_status, SEAT_AVAILABLE | SEAT_DISABLED) {
-            DeleteCapability::allowed()
-        } else {
-            DeleteCapability::blocked("seat_not_reclaimable")
-        };
+    if matches!(seat_status, SEAT_AVAILABLE | SEAT_DISABLED) && retired_at.is_none() {
+        let has_live_rental = subscription.is_some_and(|subscription| {
+            !matches!(subscription.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED)
+        });
+        if !has_live_rental {
+            return DeleteCapability::allowed();
+        }
     }
     let Some(subscription) = subscription else {
         return DeleteCapability::blocked("rental_history");
@@ -15166,6 +15167,48 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn unused_paid_idle_seat_can_be_deleted() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-paid-idle", "owner-paid-idle@example.com");
+        insert_share(
+            &store,
+            "share-paid-idle",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        configure_payment_profile(&store, &owner, "paid-idle-account", "paid-idle-profile").await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-paid-idle", paid_seat()).await;
+        store
+            .share_market_delete_seat(&owner, &seat_id)
+            .await
+            .expect("delete unused paid seat");
+        let status: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status FROM share_market_seats WHERE id = ?1",
+                params![seat_id],
+                |row| row.get(0),
+            )
+            .expect("read deleted paid seat");
+        assert_eq!(status, SEAT_DELETED);
+        let listing_status: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status FROM share_market_listings WHERE id = ?1",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .expect("read listing after paid seat delete");
+        assert_eq!(listing_status, "active");
     }
 
     #[test]

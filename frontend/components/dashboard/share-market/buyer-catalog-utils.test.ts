@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   catalogSeatPreview,
+  filterMarketListings,
   initialCatalogSeat,
+  listingFamilyTabs,
   marketShareCardSeatPreview,
   preserveCatalogSeat,
 } from "./buyer-catalog-utils";
@@ -14,6 +16,7 @@ import {
 import { mergeShareMarketSubscriptionPage } from "./subscription-utils";
 import type {
   ShareMarketAppCapability,
+  ShareMarketListing,
   ShareMarketSubscription,
 } from "@/lib/types";
 
@@ -45,6 +48,37 @@ test("workspace cards keep at most two seat rows and prefer the caller's seats",
   assert.deepEqual(listed.preview.map((item) => item.id), ["a", "b"]);
   assert.equal(listed.hiddenCount, 2);
   assert.equal(listed.idleCount, 3);
+});
+
+test("family and search filters match catalog listing fields", () => {
+  const listings = [
+    {
+      id: "openai",
+      shareName: "alpha",
+      subdomain: "alpha-route",
+      ownerEmail: "owner@example.com",
+      providerFamily: "openai",
+      providerFamilies: ["openai"],
+      supportedApps: ["codex"],
+      appCapabilities: [{ providerName: "OpenAI Official", models: ["gpt-5"] }],
+      seats: [{ status: "available", readOnly: false }],
+    },
+    {
+      id: "anthropic",
+      shareName: "bravo",
+      subdomain: "bravo-route",
+      ownerEmail: "other@example.com",
+      providerFamily: "anthropic",
+      providerFamilies: ["anthropic"],
+      supportedApps: ["claude"],
+      appCapabilities: [{ providerName: "Anthropic", models: ["opus"] }],
+      seats: [{ status: "occupied", readOnly: false }],
+    },
+  ] as ShareMarketListing[];
+
+  assert.deepEqual(listingFamilyTabs(listings).map((item) => item.value), ["anthropic", "openai"]);
+  assert.deepEqual(filterMarketListings(listings, "openai", "").map((item) => item.id), ["openai"]);
+  assert.deepEqual(filterMarketListings(listings, "all", "opus").map((item) => item.id), ["anthropic"]);
 });
 
 const capability = (

@@ -15,6 +15,8 @@ import {
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
+import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
+import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import {
   CatalogSeatPreviewList,
   MARKET_SHARE_CARD_GRID_CLASS,
@@ -33,7 +35,7 @@ import {
 } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
-import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
+import type { ShareMarketListing, ShareMarketProviderFamily, ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
   formatTokenLimit,
@@ -470,6 +472,8 @@ export function ShareMarketBuyerRentals({
   const [busyId, setBusyId] = React.useState("");
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
+  const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
+  const [query, setQuery] = React.useState("");
   const interactionActive = !!busyId || !!action || loadingMore;
 
   React.useEffect(() => {
@@ -482,9 +486,28 @@ export function ShareMarketBuyerRentals({
     [subscriptions],
   );
   const activeGroups = React.useMemo(
-    () => groupActiveRentalsByShare(subscriptions),
-    [subscriptions],
+    () => {
+      const groups = groupActiveRentalsByShare(subscriptions);
+      if (family === "all" && !query.trim()) return groups;
+      return groups.filter((group) => {
+        const listing = listingForRentalShare(listings, group) as ShareMarketListing | undefined;
+        if (!listing) {
+          if (family !== "all") return false;
+          const needle = query.trim().toLocaleLowerCase();
+          if (!needle) return true;
+          return [
+            group.subscription.shareName,
+            group.subscription.subdomain,
+            group.subscription.ownerEmail,
+            ...(group.subscription.apps || []),
+          ].filter(Boolean).join(" ").toLocaleLowerCase().includes(needle);
+        }
+        return filterMarketListings([listing], family, query).length > 0;
+      });
+    },
+    [family, listings, query, subscriptions],
   );
+
 
   const run = async (subscriptionId: string, operation: () => Promise<unknown>) => {
     if (busyId) return;
@@ -528,7 +551,7 @@ export function ShareMarketBuyerRentals({
       : undefined,
   });
 
-  if (loading && !subscriptions.length) {
+  if (loading && !subscriptions.length && !listings.length) {
     return <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div>;
   }
 
@@ -541,6 +564,15 @@ export function ShareMarketBuyerRentals({
         </div>
       ) : null}
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
+      {listings.length || query || family !== "all" ? (
+        <MarketListingFilters
+          listings={listings}
+          family={family}
+          query={query}
+          onFamilyChange={setFamily}
+          onQueryChange={setQuery}
+        />
+      ) : null}
 
       <section className="grid gap-2" aria-labelledby="share-rentals-active">
         <h3 id="share-rentals-active" className="text-xs font-semibold uppercase tracking-wide text-slate-500">

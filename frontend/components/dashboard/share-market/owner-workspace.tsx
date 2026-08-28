@@ -23,6 +23,8 @@ import {
   usePaidOfferReadiness,
 } from "@/components/dashboard/share-market/paid-offer-readiness";
 import { expiryTitle } from "@/components/dashboard/share-dashboard-utils";
+import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
+import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import {
   CatalogSeatPreviewList,
@@ -35,6 +37,7 @@ import {
   addShareMarketSeat,
   cancelShareMarketPriceChange,
   closeShareMarketListing,
+  getShareUserLimitStatus,
   createShareMarketListing,
   deleteShareMarketListing,
   deleteShareMarketSeat,
@@ -49,6 +52,7 @@ import {
   ApiError,
 } from "@/lib/api";
 import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
+
 import {
   formatTokenMillions,
   millionsInputToTokens,
@@ -57,13 +61,15 @@ import {
 import type {
   ShareMarketListing,
   ShareMarketOwnedShare,
+  ShareMarketProviderFamily,
   ShareMarketSeat,
   ShareMarketSeatInput,
   ShareMarketSubscription,
   ShareMarketTerminationQuote,
   ShareTokenPeriod,
+  ShareUserLimitStatusRow,
 } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, compactTokens } from "@/lib/utils";
 import {
   formatSeatPrice,
   formatTokenLimit,
@@ -1052,6 +1058,25 @@ function seatQuotaLabel(seat: ShareMarketSeat, locale: string, t: TFn) {
   ].join(" · ");
 }
 
+function rentedSeatTokenUsage(
+  seat: ShareMarketSeat,
+  rows: ShareUserLimitStatusRow[],
+  locale: string,
+  t: TFn,
+) {
+  const email = seat.subscription?.renterEmail?.trim().toLowerCase();
+  if (!email) return null;
+  const row = rows.find((item) => item.email.trim().toLowerCase() === email);
+  const used = row?.tokensUsed || 0;
+  const limit = seat.tokenLimit ?? row?.tokenLimit;
+  const period = seat.tokenPeriod || row?.tokenPeriod || "lifetime";
+  const limited = limit != null && limit > 0;
+  return [
+    `${compactTokens(used, locale)} / ${limited ? compactTokens(limit, locale) : t("common.unlimited")}`,
+    t(`shareMarket.period.${period}`),
+  ].join(" · ");
+}
+
 function seatStatusLabel(seat: ShareMarketSeat, t: TFn) {
   const statusKey = subscriptionStatusKey(seat.subscription?.status || "");
   return statusKey ? t(statusKey) : isSeatIdle(seat) ? t("shareMarket.available") : seat.status;
@@ -1082,12 +1107,19 @@ export function ShareMarketOwnerWorkspace({
   const [confirm, setConfirm] = React.useState<ConfirmAction | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
+  const [query, setQuery] = React.useState("");
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[]>([]);
   const focusedRef = React.useRef("");
   const interactionActive = addOpen || !!reopenListing || !!seatDialog || !!priceDialog || !!terminationTarget || !!confirm || busy || !!selectedId;
+  const filteredListings = React.useMemo(
+    () => filterMarketListings(listings, family, query),
+    [family, listings, query],
+  );
   const { attentionSeats, attentionListings, active, closed } = React.useMemo(
-    () => partitionOwnedListings(listings),
-    [listings],
+    () => partitionOwnedListings(filteredListings),
+    [filteredListings],
   );
   const hasListings = listings.length > 0;
   const selected = selectedId ? listings.find((listing) => listing.id === selectedId) || null : null;
@@ -1106,6 +1138,25 @@ export function ShareMarketOwnerWorkspace({
     if (!selectedId) return;
     if (!listings.some((listing) => listing.id === selectedId)) setSelectedId(null);
   }, [listings, selectedId]);
+
+  React.useEffect(() => {
+    const shareId = selected?.shareId;
+    if (!shareId) {
+      setLimitRows([]);
+      return;
+    }
+    let cancelled = false;
+    void getShareUserLimitStatus(shareId)
+      .then((page) => {
+        if (!cancelled) setLimitRows(page.rows || []);
+      })
+      .catch(() => {
+        if (!cancelled) setLimitRows([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected?.shareId]);
 
   React.useEffect(() => {
     if (!focusedShareId || loading || focusedRef.current === focusedShareId) return;
@@ -1491,6 +1542,15 @@ export function ShareMarketOwnerWorkspace({
         </div>
       ) : null}
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
+      {listings.length ? (
+        <MarketListingFilters
+          listings={listings}
+          family={family}
+          query={query}
+          onFamilyChange={setFamily}
+          onQueryChange={setQuery}
+        />
+      ) : null}
 
       {loading && !listings.length ? (
         <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-500">
@@ -1558,7 +1618,7 @@ export function ShareMarketOwnerWorkspace({
                             <th className="w-16 px-3 py-2">{t("shareMarket.col.seat")}</th>
                             <th className="w-28 px-2 py-2">{t("shareMarket.col.status")}</th>
                             <th className="w-28 px-2 py-2">{t("shareMarket.col.amount")}</th>
-                            <th className="px-2 py-2">{t("account.share.quota")}</th>
+                            <th className="px-2 py-2">{t("shareMarket.col.limits")}</th>
                             <th className="w-40 px-2 py-2 text-right">{t("shareMarket.col.actions")}</th>
                           </tr>
                         </thead>
@@ -1582,7 +1642,16 @@ export function ShareMarketOwnerWorkspace({
                                   </div>
                                 </td>
                                 <td className="px-2 py-2 tabular-nums">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</td>
-                                <td className="px-2 py-2 text-slate-500">{seatQuotaLabel(seat, locale, t)}</td>
+                                <td className="px-2 py-2 text-slate-500">
+                                  <div className="grid gap-0.5">
+                                    <span>{seatQuotaLabel(seat, locale, t)}</span>
+                                    {seat.subscription && !isSeatIdle(seat) ? (
+                                      <span className="font-mono text-[11px] text-slate-600">
+                                        {t("dashboard.userLimit.token")}: {rentedSeatTokenUsage(seat, limitRows, locale, t) || `${compactTokens(0, locale)} / ${seat.tokenLimit == null ? t("common.unlimited") : compactTokens(seat.tokenLimit, locale)}`}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                </td>
                                 <td className="px-2 py-2">
                                   <div className="flex justify-end">{renderSeatActions(selected, seat)}</div>
                                 </td>
