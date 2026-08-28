@@ -55,7 +55,7 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
 
 核心依赖:`axum`、`russh`、`libsql`、`tokio`、`reqwest`。
 
-**客户端**:`cc-switch-server` 是唯一客户端。`install-client.sh` 负责在远程主机上部署它。
+**客户端**:`cc-switch-server` 是唯一客户端。`install-client.sh` 负责在远程主机上部署它；Router 按动态 Settings 把 `latest` 或已验证的 7 位 Commit Release 写入每次返回的脚本，脚本在安装前校验对应架构的 checksum，Commit 模式还核对 staged binary 的构建 Commit。
 
 **多区域**:仓库根部 `regions` 文件声明区域到域名的映射,当前为 `japan` / `singapore` / `hongkong` / `usa` 四个区域,经 `GET /v1/regions` 暴露(`src/api.rs:121, 2340`)。
 
@@ -376,8 +376,8 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 
 - 无外部状态库,纯 React Context
 - i18n 覆盖 `en` / `zh-CN`
-- **Settings 控制面**(`/settings/`):受管环境变量按 7 个稳定配置域组织。后端 schema 是字段类型、约束、依赖、风险和重启边界的唯一来源，前端 i18n catalog 只覆盖文案。`GET /v1/admin/settings` 在一个快照中返回 schema、持久化值、进程有效值、来源和 SHA-256 revision；validate/PATCH 都要求 `expectedRevision`。进程启动前已有的环境变量被标记为只读 override，Secret 只暴露 `hasValue`。静态字段以启动快照计算 durable pending-restart，动态字段保存后直接更新 `DynamicSettings`；快照从当前 `DynamicSettings` 反向生成热更新字段的运行值，因此手工修改 `.env` 也不会被误报为已经生效
-- **持久化边界**:`PATCH /v1/admin/settings` 在 `DynamicSettings` 写锁内完成 revision 校验、整组关系校验、`.env.new` 写入与 fsync、旧文件备份、原子 rename、目录 fsync，再发布动态快照。通知 lifecycle 同步失败会回写旧 `.env`。地图和公告使用独立 revision，前端在 409 时加载最新版本并保留用户草稿供复核
+- **Settings 控制面**(`/settings/`):受管环境变量按 7 个稳定配置域组织。后端 schema 是字段类型、约束、依赖、风险和重启边界的唯一来源，前端 i18n catalog 只覆盖文案。`GET /v1/admin/settings` 在一个快照中返回 schema、持久化值、进程有效值、来源和 SHA-256 revision；validate/PATCH 都要求 `expectedRevision`。进程启动前已有的环境变量被标记为只读 override，Secret 只暴露 `hasValue`。静态字段以启动快照计算 durable pending-restart，动态字段保存后直接更新 `DynamicSettings`；快照从当前 `DynamicSettings` 反向生成热更新字段的运行值，因此手工修改 `.env` 也不会被误报为已经生效。Client 分发设置额外通过 `POST /v1/admin/client-server-release/validate` 检查 GitHub Release 的 tag、目标 Commit 和 AMD64/ARM64 binary/checksum；相同 selector single-flight，并使用短期正/负缓存，404 与限流/超时不会混淆
+- **持久化边界**:`PATCH /v1/admin/settings` 先在锁外完成 schema 与必要的外部 Release 验证，再获取 `DynamicSettings` 写锁并重新确认 revision，随后完成 `.env.new` 写入与 fsync、旧文件备份、原子 rename、目录 fsync，再发布动态快照。通知 lifecycle 同步失败会回写旧 `.env`。地图和公告使用独立 revision，前端在 409 时加载最新版本并保留用户草稿供复核
 - **Operations 控制面**(`/operations/`):版本/服务操作、Router 日志、通知投递历史和 admin audit 从 Settings 中独立出来，避免配置编辑与即时运维动作混在同一导航和保存状态机中
 - **模型中枢**(`/clients/?tab=mine`):作为 Clients「我的」分页内的可选能力展示区域统一入口、用户 API Key 和 revision 化模型映射；同页 Share 卡片继续显示直连 URL，并只在该上下文附加映射摘要和快捷新增入口。它不是独立一级导航，不改变首页地图或 Share 侧边栏的信息层级
 - **配置契约审计**:`cargo test admin::settings` 覆盖后端 schema、来源、关系和文件权限；`npm run audit:settings-i18n` 保证所有字段与分组都有中英文文案；`npm run audit:settings-contract` 保证 Rust schema、默认 `.env` 和前端字段 catalog 精确一致，且旧 Settings API 不会回流

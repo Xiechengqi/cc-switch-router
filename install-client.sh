@@ -64,6 +64,7 @@ YELLOW "       Client_Subdomain and disableWebTerminal are optional; disableWebT
 }
 
 export GITHUB_PROXY="https://gh-proxy.org"
+SERVER_RELEASE="latest" # __CC_SWITCH_SERVER_RELEASE__
 
 disable_web_terminal() {
   local conf="${HOME}/.cc-switch-server/server.json"
@@ -160,8 +161,24 @@ countryCode=$(check_if_in_china)
 INFO "Location: ${countryCode}"
 
 # environment
-! uname -m | grep -E 'aarch|arm' &> /dev/null && downloadUrl="https://github.com/Xiechengqi/cc-switch-server/releases/download/latest/cc-switch-server-linux-amd64" || downloadUrl="https://github.com/Xiechengqi/cc-switch-server/releases/download/latest/cc-switch-server-linux-arm64"
-[ "${countryCode}" = "China" ] && downloadUrl="${GITHUB_PROXY}/${downloadUrl}"
+case "$(uname -m)" in
+  x86_64|amd64)
+    asset="cc-switch-server-linux-amd64"
+    ;;
+  aarch64|arm64)
+    asset="cc-switch-server-linux-arm64"
+    ;;
+  *)
+    ERROR "Unsupported CPU architecture: $(uname -m). Supported: x86_64/amd64 and aarch64/arm64."
+    ;;
+esac
+releaseBase="https://github.com/Xiechengqi/cc-switch-server/releases/download/${SERVER_RELEASE}"
+downloadUrl="${releaseBase}/${asset}"
+checksumUrl="${releaseBase}/${asset}.sha256"
+if [ "${countryCode}" = "China" ]; then
+  downloadUrl="${GITHUB_PROXY}/${downloadUrl}"
+  checksumUrl="${GITHUB_PROXY}/${checksumUrl}"
+fi
 binary="cc-switch-server"
 
 # check process (exact name; avoid matching this script's own argv/cmdline)
@@ -206,8 +223,62 @@ fi
 
 mkdir -p /usr/local/bin
 
-# download tarball
-EXEC "curl -SsL ${downloadUrl} -o /usr/local/bin/${binary} && chmod +x /usr/local/bin/${binary}"
+# Download and verify a staged binary before replacing the installed file.
+command -v sha256sum >/dev/null 2>&1 || ERROR "sha256sum is required to verify cc-switch-server"
+download_dir=$(mktemp -d) || ERROR "Unable to create download temporary directory"
+cleanup_download() {
+  rm -rf "${download_dir}"
+}
+trap cleanup_download EXIT
+INFO "Downloading cc-switch-server release ${SERVER_RELEASE} (${asset})"
+curl --fail --show-error --silent --location "${downloadUrl}" -o "${download_dir}/${asset}" \
+  || ERROR "Unable to download cc-switch-server release ${SERVER_RELEASE}"
+curl --fail --show-error --silent --location "${checksumUrl}" -o "${download_dir}/${asset}.sha256" \
+  || ERROR "Unable to download checksum for cc-switch-server release ${SERVER_RELEASE}"
+expected_checksum=$(awk '
+  NF { checksum=tolower($1); lines++ }
+  END {
+    if (lines != 1) exit 1
+    print checksum
+  }
+' "${download_dir}/${asset}.sha256") \
+  || ERROR "cc-switch-server checksum file must contain exactly one digest"
+printf '%s\n' "${expected_checksum}" | grep -E '^[0-9a-f]{64}$' >/dev/null \
+  || ERROR "cc-switch-server checksum file contains an invalid digest"
+actual_checksum_output=$(sha256sum "${download_dir}/${asset}") \
+  || ERROR "Unable to calculate cc-switch-server checksum"
+actual_checksum=$(printf '%s\n' "${actual_checksum_output}" | awk '{print tolower($1)}')
+[ "${actual_checksum}" = "${expected_checksum}" ] \
+  || ERROR "cc-switch-server checksum verification failed"
+chmod +x "${download_dir}/${asset}" || ERROR "Unable to mark staged cc-switch-server executable"
+"${download_dir}/${asset}" -V >/dev/null \
+  || ERROR "Staged cc-switch-server binary failed its version sanity check"
+
+if [ "${SERVER_RELEASE}" != "latest" ]; then
+  version_json=$("${download_dir}/${asset}" version --json 2>/dev/null) \
+    || ERROR "Unable to read staged cc-switch-server build metadata"
+  actual_commit=$(printf '%s\n' "${version_json}" | awk -F '"' '
+    /^[[:space:]]*"commitId"[[:space:]]*:/ {
+      commit=tolower($4)
+      matches++
+    }
+    END {
+      if (matches != 1) exit 1
+      print commit
+    }
+  ') || ERROR "Staged cc-switch-server build metadata has no unique commitId"
+  printf '%s\n' "${actual_commit}" | grep -E '^[0-9a-f]{7,40}$' >/dev/null \
+    || ERROR "Staged cc-switch-server build metadata contains an invalid commitId"
+  case "${actual_commit}" in
+    "${SERVER_RELEASE}"*) ;;
+    *) ERROR "Staged cc-switch-server commit (${actual_commit:-unknown}) does not match release ${SERVER_RELEASE}" ;;
+  esac
+fi
+
+install -m 0755 "${download_dir}/${asset}" "/usr/local/bin/${binary}" \
+  || ERROR "Unable to install cc-switch-server"
+cleanup_download
+trap - EXIT
 EXEC "${binary} -V" && ${binary} -V
 
 # start

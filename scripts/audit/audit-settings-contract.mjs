@@ -29,7 +29,7 @@ const frontendOccurrences = [...frontendBlock[1].matchAll(/"(CC_SWITCH_ROUTER_[A
 const frontendKeys = [...new Set(frontendOccurrences)].sort();
 
 const errors = [];
-if (schemaKeys.length !== 118) errors.push(`expected 118 Settings fields, found ${schemaKeys.length}`);
+if (schemaKeys.length !== 119) errors.push(`expected 119 Settings fields, found ${schemaKeys.length}`);
 for (const [label, occurrences, unique] of [
   ["Settings schema", schemaKeyOccurrences, schemaKeys],
   ["default env", defaultEnvOccurrences, defaultEnvKeys],
@@ -57,6 +57,7 @@ for (const category of [
 for (const route of [
   '"/v1/admin/settings"',
   '"/v1/admin/settings/validate"',
+  '"/v1/admin/client-server-release/validate"',
 ]) {
   if (!apiSource.includes(route)) errors.push(`missing Settings API route ${route}`);
 }

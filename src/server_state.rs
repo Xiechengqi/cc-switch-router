@@ -40,6 +40,10 @@ pub struct ServerState {
     pub resend: Option<Arc<Resend>>,
     pub resend_usage_cache: Arc<Mutex<Option<ResendUsageCache>>>,
     pub dynamic: Arc<RwLock<DynamicSettings>>,
+    /// Cached, single-flight GitHub validator for the cc-switch-server release
+    /// selected by the dynamic Client installation setting.
+    pub client_server_release_validator:
+        Arc<crate::client_server_release::ClientServerReleaseValidator>,
     /// SSH host key 指纹（`SHA256:<base64-nopad>` 格式），在 /lease 响应中回传给客户端。
     pub ssh_host_fingerprint: Option<String>,
     /// Outbound Client Market SSH private key path (IdentityFile for host provisioning).

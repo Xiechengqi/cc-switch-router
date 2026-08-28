@@ -10,6 +10,7 @@ mod client_market_coordination;
 mod client_market_terminal;
 mod client_market_trade;
 mod client_meta;
+mod client_server_release;
 mod client_subdomain_takeover;
 mod clock_health;
 mod config;
@@ -208,6 +209,10 @@ async fn main() -> Result<()> {
     server_logs.spawn_maintenance();
     let clock_health = crate::clock_health::ClockHealthService::new(config.clock_health.clone())?;
     let dynamic = Arc::new(RwLock::new(DynamicSettings::from_config(&config)));
+    let client_server_release_validator = Arc::new(
+        crate::client_server_release::ClientServerReleaseValidator::new()
+            .context("build cc-switch-server release validator HTTP client failed")?,
+    );
     let alerting = crate::alerting::AlertingService::new(
         config.metrics.db_path.clone(),
         dynamic.clone(),
@@ -224,6 +229,7 @@ async fn main() -> Result<()> {
         resend,
         resend_usage_cache: Arc::new(Mutex::new(None)),
         dynamic,
+        client_server_release_validator,
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
         provision_ssh_key_path: config.provision_ssh_private_key_path.clone(),
         provision_ssh_authorized_keys_line,

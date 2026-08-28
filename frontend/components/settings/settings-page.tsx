@@ -41,6 +41,7 @@ import {
   getSettings,
   saveSettings,
   updateMapDisplay,
+  validateClientServerRelease,
   validateSettings,
 } from "@/lib/api";
 import {
@@ -51,6 +52,7 @@ import {
 } from "@/lib/map-display-settings";
 import type {
   MapDisplaySettings,
+  ClientServerReleaseValidation,
   ProvisionSshKey,
   SettingValueEntry,
   SettingsCategory,
@@ -71,6 +73,22 @@ type SettingsSubsection = {
   fieldCount?: number;
   dirtyCount: number;
 };
+
+type ClientServerReleaseCheck = {
+  release: string;
+  phase:
+    | "idle"
+    | "invalid_format"
+    | "checking"
+    | "valid"
+    | "not_found"
+    | "incomplete_assets"
+    | "commit_mismatch"
+    | "unavailable";
+  result?: ClientServerReleaseValidation;
+};
+
+const CLIENT_SERVER_RELEASE_KEY = "CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE";
 
 const PANEL_SUBSECTION_IDS: Record<SettingsPanel, string> = {
   map: "panel:map",
@@ -119,6 +137,10 @@ export function SettingsPage() {
   const [provisionSshKey, setProvisionSshKey] = React.useState<ProvisionSshKey | null>(null);
   const [provisionError, setProvisionError] = React.useState("");
   const [settingsRevision, setSettingsRevision] = React.useState(0);
+  const [clientServerReleaseCheck, setClientServerReleaseCheck] = React.useState<ClientServerReleaseCheck>({
+    release: "",
+    phase: "idle",
+  });
   const subsectionPanelId = React.useId().replaceAll(":", "");
 
   const isAdmin = !!session?.isAdmin;
@@ -128,6 +150,22 @@ export function SettingsPage() {
     [snapshot],
   );
   const dirtyCount = Object.keys(dirty).length + (mapDirty ? 1 : 0);
+  const clientServerReleaseField = snapshot?.schema.fields.find(
+    (field) => field.key === CLIENT_SERVER_RELEASE_KEY,
+  );
+  const clientServerReleaseInput = clientServerReleaseField
+    ? String(dirtyValue(clientServerReleaseField, values[CLIENT_SERVER_RELEASE_KEY], dirty) ?? "").trim()
+    : "";
+  const clientServerReleaseCandidate = clientServerReleaseInput || "latest";
+  const normalizedClientServerRelease = /^(latest|[0-9a-f]{7})$/i.test(clientServerReleaseCandidate)
+    ? clientServerReleaseCandidate.toLocaleLowerCase()
+    : null;
+  const clientServerReleaseDirty = Object.prototype.hasOwnProperty.call(dirty, CLIENT_SERVER_RELEASE_KEY);
+  const clientServerReleaseReady = !clientServerReleaseDirty || (
+    normalizedClientServerRelease !== null
+    && clientServerReleaseCheck.release === normalizedClientServerRelease
+    && clientServerReleaseCheck.phase === "valid"
+  );
 
   const loadSettings = React.useCallback(async ({ preserveBanner = false, manageBusy = true } = {}) => {
     if (manageBusy) setBusy((current) => current || "load");
@@ -176,6 +214,47 @@ export function SettingsPage() {
     void loadMap();
     void loadProvisionKey();
   }, [isAdmin, loadMap, loadProvisionKey, loadSettings]);
+
+  React.useEffect(() => {
+    if (!isAdmin || !clientServerReleaseField) {
+      setClientServerReleaseCheck({ release: "", phase: "idle" });
+      return;
+    }
+    if (!normalizedClientServerRelease) {
+      setClientServerReleaseCheck({
+        release: clientServerReleaseCandidate.toLocaleLowerCase(),
+        phase: "invalid_format",
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    let active = true;
+    setClientServerReleaseCheck({ release: normalizedClientServerRelease, phase: "checking" });
+    const timer = window.setTimeout(() => {
+      void validateClientServerRelease(normalizedClientServerRelease, controller.signal)
+        .then((result) => {
+          if (!active) return;
+          setClientServerReleaseCheck({
+            release: result.release,
+            phase: result.status,
+            result,
+          });
+        })
+        .catch((cause) => {
+          if (!active || (cause instanceof DOMException && cause.name === "AbortError")) return;
+          setClientServerReleaseCheck({
+            release: normalizedClientServerRelease,
+            phase: "unavailable",
+          });
+        });
+    }, 600);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [clientServerReleaseCandidate, clientServerReleaseField, isAdmin, normalizedClientServerRelease]);
 
   if (loading) {
     return <main className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-12 text-muted-foreground">{t("common.loadingSession")}</main>;
@@ -233,7 +312,11 @@ export function SettingsPage() {
             {busy === "load" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             {t("common.reload")}
           </Button>
-          <Button variant="primary" onClick={() => void submit()} isDisabled={!!busy || dirtyCount === 0 || !snapshot}>
+          <Button
+            variant="primary"
+            onClick={() => void submit()}
+            isDisabled={!!busy || dirtyCount === 0 || !snapshot || !clientServerReleaseReady}
+          >
             {busy === "save" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             {dirtyCount ? t("common.saveWithCount", { count: dirtyCount }) : t("common.save")}
           </Button>
@@ -337,6 +420,9 @@ export function SettingsPage() {
                           value={dirtyValue(field, values[field.key], dirty)}
                           dirty={Object.prototype.hasOwnProperty.call(dirty, field.key)}
                           errors={fieldErrors[field.key] || []}
+                          clientServerReleaseCheck={field.key === CLIENT_SERVER_RELEASE_KEY
+                            ? clientServerReleaseCheck
+                            : undefined}
                           t={t}
                           onChange={(value) => updateDirty(field, value)}
                         />
@@ -436,6 +522,13 @@ export function SettingsPage() {
 
   async function submit() {
     if (!snapshot) return;
+    if (!clientServerReleaseReady) {
+      const errors = { [CLIENT_SERVER_RELEASE_KEY]: [t("settings.clientServerRelease.saveBlocked")] };
+      setFieldErrors(errors);
+      revealFirstFieldError(errors);
+      setBanner({ kind: "destructive", text: t("settings.clientServerRelease.saveBlocked") });
+      return;
+    }
     setBusy("save");
     setBanner(null);
     setFieldErrors({});
@@ -526,6 +619,11 @@ export function SettingsPage() {
           setFieldErrors(nextErrors);
           revealFirstFieldError(nextErrors);
         }
+      }
+      if (cause instanceof ApiError && cause.code?.startsWith("CLIENT_SERVER_RELEASE_")) {
+        const nextErrors = { [CLIENT_SERVER_RELEASE_KEY]: [errorMessage(cause)] };
+        setFieldErrors(nextErrors);
+        revealFirstFieldError(nextErrors);
       }
       setBanner({
         kind: "destructive",
@@ -719,6 +817,7 @@ function SettingsFieldRow({
   value,
   dirty,
   errors,
+  clientServerReleaseCheck,
   t,
   onChange,
 }: {
@@ -727,6 +826,7 @@ function SettingsFieldRow({
   value: DirtyValue;
   dirty: boolean;
   errors: string[];
+  clientServerReleaseCheck?: ClientServerReleaseCheck;
   t: ReturnType<typeof useLocaleText>["t"];
   onChange: (value: DirtyValue) => void;
 }) {
@@ -821,6 +921,9 @@ function SettingsFieldRow({
         )}
 
         {field.unit ? <span className="text-right text-xs text-muted-foreground">{field.unit}</span> : null}
+        {clientServerReleaseCheck && clientServerReleaseCheck.phase !== "idle" ? (
+          <ClientServerReleaseFeedback check={clientServerReleaseCheck} />
+        ) : null}
         {field.fieldType === "secret" ? (
           <div className="flex min-h-8 items-center justify-between gap-3">
             <span className={`text-xs ${secretClearing ? "text-red-600" : "text-muted-foreground"}`}>
@@ -841,6 +944,55 @@ function SettingsFieldRow({
         {errors.map((error) => <p key={error} className="text-xs text-red-600">{error}</p>)}
       </div>
     </div>
+  );
+}
+
+function ClientServerReleaseFeedback({ check }: { check: ClientServerReleaseCheck }) {
+  const { t } = useLocaleText();
+  const result = check.result;
+  const content = (() => {
+    switch (check.phase) {
+      case "invalid_format":
+        return t("settings.clientServerRelease.invalidFormat");
+      case "checking":
+        return t("settings.clientServerRelease.checking");
+      case "valid":
+        return t("settings.clientServerRelease.valid", { release: check.release });
+      case "not_found":
+        return t("settings.clientServerRelease.notFound", { release: check.release });
+      case "incomplete_assets":
+        return t("settings.clientServerRelease.incomplete", {
+          release: check.release,
+          assets: result?.missingAssets?.join(", ") || "—",
+        });
+      case "commit_mismatch":
+        return t("settings.clientServerRelease.commitMismatch", { release: check.release });
+      case "unavailable":
+        return t("settings.clientServerRelease.unavailable");
+      case "idle":
+        return "";
+    }
+  })();
+  const success = check.phase === "valid";
+  const checking = check.phase === "checking";
+  const color = success
+    ? "text-emerald-700"
+    : checking
+      ? "text-muted-foreground"
+      : check.phase === "unavailable"
+        ? "text-amber-700"
+        : "text-red-600";
+  return (
+    <p className={`flex items-start gap-1.5 text-xs ${color}`} aria-live="polite">
+      {checking ? (
+        <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+      ) : success ? (
+        <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      ) : (
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      )}
+      <span>{content}</span>
+    </p>
   );
 }
 

@@ -7147,6 +7147,9 @@ mod tests {
             resend: None,
             resend_usage_cache: Arc::new(Mutex::new(None)),
             dynamic,
+            client_server_release_validator: Arc::new(
+                crate::client_server_release::ClientServerReleaseValidator::new().unwrap(),
+            ),
             ssh_host_fingerprint: None,
             provision_ssh_key_path: config.provision_ssh_private_key_path.clone(),
             provision_ssh_authorized_keys_line: String::new(),

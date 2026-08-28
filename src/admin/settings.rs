@@ -70,7 +70,9 @@ impl SettingsCategory {
         match self {
             Self::GeneralDisplay => "Dashboard presentation and operator-facing links.",
             Self::Connectivity => "Public listeners, SSH tunnels, and proxy transport limits.",
-            Self::DataLifecycle => "Database, file paths, leases, retention, and cleanup.",
+            Self::DataLifecycle => {
+                "Database, file paths, leases, retention, cleanup, and Client distribution."
+            }
             Self::IdentitySecurity => {
                 "Login, registration admission, administrators, and access controls."
             }
@@ -133,6 +135,7 @@ pub enum DynamicGroup {
     TelegramBot,
     MarketBilling,
     ServerLogs,
+    ClientDistribution,
 }
 
 #[derive(Debug, Clone)]
@@ -1387,6 +1390,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         dynamic_group: None,
     },
     SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE",
+        label: "Client Server installation release",
+        group: "Client distribution",
+        field_type: FieldType::Text,
+        required: false,
+        restart_required: false,
+        default: Some("latest"),
+        description: "GitHub Release used by newly downloaded install-client.sh scripts: latest or an immutable 7-character commit release. This does not change installed Servers or their latest-based self-upgrade policy.",
+        placeholder: Some("latest or abc1234"),
+        dynamic_group: Some(DynamicGroup::ClientDistribution),
+    },
+    SettingsField {
         key: "CC_SWITCH_ROUTER_ADMIN_EMAILS",
         label: "Extra admin emails",
         group: "Administrators",
@@ -1825,7 +1840,9 @@ fn category_for_group(group: &str) -> SettingsCategory {
     match group {
         "Dashboard UX" => SettingsCategory::GeneralDisplay,
         "Network" | "SSH transport" | "Proxy streaming" => SettingsCategory::Connectivity,
-        "Persistence" | "Lease & Cleanup" => SettingsCategory::DataLifecycle,
+        "Persistence" | "Lease & Cleanup" | "Client distribution" => {
+            SettingsCategory::DataLifecycle
+        }
         "Registration admission"
         | "Email verification & session"
         | "Security"
@@ -2223,6 +2240,7 @@ fn dynamic_effective_value(
         "CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED" => {
             Some(dynamic.server_log_public_enabled.to_string())
         }
+        "CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE" => Some(dynamic.client_server_release.clone()),
         "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED" => {
             Some(dynamic.client_notifications.enabled.to_string())
         }
@@ -2926,6 +2944,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 )));
             }
             Ok(Some(trimmed.to_ascii_lowercase()))
+        }
+        FieldType::Text if field.key == crate::client_server_release::CLIENT_SERVER_RELEASE_ENV => {
+            crate::client_server_release::normalize_client_server_release(trimmed)
+                .map(Some)
+                .map_err(AppError::BadRequest)
         }
         FieldType::Secret if field.key == "CC_SWITCH_ROUTER_RESEND_API_KEY" => {
             if !trimmed.starts_with("re_") {
@@ -3869,6 +3892,15 @@ pub fn apply_updates_to_dynamic(
             "CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED" => {
                 current.server_log_public_enabled = value.map(parse_bool_truthy).unwrap_or(true);
             }
+            "CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE" => {
+                current.client_server_release = value
+                    .map(crate::client_server_release::normalize_client_server_release)
+                    .transpose()
+                    .expect("validated client Server release selector")
+                    .unwrap_or_else(|| {
+                        crate::client_server_release::DEFAULT_CLIENT_SERVER_RELEASE.to_string()
+                    });
+            }
             // Restart-required fields (paths, addresses, TTLs, Resend API
             // key, auth limits, verification URLs, email From/Reply-To):
             // these have already been written to the .env file by the
@@ -3943,6 +3975,39 @@ mod tests {
         )]);
         apply_updates_to_dynamic(&mut dynamic, &updates, &config);
         assert_eq!(dynamic.market_usd_cny_rate_micros, 7_250_000);
+    }
+
+    #[test]
+    fn client_server_release_is_dynamic_and_strictly_canonicalized() {
+        let field = field_by_key("CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE").unwrap();
+        assert_eq!(
+            normalize_value(field, " latest ").unwrap(),
+            Some("latest".into())
+        );
+        assert_eq!(
+            normalize_value(field, " AbC1234 ").unwrap(),
+            Some("abc1234".into())
+        );
+        assert!(normalize_value(field, "abc123").is_err());
+        assert!(normalize_value(field, "abc12345").is_err());
+        assert!(!field.restart_required);
+        assert!(matches!(
+            field.dynamic_group,
+            Some(DynamicGroup::ClientDistribution)
+        ));
+
+        let config = test_static_config();
+        let mut dynamic = DynamicSettings::from_config(&config);
+        let updates = BTreeMap::from([(
+            "CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE".into(),
+            Some("AbC1234".into()),
+        )]);
+        apply_updates_to_dynamic(&mut dynamic, &updates, &config);
+        assert_eq!(dynamic.client_server_release, "abc1234");
+
+        let clear = BTreeMap::from([("CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE".into(), None)]);
+        apply_updates_to_dynamic(&mut dynamic, &clear, &config);
+        assert_eq!(dynamic.client_server_release, "latest");
     }
 
     #[test]
@@ -4635,8 +4700,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 118);
-        assert_eq!(schema.fields.len(), 118);
+        assert_eq!(SETTINGS_FIELDS.len(), 119);
+        assert_eq!(schema.fields.len(), 119);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -4650,7 +4715,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            118
+            119
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema

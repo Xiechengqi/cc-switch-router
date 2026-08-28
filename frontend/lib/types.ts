@@ -1110,6 +1110,24 @@ export type SettingsValidationResponse = {
   restartRequiredKeys: string[];
 };
 
+export type ClientServerReleaseValidationStatus =
+  | "valid"
+  | "not_found"
+  | "incomplete_assets"
+  | "commit_mismatch"
+  | "unavailable";
+
+export type ClientServerReleaseValidation = {
+  release: string;
+  valid: boolean;
+  status: ClientServerReleaseValidationStatus;
+  message: string;
+  tagName?: string;
+  targetCommitish?: string;
+  missingAssets?: string[];
+  checkedAt: string;
+};
+
 export type SettingsUpdateResponse = {
   updatedKeys: string[];
   unchangedKeys: string[];

@@ -22,6 +22,8 @@ pub struct DynamicSettings {
     pub market_usd_cny_rate_micros: i64,
     pub footer_telegram_url: String,
     pub server_log_public_enabled: bool,
+    /// GitHub Release tag rendered into newly downloaded Client installers.
+    pub client_server_release: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,7 @@ impl DynamicSettings {
             market_usd_cny_rate_micros: config.market_usd_cny_rate_micros,
             footer_telegram_url: config.footer_telegram_url.clone(),
             server_log_public_enabled: crate::server_logs::public_enabled_from_env(),
+            client_server_release: crate::client_server_release::client_server_release_from_env(),
         }
     }
 

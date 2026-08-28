@@ -5,6 +5,7 @@ import type {
   SettingsSnapshot,
   SettingsValidationResponse,
   SettingsUpdateResponse,
+  ClientServerReleaseValidation,
   ShareSettingsPatch,
   ShareEditView,
   ShareConnectionTestRequest,
@@ -505,6 +506,18 @@ export async function validateSettings(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ expectedRevision, updates }),
+    }),
+  );
+}
+
+export async function validateClientServerRelease(release: string, signal?: AbortSignal) {
+  return parseJson<ClientServerReleaseValidation>(
+    await authFetch("/v1/admin/client-server-release/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ release }),
+      cache: "no-store",
+      signal,
     }),
   );
 }
@@ -1624,6 +1637,13 @@ export async function getShareMarketCatalog(signal?: AbortSignal) {
 export async function getShareMarketOwnedListings(signal?: AbortSignal) {
   return fetchShareMarketCached<ShareMarketOwnedListings>(
     "/v1/share-market/me/listings",
+    signal,
+  );
+}
+
+export async function getShareMarketRentedListings(signal?: AbortSignal) {
+  return fetchShareMarketCached<ShareMarketOwnedListings>(
+    "/v1/share-market/me/rented-listings",
     signal,
   );
 }

@@ -49,7 +49,9 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已移除,详见 [MIGRATION.md](MIGRATION.md)。
 
-远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Client Market 的首次开通会自动调用该脚本并启动一次进程；systemd unit 使用 `Restart=no` 且不启用开机启动，OpenRC 服务不配置 respawn 且不加入默认 runlevel，没有受支持的服务管理器时仅执行一次 `nohup`。
+远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Router 的 `/install-client.sh` 会在请求时写入 Settings 中当前选择的 Server Release；默认值是 `latest`，也可固定为已经通过 Server 手动发布流程生成的 7 位 Commit Release。脚本严格识别 AMD64/ARM64，同时下载同一 Release、同一下载源的 binary 与 `.sha256`，在覆盖现有文件前完成 checksum；固定 Commit 时还会检查 staged binary 的 `version --json`。任一步失败都会终止，不会回退 `latest`。此设置只影响之后下载的安装脚本，不会修改已安装 Server，Server 自升级仍保持使用 `latest`。
+
+Client Market 的首次开通会自动调用该脚本并启动一次进程；systemd unit 使用 `Restart=no` 且不启用开机启动，OpenRC 服务不配置 respawn 且不加入默认 runlevel，没有受支持的服务管理器时仅执行一次 `nohup`。
 
 首次开通完成后,Router **不会**因为 tunnel 离线而通过 SSH 检查、启动或重启远端 `cc-switch-server`。Router 只保留连接状态观测、心跳、离线告警和页面提示；进程生命周期由 Client owner 负责，离线时应登录 Host 手动排查并启动服务。只有用户明确发起的首次开通、升级、清理或回收操作可以执行对应远端命令。清理失败的后台重试只继续既有的清理流程，不会拉起 Client 服务。
 
@@ -192,6 +194,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED` | `true` | 是否允许匿名查看最近 5 分钟的脱敏公开投影；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未心跳时标记离线,并清理其 share、lease 与内存路由 |
 | `CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS` | `21600` | 离线 client 的 installation 记录保留时长,超时后删除;必须 >= `CLIENT_STALE_SECS` |
+| `CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE` | `latest` | 新下载的 `install-client.sh` 使用的 GitHub Release；可热更新为 `latest` 或已存在且双架构 binary/checksum 完整的 7 位 Commit Release |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE` | `60` | 单可信来源每分钟持续注册尝试速率 |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST` | `20` | 单可信来源允许的短时注册尝试突发量 |
 | `CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE` | `600` | Router 全局每分钟持续注册尝试速率 |

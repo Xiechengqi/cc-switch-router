@@ -22,7 +22,7 @@ use crate::ServerState;
 use crate::admin::{
     restart::{RestartStrategy, schedule_restart},
     settings::{
-        SettingsSnapshotResponse, SettingsUpdateRequest, SettingsUpdateResponse,
+        ApplyOutcome, SettingsSnapshotResponse, SettingsUpdateRequest, SettingsUpdateResponse,
         SettingsValidationResponse, apply_updates_to_dynamic, read_env_file, settings_revision,
         snapshot_response, validate_and_diff, validation_response, write_env_file_atomic,
     },
@@ -500,6 +500,10 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/admin/settings/validate", post(admin_settings_validate))
         .route(
+            "/v1/admin/client-server-release/validate",
+            post(admin_client_server_release_validate),
+        )
+        .route(
             "/v1/admin/client-notifications/deliveries",
             get(admin_client_notification_deliveries),
         )
@@ -657,14 +661,66 @@ async fn retired_capacity_endpoint() -> StatusCode {
     StatusCode::GONE
 }
 
-async fn install_client_script() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=300"),
-        ],
-        include_str!("../install-client.sh"),
-    )
+const INSTALL_CLIENT_RELEASE_LINE: &str =
+    "SERVER_RELEASE=\"latest\" # __CC_SWITCH_SERVER_RELEASE__";
+
+async fn install_client_script(State(state): State<ServerState>, headers: HeaderMap) -> Response {
+    let release = state.dynamic.read().await.client_server_release.clone();
+    let script = match render_install_client_script(&release) {
+        Ok(script) => script,
+        Err(error) => return error.into_response(),
+    };
+    let etag = install_client_script_etag(&script);
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate
+                    .trim()
+                    .strip_prefix("W/")
+                    .unwrap_or(candidate.trim());
+                candidate == etag.as_str() || candidate == "*"
+            })
+        });
+
+    let mut response = Response::builder()
+        .status(if not_modified {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::ETAG, etag);
+    if !not_modified {
+        response = response.header(header::CONTENT_TYPE, "text/plain; charset=utf-8");
+    }
+    response
+        .body(if not_modified {
+            Body::empty()
+        } else {
+            Body::from(script)
+        })
+        .unwrap_or_else(|error| AppError::Internal(error.to_string()).into_response())
+}
+
+fn render_install_client_script(release: &str) -> Result<String, AppError> {
+    let release = crate::client_server_release::normalize_client_server_release(release)
+        .map_err(AppError::Internal)?;
+    let template = include_str!("../install-client.sh");
+    if template.matches(INSTALL_CLIENT_RELEASE_LINE).count() != 1 {
+        return Err(AppError::Internal(
+            "install-client.sh must contain exactly one Server release template marker".into(),
+        ));
+    }
+    Ok(template.replace(
+        INSTALL_CLIENT_RELEASE_LINE,
+        &format!("SERVER_RELEASE=\"{release}\" # __CC_SWITCH_SERVER_RELEASE__"),
+    ))
+}
+
+fn install_client_script_etag(script: &str) -> String {
+    format!("\"{}\"", hex::encode(Sha256::digest(script.as_bytes())))
 }
 
 async fn health(State(state): State<ServerState>) -> impl IntoResponse {
@@ -2961,6 +3017,20 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn install_client_script_renders_release_and_changes_entity_tag() {
+        let latest = render_install_client_script("latest").unwrap();
+        let pinned = render_install_client_script("AbC1234").unwrap();
+        assert!(latest.contains("SERVER_RELEASE=\"latest\""));
+        assert!(pinned.contains("SERVER_RELEASE=\"abc1234\""));
+        assert!(!pinned.contains("SERVER_RELEASE=\"latest\""));
+        assert_ne!(
+            install_client_script_etag(&latest),
+            install_client_script_etag(&pinned)
+        );
+        assert!(render_install_client_script("abc123").is_err());
+    }
 
     #[test]
     fn database_health_response_reports_remote_outage_without_error_details() {
@@ -5272,10 +5342,48 @@ async fn admin_settings_validate(
     Json(input): Json<SettingsUpdateRequest>,
 ) -> Result<Json<SettingsValidationResponse>, AppError> {
     require_admin_session(&state, &headers).await?;
-    let _settings_guard = state.dynamic.read().await;
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
-    Ok(Json(validation_response(&existing, &input.updates)))
+    let mut validation = validation_response(&existing, &input.updates);
+    if !validation.valid {
+        return Ok(Json(validation));
+    }
+    let outcome = validate_and_diff(&existing, &input.updates)?;
+    if let Some(release) = changed_client_server_release(&outcome) {
+        let release_validation = state
+            .client_server_release_validator
+            .validate(&release)
+            .await
+            .map_err(AppError::BadRequest)?;
+        if !release_validation.valid {
+            validation.valid = false;
+            validation.field_errors.insert(
+                crate::client_server_release::CLIENT_SERVER_RELEASE_ENV.to_string(),
+                vec![release_validation.message],
+            );
+        }
+    }
+    Ok(Json(validation))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientServerReleaseValidationRequest {
+    release: String,
+}
+
+async fn admin_client_server_release_validate(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ClientServerReleaseValidationRequest>,
+) -> Result<Json<crate::client_server_release::ClientServerReleaseValidation>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .client_server_release_validator
+            .validate(&input.release)
+            .await
+            .map_err(AppError::BadRequest)?,
+    ))
 }
 
 async fn admin_settings_apply(
@@ -5289,10 +5397,9 @@ async fn admin_settings_apply(
         return Err(AppError::BadRequest("updates is empty".into()));
     }
 
-    // 1) acquire write lock first so reads see the new dynamic state atomically.
-    let mut dynamic_guard = state.dynamic.write().await;
-
-    // 2) load current env, validate updates against the schema.
+    // 1) Validate the optimistic revision and schema before taking the live
+    // settings lock. GitHub validation can involve network I/O and must never
+    // stall unrelated dynamic-settings readers.
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
     let outcome = validate_and_diff(&existing, &input.updates).map_err(|error| {
@@ -5305,6 +5412,21 @@ async fn admin_settings_apply(
                 .unwrap_or_else(|_| serde_json::json!({ "valid": false })),
         }
     })?;
+    if let Some(release) = changed_client_server_release(&outcome) {
+        let release_validation = state
+            .client_server_release_validator
+            .validate(&release)
+            .await
+            .map_err(AppError::BadRequest)?;
+        ensure_client_server_release_valid(release_validation)?;
+    }
+
+    // 2) Serialize apply operations, then confirm no other Settings write won
+    // while the external validation was in flight.
+    let mut dynamic_guard = state.dynamic.write().await;
+    let locked_existing = read_env_file(&state.env_path)?;
+    ensure_settings_revision(&locked_existing, &input.expected_revision)?;
+
     let mut next_dynamic = dynamic_guard.clone();
     apply_updates_to_dynamic(&mut next_dynamic, &input.updates, &state.config);
     let telegram_settings_changed = next_dynamic.telegram_bot != dynamic_guard.telegram_bot;
@@ -5464,6 +5586,58 @@ async fn admin_settings_apply(
                 .collect(),
         ),
     }))
+}
+
+fn changed_client_server_release(outcome: &ApplyOutcome) -> Option<String> {
+    outcome
+        .updated_keys
+        .iter()
+        .any(|key| key == crate::client_server_release::CLIENT_SERVER_RELEASE_ENV)
+        .then(|| {
+            outcome
+                .new_env_kv
+                .get(crate::client_server_release::CLIENT_SERVER_RELEASE_ENV)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(crate::client_server_release::DEFAULT_CLIENT_SERVER_RELEASE)
+                .to_string()
+        })
+}
+
+fn ensure_client_server_release_valid(
+    validation: crate::client_server_release::ClientServerReleaseValidation,
+) -> Result<(), AppError> {
+    use crate::client_server_release::ClientServerReleaseValidationStatus as Status;
+
+    if validation.valid {
+        return Ok(());
+    }
+    let (status, code) = match validation.status {
+        Status::NotFound => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CLIENT_SERVER_RELEASE_NOT_FOUND",
+        ),
+        Status::IncompleteAssets => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CLIENT_SERVER_RELEASE_INCOMPLETE",
+        ),
+        Status::CommitMismatch => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CLIENT_SERVER_RELEASE_COMMIT_MISMATCH",
+        ),
+        Status::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CLIENT_SERVER_RELEASE_VALIDATION_UNAVAILABLE",
+        ),
+        Status::Valid => return Ok(()),
+    };
+    Err(AppError::Coded {
+        status,
+        code,
+        message: validation.message.clone(),
+        details: serde_json::to_value(validation)
+            .unwrap_or_else(|_| serde_json::json!({ "valid": false })),
+    })
 }
 
 fn ensure_settings_revision(
