@@ -423,6 +423,7 @@ export function ShareMarketBuyerRentals({
 
       <ShareMarketRentalHistory
         subscriptions={history}
+        listings={listings}
         nextCursor={nextCursor}
         loadingMore={loadingMore}
         onLoadMore={onLoadMore}

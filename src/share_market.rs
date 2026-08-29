@@ -5828,7 +5828,7 @@ async fn list_my_subscriptions(
             &session,
             &active_subdomains,
             query.cursor.as_deref(),
-            query.limit.unwrap_or(8).clamp(1, 50),
+            query.limit.unwrap_or(5).clamp(1, 50),
         )
         .await?;
     private_etag_json(&headers, &page)

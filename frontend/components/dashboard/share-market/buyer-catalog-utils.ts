@@ -116,6 +116,7 @@ export function filterMarketListings(
 }
 
 export const MARKET_CATALOG_PAGE_SIZE = 12;
+export const MARKET_RENTAL_HISTORY_PAGE_SIZE = 5;
 
 export function rentedShareIdsFromSubscriptions(subscriptions: ShareMarketSubscription[]) {
   return new Set(groupActiveRentalsByShare(subscriptions).map((group) => group.shareId));

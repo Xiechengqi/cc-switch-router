@@ -7,6 +7,7 @@ import {
   initialCatalogSeat,
   listingFamilyTabs,
   MARKET_CATALOG_PAGE_SIZE,
+  MARKET_RENTAL_HISTORY_PAGE_SIZE,
   marketShareCardSeatPreview,
   mergeCatalogWithRentedListings,
   pageForShareId,
@@ -482,4 +483,13 @@ test("rented share ids ignore completed history", () => {
     rental("done", { shareId: "share-done", status: "released" }),
   ]);
   assert.deepEqual([...ids], ["share-live"]);
+});
+
+test("rental history paginates five rows at a time", () => {
+  const rows = Array.from({ length: 12 }, (_, index) => ({ id: `history-${index}` }));
+  const first = paginateListings(rows, 1, MARKET_RENTAL_HISTORY_PAGE_SIZE);
+  assert.equal(first.items.length, 5);
+  assert.equal(first.pageCount, 3);
+  assert.deepEqual(first.items.map((item) => item.id), ["history-0", "history-1", "history-2", "history-3", "history-4"]);
+  assert.equal(paginateListings(rows, 3, MARKET_RENTAL_HISTORY_PAGE_SIZE).items.length, 2);
 });

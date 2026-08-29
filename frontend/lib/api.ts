@@ -1651,7 +1651,7 @@ export async function getShareMarketRentedListings(signal?: AbortSignal) {
 export async function getShareMarketSubscriptions(
   signal?: AbortSignal,
   cursor?: string,
-  limit = 8,
+  limit = 5,
 ) {
   const query = new URLSearchParams({ limit: String(limit) });
   if (cursor) query.set("cursor", cursor);

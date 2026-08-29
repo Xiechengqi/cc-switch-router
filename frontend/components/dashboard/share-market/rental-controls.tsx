@@ -11,6 +11,13 @@ import {
 } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { listingForRentalShare } from "@/components/dashboard/share-market/subscription-utils";
+import {
+  MARKET_RENTAL_HISTORY_PAGE_SIZE,
+  paginateListings,
+} from "@/components/dashboard/share-market/buyer-catalog-utils";
+import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
+import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   acceptShareMarketPriceChange,
@@ -20,7 +27,7 @@ import {
 import { shareMarketHref } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
-import type { ShareMarketSubscription } from "@/lib/types";
+import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
 import {
   isCoreShareApp,
   refundStatusKey,
@@ -30,12 +37,15 @@ import {
 
 type Translate = ReturnType<typeof useLocaleText>["t"];
 
-function formatDate(value: string | undefined, locale: string) {
+function formatUtcDateTime(value: string | undefined, locale: string) {
   if (!value) return "-";
   const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp)
-    ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(timestamp))
-    : value;
+  if (!Number.isFinite(timestamp)) return value;
+  return `${new Intl.DateTimeFormat(locale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: "UTC",
+  }).format(new Date(timestamp))} UTC`;
 }
 
 function rentalApps(subscription: ShareMarketSubscription) {
@@ -114,24 +124,70 @@ export function RentalActions({
   );
 }
 
+function historyShareSource(subscription: ShareMarketSubscription, listing?: ShareMarketListing) {
+  const apps = listing?.supportedApps?.length
+    ? listing.supportedApps
+    : (subscription.apps?.length ? subscription.apps : [subscription.appType].filter(Boolean));
+  return {
+    subdomain: listing?.subdomain || subscription.subdomain || subscription.shareName,
+    shareName: listing?.shareName || subscription.shareName,
+    supportedApps: apps,
+    apps,
+    appCapabilities: listing?.appCapabilities,
+  };
+}
+
 export function ShareMarketRentalHistory({
   subscriptions,
+  listings = [],
   nextCursor,
   loadingMore = false,
   onLoadMore,
 }: {
   subscriptions: ShareMarketSubscription[];
+  listings?: ShareMarketListing[];
   nextCursor?: string | null;
   loadingMore?: boolean;
   onLoadMore?: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
-  const notes = subscriptions.map((subscription) => historyNote(subscription, locale, t));
+  const [page, setPage] = React.useState(1);
+  const pendingPageRef = React.useRef<number | null>(null);
+  const paged = React.useMemo(
+    () => paginateListings(subscriptions, page, MARKET_RENTAL_HISTORY_PAGE_SIZE),
+    [page, subscriptions],
+  );
+
+  React.useEffect(() => {
+    if (pendingPageRef.current != null && pendingPageRef.current <= paged.pageCount) {
+      setPage(pendingPageRef.current);
+      pendingPageRef.current = null;
+      return;
+    }
+    setPage((current) => Math.min(current, paged.pageCount));
+  }, [paged.pageCount]);
+
+  const notes = paged.items.map((subscription) => historyNote(subscription, locale, t));
   const showNote = notes.some(Boolean);
-  const endedAt = (subscription: ShareMarketSubscription) => formatDate(subscription.releasedAt || subscription.updatedAt, locale);
+  const startedAt = (subscription: ShareMarketSubscription) => (
+    formatUtcDateTime(subscription.serviceStartedAt || subscription.activatedAt || subscription.createdAt, locale)
+  );
+  const endedAt = (subscription: ShareMarketSubscription) => (
+    formatUtcDateTime(subscription.releasedAt || subscription.updatedAt, locale)
+  );
   const statusLabel = (subscription: ShareMarketSubscription) => {
     const key = subscriptionStatusKey(subscription.status);
     return key ? t(key) : subscription.status;
+  };
+  const goToPage = async (nextPage: number) => {
+    if (nextPage <= paged.pageCount) {
+      pendingPageRef.current = null;
+      setPage(nextPage);
+      return;
+    }
+    if (!nextCursor || !onLoadMore || loadingMore) return;
+    pendingPageRef.current = nextPage;
+    await onLoadMore();
   };
 
   return (
@@ -143,26 +199,29 @@ export function ShareMarketRentalHistory({
       {subscriptions.length ? (
         <>
           <div className="grid gap-2 lg:hidden">
-            {subscriptions.map((subscription, index) => (
-              <div key={subscription.id} className="grid gap-0.5 border-b border-slate-100 py-2 last:border-0">
-                <div className="flex min-w-0 items-center gap-2">
-                  <RentalApps subscription={subscription} size={14} />
-                  <Link
-                    href={shareMarketHref({ shareId: subscription.shareId })}
-                    className="min-w-0 truncate text-sm font-medium text-slate-800 hover:underline"
-                  >
-                    {subscription.shareName}
-                  </Link>
-                  <span className="shrink-0 text-xs tabular-nums text-slate-400">#{subscription.seatPosition}</span>
+            {paged.items.map((subscription, index) => {
+              const listing = listingForRentalShare(listings, subscription) as ShareMarketListing | undefined;
+              return (
+                <div key={subscription.id} className="grid gap-0.5 border-b border-slate-100 py-2 last:border-0">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Link
+                      href={shareMarketHref({ shareId: subscription.shareId })}
+                      className="min-w-0"
+                    >
+                      <MarketShareIdentity source={historyShareSource(subscription, listing)} size={14} />
+                    </Link>
+                    <span className="shrink-0 text-xs tabular-nums text-slate-400">#{subscription.seatPosition}</span>
+                  </div>
+                  <p className="flex min-w-0 flex-wrap gap-x-2 text-[11px] text-slate-500">
+                    <span>{statusLabel(subscription)}</span>
+                    <span className="tabular-nums">{rentalPrice(subscription, locale, t)}</span>
+                    <span className="tabular-nums">{startedAt(subscription)}</span>
+                    <span className="tabular-nums">{endedAt(subscription)}</span>
+                  </p>
+                  {notes[index] ? <p className="text-[11px] leading-4 text-slate-400">{notes[index]}</p> : null}
                 </div>
-                <p className="flex min-w-0 flex-wrap gap-x-2 text-[11px] text-slate-500">
-                  <span>{statusLabel(subscription)}</span>
-                  <span className="tabular-nums">{rentalPrice(subscription, locale, t)}</span>
-                  <span className="tabular-nums">{endedAt(subscription)}</span>
-                </p>
-                {notes[index] ? <p className="text-[11px] leading-4 text-slate-400">{notes[index]}</p> : null}
-              </div>
-            ))}
+              );
+            })}
           </div>
           <div className="hidden overflow-hidden rounded-md border border-slate-200 lg:block">
             <table className="w-full table-fixed border-collapse text-left text-xs">
@@ -172,45 +231,46 @@ export function ShareMarketRentalHistory({
                   <th className="w-14 px-2 py-2">{t("shareMarket.col.seat")}</th>
                   <th className="w-28 px-2 py-2">{t("shareMarket.col.status")}</th>
                   <th className="w-32 px-2 py-2">{t("shareMarket.col.amount")}</th>
+                  <th className="w-40 px-2 py-2">{t("shareMarket.col.started")}</th>
                   <th className="w-40 px-2 py-2">{t("shareMarket.col.ended")}</th>
                   {showNote ? <th className="px-3 py-2">{t("shareMarket.col.note")}</th> : null}
                 </tr>
               </thead>
               <tbody>
-                {subscriptions.map((subscription, index) => (
-                  <tr key={subscription.id} className="border-t border-slate-100 text-slate-700">
-                    <td className="min-w-0 px-3 py-2">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <RentalApps subscription={subscription} size={14} />
+                {paged.items.map((subscription, index) => {
+                  const listing = listingForRentalShare(listings, subscription) as ShareMarketListing | undefined;
+                  return (
+                    <tr key={subscription.id} className="border-t border-slate-100 text-slate-700">
+                      <td className="min-w-0 px-3 py-2">
                         <Link
                           href={shareMarketHref({ shareId: subscription.shareId })}
-                          className="min-w-0 truncate font-medium text-slate-800 hover:underline"
-                          title={subscription.shareName}
+                          className="min-w-0 block"
                         >
-                          {subscription.shareName}
+                          <MarketShareIdentity source={historyShareSource(subscription, listing)} size={14} />
                         </Link>
-                      </div>
-                    </td>
-                    <td className="px-2 py-2 tabular-nums text-slate-500">#{subscription.seatPosition}</td>
-                    <td className="px-2 py-2 text-slate-500">{statusLabel(subscription)}</td>
-                    <td className="px-2 py-2 tabular-nums">{rentalPrice(subscription, locale, t)}</td>
-                    <td className="px-2 py-2 tabular-nums text-slate-500">{endedAt(subscription)}</td>
-                    {showNote ? (
-                      <td className="px-3 py-2">
-                        <span className="block truncate text-slate-400" title={notes[index] || undefined}>{notes[index] || "—"}</span>
                       </td>
-                    ) : null}
-                  </tr>
-                ))}
+                      <td className="px-2 py-2 tabular-nums text-slate-500">#{subscription.seatPosition}</td>
+                      <td className="px-2 py-2 text-slate-500">{statusLabel(subscription)}</td>
+                      <td className="px-2 py-2 tabular-nums">{rentalPrice(subscription, locale, t)}</td>
+                      <td className="px-2 py-2 tabular-nums text-slate-500">{startedAt(subscription)}</td>
+                      <td className="px-2 py-2 tabular-nums text-slate-500">{endedAt(subscription)}</td>
+                      {showNote ? (
+                        <td className="px-3 py-2">
+                          <span className="block truncate text-slate-400" title={notes[index] || undefined}>{notes[index] || "—"}</span>
+                        </td>
+                      ) : null}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
-          {nextCursor && onLoadMore ? (
-            <Button variant="outline" className="justify-self-center" isDisabled={loadingMore} onClick={() => void onLoadMore()}>
-              {loadingMore ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              {t("account.share.loadMore")}
-            </Button>
-          ) : null}
+          <MarketPagination
+            page={paged.page}
+            pageCount={paged.pageCount}
+            onPageChange={(nextPage) => void goToPage(nextPage)}
+            hasMore={!!nextCursor}
+          />
         </>
       ) : <p className="py-1 text-sm text-slate-400">{t("account.share.historyEmpty")}</p>}
     </section>

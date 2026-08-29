@@ -5,8 +5,6 @@ import { Button, Drawer, Modal } from "@heroui/react";
 import {
   CalendarClock,
   Check,
-  ChevronLeft,
-  ChevronRight,
   Clock3,
   Info,
   Loader2,
@@ -75,6 +73,7 @@ import {
   sortMergedCatalogListings,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
+import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
 import {
   RentalActions,
   ShareMarketRentalHistory,
@@ -190,44 +189,6 @@ function ListingCard({
         </div>
       )}
     />
-  );
-}
-
-function CatalogPagination({
-  page,
-  pageCount,
-  onPageChange,
-}: {
-  page: number;
-  pageCount: number;
-  onPageChange: (page: number) => void;
-}) {
-  const { t } = useLocaleText();
-  if (pageCount <= 1) return null;
-  return (
-    <div className="flex items-center justify-center gap-2">
-      <Button
-        variant="outline"
-        className="h-9"
-        isDisabled={page <= 1}
-        onClick={() => onPageChange(page - 1)}
-        aria-label={t("shareMarket.catalog.previousPage")}
-      >
-        <ChevronLeft className="h-4 w-4" />
-        {t("shareMarket.catalog.previousPage")}
-      </Button>
-      <span className="text-xs tabular-nums text-slate-500">{t("shareMarket.catalog.page", { page, pages: pageCount })}</span>
-      <Button
-        variant="outline"
-        className="h-9"
-        isDisabled={page >= pageCount}
-        onClick={() => onPageChange(page + 1)}
-        aria-label={t("shareMarket.catalog.nextPage")}
-      >
-        {t("shareMarket.catalog.nextPage")}
-        <ChevronRight className="h-4 w-4" />
-      </Button>
-    </div>
   );
 }
 
@@ -517,10 +478,11 @@ export function ShareMarketBuyerCatalog({
           {mine ? t("shareMarket.catalog.mineEmpty") : t("shareMarket.catalog.empty")}
         </div>
       ) : null}
-      <CatalogPagination page={paged.page} pageCount={paged.pageCount} onPageChange={setPage} />
+      <MarketPagination page={paged.page} pageCount={paged.pageCount} onPageChange={setPage} />
       {authed ? (
         <ShareMarketRentalHistory
           subscriptions={history}
+          listings={mergedListings}
           nextCursor={nextCursor}
           loadingMore={loadingMore}
           onLoadMore={onLoadMore}
