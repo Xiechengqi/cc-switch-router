@@ -26,6 +26,10 @@ export function isHistorySubscription(status: string) {
   return status === "released";
 }
 
+export function subscriptionsNeedGrantPolling(subscriptions: Array<Pick<ShareMarketSubscription, "status">>) {
+  return subscriptions.some((subscription) => subscription.status === "grant_pending");
+}
+
 export function needsRentalAttention(subscription: Pick<
   ShareMarketSubscription,
   "status" | "integrityState" | "priceChange"

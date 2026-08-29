@@ -1112,7 +1112,7 @@ export function ShareMarketOwnerWorkspace({
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[]>([]);
   const focusedRef = React.useRef("");
-  const interactionActive = addOpen || !!reopenListing || !!seatDialog || !!priceDialog || !!terminationTarget || !!confirm || busy || !!selectedId;
+  const interactionActive = addOpen || !!reopenListing || !!seatDialog || !!priceDialog || !!terminationTarget || !!confirm || busy;
   const filteredListings = React.useMemo(
     () => filterMarketListings(listings, family, query),
     [family, listings, query],

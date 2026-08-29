@@ -8,7 +8,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareMarketBuyerCatalog } from "@/components/dashboard/share-market/buyer-catalog";
 import { shareMarketMutationError } from "@/components/dashboard/share-market/market-utils";
-import { mergeShareMarketSubscriptionPage } from "@/components/dashboard/share-market/subscription-utils";
+import { mergeShareMarketSubscriptionPage, subscriptionsNeedGrantPolling } from "@/components/dashboard/share-market/subscription-utils";
 import { ShareMarketOwnerWorkspace } from "@/components/dashboard/share-market/owner-workspace";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -27,6 +27,7 @@ import type {
 type Workspace = "catalog" | "selling";
 type LoadScope = Workspace | "all";
 const SHARE_MARKET_POLL_MS = 15_000;
+const SHARE_MARKET_GRANT_POLL_MS = 2_000;
 
 function workspaceFromQuery(value: string | null): Workspace {
   if (value === "selling" || value === "mine") return "selling";
@@ -234,13 +235,15 @@ export function ShareMarketWorkspace() {
     };
   }, [actorKey, authed, authLoading, load]);
 
+  const grantPolling = subscriptionsNeedGrantPolling(subscriptions);
   React.useEffect(() => {
     if (authLoading) return;
     const tick = () => {
       if (document.visibilityState !== "visible" || pausePolling) return;
       void load({ scope: workspace, silent: true, skipIfBusy: true });
     };
-    const timer = window.setInterval(tick, SHARE_MARKET_POLL_MS);
+    if (grantPolling) tick();
+    const timer = window.setInterval(tick, grantPolling ? SHARE_MARKET_GRANT_POLL_MS : SHARE_MARKET_POLL_MS);
     const onVisibility = () => {
       if (document.visibilityState === "visible") tick();
     };
@@ -249,7 +252,7 @@ export function ShareMarketWorkspace() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [authLoading, load, pausePolling, workspace]);
+  }, [authLoading, grantPolling, load, pausePolling, workspace]);
 
   const setWorkspace = (next: Workspace) => {
     if (!authed && next !== "catalog") return;

@@ -281,12 +281,12 @@ export function ShareMarketBuyerCatalog({
   const focusedRef = React.useRef("");
   const skipPageResetRef = React.useRef(false);
   const rentals = useShareMarketRentalActions(onChanged);
-  const blocking = !!rentTarget || !!accessTarget || !!busySeatId || !!selected || rentals.interactionActive;
+  const pausePolling = !!rentTarget || !!accessTarget || !!busySeatId || rentals.interactionActive;
 
   React.useEffect(() => {
-    onInteractionChange?.(blocking);
+    onInteractionChange?.(pausePolling);
     return () => onInteractionChange?.(false);
-  }, [blocking, onInteractionChange]);
+  }, [onInteractionChange, pausePolling]);
 
   React.useEffect(() => {
     if (!rentTarget) return;
@@ -552,7 +552,7 @@ export function ShareMarketBuyerCatalog({
                   isDisabled={!selected.seat || selectedAction === "unavailable" || selectedAction === "rented" || selectedAction === "granting" || !!busySeatId}
                   onClick={() => selected.seat && void triggerSeat({ listing: selected.listing, seat: selected.seat })}
                 >
-                  {busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : selectedAction === "approval" ? <Send className="h-4 w-4" /> : selectedAction === "login" ? <LogIn className="h-4 w-4" /> : selectedAction === "rented" ? <Check className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}
+                  {busySeatId || selectedAction === "granting" ? <Loader2 className="h-4 w-4 animate-spin" /> : selectedAction === "approval" ? <Send className="h-4 w-4" /> : selectedAction === "login" ? <LogIn className="h-4 w-4" /> : selectedAction === "rented" ? <Check className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}
                   {selected.seat ? actionLabel(selectedAction, t) : t("shareMarket.catalog.chooseSeat")}
                 </Button>
               </div>

@@ -8,6 +8,7 @@ import {
   needsRentalAttention,
   partitionShareMarketSubscriptions,
   sortShareMarketSubscriptions,
+  subscriptionsNeedGrantPolling,
 } from "./subscription-utils";
 import type { ShareMarketSubscription } from "@/lib/types";
 
@@ -28,6 +29,14 @@ test("history is completed releases only", () => {
   assert.equal(isHistorySubscription("released"), true);
   assert.equal(isHistorySubscription("grant_failed"), false);
   assert.equal(isHistorySubscription("active_free"), false);
+});
+
+test("grant polling stays on until pending grants finish", () => {
+  assert.equal(subscriptionsNeedGrantPolling([subscription("live", "active_free")]), false);
+  assert.equal(subscriptionsNeedGrantPolling([
+    subscription("live", "active_free"),
+    subscription("pending", "grant_pending"),
+  ]), true);
 });
 
 test("attention covers failures, integrity, and pending price changes", () => {
