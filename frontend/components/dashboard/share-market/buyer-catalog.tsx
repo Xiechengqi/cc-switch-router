@@ -5,6 +5,8 @@ import { Button, Drawer, Modal } from "@heroui/react";
 import {
   CalendarClock,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   Info,
   Loader2,
@@ -62,21 +64,28 @@ import {
   shareMarketMutationError,
 } from "@/components/dashboard/share-market/market-utils";
 import {
-  filterMarketListings,
+  filterMergedCatalogListings,
   initialCatalogSeat,
+  MARKET_CATALOG_PAGE_SIZE,
+  mergeCatalogWithRentedListings,
+  pageForShareId,
+  paginateListings,
   preserveCatalogSeat,
+  rentedShareIdsFromSubscriptions,
+  sortMergedCatalogListings,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
+import {
+  RentalActions,
+  ShareMarketRentalHistory,
+  useShareMarketRentalActions,
+} from "@/components/dashboard/share-market/rental-controls";
+import { needsRentalAttention, partitionShareMarketSubscriptions } from "@/components/dashboard/share-market/subscription-utils";
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
 type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat };
 type SeatAction = "rent" | "approval" | "login" | "rented" | "granting" | "selling" | "unavailable";
 type RentTarget = SeatCard & { quote: ShareMarketRentQuote; idempotencyKey: string };
-
-function listingCreatedAtMs(listing: ShareMarketListing) {
-  const timestamp = Date.parse(listing.createdAt);
-  return Number.isFinite(timestamp) ? timestamp : 0;
-}
 
 function rentAppLabel(app: string) {
   return isCoreShareApp(app) ? SHARE_APP_LABELS[app] : app;
@@ -124,15 +133,101 @@ function seatAction(
   return "unavailable";
 }
 
-function ListingCard({ listing, focused, onOpen }: { listing: ShareMarketListing; focused: boolean; onOpen: (seat?: ShareMarketSeat) => void }) {
+type RentalCardActions = {
+  onRelease?: () => void;
+  onAcceptPrice?: () => void;
+  onRejectPrice?: () => void;
+};
+
+function ListingCard({
+  listing,
+  focused,
+  onOpen,
+  subscription,
+  busy,
+  actions,
+}: {
+  listing: ShareMarketListing;
+  focused: boolean;
+  onOpen: (seat?: ShareMarketSeat) => void;
+  subscription?: ShareMarketSubscription;
+  busy?: boolean;
+  actions?: RentalCardActions;
+}) {
+  const { t } = useLocaleText();
+  const mineSeatIds = subscription ? [subscription.seatId] : [];
+  const attention = subscription ? needsRentalAttention(subscription) : false;
   return (
     <MarketShareCard
       listing={listing}
       focused={focused}
+      attention={attention}
+      rented={!!subscription}
       cardId={listingCardId("catalog", listing.shareId)}
       onOpen={() => onOpen()}
-      footer={<CatalogSeatPreviewList listing={listing} onOpen={onOpen} />}
+      footer={(
+        <div className="grid content-start">
+          <CatalogSeatPreviewList
+            listing={listing}
+            seats={listing.seats}
+            onOpen={onOpen}
+            preferredSeatIds={mineSeatIds}
+            mineSeatIds={mineSeatIds}
+            attentionSeatIds={attention ? mineSeatIds : []}
+          />
+          {subscription ? (
+            <div data-no-card-open className="px-1.5 pt-1">
+              <RentalActions
+                subscription={subscription}
+                t={t}
+                busy={busy}
+                onRelease={actions?.onRelease}
+                onAcceptPrice={actions?.onAcceptPrice}
+                onRejectPrice={actions?.onRejectPrice}
+              />
+            </div>
+          ) : null}
+        </div>
+      )}
     />
+  );
+}
+
+function CatalogPagination({
+  page,
+  pageCount,
+  onPageChange,
+}: {
+  page: number;
+  pageCount: number;
+  onPageChange: (page: number) => void;
+}) {
+  const { t } = useLocaleText();
+  if (pageCount <= 1) return null;
+  return (
+    <div className="flex items-center justify-center gap-2">
+      <Button
+        variant="outline"
+        className="h-9"
+        isDisabled={page <= 1}
+        onClick={() => onPageChange(page - 1)}
+        aria-label={t("shareMarket.catalog.previousPage")}
+      >
+        <ChevronLeft className="h-4 w-4" />
+        {t("shareMarket.catalog.previousPage")}
+      </Button>
+      <span className="text-xs tabular-nums text-slate-500">{t("shareMarket.catalog.page", { page, pages: pageCount })}</span>
+      <Button
+        variant="outline"
+        className="h-9"
+        isDisabled={page >= pageCount}
+        onClick={() => onPageChange(page + 1)}
+        aria-label={t("shareMarket.catalog.nextPage")}
+      >
+        {t("shareMarket.catalog.nextPage")}
+        <ChevronRight className="h-4 w-4" />
+      </Button>
+    </div>
   );
 }
 
@@ -185,25 +280,37 @@ function actionLabel(action: SeatAction, t: ReturnType<typeof useLocaleText>["t"
 export function ShareMarketBuyerCatalog({
   catalog,
   subscriptions,
+  rentedListings = [],
   authed,
   focusedShareId,
+  initialMine = false,
   onChanged,
   onInteractionChange,
   onSwitchSelling,
+  nextCursor,
+  loadingMore = false,
+  onLoadMore,
 }: {
   catalog: ShareMarketCatalog;
   subscriptions: ShareMarketSubscription[];
+  rentedListings?: ShareMarketListing[];
   authed: boolean;
   focusedShareId?: string;
+  initialMine?: boolean;
   onChanged: () => Promise<void> | void;
   onInteractionChange?: (active: boolean) => void;
   onSwitchSelling?: () => void;
+  nextCursor?: string | null;
+  loadingMore?: boolean;
+  onLoadMore?: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
   const chat = useClientChat();
   const [query, setQuery] = React.useState("");
   const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
+  const [mine, setMine] = React.useState(initialMine);
+  const [page, setPage] = React.useState(1);
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
   const [rentTarget, setRentTarget] = React.useState<RentTarget | null>(null);
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
@@ -211,7 +318,9 @@ export function ShareMarketBuyerCatalog({
   const [error, setError] = React.useState("");
   const [quoteNowMs, setQuoteNowMs] = React.useState(() => Date.now());
   const focusedRef = React.useRef("");
-  const blocking = !!rentTarget || !!accessTarget || !!busySeatId || !!selected;
+  const skipPageResetRef = React.useRef(false);
+  const rentals = useShareMarketRentalActions(onChanged);
+  const blocking = !!rentTarget || !!accessTarget || !!busySeatId || !!selected || rentals.interactionActive;
 
   React.useEffect(() => {
     onInteractionChange?.(blocking);
@@ -225,29 +334,69 @@ export function ShareMarketBuyerCatalog({
     return () => window.clearInterval(timer);
   }, [rentTarget]);
 
-  const listings = React.useMemo(() => {
-    return filterMarketListings(catalog.listings, family, query)
-      .sort((left, right) => listingCreatedAtMs(right) - listingCreatedAtMs(left) || right.id.localeCompare(left.id));
-  }, [catalog.listings, family, query]);
+  const rentedShareIds = React.useMemo(
+    () => rentedShareIdsFromSubscriptions(subscriptions),
+    [subscriptions],
+  );
+  const mergedListings = React.useMemo(
+    () => mergeCatalogWithRentedListings(catalog.listings, authed ? rentedListings : []),
+    [authed, catalog.listings, rentedListings],
+  );
+  const filteredListings = React.useMemo(
+    () => sortMergedCatalogListings(
+      filterMergedCatalogListings(mergedListings, {
+        mine: authed && mine,
+        family,
+        query,
+        rentedShareIds,
+      }),
+      subscriptions,
+    ),
+    [authed, family, mergedListings, mine, query, rentedShareIds, subscriptions],
+  );
+  const paged = React.useMemo(
+    () => paginateListings(filteredListings, page, MARKET_CATALOG_PAGE_SIZE),
+    [filteredListings, page],
+  );
+  const { history } = React.useMemo(
+    () => partitionShareMarketSubscriptions(subscriptions),
+    [subscriptions],
+  );
+
+  React.useEffect(() => {
+    setPage((current) => Math.min(current, paged.pageCount));
+  }, [paged.pageCount]);
+
+  React.useEffect(() => {
+    if (skipPageResetRef.current) {
+      skipPageResetRef.current = false;
+      return;
+    }
+    setPage(1);
+  }, [family, mine, query]);
 
   React.useEffect(() => {
     if (!selected) return;
-    const listing = catalog.listings.find((item) => item.id === selected.listing.id);
+    const listing = mergedListings.find((item) => item.id === selected.listing.id)
+      || mergedListings.find((item) => item.shareId === selected.listing.shareId);
     if (!listing) return setSelected(null);
     const seat = selected.seat ? preserveCatalogSeat(listing.seats, selected.seat.id) : undefined;
     if (listing !== selected.listing || seat !== selected.seat) {
       setSelected({ listing, seat });
     }
-  }, [catalog.listings, selected]);
+  }, [mergedListings, selected]);
 
   React.useEffect(() => {
     if (!focusedShareId || focusedRef.current === focusedShareId) return;
-    const listing = catalog.listings.find((item) => item.shareId === focusedShareId);
+    const listing = mergedListings.find((item) => item.shareId === focusedShareId);
     if (!listing) return;
     focusedRef.current = focusedShareId;
+    const nextPage = pageForShareId(filteredListings, focusedShareId, MARKET_CATALOG_PAGE_SIZE);
+    skipPageResetRef.current = true;
+    setPage(nextPage);
     setSelected({ listing });
     window.requestAnimationFrame(() => document.getElementById(`share-market-catalog-${focusedShareId}`)?.scrollIntoView({ block: "start" }));
-  }, [catalog.listings, focusedShareId]);
+  }, [filteredListings, focusedShareId, mergedListings]);
 
   const openListing = (listing: ShareMarketListing, seat?: ShareMarketSeat) => {
     setError("");
@@ -308,6 +457,7 @@ export function ShareMarketBuyerCatalog({
     try {
       await rentShareMarketSeat(rentTarget.seat.id, rentTarget.quote.id, rentTarget.idempotencyKey);
       setRentTarget(null);
+      setPage(1);
       await onChanged();
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 410) {
@@ -329,21 +479,54 @@ export function ShareMarketBuyerCatalog({
     : 0;
   const quoteExpired = !!rentTarget && quoteRemainingSeconds <= 0;
 
+  const displayError = error || rentals.error;
+
   return (
     <div className="grid min-w-0 gap-4">
       <MarketListingFilters
-        listings={catalog.listings}
+        listings={mergedListings}
         family={family}
         query={query}
         onFamilyChange={setFamily}
         onQueryChange={setQuery}
+        mine={mine}
+        mineCount={rentedShareIds.size}
+        mineEnabled={authed && rentedShareIds.size > 0}
+        onMineChange={authed ? setMine : undefined}
       />
 
-      {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
+      {displayError ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{displayError}</p> : null}
       <div className={MARKET_SHARE_CARD_GRID_CLASS}>
-        {listings.map((listing) => <ListingCard key={listing.id} listing={listing} focused={focusedShareId === listing.shareId} onOpen={(seat) => openListing(listing, seat)} />)}
+        {paged.items.map((listing) => {
+          const subscription = activeSubscriptionForShare(subscriptions, listing.shareId);
+          return (
+            <ListingCard
+              key={listing.id}
+              listing={listing}
+              focused={focusedShareId === listing.shareId}
+              onOpen={(seat) => openListing(listing, seat)}
+              subscription={subscription}
+              busy={subscription ? rentals.busyId === subscription.id : false}
+              actions={subscription ? rentals.rowActions(subscription) : undefined}
+            />
+          );
+        })}
       </div>
-      {!listings.length ? <div className="grid min-h-48 place-items-center border-y border-dashed border-slate-200 text-sm text-slate-500">{t("shareMarket.catalog.empty")}</div> : null}
+      {!paged.items.length ? (
+        <div className="grid min-h-48 place-items-center border-y border-dashed border-slate-200 text-sm text-slate-500">
+          {mine ? t("shareMarket.catalog.mineEmpty") : t("shareMarket.catalog.empty")}
+        </div>
+      ) : null}
+      <CatalogPagination page={paged.page} pageCount={paged.pageCount} onPageChange={setPage} />
+      {authed ? (
+        <ShareMarketRentalHistory
+          subscriptions={history}
+          nextCursor={nextCursor}
+          loadingMore={loadingMore}
+          onLoadMore={onLoadMore}
+        />
+      ) : null}
+      {rentals.dialog}
 
       <Drawer.Backdrop isOpen={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
         <Drawer.Content placement="right">

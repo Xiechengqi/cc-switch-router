@@ -3,10 +3,17 @@ import test from "node:test";
 import {
   catalogSeatPreview,
   filterMarketListings,
+  filterMergedCatalogListings,
   initialCatalogSeat,
   listingFamilyTabs,
+  MARKET_CATALOG_PAGE_SIZE,
   marketShareCardSeatPreview,
+  mergeCatalogWithRentedListings,
+  pageForShareId,
+  paginateListings,
   preserveCatalogSeat,
+  rentedShareIdsFromSubscriptions,
+  sortMergedCatalogListings,
 } from "./buyer-catalog-utils";
 import {
   integrityReasonText,
@@ -41,9 +48,10 @@ test("compact cards preview at most two idle seats", () => {
 
 test("workspace cards keep at most two seat rows and prefer the caller's seats", () => {
   const seats = [seat("a"), seat("busy", "occupied"), seat("b"), seat("c")];
-  const rented = marketShareCardSeatPreview([seat("busy", "occupied")], ["busy"]);
-  assert.deepEqual(rented.preview.map((item) => item.id), ["busy"]);
-  assert.equal(rented.hiddenCount, 0);
+  const rented = marketShareCardSeatPreview(seats, ["busy"]);
+  assert.deepEqual(rented.preview.map((item) => item.id), ["busy", "a"]);
+  assert.equal(rented.hiddenCount, 2);
+  assert.equal(rented.idleHiddenCount, 2);
   const listed = marketShareCardSeatPreview(seats);
   assert.deepEqual(listed.preview.map((item) => item.id), ["a", "b"]);
   assert.equal(listed.hiddenCount, 2);
@@ -324,4 +332,154 @@ test("subscription history pages append once by id", () => {
     mergeShareMarketSubscriptionPage([active, first], [first, second], true),
     [active, first, second],
   );
+});
+
+const listing = (
+  id: string,
+  extra: Partial<ShareMarketListing> = {},
+): ShareMarketListing => ({
+  id,
+  shareId: extra.shareId || id,
+  installationId: extra.installationId || `install-${id}`,
+  shareName: extra.shareName || id,
+  appType: extra.appType || "codex",
+  supportedApps: extra.supportedApps || ["codex"],
+  providerFamily: extra.providerFamily || "openai",
+  providerFamilies: extra.providerFamilies || [extra.providerFamily || "openai"],
+  appCapabilities: extra.appCapabilities || [],
+  ownerEmail: extra.ownerEmail || "owner@example.com",
+  status: extra.status || "active",
+  shareStatus: extra.shareStatus || "active",
+  subdomain: extra.subdomain || id,
+  shareOnline: extra.shareOnline ?? true,
+  isOwner: extra.isOwner ?? false,
+  canDelete: false,
+  canReopen: false,
+  reopenableSeatCount: 0,
+  paymentMethodKinds: [],
+  performance: extra.performance || {
+    recentRequestCount: 0,
+    ttftSampleCount: 0,
+    tpsSampleCount: 0,
+    windowHours: 24,
+  },
+  reliability: extra.reliability || {
+    observedMinutes24h: 0,
+    observationCoverage24h: 0,
+    sufficientCoverage: false,
+  },
+  supportedUserTokenPeriods: extra.supportedUserTokenPeriods || ["lifetime"],
+  seats: extra.seats || [],
+  createdAt: extra.createdAt || "2026-01-01T00:00:00Z",
+  updatedAt: extra.updatedAt || extra.createdAt || "2026-01-01T00:00:00Z",
+  ...extra,
+});
+
+const rental = (
+  id: string,
+  extra: Partial<ShareMarketSubscription> = {},
+): ShareMarketSubscription => ({
+  id,
+  seatId: extra.seatId || `seat-${id}`,
+  listingId: extra.listingId || `listing-${id}`,
+  shareId: extra.shareId || id,
+  installationId: extra.installationId || `install-${id}`,
+  shareName: extra.shareName || id,
+  appType: extra.appType || "codex",
+  apps: extra.apps || ["codex"],
+  ownerEmail: extra.ownerEmail || "owner@example.com",
+  status: extra.status || "active_free",
+  integrityState: extra.integrityState || "compatible",
+  seatPosition: extra.seatPosition || 1,
+  tokenPeriod: extra.tokenPeriod || "lifetime",
+  offerRevision: extra.offerRevision || 1,
+  paymentMethodKinds: extra.paymentMethodKinds || [],
+  canRelease: extra.canRelease ?? true,
+  canForceRevoke: false,
+  canRetryGrant: false,
+  canProposePriceChange: false,
+  createdAt: extra.createdAt || extra.updatedAt || "2026-01-01T00:00:00Z",
+  updatedAt: extra.updatedAt || "2026-01-01T00:00:00Z",
+  ...extra,
+});
+
+test("closed rented listings are merged over the public catalog copy", () => {
+  const publicListing = listing("public", { shareId: "share-a", status: "active", createdAt: "2026-01-02T00:00:00Z" });
+  const otherPublic = listing("other", { shareId: "share-b", createdAt: "2026-01-03T00:00:00Z" });
+  const closedRented = listing("closed", { shareId: "share-a", status: "closed", createdAt: "2026-01-01T00:00:00Z" });
+  const merged = mergeCatalogWithRentedListings([publicListing, otherPublic], [closedRented]);
+  assert.deepEqual(merged.map((item) => `${item.shareId}:${item.status}`).sort(), [
+    "share-a:closed",
+    "share-b:active",
+  ]);
+});
+
+test("mine filter is orthogonal to family and search", () => {
+  const openaiRented = listing("openai-rented", {
+    shareId: "share-openai",
+    providerFamily: "openai",
+    providerFamilies: ["openai"],
+    shareName: "alpha",
+  });
+  const anthropicRented = listing("anthropic-rented", {
+    shareId: "share-anthropic",
+    providerFamily: "anthropic",
+    providerFamilies: ["anthropic"],
+    shareName: "bravo",
+  });
+  const openaiPublic = listing("openai-public", {
+    shareId: "share-public",
+    providerFamily: "openai",
+    providerFamilies: ["openai"],
+    shareName: "charlie",
+  });
+  const rentedShareIds = new Set(["share-openai", "share-anthropic"]);
+  const listings = [openaiRented, anthropicRented, openaiPublic];
+  assert.deepEqual(
+    filterMergedCatalogListings(listings, { mine: true, family: "all", query: "", rentedShareIds }).map((item) => item.id),
+    ["openai-rented", "anthropic-rented"],
+  );
+  assert.deepEqual(
+    filterMergedCatalogListings(listings, { mine: true, family: "openai", query: "", rentedShareIds }).map((item) => item.id),
+    ["openai-rented"],
+  );
+  assert.deepEqual(
+    filterMergedCatalogListings(listings, { mine: true, family: "all", query: "bravo", rentedShareIds }).map((item) => item.id),
+    ["anthropic-rented"],
+  );
+});
+
+test("rented listings sort ahead of public catalog and attention stays first", () => {
+  const publicNew = listing("public-new", { shareId: "share-public", createdAt: "2026-03-01T00:00:00Z" });
+  const rentedHealthy = listing("rented-healthy", { shareId: "share-healthy", createdAt: "2026-01-01T00:00:00Z" });
+  const rentedFailed = listing("rented-failed", { shareId: "share-failed", createdAt: "2026-02-01T00:00:00Z" });
+  const sorted = sortMergedCatalogListings(
+    [publicNew, rentedHealthy, rentedFailed],
+    [
+      rental("healthy", { shareId: "share-healthy", status: "active_free", updatedAt: "2026-03-01T00:00:00Z" }),
+      rental("failed", { shareId: "share-failed", status: "grant_failed", updatedAt: "2026-01-01T00:00:00Z" }),
+    ],
+  );
+  assert.deepEqual(sorted.map((item) => item.id), ["rented-failed", "rented-healthy", "public-new"]);
+});
+
+test("catalog pagination clamps and can locate a focused share", () => {
+  const listings = Array.from({ length: MARKET_CATALOG_PAGE_SIZE + 3 }, (_, index) => listing(`share-${index}`, {
+    shareId: `share-${index}`,
+  }));
+  const first = paginateListings(listings, 1);
+  assert.equal(first.items.length, MARKET_CATALOG_PAGE_SIZE);
+  assert.equal(first.pageCount, 2);
+  assert.equal(paginateListings(listings, 9).page, 2);
+  assert.equal(paginateListings([], 3).page, 1);
+  assert.equal(pageForShareId(listings, `share-${MARKET_CATALOG_PAGE_SIZE}`), 2);
+  assert.equal(pageForShareId(listings, "missing"), 1);
+});
+
+test("rented share ids ignore completed history", () => {
+  const ids = rentedShareIdsFromSubscriptions([
+    rental("live", { shareId: "share-live", status: "active_postpaid" }),
+    rental("done", { shareId: "share-done", status: "released" }),
+  ]);
+  assert.deepEqual([...ids], ["share-live"]);
 });

@@ -90,16 +90,28 @@ export function CatalogSeatPreview({
   seat,
   onSelect,
   interactive = true,
+  mine = false,
+  attention = false,
 }: {
   seat: ShareMarketSeat;
   onSelect?: () => void;
   interactive?: boolean;
+  mine?: boolean;
+  attention?: boolean;
 }) {
   const { locale, t } = useLocaleText();
-  const className = "grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded px-1.5 py-1 text-left text-[11px]";
+  const className = cn(
+    "grid min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left text-[11px]",
+    mine ? "grid-cols-[auto_auto_minmax(0,1fr)_auto] bg-sky-50" : "grid-cols-[auto_minmax(0,1fr)_auto]",
+  );
   const body = (
     <>
       <span className="font-semibold text-slate-700">#{seat.position}</span>
+      {mine ? (
+        <span className={cn("shrink-0 text-[10px] font-semibold", attention ? "text-amber-800" : "text-sky-800")}>
+          {t("shareMarket.catalog.mineSeat")}
+        </span>
+      ) : null}
       <span className="truncate text-slate-500">
         {compactSeatTerms(seat, locale, t("common.unlimited"), t(`shareMarket.period.${seat.tokenPeriod}`))}
       </span>
@@ -128,14 +140,20 @@ export function CatalogSeatPreviewList({
   preferredSeatIds,
   seats,
   showHint = true,
+  mineSeatIds,
+  attentionSeatIds,
 }: {
   listing: ShareMarketListing;
   onOpen?: (seat?: ShareMarketSeat) => void;
   preferredSeatIds?: string[];
   seats?: ShareMarketSeat[];
   showHint?: boolean;
+  mineSeatIds?: string[];
+  attentionSeatIds?: string[];
 }) {
   const { t } = useLocaleText();
+  const mineIds = new Set(mineSeatIds ?? preferredSeatIds ?? []);
+  const attentionIds = new Set(attentionSeatIds ?? []);
   const source = seats ?? listing.seats.filter(isSeatIdle);
   const { preview, hiddenCount, idleHiddenCount, idleCount } = marketShareCardSeatPreview(
     source,
@@ -154,7 +172,14 @@ export function CatalogSeatPreviewList({
   return (
     <div className="grid content-start gap-0.5 border-t border-slate-100 pt-1.5">
       {preview.map((seat) => (
-        <CatalogSeatPreview key={seat.id} seat={seat} onSelect={() => onOpen?.(seat)} interactive={!!onOpen} />
+        <CatalogSeatPreview
+          key={seat.id}
+          seat={seat}
+          onSelect={() => onOpen?.(seat)}
+          interactive={!!onOpen}
+          mine={mineIds.has(seat.id)}
+          attention={attentionIds.has(seat.id)}
+        />
       ))}
       {hint ? (
         onOpen ? (
@@ -185,6 +210,7 @@ export function MarketShareCard({
   focused = false,
   muted = false,
   attention = false,
+  rented = false,
   cardId,
   occupancy,
   footer,
@@ -194,6 +220,7 @@ export function MarketShareCard({
   focused?: boolean;
   muted?: boolean;
   attention?: boolean;
+  rented?: boolean;
   cardId?: string;
   occupancy?: React.ReactNode;
   footer?: React.ReactNode;
@@ -217,7 +244,7 @@ export function MarketShareCard({
         interactive
           ? "cursor-pointer transition-[border-color,box-shadow,background-color] hover:border-primary/35"
           : "cursor-default",
-        muted || !idleCount ? "bg-slate-50" : "bg-white",
+        muted || (!idleCount && !attention && !rented) ? "bg-slate-50" : "bg-white",
         focused
           ? "border-primary ring-2 ring-primary/20"
           : attention

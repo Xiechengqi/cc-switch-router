@@ -18,6 +18,10 @@ export function MarketListingFilters({
   onQueryChange,
   leading,
   trailing,
+  mine = false,
+  mineCount = 0,
+  mineEnabled = false,
+  onMineChange,
 }: {
   listings: ShareMarketListing[];
   family: ShareMarketProviderFamily | "all";
@@ -26,14 +30,42 @@ export function MarketListingFilters({
   onQueryChange: (query: string) => void;
   leading?: ReactNode;
   trailing?: ReactNode;
+  mine?: boolean;
+  mineCount?: number;
+  mineEnabled?: boolean;
+  onMineChange?: (mine: boolean) => void;
 }) {
   const { t } = useLocaleText();
   const familyTabs = listingFamilyTabs(listings);
-  if (!familyTabs.length && !query && !leading && !trailing) return null;
+  const showMine = !!onMineChange;
+  if (!familyTabs.length && !query && !leading && !trailing && !showMine) return null;
   return (
     <div className="flex min-w-0 items-center gap-2">
       {leading}
       <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto" role="tablist" aria-label={t("shareMarket.catalog.familyFilter")}>
+        {showMine ? (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mine}
+            title={t("shareMarket.catalog.mineHint")}
+            disabled={!mine && !mineEnabled}
+            className={cn(
+              "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+              mine
+                ? "bg-sky-100 font-semibold text-sky-800"
+                : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
+              !mine && !mineEnabled ? "cursor-not-allowed opacity-50 hover:bg-slate-100 hover:text-slate-600" : null,
+            )}
+            onClick={() => {
+              if (mine) onMineChange(false);
+              else if (mineEnabled) onMineChange(true);
+            }}
+          >
+            <span>{t("shareMarket.catalog.mine")}</span>
+            <span className={cn("tabular-nums", mine ? "text-sky-600" : "text-slate-400")}>{mineCount}</span>
+          </button>
+        ) : null}
         {familyTabs.map((item) => {
           const selectedFamily = family === item.value;
           return (

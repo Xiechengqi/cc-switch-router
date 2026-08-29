@@ -2,13 +2,11 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
-import { CircleDollarSign, Loader2, RefreshCw } from "lucide-react";
-import Link from "next/link";
+import { Loader2, RefreshCw } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareMarketBuyerCatalog } from "@/components/dashboard/share-market/buyer-catalog";
-import { ShareMarketBuyerRentals } from "@/components/dashboard/share-market/buyer-rentals";
 import { shareMarketMutationError } from "@/components/dashboard/share-market/market-utils";
 import { mergeShareMarketSubscriptionPage } from "@/components/dashboard/share-market/subscription-utils";
 import { ShareMarketOwnerWorkspace } from "@/components/dashboard/share-market/owner-workspace";
@@ -20,27 +18,38 @@ import {
   getShareMarketRentedListings,
   getShareMarketSubscriptions,
 } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import type {
   ShareMarketCatalog,
   ShareMarketListing,
   ShareMarketSubscription,
 } from "@/lib/types";
 
-type Workspace = "catalog" | "rentals" | "selling";
+type Workspace = "catalog" | "selling";
 type LoadScope = Workspace | "all";
 const SHARE_MARKET_POLL_MS = 15_000;
 
 function workspaceFromQuery(value: string | null): Workspace {
   if (value === "selling" || value === "mine") return "selling";
-  if (value === "rentals" || value === "rented") return "rentals";
   return "catalog";
+}
+
+function mineFromQuery(value: string | null) {
+  return value === "rentals" || value === "rented";
 }
 
 function replaceWorkspaceQuery(workspace: Workspace) {
   const url = new URL(window.location.href);
   if (workspace === "catalog") url.searchParams.delete("view");
   else url.searchParams.set("view", workspace);
+  url.searchParams.delete("tab");
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function consumeRentalsQuery() {
+  const url = new URL(window.location.href);
+  const view = url.searchParams.get("view") || url.searchParams.get("tab");
+  if (view !== "rentals" && view !== "rented") return;
+  url.searchParams.delete("view");
   url.searchParams.delete("tab");
   window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
 }
@@ -74,6 +83,11 @@ export function ShareMarketWorkspace() {
   const expandedSubscriptionHistoryRef = React.useRef(false);
   const subscriptionHistoryGenerationRef = React.useRef(0);
   const focusedShareId = searchParams.get("focus") || undefined;
+  const initialMine = mineFromQuery(searchParams.get("view") || searchParams.get("tab"));
+
+  React.useEffect(() => {
+    consumeRentalsQuery();
+  }, []);
 
   const load = React.useCallback(async ({
     scope = "all",
@@ -84,7 +98,7 @@ export function ShareMarketWorkspace() {
     if (actorKeyRef.current !== requestedActorKey) return;
     if (skipIfBusy && requestRef.current) return;
     const resetSubscriptionHistory = !silent
-      && (scope === "all" || scope === "catalog" || scope === "rentals");
+      && (scope === "all" || scope === "catalog");
     if (resetSubscriptionHistory) {
       subscriptionHistoryGenerationRef.current += 1;
       loadMoreRequestRef.current?.abort();
@@ -137,24 +151,17 @@ export function ShareMarketWorkspace() {
         applySubscriptionPage(nextSubscriptions);
         setLoadedActorKey(actorKey);
       } else if (scope === "catalog") {
-        const [nextCatalog, nextShares, nextSubscriptions] = await Promise.all([
+        const [nextCatalog, nextRented, nextShares, nextSubscriptions] = await Promise.all([
           getShareMarketCatalog(controller.signal),
+          getShareMarketRentedListings(controller.signal),
           getShareMarketOwnedShares(controller.signal),
           getShareMarketSubscriptions(controller.signal),
         ]);
         if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
         setCatalog(nextCatalog);
+        setRentedListings(nextRented.listings);
         setOwnedShareCount(nextShares.length);
         applySubscriptionPage(nextSubscriptions);
-        setLoadedActorKey(actorKey);
-      } else if (scope === "rentals") {
-        const [nextSubscriptions, nextRented] = await Promise.all([
-          getShareMarketSubscriptions(controller.signal),
-          getShareMarketRentedListings(controller.signal),
-        ]);
-        if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
-        applySubscriptionPage(nextSubscriptions);
-        setRentedListings(nextRented.listings);
         setLoadedActorKey(actorKey);
       } else {
         const [nextOwned, nextShares] = await Promise.all([
@@ -258,8 +265,8 @@ export function ShareMarketWorkspace() {
   const visibleOwnedShareCount = actorDataCurrent ? ownedShareCount : null;
   const visibleSubscriptions = actorDataCurrent ? subscriptions : [];
   const visibleSubscriptionCursor = actorDataCurrent ? subscriptionCursor : null;
-  const hasOwnedShares = (visibleOwnedShareCount ?? 0) > 0 || visibleOwnedListings.length > 0;
-  const showSellingTab = authed && (workspace === "selling" || hasOwnedShares);
+  const hasOwnedShares = (visibleOwnedShareCount ?? 0) > 0;
+  const showSellingTab = authed && hasOwnedShares;
 
   React.useEffect(() => {
     if (workspace !== "selling" || visibleOwnedShareCount == null || hasOwnedShares) return;
@@ -269,7 +276,6 @@ export function ShareMarketWorkspace() {
 
   const workspaceItems = [
     { id: "catalog" as const, label: t("shareMarket.workspace.catalog") },
-    { id: "rentals" as const, label: t("shareMarket.workspace.rentals") },
     ...(showSellingTab
       ? [{ id: "selling" as const, label: t("shareMarket.workspace.selling") }]
       : []),
@@ -295,15 +301,6 @@ export function ShareMarketWorkspace() {
           </div>
         )}
         <div className="flex items-center justify-end gap-2">
-          {authed ? (
-            <Link
-              href={DASHBOARD_ACCOUNT_BILLING_PATH}
-              className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-            >
-              <CircleDollarSign className="h-4 w-4" />
-              {t("marketBilling.open")}
-            </Link>
-          ) : null}
           <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load({ scope: workspace })}>
             <RefreshCw className={loading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
           </Button>
@@ -320,28 +317,19 @@ export function ShareMarketWorkspace() {
 
       {visibleCatalog && workspace === "catalog" ? (
         <ShareMarketBuyerCatalog
-          key={`catalog:${actorKey}`}
+          key={`catalog:${actorKey}:${initialMine ? "mine" : "all"}`}
           catalog={visibleCatalog}
           subscriptions={visibleSubscriptions}
+          rentedListings={visibleRentedListings}
           authed={authed}
           focusedShareId={focusedShareId}
+          initialMine={authed && initialMine}
           onChanged={() => load({ scope: "catalog", silent: true })}
           onInteractionChange={setPausePolling}
           onSwitchSelling={authed ? () => setWorkspace("selling") : undefined}
-        />
-      ) : null}
-      {authed && workspace === "rentals" ? (
-        <ShareMarketBuyerRentals
-          key={`rentals:${actorKey}`}
-          subscriptions={visibleSubscriptions}
-          listings={visibleRentedListings}
-          loading={loading}
-          onChanged={() => load({ scope: "rentals", silent: true })}
-          onInteractionChange={setPausePolling}
           nextCursor={visibleSubscriptionCursor}
           loadingMore={loadingMoreSubscriptions}
           onLoadMore={loadMoreSubscriptions}
-          showHeading={false}
         />
       ) : null}
       {authed && workspace === "selling" ? (
