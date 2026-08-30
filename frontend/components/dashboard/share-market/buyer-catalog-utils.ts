@@ -7,6 +7,7 @@ import type {
 import {
   PROVIDER_FAMILY_ORDER,
   listingIdleCount,
+  listingLowestDailyRate,
 } from "@/components/dashboard/share-market/market-utils";
 import {
   groupActiveRentalsByShare,
@@ -157,15 +158,62 @@ export function sortMergedCatalogListings(
   });
 }
 
+export const MARKET_CATALOG_SORTS = ["recommended", "idle", "price", "uptime"] as const;
+
+export type MarketCatalogSort = (typeof MARKET_CATALOG_SORTS)[number];
+
+/** Lower is better, so every sort key can be compared with a plain subtraction. */
+function listingSortValue(listing: ShareMarketListing, sort: MarketCatalogSort) {
+  switch (sort) {
+    case "idle":
+      return -listingIdleCount(listing);
+    case "price":
+      return listingLowestDailyRate(listing);
+    case "uptime":
+      // Unknown uptime sorts below 0%: an unmeasured Share is not a good Share.
+      return -(listing.reliability.onlineRate24h ?? -1);
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Explicit buyer sorting. Shares the rider already rents stay pinned on top under every
+ * sort (in their recommended order, so anything needing attention stays first) — losing
+ * your own seat behind a price sort would break the "my rentals live here too" model.
+ * The recommended order is also the tiebreaker, which keeps the sort stable.
+ */
+export function sortCatalogListings(
+  listings: ShareMarketListing[],
+  subscriptions: ShareMarketSubscription[],
+  sort: MarketCatalogSort = "recommended",
+) {
+  const recommended = sortMergedCatalogListings(listings, subscriptions);
+  if (sort === "recommended") return recommended;
+  const rentedShareIds = rentedShareIdsFromSubscriptions(subscriptions);
+  const rank = new Map(recommended.map((listing, index) => [listing.shareId, index]));
+  const rankOf = (listing: ShareMarketListing) => rank.get(listing.shareId) ?? 0;
+  return [...recommended].sort((left, right) => {
+    const leftRented = rentedShareIds.has(left.shareId);
+    const rightRented = rentedShareIds.has(right.shareId);
+    if (leftRented !== rightRented) return leftRented ? -1 : 1;
+    if (leftRented && rightRented) return rankOf(left) - rankOf(right);
+    return listingSortValue(left, sort) - listingSortValue(right, sort)
+      || rankOf(left) - rankOf(right);
+  });
+}
+
 export function filterMergedCatalogListings(
   listings: ShareMarketListing[],
   {
     mine,
+    idleOnly = false,
     family,
     query,
     rentedShareIds,
   }: {
     mine: boolean;
+    idleOnly?: boolean;
     family: ShareMarketProviderFamily | "all";
     query: string;
     rentedShareIds: Set<string>;
@@ -173,6 +221,7 @@ export function filterMergedCatalogListings(
 ) {
   return listings.filter((listing) => {
     if (mine && !rentedShareIds.has(listing.shareId)) return false;
+    if (idleOnly && !listingIdleCount(listing)) return false;
     return listingMatchesFamily(listing, family) && listingMatchesQuery(listing, query);
   });
 }

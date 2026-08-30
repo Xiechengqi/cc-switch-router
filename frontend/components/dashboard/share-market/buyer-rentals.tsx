@@ -23,7 +23,9 @@ import {
 import {
   RentalActions,
   RentalApps,
+  RentalTermLine,
   rentalPrice,
+  rentalServiceTerm,
   ShareMarketRentalHistory,
   useShareMarketRentalActions,
 } from "@/components/dashboard/share-market/rental-controls";
@@ -72,12 +74,6 @@ function formatDate(value: string | undefined, locale: string) {
   return Number.isFinite(timestamp)
     ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(timestamp))
     : value;
-}
-
-function rentalServiceTerm(subscription: ShareMarketSubscription, t: Translate) {
-  return subscription.serviceDurationDays == null
-    ? t("shareMarket.serviceDuration.permanent")
-    : t("shareMarket.serviceDuration.daysValue", { count: subscription.serviceDurationDays });
 }
 
 function rentalQuota(subscription: ShareMarketSubscription, locale: string, t: Translate) {
@@ -366,16 +362,16 @@ export function ShareMarketBuyerRentals({
                     mineSeatIds={[subscription.seatId]}
                     showHint={false}
                   />
+                  <RentalTermLine subscription={subscription} className="px-1.5 pt-1" />
                   <div data-no-card-open>
                     <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease} onAcceptPrice={actions.onAcceptPrice} onRejectPrice={actions.onRejectPrice} />
                   </div>
                 </div>
               ) : (
                 <div className="grid content-start gap-1.5 border-t border-slate-100 pt-1.5">
-                  <p className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 px-1.5 text-xs text-slate-500">
-                    <strong className="font-medium tabular-nums text-slate-800">{rentalPrice(subscription, locale, t)}</strong>
-                    <span>{rentalServiceTerm(subscription, t)}</span>
-                    <span className="min-w-0 truncate">{rentalQuota(subscription, locale, t)}</span>
+                  <RentalTermLine subscription={subscription} className="px-1.5" />
+                  <p className="min-w-0 truncate px-1.5 text-[10px] leading-4 text-slate-500">
+                    {rentalQuota(subscription, locale, t)}
                   </p>
                   <div data-no-card-open>
                     <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease} onAcceptPrice={actions.onAcceptPrice} onRejectPrice={actions.onRejectPrice} />

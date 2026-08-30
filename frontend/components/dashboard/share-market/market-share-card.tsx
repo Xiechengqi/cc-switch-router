@@ -13,12 +13,15 @@ import {
   formatSeatPrice,
   isSeatIdle,
   listingIdleCount,
+  listingPriceSummary,
   marketProviderStatusView,
 } from "@/components/dashboard/share-market/market-utils";
 import { marketShareCardSeatPreview } from "@/components/dashboard/share-market/buyer-catalog-utils";
 
+// One column on phones: two columns at ~180px each turn the provider line, the price and
+// the seat rows into unreadable stubs, and the market's whole job is comparing those.
 export const MARKET_SHARE_CARD_GRID_CLASS =
-  "grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4";
+  "grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4";
 
 export function listingUptimeValue(listing: Pick<ShareMarketListing, "reliability">) {
   return listing.reliability.onlineRate24h == null
@@ -60,15 +63,21 @@ export function MarketShareCardMetric({
   label,
   value,
   title,
+  warning,
 }: {
   label: string;
   value: string;
   title?: string;
+  /** Shown under the number when the sample behind it is too thin to trust. */
+  warning?: string;
 }) {
   return (
     <div className="min-w-0">
       <dt className="truncate text-[11px] text-muted-foreground">{label}</dt>
       <dd className="truncate text-[11px] font-semibold tabular-nums text-foreground" title={title}>{value}</dd>
+      {warning ? (
+        <p className="truncate text-[10px] leading-4 text-amber-700" title={warning}>{warning}</p>
+      ) : null}
     </div>
   );
 }
@@ -236,11 +245,28 @@ export function MarketShareCard({
   });
   const subdomain = listing.subdomain?.trim() || listing.shareName;
   const interactive = !!onOpen;
+  const price = listingPriceSummary(listing, locale, t("shareMarket.free"), t("marketBilling.day"));
+  const priceLabel = price.isFrom
+    ? t("shareMarket.catalog.fromPrice", { price: price.price })
+    : price.price;
+  const reliability = listing.reliability;
+  // Only warn. A healthy signal keeps its detail in the tooltip, as before; a thin one has
+  // to say so on the card, because "0.0%" and "-" otherwise read as measured facts.
+  const uptimeWarning = reliability.onlineRate24h == null
+    ? t("shareMarket.catalog.noObservations")
+    : reliability.sufficientCoverage
+      ? undefined
+      : t("shareMarket.catalog.coverageInsufficient", { count: reliability.observedMinutes24h });
+  const performanceWarning = listing.performance.ttftSampleCount + listing.performance.tpsSampleCount
+    ? undefined
+    : t("shareMarket.catalog.thinSamples");
+  const occupancyLabel = occupancy
+    ?? t("shareMarket.catalog.occupancy", { idle: idleCount, total: listing.seats.length });
   return (
     <article
       id={cardId}
       className={cn(
-        "grid min-h-[15rem] min-w-0 scroll-mt-20 select-text grid-rows-[auto_auto_auto_1fr] gap-2.5 rounded-xl border p-3 shadow-sm",
+        "grid min-h-[15rem] min-w-0 scroll-mt-20 select-text grid-rows-[auto_auto_auto_auto_1fr] gap-2.5 rounded-xl border p-3 shadow-sm",
         interactive
           ? "cursor-pointer transition-[border-color,box-shadow,background-color] hover:border-primary/35"
           : "cursor-default",
@@ -269,27 +295,61 @@ export function MarketShareCard({
             title={listing.shareOnline ? listing.shareStatus : t("shareMarket.blockReason.share_offline")}
           />
           <MarketProviderLogos source={listing} />
-          <strong className="min-w-0 truncate font-mono text-xs font-semibold text-foreground" title={subdomain}>
-            {subdomain}
-          </strong>
+          {interactive ? (
+            // The whole card opens on click, but a mouse-only affordance strands keyboard
+            // and screen-reader users. The name is the natural handle, so it carries the
+            // real button; the card keeps its click shortcut for everyone else.
+            <button
+              type="button"
+              className="min-w-0 truncate rounded font-mono text-xs font-semibold text-foreground hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              title={subdomain}
+              aria-label={`${subdomain} · ${t("shareMarket.catalog.details")}`}
+              onClick={onOpen}
+            >
+              {subdomain}
+            </button>
+          ) : (
+            <strong className="min-w-0 truncate font-mono text-xs font-semibold text-foreground" title={subdomain}>
+              {subdomain}
+            </strong>
+          )}
           {listing.subdomain ? <SubdomainCopyButton subdomain={listing.subdomain} /> : null}
         </div>
-        <strong className="shrink-0 whitespace-nowrap text-[11px] font-semibold tabular-nums text-slate-700">
-          {occupancy ?? t("shareMarket.catalog.occupancy", { idle: idleCount, total: listing.seats.length })}
+        {/* Price sits where the eye lands first: it is the one number every rider compares. */}
+        <strong
+          className="shrink-0 whitespace-nowrap text-[13px] font-semibold tabular-nums text-slate-900"
+          title={priceLabel}
+        >
+          {priceLabel}
         </strong>
       </header>
       <ShareProviderStatusPanel view={providerView} wrapPrimaryLine />
+      <p className="flex min-w-0 items-center gap-2 text-[11px]">
+        <strong className={cn(
+          "shrink-0 whitespace-nowrap font-semibold tabular-nums",
+          idleCount ? "text-slate-700" : "text-slate-400",
+        )}>
+          {occupancyLabel}
+        </strong>
+        {!listing.shareOnline ? (
+          <span className="min-w-0 truncate text-rose-700" title={t("shareMarket.catalog.offlineHint")}>
+            {t("shareMarket.catalog.offlineHint")}
+          </span>
+        ) : null}
+      </p>
       <div className="min-w-0">
         <dl className="grid grid-cols-2 gap-2">
           <MarketShareCardMetric
             label={t("shareMarket.catalog.uptime24h")}
             value={listingUptimeValue(listing)}
-            title={`${t("shareMarket.catalog.coverage24hValue", { value: listing.reliability.observationCoverage24h.toFixed(1) })} · ${t("shareMarket.catalog.observedMinutesValue", { count: listing.reliability.observedMinutes24h })}`}
+            title={`${t("shareMarket.catalog.coverage24hValue", { value: reliability.observationCoverage24h.toFixed(1) })} · ${t("shareMarket.catalog.observedMinutesValue", { count: reliability.observedMinutes24h })}`}
+            warning={uptimeWarning}
           />
           <MarketShareCardMetric
             label="P50 TTFT/TPS"
             value={performance.label}
-            title={`${t("shareMarket.catalog.samplesValue", { count: listing.performance.ttftSampleCount })} · ${t("shareMarket.catalog.samplesValue", { count: listing.performance.tpsSampleCount })}`}
+            title={t("shareMarket.catalog.performanceSamples", { ttft: listing.performance.ttftSampleCount, tps: listing.performance.tpsSampleCount })}
+            warning={performanceWarning}
           />
         </dl>
         <p className="mt-1 flex min-w-0 items-start gap-1 text-[10px] leading-4 text-slate-500">

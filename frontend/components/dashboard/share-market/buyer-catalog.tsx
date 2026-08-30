@@ -70,12 +70,14 @@ import {
   paginateListings,
   preserveCatalogSeat,
   rentedShareIdsFromSubscriptions,
-  sortMergedCatalogListings,
+  sortCatalogListings,
+  type MarketCatalogSort,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
 import {
   RentalActions,
+  RentalTermLine,
   ShareMarketRentalHistory,
   useShareMarketRentalActions,
 } from "@/components/dashboard/share-market/rental-controls";
@@ -175,6 +177,9 @@ function ListingCard({
             attentionSeatIds={attention ? mineSeatIds : []}
           />
           {subscription ? (
+            <RentalTermLine subscription={subscription} className="px-1.5 pt-1" />
+          ) : null}
+          {subscription ? (
             <div data-no-card-open className="px-1.5 pt-1">
               <RentalActions
                 subscription={subscription}
@@ -271,6 +276,8 @@ export function ShareMarketBuyerCatalog({
   const [query, setQuery] = React.useState("");
   const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
   const [mine, setMine] = React.useState(initialMine);
+  const [idleOnly, setIdleOnly] = React.useState(false);
+  const [sort, setSort] = React.useState<MarketCatalogSort>("recommended");
   const [page, setPage] = React.useState(1);
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
   const [rentTarget, setRentTarget] = React.useState<RentTarget | null>(null);
@@ -304,16 +311,18 @@ export function ShareMarketBuyerCatalog({
     [authed, catalog.listings, rentedListings],
   );
   const filteredListings = React.useMemo(
-    () => sortMergedCatalogListings(
+    () => sortCatalogListings(
       filterMergedCatalogListings(mergedListings, {
         mine: authed && mine,
+        idleOnly,
         family,
         query,
         rentedShareIds,
       }),
       subscriptions,
+      sort,
     ),
-    [authed, family, mergedListings, mine, query, rentedShareIds, subscriptions],
+    [authed, family, idleOnly, mergedListings, mine, query, rentedShareIds, sort, subscriptions],
   );
   const paged = React.useMemo(
     () => paginateListings(filteredListings, page, MARKET_CATALOG_PAGE_SIZE),
@@ -334,7 +343,7 @@ export function ShareMarketBuyerCatalog({
       return;
     }
     setPage(1);
-  }, [family, mine, query]);
+  }, [family, idleOnly, mine, query, sort]);
 
   React.useEffect(() => {
     if (!selected) return;
@@ -454,9 +463,26 @@ export function ShareMarketBuyerCatalog({
         mineCount={rentedShareIds.size}
         mineEnabled={authed && rentedShareIds.size > 0}
         onMineChange={authed ? setMine : undefined}
+        idleOnly={idleOnly}
+        onIdleOnlyChange={setIdleOnly}
+        sort={sort}
+        onSortChange={setSort}
       />
 
       {displayError ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{displayError}</p> : null}
+      {/*
+        The two rules that apply to every seat in the market, stated once before anyone
+        picks one. They used to appear only in the confirm dialog, which is exactly the
+        moment a rider is deciding whether to trust the whole thing — the free window and
+        the "you are not charged now" rule belong before that, not as a surprise inside it.
+      */}
+      <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] leading-5 text-slate-600">
+        <Clock3 className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden />
+        <strong className="font-semibold text-slate-800">{t("shareMarket.catalog.trial", { hours: catalog.trialHours })}</strong>
+        <span className="text-slate-300" aria-hidden>·</span>
+        <span className="min-w-0">{t("shareMarket.catalog.postpaidHint")}</span>
+        <span className="ml-auto shrink-0 tabular-nums text-slate-400">{t("shareMarket.catalog.listingCount", { count: filteredListings.length })}</span>
+      </p>
       <div className={MARKET_SHARE_CARD_GRID_CLASS}>
         {paged.items.map((listing) => {
           const subscription = activeSubscriptionForShare(subscriptions, listing.shareId);

@@ -216,3 +216,28 @@ export function partitionOwnedListings<TListing extends ShareMarketListing>(list
 
   return { attentionSeats, attentionListings, active, closed };
 }
+
+/**
+ * Triage view over `partitionOwnedListings`. Anything the owner has to act on — a Share
+ * that can no longer be reopened, or one holding a seat that needs a decision — is lifted
+ * into its own lane instead of being filed under "Closed", where owners read the whole
+ * section as an archive and never look. "Active" and "Closed" keep only the listings that
+ * are genuinely running or genuinely settled, so both counts mean what they say.
+ */
+export function ownedListingSections<TListing extends ShareMarketListing>(listings: TListing[]) {
+  const { attentionSeats, attentionListings, active, closed } = partitionOwnedListings(listings);
+  const seatAttentionIds = new Set(attentionSeats.map((item) => item.listing.id));
+  const hasSeatAttention = (listing: TListing) => seatAttentionIds.has(listing.id);
+  const attention = [
+    ...attentionListings,
+    ...active.filter(hasSeatAttention),
+    ...closed.filter(hasSeatAttention),
+  ];
+  return {
+    attentionSeats,
+    attention,
+    attentionIds: new Set(attention.map((listing) => listing.id)),
+    active: active.filter((listing) => !hasSeatAttention(listing)),
+    closed: closed.filter((listing) => !hasSeatAttention(listing)),
+  };
+}

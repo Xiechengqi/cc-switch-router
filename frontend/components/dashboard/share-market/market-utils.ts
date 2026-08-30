@@ -149,6 +149,38 @@ export function listingLowestDailyRate(listing: {
   return Math.min(...seats.map((seat) => seat.dailyRateMinor ?? 0));
 }
 
+export type ListingPriceSummary = {
+  /** Lowest effective daily rate in minor units, or null when the Share has no seats. */
+  rateMinor: number | null;
+  /** Formatted lowest price, e.g. "$2.50 / day", or the free label when the floor is 0. */
+  price: string;
+  /** True when the candidate seats do not all share the same rate, so `price` is a floor. */
+  isFrom: boolean;
+};
+
+/**
+ * Price floor shown on the catalog card. Mirrors `listingLowestDailyRate`: idle seats
+ * decide the number a buyer can actually act on, and only when none are idle does the
+ * whole Share stand in, so a full Share still advertises the level it sells at.
+ */
+export function listingPriceSummary(
+  listing: { seats: Array<Pick<ShareMarketSeat, "status" | "readOnly" | "dailyRateMinor" | "isFree">> },
+  locale: string,
+  freeLabel: string,
+  dayLabel: string,
+): ListingPriceSummary {
+  const idle = listing.seats.filter(isSeatIdle);
+  const seats = idle.length ? idle : listing.seats;
+  if (!seats.length) return { rateMinor: null, price: "-", isFrom: false };
+  const rates = seats.map((seat) => (seat.isFree ? 0 : seat.dailyRateMinor ?? 0));
+  const rateMinor = Math.min(...rates);
+  return {
+    rateMinor,
+    price: formatSeatPrice({ isFree: rateMinor === 0, dailyRateMinor: rateMinor }, locale, freeLabel, dayLabel),
+    isFrom: rates.some((rate) => rate !== rateMinor),
+  };
+}
+
 export function formatSeatPrice(
   seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor">,
   locale: string,

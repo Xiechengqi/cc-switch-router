@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal } from "@heroui/react";
+import { Button, Drawer, Modal } from "@heroui/react";
 import {
   Clock3,
   Copy,
@@ -22,7 +22,7 @@ import {
   PaidOfferReadinessNotice,
   usePaidOfferReadiness,
 } from "@/components/dashboard/share-market/paid-offer-readiness";
-import { expiryTitle } from "@/components/dashboard/share-dashboard-utils";
+import { drawerDialogClassName, expiryTitle } from "@/components/dashboard/share-dashboard-utils";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
@@ -89,8 +89,8 @@ import {
   listingLiveSeats,
   listingOccupancyCounts,
   needsOwnedSeatAttention,
+  ownedListingSections,
   ownedShareBlockedReasonKey,
-  partitionOwnedListings,
   reopenableListingSeats,
   reopenBlockedReasonKey,
 } from "@/components/dashboard/share-market/owner-workspace-utils";
@@ -1117,17 +1117,13 @@ export function ShareMarketOwnerWorkspace({
     () => filterMarketListings(listings, family, query),
     [family, listings, query],
   );
-  const { attentionSeats, attentionListings, active, closed } = React.useMemo(
-    () => partitionOwnedListings(filteredListings),
+  const { attention, attentionIds, active, closed } = React.useMemo(
+    () => ownedListingSections(filteredListings),
     [filteredListings],
   );
   const hasListings = listings.length > 0;
   const selected = selectedId ? listings.find((listing) => listing.id === selectedId) || null : null;
-  const attentionShareIds = React.useMemo(() => {
-    const ids = new Set(attentionListings.map((listing) => listing.id));
-    for (const item of attentionSeats) ids.add(item.listing.id);
-    return ids;
-  }, [attentionListings, attentionSeats]);
+  const attentionShareIds = attentionIds;
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
@@ -1564,6 +1560,20 @@ export function ShareMarketOwnerWorkspace({
             )}
             trailing={addShareButton(hasListings ? "outline" : "primary")}
           />
+          {attention.length ? (
+            // Owner to-dos used to sit inside "Closed", which owners read as an archive.
+            // Their own lane, above the healthy listings, is the whole point of a triage view.
+            <section className="grid gap-2" aria-labelledby="share-listings-attention">
+              <h3 id="share-listings-attention" className="text-xs font-semibold uppercase tracking-wide text-amber-700">
+                {t("shareMarket.rentals.attention")}
+                <span className="ml-1.5 tabular-nums text-amber-600">{attention.length}</span>
+              </h3>
+              <div className={MARKET_SHARE_CARD_GRID_CLASS}>
+                {attention.map((listing) => renderListingCard(listing, listing.status !== "active"))}
+              </div>
+            </section>
+          ) : null}
+
           <section className="grid gap-2" aria-labelledby="share-listings-active">
             {active.length ? (
               <div className={MARKET_SHARE_CARD_GRID_CLASS}>
@@ -1579,14 +1589,13 @@ export function ShareMarketOwnerWorkspace({
             )}
           </section>
 
-          {closed.length || attentionListings.length ? (
+          {closed.length ? (
             <section className="grid gap-2 border-t border-slate-200 pt-5" aria-labelledby="share-listings-closed">
               <h3 id="share-listings-closed" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                 {t("shareMarket.listings.closed")}
-                <span className="ml-1.5 tabular-nums text-slate-400">{closed.length + attentionListings.length}</span>
+                <span className="ml-1.5 tabular-nums text-slate-400">{closed.length}</span>
               </h3>
               <div className={MARKET_SHARE_CARD_GRID_CLASS}>
-                {attentionListings.map((listing) => renderListingCard(listing, true))}
                 {closed.map((listing) => renderListingCard(listing, true))}
               </div>
             </section>
@@ -1594,13 +1603,23 @@ export function ShareMarketOwnerWorkspace({
         </>
       )}
 
-      <Modal.Backdrop isOpen={!!selected} onOpenChange={(open) => !open && setSelectedId(null)}>
-        <Modal.Container placement="center">
-          <Modal.Dialog className="light w-[min(860px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-            <Modal.Header>
-              <Modal.Heading>{t("shareMarket.catalog.shareSeats")}</Modal.Heading>
-            </Modal.Header>
-            <Modal.Body className="grid max-h-[min(70vh,36rem)] gap-3 overflow-y-auto">
+      {/*
+        A side drawer, not a centred modal. Everything an owner does from here — edit a
+        seat, propose a price, end a rental — opens another dialog on top, and a modal
+        stacked on a modal buries the list the owner is working through. A drawer keeps the
+        listing grid visible behind it, and matches the buyer-side detail panel.
+      */}
+      <Drawer.Backdrop isOpen={!!selected} onOpenChange={(open) => !open && setSelectedId(null)}>
+        <Drawer.Content placement="right">
+          <Drawer.Dialog className={drawerDialogClassName}>
+            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200" />
+            <Drawer.Header>
+              <div className="min-w-0 pr-10">
+                <Drawer.Heading className="truncate text-base">{selected?.shareName || selected?.subdomain || t("shareMarket.catalog.shareSeats")}</Drawer.Heading>
+                <p className="truncate font-mono text-xs text-slate-500">{selected?.subdomain}</p>
+              </div>
+            </Drawer.Header>
+            <Drawer.Body className="grid content-start gap-3 overflow-y-auto pb-24">
               {selected ? (
                 <>
                   {selected.status === "closed" && !selected.canReopen ? (
@@ -1664,14 +1683,16 @@ export function ShareMarketOwnerWorkspace({
                   )}
                 </>
               ) : null}
-            </Modal.Body>
-            <Modal.Footer>
-              {selected ? renderListingActions(selected) : null}
-              <Button variant="ghost" onClick={() => setSelectedId(null)}>{t("common.close")}</Button>
-            </Modal.Footer>
-          </Modal.Dialog>
-        </Modal.Container>
-      </Modal.Backdrop>
+            </Drawer.Body>
+            {selected ? (
+              <div className="absolute inset-x-0 bottom-0 flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 bg-white px-5 py-4">
+                {renderListingActions(selected)}
+                <Button variant="ghost" onClick={() => setSelectedId(null)}>{t("common.close")}</Button>
+              </div>
+            ) : null}
+          </Drawer.Dialog>
+        </Drawer.Content>
+      </Drawer.Backdrop>
 
       <ShareMarketAddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void onChanged()} onReopenListing={openReopenListing} />
       <ReopenListingDialog listing={reopenListing} onOpenChange={(open) => !open && setReopenListing(null)} onSaved={() => void onChanged()} />

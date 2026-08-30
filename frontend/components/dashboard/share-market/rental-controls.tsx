@@ -11,7 +11,10 @@ import {
 } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { listingForRentalShare } from "@/components/dashboard/share-market/subscription-utils";
+import {
+  listingForRentalShare,
+  rentalTermProgress,
+} from "@/components/dashboard/share-market/subscription-utils";
 import {
   MARKET_RENTAL_HISTORY_PAGE_SIZE,
   paginateListings,
@@ -28,6 +31,7 @@ import { shareMarketHref } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import {
   isCoreShareApp,
   refundStatusKey,
@@ -58,6 +62,55 @@ export function rentalPrice(subscription: ShareMarketSubscription, locale: strin
   return subscription.dailyRateMinor == null
     ? t("shareMarket.free")
     : `${formatUsdMoney(subscription.dailyRateMinor, locale)} / ${t("marketBilling.day")}`;
+}
+
+/** The term frozen into the rental at rent time, independent of what the listing says today. */
+export function rentalServiceTerm(subscription: ShareMarketSubscription, t: Translate) {
+  return subscription.serviceDurationDays == null
+    ? t("shareMarket.serviceDuration.permanent")
+    : t("shareMarket.serviceDuration.daysValue", { count: subscription.serviceDurationDays });
+}
+
+/**
+ * What the rider pays and how long the seat still runs, on the card itself.
+ * The rate is the one frozen into their rental — the listing price next to it can already
+ * have moved — and the countdown replaces an expiry timestamp nobody converts correctly.
+ * It ticks once a minute, which is as fast as a day/hour readout can ever change.
+ */
+export function RentalTermLine({
+  subscription,
+  className,
+}: {
+  subscription: ShareMarketSubscription;
+  className?: string;
+}) {
+  const { locale, t } = useLocaleText();
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
+
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const progress = rentalTermProgress(subscription, nowMs);
+  const remaining = progress.pending
+    ? t("account.share.activationPending")
+    : progress.expired
+      ? t("shareMarket.serviceDuration.expired")
+      : progress.days != null
+        ? t("shareMarket.serviceDuration.remainingDays", { count: progress.days })
+        : progress.hours != null
+          ? t("shareMarket.serviceDuration.remainingHours", { count: progress.hours })
+          : t("shareMarket.serviceDuration.permanent");
+  const urgent = progress.expired || progress.hours != null || (progress.days ?? 99) <= 2;
+
+  return (
+    <p className={cn("flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[10px] leading-4 text-slate-500", className)}>
+      <strong className="font-semibold tabular-nums text-slate-700">{rentalPrice(subscription, locale, t)}</strong>
+      <span>{rentalServiceTerm(subscription, t)}</span>
+      <span className={cn("tabular-nums", urgent ? "font-medium text-amber-700" : null)}>{remaining}</span>
+    </p>
+  );
 }
 
 function historyNote(subscription: ShareMarketSubscription, locale: string, t: Translate) {

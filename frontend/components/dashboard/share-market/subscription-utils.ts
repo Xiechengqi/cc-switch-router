@@ -55,6 +55,44 @@ export function sortShareMarketSubscriptions(
   );
 }
 
+export type RentalTermProgress = {
+  /** No expiry set: the seat runs until one side ends it. */
+  permanent: boolean;
+  /** Service has not started yet, so there is nothing to count down. */
+  pending: boolean;
+  /** Whole days left, when more than a day remains. */
+  days?: number;
+  /** Whole hours left, used inside the final day so the number keeps moving. */
+  hours?: number;
+  /** The term is already over. */
+  expired: boolean;
+};
+
+/**
+ * Turns the frozen term into what a rider actually wants to know: how much is left.
+ * The card already prints the expiry timestamp; a raw date makes people do arithmetic,
+ * and people do that arithmetic wrong right before a seat lapses. Hours are used inside
+ * the last day so the number visibly moves when it matters most.
+ */
+export function rentalTermProgress(
+  subscription: Pick<ShareMarketSubscription, "serviceStartedAt" | "expiresAt">,
+  nowMs: number,
+): RentalTermProgress {
+  if (!subscription.expiresAt) {
+    return { permanent: true, pending: !subscription.serviceStartedAt, expired: false };
+  }
+  const expiresAtMs = Date.parse(subscription.expiresAt);
+  if (!Number.isFinite(expiresAtMs)) {
+    return { permanent: false, pending: !subscription.serviceStartedAt, expired: false };
+  }
+  const remainingMs = expiresAtMs - nowMs;
+  if (remainingMs <= 0) return { permanent: false, pending: false, expired: true };
+  const hours = Math.floor(remainingMs / 3_600_000);
+  return hours >= 24
+    ? { permanent: false, pending: false, expired: false, days: Math.floor(hours / 24) }
+    : { permanent: false, pending: false, expired: false, hours: Math.max(1, hours) };
+}
+
 export function partitionShareMarketSubscriptions(subscriptions: ShareMarketSubscription[]) {
   const attention: ShareMarketSubscription[] = [];
   const active: ShareMarketSubscription[] = [];
