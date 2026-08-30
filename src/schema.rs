@@ -124,6 +124,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         33,
         include_str!("../schema/0033_request_usage_semantics.sql"),
     ),
+    (
+        34,
+        include_str!("../schema/0034_share_market_seat_trial.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1134,8 +1138,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 33);
-        check_compatibility(&conn).expect("upgraded version 33 is compatible");
+        assert_eq!(latest_version, 34);
+        check_compatibility(&conn).expect("upgraded version 34 is compatible");
     }
 
     #[test]
@@ -1197,7 +1201,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 33);
+        assert_eq!(latest_version, 34);
     }
 
     #[test]
@@ -1377,7 +1381,78 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 33);
+        assert_eq!(latest_version, 34);
+    }
+
+    #[test]
+    fn migration_34_backfills_paid_seat_trial_hours() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 33);
+        conn.execute_batch(
+            "INSERT INTO share_market_listings
+                (id, share_id, installation_id, owner_user_id, owner_email, status,
+                 created_at, updated_at)
+             VALUES ('listing-trial', 'share-trial', 'installation-trial', 'owner',
+                     'owner@example.com', 'active', 'now', 'now');
+             INSERT INTO share_market_seats
+                (id, listing_id, position, status, token_period_json, daily_rate_minor,
+                 currency, offer_revision, created_at, updated_at)
+             VALUES
+                ('seat-paid', 'listing-trial', 1, 'available', '\"day\"', 1200, 'USD', 1,
+                 'now', 'now'),
+                ('seat-free', 'listing-trial', 2, 'available', '\"day\"', NULL, NULL, 1,
+                 'now', 'now');
+             INSERT INTO share_market_subscriptions
+                (id, seat_id, listing_id, share_id, installation_id, entitlement_id,
+                 owner_user_id, owner_email, renter_user_id, renter_email, status,
+                 token_period_json, daily_rate_minor, currency, offer_revision,
+                 created_at, updated_at)
+             VALUES
+                ('sub-paid', 'seat-paid', 'listing-trial', 'share-trial',
+                 'installation-trial', 'entitlement-paid', 'owner', 'owner@example.com',
+                 'renter', 'renter@example.com', 'released', '\"day\"', 1200, 'USD', 1,
+                 'now', 'now'),
+                ('sub-free', 'seat-free', 'listing-trial', 'share-trial',
+                 'installation-trial', 'entitlement-free', 'owner', 'owner@example.com',
+                 'renter-free', 'free@example.com', 'released', '\"day\"', NULL, NULL, 1,
+                 'now', 'now');",
+        )
+        .expect("seed paid and free Share seats before trial migration");
+
+        apply(&conn).expect("upgrade to seat trial columns");
+
+        let paid_hours: Option<i64> = conn
+            .query_row(
+                "SELECT trial_hours FROM share_market_seats WHERE id = 'seat-paid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read paid seat trial hours");
+        let free_hours: Option<i64> = conn
+            .query_row(
+                "SELECT trial_hours FROM share_market_seats WHERE id = 'seat-free'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read free seat trial hours");
+        let paid_sub_hours: Option<i64> = conn
+            .query_row(
+                "SELECT trial_hours FROM share_market_subscriptions WHERE id = 'sub-paid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read paid subscription trial hours");
+        let free_sub_hours: Option<i64> = conn
+            .query_row(
+                "SELECT trial_hours FROM share_market_subscriptions WHERE id = 'sub-free'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read free subscription trial hours");
+        assert_eq!(paid_hours, Some(12));
+        assert_eq!(free_hours, None);
+        assert_eq!(paid_sub_hours, Some(12));
+        assert_eq!(free_sub_hours, None);
     }
 
     #[test]

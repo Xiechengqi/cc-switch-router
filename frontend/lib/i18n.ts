@@ -106,7 +106,7 @@ export const messages = {
       "Compare Shares by provider, occupancy, supported apps, terms, and service quality.",
     "shareMarket.catalog.rented": "Already rented",
     "shareMarket.catalog.modelUnknown": "Unknown",
-    "shareMarket.catalog.trial": "First {hours}h free",
+    "shareMarket.catalog.trial": "Paid seats can include a free healthy-service window",
     "shareMarket.catalog.performanceSamples":
       "TTFT: {ttft} samples · TPS: {tps} samples",
     "shareMarket.catalog.uptime24h": "24h uptime",
@@ -278,7 +278,9 @@ export const messages = {
     "shareMarket.rentConfirm.expired": "This frozen quote has expired. Refresh it before confirming.",
     "shareMarket.rentConfirm.requote": "Refresh quote",
     "shareMarket.rentConfirm.postpaid":
-      "The first {hours} hours of healthy service are free and do not create charges. After that, usage accrues on this Owner account at the daily rate. When this Owner's credit threshold is reached, one payable invoice may combine multiple Share and Client Host services.",
+      "The first {hours} hours of healthy service are free and do not create charges{tokens}. After that, usage accrues on this Owner account at the daily rate. When this Owner's credit threshold is reached, one payable invoice may combine multiple Share and Client Host services.",
+    "shareMarket.rentConfirm.trialTokens":
+      ", with a free trial token quota of {tokens}",
     "shareMarket.rentConfirm.freeBilling":
       "This seat is free and does not create credit charges.",
     "shareMarket.rentConfirm.remainingTrial":
@@ -428,8 +430,11 @@ export const messages = {
     "shareMarket.confirm.deleteFailedDescription":
       "The failed seat will be hidden from this listing. Rental, billing, control, and audit history remains available.",
     "shareMarket.error.positiveInteger": "{field} must be a positive integer.",
+    "shareMarket.error.nonNegativeInteger": "{field} must be an integer greater than or equal to 0.",
     "shareMarket.error.positiveMillions":
       "{field} must be a positive M amount with no more than six decimal places.",
+    "shareMarket.error.nonNegativeMillions":
+      "{field} must be a M amount of 0 or more with no more than six decimal places.",
     "shareMarket.error.price":
       "Price must be greater than zero with no more than two decimal places.",
     "shareMarket.error.priceRange": "Daily price cannot exceed USD 1,000,000.00.",
@@ -519,6 +524,8 @@ export const messages = {
     "shareMarket.dialog.paidMode": "Paid",
     "shareMarket.dialog.amount": "Daily price",
     "shareMarket.dialog.currency": "Currency",
+    "shareMarket.dialog.trialHours": "Free trial hours",
+    "shareMarket.dialog.trialTokenLimit": "Free trial tokens (M)",
     "shareMarket.dialog.unlimited": "Unlimited",
     "shareMarket.dialog.shareCapacity": "Share-wide ceiling",
     "shareMarket.dialog.capacityParallel": "Parallel {value}",
@@ -3212,7 +3219,7 @@ export const messages = {
       "按供应商、空闲车位、支持的 App、使用条款和服务质量比较 Share。",
     "shareMarket.catalog.rented": "已租用",
     "shareMarket.catalog.modelUnknown": "未知",
-    "shareMarket.catalog.trial": "前 {hours} 小时免费",
+    "shareMarket.catalog.trial": "付费拼车位可设置健康服务免费试用窗口",
     "shareMarket.catalog.performanceSamples":
       "TTFT：{ttft} 个样本 · TPS：{tps} 个样本",
     "shareMarket.catalog.uptime24h": "24h 在线率",
@@ -3383,7 +3390,9 @@ export const messages = {
     "shareMarket.rentConfirm.expired": "该冻结报价已失效，请刷新报价后再确认。",
     "shareMarket.rentConfirm.requote": "刷新报价",
     "shareMarket.rentConfirm.postpaid":
-      "前 {hours} 小时健康服务时间免费且不产生费用；之后按实际健康服务时间和日费累计到该 Owner 的赊账账户。用满该 Owner 授予的信用额度后生成应付账单，一张账单可能合并多个 Share 和 Client Host 服务。",
+      "前 {hours} 小时健康服务时间免费且不产生费用{tokens}；之后按实际健康服务时间和日费累计到该 Owner 的赊账账户。用满该 Owner 授予的信用额度后生成应付账单，一张账单可能合并多个 Share 和 Client Host 服务。",
+    "shareMarket.rentConfirm.trialTokens":
+      "，试用 Token 额度为 {tokens}",
     "shareMarket.rentConfirm.freeBilling": "该拼车位免费，不会产生赊账费用。",
     "shareMarket.rentConfirm.remainingTrial":
       "你在该卖家和 Share 下还剩 {hours} 小时健康服务试用；用完后才开始计费。",
@@ -3531,8 +3540,11 @@ export const messages = {
     "shareMarket.confirm.deleteFailedDescription":
       "该失败拼车位会从挂售中隐藏；租用、账务、控制和审计历史都会保留。",
     "shareMarket.error.positiveInteger": "{field} 必须是正整数。",
+    "shareMarket.error.nonNegativeInteger": "{field} 必须是大于等于 0 的整数。",
     "shareMarket.error.positiveMillions":
       "{field} 必须是正数百万 Token（百万），且最多保留 6 位小数。",
+    "shareMarket.error.nonNegativeMillions":
+      "{field} 必须是大于等于 0 的百万 Token（百万），且最多保留 6 位小数。",
     "shareMarket.error.price": "价格必须大于 0，且最多保留两位小数。",
     "shareMarket.error.priceRange": "每日价格不能超过 USD 1,000,000.00。",
     "shareMarket.error.currency": "币种仅支持 USD。",
@@ -3619,6 +3631,8 @@ export const messages = {
     "shareMarket.dialog.paidMode": "付费",
     "shareMarket.dialog.amount": "每日价格",
     "shareMarket.dialog.currency": "币种",
+    "shareMarket.dialog.trialHours": "免费试用时间(小时)",
+    "shareMarket.dialog.trialTokenLimit": "免费试用Token额度（百万）",
     "shareMarket.dialog.unlimited": "不限",
     "shareMarket.dialog.shareCapacity": "Share 总上限",
     "shareMarket.dialog.capacityParallel": "并发 {value}",

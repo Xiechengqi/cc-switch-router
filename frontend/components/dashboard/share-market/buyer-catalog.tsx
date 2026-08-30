@@ -226,6 +226,7 @@ function SeatChoice({ seat, selected, onSelect }: { seat: ShareMarketSeat; selec
         </span>
         <span className="mt-0.5 block text-slate-500">
           {seat.serviceDurationDays == null ? t("shareMarket.serviceDuration.permanent") : t("shareMarket.serviceDuration.daysValue", { count: seat.serviceDurationDays })}
+          {!seat.isFree && seat.trialHours != null ? ` · ${t("shareMarket.dialog.trialHours")} ${seat.trialHours}` : ""}
         </span>
       </span>
       <strong className="shrink-0 text-sm tabular-nums">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</strong>
@@ -478,7 +479,7 @@ export function ShareMarketBuyerCatalog({
       */}
       <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] leading-5 text-slate-600">
         <Clock3 className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden />
-        <strong className="font-semibold text-slate-800">{t("shareMarket.catalog.trial", { hours: catalog.trialHours })}</strong>
+        <strong className="font-semibold text-slate-800">{t("shareMarket.catalog.trial")}</strong>
         <span className="text-slate-300" aria-hidden>·</span>
         <span className="min-w-0">{t("shareMarket.catalog.postpaidHint")}</span>
         <span className="ml-auto shrink-0 tabular-nums text-slate-400">{t("shareMarket.catalog.listingCount", { count: filteredListings.length })}</span>
@@ -613,7 +614,7 @@ export function ShareMarketBuyerCatalog({
                     <dt className="text-slate-500">{t("shareMarket.catalog.serviceTerm")}</dt><dd>{rentTarget.quote.offer.serviceDurationDays == null ? t("shareMarket.serviceDuration.permanent") : t("shareMarket.serviceDuration.daysValue", { count: rentTarget.quote.offer.serviceDurationDays })}</dd>
                     <dt className="text-slate-500">{t("shareMarket.dialog.amount")}</dt><dd className="font-medium">{formatSeatPrice({ isFree: rentTarget.quote.offer.dailyRateMinor == null, dailyRateMinor: rentTarget.quote.offer.dailyRateMinor }, locale, t("shareMarket.free"), t("marketBilling.day"))}</dd>
                   </dl>
-                  <div className="flex gap-3 border-l-2 border-sky-400 bg-sky-50 px-3 py-2 text-sm leading-6 text-sky-950"><Clock3 className="mt-1 h-4 w-4 shrink-0" /><div><p>{rentTarget.quote.offer.dailyRateMinor == null ? t("shareMarket.rentConfirm.freeBilling") : t("shareMarket.rentConfirm.postpaid", { hours: catalog.trialHours })}</p>{rentTarget.quote.offer.dailyRateMinor != null ? <strong className="mt-1 block text-xs">{rentTarget.quote.trialSecondsRemaining > 0 ? t("shareMarket.rentConfirm.remainingTrial", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1) }) : t("shareMarket.rentConfirm.noTrial")}</strong> : null}</div></div>
+                  <div className="flex gap-3 border-l-2 border-sky-400 bg-sky-50 px-3 py-2 text-sm leading-6 text-sky-950"><Clock3 className="mt-1 h-4 w-4 shrink-0" /><div><p>{rentTarget.quote.offer.dailyRateMinor == null ? t("shareMarket.rentConfirm.freeBilling") : t("shareMarket.rentConfirm.postpaid", { hours: rentTarget.quote.offer.trialHours ?? catalog.trialHours, tokens: rentTarget.quote.offer.trialTokenLimit != null ? t("shareMarket.rentConfirm.trialTokens", { tokens: formatTokenMillions(rentTarget.quote.offer.trialTokenLimit, locale) }) : "" })}</p>{rentTarget.quote.offer.dailyRateMinor != null ? <strong className="mt-1 block text-xs">{rentTarget.quote.trialSecondsRemaining > 0 ? t("shareMarket.rentConfirm.remainingTrial", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1) }) : t("shareMarket.rentConfirm.noTrial")}</strong> : null}</div></div>
                   <div className="flex gap-3 border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-950"><CalendarClock className="mt-1 h-4 w-4 shrink-0" /><p>{rentTarget.quote.offer.serviceDurationDays == null ? t("shareMarket.rentConfirm.servicePermanent") : t("shareMarket.rentConfirm.serviceFixed", { days: rentTarget.quote.offer.serviceDurationDays })}</p></div>
                   <p className={cn("flex items-start gap-2 text-xs leading-5", quoteExpired ? "text-rose-700" : "text-slate-500")} title={t("shareMarket.rentConfirm.quoteExpiry", { time: new Intl.DateTimeFormat(locale, { timeStyle: "medium" }).format(new Date(rentTarget.quote.expiresAt)) })}><Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />{quoteExpired ? t("shareMarket.rentConfirm.expired") : t("shareMarket.rentConfirm.expiresIn", { seconds: quoteRemainingSeconds })}</p>
                   {error ? <p className="text-sm text-rose-700">{error}</p> : null}

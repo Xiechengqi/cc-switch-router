@@ -18,7 +18,8 @@ use crate::error::AppError;
 use crate::models::AuthSession;
 use crate::store::AppStore;
 
-pub const TRIAL_SECONDS: i64 = 12 * 60 * 60;
+pub const DEFAULT_TRIAL_HOURS: i64 = 12;
+pub const TRIAL_SECONDS: i64 = DEFAULT_TRIAL_HOURS * 3_600;
 pub(crate) const MARKET_CURRENCY: &str = "USD";
 pub(crate) const ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED: &str =
     "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED";
@@ -73,6 +74,7 @@ pub struct ActivateContractInput<'a> {
     pub daily_rate_minor: i64,
     pub offer_revision: i64,
     pub replacement_of: Option<&'a str>,
+    pub trial_allowance_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1816,16 +1818,14 @@ fn ensure_trial_ledger_tx(
             allowance_seconds, consumed_seconds, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
          ON CONFLICT(buyer_user_id, supplier_user_id, product_kind, service_ref, currency)
-         DO UPDATE SET allowance_seconds = MAX(market_trial_ledgers.allowance_seconds,
-                                                excluded.allowance_seconds),
-                       updated_at = excluded.updated_at",
+         DO UPDATE SET updated_at = excluded.updated_at",
         params![
             input.buyer_user_id,
             input.supplier_user_id,
             input.product_kind,
             input.service_ref,
             input.currency,
-            TRIAL_SECONDS,
+            input.trial_allowance_seconds.max(0),
             now,
         ],
     )
@@ -1854,6 +1854,7 @@ pub(crate) fn trial_seconds_remaining_tx(
     product_kind: &str,
     service_ref: &str,
     currency: &str,
+    seat_trial_seconds: i64,
 ) -> Result<i64, AppError> {
     let remaining = tx
         .query_row(
@@ -1873,7 +1874,11 @@ pub(crate) fn trial_seconds_remaining_tx(
         )
         .optional()
         .map_err(map_db("read market trial balance"))?;
-    Ok(remaining.unwrap_or(TRIAL_SECONDS).clamp(0, TRIAL_SECONDS))
+    let seat_trial_seconds = seat_trial_seconds.max(0);
+    Ok(remaining
+        .unwrap_or(seat_trial_seconds)
+        .max(0)
+        .min(seat_trial_seconds))
 }
 
 fn free_usage_allowance_seconds(free_duration_days: u32) -> Result<i64, AppError> {
@@ -7409,6 +7414,7 @@ mod tests {
                     daily_rate_minor,
                     offer_revision: 1,
                     replacement_of: None,
+                    trial_allowance_seconds: TRIAL_SECONDS,
                 },
                 now,
             )
@@ -7444,6 +7450,7 @@ mod tests {
                 daily_rate_minor,
                 offer_revision: 1,
                 replacement_of: None,
+                trial_allowance_seconds: TRIAL_SECONDS,
             },
             TRIAL_SECONDS,
             &now,
@@ -7979,6 +7986,7 @@ mod tests {
                     daily_rate_minor: 100,
                     offer_revision: 1,
                     replacement_of: None,
+                    trial_allowance_seconds: TRIAL_SECONDS,
                 },
                 now,
             )
@@ -9032,6 +9040,7 @@ mod tests {
                     daily_rate_minor: 500,
                     offer_revision: 1,
                     replacement_of: None,
+                    trial_allowance_seconds: TRIAL_SECONDS,
                 },
                 Utc::now(),
             )

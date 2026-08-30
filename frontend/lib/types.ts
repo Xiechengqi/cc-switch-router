@@ -2385,6 +2385,8 @@ export type ShareMarketSeatInput = {
   dailyRateMinor?: number;
   currency?: "USD";
   serviceDurationDays?: number;
+  trialHours?: number;
+  trialTokenLimit?: number;
 };
 
 export type ShareMarketSubscription = {
@@ -2412,6 +2414,8 @@ export type ShareMarketSubscription = {
   dailyRateMinor?: number;
   currency?: "USD";
   serviceDurationDays?: number;
+  trialHours?: number;
+  trialTokenLimit?: number;
   offerRevision: number;
   activatedAt?: string;
   serviceStartedAt?: string;
@@ -2660,6 +2664,8 @@ export type ShareMarketRentQuote = {
     dailyRateMinor?: number;
     currency?: "USD";
     serviceDurationDays?: number;
+    trialHours?: number;
+    trialTokenLimit?: number;
     offerRevision: number;
     service: ShareMarketRentService;
   };

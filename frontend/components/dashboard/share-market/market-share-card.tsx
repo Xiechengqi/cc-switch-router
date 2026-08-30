@@ -83,16 +83,20 @@ export function MarketShareCardMetric({
 }
 
 function compactSeatTerms(
-  seat: Pick<ShareMarketSeat, "parallelLimit" | "tokenLimit" | "tokenPeriod">,
+  seat: Pick<ShareMarketSeat, "parallelLimit" | "tokenLimit" | "tokenPeriod" | "isFree" | "trialHours">,
   locale: string,
   unlimited: string,
   periodLabel: string,
+  trialLabel?: string,
 ) {
   const parallel = seat.parallelLimit == null ? "P∞" : `P${seat.parallelLimit}`;
   const tokens = seat.tokenLimit == null
     ? unlimited
     : `${formatTokenMillions(seat.tokenLimit, locale)}/${periodLabel}`;
-  return `${parallel} · ${tokens}`;
+  const trial = !seat.isFree && seat.trialHours != null && trialLabel
+    ? ` · ${trialLabel}`
+    : "";
+  return `${parallel} · ${tokens}${trial}`;
 }
 
 export function CatalogSeatPreview({
@@ -122,7 +126,13 @@ export function CatalogSeatPreview({
         </span>
       ) : null}
       <span className="truncate text-slate-500">
-        {compactSeatTerms(seat, locale, t("common.unlimited"), t(`shareMarket.period.${seat.tokenPeriod}`))}
+        {compactSeatTerms(
+          seat,
+          locale,
+          t("common.unlimited"),
+          t(`shareMarket.period.${seat.tokenPeriod}`),
+          seat.trialHours != null ? `${seat.trialHours}h` : undefined,
+        )}
       </span>
       <strong className="shrink-0 tabular-nums text-slate-800">
         {formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}

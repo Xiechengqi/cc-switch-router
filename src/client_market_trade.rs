@@ -4692,6 +4692,7 @@ pub(crate) fn complete_provisioning_tx(
                 daily_rate_minor,
                 offer_revision: revision,
                 replacement_of: None,
+                trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
             },
             &now.to_rfc3339(),
         )?;
@@ -5474,6 +5475,7 @@ mod tests {
                     daily_rate_minor: 500,
                     offer_revision: 1,
                     replacement_of: None,
+                    trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
                 },
                 now,
             )
@@ -5595,6 +5597,7 @@ mod tests {
                     daily_rate_minor: 500,
                     offer_revision: 1,
                     replacement_of: None,
+                    trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
                 },
                 Utc::now(),
             )

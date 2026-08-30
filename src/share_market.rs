@@ -27,7 +27,9 @@ use crate::models::{
 };
 use crate::store::AppStore;
 
-const TRIAL_HOURS: i64 = crate::market_billing::TRIAL_SECONDS / 3_600;
+const DEFAULT_TRIAL_HOURS: i64 = crate::market_billing::DEFAULT_TRIAL_HOURS;
+const DEFAULT_TRIAL_TOKEN_LIMIT: u64 = 1_000_000;
+const MAX_TRIAL_HOURS: i64 = 100_000;
 const SERVICE_CYCLE_SECS: u64 = 5;
 const MAX_SEATS_PER_LISTING: usize = 20;
 pub(crate) const ERROR_SHARE_MARKET_PAYMENT_PROFILE_REQUIRED: &str =
@@ -322,6 +324,10 @@ pub struct SeatView {
     pub daily_rate_minor: Option<i64>,
     pub currency: Option<String>,
     pub service_duration_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_hours: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_limit: Option<u64>,
     pub offer_revision: i64,
     pub is_free: bool,
     pub can_rent: bool,
@@ -372,6 +378,10 @@ pub struct SubscriptionView {
     pub daily_rate_minor: Option<i64>,
     pub currency: Option<String>,
     pub service_duration_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_hours: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,6 +487,10 @@ pub struct SeatInput {
     pub currency: Option<String>,
     #[serde(default)]
     pub service_duration_days: Option<u32>,
+    #[serde(default)]
+    pub trial_hours: Option<i64>,
+    #[serde(default)]
+    pub trial_token_limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -626,6 +640,10 @@ pub struct RentQuoteSnapshot {
     pub daily_rate_minor: Option<i64>,
     pub currency: Option<String>,
     pub service_duration_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_hours: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_limit: Option<u64>,
     pub offer_revision: i64,
     pub service: RentServiceSnapshot,
 }
@@ -640,6 +658,8 @@ struct RentOfferTerms {
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
     service_duration_days: Option<u32>,
+    trial_hours: Option<i64>,
+    trial_token_limit: Option<u64>,
 }
 
 impl RentOfferTerms {
@@ -653,6 +673,8 @@ impl RentOfferTerms {
             daily_rate_minor: snapshot.daily_rate_minor,
             currency: snapshot.currency.clone(),
             service_duration_days: snapshot.service_duration_days,
+            trial_hours: snapshot.trial_hours,
+            trial_token_limit: snapshot.trial_token_limit,
         }
     }
 }
@@ -732,6 +754,8 @@ struct NormalizedSeat {
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
     service_duration_days: Option<u32>,
+    trial_hours: Option<i64>,
+    trial_token_limit: Option<u64>,
 }
 
 impl NormalizedSeat {
@@ -877,6 +901,11 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         .filter(|value| !value.is_empty());
     let pricing_empty = daily_rate_minor.is_none() && currency.is_none();
     if pricing_empty {
+        if input.trial_hours.is_some() || input.trial_token_limit.is_some() {
+            return Err(AppError::BadRequest(
+                "trial hours and trial token limit apply only to paid seats".into(),
+            ));
+        }
         return Ok(NormalizedSeat {
             parallel_limit: input.parallel_limit,
             token_limit: input.token_limit,
@@ -884,6 +913,8 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             daily_rate_minor: None,
             currency: None,
             service_duration_days: input.service_duration_days,
+            trial_hours: None,
+            trial_token_limit: None,
         });
     }
     let daily_rate_minor = daily_rate_minor.ok_or_else(|| {
@@ -898,6 +929,18 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
     if currency != crate::market_billing::MARKET_CURRENCY {
         return Err(AppError::BadRequest("currency must be USD".into()));
     }
+    let trial_hours = input.trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS);
+    if !(0..=MAX_TRIAL_HOURS).contains(&trial_hours) {
+        return Err(AppError::BadRequest(format!(
+            "trialHours must be an integer between 0 and {MAX_TRIAL_HOURS}"
+        )));
+    }
+    let trial_token_limit = input.trial_token_limit.unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT);
+    if trial_token_limit > i64::MAX as u64 {
+        return Err(AppError::BadRequest(
+            "trial token limit is too large".into(),
+        ));
+    }
     Ok(NormalizedSeat {
         parallel_limit: input.parallel_limit,
         token_limit: input.token_limit,
@@ -905,7 +948,15 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         daily_rate_minor: Some(daily_rate_minor),
         currency: Some(currency),
         service_duration_days: input.service_duration_days,
+        trial_hours: Some(trial_hours),
+        trial_token_limit: Some(trial_token_limit),
     })
+}
+
+fn trial_seconds_from_hours(hours: i64) -> Result<i64, AppError> {
+    hours
+        .checked_mul(3_600)
+        .ok_or_else(|| AppError::BadRequest("trialHours is too large".into()))
 }
 
 fn validate_seat_share_capacity(
@@ -1747,9 +1798,7 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
         parallel_limit: record
             .parallel_limit
             .and_then(|value| u32::try_from(value).ok()),
-        token_limit: record
-            .token_limit
-            .and_then(|value| u64::try_from(value).ok()),
+        token_limit: grant_token_limit(record),
         token_period,
         token_period_anchor_at_ms: service_started_at
             .and_then(|started_at| token_period_anchor_at_ms(token_period, started_at)),
@@ -1761,6 +1810,28 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
             .map(|value| value.timestamp_millis()),
         allowed_apps: market_allowed_apps(),
     })
+}
+
+fn grant_token_limit(record: &SubscriptionRecord) -> Option<u64> {
+    if should_apply_trial_tokens(record) {
+        return record
+            .trial_token_limit
+            .and_then(|value| u64::try_from(value).ok())
+            .or_else(|| record.token_limit.and_then(|value| u64::try_from(value).ok()));
+    }
+    record
+        .token_limit
+        .and_then(|value| u64::try_from(value).ok())
+}
+
+fn should_apply_trial_tokens(record: &SubscriptionRecord) -> bool {
+    if record.daily_rate_minor.is_none() || record.trial_hours.unwrap_or(0) <= 0 {
+        return false;
+    }
+    match record.contract_trial_seconds_remaining {
+        Some(remaining) => remaining > 0,
+        None => matches!(record.status.as_str(), SUB_GRANT_PENDING),
+    }
 }
 
 fn active_grant_has_contract_scope(grants_json: Option<&str>, record: &SubscriptionRecord) -> bool {
@@ -2874,7 +2945,8 @@ fn share_seat_event_snapshot_tx(
     let row = conn
         .query_row(
             "SELECT position, status, parallel_limit, token_limit, token_period_json,
-                    daily_rate_minor, currency, service_duration_days, offer_revision, retired_at
+                    daily_rate_minor, currency, service_duration_days, trial_hours,
+                    trial_token_limit, offer_revision, retired_at
              FROM share_market_seats WHERE id = ?1",
             params![seat_id],
             |row| {
@@ -2887,8 +2959,10 @@ fn share_seat_event_snapshot_tx(
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
@@ -2904,6 +2978,8 @@ fn share_seat_event_snapshot_tx(
             daily_rate_minor,
             currency,
             service_duration_days,
+            trial_hours,
+            trial_token_limit,
             offer_revision,
             retired_at,
         )| {
@@ -2916,6 +2992,8 @@ fn share_seat_event_snapshot_tx(
                 "dailyRateMinor": daily_rate_minor,
                 "currency": currency,
                 "serviceDurationDays": service_duration_days,
+                "trialHours": trial_hours,
+                "trialTokenLimit": trial_token_limit,
                 "offerRevision": offer_revision,
                 "retiredAt": retired_at,
             });
@@ -2936,7 +3014,8 @@ fn share_subscription_event_snapshot_tx(
         .query_row(
             "SELECT owner_user_id, owner_email, renter_user_id, renter_email, status,
                     parallel_limit, token_limit, token_period_json, daily_rate_minor,
-                    currency, service_duration_days, offer_revision, release_reason, created_at,
+                    currency, service_duration_days, trial_hours, trial_token_limit,
+                    offer_revision, release_reason, created_at,
                     activated_at, expires_at, released_at
              FROM share_market_subscriptions WHERE id = ?1",
             params![subscription_id],
@@ -2953,12 +3032,14 @@ fn share_subscription_event_snapshot_tx(
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, Option<i64>>(10)?,
-                    row.get::<_, i64>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, String>(13)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, i64>(13)?,
                     row.get::<_, Option<String>>(14)?,
-                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, String>(15)?,
                     row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             },
         )
@@ -2977,6 +3058,8 @@ fn share_subscription_event_snapshot_tx(
             daily_rate_minor,
             currency,
             service_duration_days,
+            trial_hours,
+            trial_token_limit,
             offer_revision,
             release_reason,
             created_at,
@@ -3014,6 +3097,8 @@ fn share_subscription_event_snapshot_tx(
                 "dailyRateMinor": daily_rate_minor,
                 "currency": currency,
                 "serviceDurationDays": service_duration_days,
+                "trialHours": trial_hours,
+                "trialTokenLimit": trial_token_limit,
                 "offerRevision": offer_revision,
                 "releaseReason": release_reason,
                 "createdAt": created_at,
@@ -3752,6 +3837,9 @@ struct SubscriptionRecord {
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
     service_duration_days: Option<u32>,
+    trial_hours: Option<i64>,
+    trial_token_limit: Option<i64>,
+    contract_trial_seconds_remaining: Option<i64>,
     offer_revision: i64,
     release_reason: Option<String>,
     failure_code: Option<String>,
@@ -3891,7 +3979,13 @@ fn subscription_record(
                 sub.contract_apps_json, sub.app_scope_enforced_at,
                 COALESCE(CASE WHEN json_valid(sub.service_snapshot_json)
                     THEN CAST(json_extract(sub.service_snapshot_json, '$.schemaVersion') AS INTEGER)
-                    END, 0)
+                    END, 0),
+                sub.trial_hours, sub.trial_token_limit,
+                (SELECT contract.trial_seconds_remaining
+                 FROM market_service_contracts contract
+                 WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                   AND contract.status != 'terminated'
+                 ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -3940,6 +4034,9 @@ fn subscription_record(
                 contract_apps_json: row.get(37)?,
                 app_scope_enforced_at: row.get(38)?,
                 service_schema_version: row.get::<_, i64>(39)?.try_into().unwrap_or_default(),
+                trial_hours: row.get(40)?,
+                trial_token_limit: row.get(41)?,
+                contract_trial_seconds_remaining: row.get(42)?,
             })
         },
     )
@@ -4110,7 +4207,13 @@ fn catalog_subscription_records(
                 sub.contract_apps_json, sub.app_scope_enforced_at,
                 COALESCE(CASE WHEN json_valid(sub.service_snapshot_json)
                     THEN CAST(json_extract(sub.service_snapshot_json, '$.schemaVersion') AS INTEGER)
-                    END, 0)
+                    END, 0),
+                sub.trial_hours, sub.trial_token_limit,
+                (SELECT contract.trial_seconds_remaining
+                 FROM market_service_contracts contract
+                 WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                   AND contract.status != 'terminated'
+                 ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -4165,6 +4268,9 @@ fn catalog_subscription_records(
                             .get::<_, i64>(39)?
                             .try_into()
                             .unwrap_or_default(),
+                        trial_hours: row.get(40)?,
+                        trial_token_limit: row.get(41)?,
+                        contract_trial_seconds_remaining: row.get(42)?,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -4184,6 +4290,8 @@ struct CatalogSeatRecord {
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
     service_duration_days: Option<i64>,
+    trial_hours: Option<i64>,
+    trial_token_limit: Option<i64>,
     offer_revision: i64,
     current_subscription_id: Option<String>,
     retired_subscription_id: Option<String>,
@@ -4401,6 +4509,7 @@ fn catalog_seats(
         "SELECT seat.listing_id, seat.id, seat.position, seat.status,
                 seat.parallel_limit, seat.token_limit, seat.token_period_json,
                 seat.daily_rate_minor, seat.currency, seat.service_duration_days,
+                seat.trial_hours, seat.trial_token_limit,
                 seat.offer_revision, seat.current_subscription_id,
                 seat.retired_subscription_id, seat.retired_at,
                 (SELECT COUNT(*) FROM share_market_subscriptions subscription
@@ -4432,11 +4541,13 @@ fn catalog_seats(
                             daily_rate_minor: row.get(7)?,
                             currency: row.get(8)?,
                             service_duration_days: row.get(9)?,
-                            offer_revision: row.get(10)?,
-                            current_subscription_id: row.get(11)?,
-                            retired_subscription_id: row.get(12)?,
-                            retired_at: row.get(13)?,
-                            subscription_count: row.get(14)?,
+                            trial_hours: row.get(10)?,
+                            trial_token_limit: row.get(11)?,
+                            offer_revision: row.get(12)?,
+                            current_subscription_id: row.get(13)?,
+                            retired_subscription_id: row.get(14)?,
+                            retired_at: row.get(15)?,
+                            subscription_count: row.get(16)?,
                         },
                     ))
                 })?
@@ -4993,6 +5104,10 @@ fn subscription_view(
         daily_rate_minor: record.daily_rate_minor,
         currency: record.currency,
         service_duration_days: record.service_duration_days,
+        trial_hours: record.trial_hours,
+        trial_token_limit: record
+            .trial_token_limit
+            .and_then(|value| u64::try_from(value).ok()),
         activated_at: record.activated_at,
         service_started_at: record.service_started_at,
         expires_at: record.expires_at,
@@ -5589,6 +5704,20 @@ impl AppStore {
                     service_duration_days: seat
                         .service_duration_days
                         .and_then(|value| u32::try_from(value).ok()),
+                    trial_hours: if seat.daily_rate_minor.is_some() {
+                        Some(seat.trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
+                    } else {
+                        None
+                    },
+                    trial_token_limit: if seat.daily_rate_minor.is_some() {
+                        Some(
+                            seat.trial_token_limit
+                                .and_then(|value| u64::try_from(value).ok())
+                                .unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT),
+                        )
+                    } else {
+                        None
+                    },
                     offer_revision: seat.offer_revision,
                     is_free: seat.daily_rate_minor.is_none(),
                     can_rent,
@@ -5690,7 +5819,7 @@ impl AppStore {
         Ok(ShareMarketCatalog {
             listings,
             my_subscriptions,
-            trial_hours: TRIAL_HOURS,
+            trial_hours: DEFAULT_TRIAL_HOURS,
         })
     }
 }
@@ -5909,8 +6038,9 @@ fn insert_seat_tx(
         "INSERT INTO share_market_seats (
             id, listing_id, position, status, parallel_limit, token_limit,
             token_period_json, daily_rate_minor, currency, service_duration_days,
+            trial_hours, trial_token_limit,
             offer_revision, current_subscription_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, 'available', ?4, ?5, ?6, ?7, ?8, ?9, 1, NULL, ?10, ?10)",
+         ) VALUES (?1, ?2, ?3, 'available', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, NULL, ?12, ?12)",
         params![
             id,
             listing_id,
@@ -5921,6 +6051,8 @@ fn insert_seat_tx(
             seat.daily_rate_minor,
             seat.currency,
             seat.service_duration_days.map(i64::from),
+            seat.trial_hours,
+            seat.trial_token_limit.and_then(|value| i64::try_from(value).ok()),
             now,
         ],
     )
@@ -6577,11 +6709,12 @@ impl AppStore {
                     "UPDATE share_market_seats
                      SET status = 'available', parallel_limit = ?3, token_limit = ?4,
                          token_period_json = ?5, daily_rate_minor = ?6, currency = ?7,
-                         service_duration_days = ?8, offer_revision = offer_revision + 1,
-                         updated_at = ?9
+                         service_duration_days = ?8, trial_hours = ?9, trial_token_limit = ?10,
+                         offer_revision = offer_revision + 1,
+                         updated_at = ?11
                      WHERE id = ?1 AND listing_id = ?2 AND status = 'disabled'
                        AND retired_at IS NULL AND current_subscription_id IS NULL
-                       AND offer_revision = ?10",
+                       AND offer_revision = ?12",
                     params![
                         seat_id,
                         listing_id,
@@ -6591,6 +6724,8 @@ impl AppStore {
                         seat.daily_rate_minor,
                         seat.currency,
                         seat.service_duration_days.map(i64::from),
+                        seat.trial_hours,
+                        seat.trial_token_limit.and_then(|value| i64::try_from(value).ok()),
                         now,
                         expected_revision,
                     ],
@@ -6777,8 +6912,9 @@ impl AppStore {
                 "UPDATE share_market_seats
              SET parallel_limit = ?2, token_limit = ?3, token_period_json = ?4,
                  daily_rate_minor = ?5, currency = ?6, service_duration_days = ?7,
-                 offer_revision = offer_revision + 1, updated_at = ?8
-             WHERE id = ?1 AND status = 'available' AND offer_revision = ?9",
+                 trial_hours = ?8, trial_token_limit = ?9,
+                 offer_revision = offer_revision + 1, updated_at = ?10
+             WHERE id = ?1 AND status = 'available' AND offer_revision = ?11",
                 params![
                     seat_id,
                     seat.parallel_limit.map(i64::from),
@@ -6787,6 +6923,8 @@ impl AppStore {
                     seat.daily_rate_minor,
                     seat.currency,
                     seat.service_duration_days.map(i64::from),
+                    seat.trial_hours,
+                    seat.trial_token_limit.and_then(|value| i64::try_from(value).ok()),
                     now,
                     input.offer_revision,
                 ],
@@ -7865,6 +8003,8 @@ impl AppStore {
             Option<i64>,
             Option<String>,
             Option<i64>,
+            Option<i64>,
+            Option<i64>,
             String,
             String,
             i64,
@@ -7882,7 +8022,8 @@ impl AppStore {
                         listing.owner_user_id, listing.owner_email, listing.status,
                         seat.position, seat.offer_revision, seat.parallel_limit, seat.token_limit,
                         seat.token_period_json, seat.daily_rate_minor, seat.currency,
-                        seat.service_duration_days, COALESCE(share.user_grants_json, '{}'),
+                        seat.service_duration_days, seat.trial_hours, seat.trial_token_limit,
+                        COALESCE(share.user_grants_json, '{}'),
                         COALESCE(share.bindings_json, '{}'),
                         COALESCE(share.enabled_claude, 0), COALESCE(share.enabled_codex, 0),
                         COALESCE(share.enabled_gemini, 0), share.app_runtimes_json,
@@ -7902,6 +8043,7 @@ impl AppStore {
                         row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
                         row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?,
                         row.get(20)?, row.get(21)?, row.get(22)?, row.get(23)?, row.get(24)?,
+                        row.get(25)?, row.get(26)?,
                     ))
                 },
             )
@@ -7922,6 +8064,8 @@ impl AppStore {
             daily_rate_minor,
             currency,
             service_duration_days,
+            trial_hours,
+            trial_token_limit,
             grants_json,
             bindings_json,
             enabled_claude,
@@ -7989,6 +8133,20 @@ impl AppStore {
             crate::market_access::PRODUCT_SHARE,
             crate::market_access::pricing_kind_for_rate(daily_rate_minor),
         )?;
+        let quoted_trial_hours = if daily_rate_minor.is_some() {
+            Some(trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
+        } else {
+            None
+        };
+        let quoted_trial_token_limit = if daily_rate_minor.is_some() {
+            Some(
+                trial_token_limit
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT),
+            )
+        } else {
+            None
+        };
         let trial_seconds_remaining = if daily_rate_minor.is_some() {
             let quote_currency = currency
                 .as_deref()
@@ -8008,6 +8166,7 @@ impl AppStore {
                 crate::market_access::PRODUCT_SHARE,
                 &share_id,
                 quote_currency,
+                trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
             )?
         } else {
             0
@@ -8077,6 +8236,8 @@ impl AppStore {
             currency,
             service_duration_days: service_duration_days
                 .and_then(|value| u32::try_from(value).ok()),
+            trial_hours: quoted_trial_hours,
+            trial_token_limit: quoted_trial_token_limit,
             offer_revision,
             service: service.clone(),
         };
@@ -8535,6 +8696,7 @@ impl AppStore {
                     daily_rate_minor,
                     offer_revision: record.offer_revision,
                     replacement_of: Some(&replacement_contract_id),
+                    trial_allowance_seconds: trial_seconds_from_hours(record.trial_hours.unwrap_or(0))?,
                 },
                 i64::MAX,
                 &now,
@@ -8629,6 +8791,8 @@ impl AppStore {
             Option<i64>,
             Option<String>,
             Option<i64>,
+            Option<i64>,
+            Option<i64>,
             String,
             String,
             String,
@@ -8649,6 +8813,7 @@ impl AppStore {
                         seat.offer_revision,
                         seat.parallel_limit, seat.token_limit, seat.token_period_json,
                         seat.daily_rate_minor, seat.currency, seat.service_duration_days,
+                        seat.trial_hours, seat.trial_token_limit,
                         COALESCE(s.user_grants_json, '{}'),
                         COALESCE(s.share_name, listing.share_id), listing.installation_id,
                         COALESCE(s.bindings_json, '{}'),
@@ -8692,6 +8857,8 @@ impl AppStore {
                         row.get(24)?,
                         row.get(25)?,
                         row.get(26)?,
+                        row.get(27)?,
+                        row.get(28)?,
                     ))
                 },
             )
@@ -8712,6 +8879,8 @@ impl AppStore {
             daily_rate_minor,
             currency,
             service_duration_days,
+            trial_hours,
+            trial_token_limit,
             grants_json,
             share_name,
             installation_id,
@@ -8813,6 +8982,20 @@ impl AppStore {
         };
         let token_period: ShareTokenPeriod = serde_json::from_str(&token_period_json)
             .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
+        let rented_trial_hours = if daily_rate_minor.is_some() {
+            Some(trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
+        } else {
+            None
+        };
+        let rented_trial_token_limit = if daily_rate_minor.is_some() {
+            Some(
+                trial_token_limit
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT),
+            )
+        } else {
+            None
+        };
         let current_offer_terms = RentOfferTerms {
             owner_email: owner_email.to_ascii_lowercase(),
             seat_position,
@@ -8822,6 +9005,8 @@ impl AppStore {
             daily_rate_minor,
             currency: currency.clone(),
             service_duration_days,
+            trial_hours: rented_trial_hours,
+            trial_token_limit: rented_trial_token_limit,
         };
         let current_service = build_rent_service_snapshot(
             &bindings_json,
@@ -8892,9 +9077,17 @@ impl AppStore {
             serde_json::to_string(&current_service.supported_apps).map_err(|error| {
                 AppError::Internal(format!("encode Share contract Apps failed: {error}"))
             })?;
+        let grant_token_limit = if daily_rate_minor.is_some()
+            && rented_trial_hours.unwrap_or(0) > 0
+            && quoted_trial_seconds.unwrap_or(i64::MAX) > 0
+        {
+            rented_trial_token_limit.or_else(|| token_limit.and_then(|value| u64::try_from(value).ok()))
+        } else {
+            token_limit.and_then(|value| u64::try_from(value).ok())
+        };
         let policy = ShareUserPolicy {
             parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
-            token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
+            token_limit: grant_token_limit,
             token_period,
             token_period_anchor_at_ms: None,
             expires_at: None,
@@ -8907,14 +9100,14 @@ impl AppStore {
                 id, seat_id, listing_id, share_id, installation_id, entitlement_id,
                 owner_user_id, owner_email, renter_user_id, renter_email, status,
                 parallel_limit, token_limit, token_period_json, daily_rate_minor, currency,
-                service_duration_days, offer_revision, release_reason,
+                service_duration_days, trial_hours, trial_token_limit, offer_revision, release_reason,
                 activated_at, expires_at, created_at, updated_at, released_at,
                 free_usage_seconds, rent_quote_id, idempotency_key, request_fingerprint,
                 required_app, service_snapshot_json, contract_apps_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'grant_pending',
-                       ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                       NULL, NULL, ?18, ?19, ?19, NULL, ?20, ?21, ?22, ?23,
-                       ?24, ?25, ?26)",
+                       ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                       NULL, NULL, ?20, ?21, ?21, NULL, ?22, ?23, ?24, ?25,
+                       ?26, ?27, ?28)",
             params![
                 subscription_id,
                 seat_id,
@@ -8932,6 +9125,8 @@ impl AppStore {
                 daily_rate_minor,
                 currency,
                 service_duration_days.map(i64::from),
+                rented_trial_hours,
+                rented_trial_token_limit.and_then(|value| i64::try_from(value).ok()),
                 offer_revision,
                 Option::<String>::None,
                 now,
@@ -8970,6 +9165,9 @@ impl AppStore {
                     daily_rate_minor,
                     offer_revision,
                     replacement_of: None,
+                    trial_allowance_seconds: trial_seconds_from_hours(
+                        rented_trial_hours.unwrap_or(0),
+                    )?,
                 },
                 quoted_trial_seconds.unwrap_or(i64::MAX),
                 &now,
@@ -9860,9 +10058,7 @@ fn validate_effective_initial_policy(
     let expected_parallel = record
         .parallel_limit
         .and_then(|value| u32::try_from(value).ok());
-    let expected_tokens = record
-        .token_limit
-        .and_then(|value| u64::try_from(value).ok());
+    let expected_tokens = grant_token_limit(record);
     if effective_policy.parallel_limit != expected_parallel
         || effective_policy.token_limit != expected_tokens
         || effective_policy.token_period != token_period
@@ -9896,9 +10092,7 @@ fn validate_effective_resume_policy(
     let expected_parallel = record
         .parallel_limit
         .and_then(|value| u32::try_from(value).ok());
-    let expected_tokens = record
-        .token_limit
-        .and_then(|value| u64::try_from(value).ok());
+    let expected_tokens = grant_token_limit(record);
     if effective_policy.parallel_limit != expected_parallel
         || effective_policy.token_limit != expected_tokens
         || effective_policy.token_period != token_period
@@ -11507,6 +11701,28 @@ impl AppStore {
                 )?;
                 continue;
             }
+            if record.status == SUB_ACTIVE_POSTPAID
+                && record.daily_rate_minor.is_some()
+                && record.trial_hours.unwrap_or(0) > 0
+                && record.contract_trial_seconds_remaining == Some(0)
+            {
+                if let Some(grant) = entitlement_grant.as_ref() {
+                    let paid_tokens = record.token_limit.and_then(|value| u64::try_from(value).ok());
+                    if grant.policy.token_limit != paid_tokens {
+                        let policy = contract_policy(&record)?;
+                        enqueue_control_operation_tx(
+                            &tx,
+                            &record.share_id,
+                            &record.id,
+                            &record.entitlement_id,
+                            "upsert",
+                            &record.renter_email,
+                            Some(&policy),
+                            &now,
+                        )?;
+                    }
+                }
+            }
         }
 
         let operation_ids = {
@@ -12790,6 +13006,8 @@ mod tests {
             daily_rate_minor: None,
             currency: None,
             service_duration_days: Some(1),
+            trial_hours: None,
+            trial_token_limit: None,
         }
     }
 
@@ -14251,6 +14469,8 @@ mod tests {
         assert_eq!(quote.trial_seconds_remaining, expected_remaining);
         assert_eq!(quote.offer.seat_id, seat_id);
         assert_eq!(quote.offer.daily_rate_minor, Some(1_200));
+        assert_eq!(quote.offer.trial_hours, Some(DEFAULT_TRIAL_HOURS));
+        assert_eq!(quote.offer.trial_token_limit, Some(DEFAULT_TRIAL_TOKEN_LIMIT));
     }
 
     #[tokio::test]
@@ -15103,6 +15323,8 @@ mod tests {
             daily_rate_minor: Some(1_200),
             currency: Some("USD".into()),
             service_duration_days: Some(30),
+            trial_hours: Some(12),
+            trial_token_limit: Some(1_000_000),
             offer_revision: 7,
             service: RentServiceSnapshot {
                 schema_version: 1,
@@ -15140,6 +15362,8 @@ mod tests {
         assert_changed!(daily_rate_minor, Some(1_201));
         assert_changed!(currency, Some("CNY".into()));
         assert_changed!(service_duration_days, Some(31));
+        assert_changed!(trial_hours, Some(6));
+        assert_changed!(trial_token_limit, Some(2_000_000));
     }
 
     #[test]
@@ -15820,6 +16044,24 @@ mod tests {
         let mut cny = paid_seat();
         cny.currency = Some("CNY".into());
         assert!(normalize_seat(cny).is_err());
+    }
+
+    #[test]
+    fn paid_seat_defaults_trial_hours_and_tokens_and_rejects_free_trial_fields() {
+        let paid = normalize_seat(paid_seat()).expect("paid seat");
+        assert_eq!(paid.trial_hours, Some(DEFAULT_TRIAL_HOURS));
+        assert_eq!(paid.trial_token_limit, Some(DEFAULT_TRIAL_TOKEN_LIMIT));
+
+        let mut zero = paid_seat();
+        zero.trial_hours = Some(0);
+        zero.trial_token_limit = Some(0);
+        let zero = normalize_seat(zero).expect("zero trial is allowed");
+        assert_eq!(zero.trial_hours, Some(0));
+        assert_eq!(zero.trial_token_limit, Some(0));
+
+        let mut free = free_seat();
+        free.trial_hours = Some(12);
+        assert!(normalize_seat(free).is_err());
     }
 
     #[tokio::test]
