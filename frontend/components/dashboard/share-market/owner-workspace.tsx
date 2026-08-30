@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Button, Drawer, Modal } from "@heroui/react";
+import { Button, Modal } from "@heroui/react";
 import {
   Clock3,
   Copy,
@@ -22,7 +22,7 @@ import {
   PaidOfferReadinessNotice,
   usePaidOfferReadiness,
 } from "@/components/dashboard/share-market/paid-offer-readiness";
-import { drawerDialogClassName, expiryTitle } from "@/components/dashboard/share-dashboard-utils";
+import { expiryTitle } from "@/components/dashboard/share-dashboard-utils";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
@@ -1706,23 +1706,13 @@ export function ShareMarketOwnerWorkspace({
         </>
       )}
 
-      {/*
-        A side drawer, not a centred modal. Everything an owner does from here — edit a
-        seat, propose a price, end a rental — opens another dialog on top, and a modal
-        stacked on a modal buries the list the owner is working through. A drawer keeps the
-        listing grid visible behind it, and matches the buyer-side detail panel.
-      */}
-      <Drawer.Backdrop isOpen={!!selected} onOpenChange={(open) => !open && setSelectedId(null)}>
-        <Drawer.Content placement="right">
-          <Drawer.Dialog className={drawerDialogClassName}>
-            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200" />
-            <Drawer.Header>
-              <div className="min-w-0 pr-10">
-                <Drawer.Heading className="truncate text-base">{selected?.shareName || selected?.subdomain || t("shareMarket.catalog.shareSeats")}</Drawer.Heading>
-                <p className="truncate font-mono text-xs text-slate-500">{selected?.subdomain}</p>
-              </div>
-            </Drawer.Header>
-            <Drawer.Body className="grid content-start gap-3 overflow-y-auto pb-24">
+      <Modal.Backdrop isOpen={!!selected} onOpenChange={(open) => !open && setSelectedId(null)}>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(760px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading>{t("shareMarket.catalog.shareSeats")}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid max-h-[75vh] content-start gap-3 overflow-y-auto">
               {selected ? (
                 <>
                   {selected.status === "closed" && !selected.canReopen ? (
@@ -1786,16 +1776,16 @@ export function ShareMarketOwnerWorkspace({
                   )}
                 </>
               ) : null}
-            </Drawer.Body>
+            </Modal.Body>
             {selected ? (
-              <div className="absolute inset-x-0 bottom-0 flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 bg-white px-5 py-4">
+              <Modal.Footer>
                 {renderListingActions(selected)}
                 <Button variant="ghost" onClick={() => setSelectedId(null)}>{t("common.close")}</Button>
-              </div>
+              </Modal.Footer>
             ) : null}
-          </Drawer.Dialog>
-        </Drawer.Content>
-      </Drawer.Backdrop>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
 
       <ShareMarketAddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void onChanged()} onReopenListing={openReopenListing} />
       <ReopenListingDialog listing={reopenListing} onOpenChange={(open) => !open && setReopenListing(null)} onSaved={() => void onChanged()} />
