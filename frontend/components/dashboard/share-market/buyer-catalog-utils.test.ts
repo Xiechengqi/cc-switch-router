@@ -9,6 +9,8 @@ import {
   MARKET_CATALOG_PAGE_SIZE,
   MARKET_RENTAL_HISTORY_PAGE_SIZE,
   marketShareCardSeatPreview,
+  pageCountForSize,
+  rentalHistoryPageStart,
   mergeCatalogWithRentedListings,
   pageForShareId,
   paginateListings,
@@ -492,4 +494,23 @@ test("rental history paginates five rows at a time", () => {
   assert.equal(first.pageCount, 3);
   assert.deepEqual(first.items.map((item) => item.id), ["history-0", "history-1", "history-2", "history-3", "history-4"]);
   assert.equal(paginateListings(rows, 3, MARKET_RENTAL_HISTORY_PAGE_SIZE).items.length, 2);
+});
+
+test("rental history page count uses the full total, not the loaded page", () => {
+  assert.equal(pageCountForSize(12, MARKET_RENTAL_HISTORY_PAGE_SIZE), 3);
+  assert.equal(pageCountForSize(5, MARKET_RENTAL_HISTORY_PAGE_SIZE), 1);
+  assert.equal(pageCountForSize(0, MARKET_RENTAL_HISTORY_PAGE_SIZE), 1);
+  const loaded = Array.from({ length: 5 }, (_, index) => ({ id: `history-${index}` }));
+  const first = paginateListings(loaded, 1, MARKET_RENTAL_HISTORY_PAGE_SIZE, 12);
+  assert.equal(first.page, 1);
+  assert.equal(first.pageCount, 3);
+  assert.equal(first.total, 12);
+  assert.equal(first.items.length, 5);
+  const second = paginateListings(loaded, 2, MARKET_RENTAL_HISTORY_PAGE_SIZE, 12);
+  assert.equal(second.page, 2);
+  assert.equal(second.pageCount, 3);
+  assert.equal(second.items.length, 0);
+  assert.equal(rentalHistoryPageStart(1), 0);
+  assert.equal(rentalHistoryPageStart(2), 5);
+  assert.equal(rentalHistoryPageStart(2) >= loaded.length, true);
 });

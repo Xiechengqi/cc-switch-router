@@ -113,6 +113,7 @@ pub struct ShareMarketSubscriptions {
     pub subscriptions: Vec<SubscriptionView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    pub history_total: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5353,6 +5354,14 @@ impl AppStore {
         } else {
             None
         };
+        let history_total = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_market_subscriptions
+                 WHERE renter_user_id = ?1 AND status = 'released' AND released_at IS NOT NULL",
+                params![session.user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("count Share rental history"))?;
         let ids = active_ids
             .into_iter()
             .chain(terminal_rows.into_iter().map(|(id, _)| id))
@@ -5393,6 +5402,7 @@ impl AppStore {
         Ok(ShareMarketSubscriptions {
             subscriptions,
             next_cursor,
+            history_total,
         })
     }
 
@@ -21662,6 +21672,14 @@ mod tests {
                 .into_iter()
                 .map(|(_, id)| id)
                 .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store
+                .share_market_subscriptions_page(&renter, &[], None, 2)
+                .await
+                .expect("reread subscription history page")
+                .history_total,
+            6
         );
     }
 

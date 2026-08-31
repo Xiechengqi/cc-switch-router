@@ -255,6 +255,7 @@ export function ShareMarketBuyerCatalog({
   onInteractionChange,
   onSwitchSelling,
   nextCursor,
+  historyTotal,
   loadingMore = false,
   onLoadMore,
 }: {
@@ -268,6 +269,7 @@ export function ShareMarketBuyerCatalog({
   onInteractionChange?: (active: boolean) => void;
   onSwitchSelling?: () => void;
   nextCursor?: string | null;
+  historyTotal?: number;
   loadingMore?: boolean;
   onLoadMore?: () => Promise<void> | void;
 }) {
@@ -511,6 +513,7 @@ export function ShareMarketBuyerCatalog({
           subscriptions={history}
           listings={mergedListings}
           nextCursor={nextCursor}
+          historyTotal={historyTotal}
           loadingMore={loadingMore}
           onLoadMore={onLoadMore}
         />

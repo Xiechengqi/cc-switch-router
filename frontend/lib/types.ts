@@ -2678,6 +2678,7 @@ export type ShareMarketOwnedListings = {
 export type ShareMarketSubscriptions = {
   subscriptions: ShareMarketSubscription[];
   nextCursor?: string;
+  historyTotal?: number;
 };
 
 export type ShareControlOperationSummary = {

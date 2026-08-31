@@ -17,7 +17,9 @@ import {
 } from "@/components/dashboard/share-market/subscription-utils";
 import {
   MARKET_RENTAL_HISTORY_PAGE_SIZE,
+  pageCountForSize,
   paginateListings,
+  rentalHistoryPageStart,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
 import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
@@ -194,31 +196,55 @@ export function ShareMarketRentalHistory({
   subscriptions,
   listings = [],
   nextCursor,
+  historyTotal,
   loadingMore = false,
   onLoadMore,
 }: {
   subscriptions: ShareMarketSubscription[];
   listings?: ShareMarketListing[];
   nextCursor?: string | null;
+  historyTotal?: number;
   loadingMore?: boolean;
   onLoadMore?: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
   const [page, setPage] = React.useState(1);
   const pendingPageRef = React.useRef<number | null>(null);
+  const total = Math.max(historyTotal ?? 0, subscriptions.length);
   const paged = React.useMemo(
-    () => paginateListings(subscriptions, page, MARKET_RENTAL_HISTORY_PAGE_SIZE),
-    [page, subscriptions],
+    () => paginateListings(
+      subscriptions,
+      page,
+      MARKET_RENTAL_HISTORY_PAGE_SIZE,
+      total,
+    ),
+    [page, subscriptions, total],
   );
+  const needsMoreForPage = (nextPage: number) =>
+    nextPage >= 1
+    && nextPage <= paged.pageCount
+    && rentalHistoryPageStart(nextPage) >= subscriptions.length
+    && !!nextCursor
+    && !!onLoadMore;
 
   React.useEffect(() => {
-    if (pendingPageRef.current != null && pendingPageRef.current <= paged.pageCount) {
-      setPage(pendingPageRef.current);
-      pendingPageRef.current = null;
+    if (pendingPageRef.current != null) {
+      if (rentalHistoryPageStart(pendingPageRef.current) < subscriptions.length) {
+        setPage(pendingPageRef.current);
+        pendingPageRef.current = null;
+      }
       return;
     }
-    setPage((current) => Math.min(current, paged.pageCount));
-  }, [paged.pageCount]);
+    setPage((current) => {
+      if (rentalHistoryPageStart(current) >= subscriptions.length) {
+        return Math.min(
+          current,
+          pageCountForSize(subscriptions.length, MARKET_RENTAL_HISTORY_PAGE_SIZE),
+        );
+      }
+      return Math.min(current, paged.pageCount);
+    });
+  }, [paged.pageCount, subscriptions.length]);
 
   const notes = paged.items.map((subscription) => historyNote(subscription, locale, t));
   const showNote = notes.some(Boolean);
@@ -233,23 +259,24 @@ export function ShareMarketRentalHistory({
     return key ? t(key) : subscription.status;
   };
   const goToPage = async (nextPage: number) => {
-    if (nextPage <= paged.pageCount) {
+    if (nextPage < 1 || nextPage > paged.pageCount) return;
+    if (!needsMoreForPage(nextPage)) {
       pendingPageRef.current = null;
       setPage(nextPage);
       return;
     }
-    if (!nextCursor || !onLoadMore || loadingMore) return;
+    if (loadingMore) return;
     pendingPageRef.current = nextPage;
-    await onLoadMore();
+    await onLoadMore?.();
   };
 
   return (
     <section className="grid gap-2 border-t border-slate-200 pt-5" aria-labelledby="share-rentals-history">
       <h3 id="share-rentals-history" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
         {t("account.share.history")}
-        {subscriptions.length ? <span className="ml-1.5 tabular-nums text-slate-400">{subscriptions.length}</span> : null}
+        {total ? <span className="ml-1.5 tabular-nums text-slate-400">{total}</span> : null}
       </h3>
-      {subscriptions.length ? (
+      {total ? (
         <>
           <div className="grid gap-2 lg:hidden">
             {paged.items.map((subscription, index) => {
@@ -322,7 +349,6 @@ export function ShareMarketRentalHistory({
             page={paged.page}
             pageCount={paged.pageCount}
             onPageChange={(nextPage) => void goToPage(nextPage)}
-            hasMore={!!nextCursor}
           />
         </>
       ) : <p className="py-1 text-sm text-slate-400">{t("account.share.historyEmpty")}</p>}

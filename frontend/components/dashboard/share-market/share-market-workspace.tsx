@@ -69,6 +69,7 @@ export function ShareMarketWorkspace() {
   const [ownedShareCount, setOwnedShareCount] = React.useState<number | null>(null);
   const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
   const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
+  const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(0);
   const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
   const [pausePolling, setPausePolling] = React.useState(false);
   const [workspace, setWorkspaceState] = React.useState<Workspace>(() =>
@@ -118,6 +119,7 @@ export function ShareMarketWorkspace() {
         setSubscriptions((current) => resetSubscriptionHistory
           ? page.subscriptions
           : mergeShareMarketSubscriptionPage(current, page.subscriptions, false));
+        setSubscriptionHistoryTotal(page.historyTotal ?? 0);
         if (resetSubscriptionHistory || !expandedSubscriptionHistoryRef.current) {
           setSubscriptionCursor(page.nextCursor || null);
         }
@@ -132,6 +134,7 @@ export function ShareMarketWorkspace() {
         setOwnedShareCount(0);
         setSubscriptions([]);
         setSubscriptionCursor(null);
+        setSubscriptionHistoryTotal(0);
         setLoadedActorKey(actorKey);
         return;
       }
@@ -202,6 +205,7 @@ export function ShareMarketWorkspace() {
       expandedSubscriptionHistoryRef.current = true;
       setSubscriptions((current) => mergeShareMarketSubscriptionPage(current, page.subscriptions, true));
       setSubscriptionCursor(page.nextCursor || null);
+      setSubscriptionHistoryTotal(page.historyTotal ?? 0);
     } catch (reason) {
       if (controller.signal.aborted
         || actorKeyRef.current !== requestedActorKey
@@ -268,6 +272,7 @@ export function ShareMarketWorkspace() {
   const visibleOwnedShareCount = actorDataCurrent ? ownedShareCount : null;
   const visibleSubscriptions = actorDataCurrent ? subscriptions : [];
   const visibleSubscriptionCursor = actorDataCurrent ? subscriptionCursor : null;
+  const visibleSubscriptionHistoryTotal = actorDataCurrent ? subscriptionHistoryTotal : 0;
   const hasOwnedShares = (visibleOwnedShareCount ?? 0) > 0;
   const showSellingTab = authed && hasOwnedShares;
 
@@ -331,6 +336,7 @@ export function ShareMarketWorkspace() {
           onInteractionChange={setPausePolling}
           onSwitchSelling={authed ? () => setWorkspace("selling") : undefined}
           nextCursor={visibleSubscriptionCursor}
+          historyTotal={visibleSubscriptionHistoryTotal}
           loadingMore={loadingMoreSubscriptions}
           onLoadMore={loadMoreSubscriptions}
         />

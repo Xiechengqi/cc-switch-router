@@ -226,13 +226,22 @@ export function filterMergedCatalogListings(
   });
 }
 
+export function pageCountForSize(total: number, pageSize: number) {
+  return Math.max(1, Math.ceil(Math.max(0, total) / pageSize) || 1);
+}
+
+export function rentalHistoryPageStart(page: number, pageSize = MARKET_RENTAL_HISTORY_PAGE_SIZE) {
+  return (Math.max(1, page) - 1) * pageSize;
+}
+
 export function paginateListings<T>(
   listings: T[],
   page: number,
   pageSize = MARKET_CATALOG_PAGE_SIZE,
+  total = listings.length,
 ) {
-  const total = listings.length;
-  const pageCount = Math.max(1, Math.ceil(total / pageSize) || 1);
+  const resolvedTotal = Math.max(listings.length, total);
+  const pageCount = pageCountForSize(resolvedTotal, pageSize);
   const currentPage = Math.min(Math.max(1, page), pageCount);
   const start = (currentPage - 1) * pageSize;
   return {
@@ -240,7 +249,7 @@ export function paginateListings<T>(
     page: currentPage,
     pageCount,
     pageSize,
-    total,
+    total: resolvedTotal,
   };
 }
 

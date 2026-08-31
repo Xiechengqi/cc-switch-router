@@ -263,6 +263,7 @@ export function ShareMarketBuyerRentals({
   onChanged,
   onInteractionChange,
   nextCursor,
+  historyTotal,
   loadingMore = false,
   onLoadMore,
   showHeading = true,
@@ -273,6 +274,7 @@ export function ShareMarketBuyerRentals({
   onChanged: () => Promise<void> | void;
   onInteractionChange?: (active: boolean) => void;
   nextCursor?: string | null;
+  historyTotal?: number;
   loadingMore?: boolean;
   onLoadMore?: () => Promise<void> | void;
   showHeading?: boolean;
@@ -421,6 +423,7 @@ export function ShareMarketBuyerRentals({
         subscriptions={history}
         listings={listings}
         nextCursor={nextCursor}
+        historyTotal={historyTotal}
         loadingMore={loadingMore}
         onLoadMore={onLoadMore}
       />

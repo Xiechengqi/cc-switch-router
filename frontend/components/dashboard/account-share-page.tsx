@@ -102,6 +102,7 @@ export function AccountSharePage() {
   const tab: ShareMonitorTab = searchParams.get("tab") === "provider" ? "provider" : "user";
   const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
   const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
+  const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(0);
   const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
   const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
   const [rentedListings, setRentedListings] = React.useState<ShareMarketListing[]>([]);
@@ -153,6 +154,7 @@ export function AccountSharePage() {
       setSubscriptions((current) => silent
         ? mergeShareMarketSubscriptionPage(current, nextSubscriptions.subscriptions, false)
         : nextSubscriptions.subscriptions);
+      setSubscriptionHistoryTotal(nextSubscriptions.historyTotal ?? 0);
       if (!silent || !expandedSubscriptionHistoryRef.current) {
         if (!silent) expandedSubscriptionHistoryRef.current = false;
         setSubscriptionCursor(nextSubscriptions.nextCursor || null);
@@ -192,6 +194,7 @@ export function AccountSharePage() {
       expandedSubscriptionHistoryRef.current = true;
       setSubscriptions((current) => mergeShareMarketSubscriptionPage(current, page.subscriptions, true));
       setSubscriptionCursor(page.nextCursor || null);
+      setSubscriptionHistoryTotal(page.historyTotal ?? 0);
     } catch (reason) {
       if (controller.signal.aborted
         || actorKeyRef.current !== requestedActorKey
@@ -259,6 +262,7 @@ export function AccountSharePage() {
           onChanged={() => load({ silent: true })}
           onInteractionChange={setPausePolling}
           nextCursor={subscriptionCursor}
+          historyTotal={subscriptionHistoryTotal}
           loadingMore={loadingMoreSubscriptions}
           onLoadMore={loadMoreSubscriptions}
         />
