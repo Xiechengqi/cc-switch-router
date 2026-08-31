@@ -5,7 +5,7 @@ use std::time::Instant;
 use resend_rs::Resend;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::abuse::AbuseTracker;
+use crate::abuse::{AbuseTracker, ShareAbuseTracker};
 use crate::admin::settings::SettingsRuntimeSnapshot;
 use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::alerting::AlertingService;
@@ -67,6 +67,8 @@ pub struct ServerState {
     pub recent_traffic: RecentTraffic,
     /// In-memory temporary ban tracker for repeated invalid API authentication.
     pub abuse: Arc<AbuseTracker>,
+    /// Share-scoped client abuse windows and the hot cache of persisted active bans.
+    pub share_abuse: Arc<ShareAbuseTracker>,
     /// In-memory aggregation for blocked IP blacklist requests. Flushed to logs periodically.
     pub ip_blacklist_stats: Arc<IpBlacklistStats>,
     /// Single-flight upgrade orchestrator with SSE log fan-out.

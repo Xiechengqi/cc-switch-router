@@ -128,6 +128,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         34,
         include_str!("../schema/0034_share_market_seat_trial.sql"),
     ),
+    (35, include_str!("../schema/0035_share_client_bans.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -655,7 +656,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 128);
+        assert_eq!(table_count, 129);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -735,6 +736,8 @@ mod tests {
         assert_eq!(versions[30], (31, migration_checksum(MIGRATIONS[29].1)));
         assert_eq!(versions[31], (32, migration_checksum(MIGRATIONS[30].1)));
         assert_eq!(versions[32], (33, migration_checksum(MIGRATIONS[31].1)));
+        assert_eq!(versions[33], (34, migration_checksum(MIGRATIONS[32].1)));
+        assert_eq!(versions[34], (35, migration_checksum(MIGRATIONS[33].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1138,8 +1141,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 34);
-        check_compatibility(&conn).expect("upgraded version 34 is compatible");
+        assert_eq!(latest_version, 35);
+        check_compatibility(&conn).expect("upgraded version 35 is compatible");
     }
 
     #[test]
@@ -1201,7 +1204,31 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 34);
+        assert_eq!(latest_version, 35);
+    }
+
+    #[test]
+    fn migration_35_installs_share_scoped_client_bans() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 34);
+
+        apply(&conn).expect("upgrade to Share client bans");
+
+        let table_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name = 'share_client_bans'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("inspect Share client ban table");
+        assert_eq!(table_count, 1);
+        let latest_version = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("read upgraded schema version");
+        assert_eq!(latest_version, 35);
     }
 
     #[test]
@@ -1381,7 +1408,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 34);
+        assert_eq!(latest_version, 35);
     }
 
     #[test]

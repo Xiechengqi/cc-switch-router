@@ -85,12 +85,42 @@ pub fn compute_share_signals(
 /// the missing-signal case should not punish, since cc-switch-server hasn't observed
 /// the upstream yet.
 pub fn compute_quota_health(quota: Option<&ShareUpstreamQuota>, now: DateTime<Utc>) -> f64 {
+    compute_quota_health_for_model(quota, None, now)
+}
+
+/// Compute quota health for an optional requested model. Account-scoped tiers
+/// always participate; model-family tiers participate only when they match the
+/// requested model. The model-agnostic Share score therefore cannot be pulled
+/// down by a fully consumed Fable-only pool.
+pub fn compute_quota_health_for_model(
+    quota: Option<&ShareUpstreamQuota>,
+    requested_model: Option<&str>,
+    now: DateTime<Utc>,
+) -> f64 {
     let Some(q) = quota else {
         return 0.5;
     };
 
     let mut contributions: Vec<f64> = Vec::new();
     for tier in &q.tiers {
+        let scope = tier.scope.as_deref().unwrap_or("account");
+        if scope == "model_family" {
+            let matches_model = requested_model.is_some_and(|model| {
+                tier.model_family.as_deref().is_some_and(|family| {
+                    let model = model.trim().to_ascii_lowercase();
+                    let family = family.trim().to_ascii_lowercase();
+                    model == family
+                        || model.strip_prefix(&family).is_some_and(|suffix| {
+                            suffix.starts_with('-') || suffix.starts_with(':')
+                        })
+                })
+            });
+            if !matches_model {
+                continue;
+            }
+        } else if scope != "account" {
+            continue;
+        }
         let Some(ttl_s) = tier_ttl_secs(tier.resets_at.as_deref(), now) else {
             continue;
         };
@@ -320,6 +350,7 @@ mod tests {
                 used: None,
                 limit: None,
                 unit: None,
+                ..Default::default()
             }],
         };
         // Only short window → fall back to neutral.
@@ -346,6 +377,7 @@ mod tests {
                     used: None,
                     limit: None,
                     unit: None,
+                    ..Default::default()
                 },
                 crate::models::ShareUpstreamQuotaTier {
                     label: "daily".into(),
@@ -354,12 +386,62 @@ mod tests {
                     used: None,
                     limit: None,
                     unit: None,
+                    ..Default::default()
                 },
             ],
         };
         let v = compute_quota_health(Some(&quota), Utc::now());
         // The 95%-utilized daily tier dominates softmin, so result is near 0.05..0.1.
         assert!(v < 0.25, "expected near-zero quota health, got {v}");
+    }
+
+    #[test]
+    fn fable_pool_only_affects_matching_model_health() {
+        let now = Utc::now();
+        let quota = ShareUpstreamQuota {
+            status: "ok".into(),
+            plan: Some("Claude Max 20x".into()),
+            activity_cost: None,
+            queried_at: None,
+            subscription_period_end: None,
+            availability: None,
+            blocked_until: None,
+            blocked_reason: None,
+            blocked_scope: None,
+            tiers: vec![
+                crate::models::ShareUpstreamQuotaTier {
+                    label: "1w".into(),
+                    utilization: 72.0,
+                    resets_at: Some(ts(7 * 86400)),
+                    scope: Some("account".into()),
+                    ..Default::default()
+                },
+                crate::models::ShareUpstreamQuotaTier {
+                    label: "Fable 7d".into(),
+                    utilization: 100.0,
+                    resets_at: Some(ts(7 * 86400)),
+                    scope: Some("model_family".into()),
+                    capacity_pool: Some("claude_fable_7d_oi".into()),
+                    model_family: Some("claude-fable-5".into()),
+                    relative_weekly_capacity: Some(0.5),
+                    source: Some("anthropic_usage_7d_oi".into()),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let generic = compute_quota_health(Some(&quota), now);
+        let opus = compute_quota_health_for_model(Some(&quota), Some("claude-opus-5"), now);
+        let fable = compute_quota_health_for_model(Some(&quota), Some("claude-fable-5"), now);
+        assert!((generic - opus).abs() < 1e-9);
+        assert!(
+            generic > 0.2,
+            "regular weekly pool should remain usable: {generic}"
+        );
+        assert!(
+            fable < 0.05,
+            "exhausted Fable pool should dominate: {fable}"
+        );
     }
 
     #[test]

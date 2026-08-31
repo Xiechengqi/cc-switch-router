@@ -34,6 +34,7 @@ const INSTALLATION_UPGRADE_STATUS_FRESH_SECS: i64 = 45;
 const INSTALLATION_UPGRADE_STATUS_LOST_SECS: i64 = 15 * 60;
 
 use crate::ServerGeo;
+use crate::abuse::{ShareBanDecision, ShareClientBan, ShareClientBanPage};
 use crate::alerting::models::OperatorAlertSignal;
 use crate::config::{Config, DatabaseMode, tunnel_domain_host};
 use crate::ctl_client::authorize_control_request;
@@ -933,6 +934,99 @@ fn map_database_error(context: &str, error: crate::db::Error) -> AppError {
     } else {
         AppError::Internal(format!("{context}: {error}"))
     }
+}
+
+type ShareClientBanSqlRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+);
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareClientBanCursor {
+    banned_at: String,
+    id: String,
+}
+
+fn share_client_ban_sql_row(row: &Row<'_>) -> crate::db::Result<ShareClientBanSqlRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn parse_share_client_ban_row(row: ShareClientBanSqlRow) -> Result<ShareClientBan, AppError> {
+    let parse_time = |field: &str, value: String| {
+        DateTime::parse_from_rfc3339(&value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                AppError::Internal(format!("invalid Share client ban {field}: {error}"))
+            })
+    };
+    Ok(ShareClientBan {
+        id: row.0,
+        share_id: row.1,
+        client_ip: row.2,
+        reason_code: row.3,
+        failure_count: usize::try_from(row.4)
+            .map_err(|_| AppError::Internal("invalid Share client ban failure count".into()))?,
+        first_failure_at: parse_time("first_failure_at", row.5)?,
+        last_failure_at: parse_time("last_failure_at", row.6)?,
+        banned_at: parse_time("banned_at", row.7)?,
+        banned_until: parse_time("banned_until", row.8)?,
+    })
+}
+
+fn encode_share_client_ban_cursor(banned_at: &str, id: &str) -> String {
+    let payload = serde_json::to_vec(&ShareClientBanCursor {
+        banned_at: banned_at.to_string(),
+        id: id.to_string(),
+    })
+    .unwrap_or_default();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+}
+
+fn decode_share_client_ban_cursor(value: &str) -> Result<ShareClientBanCursor, AppError> {
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| AppError::BadRequest("invalid Share client ban cursor".into()))?;
+    serde_json::from_slice(&decoded)
+        .map_err(|_| AppError::BadRequest("invalid Share client ban cursor".into()))
+}
+
+fn expire_and_prune_share_client_bans(conn: &Connection) -> Result<(), AppError> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE share_client_bans
+            SET status = 'expired', updated_at = ?1
+          WHERE status = 'active' AND datetime(banned_until) <= datetime(?1)",
+        params![now],
+    )
+    .map_err(|error| AppError::Internal(format!("expire Share client bans failed: {error}")))?;
+    conn.execute(
+        "DELETE FROM share_client_bans
+          WHERE status IN ('expired', 'unbanned')
+            AND datetime(updated_at) < datetime(?1, '-90 days')",
+        params![now],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("prune Share client ban history failed: {error}"))
+    })?;
+    Ok(())
 }
 
 fn map_public_host_error(error: crate::public_hosts::PublicHostCatalogError) -> AppError {
@@ -12158,6 +12252,172 @@ impl AppStore {
         Ok(owner)
     }
 
+    pub async fn create_share_client_ban(
+        &self,
+        decision: &ShareBanDecision,
+    ) -> Result<ShareClientBan, AppError> {
+        let conn = self.conn.lock().await;
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        // The hot cache expires bans lazily. Reconcile the durable row here as
+        // well so an expired partial-index entry cannot suppress a later ban
+        // for the same Share/IP pair.
+        expire_and_prune_share_client_bans(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO share_client_bans (
+                 id, share_id, client_ip, reason_code, failure_count,
+                 first_failure_at, last_failure_at, banned_at, banned_until,
+                 status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?10)",
+            params![
+                id,
+                decision.share_id,
+                decision.client_ip,
+                decision.reason_code,
+                decision.failure_count as i64,
+                decision.first_failure_at.to_rfc3339(),
+                decision.last_failure_at.to_rfc3339(),
+                decision.banned_at.to_rfc3339(),
+                decision.banned_until.to_rfc3339(),
+                now,
+            ],
+        )
+        .map_err(|error| AppError::Internal(format!("persist Share client ban failed: {error}")))?;
+
+        let row = conn
+            .query_row(
+                "SELECT id, share_id, client_ip, reason_code, failure_count,
+                        first_failure_at, last_failure_at, banned_at, banned_until
+                   FROM share_client_bans
+                  WHERE share_id = ?1 AND client_ip = ?2 AND status = 'active'",
+                params![decision.share_id, decision.client_ip],
+                share_client_ban_sql_row,
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read persisted Share client ban failed: {error}"))
+            })?;
+        parse_share_client_ban_row(row)
+    }
+
+    pub async fn load_active_share_client_bans(&self) -> Result<Vec<ShareClientBan>, AppError> {
+        let conn = self.conn.lock().await;
+        expire_and_prune_share_client_bans(&conn)?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, share_id, client_ip, reason_code, failure_count,
+                        first_failure_at, last_failure_at, banned_at, banned_until
+                   FROM share_client_bans
+                  WHERE status = 'active' AND datetime(banned_until) > datetime(?1)",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare active Share client bans failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![Utc::now().to_rfc3339()], share_client_ban_sql_row)
+            .map_err(|error| {
+                AppError::Internal(format!("query active Share client bans failed: {error}"))
+            })?;
+        let mut bans = Vec::new();
+        for row in rows {
+            bans.push(parse_share_client_ban_row(row.map_err(|error| {
+                AppError::Internal(format!("read active Share client ban failed: {error}"))
+            })?)?);
+        }
+        Ok(bans)
+    }
+
+    pub async fn list_active_share_client_bans(
+        &self,
+        share_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ShareClientBanPage, AppError> {
+        let limit = limit.clamp(1, 200);
+        let cursor = cursor.map(decode_share_client_ban_cursor).transpose()?;
+        let cursor_at = cursor.as_ref().map(|value| value.banned_at.as_str());
+        let cursor_id = cursor.as_ref().map(|value| value.id.as_str());
+        let conn = self.conn.lock().await;
+        expire_and_prune_share_client_bans(&conn)?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, share_id, client_ip, reason_code, failure_count,
+                        first_failure_at, last_failure_at, banned_at, banned_until
+                   FROM share_client_bans
+                  WHERE share_id = ?1 AND status = 'active'
+                    AND datetime(banned_until) > datetime(?2)
+                    AND (?3 IS NULL
+                         OR datetime(banned_at) < datetime(?3)
+                         OR (banned_at = ?3 AND id < ?4))
+                  ORDER BY datetime(banned_at) DESC, id DESC
+                  LIMIT ?5",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare Share client ban list failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    share_id,
+                    Utc::now().to_rfc3339(),
+                    cursor_at,
+                    cursor_id,
+                    (limit + 1) as i64,
+                ],
+                share_client_ban_sql_row,
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("query Share client ban list failed: {error}"))
+            })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(parse_share_client_ban_row(row.map_err(|error| {
+                AppError::Internal(format!("read Share client ban list failed: {error}"))
+            })?)?);
+        }
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = has_more
+            .then(|| items.last())
+            .flatten()
+            .map(|ban| encode_share_client_ban_cursor(&ban.banned_at.to_rfc3339(), &ban.id));
+        Ok(ShareClientBanPage { items, next_cursor })
+    }
+
+    pub async fn unban_share_client(
+        &self,
+        share_id: &str,
+        ban_id: &str,
+        actor_email: &str,
+        actor_ip: Option<&str>,
+    ) -> Result<(String, bool), AppError> {
+        let conn = self.conn.lock().await;
+        let row = conn
+            .query_row(
+                "SELECT client_ip, status FROM share_client_bans
+                  WHERE id = ?1 AND share_id = ?2",
+                params![ban_id, share_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("lookup Share client ban failed: {error}"))
+            })?
+            .ok_or_else(|| AppError::NotFound("Share client ban not found".into()))?;
+        let already_unbanned = row.1 != "active";
+        if !already_unbanned {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE share_client_bans
+                    SET status = 'unbanned', released_at = ?3,
+                        released_by_email = ?4, released_from_ip = ?5, updated_at = ?3
+                  WHERE id = ?1 AND share_id = ?2 AND status = 'active'",
+                params![ban_id, share_id, now, actor_email, actor_ip],
+            )
+            .map_err(|error| AppError::Internal(format!("unban Share client failed: {error}")))?;
+        }
+        Ok((row.0, already_unbanned))
+    }
+
     pub async fn public_map_points(
         &self,
         server_geo: &ServerGeo,
@@ -20552,10 +20812,10 @@ fn quota_blocked_capacity_availability(
     health
         .iter()
         .filter(|entry| {
-            let is_quota_block = entry.status.eq_ignore_ascii_case("quota_blocked")
-                || (is_app_level_model_health(entry, app_type)
-                    && entry.status.eq_ignore_ascii_case("failed")
-                    && model_health_error_is_quota_block(entry.error_message.as_deref()));
+            let is_quota_block = is_app_level_model_health(entry, app_type)
+                && (entry.status.eq_ignore_ascii_case("quota_blocked")
+                    || (entry.status.eq_ignore_ascii_case("failed")
+                        && model_health_error_is_quota_block(entry.error_message.as_deref())));
             is_quota_block && !quota_block_expired(entry.error_message.as_deref(), now)
         })
         .max_by_key(|entry| entry.last_checked_at.unwrap_or_default())
@@ -20870,6 +21130,7 @@ mod quota_runtime_filter_tests {
                     used: None,
                     limit: None,
                     unit: None,
+                    ..Default::default()
                 }],
             }),
             models: Vec::new(),
@@ -20904,6 +21165,7 @@ mod quota_runtime_filter_tests {
                         used: None,
                         limit: None,
                         unit: None,
+                        ..Default::default()
                     })
                     .collect(),
             }),
@@ -46628,6 +46890,22 @@ mod tests {
     }
 
     #[test]
+    fn fable_quota_block_does_not_become_claude_app_unavailability() {
+        let mut fable_health = test_model_summary("claude-fable-5", &["failed"]);
+        fable_health.actual_model = "claude-fable-5".into();
+        fable_health.status = "quota_blocked".into();
+        let future_reset = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        fable_health.error_message = Some(format!(
+            "Fable weekly capacity pool exhausted until {future_reset}"
+        ));
+
+        assert!(
+            quota_blocked_capacity_availability("claude", None, &[fable_health], Utc::now(),)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn market_runtime_filter_keeps_app_when_quota_block_expired() {
         let runtimes = ShareAppRuntimes {
             codex: Some(test_upstream_provider("gpt-5.5")),
@@ -49621,6 +49899,81 @@ mod tests {
             .await
             .expect("failed takeover must release both active-job constraints");
         assert_ne!(retry.id, first.id);
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_client_bans_persist_page_and_unban_idempotently() {
+        let (store, config) = setup_store("share-client-bans").await;
+        insert_share(
+            &store,
+            "ban-installation",
+            "share-ban",
+            "share-ban-host",
+            "active",
+        )
+        .await;
+        let now = Utc::now();
+        let decision = crate::abuse::ShareBanDecision {
+            share_id: "share-ban".into(),
+            client_ip: "2001:db8::1".into(),
+            reason_code: "invalid_share_client_credential".into(),
+            failure_count: 10,
+            first_failure_at: now - Duration::minutes(1),
+            last_failure_at: now,
+            banned_at: now,
+            banned_until: now + Duration::hours(1),
+        };
+
+        let persisted = store
+            .create_share_client_ban(&decision)
+            .await
+            .expect("persist Share client ban");
+        let loaded = store
+            .load_active_share_client_bans()
+            .await
+            .expect("reload active Share client bans");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, persisted.id);
+
+        let page = store
+            .list_active_share_client_bans("share-ban", 50, None)
+            .await
+            .expect("list active Share client bans");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].client_ip, "2001:db8::1");
+        assert!(page.next_cursor.is_none());
+
+        let (client_ip, already_unbanned) = store
+            .unban_share_client(
+                "share-ban",
+                &persisted.id,
+                "owner@example.com",
+                Some("198.51.100.4"),
+            )
+            .await
+            .expect("unban Share client");
+        assert_eq!(client_ip, "2001:db8::1");
+        assert!(!already_unbanned);
+        let (_, already_unbanned) = store
+            .unban_share_client(
+                "share-ban",
+                &persisted.id,
+                "owner@example.com",
+                Some("198.51.100.4"),
+            )
+            .await
+            .expect("repeat Share client unban");
+        assert!(already_unbanned);
+        assert!(
+            store
+                .list_active_share_client_bans("share-ban", 50, None)
+                .await
+                .expect("list after unban")
+                .items
+                .is_empty()
+        );
 
         let _ = std::fs::remove_file(config.database.path);
     }

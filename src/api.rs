@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
 
 use crate::ServerState;
+use crate::abuse::ShareClientUnbanResponse;
 use crate::admin::{
     restart::{RestartStrategy, schedule_restart},
     settings::{
@@ -422,6 +423,14 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/settings",
             patch(update_share_settings),
+        )
+        .route(
+            "/v1/shares/:share_id/client-bans",
+            get(list_share_client_bans),
+        )
+        .route(
+            "/v1/shares/:share_id/client-bans/:ban_id/unban",
+            post(unban_share_client),
         )
         .route(
             "/v1/shares/:share_id/usage-by-email",
@@ -3018,6 +3027,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[tokio::test]
+    async fn regions_endpoint_preserves_file_order_with_free_first() {
+        let Json(regions) = regions().await.expect("embedded regions should be valid");
+
+        let first = regions.first().expect("at least one region");
+        assert_eq!(first.name, "free");
+        assert_eq!(first.url, "freetokenswitch.cc");
+        assert_eq!(
+            regions
+                .iter()
+                .map(|region| region.name.as_str())
+                .collect::<Vec<_>>(),
+            ["free", "japan", "singapore", "hongkong", "usa"]
+        );
+    }
+
     #[test]
     fn install_client_script_renders_release_and_changes_entity_tag() {
         let latest = render_install_client_script("latest").unwrap();
@@ -4378,6 +4403,93 @@ async fn update_share_settings(
             input.base_config_revision,
         )
         .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareClientBanListQuery {
+    #[serde(default = "default_share_client_ban_limit")]
+    limit: usize,
+    cursor: Option<String>,
+}
+
+fn default_share_client_ban_limit() -> usize {
+    50
+}
+
+async fn require_share_owner(
+    state: &ServerState,
+    headers: &HeaderMap,
+    share_id: &str,
+) -> Result<String, AppError> {
+    let email = require_user_email(state, headers, "share:write").await?;
+    let owner = state
+        .store
+        .lookup_share_owner_email(share_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Share not found".into()))?;
+    if !owner.eq_ignore_ascii_case(&email) {
+        return Err(AppError::Forbidden(
+            "only Share owner can manage client bans".into(),
+        ));
+    }
+    Ok(email)
+}
+
+async fn list_share_client_bans(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Query(query): Query<ShareClientBanListQuery>,
+) -> Result<(HeaderMap, Json<crate::abuse::ShareClientBanPage>), AppError> {
+    require_share_owner(&state, &headers, &share_id).await?;
+    let page = state
+        .store
+        .list_active_share_client_bans(&share_id, query.limit, query.cursor.as_deref())
+        .await?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((response_headers, Json(page)))
+}
+
+async fn unban_share_client(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path((share_id, ban_id)): Path<(String, String)>,
+) -> Result<(HeaderMap, Json<ShareClientUnbanResponse>), AppError> {
+    let actor_email = require_share_owner(&state, &headers, &share_id).await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let (client_ip, already_unbanned) = state
+        .store
+        .unban_share_client(&share_id, &ban_id, &actor_email, metadata.ip.as_deref())
+        .await?;
+    state.share_abuse.unban(&share_id, &client_ip).await;
+    let audit_payload = serde_json::json!({
+        "shareId": share_id,
+        "banId": ban_id,
+        "clientIp": client_ip,
+        "alreadyUnbanned": already_unbanned,
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&actor_email),
+            "share.client_ban.unban",
+            Some(&audit_payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((
+        response_headers,
+        Json(ShareClientUnbanResponse {
+            ok: true,
+            ban_id,
+            already_unbanned,
+        }),
     ))
 }
 

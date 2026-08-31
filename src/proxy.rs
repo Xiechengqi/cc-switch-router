@@ -2430,10 +2430,18 @@ async fn user_model_proxy_handler_inner(
         if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
             response.headers_mut().insert(header::RETRY_AFTER, value);
         }
+        response.headers_mut().insert(
+            "x-cc-switch-error-code",
+            HeaderValue::from_static("cc_switch_router_auth_client_banned"),
+        );
+        response.headers_mut().insert(
+            "x-cc-switch-error-scope",
+            HeaderValue::from_static("router"),
+        );
         return response;
     }
 
-    let principal = match authenticate_user_model_request(&state, &parts.headers).await {
+    let principal = match authenticate_user_model_request(&state, &parts.headers, &user_ip).await {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -2630,8 +2638,10 @@ async fn forward_to_selected_share(
 async fn authenticate_user_model_request(
     state: &ServerState,
     headers: &HeaderMap,
+    client_ip: &str,
 ) -> Result<UserApiTokenPrincipal, Response> {
     let Some(token) = crate::api::extract_router_api_token(headers) else {
+        record_router_auth_failure(state, client_ip).await;
         return Err(unified_api_error_response(
             StatusCode::UNAUTHORIZED,
             "user_api_token_invalid",
@@ -2645,10 +2655,19 @@ async fn authenticate_user_model_request(
         .await
     {
         Ok(Some(principal)) => Ok(principal),
-        Ok(None) | Err(crate::error::AppError::Unauthorized(_)) => Err(unified_api_error_response(
-            StatusCode::UNAUTHORIZED,
-            "user_api_token_invalid",
-            "a valid user API key is required",
+        Ok(None) => {
+            record_router_auth_failure(state, client_ip).await;
+            Err(unified_api_error_response(
+                StatusCode::UNAUTHORIZED,
+                "user_api_token_invalid",
+                "a valid user API key is required",
+                serde_json::json!({}),
+            ))
+        }
+        Err(crate::error::AppError::Unauthorized(_)) => Err(unified_api_error_response(
+            StatusCode::FORBIDDEN,
+            "user_api_token_scope_forbidden",
+            "the user API key is not allowed to invoke Shares",
             serde_json::json!({}),
         )),
         Err(error) => Err(error.into_response()),
@@ -3086,7 +3105,7 @@ pub(crate) fn with_unified_api_cors(mut response: Response) -> Response {
     response.headers_mut().insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static(
-            "x-request-id, x-cc-switch-request-id, x-cc-switch-error-code, x-cc-switch-error-scope, x-share-router-error",
+            "x-request-id, x-cc-switch-request-id, x-cc-switch-error-code, x-cc-switch-error-scope, x-share-router-error, retry-after",
         ),
     );
     response
@@ -3169,7 +3188,7 @@ pub async fn proxy_handler(
             ban_remaining_secs = remaining.as_secs(),
             "proxy request rejected: client temporarily banned"
         );
-        return simple_response(StatusCode::FORBIDDEN, "client-banned");
+        return client_banned_response(remaining, "router");
     }
     let is_internal_share_router_path = is_internal_share_router_path(&path);
     let is_share_router_probe = parts
@@ -3335,6 +3354,12 @@ pub async fn proxy_handler(
                 .await
             {
                 Ok(owner_email) => owner_email,
+                Err(crate::error::AppError::Unauthorized(_)) => {
+                    return simple_response(
+                        StatusCode::FORBIDDEN,
+                        "router-api-token-scope-forbidden",
+                    );
+                }
                 Err(err) => {
                     warn!(
                         method = %method,
@@ -3432,6 +3457,7 @@ pub async fn proxy_handler(
     if !skips_share_edge_auth {
         if let Some(share_id) = route.share_id.as_deref() {
             let Some(user_token) = crate::api::extract_router_api_token(&parts.headers) else {
+                record_router_auth_failure(&state, &user_ip).await;
                 return simple_response(StatusCode::UNAUTHORIZED, "missing-router-api-token");
             };
             let principal = match state
@@ -3441,6 +3467,7 @@ pub async fn proxy_handler(
             {
                 Ok(Some(principal)) => principal,
                 Ok(None) => {
+                    record_router_auth_failure(&state, &user_ip).await;
                     return simple_response(StatusCode::UNAUTHORIZED, "invalid-router-api-token");
                 }
                 Err(err) => {
@@ -3456,7 +3483,10 @@ pub async fn proxy_handler(
                         error = %err,
                         "proxy request rejected: router api token authentication failed"
                     );
-                    return simple_response(StatusCode::UNAUTHORIZED, "invalid-router-api-token");
+                    return simple_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "router-api-token-lookup-failed",
+                    );
                 }
             };
             match state
@@ -3491,6 +3521,21 @@ pub async fn proxy_handler(
                 }
             }
         }
+    }
+    if let Some(share_id) = route.share_id.as_deref()
+        && is_abuse_tracked_api_path(&path)
+        && let Some(remaining) = state.share_abuse.ban_remaining(share_id, &user_ip).await
+    {
+        warn!(
+            method = %method,
+            host = %host,
+            path = %path_and_query,
+            share_id,
+            client_ip = %user_ip,
+            ban_remaining_secs = remaining.as_secs(),
+            "proxy request rejected: client banned from Share"
+        );
+        return client_banned_response(remaining, "share");
     }
     if route.is_share()
         && method == axum::http::Method::POST
@@ -4055,29 +4100,45 @@ pub async fn proxy_handler(
             retire_failed_client_web_probe(&state, &route).await;
         }
     }
+    if ingress_rejection.is_none()
+        && is_abuse_tracked_api_path(&path)
+        && let Some(share_id) = route.share_id.as_deref()
+        && let Some(reason_code) = share_abuse_signal(upstream_status, &response_headers)
+        && let Some(decision) = state
+            .share_abuse
+            .record_violation(share_id, &user_ip, reason_code)
+            .await
+    {
+        match state.store.create_share_client_ban(&decision).await {
+            Ok(ban) => {
+                state.share_abuse.activate(ban).await;
+                warn!(
+                    method = %method,
+                    host = %host,
+                    path = %path_and_query,
+                    share_id,
+                    client_ip = %user_ip,
+                    reason_code,
+                    failures_10m = decision.failure_count,
+                    ban_secs = (decision.banned_until - decision.banned_at).num_seconds(),
+                    "proxy client banned from Share: typed abuse threshold reached"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    share_id,
+                    client_ip = %user_ip,
+                    reason_code,
+                    error = %error,
+                    "persist Share client ban failed; enforcement remains fail-open"
+                );
+            }
+        }
+    }
     if let Some(response) = ingress_rejection {
         return response;
     }
     let is_event_stream = is_event_stream_response(&response_headers);
-    if is_invalid_auth_status(status) && is_abuse_tracked_api_path(&path) {
-        if let Some(decision) = state.abuse.record_invalid_auth(&user_ip).await {
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path_and_query,
-                backend = %backend,
-                status = %status.as_u16(),
-                share_id = %log_share_id,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                failures_10m = decision.failures,
-                ban_secs = decision.ban_duration.as_secs(),
-                "proxy client temporarily banned: invalid auth threshold reached"
-            );
-        }
-    }
 
     // Stream the response body instead of buffering it entirely.
     // This is critical for SSE (text/event-stream) responses so that
@@ -5890,6 +5951,25 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
     response
 }
 
+fn client_banned_response(remaining: Duration, scope: &'static str) -> Response {
+    let mut response = simple_response(StatusCode::FORBIDDEN, "client-banned");
+    let code = if scope == "share" {
+        "cc_switch_share_client_banned"
+    } else {
+        "cc_switch_router_auth_client_banned"
+    };
+    response
+        .headers_mut()
+        .insert("x-cc-switch-error-code", HeaderValue::from_static(code));
+    response
+        .headers_mut()
+        .insert("x-cc-switch-error-scope", HeaderValue::from_static(scope));
+    if let Ok(value) = HeaderValue::from_str(&remaining.as_secs().max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 fn ingress_rejection_response(
     state: &ServerState,
     upstream_status: StatusCode,
@@ -6290,8 +6370,40 @@ fn is_abuse_tracked_api_path(path: &str) -> bool {
     )
 }
 
-fn is_invalid_auth_status(status: StatusCode) -> bool {
-    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+async fn record_router_auth_failure(state: &ServerState, client_ip: &str) {
+    if let Some(decision) = state.abuse.record_invalid_auth(client_ip).await {
+        warn!(
+            client_ip,
+            failures_10m = decision.failures,
+            ban_secs = decision.ban_duration.as_secs(),
+            "proxy client temporarily banned: Router authentication threshold reached"
+        );
+    }
+}
+
+fn share_abuse_signal<'a>(status: StatusCode, headers: &'a HeaderMap) -> Option<&'a str> {
+    if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return None;
+    }
+    let code = headers.get("x-cc-switch-error-code")?.to_str().ok()?.trim();
+    let scope = headers
+        .get("x-cc-switch-error-scope")?
+        .to_str()
+        .ok()?
+        .trim();
+    if code != "cc_switch_share_client_abuse" || scope != "share" {
+        return None;
+    }
+    let reason = headers
+        .get("x-cc-switch-abuse-reason")?
+        .to_str()
+        .ok()?
+        .trim();
+    matches!(
+        reason,
+        "invalid_share_client_credential" | "automated_credential_abuse" | "share_policy_abuse"
+    )
+    .then_some(reason)
 }
 
 fn is_allowed_direct_share_proxy_path(path: &str) -> bool {
@@ -7169,6 +7281,7 @@ mod tests {
             market_billing_controls: Arc::new(Mutex::new(())),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
+            share_abuse: Arc::new(crate::abuse::ShareAbuseTracker::new([])),
             ip_blacklist_stats: Arc::new(crate::ip_blacklist_stats::IpBlacklistStats::new()),
             upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
             share_edit_events,
@@ -7679,6 +7792,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
         assert_eq!(
+            response.headers().get("x-cc-switch-error-scope"),
+            Some(&HeaderValue::from_static("router"))
+        );
+        assert_eq!(
             response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some(&HeaderValue::from_static("*"))
         );
@@ -7687,6 +7804,32 @@ mod tests {
             .expect("read unified ban response");
         let payload: Value = serde_json::from_slice(&body).expect("parse unified ban response");
         assert_eq!(payload["code"], "user_model_route_client_banned");
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn unified_user_api_counts_explicit_missing_credentials() {
+        let config = proxy_test_config("unified-missing-token-ban");
+        let state = proxy_test_state(&config, Arc::new(ProxyRegistry::default()));
+        let peer = ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("host", format!("api.{}", config.tunnel_domain))
+                .body(Body::from(r#"{"model":"gpt-5.6"}"#))
+                .expect("build unified request")
+        };
+
+        for _ in 0..10 {
+            let response =
+                user_model_proxy_handler(State(state.clone()), peer.clone(), request()).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let response = user_model_proxy_handler(State(state), peer, request()).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -9855,6 +9998,37 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
         let claude_curl = unified_model_test_curl("https://api.example.com", &claude);
         assert!(claude_curl.contains("anthropic-version: 2023-06-01"));
         assert!(claude_curl.contains("x-api-key: <YOUR_API_KEY>"));
+    }
+
+    #[test]
+    fn ordinary_downstream_auth_status_is_not_a_share_abuse_signal() {
+        let headers = HeaderMap::new();
+        assert_eq!(share_abuse_signal(StatusCode::FORBIDDEN, &headers), None);
+        assert_eq!(share_abuse_signal(StatusCode::UNAUTHORIZED, &headers), None);
+    }
+
+    #[test]
+    fn share_abuse_signal_requires_typed_scope_and_allowlisted_reason() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-error-code",
+            HeaderValue::from_static("cc_switch_share_client_abuse"),
+        );
+        headers.insert("x-cc-switch-error-scope", HeaderValue::from_static("share"));
+        headers.insert(
+            "x-cc-switch-abuse-reason",
+            HeaderValue::from_static("invalid_share_client_credential"),
+        );
+        assert_eq!(
+            share_abuse_signal(StatusCode::FORBIDDEN, &headers),
+            Some("invalid_share_client_credential")
+        );
+
+        headers.insert(
+            "x-cc-switch-abuse-reason",
+            HeaderValue::from_static("provider_forbidden"),
+        );
+        assert_eq!(share_abuse_signal(StatusCode::FORBIDDEN, &headers), None);
     }
 }
 

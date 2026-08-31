@@ -441,6 +441,29 @@ export type GrokMediaPolicy = {
   videoGenerationEnabled: boolean;
 };
 
+export type ShareClientBan = {
+  id: string;
+  shareId: string;
+  clientIp: string;
+  reasonCode: string;
+  failureCount: number;
+  firstFailureAt: string;
+  lastFailureAt: string;
+  bannedAt: string;
+  bannedUntil: string;
+};
+
+export type ShareClientBanPage = {
+  items: ShareClientBan[];
+  nextCursor?: string;
+};
+
+export type ShareClientUnbanResponse = {
+  ok: boolean;
+  banId: string;
+  alreadyUnbanned: boolean;
+};
+
 export type ShareSettingsPatch = {
   ownerEmail?: string;
   description?: string | null;

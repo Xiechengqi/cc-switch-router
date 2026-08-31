@@ -69,7 +69,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uuid::Uuid;
 
-use crate::abuse::AbuseTracker;
+use crate::abuse::{AbuseTracker, ShareAbuseTracker};
 use crate::client_market::ClientMarketJobSecrets;
 use crate::config::{Config, DatabaseMode, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
@@ -218,10 +218,14 @@ async fn main() -> Result<()> {
         dynamic.clone(),
         &config,
     )?;
+    let store = AppStore::new(&config)?;
+    let share_abuse = Arc::new(ShareAbuseTracker::new(
+        store.load_active_share_client_bans().await?,
+    ));
     let state = ServerState {
         config: config.clone(),
         server_geo: server_geo.clone(),
-        store: AppStore::new(&config)?,
+        store,
         server_logs,
         client_logs: Arc::new(crate::client_logs::ClientLogAccessLimiter::default()),
         proxy: Arc::new(ProxyRegistry::default()),
@@ -247,6 +251,7 @@ async fn main() -> Result<()> {
         market_billing_controls: Arc::new(Mutex::new(())),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
+        share_abuse,
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),
         upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
         share_edit_events: broadcast::channel(512).0,

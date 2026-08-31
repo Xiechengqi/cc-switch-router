@@ -2963,6 +2963,24 @@ export const messages = {
     "dashboard.shareEdit.passthrough": "passthrough",
     "dashboard.shareEditNoAppType":
       "No app binding is configured for this share.",
+    "dashboard.shareClientBans.title": "Banned client IPs",
+    "dashboard.shareClientBans.description":
+      "Only active bans scoped to this Share are shown. Router-wide authentication bans are managed separately.",
+    "dashboard.shareClientBans.loading": "Loading banned client IPs…",
+    "dashboard.shareClientBans.empty": "No client IP is currently banned from this Share.",
+    "dashboard.shareClientBans.refresh": "Refresh banned client IPs",
+    "dashboard.shareClientBans.failures": "{count} violations",
+    "dashboard.shareClientBans.until": "Banned until {time}",
+    "dashboard.shareClientBans.unban": "Unban",
+    "dashboard.shareClientBans.loadMore": "Load more",
+    "dashboard.shareClientBans.confirm":
+      "Unban {ip} from Share {share}? Its violation counter for this Share will also be cleared.",
+    "dashboard.shareClientBans.unbanSuccess": "Unbanned {ip}.",
+    "dashboard.shareClientBans.reason.invalid_share_client_credential":
+      "Invalid Share client credential",
+    "dashboard.shareClientBans.reason.automated_credential_abuse":
+      "Automated credential abuse",
+    "dashboard.shareClientBans.reason.share_policy_abuse": "Share policy abuse",
     "dashboard.field.description": "Description",
     "dashboard.field.ownerEmail": "Owner email",
     "dashboard.field.subdomain": "Subdomain",
@@ -5979,6 +5997,23 @@ export const messages = {
     "dashboard.shareEdit.appApiUnbound": "未绑定",
     "dashboard.shareEdit.passthrough": "透传",
     "dashboard.shareEditNoAppType": "此 share 未配置 app 绑定。",
+    "dashboard.shareClientBans.title": "被封禁的客户端 IP",
+    "dashboard.shareClientBans.description":
+      "这里只显示当前 Share 范围内的有效封禁；Router 全局认证封禁不在此处管理。",
+    "dashboard.shareClientBans.loading": "正在加载被封禁的客户端 IP…",
+    "dashboard.shareClientBans.empty": "当前没有被此 Share 封禁的客户端 IP。",
+    "dashboard.shareClientBans.refresh": "刷新被封禁的客户端 IP",
+    "dashboard.shareClientBans.failures": "{count} 次违规",
+    "dashboard.shareClientBans.until": "封禁至 {time}",
+    "dashboard.shareClientBans.unban": "解封",
+    "dashboard.shareClientBans.loadMore": "加载更多",
+    "dashboard.shareClientBans.confirm":
+      "确认从 Share {share} 解封 {ip}？该 IP 在此 Share 下的违规计数也会同时清除。",
+    "dashboard.shareClientBans.unbanSuccess": "已解封 {ip}。",
+    "dashboard.shareClientBans.reason.invalid_share_client_credential":
+      "无效的 Share 客户端凭据",
+    "dashboard.shareClientBans.reason.automated_credential_abuse": "自动化凭据滥用",
+    "dashboard.shareClientBans.reason.share_policy_abuse": "Share 策略违规",
     "dashboard.field.description": "描述",
     "dashboard.field.ownerEmail": "Owner Email",
     "dashboard.field.subdomain": "子域名",

@@ -8,6 +8,8 @@ import type {
   ClientServerReleaseValidation,
   ShareSettingsPatch,
   ShareEditView,
+  ShareClientBanPage,
+  ShareClientUnbanResponse,
   ShareConnectionTestRequest,
   ShareConnectionTestResponse,
   ClientOnlineCalendar,
@@ -347,6 +349,30 @@ export async function updateShareSettings(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ patch, baseConfigRevision }),
     }),
+  );
+}
+
+export async function getShareClientBans(
+  shareId: string,
+  cursor?: string,
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({ limit: "50" });
+  if (cursor) params.set("cursor", cursor);
+  return parseJson<ShareClientBanPage>(
+    await authFetch(
+      `/v1/shares/${encodeURIComponent(shareId)}/client-bans?${params.toString()}`,
+      { cache: "no-store", signal },
+    ),
+  );
+}
+
+export async function unbanShareClient(shareId: string, banId: string) {
+  return parseJson<ShareClientUnbanResponse>(
+    await authFetch(
+      `/v1/shares/${encodeURIComponent(shareId)}/client-bans/${encodeURIComponent(banId)}/unban`,
+      { method: "POST" },
+    ),
   );
 }
 
