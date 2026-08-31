@@ -354,7 +354,7 @@ export const ShareCard = React.memo(function ShareCard({
           ) : null}
         </div>
 
-        <ShareProviderStatusPanel view={providerPanelView} />
+        <ShareProviderStatusPanel view={providerPanelView} wrapPrimaryLine />
 
         {directApiUrl ? (
           <div className="grid min-w-0 gap-1.5 border-t border-slate-100 pt-2">

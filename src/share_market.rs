@@ -20,8 +20,10 @@ use crate::ServerState;
 use crate::client_market_trade::PaymentContact;
 use crate::client_market_trade::PaymentMethod;
 use crate::error::AppError;
+#[cfg(test)]
+use crate::models::SHARE_CONTRACT_VERSION;
 use crate::models::{
-    AuthSession, SHARE_CONTRACT_VERSION, ShareEditAvailableEvent, ShareGrantManager,
+    AuthSession, MIN_SHARE_MARKET_CONTRACT_VERSION, ShareEditAvailableEvent, ShareGrantManager,
     ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareSupport,
     ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
 };
@@ -990,14 +992,14 @@ fn ensure_share_market_app_scope_supported_tx(
         .optional()
         .map_err(map_db("read Share contract version"))?
         .ok_or_else(|| AppError::NotFound("Share not found".into()))?;
-    if version < i64::from(SHARE_CONTRACT_VERSION) {
+    if version < i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION) {
         return Err(AppError::coded_conflict(
             "share_market_client_upgrade_required",
             "the Share owner must upgrade cc-switch-server before accepting market rentals",
             serde_json::json!({
                 "reason": "share_contract_upgrade_required",
                 "currentVersion": version,
-                "requiredVersion": SHARE_CONTRACT_VERSION,
+                "requiredVersion": MIN_SHARE_MARKET_CONTRACT_VERSION,
             }),
         ));
     }
@@ -1575,7 +1577,7 @@ fn evaluate_share_market_service_availability_tx(
         None => block_availability(&mut blocking_reason, &mut reasons, "share_expiry_invalid"),
         _ => {}
     }
-    if record.contract_version < i64::from(SHARE_CONTRACT_VERSION) {
+    if record.contract_version < i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION) {
         block_availability(
             &mut blocking_reason,
             &mut reasons,
@@ -1852,7 +1854,7 @@ fn subscription_integrity_violations_tx(
     if share.share_status != "active" {
         push_reason(&mut violations, "share_inactive");
     }
-    if share.contract_version < i64::from(SHARE_CONTRACT_VERSION) {
+    if share.contract_version < i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION) {
         push_reason(&mut violations, "share_contract_upgrade_required");
     }
     let contract_apps = subscription_contract_apps(record);
@@ -2002,7 +2004,7 @@ fn subscription_integrity_violations_tx(
             .flatten();
         if active_entitlement_grant(grants_json.as_deref(), &record.entitlement_id).is_none() {
             push_reason(&mut violations, "entitlement_missing");
-        } else if share.contract_version >= i64::from(SHARE_CONTRACT_VERSION)
+        } else if share.contract_version >= i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION)
             && !active_grant_has_contract_scope(grants_json.as_deref(), record)
         {
             push_reason(&mut violations, "app_scope_not_enforced");
@@ -4388,7 +4390,7 @@ fn listing_reopen_capability_tx(
             Some(state) if pending_edit_enables_free_access_tx(conn, &state.0)? => {
                 Some("pending_share_edit")
             }
-            Some(state) if state.5 < i64::from(SHARE_CONTRACT_VERSION) => {
+            Some(state) if state.5 < i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION) => {
                 Some("client_upgrade_required")
             }
             Some(state) if state.8.is_some() => Some("another_listing_active"),
@@ -5230,7 +5232,7 @@ impl AppStore {
                     Some("share_inactive")
                 } else if pending_free_access {
                     Some("pending_share_edit")
-                } else if contract_version < i64::from(SHARE_CONTRACT_VERSION) {
+                } else if contract_version < i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION) {
                     Some("client_upgrade_required")
                 } else {
                     None
@@ -13061,7 +13063,7 @@ mod tests {
                     format!("{share_id}-route"),
                     now,
                     periods,
-                    i64::from(SHARE_CONTRACT_VERSION),
+                    i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION),
                 ],
             )
             .expect("insert Share");
@@ -19697,7 +19699,7 @@ mod tests {
             .await
             .execute(
                 "UPDATE shares SET share_access_policy_version = ?2 WHERE share_id = ?1",
-                params!["share-reopen-rollback", i64::from(SHARE_CONTRACT_VERSION)],
+                params!["share-reopen-rollback", i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION)],
             )
             .expect("restore Share contract");
 
@@ -22546,7 +22548,7 @@ mod tests {
             let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE shares SET share_access_policy_version = ?2 WHERE share_id = ?1",
-                params!["share-scope-upgrade", i64::from(SHARE_CONTRACT_VERSION)],
+                params!["share-scope-upgrade", i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION)],
             )
             .expect("upgrade Share contract version");
         }

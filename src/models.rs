@@ -7,7 +7,11 @@ use std::collections::BTreeMap;
 use crate::namespace::PROTOCOL_EPOCH;
 
 pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
-pub const SHARE_CONTRACT_VERSION: u16 = 5;
+/// Contract v5 introduced the market App-scope guarantees. Contract v6 only
+/// adds scoped quota metadata, so v5 market records remain valid during a
+/// rolling Server/Router deployment.
+pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
+pub const SHARE_CONTRACT_VERSION: u16 = 6;
 
 #[derive(Debug)]
 struct ParsedRawJson<T> {
@@ -2438,7 +2442,7 @@ pub struct ShareSupport {
     pub gemini: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUpstreamQuotaTier {
     #[serde(alias = "name")]
@@ -2452,6 +2456,16 @@ pub struct ShareUpstreamQuotaTier {
     pub limit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_weekly_capacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

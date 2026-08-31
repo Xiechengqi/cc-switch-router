@@ -165,3 +165,34 @@ test("Ollama display-only windows keep one-decimal percents without a second sca
   }, "en");
   assert.match(line, /Weekly 0\.1%/);
 });
+
+test("Claude quota summary keeps the scoped Fable weekly pool", () => {
+  const line = quotaSummary(
+    {
+      kind: "official_oauth",
+      app: "claude",
+      providerName: "Claude Official",
+      providerType: "claude_oauth",
+      quota: {
+        status: "ok",
+        plan: "Claude Max 20x",
+        tiers: [
+          { label: "1w", utilization: 72 },
+          {
+            label: "Fable 7d",
+            utilization: 100,
+            scope: "model_family",
+            capacityPool: "claude_fable_7d_oi",
+            modelFamily: "claude-fable-5",
+            relativeWeeklyCapacity: 0.5,
+            source: "anthropic_usage_7d_oi",
+          },
+        ],
+      },
+    },
+    "en",
+  );
+  assert.match(line, /Claude Max 20x/);
+  assert.match(line, /7d 72%/);
+  assert.match(line, /Fable 7d 100%/);
+});

@@ -980,6 +980,11 @@ export type ShareUpstreamProvider = {
       used?: number;
       limit?: number;
       unit?: string;
+      scope?: "account" | "model_family";
+      capacityPool?: string;
+      modelFamily?: string;
+      relativeWeeklyCapacity?: number;
+      source?: string;
     }>;
   };
   models?: Array<{
@@ -2576,6 +2581,11 @@ export type ShareMarketProviderQuota = {
     used?: number;
     limit?: number;
     unit?: string;
+    scope?: "account" | "model_family";
+    capacityPool?: string;
+    modelFamily?: string;
+    relativeWeeklyCapacity?: number;
+    source?: string;
   }>;
 };
 

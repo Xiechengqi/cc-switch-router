@@ -1070,7 +1070,7 @@ export function quotaSummary(
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
     .filter((tier) => tier.label);
   if (runtime.app === "claude") {
-    const preferredLabels = new Set(["5h", "1w", "7d"]);
+    const preferredLabels = new Set(["5h", "1w", "7d", "fable 7d"]);
     const preferredTiers = tiers.filter((tier) =>
       preferredLabels.has(String(tier.label).toLowerCase()),
     );
@@ -1184,7 +1184,7 @@ function preferredQuotaTiers(runtime?: ShareUpstreamProvider) {
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
     .filter((tier) => tier.label);
   if (runtime?.app === "claude") {
-    const preferredLabels = new Set(["5h", "1w", "7d"]);
+    const preferredLabels = new Set(["5h", "1w", "7d", "fable 7d"]);
     const preferredTiers = tiers.filter((tier) =>
       preferredLabels.has(String(tier.label).toLowerCase()),
     );
