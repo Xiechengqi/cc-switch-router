@@ -7558,7 +7558,7 @@ async fn test_share_connection(
             .cloned()
             .ok_or_else(|| {
                 AppError::Conflict(format!(
-                    "Share Contract v5 modelProbe is unavailable (contract version {}); upgrade or resync cc-switch-server",
+                    "Share Contract modelProbe is unavailable (contract version {}); upgrade or resync cc-switch-server",
                     share.contract_version
                 ))
             })?;
