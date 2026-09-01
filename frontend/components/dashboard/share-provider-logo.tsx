@@ -35,9 +35,9 @@ const PROVIDER_LOGOS: Record<string, Omit<ProviderLogo, "key">> = {
     asset: "/provider-icons/grok.svg",
     monochromeColor: "#111827",
   },
-  kiro: { label: "Kiro", asset: "/provider-icons/kiro.png" },
+  kiro: { label: "Kiro", asset: "/provider-icons/kiro.svg" },
   kimi: { label: "Kimi" },
-  cursor: { label: "Cursor", asset: "/provider-icons/cursor.png" },
+  cursor: { label: "Cursor", asset: "/provider-icons/cursor.svg" },
   ollama: {
     label: "Ollama",
     asset: "/provider-icons/ollama.svg",
