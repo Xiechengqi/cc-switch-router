@@ -2948,6 +2948,17 @@ impl AppStore {
                 "serialize installation upgrade task logs failed: {error}"
             ))
         })?;
+        let failure_json = input
+            .payload
+            .failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "serialize installation upgrade failure failed: {error}"
+                ))
+            })?;
         let now = Utc::now().to_rfc3339();
         let client_reported_at_ms = input.timestamp_ms;
         let conn = self.conn.lock().await;
@@ -2973,8 +2984,8 @@ impl AppStore {
             "INSERT INTO installation_upgrade_tasks (
                 installation_id, task_id, requested_by_email, status, restart_pending,
                 target_commit_id, logs_json, restart_after, client_reported_at_ms,
-                reported_at, created_at, updated_at
-             ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9)
+                reported_at, created_at, updated_at, failure_json
+             ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9, ?10)
              ON CONFLICT(installation_id, task_id) DO UPDATE SET
                 status = CASE
                     WHEN installation_upgrade_tasks.status IN ('success', 'failed')
@@ -3000,6 +3011,12 @@ impl AppStore {
                     THEN installation_upgrade_tasks.logs_json
                     ELSE excluded.logs_json
                 END,
+                failure_json = CASE
+                    WHEN installation_upgrade_tasks.status IN ('success', 'failed')
+                         AND excluded.status = 'running'
+                    THEN installation_upgrade_tasks.failure_json
+                    ELSE excluded.failure_json
+                END,
                 restart_after = excluded.restart_after,
                 client_reported_at_ms = excluded.client_reported_at_ms,
                 reported_at = excluded.reported_at,
@@ -3016,6 +3033,7 @@ impl AppStore {
                 i64::from(input.payload.restart_after),
                 client_reported_at_ms,
                 now,
+                failure_json,
             ],
         )
         .map_err(|error| {
@@ -5364,6 +5382,89 @@ impl AppStore {
         Ok((tunnel_url, installation.id))
     }
 
+    pub async fn ensure_installation_upgrade_target_allowed(
+        &self,
+        target_commit_id: &str,
+    ) -> Result<(), AppError> {
+        let target_commit_id = target_commit_id.trim();
+        if !(7..=40).contains(&target_commit_id.len())
+            || !target_commit_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AppError::BadRequest(
+                "client upgrade target commit is invalid".into(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT installation_id, target_commit_id, failure_json
+                 FROM installation_upgrade_tasks
+                 WHERE status = 'failed'
+                   AND target_commit_id IS NOT NULL
+                   AND failure_json IS NOT NULL
+                 ORDER BY updated_at DESC",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare upgrade rollout guard failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query upgrade rollout guard failed: {error}"))
+            })?;
+        let mut failures =
+            std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+        for row in rows {
+            let (installation_id, failed_target, failure_json) = row.map_err(|error| {
+                AppError::Internal(format!("read upgrade rollout guard failed: {error}"))
+            })?;
+            if !upgrade_commits_match(&failed_target, target_commit_id) {
+                continue;
+            }
+            let Ok(failure) =
+                serde_json::from_str::<crate::models::InstallationUpgradeFailure>(&failure_json)
+            else {
+                continue;
+            };
+            if !matches!(
+                failure.failure_code.as_str(),
+                "startup_contract_preflight_failed" | "replacement_exited"
+            ) {
+                continue;
+            }
+            failures
+                .entry(failure.failure_code)
+                .or_default()
+                .insert(installation_id);
+        }
+        if let Some((failure_code, installations)) = failures
+            .into_iter()
+            .find(|(_, installations)| installations.len() >= 2)
+        {
+            return Err(AppError::coded_conflict(
+                "CLIENT_UPGRADE_ROLLOUT_CIRCUIT_OPEN",
+                format!(
+                    "client upgrade rollout circuit is open for target {target_commit_id}: {failure_code} occurred on {} installations",
+                    installations.len()
+                ),
+                serde_json::json!({
+                    "targetCommitId": target_commit_id,
+                    "failureCode": failure_code,
+                    "installationCount": installations.len(),
+                }),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn record_installation_upgrade_started(
         &self,
         installation_id: &str,
@@ -5436,7 +5537,7 @@ impl AppStore {
         let row = if let Some(task_id) = task_id {
             conn.query_row(
                 "SELECT task_id, status, restart_pending, target_commit_id, logs_json,
-                        client_reported_at_ms, updated_at, created_at
+                        client_reported_at_ms, updated_at, created_at, failure_json
                  FROM installation_upgrade_tasks
                  WHERE installation_id = ?1 AND task_id = ?2",
                 params![installation_id, task_id],
@@ -5450,6 +5551,7 @@ impl AppStore {
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -5457,7 +5559,7 @@ impl AppStore {
         } else {
             conn.query_row(
                 "SELECT task_id, status, restart_pending, target_commit_id, logs_json,
-                        client_reported_at_ms, updated_at, created_at
+                        client_reported_at_ms, updated_at, created_at, failure_json
                  FROM installation_upgrade_tasks
                  WHERE installation_id = ?1 AND status = 'running'
                  ORDER BY created_at DESC, task_id DESC
@@ -5473,6 +5575,7 @@ impl AppStore {
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -5487,6 +5590,16 @@ impl AppStore {
                 "decode installation upgrade task logs failed: {error}"
             ))
         })?;
+        let failure = row
+            .8
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "decode installation upgrade failure failed: {error}"
+                ))
+            })?;
         let reference_at = DateTime::parse_from_rfc3339(&row.6)
             .or_else(|_| DateTime::parse_from_rfc3339(&row.7))
             .map(|value| value.with_timezone(&Utc))
@@ -5509,6 +5622,7 @@ impl AppStore {
             status: row.1,
             restart_pending: row.2 != 0,
             target_commit_id: row.3,
+            failure,
             logs,
             status_sync: status_sync.into(),
             updated_at: row.6,
@@ -5555,6 +5669,16 @@ impl AppStore {
                 "serialize reconciled installation upgrade logs failed: {error}"
             ))
         })?;
+        let failure_json = payload
+            .failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "serialize reconciled installation upgrade failure failed: {error}"
+                ))
+            })?;
         let client_reported_at_ms = DateTime::parse_from_rfc3339(payload.updated_at.trim())
             .map_err(|_| {
                 AppError::BadRequest(
@@ -5602,6 +5726,10 @@ impl AppStore {
                          WHEN status IN ('success', 'failed') AND ?3 = 'running' THEN logs_json
                          ELSE ?6
                      END,
+                     failure_json = CASE
+                         WHEN status IN ('success', 'failed') AND ?3 = 'running' THEN failure_json
+                         ELSE ?10
+                     END,
                      restart_after = ?7,
                      client_reported_at_ms = ?8,
                      reported_at = ?9,
@@ -5617,6 +5745,7 @@ impl AppStore {
                     i64::from(payload.restart_after),
                     client_reported_at_ms,
                     now_text,
+                    failure_json,
                 ],
             )
             .map_err(|error| {
@@ -17939,6 +18068,24 @@ fn validate_installation_upgrade_task_report(
             "installation upgrade target commit is invalid".into(),
         ));
     }
+    if let Some(failure) = payload.failure.as_ref() {
+        if payload.status != "failed"
+            || failure.failure_code.trim().is_empty()
+            || failure.failure_code.len() > 128
+            || !failure
+                .failure_code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            || failure.stage.trim().is_empty()
+            || failure.stage.len() > 128
+            || failure.diagnostic.trim().is_empty()
+            || failure.diagnostic.len() > 4_096
+        {
+            return Err(AppError::BadRequest(
+                "installation upgrade failure diagnostic is invalid".into(),
+            ));
+        }
+    }
     if payload.updated_at.trim().is_empty()
         || payload.updated_at.len() > 128
         || DateTime::parse_from_rfc3339(payload.updated_at.trim()).is_err()
@@ -17977,6 +18124,19 @@ fn validate_installation_upgrade_task_report(
         ));
     }
     Ok(())
+}
+
+fn upgrade_commits_match(left: &str, right: &str) -> bool {
+    let left = left.trim().to_ascii_lowercase();
+    let right = right.trim().to_ascii_lowercase();
+    if !(7..=40).contains(&left.len())
+        || !(7..=40).contains(&right.len())
+        || !left.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !right.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    left.starts_with(&right) || right.starts_with(&left)
 }
 
 fn find_installation_id_by_public_key(
@@ -24412,12 +24572,18 @@ impl Serialize for CanonicalInstallationUpgradeTaskReportPayload<'_> {
         S: serde::Serializer,
     {
         let payload = self.0;
-        let mut state = serializer.serialize_struct("InstallationUpgradeTaskReportPayload", 7)?;
+        let mut state = serializer.serialize_struct(
+            "InstallationUpgradeTaskReportPayload",
+            if payload.failure.is_some() { 8 } else { 7 },
+        )?;
         state.serialize_field("taskId", &payload.task_id)?;
         state.serialize_field("status", &payload.status)?;
         state.serialize_field("restartPending", &payload.restart_pending)?;
         state.serialize_field("logs", &payload.logs)?;
         state.serialize_field("targetCommitId", &payload.target_commit_id)?;
+        if let Some(failure) = payload.failure.as_ref() {
+            state.serialize_field("failure", failure)?;
+        }
         state.serialize_field("restartAfter", &payload.restart_after)?;
         state.serialize_field("updatedAt", &payload.updated_at)?;
         state.end()
@@ -26125,6 +26291,7 @@ mod tests {
                 at: "2026-08-11T10:00:00Z".into(),
             }],
             target_commit_id: Some("7b5e172c9cb4".into()),
+            failure: None,
             restart_after: true,
             updated_at: "2026-08-11T10:00:01Z".into(),
         };
@@ -26143,6 +26310,64 @@ mod tests {
             GOLDEN_UPGRADE_REPORT_SIGNATURE,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn upgrade_task_report_failure_uses_the_server_canonical_field_order() {
+        let mut payload = upgrade_task_report_payload(
+            "task-upgrade-failure",
+            "failed",
+            "error",
+            "replacement exited",
+        );
+        payload.failure = Some(upgrade_failure(
+            "replacement_exited",
+            "replacement_startup",
+            "replacement exited with status 1",
+        ));
+        payload.updated_at = "2026-08-11T10:00:01Z".into();
+        payload.logs[0].at = "2026-08-11T10:00:00Z".into();
+
+        let payload_json = installation_upgrade_task_report_payload_json(&payload).unwrap();
+        assert_eq!(
+            payload_json,
+            r#"{"taskId":"task-upgrade-failure","status":"failed","restartPending":false,"logs":[{"taskId":"task-upgrade-failure","step":7,"totalSteps":7,"level":"error","message":"replacement exited","progress":null,"at":"2026-08-11T10:00:00Z"}],"targetCommitId":"aabbccddeeff","failure":{"failureCode":"replacement_exited","stage":"replacement_startup","exitCode":1,"diagnostic":"replacement exited with status 1"},"restartAfter":true,"updatedAt":"2026-08-11T10:00:01Z"}"#
+        );
+
+        let signing_key = SigningKey::from_bytes(&[17_u8; 32]);
+        let signature = sign_test_payload_json(
+            &signing_key,
+            "fixture-installation",
+            INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+            &payload_json,
+            GOLDEN_TIMESTAMP_MS,
+            "failure-order-nonce",
+        );
+        verify_signed_payload_json(
+            &public_key_b64(&signing_key),
+            "fixture-installation",
+            INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+            &payload_json,
+            GOLDEN_TIMESTAMP_MS,
+            "failure-order-nonce",
+            &signature,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upgrade_commit_matching_requires_an_exact_or_full_prefix_match() {
+        assert!(upgrade_commits_match("AABBCCD", "aabbccddeeff0011"));
+        assert!(upgrade_commits_match(
+            "aabbccddeeff00112233445566778899aabbccdd",
+            "aabbccddeeff00112233445566778899aabbccdd"
+        ));
+        assert!(!upgrade_commits_match(
+            "aabbccddeeff00112233445566778899aabbccdd",
+            "aabbccddeeff88992233445566778899aabbccdd"
+        ));
+        assert!(!upgrade_commits_match("aabbcc", "aabbccddeeff"));
+        assert!(!upgrade_commits_match("not-a-sha", "aabbccddeeff"));
     }
 
     #[test]
@@ -28964,7 +29189,7 @@ mod tests {
             "active",
         )
         .await;
-        let slot_start = 1_787_443_200;
+        let slot_start = (Utc::now().timestamp() / 1_800) * 1_800;
         let epoch_id = store
             .sync_share_model_probe_epoch(
                 "health-share",
@@ -31967,6 +32192,7 @@ mod tests {
             status: status.into(),
             restart_pending: status == "success",
             target_commit_id: Some("aabbccddeeff".into()),
+            failure: None,
             logs: vec![InstallationUpgradeLogEntry {
                 task_id: task_id.into(),
                 step: 7,
@@ -31979,6 +32205,52 @@ mod tests {
             restart_after: true,
             updated_at,
         }
+    }
+
+    fn upgrade_failure(
+        failure_code: &str,
+        stage: &str,
+        diagnostic: &str,
+    ) -> crate::models::InstallationUpgradeFailure {
+        crate::models::InstallationUpgradeFailure {
+            failure_code: failure_code.into(),
+            stage: stage.into(),
+            exit_code: Some(1),
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    async fn insert_failed_upgrade_for_rollout_guard(
+        store: &AppStore,
+        installation_id: &str,
+        task_id: &str,
+        target_commit_id: &str,
+        failure_code: &str,
+    ) {
+        insert_installation(store, installation_id).await;
+        let failure_json = serde_json::to_string(&upgrade_failure(
+            failure_code,
+            "test_stage",
+            "test rollout failure",
+        ))
+        .unwrap();
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installation_upgrade_tasks (
+                installation_id, task_id, requested_by_email, status, restart_pending,
+                target_commit_id, logs_json, restart_after, created_at, updated_at,
+                failure_json
+             ) VALUES (?1, ?2, 'owner@example.com', 'failed', 0, ?3, '[]', 1, ?4, ?4, ?5)",
+            params![
+                installation_id,
+                task_id,
+                target_commit_id,
+                now,
+                failure_json
+            ],
+        )
+        .expect("insert failed upgrade for rollout guard");
     }
 
     fn sign_tunnel_test_payload<T: Serialize>(
@@ -34020,6 +34292,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_status_reconciliation_persists_failure_diagnostics() {
+        let (store, config) = setup_store("upgrade-status-reconcile-failure").await;
+        let installation_id = "inst-upgrade-reconcile-failure";
+        insert_installation(&store, installation_id).await;
+        store
+            .record_installation_upgrade_started(
+                installation_id,
+                "task-reconcile-failure",
+                "owner@example.com",
+                true,
+            )
+            .await
+            .expect("record current upgrade");
+
+        let mut payload = upgrade_task_report_payload(
+            "task-reconcile-failure",
+            "failed",
+            "error",
+            "replacement exited",
+        );
+        payload.failure = Some(upgrade_failure(
+            "replacement_exited",
+            "replacement_startup",
+            "replacement exited with status 1",
+        ));
+        store
+            .reconcile_installation_upgrade_status_from_client(
+                installation_id,
+                "task-reconcile-failure",
+                payload,
+            )
+            .await
+            .expect("reconcile failed client task");
+
+        let status = store
+            .installation_upgrade_status_for_owner(
+                installation_id,
+                Some("task-reconcile-failure"),
+                "owner@example.com",
+            )
+            .await
+            .expect("read reconciled failure");
+        assert_eq!(status.status, "failed");
+        assert_eq!(
+            status.failure,
+            Some(upgrade_failure(
+                "replacement_exited",
+                "replacement_startup",
+                "replacement exited with status 1",
+            ))
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn signed_upgrade_reports_update_tasks_without_terminal_regression() {
         let (store, config) = setup_store("signed-upgrade-task-report").await;
         let installation_id = "inst-upgrade-report";
@@ -34034,12 +34362,17 @@ mod tests {
             .await
             .expect("record failed task start");
 
-        let failed_payload = upgrade_task_report_payload(
+        let mut failed_payload = upgrade_task_report_payload(
             "task-failed",
             "failed",
             "error",
             "replacement process failed health checks",
         );
+        failed_payload.failure = Some(upgrade_failure(
+            "replacement_exited",
+            "replacement_startup",
+            "replacement exited with status 1; startup log: bind failed",
+        ));
         store
             .report_installation_upgrade_task(signed_upgrade_task_report_request(
                 &signing_key,
@@ -34079,6 +34412,14 @@ mod tests {
         assert_eq!(
             failed.logs[0].message,
             "replacement process failed health checks"
+        );
+        assert_eq!(
+            failed.failure,
+            Some(upgrade_failure(
+                "replacement_exited",
+                "replacement_startup",
+                "replacement exited with status 1; startup log: bind failed",
+            ))
         );
 
         store
@@ -34169,6 +34510,92 @@ mod tests {
             .await
             .expect_err("terminal tasks must not be restored as active upgrades");
         assert!(no_running_task.to_string().contains("not found"));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn upgrade_rollout_guard_requires_two_installations_on_the_same_target() {
+        let (store, config) = setup_store("upgrade-rollout-guard").await;
+        let target = "aabbccddeeff00112233445566778899aabbccdd";
+
+        insert_failed_upgrade_for_rollout_guard(
+            &store,
+            "rollout-inst-1",
+            "rollout-task-1",
+            target,
+            "startup_contract_preflight_failed",
+        )
+        .await;
+        store
+            .ensure_installation_upgrade_target_allowed("aabbccd")
+            .await
+            .expect("one deterministic failure must not open the rollout circuit");
+
+        insert_failed_upgrade_for_rollout_guard(
+            &store,
+            "rollout-health-inst",
+            "rollout-health-task",
+            target,
+            "health_check_timeout",
+        )
+        .await;
+        store
+            .ensure_installation_upgrade_target_allowed(target)
+            .await
+            .expect("a health timeout must not count as a deterministic rollout failure");
+
+        insert_failed_upgrade_for_rollout_guard(
+            &store,
+            "rollout-inst-2",
+            "rollout-task-2",
+            "aabbccddeeff",
+            "startup_contract_preflight_failed",
+        )
+        .await;
+        let blocked = store
+            .ensure_installation_upgrade_target_allowed(target)
+            .await
+            .expect_err("two installations with the same deterministic failure must trip guard");
+        assert_eq!(blocked.code(), Some("CLIENT_UPGRADE_ROLLOUT_CIRCUIT_OPEN"));
+        assert!(blocked.to_string().contains("rollout circuit is open"));
+        assert!(
+            blocked
+                .to_string()
+                .contains("startup_contract_preflight_failed")
+        );
+
+        store
+            .ensure_installation_upgrade_target_allowed("bbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .await
+            .expect("failures from another target must not open this rollout circuit");
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn upgrade_rollout_guard_includes_replacement_exit_failures() {
+        let (store, config) = setup_store("upgrade-rollout-replacement-exit").await;
+        let target = "ccddee112233445566778899aabbccddeeff0011";
+        for (installation_id, task_id) in [
+            ("replacement-exit-inst-1", "replacement-exit-task-1"),
+            ("replacement-exit-inst-2", "replacement-exit-task-2"),
+        ] {
+            insert_failed_upgrade_for_rollout_guard(
+                &store,
+                installation_id,
+                task_id,
+                target,
+                "replacement_exited",
+            )
+            .await;
+        }
+
+        let blocked = store
+            .ensure_installation_upgrade_target_allowed("ccddee112233")
+            .await
+            .expect_err("replacement exits on two installations must trip guard");
+        assert!(blocked.to_string().contains("replacement_exited"));
 
         let _ = std::fs::remove_file(&config.database.path);
     }

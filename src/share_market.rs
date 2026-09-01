@@ -1820,7 +1820,11 @@ fn grant_token_limit(record: &SubscriptionRecord) -> Option<u64> {
         return record
             .trial_token_limit
             .and_then(|value| u64::try_from(value).ok())
-            .or_else(|| record.token_limit.and_then(|value| u64::try_from(value).ok()));
+            .or_else(|| {
+                record
+                    .token_limit
+                    .and_then(|value| u64::try_from(value).ok())
+            });
     }
     record
         .token_limit
@@ -4417,7 +4421,10 @@ fn seat_delete_capability(
     }
     if matches!(seat_status, SEAT_AVAILABLE | SEAT_DISABLED) && retired_at.is_none() {
         let has_live_rental = subscription.is_some_and(|subscription| {
-            !matches!(subscription.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED)
+            !matches!(
+                subscription.status.as_str(),
+                SUB_RELEASED | SUB_GRANT_FAILED
+            )
         });
         if !has_live_rental {
             return DeleteCapability::allowed();
@@ -6064,7 +6071,8 @@ fn insert_seat_tx(
             seat.currency,
             seat.service_duration_days.map(i64::from),
             seat.trial_hours,
-            seat.trial_token_limit.and_then(|value| i64::try_from(value).ok()),
+            seat.trial_token_limit
+                .and_then(|value| i64::try_from(value).ok()),
             now,
         ],
     )
@@ -6737,7 +6745,8 @@ impl AppStore {
                         seat.currency,
                         seat.service_duration_days.map(i64::from),
                         seat.trial_hours,
-                        seat.trial_token_limit.and_then(|value| i64::try_from(value).ok()),
+                        seat.trial_token_limit
+                            .and_then(|value| i64::try_from(value).ok()),
                         now,
                         expected_revision,
                     ],
@@ -6936,7 +6945,8 @@ impl AppStore {
                     seat.currency,
                     seat.service_duration_days.map(i64::from),
                     seat.trial_hours,
-                    seat.trial_token_limit.and_then(|value| i64::try_from(value).ok()),
+                    seat.trial_token_limit
+                        .and_then(|value| i64::try_from(value).ok()),
                     now,
                     input.offer_revision,
                 ],
@@ -8708,7 +8718,9 @@ impl AppStore {
                     daily_rate_minor,
                     offer_revision: record.offer_revision,
                     replacement_of: Some(&replacement_contract_id),
-                    trial_allowance_seconds: trial_seconds_from_hours(record.trial_hours.unwrap_or(0))?,
+                    trial_allowance_seconds: trial_seconds_from_hours(
+                        record.trial_hours.unwrap_or(0),
+                    )?,
                 },
                 i64::MAX,
                 &now,
@@ -9093,7 +9105,8 @@ impl AppStore {
             && rented_trial_hours.unwrap_or(0) > 0
             && quoted_trial_seconds.unwrap_or(i64::MAX) > 0
         {
-            rented_trial_token_limit.or_else(|| token_limit.and_then(|value| u64::try_from(value).ok()))
+            rented_trial_token_limit
+                .or_else(|| token_limit.and_then(|value| u64::try_from(value).ok()))
         } else {
             token_limit.and_then(|value| u64::try_from(value).ok())
         };
@@ -11719,7 +11732,9 @@ impl AppStore {
                 && record.contract_trial_seconds_remaining == Some(0)
             {
                 if let Some(grant) = entitlement_grant.as_ref() {
-                    let paid_tokens = record.token_limit.and_then(|value| u64::try_from(value).ok());
+                    let paid_tokens = record
+                        .token_limit
+                        .and_then(|value| u64::try_from(value).ok());
                     if grant.policy.token_limit != paid_tokens {
                         let policy = contract_policy(&record)?;
                         enqueue_control_operation_tx(
@@ -14482,7 +14497,10 @@ mod tests {
         assert_eq!(quote.offer.seat_id, seat_id);
         assert_eq!(quote.offer.daily_rate_minor, Some(1_200));
         assert_eq!(quote.offer.trial_hours, Some(DEFAULT_TRIAL_HOURS));
-        assert_eq!(quote.offer.trial_token_limit, Some(DEFAULT_TRIAL_TOKEN_LIMIT));
+        assert_eq!(
+            quote.offer.trial_token_limit,
+            Some(DEFAULT_TRIAL_TOKEN_LIMIT)
+        );
     }
 
     #[tokio::test]
@@ -19699,7 +19717,10 @@ mod tests {
             .await
             .execute(
                 "UPDATE shares SET share_access_policy_version = ?2 WHERE share_id = ?1",
-                params!["share-reopen-rollback", i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION)],
+                params![
+                    "share-reopen-rollback",
+                    i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION)
+                ],
             )
             .expect("restore Share contract");
 
@@ -22548,7 +22569,10 @@ mod tests {
             let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE shares SET share_access_policy_version = ?2 WHERE share_id = ?1",
-                params!["share-scope-upgrade", i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION)],
+                params![
+                    "share-scope-upgrade",
+                    i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION)
+                ],
             )
             .expect("upgrade Share contract version");
         }

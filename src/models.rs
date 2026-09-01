@@ -3337,6 +3337,16 @@ pub struct InstallationUpgradeLogEntry {
     pub at: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationUpgradeFailure {
+    pub failure_code: String,
+    pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub diagnostic: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeInstallationStatusResponse {
@@ -3346,6 +3356,8 @@ pub struct UpgradeInstallationStatusResponse {
     pub restart_pending: bool,
     #[serde(default)]
     pub target_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<InstallationUpgradeFailure>,
     #[serde(default)]
     pub logs: Vec<InstallationUpgradeLogEntry>,
     pub status_sync: String,
@@ -3363,6 +3375,8 @@ pub struct InstallationUpgradeTaskReportPayload {
     pub logs: Vec<InstallationUpgradeLogEntry>,
     #[serde(default)]
     pub target_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<InstallationUpgradeFailure>,
     #[serde(default)]
     pub restart_after: bool,
     #[serde(default)]

@@ -25,6 +25,7 @@ type ClientUpgradeState = {
   errorMessage?: string;
   recoveryReason?: ClientUpgradeRecoveryReason;
   statusUnavailable?: boolean;
+  retryBlocked?: boolean;
 };
 
 const CLIENT_UPGRADE_START_TIMEOUT_MS = 35_000;
@@ -55,6 +56,7 @@ function isStoredClientUpgradeState(value: unknown): value is ClientUpgradeState
   if (candidate.taskId != null && typeof candidate.taskId !== "string") return false;
   if (candidate.errorMessage != null && typeof candidate.errorMessage !== "string") return false;
   if (candidate.statusUnavailable != null && typeof candidate.statusUnavailable !== "boolean") return false;
+  if (candidate.retryBlocked != null && typeof candidate.retryBlocked !== "boolean") return false;
   if (candidate.phase === "running" && !candidate.taskId?.trim()) return false;
   if (
     candidate.phase === "recovering"
@@ -66,7 +68,20 @@ function isStoredClientUpgradeState(value: unknown): value is ClientUpgradeState
   return true;
 }
 
-function upgradeFailureMessage(logs: ClientInstallationUpgradeLog[]) {
+function upgradeFailureMessage(
+  logs: ClientInstallationUpgradeLog[],
+  failure?: {
+    failureCode: string;
+    stage: string;
+    exitCode?: number | null;
+    diagnostic: string;
+  } | null,
+) {
+  if (failure?.diagnostic.trim()) {
+    const exit = failure.exitCode == null ? "" : `, exit ${failure.exitCode}`;
+    const message = `[${failure.stage}/${failure.failureCode}${exit}] ${failure.diagnostic.trim()}`;
+    return message.length > 800 ? `${message.slice(0, 797)}...` : message;
+  }
   let message = "";
   for (let index = logs.length - 1; index >= 0; index -= 1) {
     const entry = logs[index];
@@ -143,7 +158,8 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     && clientTunnel?.enabled === true
     && clientTunnel.online
     && delegateEnabled
-    && upgradeCapable !== false;
+    && upgradeCapable !== false
+    && !state.retryBlocked;
 
   const patchState = React.useCallback((
     updater: ClientUpgradeState | ((prev: ClientUpgradeState) => ClientUpgradeState),
@@ -161,13 +177,14 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     patchState(IDLE_CLIENT_UPGRADE_STATE);
   }, [patchState]);
 
-  const markUpgradeFailed = React.useCallback((errorMessage?: string) => {
+  const markUpgradeFailed = React.useCallback((errorMessage?: string, retryBlocked = false) => {
     startGuardRef.current = false;
     patchState((prev) => ({
       phase: "failed",
       startedAt: prev.startedAt || Date.now(),
       taskId: prev.taskId,
       errorMessage,
+      retryBlocked,
     }));
     toast.danger(t("dashboard.clientUpgradeFailed", { target: upgradeTarget }), errorMessage ? {
       description: errorMessage,
@@ -268,7 +285,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
             resetUpgradeState();
           } else {
             finished = true;
-            markUpgradeFailed(upgradeFailureMessage(result.logs));
+            markUpgradeFailed(upgradeFailureMessage(result.logs, result.failure));
           }
           return;
         }
@@ -392,7 +409,13 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
         });
         toast.warning(t("dashboard.clientUpgradeStartUncertain"));
       } else {
-        markUpgradeFailed(errorMessage);
+        const retryBlocked = error instanceof ApiError
+          && error.status === 409
+          && (
+            error.code === "CLIENT_UPGRADE_ROLLOUT_CIRCUIT_OPEN"
+            || errorMessage.toLowerCase().includes("rollout circuit")
+          );
+        markUpgradeFailed(errorMessage, retryBlocked);
       }
     } finally {
       window.clearTimeout(requestTimeout);
@@ -408,7 +431,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     void runUpgrade(startedAt);
   }
 
-  const buttonDisabled = !stateReady || locked || confirmOpen || !canUpgrade;
+  const buttonDisabled = !stateReady || locked || confirmOpen || !canUpgrade || !!state.retryBlocked;
 
   return (
     <>

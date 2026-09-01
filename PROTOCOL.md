@@ -399,6 +399,19 @@ Share Market、Client Market 和统一账务不创建商品级聊天室。Router
 
 事件 payload 是公开数据。Router 原样公开完整邮箱、账单金额、收款方式/联系方式、付款 reference/note、凭证 URL、争议/回收原因和安全的原始错误。系统消息中由 Owner/Provider/Supplier 发布的 `/v1/account/payment-assets/:id` 收款图片也允许匿名读取；未被系统消息引用的资产继续要求 Owner 或对应账单买方 Session。以下内容是唯一保密例外,不得出现在 DB、API、日志或 UI：API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥以及 SSH/lease 凭据。`PaymentMethod.token` 仅在 `kind=crypto` 且值为 `USDT`/`USDC` 时作为公开资产符号放行,其他 `token` 字段均按凭据拒绝。后端入 outbox 前拒绝敏感字段和带凭据 query/userinfo/fragment 的 URL,错误文本命中凭据片段时整体替换为固定占位；Web UI 还会独立执行字段、文本和 URL 二次过滤。
 
+### 7.5 Client 自升级状态与 rollout circuit
+
+Server 使用 installation Ed25519 身份向 `POST /v1/installations/upgrade-task-report` 上报升级状态，签名 action 固定为 `installation_upgrade_task_report_v1`。canonical payload 顺序为 `taskId`、`status`、`restartPending`、`logs`、`targetCommitId`、可选 `failure`、`restartAfter`、`updatedAt`；为了兼容旧 Server，`failure` 不存在时不得序列化该字段，原有签名串保持不变。
+
+`failure` 结构为 `failureCode`、`stage`、可选 `exitCode`、`diagnostic`。它只允许出现在 `status=failed` 的报告中；原因码只接受小写 ASCII、数字与下划线，code/stage 最长 128 字节，diagnostic 必须非空且最多 4096 字节。Router 在 signed report、Client Web reconcile 和 status read 三条路径中持久化并返回同一对象；终态任务不得被迟到的 `running` report 清除诊断。
+
+Router 在向 Client 发起目标 commit 可确定的升级前检查历史失败。同一目标（完整 SHA 与至少 7 位的大小写不敏感前缀视为同一 commit）在至少两个不同 installation 上出现同一种确定性原因时返回 `409 Conflict`（code=`CLIENT_UPGRADE_ROLLOUT_CIRCUIT_OPEN`）并打开 rollout circuit。当前确定性集合只有：
+
+- `startup_contract_preflight_failed`：staged binary 的只读启动契约预检失败。
+- `replacement_exited`：替代进程或服务在健康检查完成前已明确退出。
+
+`upgrade_failed`、`resource_preflight_failed`、`health_check_timeout` 等不进入熔断计数。熔断按目标 commit 隔离，不影响其他 release；Router Web 收到该 409 后禁用当前 installation 的连续重试。
+
 ---
 
 ## 8. 探针:`/_share-router/*`

@@ -1088,6 +1088,33 @@ async fn upgrade_installation(
         .store
         .prepare_installation_upgrade(&state.config, &installation_id, &session_email)
         .await?;
+    let release = state.dynamic.read().await.client_server_release.clone();
+    let validation = state
+        .client_server_release_validator
+        .validate(&release)
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!(
+                "validate client server release before upgrade failed: {error}"
+            ))
+        })?;
+    ensure_client_server_release_valid(validation.clone())?;
+    let target_commit = validation
+        .target_commitish
+        .as_deref()
+        .filter(|value| {
+            (7..=40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .or_else(|| {
+            ((release.len() == 7) && release.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then_some(release.as_str())
+        });
+    if let Some(target_commit) = target_commit {
+        state
+            .store
+            .ensure_installation_upgrade_target_allowed(target_commit)
+            .await?;
+    }
     // Speak directly to the live client-web tunnel backend with a signed ingress
     // context. Unauthenticated `x-cc-switch-web-*` headers are stripped by the
     // Client's `verify_router_ingress` middleware; going through the public URL

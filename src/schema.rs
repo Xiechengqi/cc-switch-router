@@ -129,6 +129,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0034_share_market_seat_trial.sql"),
     ),
     (35, include_str!("../schema/0035_share_client_bans.sql")),
+    (
+        36,
+        include_str!("../schema/0036_installation_upgrade_diagnostics.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1092,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_33_upgrade_a_version_26_database() {
+    fn migrations_27_through_36_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1136,13 +1140,32 @@ mod tests {
             )
             .expect("count model-health evidence columns after upgrade");
         assert_eq!(evidence_columns, 7);
+        let upgrade_failure_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('installation_upgrade_tasks')
+                 WHERE name = 'failure_json'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count upgrade diagnostic columns after upgrade");
+        assert_eq!(upgrade_failure_columns, 1);
+        let rollout_indexes = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'idx_installation_upgrade_tasks_failure_target'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count upgrade rollout indexes after upgrade");
+        assert_eq!(rollout_indexes, 1);
         let latest_version = conn
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 35);
-        check_compatibility(&conn).expect("upgraded version 35 is compatible");
+        assert_eq!(latest_version, 36);
+        check_compatibility(&conn).expect("upgraded version 36 is compatible");
     }
 
     #[test]
@@ -1204,7 +1227,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 35);
+        assert_eq!(latest_version, 36);
     }
 
     #[test]
@@ -1228,7 +1251,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 35);
+        assert_eq!(latest_version, 36);
     }
 
     #[test]
@@ -1408,7 +1431,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 35);
+        assert_eq!(latest_version, 36);
     }
 
     #[test]

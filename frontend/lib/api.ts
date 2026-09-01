@@ -605,6 +605,12 @@ export type ClientInstallationUpgradeStatus = {
   status: "running" | "success" | "failed";
   restartPending: boolean;
   targetCommitId: string | null;
+  failure?: {
+    failureCode: string;
+    stage: string;
+    exitCode?: number | null;
+    diagnostic: string;
+  } | null;
   logs: ClientInstallationUpgradeLog[];
   statusSync: "reported" | "pending" | "unavailable" | "lost";
   updatedAt: string;

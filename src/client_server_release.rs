@@ -251,10 +251,10 @@ fn validate_release_payload(
     let metadata = Some((payload.tag_name.clone(), payload.target_commitish.clone()));
     let tag_matches = payload.tag_name.trim().eq_ignore_ascii_case(release);
     let target = payload.target_commitish.trim().to_ascii_lowercase();
-    let commit_matches = release == DEFAULT_CLIENT_SERVER_RELEASE
-        || ((7..=40).contains(&target.len())
-            && target.bytes().all(|byte| byte.is_ascii_hexdigit())
-            && target.starts_with(release));
+    let target_is_commit =
+        (7..=40).contains(&target.len()) && target.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let commit_matches = target_is_commit
+        && (release == DEFAULT_CLIENT_SERVER_RELEASE || target.starts_with(release));
     if !tag_matches || !commit_matches {
         return validation_result(
             release,
@@ -397,12 +397,25 @@ mod tests {
     }
 
     #[test]
-    fn latest_release_does_not_require_a_pinned_target_commit() {
-        let result = validate_release_payload(
+    fn latest_release_requires_a_resolved_target_commit_for_rollout_safety() {
+        let unresolved = validate_release_payload(
             "latest",
             release("latest", "main", &REQUIRED_RELEASE_ASSETS),
         );
-        assert_eq!(result.status, ClientServerReleaseValidationStatus::Valid);
+        assert_eq!(
+            unresolved.status,
+            ClientServerReleaseValidationStatus::CommitMismatch
+        );
+
+        let resolved = validate_release_payload(
+            "latest",
+            release(
+                "latest",
+                "abc1234567890abcdef1234567890abcdef12345",
+                &REQUIRED_RELEASE_ASSETS,
+            ),
+        );
+        assert_eq!(resolved.status, ClientServerReleaseValidationStatus::Valid);
     }
 
     #[test]
