@@ -7279,6 +7279,9 @@ mod tests {
                 std::sync::atomic::AtomicBool::new(false),
             ),
             market_billing_controls: Arc::new(Mutex::new(())),
+            binance_settlement: Arc::new(
+                crate::binance_settlement::BinanceSettlementRuntime::disabled_for_tests(),
+            ),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
             share_abuse: Arc::new(crate::abuse::ShareAbuseTracker::new([])),

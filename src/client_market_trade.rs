@@ -72,6 +72,11 @@ pub struct PaymentMethod {
     pub address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Public settlement asset for payment rails whose account identifier does
+    /// not itself encode an asset. Binance auto-settlement currently supports
+    /// USDT only; this value is safe to freeze into invoice snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_asset: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -772,6 +777,8 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
     method.chain = clean_optional(method.chain, 20)?.map(|value| value.to_ascii_lowercase());
     method.address = clean_optional(method.address, 300)?;
     method.instructions = clean_payment_instructions(method.instructions)?;
+    method.settlement_asset =
+        clean_optional(method.settlement_asset, 10)?.map(|value| value.to_ascii_uppercase());
     match method.kind.as_str() {
         "alipay" => {
             if method.account.is_none() && method.qr_image_url.is_none() {
@@ -783,6 +790,7 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
             method.chain = None;
             method.address = None;
             method.instructions = None;
+            method.settlement_asset = None;
         }
         "wechat" => {
             if method.qr_image_url.is_none() {
@@ -795,6 +803,7 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
             method.chain = None;
             method.address = None;
             method.instructions = None;
+            method.settlement_asset = None;
         }
         "binance" => {
             if method.account.is_none() && method.qr_image_url.is_none() {
@@ -806,6 +815,18 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
             method.chain = None;
             method.address = None;
             method.instructions = None;
+            if method.account.is_some() {
+                match method.settlement_asset.as_deref() {
+                    None | Some("USDT") => method.settlement_asset = Some("USDT".into()),
+                    Some(_) => {
+                        return Err(AppError::BadRequest(
+                            "Binance auto-settlement currently supports USDT only".into(),
+                        ));
+                    }
+                }
+            } else {
+                method.settlement_asset = None;
+            }
         }
         "crypto" => {
             let token = method.token.as_deref().unwrap_or_default();
@@ -823,6 +844,7 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
             method.account = None;
             method.qr_image_url = None;
             method.instructions = None;
+            method.settlement_asset = None;
         }
         "custom" => {
             if method.instructions.is_none() {
@@ -835,6 +857,7 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
             method.token = None;
             method.chain = None;
             method.address = None;
+            method.settlement_asset = None;
         }
         _ => {
             return Err(AppError::BadRequest(
@@ -4968,6 +4991,7 @@ mod tests {
             chain: None,
             address: None,
             instructions: Some("Wire transfer details".into()),
+            settlement_asset: None,
         }
     }
 
@@ -5387,6 +5411,7 @@ mod tests {
             chain: None,
             address: None,
             instructions: Some(" Bank transfer\r\nReference: client\tID ".into()),
+            settlement_asset: None,
         })
         .expect("normalize multiline custom payment instructions");
         assert_eq!(
@@ -5403,6 +5428,7 @@ mod tests {
                 chain: None,
                 address: None,
                 instructions: Some("unsafe\0text".into()),
+                settlement_asset: None,
             })
             .is_err()
         );
@@ -5565,6 +5591,7 @@ mod tests {
             chain: None,
             address: None,
             instructions: Some("Snapshot instructions".into()),
+            settlement_asset: None,
         };
         store
             .client_market_update_payment_profile(

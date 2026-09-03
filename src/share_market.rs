@@ -20,8 +20,6 @@ use crate::ServerState;
 use crate::client_market_trade::PaymentContact;
 use crate::client_market_trade::PaymentMethod;
 use crate::error::AppError;
-#[cfg(test)]
-use crate::models::SHARE_CONTRACT_VERSION;
 use crate::models::{
     AuthSession, MIN_SHARE_MARKET_CONTRACT_VERSION, ShareEditAvailableEvent, ShareGrantManager,
     ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareSupport,
@@ -13099,6 +13097,7 @@ mod tests {
             chain: None,
             address: None,
             instructions: None,
+            settlement_asset: None,
         }])
         .expect("serialize payment methods");
         let conn = store.conn.lock().await;
@@ -18933,9 +18932,13 @@ mod tests {
             .share_market_request_release(&owner, &subscription_id, true, false)
             .await
             .expect("force revoke");
+        // request_release records the real wall-clock time. Under a busy
+        // full-suite run, the earlier synthetic `now` can already be more than
+        // two seconds behind it, so anchor the revoke phase after that write.
+        let revoke_dispatch_at = Utc::now() + Duration::minutes(1);
         assert_eq!(
             store
-                .share_market_reconcile_and_dispatch(now + Duration::seconds(2))
+                .share_market_reconcile_and_dispatch(revoke_dispatch_at)
                 .await
                 .expect("dispatch revoke")
                 .len(),
@@ -18964,12 +18967,12 @@ mod tests {
                 &revoke_edit,
                 "applied",
                 None,
-                &(now + Duration::seconds(3)).to_rfc3339(),
+                &(revoke_dispatch_at + Duration::seconds(1)).to_rfc3339(),
             )
             .expect("ack clears managed grant");
         }
         store
-            .share_market_reconcile_and_dispatch(now + Duration::seconds(4))
+            .share_market_reconcile_and_dispatch(revoke_dispatch_at + Duration::seconds(2))
             .await
             .expect("release after ack-cleared entitlement");
         assert_eq!(
@@ -19175,6 +19178,10 @@ mod tests {
             .share_market_request_release(&owner, &second_subscription, true, false)
             .await
             .expect("request revoke");
+        // Anchor simulated reconciliation after the real timestamp written by
+        // request_release. Under a busy full-suite run, reusing replacement_now
+        // can otherwise leave the revoke pending with a NULL edit_id.
+        let first_revoke_dispatch_at = Utc::now() + Duration::minutes(1);
         assert!(matches!(
             store
                 .share_market_delete_seat(&owner, &replacement_seat)
@@ -19182,7 +19189,7 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
         store
-            .share_market_reconcile_and_dispatch(replacement_now + Duration::seconds(1))
+            .share_market_reconcile_and_dispatch(first_revoke_dispatch_at)
             .await
             .expect("dispatch failing revoke");
         let first_revoke_edit: String = store
@@ -19209,7 +19216,7 @@ mod tests {
                 &first_revoke_edit,
                 "rejected",
                 Some("managed revoke rejected"),
-                &(replacement_now + Duration::seconds(2)).to_rfc3339(),
+                &(first_revoke_dispatch_at + Duration::seconds(1)).to_rfc3339(),
             )
             .expect("record failed revoke");
         }
@@ -19229,7 +19236,9 @@ mod tests {
             .expect("retry failed revoke");
         assert_eq!(
             store
-                .share_market_reconcile_and_dispatch(replacement_now + Duration::seconds(3))
+                .share_market_reconcile_and_dispatch(
+                    first_revoke_dispatch_at + Duration::seconds(2),
+                )
                 .await
                 .expect("redispatch revoke")
                 .len(),
@@ -19237,7 +19246,7 @@ mod tests {
         );
         clear_entitlements(&store, "share-failure").await;
         store
-            .share_market_reconcile_and_dispatch(replacement_now + Duration::seconds(4))
+            .share_market_reconcile_and_dispatch(first_revoke_dispatch_at + Duration::seconds(3))
             .await
             .expect("confirm retried revoke");
         assert_eq!(

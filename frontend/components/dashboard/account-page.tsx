@@ -2,21 +2,42 @@
 
 import * as React from "react";
 import { Button, Chip, ListBox, Select, toast } from "@heroui/react";
-import { ExternalLink, Loader2, Plus, Save, Trash2, WalletCards } from "lucide-react";
+import {
+  ExternalLink,
+  KeyRound,
+  Loader2,
+  Plus,
+  Power,
+  RefreshCw,
+  Save,
+  ShieldCheck,
+  Trash2,
+  WalletCards,
+} from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  bindBinanceAutoSettlement,
+  deleteBinanceAutoSettlement,
+  disableBinanceAutoSettlement,
   getAccountPaymentProfile,
+  getBinanceAutoSettlementStatus,
   getMarketBillingConfig,
   updateAccountPaymentProfile,
+  verifyBinanceAutoSettlement,
 } from "@/lib/api";
 import {
   DEFAULT_USD_CNY_RATE_MICROS,
   formatUsdCnyRate,
 } from "@/lib/market-money";
-import type { ClientMarketPaymentMethod, PaymentContact, PaymentContactChannel } from "@/lib/types";
+import type {
+  BinanceAutoSettlementStatus,
+  ClientMarketPaymentMethod,
+  PaymentContact,
+  PaymentContactChannel,
+} from "@/lib/types";
 
 type CryptoDraft = { token: "USDT" | "USDC"; chain: "bsc" | "base" | "eth" | "tron"; address: string };
 type ContactDraft = { channel: PaymentContactChannel; handle: string };
@@ -100,6 +121,9 @@ export function AccountPaymentsPanel() {
   const { t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
+  const actorKey = authed
+    ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
+    : "anonymous";
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [draft, setDraft] = React.useState<PaymentDraft>(emptyPaymentDraft);
@@ -108,6 +132,36 @@ export function AccountPaymentsPanel() {
   const [usdCnyRateMicros, setUsdCnyRateMicros] = React.useState(
     DEFAULT_USD_CNY_RATE_MICROS,
   );
+  const [binanceStatus, setBinanceStatus] = React.useState<BinanceAutoSettlementStatus | null>(null);
+  const [binanceCredentialDraft, setBinanceCredentialDraft] = React.useState(() => ({
+    actorKey,
+    apiKey: "",
+    apiSecret: "",
+  }));
+  const [binanceBusy, setBinanceBusy] = React.useState("");
+  const [binanceStatusError, setBinanceStatusError] = React.useState("");
+  const actorKeyRef = React.useRef(actorKey);
+  actorKeyRef.current = actorKey;
+  const binanceApiKey = binanceCredentialDraft.actorKey === actorKey
+    ? binanceCredentialDraft.apiKey
+    : "";
+  const binanceApiSecret = binanceCredentialDraft.actorKey === actorKey
+    ? binanceCredentialDraft.apiSecret
+    : "";
+  const setBinanceApiKey = React.useCallback((apiKey: string) => {
+    setBinanceCredentialDraft((current) => ({
+      actorKey,
+      apiKey,
+      apiSecret: current.actorKey === actorKey ? current.apiSecret : "",
+    }));
+  }, [actorKey]);
+  const setBinanceApiSecret = React.useCallback((apiSecret: string) => {
+    setBinanceCredentialDraft((current) => ({
+      actorKey,
+      apiKey: current.actorKey === actorKey ? current.apiKey : "",
+      apiSecret,
+    }));
+  }, [actorKey]);
 
   const dirty = serializePaymentDraft(draft) !== baseline;
 
@@ -154,16 +208,45 @@ export function AccountPaymentsPanel() {
   }, []);
 
   React.useEffect(() => {
-    if (!authed) return;
+    let active = true;
+    setBinanceApiKey("");
+    setBinanceApiSecret("");
+    setBinanceStatus(null);
+    setBinanceBusy("");
+    setBinanceStatusError("");
+    if (!authed) {
+      setLoading(false);
+      return () => {
+        active = false;
+      };
+    }
     setLoading(true);
-    Promise.all([getAccountPaymentProfile(), getMarketBillingConfig()])
-      .then(([profile, billingConfig]) => {
+    Promise.all([
+      getAccountPaymentProfile(),
+      getMarketBillingConfig(),
+      getBinanceAutoSettlementStatus().catch((error) => {
+        if (active) {
+          setBinanceStatusError(error instanceof Error ? error.message : String(error));
+        }
+        return null;
+      }),
+    ])
+      .then(([profile, billingConfig, nextBinanceStatus]) => {
+        if (!active) return;
         applyProfile(profile.methods, profile.contacts || []);
         setUsdCnyRateMicros(billingConfig.usdCnyRateMicros);
+        if (nextBinanceStatus) setBinanceStatus(nextBinanceStatus);
       })
-      .catch((error) => toast.danger(error instanceof Error ? error.message : String(error)))
-      .finally(() => setLoading(false));
-  }, [applyProfile, authed]);
+      .catch((error) => {
+        if (active) toast.danger(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [actorKey, applyProfile, authed]);
 
   const save = async () => {
     if (!dirty || saving) return;
@@ -181,6 +264,7 @@ export function AccountPaymentsPanel() {
         kind: "binance",
         account: draft.binanceAccount.trim() || undefined,
         qrImageUrl: draft.binanceQr.trim() || undefined,
+        settlementAsset: "USDT",
       });
     }
     for (const method of draft.crypto) {
@@ -204,6 +288,95 @@ export function AccountPaymentsPanel() {
       toast.danger(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const updateBinanceCredentials = async () => {
+    if (binanceBusy || dirty) return;
+    if (
+      binanceStatus?.account?.maskedApiKey
+      && !window.confirm(t("account.binanceAuto.rotateConfirm"))
+    ) return;
+    const requestedActorKey = actorKey;
+    setBinanceBusy("bind");
+    try {
+      const next = await bindBinanceAutoSettlement({
+        binanceUid: draft.binanceAccount.trim(),
+        apiKey: binanceApiKey.trim(),
+        apiSecret: binanceApiSecret.trim(),
+        automationMode: "enabled",
+      });
+      if (actorKeyRef.current !== requestedActorKey) return;
+      setBinanceStatus(next);
+      setBinanceStatusError("");
+      setBinanceApiKey("");
+      setBinanceApiSecret("");
+      toast.success(t("account.binanceAuto.saved"));
+    } catch (error) {
+      if (actorKeyRef.current === requestedActorKey) {
+        toast.danger(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
+    }
+  };
+
+  const verifyBinanceCredentials = async () => {
+    if (binanceBusy) return;
+    const requestedActorKey = actorKey;
+    setBinanceBusy("verify");
+    try {
+      const next = await verifyBinanceAutoSettlement();
+      if (actorKeyRef.current !== requestedActorKey) return;
+      setBinanceStatus(next);
+      setBinanceStatusError("");
+      toast.success(t("account.binanceAuto.verified"));
+    } catch (error) {
+      if (actorKeyRef.current === requestedActorKey) {
+        toast.danger(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
+    }
+  };
+
+  const disableBinanceCredentials = async () => {
+    if (binanceBusy || !window.confirm(t("account.binanceAuto.disableConfirm"))) return;
+    const requestedActorKey = actorKey;
+    setBinanceBusy("disable");
+    try {
+      const next = await disableBinanceAutoSettlement();
+      if (actorKeyRef.current !== requestedActorKey) return;
+      setBinanceStatus(next);
+      setBinanceStatusError("");
+      toast.success(t("account.binanceAuto.disabled"));
+    } catch (error) {
+      if (actorKeyRef.current === requestedActorKey) {
+        toast.danger(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
+    }
+  };
+
+  const deleteBinanceCredentials = async () => {
+    if (binanceBusy || !window.confirm(t("account.binanceAuto.deleteConfirm"))) return;
+    const requestedActorKey = actorKey;
+    setBinanceBusy("delete");
+    try {
+      const next = await deleteBinanceAutoSettlement();
+      if (actorKeyRef.current !== requestedActorKey) return;
+      setBinanceStatus(next);
+      setBinanceStatusError("");
+      setBinanceApiKey("");
+      setBinanceApiSecret("");
+      toast.success(t("account.binanceAuto.deleted"));
+    } catch (error) {
+      if (actorKeyRef.current === requestedActorKey) {
+        toast.danger(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
     }
   };
 
@@ -403,6 +576,184 @@ export function AccountPaymentsPanel() {
               />
             </label>
             {qrField("binance", draft.binanceQr, (value) => patchDraft({ binanceQr: value }), t("account.qrImageUrl"))}
+          </div>
+        </div>
+
+        <div className="grid gap-4 rounded-lg border border-amber-200 bg-amber-50/50 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-2">
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+              <div>
+                <h3 className="text-sm font-semibold">{t("account.binanceAuto.title")}</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {t("account.binanceAuto.description")}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Chip size="sm" variant="soft">
+                {t("account.binanceAuto.globalMode", {
+                  mode: binanceStatus?.globalMode || "disabled",
+                })}
+              </Chip>
+              {binanceStatus?.account ? (
+                <>
+                  <Chip
+                    size="sm"
+                    variant="soft"
+                    className={binanceStatus.account.status === "verified"
+                      ? "bg-emerald-100 text-emerald-700"
+                      : binanceStatus.account.status === "degraded"
+                        ? "bg-rose-100 text-rose-700"
+                        : "bg-slate-100 text-slate-600"}
+                  >
+                    {t("account.binanceAuto.accountStatus", { status: binanceStatus.account.status })}
+                  </Chip>
+                  <Chip size="sm" variant="soft">
+                    {t("account.binanceAuto.accountMode", { mode: binanceStatus.account.automationMode })}
+                  </Chip>
+                </>
+              ) : null}
+            </div>
+          </div>
+
+          {binanceStatusError ? (
+            <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+              {t("account.binanceAuto.statusUnavailable")} {binanceStatusError}
+            </p>
+          ) : null}
+          {binanceStatus && !binanceStatus.credentialStorageConfigured ? (
+            <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+              {t("account.binanceAuto.storageUnavailable")}
+            </p>
+          ) : null}
+          {binanceStatus?.globalMode === "disabled" ? (
+            <p className="rounded-md border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-700">
+              {t("account.binanceAuto.routerDisabled")}
+            </p>
+          ) : null}
+          {binanceStatus?.globalMode === "enabled"
+            && binanceStatus.account?.automationMode === "shadow" ? (
+              <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
+                {t("account.binanceAuto.activateByRebind")}
+              </p>
+            ) : null}
+          {dirty ? (
+            <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
+              {t("account.binanceAuto.saveUidFirst")}
+            </p>
+          ) : null}
+
+          {binanceStatus?.account ? (
+            <div className="grid gap-2 rounded-md border border-border bg-white p-3 text-xs sm:grid-cols-2">
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.boundUid")}</span>
+                <strong className="mt-0.5 block break-all">{binanceStatus.account.binanceUid}</strong>
+              </div>
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.maskedKey")}</span>
+                <strong className="mt-0.5 block break-all">{binanceStatus.account.maskedApiKey || "—"}</strong>
+              </div>
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.permission")}</span>
+                <strong className="mt-0.5 block">
+                  {binanceStatus.account.permissionsVerifiedAt
+                    ? t("account.binanceAuto.permissionVerified")
+                    : t("account.binanceAuto.permissionUnknown")}
+                </strong>
+              </div>
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.uidCheck")}</span>
+                <strong className="mt-0.5 block">
+                  {binanceStatus.account.uidConfirmed
+                    ? t("account.binanceAuto.uidConfirmed")
+                    : t("account.binanceAuto.uidPending")}
+                </strong>
+              </div>
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.lastPoll")}</span>
+                <strong className="mt-0.5 block">
+                  {binanceStatus.account.lastPollSuccessAt
+                    ? new Date(binanceStatus.account.lastPollSuccessAt).toLocaleString()
+                    : "—"}
+                </strong>
+              </div>
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.region")}</span>
+                <strong className="mt-0.5 block">{binanceStatus.account.paymentHomeRegion}</strong>
+              </div>
+              {binanceStatus.account.lastPollErrorCode ? (
+                <p className="sm:col-span-2 text-rose-700">
+                  {t("account.binanceAuto.lastError", {
+                    code: binanceStatus.account.lastPollErrorCode,
+                    count: binanceStatus.account.consecutiveFailures,
+                  })}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="grid gap-1.5 text-sm">
+              <span className="text-muted-foreground">{t("account.binanceAuto.apiKey")}</span>
+              <input
+                type="password"
+                value={binanceApiKey}
+                onChange={(event) => setBinanceApiKey(event.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
+              />
+            </label>
+            <label className="grid gap-1.5 text-sm">
+              <span className="text-muted-foreground">{t("account.binanceAuto.apiSecret")}</span>
+              <input
+                type="password"
+                value={binanceApiSecret}
+                onChange={(event) => setBinanceApiSecret(event.target.value)}
+                autoComplete="new-password"
+                spellCheck={false}
+                className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
+              />
+            </label>
+          </div>
+          <p className="text-xs leading-5 text-muted-foreground">{t("account.binanceAuto.readOnlyWarning")}</p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="primary"
+              isDisabled={
+                !!binanceBusy
+                || dirty
+                || !binanceStatus?.credentialStorageConfigured
+                || binanceStatus.globalMode === "disabled"
+                || !/^\d{6,20}$/.test(draft.binanceAccount.trim())
+                || binanceApiKey.trim().length < 16
+                || binanceApiSecret.trim().length < 16
+              }
+              onClick={() => void updateBinanceCredentials()}
+            >
+              {binanceBusy === "bind" ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+              {binanceStatus?.account?.maskedApiKey
+                ? t("account.binanceAuto.rotate")
+                : t("account.binanceAuto.bind")}
+            </Button>
+            {binanceStatus?.account?.maskedApiKey ? (
+              <>
+                <Button size="sm" variant="outline" isDisabled={!!binanceBusy || binanceStatus.globalMode === "disabled" || binanceStatus.account.status === "disabled"} onClick={() => void verifyBinanceCredentials()}>
+                  {binanceBusy === "verify" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  {t("account.binanceAuto.verify")}
+                </Button>
+                <Button size="sm" variant="outline" isDisabled={!!binanceBusy || binanceStatus.account.status === "disabled"} onClick={() => void disableBinanceCredentials()}>
+                  {binanceBusy === "disable" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
+                  {t("account.binanceAuto.disable")}
+                </Button>
+                <Button size="sm" variant="outline" className="text-rose-700" isDisabled={!!binanceBusy} onClick={() => void deleteBinanceCredentials()}>
+                  {binanceBusy === "delete" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                  {t("account.binanceAuto.delete")}
+                </Button>
+              </>
+            ) : null}
           </div>
         </div>
 

@@ -70,6 +70,9 @@ import type {
   CreateClientMarketClientResponse,
   ClientTunnelSubdomainAvailability,
   AccountPaymentProfile,
+  BinanceAutoSettlementStatus,
+  BinancePaymentIntent,
+  BinanceSettlementAdmin,
   ClientMarketPaymentMethod,
   PaymentContact,
   ClientMarketProviderSupply,
@@ -1168,6 +1171,104 @@ export async function updateAccountPaymentProfile(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ methods, contacts }),
     }),
+  );
+}
+
+export async function getBinanceAutoSettlementStatus() {
+  return parseJson<BinanceAutoSettlementStatus>(
+    await authFetch("/v1/account/binance-auto-settlement", { cache: "no-store" }),
+  );
+}
+
+export async function bindBinanceAutoSettlement(body: {
+  binanceUid: string;
+  apiKey: string;
+  apiSecret: string;
+  automationMode?: "enabled" | "shadow";
+}) {
+  return parseJson<BinanceAutoSettlementStatus>(
+    await authFetch("/v1/account/binance-auto-settlement", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function verifyBinanceAutoSettlement() {
+  return parseJson<BinanceAutoSettlementStatus>(
+    await authFetch("/v1/account/binance-auto-settlement/verify", { method: "POST" }),
+  );
+}
+
+export async function disableBinanceAutoSettlement() {
+  return parseJson<BinanceAutoSettlementStatus>(
+    await authFetch("/v1/account/binance-auto-settlement/disable", { method: "POST" }),
+  );
+}
+
+export async function deleteBinanceAutoSettlement() {
+  return parseJson<BinanceAutoSettlementStatus>(
+    await authFetch("/v1/account/binance-auto-settlement", { method: "DELETE" }),
+  );
+}
+
+export async function createBinancePaymentIntent(invoiceId: string) {
+  return parseJson<BinancePaymentIntent>(
+    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function getBinancePaymentIntent(invoiceId: string, signal?: AbortSignal) {
+  return parseJson<BinancePaymentIntent | null>(
+    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent`, {
+      cache: "no-store",
+      signal,
+    }),
+  );
+}
+
+export async function refreshBinancePaymentIntent(invoiceId: string) {
+  return parseJson<BinancePaymentIntent>(
+    await authFetch(
+      `/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent/refresh`,
+      { method: "POST" },
+    ),
+  );
+}
+
+export async function cancelBinancePaymentIntent(invoiceId: string) {
+  return parseJson<BinancePaymentIntent>(
+    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent`, {
+      method: "DELETE",
+    }),
+  );
+}
+
+export async function getAdminBinanceReconciliation(signal?: AbortSignal) {
+  return parseJson<BinanceSettlementAdmin>(
+    await authFetch("/v1/admin/market-billing/binance-reconciliation", {
+      cache: "no-store",
+      signal,
+    }),
+  );
+}
+
+export async function resolveAdminBinanceReconciliation(
+  caseId: string,
+  body: { resolution: "settle" | "ignore"; invoiceId?: string; note?: string },
+) {
+  return parseJson<{ ok: true }>(
+    await authFetch(
+      `/v1/admin/market-billing/binance-reconciliation/${encodeURIComponent(caseId)}/resolve`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
   );
 }
 

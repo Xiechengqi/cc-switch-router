@@ -1949,6 +1949,7 @@ export type ClientMarketPaymentMethod = {
   chain?: "bsc" | "base" | "eth" | "tron" | string;
   address?: string;
   instructions?: string;
+  settlementAsset?: "USDT" | string;
 };
 
 export type PaymentContactChannel = "wechat" | "telegram" | "custom";
@@ -1964,6 +1965,73 @@ export type AccountPaymentProfile = {
   methods: ClientMarketPaymentMethod[];
   contacts?: PaymentContact[];
   updatedAt: string;
+};
+
+export type BinanceAutoSettlementAccount = {
+  binanceUid: string;
+  maskedApiKey: string;
+  status: "verified" | "degraded" | "disabled" | string;
+  automationMode: "enabled" | "shadow" | string;
+  paymentHomeRegion: string;
+  permissionsVerifiedAt?: string;
+  uidConfirmed: boolean;
+  uidConfirmationSource?: "receiver_history" | "payment_observation" | string;
+  lastPollSuccessAt?: string;
+  lastPollErrorCode?: string;
+  consecutiveFailures: number;
+  credentialRevision: number;
+  updatedAt: string;
+};
+
+export type BinanceAutoSettlementStatus = {
+  globalMode: "disabled" | "shadow" | "enabled" | string;
+  credentialStorageConfigured: boolean;
+  paymentHomeRegion: string;
+  account?: BinanceAutoSettlementAccount;
+};
+
+export type BinancePaymentIntent = {
+  id: string;
+  invoiceId: string;
+  status: "pending" | "paid" | "expired" | "cancelled" | "review_required" | string;
+  asset: "USDT" | string;
+  baseAmount: string;
+  payAmount: string;
+  receiverUid: string;
+  noteCode: string;
+  expiresAt: string;
+  createdAt: string;
+  paidAt?: string;
+  cancellationReason?: string;
+  accountStatus: string;
+  lastCheckedAt?: string;
+};
+
+export type BinanceReconciliationCase = {
+  id: string;
+  invoiceId?: string;
+  paymentIntentId?: string;
+  paymentAccountId: string;
+  transactionId: string;
+  caseKind: string;
+  status: string;
+  detail: Record<string, unknown>;
+  supplierUserId: string;
+  binanceUid: string;
+  transactionTime: string;
+  asset: string;
+  amount: string;
+  invoiceStatus?: string;
+  createdAt: string;
+  resolvedAt?: string;
+};
+
+export type BinanceSettlementAdmin = {
+  cases: BinanceReconciliationCase[];
+  openCaseCount: number;
+  pendingIntentCount: number;
+  degradedAccountCount: number;
+  oldestOpenCaseAt?: string;
 };
 
 export type MarketBillingSupplierProfile = {
@@ -2116,6 +2184,7 @@ export type MarketBillingDashboard = {
 export type MarketBillingConfig = {
   currency: "USD";
   usdCnyRateMicros: number;
+  binanceAutoSettlementEnabled: boolean;
 };
 
 export type AdminMarketBillingDispute = {

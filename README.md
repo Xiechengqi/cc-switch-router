@@ -78,7 +78,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
 | `/v1/client-market/*` | 30 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
-| `/v1/admin/*` | 约 44 | Session + admin 判定 | `settings`、`settings/validate`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`market-billing/disputes` |
+| `/v1/admin/*` | 约 46 | Session + admin 判定 | `settings`、`settings/validate`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`market-billing/disputes`、`market-billing/binance-reconciliation` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
@@ -87,11 +87,11 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` | 退役 | 无 | 统一返回 `410 Gone`；不会创建旧 Market session、host 或 proxy |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
 | `/v1/market-access/*` | 12 | 用户 Session / scoped API Token | `dashboard`、`inbox-summary`、`policies`、`counterparties/batch`、准入申请批准/拒绝/取消、买家授信与公共额度 |
-| `/v1/market-billing/*` | 11 | 公开 `config` / 用户 Session | `config`、`dashboard`、`supplier-profiles`、`accounts/:id/settle`、`request-settlement`、`accounts/:id/invoices`、付款声明/确认/拒绝与争议 |
+| `/v1/market-billing/*` | 15 | 公开 `config` / 用户 Session | `config`、`dashboard`、`supplier-profiles`、`accounts/:id/settle`、`request-settlement`、`accounts/:id/invoices`、付款声明/确认/拒绝与争议、`invoices/:id/binance-intent` |
 | `/v1/gateway/*`、`/v1/gateways/*` | 5 | Ed25519 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/headroom`、`shares/feedback`、`request-logs/batch`；签名绑定原始 body，owner email、Free 与 ShareTo 均不授权，新 grant contract 前普通 Share 整体 fail-closed |
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
-| `/v1/account/*` | 2 | Session | `payment-profile`、`payment-assets/:id` |
+| `/v1/account/*` | 5 | Session | `payment-profile`、`payment-assets/:id`、`binance-auto-settlement` 绑定/复验/停用 |
 | `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 14 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link` |
@@ -99,7 +99,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 ## 管理设置与运维
 
-管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；地图和公告留在 General & Display，通知渠道健康检查留在 Notifications。
+管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；Binance settlement 位于 Marketplace，地图和公告留在 General & Display，通知渠道健康检查留在 Notifications。
 
 Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。
 
@@ -245,6 +245,12 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_AUTH_SOURCE_HOURLY_LIMIT` | `10` | 单认证来源每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `free_access = 1` 的公开免费 Share 共用的单真实用户 IP 并发上限；v1 `forSale=Free` 只在 migration 20 的持久化迁移边界识别，不属于 active contract；设为 `0` 可关闭 |
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
+| `CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE` | `disabled` | 币安自动到账总开关：`disabled`、`shadow` 或 `enabled`；修改后需重启。`disabled` 还会持久化把全部绑定降为账户级 shadow，`shadow` 读取和匹配但不改账，并强制该阶段的新绑定保持账户级 shadow |
+| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY` | 空 | 32 字节凭据加密主密钥，使用 64 位 hex 或 base64；`shadow`/`enabled` 必填，禁止与数据库一起存放；密钥本身变化后所有商家凭据也必须重新绑定 |
+| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION` | `1` | 当前主密钥版本（1-1000000）；版本变化后，使用旧版本加密的商家凭据必须重新绑定 |
+| `CC_SWITCH_ROUTER_BINANCE_API_BASE` | `https://api.binance.com` | Binance API base；生产仅接受 Binance 官方 `api`/`api-gcp`/`api1`–`api4.binance.com` 的标准 HTTPS 端口，loopback 地址仅用于测试 |
+| `CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION` | Router tunnel domain（为空时 `local`） | 唯一负责轮询和结算币安付款的 Region；首期必须保证同一付款账户只有一个 home Region |
+| `CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS` | `4` | 存在待付款或迟到保护账单时的轮询间隔，范围 2-60 秒 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
 ### 统一入口 DNS 与 TLS

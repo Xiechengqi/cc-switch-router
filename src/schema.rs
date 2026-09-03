@@ -133,6 +133,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         36,
         include_str!("../schema/0036_installation_upgrade_diagnostics.sql"),
     ),
+    (
+        37,
+        include_str!("../schema/0037_binance_auto_settlement.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -660,7 +664,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 129);
+        assert_eq!(table_count, 135);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -742,6 +746,8 @@ mod tests {
         assert_eq!(versions[32], (33, migration_checksum(MIGRATIONS[31].1)));
         assert_eq!(versions[33], (34, migration_checksum(MIGRATIONS[32].1)));
         assert_eq!(versions[34], (35, migration_checksum(MIGRATIONS[33].1)));
+        assert_eq!(versions[35], (36, migration_checksum(MIGRATIONS[34].1)));
+        assert_eq!(versions[36], (37, migration_checksum(MIGRATIONS[35].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1096,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_36_upgrade_a_version_26_database() {
+    fn migrations_27_through_37_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1164,8 +1170,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 36);
-        check_compatibility(&conn).expect("upgraded version 36 is compatible");
+        assert_eq!(latest_version, 37);
+        check_compatibility(&conn).expect("upgraded version 37 is compatible");
     }
 
     #[test]
@@ -1227,7 +1233,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 36);
+        assert_eq!(latest_version, 37);
     }
 
     #[test]
@@ -1251,7 +1257,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 36);
+        assert_eq!(latest_version, 37);
     }
 
     #[test]
@@ -1431,7 +1437,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 36);
+        assert_eq!(latest_version, 37);
     }
 
     #[test]

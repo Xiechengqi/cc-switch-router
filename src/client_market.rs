@@ -9353,6 +9353,7 @@ mod tests {
                     chain: None,
                     address: None,
                     instructions: None,
+                    settlement_asset: None,
                 }],
                 None,
             )

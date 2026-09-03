@@ -80,7 +80,9 @@ impl SettingsCategory {
                 "Email, user notifications, operator alerts, and delivery channels."
             }
             Self::Observability => "Metrics, clock health, and Server audit-log collection.",
-            Self::Marketplace => "Share and Client Market policy, billing, and host intelligence.",
+            Self::Marketplace => {
+                "Share and Client Market policy, billing, Binance settlement, and host intelligence."
+            }
         }
     }
 }
@@ -1339,6 +1341,79 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("7"),
         dynamic_group: Some(DynamicGroup::MarketBilling),
     },
+    // ── Binance settlement ──
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE",
+        label: "Binance auto-settlement mode",
+        group: "Binance settlement",
+        field_type: FieldType::Select,
+        required: false,
+        restart_required: true,
+        default: Some("disabled"),
+        description: "Global safety mode. disabled stops Binance access and persistently demotes every binding to account-level shadow, shadow observes matches without changing balances, and enabled permits eligible account-level automation.",
+        placeholder: None,
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY",
+        label: "Binance credential master key",
+        group: "Binance settlement",
+        field_type: FieldType::Secret,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Dedicated 32-byte key, encoded as 64 hexadecimal characters or base64, used to encrypt merchant API credentials and retained transaction evidence. Stored only in protected Settings env files and never returned by the API; changing it requires every merchant to rebind.",
+        placeholder: Some("64 hex characters or base64"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION",
+        label: "Binance master key version",
+        group: "Binance settlement",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("1"),
+        description: "Version from 1 to 1000000 recorded with encrypted Binance data. Changing it requires merchants to bind their read-only credentials again.",
+        placeholder: Some("1"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BINANCE_API_BASE",
+        label: "Binance API base URL",
+        group: "Binance settlement",
+        field_type: FieldType::Url,
+        required: false,
+        restart_required: true,
+        default: Some("https://api.binance.com"),
+        description: "Binance REST API origin. Production accepts only approved official Binance hosts over standard HTTPS; loopback HTTP(S) is reserved for local tests.",
+        placeholder: Some("https://api.binance.com"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION",
+        label: "Binance payment-home Region",
+        group: "Binance settlement",
+        field_type: FieldType::Text,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Stable Region identity that exclusively polls and settles these Binance accounts. Leave blank only for local development, where the tunnel domain (or local) is used.",
+        placeholder: Some("region-a"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS",
+        label: "Binance poll interval",
+        group: "Binance settlement",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("4"),
+        description: "Seconds between Binance transaction polling cycles while payable or late-protection intents exist (2-60 seconds).",
+        placeholder: Some("4"),
+        dynamic_group: None,
+    },
     // ── External verification ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL",
@@ -1825,6 +1900,9 @@ fn field_to_view(field: &SettingsField) -> SettingsFieldView {
         dependencies: dependencies_for_field(field.key),
         options: match field.key {
             "CC_SWITCH_ROUTER_DB_MODE" => vec!["local".into(), "turso".into()],
+            "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE" => {
+                vec!["disabled".into(), "shadow".into(), "enabled".into()]
+            }
             "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
                 vec!["info".into(), "warning".into(), "critical".into()]
             }
@@ -1854,7 +1932,9 @@ fn category_for_group(group: &str) -> SettingsCategory {
         | "Telegram alerts"
         | "Telegram bot" => SettingsCategory::Notifications,
         "Metrics" | "Clock health" | "Server logs" => SettingsCategory::Observability,
-        "Free share" | "Market billing" | "Client Market" => SettingsCategory::Marketplace,
+        "Free share" | "Market billing" | "Binance settlement" | "Client Market" => {
+            SettingsCategory::Marketplace
+        }
         _ => SettingsCategory::GeneralDisplay,
     }
 }
@@ -1872,7 +1952,12 @@ fn risk_for_field(field: &SettingsField) -> RiskLevel {
         | "CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH"
         | "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH"
         | "CC_SWITCH_ROUTER_ADMIN_EMAILS"
-        | "CC_SWITCH_ROUTER_IP_BLACKLIST" => RiskLevel::Critical,
+        | "CC_SWITCH_ROUTER_IP_BLACKLIST"
+        | "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE"
+        | "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY"
+        | "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION"
+        | "CC_SWITCH_ROUTER_BINANCE_API_BASE"
+        | "CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION" => RiskLevel::Critical,
         _ if field.restart_required || matches!(field.field_type, FieldType::Secret) => {
             RiskLevel::Caution
         }
@@ -1973,6 +2058,14 @@ fn constraints_for_field(key: &str) -> FieldConstraints {
         | "CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT"
         | "CC_SWITCH_ROUTER_AUTH_SOURCE_HOURLY_LIMIT" => Some((1.0, 10_000.0)),
         "CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT" => Some((0.0, 10_000.0)),
+        "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION" => Some((
+            1.0,
+            crate::binance_settlement::MAX_MASTER_KEY_VERSION as f64,
+        )),
+        "CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS" => Some((
+            crate::binance_settlement::MIN_POLL_INTERVAL_SECS as f64,
+            crate::binance_settlement::MAX_POLL_INTERVAL_SECS as f64,
+        )),
         "CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS" => Some((1.0, 365.0)),
         "CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS" => Some((1.0, 3_650.0)),
         "CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS" => Some((1.0, 300.0)),
@@ -2601,6 +2694,7 @@ pub fn validate_and_diff(
     validate_clock_relations(&effective_next, updates)?;
     validate_lifecycle_relations(&effective_next, updates)?;
     validate_auth_relations(&effective_next, updates)?;
+    validate_binance_settlement_relations(&effective_next, updates)?;
 
     Ok(ApplyOutcome {
         updated_keys: updated,
@@ -2799,6 +2893,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                     field.key
                 ))),
             },
+            "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE" => {
+                crate::binance_settlement::GlobalMode::parse(trimmed)
+                    .map(|mode| Some(mode.as_str().to_string()))
+                    .map_err(|error| AppError::BadRequest(error.to_string()))
+            }
             "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
                 match trimmed.to_ascii_lowercase().as_str() {
                     "info" | "warning" | "critical" => Ok(Some(trimmed.to_ascii_lowercase())),
@@ -2888,6 +2987,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             let parsed = url::Url::parse(trimmed).map_err(|_| {
                 AppError::BadRequest(format!("{} must be a valid URL, got: {raw}", field.key))
             })?;
+            if field.key == "CC_SWITCH_ROUTER_BINANCE_API_BASE" {
+                crate::binance_settlement::validate_api_base(&parsed)
+                    .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
+                return Ok(Some(trimmed.trim_end_matches('/').to_string()));
+            }
             if !matches!(parsed.scheme(), "http" | "https")
                 || parsed.host_str().is_none()
                 || !parsed.username().is_empty()
@@ -2899,6 +3003,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 )));
             }
             Ok(Some(trimmed.to_string()))
+        }
+        FieldType::Text if field.key == "CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION" => {
+            crate::binance_settlement::normalize_payment_home_region(trimmed)
+                .map(Some)
+                .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))
         }
         FieldType::Text if field.key == "CC_SWITCH_ROUTER_TURSO_URL" => {
             crate::config::validate_turso_url(trimmed).map_err(AppError::BadRequest)?;
@@ -2949,6 +3058,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             crate::client_server_release::normalize_client_server_release(trimmed)
                 .map(Some)
                 .map_err(AppError::BadRequest)
+        }
+        FieldType::Secret if field.key == "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY" => {
+            crate::binance_settlement::validate_master_key(trimmed)
+                .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
+            Ok(Some(trimmed.to_string()))
         }
         FieldType::Secret if field.key == "CC_SWITCH_ROUTER_RESEND_API_KEY" => {
             if !trimmed.starts_with("re_") {
@@ -3354,6 +3468,92 @@ fn validate_auth_relations(
         )));
     }
     Ok(())
+}
+
+fn validate_binance_settlement_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<(), AppError> {
+    const KEYS: [&str; 6] = [
+        "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE",
+        "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY",
+        "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION",
+        "CC_SWITCH_ROUTER_BINANCE_API_BASE",
+        "CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION",
+        "CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS",
+    ];
+    if !KEYS.iter().any(|key| updates.contains_key(*key)) {
+        return Ok(());
+    }
+
+    let mode_text = effective_relation_value(next, KEYS[0])?.unwrap_or_else(|| "disabled".into());
+    let mode = crate::binance_settlement::GlobalMode::parse(&mode_text)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let master_key = next
+        .get(KEYS[1])
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if let Some(master_key) = master_key {
+        crate::binance_settlement::validate_master_key(master_key)
+            .map_err(|error| AppError::BadRequest(format!("{}: {error}", KEYS[1])))?;
+    } else if mode != crate::binance_settlement::GlobalMode::Disabled {
+        return Err(AppError::BadRequest(format!(
+            "{} is required when {} is shadow or enabled",
+            KEYS[1], KEYS[0]
+        )));
+    }
+
+    let key_version = effective_relation_i64(next, updates, KEYS[2])?;
+    if !(1..=crate::binance_settlement::MAX_MASTER_KEY_VERSION).contains(&key_version) {
+        return Err(AppError::BadRequest(format!(
+            "{} must be between 1 and {}",
+            KEYS[2],
+            crate::binance_settlement::MAX_MASTER_KEY_VERSION
+        )));
+    }
+
+    let api_base = effective_relation_value(next, KEYS[3])?
+        .ok_or_else(|| AppError::Internal(format!("missing settings default: {}", KEYS[3])))?;
+    let api_base = url::Url::parse(&api_base)
+        .map_err(|_| AppError::BadRequest(format!("{} must be a valid URL", KEYS[3])))?;
+    crate::binance_settlement::validate_api_base(&api_base)
+        .map_err(|error| AppError::BadRequest(format!("{}: {error}", KEYS[3])))?;
+
+    if let Some(region) = next
+        .get(KEYS[4])
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        crate::binance_settlement::normalize_payment_home_region(region)
+            .map_err(|error| AppError::BadRequest(format!("{}: {error}", KEYS[4])))?;
+    }
+
+    let poll_interval = effective_relation_i64(next, updates, KEYS[5])?;
+    if !(crate::binance_settlement::MIN_POLL_INTERVAL_SECS
+        ..=crate::binance_settlement::MAX_POLL_INTERVAL_SECS)
+        .contains(&poll_interval)
+    {
+        return Err(AppError::BadRequest(format!(
+            "{} must be between {} and {}",
+            KEYS[5],
+            crate::binance_settlement::MIN_POLL_INTERVAL_SECS,
+            crate::binance_settlement::MAX_POLL_INTERVAL_SECS
+        )));
+    }
+    Ok(())
+}
+
+fn effective_relation_value(
+    next: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<String>, AppError> {
+    let field = field_by_key(key)
+        .ok_or_else(|| AppError::Internal(format!("missing settings schema field: {key}")))?;
+    Ok(next
+        .get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| field.default.map(str::to_string)))
 }
 
 fn effective_relation_i64(
@@ -3975,6 +4175,86 @@ mod tests {
         )]);
         apply_updates_to_dynamic(&mut dynamic, &updates, &config);
         assert_eq!(dynamic.market_usd_cny_rate_micros, 7_250_000);
+    }
+
+    #[test]
+    fn binance_settings_are_strict_and_cross_validated() {
+        let mode = field_by_key("CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE").unwrap();
+        assert_eq!(
+            normalize_value(mode, " ShAdOw ").unwrap(),
+            Some("shadow".into())
+        );
+        assert!(normalize_value(mode, "live").is_err());
+
+        let master_key = field_by_key("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY").unwrap();
+        let valid_key = "ab".repeat(32);
+        assert_eq!(
+            normalize_value(master_key, &valid_key).unwrap(),
+            Some(valid_key.clone())
+        );
+        assert!(normalize_value(master_key, "too-short").is_err());
+
+        let api_base = field_by_key("CC_SWITCH_ROUTER_BINANCE_API_BASE").unwrap();
+        assert_eq!(
+            normalize_value(api_base, "https://api1.binance.com/").unwrap(),
+            Some("https://api1.binance.com".into())
+        );
+        assert!(normalize_value(api_base, "https://example.com").is_err());
+
+        let region = field_by_key("CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION").unwrap();
+        assert_eq!(
+            normalize_value(region, " Region-A:443 ").unwrap(),
+            Some("region-a:443".into())
+        );
+        assert!(normalize_value(region, "region with spaces").is_err());
+
+        let key_version = field_by_key("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION").unwrap();
+        assert!(normalize_value(key_version, "0").is_err());
+        assert!(normalize_value(key_version, "1000001").is_err());
+        let poll_interval = field_by_key("CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS").unwrap();
+        assert!(normalize_value(poll_interval, "1").is_err());
+        assert_eq!(
+            normalize_value(poll_interval, "60").unwrap(),
+            Some("60".into())
+        );
+        assert!(normalize_value(poll_interval, "61").is_err());
+
+        let existing = HashMap::new();
+        let enable_without_key = BTreeMap::from([(
+            "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE".into(),
+            Some("enabled".into()),
+        )]);
+        assert!(validate_and_diff(&existing, &enable_without_key).is_err());
+
+        let enable_with_key = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE".into(),
+                Some("shadow".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY".into(),
+                Some(valid_key.clone()),
+            ),
+        ]);
+        assert!(validate_and_diff(&existing, &enable_with_key).is_ok());
+
+        let enabled = HashMap::from([
+            (
+                "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE".into(),
+                "enabled".into(),
+            ),
+            ("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY".into(), valid_key),
+        ]);
+        let clear_key = BTreeMap::from([("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY".into(), None)]);
+        assert!(validate_and_diff(&enabled, &clear_key).is_err());
+        let disable_and_clear = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE".into(),
+                Some("disabled".into()),
+            ),
+            ("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY".into(), None),
+        ]);
+        assert!(validate_and_diff(&enabled, &disable_and_clear).is_ok());
     }
 
     #[test]
@@ -4700,8 +4980,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 119);
-        assert_eq!(schema.fields.len(), 119);
+        assert_eq!(SETTINGS_FIELDS.len(), 125);
+        assert_eq!(schema.fields.len(), 125);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -4715,7 +4995,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            119
+            125
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema
@@ -4745,6 +5025,29 @@ mod tests {
             .expect("clock sources field");
         assert_eq!(clock_sources.constraints.min_items, Some(3));
         assert_eq!(clock_sources.constraints.max_items, Some(5));
+        let binance_mode = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE")
+            .expect("Binance mode field");
+        assert_eq!(binance_mode.category, SettingsCategory::Marketplace);
+        assert_eq!(binance_mode.options, ["disabled", "shadow", "enabled"]);
+        assert!(matches!(binance_mode.risk, RiskLevel::Critical));
+        let binance_key = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY")
+            .expect("Binance master key field");
+        assert!(matches!(binance_key.field_type, FieldType::Secret));
+        assert!(matches!(binance_key.risk, RiskLevel::Critical));
+        let binance_poll = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS")
+            .expect("Binance poll interval field");
+        assert_eq!(binance_poll.constraints.min, Some(2.0));
+        assert_eq!(binance_poll.constraints.max, Some(60.0));
+        assert!(matches!(binance_poll.risk, RiskLevel::Caution));
     }
 
     #[test]
@@ -4855,6 +5158,33 @@ mod tests {
         assert!(token.effective_has_value);
         assert!(token.value.is_none());
         assert!(token.effective_value.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_values_never_return_binance_master_key() {
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-settings-binance-secret-{}.env",
+            uuid::Uuid::new_v4()
+        ));
+        let secret = "ab".repeat(32);
+        std::fs::write(
+            &path,
+            format!("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY={secret}\n"),
+        )
+        .expect("write Binance Settings fixture");
+
+        let response = values_response(&path).expect("read redacted Settings values");
+        let master_key = response
+            .values
+            .iter()
+            .find(|entry| entry.key == "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY")
+            .expect("Binance master key entry");
+        assert!(master_key.is_secret);
+        assert!(master_key.has_value);
+        assert!(master_key.value.is_none());
+        assert!(!format!("{response:?}").contains(&secret));
 
         let _ = std::fs::remove_file(path);
     }

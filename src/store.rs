@@ -67,8 +67,8 @@ use crate::models::{
     RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SHARE_CONTRACT_VERSION, SessionStatusResponse, ShareAppAvailability, ShareAppProviders,
     ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest,
-    ShareDeleteRequest, ShareDescriptor, ShareDescriptorSyncAck, ShareEditAckEnvelope,
-    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareModelHealthCalendarDay,
+    ShareDeleteRequest, ShareDescriptor, ShareDescriptorSyncAck, ShareEditAckRequest,
+    ShareEditView, ShareHeartbeatRequest, ShareModelHealthCalendarDay,
     ShareModelHealthCalendarResponse, ShareModelHealthCheckEntry, ShareModelHealthProbeEpoch,
     ShareModelHealthSummary, SharePendingEditsPayload, SharePendingEditsRequest,
     SharePendingEditsResponse, SharePruneRequest, ShareRequestLogBatchSyncRequest,
@@ -26117,7 +26117,9 @@ fn gateway_share_label(share_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::models::{InstallationUpgradeLogEntry, ShareEditAckPayload, ShareSyncOperation};
+    use crate::models::{
+        InstallationUpgradeLogEntry, ShareEditAckEnvelope, ShareEditAckPayload, ShareSyncOperation,
+    };
     use crate::proxy::ProxyRegistry;
     use axum::Router;
     use axum::extract::State;

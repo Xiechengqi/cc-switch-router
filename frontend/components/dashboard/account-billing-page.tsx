@@ -9,7 +9,9 @@ import {
   Check,
   ChevronDown,
   CircleDollarSign,
+  CircleCheckBig,
   Clock3,
+  Copy,
   ExternalLink,
   HandCoins,
   Loader2,
@@ -29,16 +31,23 @@ import {
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  cancelBinancePaymentIntent,
   closeMarketBillingAccount,
   confirmMarketBillingPayment,
+  createBinancePaymentIntent,
   declareMarketBillingPayment,
   disputeMarketBillingInvoice,
+  getAdminBinanceReconciliation,
   getAdminMarketBillingDisputes,
+  getBinancePaymentIntent,
+  getMarketBillingConfig,
   getMarketBillingDashboard,
   getMarketBillingInvoiceHistory,
+  refreshBinancePaymentIntent,
   rejectMarketBillingPayment,
   recordMarketRefundObligation,
   requestMarketBillingSettlement,
+  resolveAdminBinanceReconciliation,
   resolveAdminMarketBillingDispute,
   settleMarketBillingAccount,
   updateMarketBillingSupplierProfile,
@@ -46,6 +55,9 @@ import {
 } from "@/lib/api";
 import type {
   AdminMarketBillingDispute,
+  BinancePaymentIntent,
+  BinanceReconciliationCase,
+  BinanceSettlementAdmin,
   MarketBillingDashboard,
   MarketBillingDispute,
   MarketBillingInvoice,
@@ -67,7 +79,7 @@ type BillingTab = "todo" | "payables" | "receivables" | "history" | "admin";
 type ProfileDraft = { graceHours: string };
 type Action =
   | { kind: "settle" | "request-settlement" | "close"; account: MarketCreditAccount }
-  | { kind: "declare" | "confirm" | "reject" | "dispute"; account: MarketCreditAccount; invoice: MarketBillingInvoice }
+  | { kind: "auto-pay" | "declare" | "confirm" | "reject" | "dispute"; account: MarketCreditAccount; invoice: MarketBillingInvoice }
   | { kind: "record-refund"; obligation: ShareMarketRefundObligation }
   | { kind: "admin-uphold" | "admin-void"; dispute: AdminMarketBillingDispute }
   | { kind: "admin-invoice-void"; dispute: AdminMarketBillingDispute };
@@ -115,6 +127,17 @@ function accountStatusLabel(status: string, t: ReturnType<typeof useLocaleText>[
   }
 }
 
+function binanceIntentStatusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  switch (status) {
+    case "pending": return t("marketBilling.binance.status.pending");
+    case "paid": return t("marketBilling.binance.status.paid");
+    case "expired": return t("marketBilling.binance.status.expired");
+    case "cancelled": return t("marketBilling.binance.status.cancelled");
+    case "review_required": return t("marketBilling.binance.status.review");
+    default: return status.replaceAll("_", " ");
+  }
+}
+
 function serviceStatusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
   switch (status) {
     case "trial": return t("marketBilling.service.trial");
@@ -130,6 +153,7 @@ function actionSubmitLabel(action: Action, t: ReturnType<typeof useLocaleText>["
     case "settle": return t("marketBilling.action.settle");
     case "request-settlement": return t("marketBilling.action.requestSettlement");
     case "close": return t("marketBilling.action.closeAccount");
+    case "auto-pay": return t("marketBilling.binance.action.open");
     case "declare": return t("marketBilling.action.declare");
     case "confirm": return t("marketBilling.action.confirm");
     case "reject": return t("marketBilling.action.reject");
@@ -373,12 +397,14 @@ function CreditAccountPanel({
   perspective,
   onAction,
   usdCnyRateMicros,
+  binanceAutoSettlementEnabled,
   mode = "full",
 }: {
   account: MarketCreditAccount;
   perspective: "buyer" | "supplier";
   onAction: (action: Action) => void;
   usdCnyRateMicros: number;
+  binanceAutoSettlementEnabled: boolean;
   mode?: "full" | "history";
 }) {
   const { locale, t } = useLocaleText();
@@ -388,6 +414,13 @@ function CreditAccountPanel({
     ? null
     : Math.min(100, Math.max(0, account.utilizationBps / 100));
   const invoiceCanBePaid = perspective === "buyer" && invoice && ["open", "overdue"].includes(invoice.status);
+  const invoiceSupportsBinance = binanceAutoSettlementEnabled
+    && invoiceCanBePaid
+    && invoice.paymentMethods.some((method) =>
+      method.kind === "binance"
+      && /^\d{6,20}$/.test(method.account || "")
+      && (!method.settlementAsset || method.settlementAsset === "USDT")
+    );
   const invoiceCanBeReviewed = perspective === "supplier" && invoice?.status === "payment_declared";
   const [historyOpen, setHistoryOpen] = React.useState(false);
   const [history, setHistory] = React.useState<MarketBillingInvoice[] | null>(null);
@@ -553,10 +586,20 @@ function CreditAccountPanel({
             </div>
             <div className="flex flex-wrap gap-2">
               {invoiceCanBePaid ? (
-                <Button size="sm" variant="primary" onClick={() => onAction({ kind: "declare", account, invoice })}>
-                  <HandCoins className="h-4 w-4" />
-                  {t("marketBilling.action.declare")}
-                </Button>
+                <>
+                  {invoiceSupportsBinance ? (
+                    <Button size="sm" variant="primary" onClick={() => onAction({ kind: "auto-pay", account, invoice })}>
+                      <CircleDollarSign className="h-4 w-4" />
+                      {t("marketBilling.binance.action.open")}
+                    </Button>
+                  ) : null}
+                  <Button size="sm" variant={invoiceSupportsBinance ? "outline" : "primary"} onClick={() => onAction({ kind: "declare", account, invoice })}>
+                    <HandCoins className="h-4 w-4" />
+                    {invoiceSupportsBinance
+                      ? t("marketBilling.binance.action.other")
+                      : t("marketBilling.action.declare")}
+                  </Button>
+                </>
               ) : null}
               {perspective === "buyer" && ["open", "overdue", "payment_declared"].includes(invoice.status) && !invoice.dispute ? (
                 <Button size="sm" variant="outline" onClick={() => onAction({ kind: "dispute", account, invoice })}>
@@ -706,6 +749,14 @@ export function AccountBillingPage() {
   const searchParams = useSearchParams();
   const [dashboard, setDashboard] = React.useState<MarketBillingDashboard | null>(null);
   const [adminDisputes, setAdminDisputes] = React.useState<AdminMarketBillingDispute[]>([]);
+  const [binanceAdmin, setBinanceAdmin] = React.useState<BinanceSettlementAdmin | null>(null);
+  const [binanceAutoSettlementEnabled, setBinanceAutoSettlementEnabled] = React.useState(false);
+  const [binanceAdminError, setBinanceAdminError] = React.useState("");
+  const [reconciliationInvoices, setReconciliationInvoices] = React.useState<Record<string, string>>({});
+  const [binanceIntent, setBinanceIntent] = React.useState<BinancePaymentIntent | null>(null);
+  const [binanceIntentError, setBinanceIntentError] = React.useState("");
+  const [binanceIntentBusy, setBinanceIntentBusy] = React.useState("");
+  const [clockMs, setClockMs] = React.useState(() => Date.now());
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [busy, setBusy] = React.useState("");
@@ -725,6 +776,11 @@ export function AccountBillingPage() {
   const [loadedActorKey, setLoadedActorKey] = React.useState(actorKey);
   const requestRef = React.useRef<AbortController | null>(null);
   const actorKeyRef = React.useRef(actorKey);
+  const paidIntentRef = React.useRef("");
+  const binanceIntentEpochRef = React.useRef(0);
+  const binanceIntentMutationRef = React.useRef(false);
+  const binanceIntentPollInFlightRef = React.useRef(false);
+  const autoPayInvoiceId = action?.kind === "auto-pay" ? action.invoice.id : null;
   actorKeyRef.current = actorKey;
 
   React.useEffect(() => {
@@ -749,13 +805,25 @@ export function AccountBillingPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      const [nextDashboard, nextDisputes] = await Promise.all([
+      const [nextDashboard, nextBillingConfig, nextDisputes, nextBinanceResult] = await Promise.all([
         getMarketBillingDashboard(controller.signal),
+        getMarketBillingConfig(controller.signal),
         isAdmin ? getAdminMarketBillingDisputes(controller.signal) : Promise.resolve([]),
+        isAdmin
+          ? getAdminBinanceReconciliation(controller.signal)
+              .then((data) => ({ data, error: "" }))
+              .catch((error: unknown) => ({
+                data: null,
+                error: error instanceof Error ? error.message : String(error),
+              }))
+          : Promise.resolve({ data: null, error: "" }),
       ]);
       if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
       setDashboard(nextDashboard);
+      setBinanceAutoSettlementEnabled(nextBillingConfig.binanceAutoSettlementEnabled);
       setAdminDisputes(nextDisputes);
+      setBinanceAdmin(nextBinanceResult.data);
+      setBinanceAdminError(nextBinanceResult.error);
       setLoadedActorKey(requestedActorKey);
     } catch (error) {
       if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
@@ -782,7 +850,14 @@ export function AccountBillingPage() {
     setProfiles({ USD: { ...EMPTY_PROFILE } });
     setProfileDirty({ USD: false });
     setDashboard(null);
+    setBinanceAutoSettlementEnabled(false);
     setAdminDisputes([]);
+    setBinanceAdmin(null);
+    setBinanceAdminError("");
+    setReconciliationInvoices({});
+    setBinanceIntent(null);
+    setBinanceIntentError("");
+    setBinanceIntentBusy("");
     if (!isAdmin) setTab((current) => current === "admin" ? "todo" : current);
     if (authLoading) return;
     if (!authed) {
@@ -815,13 +890,170 @@ export function AccountBillingPage() {
     });
   }, [dashboard, profileDirty]);
 
+  React.useEffect(() => {
+    if (!autoPayInvoiceId) return;
+    let active = true;
+    const controller = new AbortController();
+    const initialEpoch = ++binanceIntentEpochRef.current;
+    binanceIntentMutationRef.current = true;
+    binanceIntentPollInFlightRef.current = false;
+    paidIntentRef.current = "";
+    setClockMs(Date.now());
+    setBinanceIntent(null);
+    setBinanceIntentError("");
+    setBinanceIntentBusy("create");
+    const acceptIntent = (intent: BinancePaymentIntent | null, expectedEpoch: number) => {
+      if (!active || !intent || binanceIntentEpochRef.current !== expectedEpoch) return;
+      setBinanceIntent(intent);
+      setBinanceIntentError("");
+      if (intent.status === "paid" && paidIntentRef.current !== intent.id) {
+        paidIntentRef.current = intent.id;
+        toast.success(t("marketBilling.binance.paid"));
+        void load(true);
+      }
+    };
+    void createBinancePaymentIntent(autoPayInvoiceId)
+      .then((intent) => acceptIntent(intent, initialEpoch))
+      .catch((error) => {
+        if (!active || binanceIntentEpochRef.current !== initialEpoch) return;
+        setBinanceIntentError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (active && binanceIntentEpochRef.current === initialEpoch) {
+          binanceIntentMutationRef.current = false;
+          setBinanceIntentBusy("");
+        }
+      });
+    const pollTimer = window.setInterval(() => {
+      if (binanceIntentMutationRef.current || binanceIntentPollInFlightRef.current) return;
+      const pollEpoch = binanceIntentEpochRef.current;
+      binanceIntentPollInFlightRef.current = true;
+      void getBinancePaymentIntent(autoPayInvoiceId, controller.signal)
+        .then((intent) => acceptIntent(intent, pollEpoch))
+        .catch((error) => {
+          if (
+            !active
+            || controller.signal.aborted
+            || binanceIntentEpochRef.current !== pollEpoch
+          ) return;
+          setBinanceIntentError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          if (active && binanceIntentEpochRef.current === pollEpoch) {
+            binanceIntentPollInFlightRef.current = false;
+          }
+        });
+    }, 3_000);
+    const clockTimer = window.setInterval(() => setClockMs(Date.now()), 1_000);
+    return () => {
+      active = false;
+      binanceIntentEpochRef.current += 1;
+      binanceIntentMutationRef.current = false;
+      binanceIntentPollInFlightRef.current = false;
+      controller.abort();
+      window.clearInterval(pollTimer);
+      window.clearInterval(clockTimer);
+    };
+  }, [autoPayInvoiceId, load, t]);
+
   const openAction = (next: Action) => {
     setReason("");
     setReference("");
     setNote("");
     setEvidenceUrl("");
     setPaymentKind(next.kind === "declare" ? next.invoice.paymentMethods[0]?.kind || "" : "");
+    setBinanceIntent(null);
+    setBinanceIntentError("");
+    setBinanceIntentBusy("");
     setAction(next);
+  };
+
+  const refreshAutoPayment = async () => {
+    if (!autoPayInvoiceId || binanceIntentBusy) return;
+    if (binanceIntent && !window.confirm(t("marketBilling.binance.refreshConfirm"))) return;
+    const mutationEpoch = ++binanceIntentEpochRef.current;
+    binanceIntentMutationRef.current = true;
+    binanceIntentPollInFlightRef.current = false;
+    setBinanceIntentBusy("refresh");
+    try {
+      const intent = await refreshBinancePaymentIntent(autoPayInvoiceId);
+      if (binanceIntentEpochRef.current !== mutationEpoch) return;
+      setBinanceIntent(intent);
+      setBinanceIntentError("");
+    } catch (error) {
+      if (binanceIntentEpochRef.current !== mutationEpoch) return;
+      setBinanceIntentError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (binanceIntentEpochRef.current === mutationEpoch) {
+        binanceIntentMutationRef.current = false;
+        setBinanceIntentBusy("");
+      }
+    }
+  };
+
+  const cancelAutoPayment = async () => {
+    if (!autoPayInvoiceId || binanceIntentBusy) return;
+    if (!window.confirm(t("marketBilling.binance.cancelConfirm"))) return;
+    const mutationEpoch = ++binanceIntentEpochRef.current;
+    binanceIntentMutationRef.current = true;
+    binanceIntentPollInFlightRef.current = false;
+    setBinanceIntentBusy("cancel");
+    try {
+      const intent = await cancelBinancePaymentIntent(autoPayInvoiceId);
+      if (binanceIntentEpochRef.current !== mutationEpoch) return;
+      setBinanceIntent(intent);
+      setBinanceIntentError("");
+    } catch (error) {
+      if (binanceIntentEpochRef.current !== mutationEpoch) return;
+      setBinanceIntentError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (binanceIntentEpochRef.current === mutationEpoch) {
+        binanceIntentMutationRef.current = false;
+        setBinanceIntentBusy("");
+      }
+    }
+  };
+
+  const copyAutoPaymentValue = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(t("marketBilling.binance.copied"));
+    } catch {
+      toast.danger(t("marketBilling.binance.copyFailed"));
+    }
+  };
+
+  const resolveBinanceCase = async (
+    item: BinanceReconciliationCase,
+    resolution: "settle" | "ignore",
+  ) => {
+    if (busy) return;
+    const invoiceId = (item.invoiceId ?? reconciliationInvoices[item.id] ?? "").trim();
+    if (resolution === "settle" && !invoiceId) {
+      toast.danger(t("marketBilling.binance.admin.invoiceRequired"));
+      return;
+    }
+    if (
+      resolution === "settle"
+      && !window.confirm(t("marketBilling.binance.admin.settleConfirm", {
+        amount: `${item.amount} ${item.asset}`,
+        invoice: invoiceId,
+      }))
+    ) return;
+    if (resolution === "ignore" && !window.confirm(t("marketBilling.binance.admin.ignoreConfirm"))) return;
+    setBusy(`binance-case:${item.id}`);
+    try {
+      await resolveAdminBinanceReconciliation(item.id, {
+        resolution,
+        invoiceId: invoiceId || undefined,
+      });
+      toast.success(t("marketBilling.action.completed"));
+      await load(true);
+    } catch (error) {
+      toast.danger(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy("");
+    }
   };
 
   const saveProfile = async (currency: Currency) => {
@@ -958,6 +1190,13 @@ export function AccountBillingPage() {
   };
 
   const actionInvoice = action && "invoice" in action ? action.invoice : action && "dispute" in action ? action.dispute.invoice : undefined;
+  const binanceRemainingSeconds = binanceIntent
+    ? Math.max(0, Math.floor((new Date(binanceIntent.expiresAt).getTime() - clockMs) / 1_000))
+    : 0;
+  const binanceCanTransfer = binanceIntent?.status === "pending"
+    && binanceIntent.accountStatus === "verified"
+    && binanceRemainingSeconds > 0;
+  const binanceCountdown = `${String(Math.floor(binanceRemainingSeconds / 60)).padStart(2, "0")}:${String(binanceRemainingSeconds % 60).padStart(2, "0")}`;
   const needsReason = action && ["reject", "dispute", "admin-invoice-void"].includes(action.kind);
   const needsAdminNote = action && ["admin-uphold", "admin-void"].includes(action.kind);
 
@@ -1028,7 +1267,7 @@ export function AccountBillingPage() {
           { id: "payables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.payables")}<span className="tabular-nums text-muted-foreground">{buyerAccounts.length}</span></span> },
           { id: "receivables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.receivables")}<span className="tabular-nums text-muted-foreground">{supplierAccounts.length}</span></span> },
           { id: "history", label: t("marketBilling.tabs.history") },
-          ...(isAdmin ? [{ id: "admin" as const, label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.admin")}<span className="tabular-nums text-muted-foreground">{adminDisputes.length}</span></span> }] : []),
+          ...(isAdmin ? [{ id: "admin" as const, label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.admin")}<span className="tabular-nums text-muted-foreground">{adminDisputes.length + (binanceAdmin?.openCaseCount || 0)}</span></span> }] : []),
         ]}
       />
 
@@ -1081,7 +1320,7 @@ export function AccountBillingPage() {
           <RefundObligationPanel key={obligation.id} obligation={obligation} locale={locale} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onRecord={(item) => openAction({ kind: "record-refund", obligation: item })} />
         ))}
         {todoEntries.map(({ account, perspective }) => (
-          <CreditAccountPanel key={`todo:${perspective}:${account.id}`} account={account} perspective={perspective} onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
+          <CreditAccountPanel key={`todo:${perspective}:${account.id}`} account={account} perspective={perspective} onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
         ))}
         {!todoEntries.length && !openRefundObligations.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.todo.empty")}</p> : null}
       </section> : null}
@@ -1092,7 +1331,7 @@ export function AccountBillingPage() {
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.payables.hint")}</p>
         </div>
         {buyerAccounts.length ? buyerAccounts.map((account) => (
-          <CreditAccountPanel key={`buyer:${account.id}`} account={account} perspective="buyer" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
+          <CreditAccountPanel key={`buyer:${account.id}`} account={account} perspective="buyer" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
         )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.payables.empty")}</p>}
       </section> : null}
 
@@ -1102,7 +1341,7 @@ export function AccountBillingPage() {
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.receivables.hint")}</p>
         </div>
         {supplierAccounts.length ? supplierAccounts.map((account) => (
-          <CreditAccountPanel key={`supplier:${account.id}`} account={account} perspective="supplier" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
+          <CreditAccountPanel key={`supplier:${account.id}`} account={account} perspective="supplier" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
         )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.receivables.empty")}</p>}
       </section> : null}
 
@@ -1115,7 +1354,7 @@ export function AccountBillingPage() {
           <RefundObligationPanel key={obligation.id} obligation={obligation} locale={locale} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onRecord={(item) => openAction({ kind: "record-refund", obligation: item })} />
         ))}
         {historyEntries.map(({ account, perspective }) => (
-          <CreditAccountPanel key={`history:${perspective}:${account.id}`} account={account} perspective={perspective} mode="history" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
+          <CreditAccountPanel key={`history:${perspective}:${account.id}`} account={account} perspective={perspective} mode="history" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
         ))}
         {!historyEntries.length && !recordedRefundObligations.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.history.empty")}</p> : null}
       </section> : null}
@@ -1129,6 +1368,63 @@ export function AccountBillingPage() {
               <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.admin.hint")}</p>
             </div>
           </div>
+          {binanceAdminError ? (
+            <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+              {t("marketBilling.binance.admin.unavailable")} {binanceAdminError}
+            </p>
+          ) : null}
+          {binanceAdmin ? (
+            <div className="grid gap-3 rounded-lg border border-amber-200 bg-amber-50/50 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h4 className="text-sm font-semibold">{t("marketBilling.binance.admin.title")}</h4>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("marketBilling.binance.admin.hint")}</p>
+                </div>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  <Chip size="sm" variant="soft">{t("marketBilling.binance.admin.openCases", { count: binanceAdmin.openCaseCount })}</Chip>
+                  <Chip size="sm" variant="soft">{t("marketBilling.binance.admin.pending", { count: binanceAdmin.pendingIntentCount })}</Chip>
+                  <Chip size="sm" variant="soft" className={binanceAdmin.degradedAccountCount ? "bg-rose-100 text-rose-700" : ""}>
+                    {t("marketBilling.binance.admin.degraded", { count: binanceAdmin.degradedAccountCount })}
+                  </Chip>
+                </div>
+              </div>
+              {binanceAdmin.cases.length ? binanceAdmin.cases.map((item) => (
+                <div key={item.id} className="grid gap-3 rounded-md border border-border bg-white p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-3 text-xs">
+                    <div>
+                      <strong className="text-sm">{item.amount} {item.asset}</strong>
+                      <p className="mt-1 break-all text-muted-foreground">{item.caseKind} · {item.transactionId}</p>
+                    </div>
+                    <span className="text-muted-foreground">{formatDate(item.transactionTime, locale)}</span>
+                  </div>
+                  <div className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+                    <span>{t("marketBilling.binance.admin.uid", { uid: item.binanceUid })}</span>
+                    <span className="break-all">{t("marketBilling.binance.admin.account", { account: item.paymentAccountId })}</span>
+                  </div>
+                  <label className="grid gap-1 text-xs text-muted-foreground">
+                    {t("marketBilling.binance.admin.invoiceId")}
+                    <input
+                      value={item.invoiceId ?? reconciliationInvoices[item.id] ?? ""}
+                      onChange={(event) => setReconciliationInvoices((current) => ({ ...current, [item.id]: event.target.value }))}
+                      readOnly={!!item.invoiceId}
+                      className="h-9 rounded-md border border-border bg-white px-3 font-mono text-xs text-foreground"
+                    />
+                  </label>
+                  <div className="flex flex-wrap gap-2">
+                    <Button size="sm" variant="primary" isDisabled={!!busy} onClick={() => void resolveBinanceCase(item, "settle")}>
+                      {busy === `binance-case:${item.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                      {t("marketBilling.binance.admin.settle")}
+                    </Button>
+                    <Button size="sm" variant="outline" isDisabled={!!busy} onClick={() => void resolveBinanceCase(item, "ignore")}>
+                      {t("marketBilling.binance.admin.ignore")}
+                    </Button>
+                  </div>
+                </div>
+              )) : (
+                <p className="text-sm text-muted-foreground">{t("marketBilling.binance.admin.empty")}</p>
+              )}
+            </div>
+          ) : null}
           {adminDisputes.length ? adminDisputes.map((item) => (
             <div key={item.dispute.id} className="grid gap-3 rounded-lg border border-sky-200 bg-sky-50/60 p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1153,7 +1449,7 @@ export function AccountBillingPage() {
                 </Button>
               </div>
             </div>
-          )) : <p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t("marketBilling.admin.empty")}</p>}
+          )) : !binanceAdmin?.cases.length ? <p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t("marketBilling.admin.empty")}</p> : null}
         </section>
       ) : null}
 
@@ -1180,6 +1476,143 @@ export function AccountBillingPage() {
               {actionInvoice?.declaration ? (
                 <div className="rounded-md border border-border p-3">
                   <PaymentDeclarationDetails declaration={actionInvoice.declaration} locale={locale} />
+                </div>
+              ) : null}
+              {action?.kind === "auto-pay" ? (
+                <div className="grid gap-4">
+                  {binanceIntentBusy === "create" && !binanceIntent ? (
+                    <div className="flex items-center justify-center gap-2 rounded-lg border border-border py-10 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {t("marketBilling.binance.creating")}
+                    </div>
+                  ) : null}
+                  {binanceIntentError ? (
+                    <div className="flex gap-2 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                      <div>
+                        <strong>{t("marketBilling.binance.unavailable")}</strong>
+                        <p className="mt-1 break-words text-xs leading-5">{binanceIntentError}</p>
+                      </div>
+                    </div>
+                  ) : null}
+                  {binanceIntent ? (
+                    <>
+                      <div className={`rounded-xl border p-4 text-center ${
+                        binanceIntent.status === "paid"
+                          ? "border-emerald-200 bg-emerald-50"
+                          : binanceIntent.status === "pending"
+                            ? "border-amber-200 bg-amber-50/70"
+                            : "border-slate-200 bg-slate-50"
+                      }`}>
+                        {binanceIntent.status === "paid" ? (
+                          <CircleCheckBig className="mx-auto h-8 w-8 text-emerald-600" />
+                        ) : null}
+                        <p className="mt-1 text-xs font-medium text-muted-foreground">
+                          {binanceCanTransfer
+                            ? t("marketBilling.binance.exactAmount")
+                            : binanceIntentStatusLabel(binanceIntent.status, t)}
+                        </p>
+                        <strong className="mt-1 block break-all text-3xl tabular-nums text-foreground">
+                          {binanceIntent.payAmount}
+                          <span className="ml-2 text-base">{binanceIntent.asset}</span>
+                        </strong>
+                        {binanceCanTransfer ? (
+                          <>
+                            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                              {t("marketBilling.binance.exactWarning")}
+                            </p>
+                            <Button size="sm" variant="outline" className="mt-3" onClick={() => void copyAutoPaymentValue(binanceIntent.payAmount)}>
+                              <Copy className="h-4 w-4" />{t("marketBilling.binance.copyAmount")}
+                            </Button>
+                          </>
+                        ) : null}
+                      </div>
+
+                      <div className="divide-y divide-dashed divide-border rounded-lg border border-border px-3 text-sm">
+                        {binanceCanTransfer ? (
+                          <>
+                            <div className="flex items-center justify-between gap-3 py-3">
+                              <span className="text-muted-foreground">{t("marketBilling.binance.receiverUid")}</span>
+                              <span className="flex min-w-0 items-center gap-2">
+                                <strong className="break-all text-right">{binanceIntent.receiverUid}</strong>
+                                <Button isIconOnly size="sm" variant="ghost" aria-label={t("marketBilling.binance.copyUid")} onClick={() => void copyAutoPaymentValue(binanceIntent.receiverUid)}>
+                                  <Copy className="h-4 w-4" />
+                                </Button>
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between gap-3 py-3">
+                              <span className="text-muted-foreground">{t("marketBilling.binance.noteCode")}</span>
+                              <span className="flex min-w-0 items-center gap-2">
+                                <strong className="break-all text-right">{binanceIntent.noteCode}</strong>
+                                <Button isIconOnly size="sm" variant="ghost" aria-label={t("marketBilling.binance.copyNote")} onClick={() => void copyAutoPaymentValue(binanceIntent.noteCode)}>
+                                  <Copy className="h-4 w-4" />
+                                </Button>
+                              </span>
+                            </div>
+                          </>
+                        ) : null}
+                        <div className="flex items-center justify-between gap-3 py-3">
+                          <span className="text-muted-foreground">{t("marketBilling.binance.remaining")}</span>
+                          <strong className={binanceRemainingSeconds ? "tabular-nums" : "text-rose-700 tabular-nums"}>{binanceCountdown}</strong>
+                        </div>
+                        <div className="flex items-center justify-between gap-3 py-3">
+                          <span className="text-muted-foreground">{t("marketBilling.binance.statusLabel")}</span>
+                          <strong className={binanceIntent.status === "paid" ? "text-emerald-700" : binanceIntent.status === "pending" ? "text-amber-700" : "text-rose-700"}>
+                            {binanceIntentStatusLabel(binanceIntent.status, t)}
+                          </strong>
+                        </div>
+                      </div>
+
+                      {binanceCanTransfer ? (
+                        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">
+                          {t("marketBilling.binance.path")}
+                        </div>
+                      ) : null}
+                      {binanceIntent.accountStatus === "degraded" ? (
+                        <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+                          {t("marketBilling.binance.degraded")}
+                        </p>
+                      ) : null}
+                      {binanceIntent.status === "expired" ? (
+                        <p className="text-xs leading-5 text-muted-foreground">{t("marketBilling.binance.expiredHint")}</p>
+                      ) : null}
+                      {binanceIntent.status === "review_required" ? (
+                        <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+                          {t("marketBilling.binance.reviewHint")}
+                        </p>
+                      ) : null}
+                      {binanceIntent.lastCheckedAt ? (
+                        <p className="text-center text-xs text-muted-foreground">
+                          {t("marketBilling.binance.lastChecked", { date: formatDate(binanceIntent.lastCheckedAt, locale) })}
+                        </p>
+                      ) : null}
+                      <div className="flex flex-wrap justify-center gap-2">
+                        {["pending", "expired", "cancelled"].includes(binanceIntent.status) ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            isDisabled={!!binanceIntentBusy || binanceIntent.accountStatus !== "verified"}
+                            onClick={() => void refreshAutoPayment()}
+                          >
+                            {binanceIntentBusy === "refresh" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                            {t("marketBilling.binance.refresh")}
+                          </Button>
+                        ) : null}
+                        {binanceIntent.status === "pending" ? (
+                          <Button size="sm" variant="outline" isDisabled={!!binanceIntentBusy} onClick={() => void cancelAutoPayment()}>
+                            {binanceIntentBusy === "cancel" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}
+                            {t("marketBilling.binance.cancel")}
+                          </Button>
+                        ) : null}
+                      </div>
+                    </>
+                  ) : null}
+                  <Button
+                    variant="ghost"
+                    onClick={() => openAction({ kind: "declare", account: action.account, invoice: action.invoice })}
+                  >
+                    {t("marketBilling.binance.manualFallback")}
+                  </Button>
                 </div>
               ) : null}
               {action?.kind === "declare" ? (
@@ -1237,15 +1670,21 @@ export function AccountBillingPage() {
               ) : null}
             </Modal.Body>
             <Modal.Footer>
-              <Button variant="ghost" isDisabled={!!busy} onClick={() => setAction(null)}>{t("common.cancel")}</Button>
-              <Button
-                variant={action && actionIsDangerous(action) ? "danger" : "primary"}
-                isDisabled={!!busy || !!(needsReason && !reason.trim()) || !!(action?.kind === "record-refund" && !reference.trim())}
-                onClick={() => void submitAction()}
-              >
-                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {action ? actionSubmitLabel(action, t) : ""}
-              </Button>
+              {action?.kind === "auto-pay" ? (
+                <Button variant="primary" onClick={() => setAction(null)}>{t("common.close")}</Button>
+              ) : (
+                <>
+                  <Button variant="ghost" isDisabled={!!busy} onClick={() => setAction(null)}>{t("common.cancel")}</Button>
+                  <Button
+                    variant={action && actionIsDangerous(action) ? "danger" : "primary"}
+                    isDisabled={!!busy || !!(needsReason && !reason.trim()) || !!(action?.kind === "record-refund" && !reference.trim())}
+                    onClick={() => void submitAction()}
+                  >
+                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    {action ? actionSubmitLabel(action, t) : ""}
+                  </Button>
+                </>
+              )}
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>

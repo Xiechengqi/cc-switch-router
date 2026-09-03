@@ -62,6 +62,8 @@ pub struct ServerState {
     pub client_subdomain_takeover_recovery_running: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes external billing suspend/resume/terminate effects across API and worker tasks.
     pub market_billing_controls: Arc<Mutex<()>>,
+    /// Private credential vault, Binance API adapter, and global settlement kill switch.
+    pub binance_settlement: Arc<crate::binance_settlement::BinanceSettlementRuntime>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
     /// "demand" overlay and burst-arc animation; not persisted across restarts.
     pub recent_traffic: RecentTraffic,

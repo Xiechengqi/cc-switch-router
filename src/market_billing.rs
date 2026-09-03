@@ -316,6 +316,7 @@ pub struct BillingDashboardView {
 pub struct MarketBillingConfigView {
     pub currency: &'static str,
     pub usd_cny_rate_micros: i64,
+    pub binance_auto_settlement_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -652,6 +653,8 @@ async fn get_billing_config(State(state): State<ServerState>) -> Json<MarketBill
     Json(MarketBillingConfigView {
         currency: MARKET_CURRENCY,
         usd_cny_rate_micros: state.store.market_usd_cny_rate_micros(),
+        binance_auto_settlement_enabled: state.binance_settlement.mode()
+            == crate::binance_settlement::GlobalMode::Enabled,
     })
 }
 
@@ -4657,6 +4660,12 @@ impl AppStore {
                 "this invoice cannot accept a payment declaration".into(),
             ));
         }
+        crate::binance_settlement::cancel_invoice_intents_tx(
+            &tx,
+            invoice_id,
+            "manual_payment_declared",
+            &now,
+        )?;
         tx.execute(
             "UPDATE market_payment_declarations
              SET status = 'superseded' WHERE invoice_id = ?1 AND status = 'declared'",
@@ -4762,84 +4771,15 @@ impl AppStore {
             params![declaration_id],
         )
         .map_err(map_db("confirm market payment declaration"))?;
-        tx.execute(
-            "UPDATE market_invoices SET status = 'paid', paid_at = ?2 WHERE id = ?1",
-            params![invoice_id, now],
-        )
-        .map_err(map_db("mark market invoice paid"))?;
-        let (close_requested, credit_kind) = tx
-            .query_row(
-                "SELECT close_requested, credit_kind FROM market_credit_accounts WHERE id = ?1",
-                params![account_id],
-                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
-            )
-            .map_err(map_db("read market account settlement state"))?;
-        let credit_revoked = credit_kind == crate::market_access::CREDIT_NONE;
-        tx.execute(
-            "UPDATE market_credit_accounts
-             SET status = ?2, balance_units = 0, open_invoice_id = NULL,
-                 version = version + 1, updated_at = ?3 WHERE id = ?1",
-            params![
-                account_id,
-                if close_requested {
-                    ACCOUNT_CLOSED
-                } else {
-                    ACCOUNT_ACTIVE
-                },
-                now,
-            ],
-        )
-        .map_err(map_db("settle market credit account"))?;
-        if !close_requested && !credit_revoked {
-            tx.execute(
-                "UPDATE market_service_contracts
-                 SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
-                     desired_control_state = 'active', applied_control_state = 'suspended',
-                     suspended_at = NULL,
-                     last_evaluated_at = ?2, updated_at = ?2
-                 WHERE account_id = ?1 AND status = 'billing_suspended'",
-                params![account_id, now],
-            )
-            .map_err(map_db("resume settled market contracts"))?;
-        } else {
-            tx.execute(
-                "UPDATE market_service_contracts
-                 SET desired_control_state = 'terminated',
-                     control_error = ?2, updated_at = ?3
-                 WHERE account_id = ?1 AND status = 'billing_suspended'",
-                params![
-                    account_id,
-                    if close_requested {
-                        "supplier_credit_closed"
-                    } else {
-                        "supplier_credit_revoked"
-                    },
-                    now,
-                ],
-            )
-            .map_err(map_db(
-                "retain market contract termination after settlement",
-            ))?;
-        }
-        tx.execute(
-            "UPDATE market_credit_restrictions SET status = 'lifted', lifted_at = ?2
-             WHERE invoice_id = ?1 AND status = 'active'",
-            params![invoice_id, now],
-        )
-        .map_err(map_db("lift settled market credit restriction"))?;
-        record_event_tx(
+        settle_invoice_paid_core_tx(
             &tx,
-            Some(&account_id),
-            None,
-            Some(invoice_id),
+            &account_id,
+            invoice_id,
             Some(&session.user_id),
-            "payment_received",
             serde_json::json!({
+                "source": "supplier_manual",
                 "declarationId": declaration_id,
-                "accountClosed": close_requested,
-                "creditRevoked": credit_revoked,
             }),
-            &format!("payment-received:{invoice_id}"),
             &now,
         )?;
         let actions = pending_control_actions_tx(&tx)?;
@@ -5201,6 +5141,12 @@ impl AppStore {
             params![invoice_id, now],
         )
         .map_err(map_db("mark market invoice disputed"))?;
+        crate::binance_settlement::cancel_invoice_intents_tx(
+            &tx,
+            invoice_id,
+            "invoice_disputed",
+            &now,
+        )?;
         tx.execute(
             "UPDATE market_credit_accounts SET status = 'disputed', updated_at = ?2 WHERE id = ?1",
             params![account_id, now],
@@ -5487,6 +5433,269 @@ impl AppStore {
     }
 }
 
+fn settle_invoice_paid_core_tx(
+    tx: &Transaction<'_>,
+    account_id: &str,
+    invoice_id: &str,
+    actor_user_id: Option<&str>,
+    mut detail: serde_json::Value,
+    now: &str,
+) -> Result<(), AppError> {
+    let changed = tx
+        .execute(
+            "UPDATE market_invoices SET status = 'paid', paid_at = ?2
+             WHERE id = ?1 AND status IN ('open', 'payment_declared', 'overdue')",
+            params![invoice_id, now],
+        )
+        .map_err(map_db("mark market invoice paid"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "this invoice can no longer be settled".into(),
+        ));
+    }
+    let (close_requested, credit_kind) = tx
+        .query_row(
+            "SELECT close_requested, credit_kind FROM market_credit_accounts WHERE id = ?1",
+            params![account_id],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+        )
+        .map_err(map_db("read market account settlement state"))?;
+    let credit_revoked = credit_kind == crate::market_access::CREDIT_NONE;
+    tx.execute(
+        "UPDATE market_credit_accounts
+         SET status = ?2, balance_units = 0, open_invoice_id = NULL,
+             version = version + 1, updated_at = ?3 WHERE id = ?1",
+        params![
+            account_id,
+            if close_requested {
+                ACCOUNT_CLOSED
+            } else {
+                ACCOUNT_ACTIVE
+            },
+            now,
+        ],
+    )
+    .map_err(map_db("settle market credit account"))?;
+    if !close_requested && !credit_revoked {
+        tx.execute(
+            "UPDATE market_service_contracts
+             SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
+                 desired_control_state = 'active', applied_control_state = 'suspended',
+                 suspended_at = NULL,
+                 last_evaluated_at = ?2, updated_at = ?2
+             WHERE account_id = ?1 AND status = 'billing_suspended'",
+            params![account_id, now],
+        )
+        .map_err(map_db("resume settled market contracts"))?;
+    } else {
+        tx.execute(
+            "UPDATE market_service_contracts
+             SET desired_control_state = 'terminated',
+                 control_error = ?2, updated_at = ?3
+             WHERE account_id = ?1 AND status = 'billing_suspended'",
+            params![
+                account_id,
+                if close_requested {
+                    "supplier_credit_closed"
+                } else {
+                    "supplier_credit_revoked"
+                },
+                now,
+            ],
+        )
+        .map_err(map_db(
+            "retain market contract termination after settlement",
+        ))?;
+    }
+    tx.execute(
+        "UPDATE market_credit_restrictions SET status = 'lifted', lifted_at = ?2
+         WHERE invoice_id = ?1 AND status = 'active'",
+        params![invoice_id, now],
+    )
+    .map_err(map_db("lift settled market credit restriction"))?;
+    if let Some(object) = detail.as_object_mut() {
+        object.insert("accountClosed".into(), close_requested.into());
+        object.insert("creditRevoked".into(), credit_revoked.into());
+    }
+    record_event_tx(
+        tx,
+        Some(account_id),
+        None,
+        Some(invoice_id),
+        actor_user_id,
+        "payment_received",
+        detail,
+        &format!("payment-received:{invoice_id}"),
+        now,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn settle_invoice_from_binance_tx(
+    tx: &Transaction<'_>,
+    invoice_id: &str,
+    intent_id: &str,
+    payment_account_id: &str,
+    transaction_id: &str,
+    actual_amount_units: i64,
+    now: &str,
+) -> Result<Vec<BillingAction>, AppError> {
+    let (account_id, invoice_status, intent_status, asset, expected_amount_units) = tx
+        .query_row(
+            "SELECT invoice.account_id, invoice.status, intent.status,
+                    intent.asset, intent.pay_amount_units
+             FROM market_payment_intents intent
+             JOIN market_invoices invoice ON invoice.id = intent.invoice_id
+             JOIN binance_pay_transactions payment
+               ON payment.payment_account_id = intent.payment_account_id
+              AND payment.transaction_id = ?4
+              AND payment.account_binance_uid = intent.receiver_uid
+             WHERE intent.id = ?1 AND intent.invoice_id = ?2
+               AND intent.payment_account_id = ?3",
+            params![intent_id, invoice_id, payment_account_id, transaction_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read Binance invoice settlement state"))?
+        .ok_or_else(|| AppError::Conflict("Binance payment intent is no longer valid".into()))?;
+    if !matches!(invoice_status.as_str(), INVOICE_OPEN | INVOICE_OVERDUE)
+        || !matches!(intent_status.as_str(), "pending" | "expired")
+        || asset != "USDT"
+        || actual_amount_units != expected_amount_units
+    {
+        return Err(AppError::Conflict(
+            "Binance payment no longer matches a payable invoice".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO market_external_payment_receipts (
+            id, invoice_id, payment_intent_id, payment_account_id, transaction_id,
+            source, matched_by, asset, expected_amount_units, actual_amount_units,
+            confirmed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'binance_auto', 'exact_amount',
+                   'USDT', ?6, ?7, ?8)",
+        params![
+            Uuid::new_v4().to_string(),
+            invoice_id,
+            intent_id,
+            payment_account_id,
+            transaction_id,
+            expected_amount_units,
+            actual_amount_units,
+            now,
+        ],
+    )
+    .map_err(map_db("create Binance payment receipt"))?;
+    settle_invoice_paid_core_tx(
+        tx,
+        &account_id,
+        invoice_id,
+        None,
+        serde_json::json!({
+            "source": "binance_auto",
+            "paymentIntentId": intent_id,
+        }),
+        now,
+    )?;
+    pending_control_actions_tx(tx)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settle_invoice_from_binance_admin_tx(
+    tx: &Transaction<'_>,
+    invoice_id: &str,
+    intent_id: &str,
+    payment_account_id: &str,
+    transaction_id: &str,
+    actual_amount_units: i64,
+    actor_user_id: &str,
+    now: &str,
+) -> Result<Vec<BillingAction>, AppError> {
+    let (
+        account_id,
+        invoice_status,
+        intent_status,
+        asset,
+        base_amount_units,
+        expected_amount_units,
+    ) = tx
+        .query_row(
+            "SELECT invoice.account_id, invoice.status, intent.status, intent.asset,
+                    intent.base_amount_units, intent.pay_amount_units
+             FROM market_payment_intents intent
+             JOIN market_invoices invoice ON invoice.id = intent.invoice_id
+             JOIN binance_pay_transactions payment
+               ON payment.payment_account_id = intent.payment_account_id
+              AND payment.transaction_id = ?4
+              AND payment.account_binance_uid = intent.receiver_uid
+             WHERE intent.id = ?1 AND intent.invoice_id = ?2
+               AND intent.payment_account_id = ?3",
+            params![intent_id, invoice_id, payment_account_id, transaction_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read Binance admin settlement state"))?
+        .ok_or_else(|| AppError::Conflict("Binance payment intent is no longer valid".into()))?;
+    if !matches!(invoice_status.as_str(), INVOICE_OPEN | INVOICE_OVERDUE)
+        || intent_status == "paid"
+        || asset != "USDT"
+        || actual_amount_units < base_amount_units
+    {
+        return Err(AppError::Conflict(
+            "Binance transaction cannot safely settle this invoice".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO market_external_payment_receipts (
+            id, invoice_id, payment_intent_id, payment_account_id, transaction_id,
+            source, matched_by, asset, expected_amount_units, actual_amount_units,
+            confirmed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'admin_reconciliation', 'admin_override',
+                   'USDT', ?6, ?7, ?8)",
+        params![
+            Uuid::new_v4().to_string(),
+            invoice_id,
+            intent_id,
+            payment_account_id,
+            transaction_id,
+            expected_amount_units,
+            actual_amount_units,
+            now,
+        ],
+    )
+    .map_err(map_db("create reconciled Binance payment receipt"))?;
+    settle_invoice_paid_core_tx(
+        tx,
+        &account_id,
+        invoice_id,
+        Some(actor_user_id),
+        serde_json::json!({
+            "source": "admin_reconciliation",
+            "paymentIntentId": intent_id,
+            "transactionId": transaction_id,
+        }),
+        now,
+    )?;
+    pending_control_actions_tx(tx)
+}
+
 fn credit_invoice_accruals_tx(
     conn: &Connection,
     invoice_id: &str,
@@ -5556,6 +5765,7 @@ fn void_invoice_tx(
         params![invoice_id, now],
     )
     .map_err(map_db("void market invoice"))?;
+    crate::binance_settlement::cancel_invoice_intents_tx(tx, invoice_id, "invoice_voided", now)?;
     tx.execute(
         "UPDATE market_payment_declarations SET status = 'superseded'
          WHERE invoice_id = ?1 AND status = 'declared'",
@@ -7278,6 +7488,7 @@ mod tests {
                     chain: None,
                     address: None,
                     instructions: Some("Test payment instructions".into()),
+                    settlement_asset: None,
                 }],
                 None,
             )
@@ -8338,6 +8549,7 @@ mod tests {
                     chain: None,
                     address: None,
                     instructions: Some("Replacement payment instructions".into()),
+                    settlement_asset: None,
                 }],
                 None,
             )
