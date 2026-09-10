@@ -92,10 +92,10 @@ use crate::namespace::{
 };
 use crate::notification_channels::{NotificationChannelId, NotificationTargets};
 use crate::notifications::{
-    ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
-    ClientNotificationPolicy, DigestEmailClient, DigestEmailData, NotificationAggregateStats,
-    NotificationReconcileStats, NotificationTemplateContext, OfflineEmailData,
-    RegistrationEmailData, RegistrationOverflowEmailData, mask_email_like_tokens,
+    BARK_MAX_BODY_BYTES, BARK_PAYLOAD_VERSION, ClientNotificationBatch, ClientNotificationClaim,
+    ClientNotificationDeliveryView, ClientNotificationPolicy, DigestEmailClient, DigestEmailData,
+    NotificationAggregateStats, NotificationReconcileStats, NotificationTemplateContext,
+    OfflineEmailData, RegistrationEmailData, RegistrationOverflowEmailData, mask_email_like_tokens,
     mask_notification_target, render_digest_email, render_offline_email, render_registration_email,
     render_registration_overflow_email,
 };
@@ -211,6 +211,19 @@ fn observed_online_rate(healthy_minutes: usize, observed_minutes: usize) -> f64 
     } else {
         (healthy_minutes as f64 / observed_minutes as f64 * 100.0).clamp(0.0, 100.0)
     }
+}
+
+fn truncate_notification_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let suffix = "\n…";
+    let content_limit = max_bytes.saturating_sub(suffix.len());
+    let mut end = content_limit.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &value[..end])
 }
 
 fn observation_coverage(observed_minutes: usize) -> f64 {
@@ -1434,7 +1447,7 @@ impl NotificationLane {
     /// A Telegram chat is bound with a deep link, which is a weaker proof, so
     /// the hint never leaves email. Everything the offline lane says is already
     /// visible on the dashboard to anyone holding the session.
-    fn allows_telegram(self) -> bool {
+    fn allows_push_channels(self) -> bool {
         match self {
             Self::Offline => true,
             Self::Registration => false,
@@ -3492,6 +3505,45 @@ impl AppStore {
         Ok(stats)
     }
 
+    pub(crate) async fn apply_notification_settings_runtime(
+        &self,
+        policy: &ClientNotificationPolicy,
+        template: &NotificationTemplateContext,
+        telegram_transition: crate::telegram::bind::TelegramRuntimeTransition<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<NotificationReconcileStats, AppError> {
+        let timestamp = now.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin notification settings runtime apply failed: {error}"
+                ))
+            })?;
+        let mut stats = NotificationReconcileStats::default();
+        sync_client_notification_runtime_tx(&tx, policy, Some(template), now, &mut stats)?;
+        match telegram_transition {
+            crate::telegram::bind::TelegramRuntimeTransition::Unchanged => {}
+            crate::telegram::bind::TelegramRuntimeTransition::Reconciling(fingerprint) => {
+                crate::telegram::bind::mark_telegram_bot_reconciling_tx(
+                    &tx,
+                    fingerprint,
+                    &timestamp,
+                )?;
+            }
+            crate::telegram::bind::TelegramRuntimeTransition::Disabled => {
+                crate::telegram::bind::mark_telegram_bot_disabled_tx(&tx, &timestamp)?;
+            }
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit notification settings runtime apply failed: {error}"
+            ))
+        })?;
+        Ok(stats)
+    }
+
     pub async fn claim_operator_alert_signals(
         &self,
         worker_id: &str,
@@ -4120,8 +4172,18 @@ impl AppStore {
             // fully excludes it.
             let targets = crate::telegram::bind::notification_targets_tx(&tx, &recipient)?
                 .unwrap_or_else(|| NotificationTargets::email_only(recipient.clone()));
-            let delivery_targets =
-                targets.delivery_targets(template.telegram.enabled, lane.allows_telegram());
+            let bark_channel = NotificationChannelId::bark();
+            let bark_available = template.bark.enabled
+                && targets.target(&bark_channel).is_some_and(|target| {
+                    target.provider_identity.as_deref()
+                        == template.bark.provider_identity.as_deref()
+                });
+            let delivery_targets = targets.delivery_targets(
+                template.telegram.enabled,
+                lane.allows_push_channels(),
+                bark_available,
+                lane.allows_push_channels(),
+            );
             let event_family = lane.as_str();
             let storm_kind = Some(lane.storm_event_kind());
             let storm_window_start =
@@ -4230,10 +4292,10 @@ impl AppStore {
                     now,
                 )?
             };
-            // One notification, one correlation id, one row per channel. The
-            // rows share the id (and the incident key) so an operator reading
-            // the outbox can see that the email and the Telegram message are
-            // the same event rather than two.
+            // One notification, one correlation id, one selected destination.
+            // The correlation id remains stable across cancellation and
+            // fallback so an operator can follow the same logical event when
+            // it is re-aggregated onto a different channel.
             let correlation_id = Uuid::new_v4().to_string();
             let timestamp = now.to_rfc3339();
 
@@ -4288,6 +4350,13 @@ impl AppStore {
                         rendered.html.clone(),
                         rendered.text.clone(),
                     )
+                } else if channel.is_bark() {
+                    (
+                        "",
+                        None,
+                        String::new(),
+                        truncate_notification_utf8(&rendered.text, BARK_MAX_BODY_BYTES),
+                    )
                 } else {
                     ("", None, String::new(), rendered.telegram.text.clone())
                 };
@@ -4307,6 +4376,18 @@ impl AppStore {
                             "text": &text_body,
                         }),
                     )
+                } else if channel.is_bark() {
+                    (
+                        BARK_PAYLOAD_VERSION,
+                        serde_json::json!({
+                            "title": &rendered.subject,
+                            "body": &text_body,
+                            "group": "cc-switch-router",
+                            "url": &template.dashboard_url,
+                            "id": &idempotency_key,
+                            "level": "active",
+                        }),
+                    )
                 } else {
                     (
                         TELEGRAM_PAYLOAD_VERSION,
@@ -4321,14 +4402,14 @@ impl AppStore {
                     "INSERT INTO notification_deliveries (
                         id, notification_lane, recipient, recipient_priority,
                         recipient_user_id, channel, channel_target, target_revision,
-                        provider_identity, payload_version, payload_json,
+                        credential_revision, provider_identity, payload_version, payload_json,
                         from_address, reply_to, subject, html_body, text_body,
                         idempotency_key, status, attempts, not_before, next_attempt_at,
                         template_fingerprint, delivery_kind, incident_key, error_message,
                         blocked_reason_code, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?25, ?10,
-                               ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18, ?19,
-                               ?20, ?21, ?22, ?23, ?24, ?18, ?18)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?26, ?11,
+                               ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20,
+                               ?21, ?22, ?23, ?24, ?25, ?19, ?19)",
                     params![
                         batch_id,
                         lane.as_str(),
@@ -4338,6 +4419,7 @@ impl AppStore {
                         channel.as_str(),
                         target.address,
                         target.revision,
+                        target.credential_revision,
                         target.provider_identity,
                         payload_json,
                         from_address,
@@ -4493,12 +4575,15 @@ impl AppStore {
             registration_global_limit,
             telegram_recipient_limit,
             telegram_global_limit,
+            bark_recipient_limit,
+            bark_global_limit,
         ) = tx
             .query_row(
                 "SELECT recipient_hourly_limit, global_hourly_limit,
                         registration_recipient_hourly_limit,
                         registration_global_hourly_limit,
-                        telegram_recipient_hourly_limit, telegram_global_hourly_limit
+                        telegram_recipient_hourly_limit, telegram_global_hourly_limit,
+                        bark_recipient_hourly_limit, bark_global_hourly_limit
                  FROM client_notification_runtime WHERE id = 1",
                 [],
                 |row| {
@@ -4509,6 +4594,8 @@ impl AppStore {
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
@@ -4517,6 +4604,8 @@ impl AppStore {
             })?;
         let (recipient_limit, global_limit) = if channel.is_telegram() {
             (telegram_recipient_limit, telegram_global_limit)
+        } else if channel.is_bark() {
+            (bark_recipient_limit, bark_global_limit)
         } else {
             match lane {
                 NotificationLane::Offline => (offline_recipient_limit, offline_global_limit),
@@ -4613,7 +4702,7 @@ impl AppStore {
         let changed = tx
             .execute(
                 "UPDATE notification_deliveries
-                 SET status = 'claimed', attempts = attempts + 1, claim_owner = ?2,
+                 SET status = 'claimed', claim_owner = ?2,
                      claim_expires_at = ?3, updated_at = ?4
                  WHERE id = ?1
                    AND (
@@ -4658,7 +4747,7 @@ impl AppStore {
                 "SELECT id, recipient, from_address, reply_to, subject, html_body,
                         text_body, idempotency_key, attempts, channel, channel_target,
                         recipient_user_id, target_revision, provider_identity,
-                        payload_version
+                        payload_version, payload_json, credential_revision
                  FROM notification_deliveries WHERE id = ?1",
                 params![batch_id],
                 |row| {
@@ -4685,6 +4774,9 @@ impl AppStore {
                         channel_target: row.get(10)?,
                         target_revision: row.get(12)?,
                         provider_identity: row.get(13)?,
+                        payload_version: row.get(14)?,
+                        payload_json: row.get(15)?,
+                        credential_revision: row.get(16)?,
                         from: row.get(2)?,
                         reply_to: row.get(3)?,
                         subject: row.get(4)?,
@@ -4692,7 +4784,11 @@ impl AppStore {
                         text: row.get(6)?,
                         parse_mode,
                         idempotency_key: row.get(7)?,
-                        attempts: attempts.max(0) as u32,
+                        // The provider attempt is started immediately after all
+                        // validation/backoff checks. Expose that prospective
+                        // one-based number to retry policy without charging it
+                        // durably until `start_client_notification_attempt`.
+                        attempts: attempts.max(0).saturating_add(1) as u32,
                     })
                 },
             )
@@ -4815,6 +4911,48 @@ impl AppStore {
                 ))
             })?;
             return Ok(false);
+        }
+
+        // A worker clones dynamic settings before entering this transaction.
+        // If Settings disables or replaces Bark immediately afterwards, that
+        // old snapshot must not be able to recreate and send work after the
+        // settings transaction has cancelled the prior outbox rows. The
+        // durable Provider row is the serialization fence for that race.
+        if channel == crate::bark::CHANNEL {
+            let bark_runtime_current = match provider_identity.as_deref() {
+                Some(provider_identity) => tx
+                    .query_row(
+                        "SELECT 1 FROM bark_provider_runtime
+                         WHERE id = 1 AND enabled = 1 AND config_fingerprint = ?1",
+                        params![provider_identity],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "validate Bark delivery runtime failed: {error}"
+                        ))
+                    })?
+                    .is_some(),
+                None => false,
+            };
+            if !bark_runtime_current {
+                cancel_notification_batch_tx(
+                    &tx,
+                    batch_id,
+                    worker_id,
+                    "cancelled_channel_changed",
+                    "Bark Provider configuration changed before delivery",
+                    now,
+                )?;
+                requeue_notification_batch_events_tx(&tx, batch_id, now)?;
+                tx.commit().map_err(|error| {
+                    AppError::Internal(format!(
+                        "commit stale Bark runtime cancellation failed: {error}"
+                    ))
+                })?;
+                return Ok(false);
+            }
         }
 
         if !notification_batch_is_authorized_for_current_owner(&tx, batch_id, &recipient)? {
@@ -5060,7 +5198,12 @@ impl AppStore {
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
-        let changed = conn
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin notification attempt start failed: {error}"))
+            })?;
+        let changed = tx
             .execute(
                 "UPDATE notification_delivery_attempts
                  SET status = 'started', started_at = ?4
@@ -5082,6 +5225,100 @@ impl AppStore {
                 "notification delivery attempt is no longer reserved".into(),
             ));
         }
+        let charged = tx
+            .execute(
+                "UPDATE notification_deliveries
+                 SET attempts = attempts + 1, updated_at = ?4
+                 WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?3
+                   AND claim_expires_at > ?4
+                   AND EXISTS (
+                       SELECT 1 FROM notification_delivery_attempts
+                       WHERE id = ?2 AND delivery_id = ?1 AND status = 'started'
+                   )",
+                params![batch_id, attempt_id, worker_id, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "charge notification provider attempt failed: {error}"
+                ))
+            })?;
+        if charged != 1 {
+            return Err(AppError::Conflict(
+                "notification delivery claim expired before its attempt was charged".into(),
+            ));
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit notification attempt start failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn defer_client_notification_batch_without_attempt(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        reason: &str,
+        next_attempt_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin uncharged notification defer failed: {error}"
+                ))
+            })?;
+        let changed = tx
+            .execute(
+                "UPDATE notification_deliveries
+                 SET status = 'retry', failure_kind = 'provider_backoff',
+                     blocked_reason_code = NULL, error_message = ?3,
+                     next_attempt_at = ?4, claim_owner = NULL, claim_expires_at = NULL,
+                     updated_at = ?5
+                 WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2
+                   AND EXISTS (
+                       SELECT 1 FROM notification_delivery_attempts
+                       WHERE delivery_id = ?1 AND status = 'reserved'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM notification_delivery_attempts
+                       WHERE delivery_id = ?1 AND status = 'started'
+                   )",
+                params![
+                    batch_id,
+                    worker_id,
+                    reason,
+                    next_attempt_at.to_rfc3339(),
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "defer uncharged notification delivery failed: {error}"
+                ))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "notification delivery was already started or its claim was lost".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE notification_delivery_attempts
+             SET status = 'cancelled', finished_at = ?2, error_message = ?3
+             WHERE delivery_id = ?1 AND status = 'reserved'",
+            params![batch_id, now.to_rfc3339(), reason],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "cancel deferred notification reservation failed: {error}"
+            ))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit uncharged notification defer failed: {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -11246,6 +11483,11 @@ impl AppStore {
             (Utc::now() - Duration::seconds(config.paused_share_stale_secs)).to_rfc3339();
         let notification_audit_cutoff =
             (Utc::now() - Duration::seconds(CLIENT_NOTIFICATION_AUDIT_RETENTION_SECS)).to_rfc3339();
+        let channel_binding_audit_cutoff = (Utc::now()
+            - Duration::seconds(
+                crate::notification_channels::CHANNEL_BINDING_AUDIT_RETENTION_SECS,
+            ))
+        .to_rfc3339();
         let (mut result, stale_subdomains, stale_image_storage_keys) = {
             let conn = self.conn.lock().await;
             let tx = conn
@@ -11542,6 +11784,20 @@ impl AppStore {
             )
             .map_err(|e| {
                 AppError::Internal(format!("delete stale registration nonces failed: {e}"))
+            })?;
+            tx.execute(
+                "DELETE FROM telegram_bind_tokens WHERE created_at < ?1",
+                params![channel_binding_audit_cutoff],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("delete stale Telegram bind tokens failed: {e}"))
+            })?;
+            tx.execute(
+                "DELETE FROM bark_binding_attempts WHERE created_at < ?1",
+                params![channel_binding_audit_cutoff],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("delete stale Bark binding attempts failed: {e}"))
             })?;
             let registration_cache_now_ms = Utc::now().timestamp_millis();
             let registration_cache_cutoff_ms =
@@ -16256,30 +16512,45 @@ fn sync_client_notification_runtime_tx(
     let telegram_global_hourly_limit = template
         .map(|value| value.telegram.global_hourly_limit)
         .unwrap_or(50);
+    let bark_recipient_hourly_limit = template
+        .map(|value| value.bark.recipient_hourly_limit)
+        .unwrap_or(10);
+    let bark_global_hourly_limit = template
+        .map(|value| value.bark.global_hourly_limit)
+        .unwrap_or(50);
     conn.execute(
         "INSERT INTO client_notification_runtime (
             id, enabled, enabled_since, policy_fingerprint, delivery_configured,
             template_fingerprint, recipient_hourly_limit, global_hourly_limit,
             registration_recipient_hourly_limit, registration_global_hourly_limit,
-            telegram_recipient_hourly_limit, telegram_global_hourly_limit, updated_at
-         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            telegram_recipient_hourly_limit, telegram_global_hourly_limit,
+            bark_recipient_hourly_limit, bark_global_hourly_limit, updated_at
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
             enabled = excluded.enabled,
             enabled_since = excluded.enabled_since,
             policy_fingerprint = excluded.policy_fingerprint,
-            delivery_configured = CASE WHEN ?13 = 1 THEN excluded.delivery_configured ELSE delivery_configured END,
+            delivery_configured = CASE WHEN ?15 = 1 THEN excluded.delivery_configured ELSE delivery_configured END,
             template_fingerprint = COALESCE(excluded.template_fingerprint, template_fingerprint),
             recipient_hourly_limit = excluded.recipient_hourly_limit,
             global_hourly_limit = excluded.global_hourly_limit,
             registration_recipient_hourly_limit = excluded.registration_recipient_hourly_limit,
             registration_global_hourly_limit = excluded.registration_global_hourly_limit,
             telegram_recipient_hourly_limit = CASE
-                WHEN ?13 = 1 THEN excluded.telegram_recipient_hourly_limit
+                WHEN ?15 = 1 THEN excluded.telegram_recipient_hourly_limit
                 ELSE telegram_recipient_hourly_limit
             END,
             telegram_global_hourly_limit = CASE
-                WHEN ?13 = 1 THEN excluded.telegram_global_hourly_limit
+                WHEN ?15 = 1 THEN excluded.telegram_global_hourly_limit
                 ELSE telegram_global_hourly_limit
+            END,
+            bark_recipient_hourly_limit = CASE
+                WHEN ?15 = 1 THEN excluded.bark_recipient_hourly_limit
+                ELSE bark_recipient_hourly_limit
+            END,
+            bark_global_hourly_limit = CASE
+                WHEN ?15 = 1 THEN excluded.bark_global_hourly_limit
+                ELSE bark_global_hourly_limit
             END,
             registration_overflow_active = CASE
                 WHEN excluded.enabled = 0 THEN 0
@@ -16298,6 +16569,8 @@ fn sync_client_notification_runtime_tx(
             policy.registration_global_hourly_limit,
             telegram_recipient_hourly_limit,
             telegram_global_hourly_limit,
+            bark_recipient_hourly_limit,
+            bark_global_hourly_limit,
             timestamp,
             i64::from(template.is_some()),
         ],
@@ -16305,6 +16578,30 @@ fn sync_client_notification_runtime_tx(
     .map_err(|error| {
         AppError::Internal(format!("update client notification activation failed: {error}"))
     })?;
+
+    if let Some(bark) = template.map(|value| &value.bark) {
+        crate::bark::sync_provider_configuration_tx(
+            conn,
+            bark.enabled,
+            bark.provider_identity.as_deref(),
+            bark.binding_config_fingerprint.as_deref(),
+            &timestamp,
+        )?;
+        invalidate_mismatched_bark_bindings_tx(
+            conn,
+            bark.provider_identity.as_deref(),
+            bark.credential_key_fingerprint.as_deref(),
+            &timestamp,
+        )?;
+        if !bark.enabled {
+            crate::telegram::bind::cancel_all_channel_deliveries(
+                conn,
+                crate::bark::CHANNEL,
+                &timestamp,
+                "Bark user notifications disabled or awaiting Router restart",
+            )?;
+        }
+    }
 
     if !policy.enabled {
         suppress_disabled_notification_work_tx(conn, now, stats)?;
@@ -16484,6 +16781,71 @@ fn sync_client_notification_runtime_tx(
 
     suppress_removed_notification_recipients(conn, now, stats)?;
     clear_inactive_setup_password_hints_tx(conn, now)?;
+    Ok(())
+}
+
+fn invalidate_mismatched_bark_bindings_tx(
+    conn: &Connection,
+    active_provider: Option<&str>,
+    active_key_fingerprint: Option<&str>,
+    timestamp: &str,
+) -> Result<(), AppError> {
+    let bindings = {
+        let mut statement = conn
+            .prepare(
+                "SELECT channel.user_id, users.email_normalized, channel.enabled
+                 FROM user_notification_channels channel
+                 INNER JOIN users ON users.id = channel.user_id
+                 WHERE channel.channel = 'bark' AND channel.state = 'ready'
+                   AND (
+                       ?1 IS NULL OR channel.provider_identity IS NULL
+                       OR channel.provider_identity <> ?1
+                       OR ?2 IS NULL OR channel.credential_key_fingerprint IS NULL
+                       OR channel.credential_key_fingerprint <> ?2
+                   )",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare stale Bark bindings failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![active_provider, active_key_fingerprint], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query stale Bark bindings failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read stale Bark bindings failed: {error}"))
+        })?
+    };
+    for (user_id, email, was_selected) in bindings {
+        conn.execute(
+            "UPDATE user_notification_channels
+             SET enabled = 0, state = 'invalid', target = NULL, target_label = NULL,
+                 provider_identity = NULL, credential_key_fingerprint = NULL,
+                 revision = revision + 1,
+                 invalidated_at = ?2, updated_at = ?2
+             WHERE user_id = ?1 AND channel = 'bark' AND state = 'ready'",
+            params![user_id, timestamp],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("invalidate stale Bark binding failed: {error}"))
+        })?;
+        crate::telegram::bind::cancel_channel_deliveries(
+            conn,
+            &email,
+            crate::bark::CHANNEL,
+            timestamp,
+            "Bark Provider or credential key changed; rebind required",
+        )?;
+        if was_selected {
+            crate::telegram::bind::enable_email_fallback(conn, &user_id, &email, timestamp)?;
+        }
+    }
     Ok(())
 }
 
@@ -26987,6 +27349,7 @@ mod tests {
             resend_reply_to: None,
             client_notifications: crate::config::ClientNotificationSettings::default(),
             telegram_bot: crate::config::TelegramBotSettings::default(),
+            bark: crate::config::BarkSettings::default(),
             auth_code_ttl_secs: 600,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 7 * 24 * 60 * 60,
@@ -27072,7 +27435,901 @@ mod tests {
             delivery_configured: true,
             delivery_config_fingerprint: "test-delivery-config".into(),
             telegram: crate::notifications::TelegramNotificationContext::default(),
+            bark: crate::notifications::BarkNotificationContext::default(),
         }
+    }
+
+    #[test]
+    fn bark_notification_truncation_preserves_utf8_and_byte_limit() {
+        let input = "警".repeat(1_100);
+        let truncated = truncate_notification_utf8(&input, 3_000);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.len() <= 3_000);
+        assert!(truncated.ends_with("\n…"));
+    }
+
+    #[tokio::test]
+    async fn bark_binding_is_encrypted_selects_once_and_unbinds_to_email() {
+        let mut config = enabled_notification_config("bark-binding-roundtrip");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("11".repeat(32));
+        let cipher = crate::bark::CredentialCipher::from_settings(&config.bark)
+            .expect("validate Bark cipher")
+            .expect("configured Bark cipher");
+        let provider_identity =
+            crate::bark::provider_identity(&config.bark.server_url).expect("Bark provider");
+        let binding_config_fingerprint =
+            crate::bark::binding_config_fingerprint(&provider_identity, cipher.key_fingerprint());
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('bark-user', 'bark@example.com', 'active', ?1, ?1)",
+                params![now],
+            )
+            .expect("insert Bark user");
+            conn.execute(
+                "INSERT INTO user_notification_channels (
+                    user_id, channel, enabled, state, target, revision,
+                    verified_at, created_at, updated_at
+                 ) VALUES ('bark-user', 'email', 1, 'ready', 'bark@example.com', 1,
+                           ?1, ?1, ?1)",
+                params![now],
+            )
+            .expect("insert Bark user's email channel");
+        }
+        let (_, attempted_user_id, generation) = store
+            .begin_bark_binding_attempt(
+                "bark@example.com",
+                None,
+                &provider_identity,
+                &binding_config_fingerprint,
+                &crate::bark::target_fingerprint(&provider_identity, "device_key_123"),
+            )
+            .await
+            .expect("begin Bark binding");
+        assert_eq!(attempted_user_id, "bark-user");
+
+        store
+            .commit_bark_binding(
+                "bark@example.com",
+                "bark-user",
+                &provider_identity,
+                "••••_123",
+                "device_key_123",
+                &cipher,
+                &binding_config_fingerprint,
+                generation,
+            )
+            .await
+            .expect("commit Bark binding");
+        let (initial_encrypted, initial_credential_revision) = {
+            let conn = store.conn.lock().await;
+            let (encrypted, label, revision, credential_revision, selected): (
+                String,
+                String,
+                i64,
+                i64,
+                i64,
+            ) = conn
+                .query_row(
+                    "SELECT target, target_label, revision, credential_revision, enabled
+                     FROM user_notification_channels
+                     WHERE user_id = 'bark-user' AND channel = 'bark'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("read encrypted Bark binding");
+            assert!(!encrypted.contains("device_key_123"));
+            assert_eq!(label, "••••_123");
+            assert_eq!(selected, 1);
+            assert_eq!(revision, credential_revision);
+            let aad =
+                crate::bark::credential_aad("bark-user", credential_revision, &provider_identity);
+            assert_eq!(
+                &*cipher.open(&encrypted, &aad).expect("decrypt Bark binding"),
+                "device_key_123"
+            );
+            let email_selected: i64 = conn
+                .query_row(
+                    "SELECT enabled FROM user_notification_channels
+                     WHERE user_id = 'bark-user' AND channel = 'email'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read email selection");
+            assert_eq!(email_selected, 0);
+            (encrypted, credential_revision)
+        };
+
+        let selected = store
+            .update_notification_settings(
+                "bark@example.com",
+                crate::models::UpdateNotificationSettingsRequest {
+                    channel: "email".into(),
+                },
+                None,
+            )
+            .await
+            .expect("switch Bark binding to Email");
+        assert_eq!(selected.delivery_channel, "email");
+        let selected = store
+            .update_notification_settings(
+                "bark@example.com",
+                crate::models::UpdateNotificationSettingsRequest {
+                    channel: crate::bark::CHANNEL.into(),
+                },
+                Some(crate::bark::BindingRuntime {
+                    provider_identity: &provider_identity,
+                    binding_config_fingerprint: &binding_config_fingerprint,
+                    cipher: &cipher,
+                }),
+            )
+            .await
+            .expect("switch Email back to the existing Bark binding");
+        assert_eq!(selected.delivery_channel, crate::bark::CHANNEL);
+
+        store
+            .apply_telegram_bot_identity("123", "router_bot", "telegram-fingerprint")
+            .await
+            .expect("activate Telegram alongside Bark");
+        bind_test_telegram(&store, "bark@example.com", "123", "4242").await;
+        let selected = store
+            .update_notification_settings(
+                "bark@example.com",
+                crate::models::UpdateNotificationSettingsRequest {
+                    channel: crate::bark::CHANNEL.into(),
+                },
+                Some(crate::bark::BindingRuntime {
+                    provider_identity: &provider_identity,
+                    binding_config_fingerprint: &binding_config_fingerprint,
+                    cipher: &cipher,
+                }),
+            )
+            .await
+            .expect("switch Telegram back to the existing Bark binding");
+        assert_eq!(selected.delivery_channel, crate::bark::CHANNEL);
+        {
+            let conn = store.conn.lock().await;
+            let (encrypted, revision, credential_revision): (String, i64, i64) = conn
+                .query_row(
+                    "SELECT target, revision, credential_revision
+                     FROM user_notification_channels
+                     WHERE user_id = 'bark-user' AND channel = 'bark'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read Bark binding after selection round trips");
+            assert_eq!(encrypted, initial_encrypted);
+            assert_eq!(credential_revision, initial_credential_revision);
+            assert!(revision > credential_revision);
+            let aad =
+                crate::bark::credential_aad("bark-user", credential_revision, &provider_identity);
+            assert_eq!(
+                &*cipher
+                    .open(&encrypted, &aad)
+                    .expect("decrypt Bark binding after selection changes"),
+                "device_key_123"
+            );
+        }
+
+        store
+            .unbind_bark("bark@example.com")
+            .await
+            .expect("unbind Bark");
+        let conn = store.conn.lock().await;
+        let bark_state: (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state, target, enabled FROM user_notification_channels
+                 WHERE user_id = 'bark-user' AND channel = 'bark'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read unbound Bark state");
+        assert_eq!(bark_state, ("unbound".into(), None, 0));
+        let email_selected: i64 = conn
+            .query_row(
+                "SELECT enabled FROM user_notification_channels
+                 WHERE user_id = 'bark-user' AND channel = 'email'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read email fallback");
+        assert_eq!(email_selected, 1);
+        drop(conn);
+
+        store
+            .commit_bark_binding(
+                "bark@example.com",
+                "bark-user",
+                &provider_identity,
+                "••••_123",
+                "device_key_123",
+                &cipher,
+                &binding_config_fingerprint,
+                generation,
+            )
+            .await
+            .expect("rebind Bark before Provider switch");
+        let mut switched = config.bark.clone();
+        switched.server_url = "https://bark.example.com".into();
+        let mut template = notification_template();
+        template.bark = crate::notifications::BarkNotificationContext::from_settings(&switched);
+        store
+            .sync_client_notification_runtime(&notification_policy(&config), &template, Utc::now())
+            .await
+            .expect("switch Bark Provider atomically");
+        let conn = store.conn.lock().await;
+        let bark_state: (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state, target, enabled FROM user_notification_channels
+                 WHERE user_id = 'bark-user' AND channel = 'bark'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read Provider-invalidated Bark state");
+        assert_eq!(bark_state, ("invalid".into(), None, 0));
+        let email_selected: i64 = conn
+            .query_row(
+                "SELECT enabled FROM user_notification_channels
+                 WHERE user_id = 'bark-user' AND channel = 'email'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read Provider switch email fallback");
+        assert_eq!(email_selected, 1);
+        drop(conn);
+
+        let switched_provider = template
+            .bark
+            .provider_identity
+            .as_deref()
+            .expect("switched Bark Provider identity");
+        assert!(
+            store
+                .bark_circuit_open_until(switched_provider, Utc::now())
+                .await
+                .expect("initialize switched Bark Provider")
+                .is_none()
+        );
+        store
+            .mark_bark_provider_failure(
+                &provider_identity,
+                Some("server_error"),
+                Some("old Provider failed"),
+                "old Provider failed",
+                Utc::now(),
+            )
+            .await
+            .expect("ignore stale Provider failure");
+        assert_eq!(
+            store
+                .bark_provider_runtime(switched_provider)
+                .await
+                .expect("read fenced Bark Provider")
+                .status,
+            "ready"
+        );
+        for _ in 0..3 {
+            store
+                .mark_bark_provider_failure(
+                    switched_provider,
+                    Some("server_error"),
+                    Some("Provider unavailable"),
+                    "Provider unavailable",
+                    Utc::now(),
+                )
+                .await
+                .expect("record Bark Provider failure");
+        }
+        assert!(
+            store
+                .bark_circuit_open_until(switched_provider, Utc::now())
+                .await
+                .expect("read open Bark circuit")
+                .is_some()
+        );
+        store
+            .mark_bark_provider_healthy(switched_provider, Utc::now())
+            .await
+            .expect("recover Bark Provider");
+        assert!(
+            store
+                .bark_circuit_open_until(switched_provider, Utc::now())
+                .await
+                .expect("read recovered Bark circuit")
+                .is_none()
+        );
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn invalid_bark_channel_test_only_clears_the_exact_tested_binding() {
+        let mut config = enabled_notification_config("bark-test-invalid-target-cas");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("12".repeat(32));
+        let cipher = crate::bark::CredentialCipher::from_settings(&config.bark)
+            .expect("validate Bark cipher")
+            .expect("configured Bark cipher");
+        let provider_identity =
+            crate::bark::provider_identity(&config.bark.server_url).expect("Bark provider");
+        let binding_config_fingerprint =
+            crate::bark::binding_config_fingerprint(&provider_identity, cipher.key_fingerprint());
+        let store = AppStore::new(&config).expect("create store");
+
+        let (_, user_id, generation) = store
+            .begin_bark_binding_attempt(
+                "owner@example.com",
+                None,
+                &provider_identity,
+                &binding_config_fingerprint,
+                &crate::bark::target_fingerprint(&provider_identity, "old_device_key"),
+            )
+            .await
+            .expect("begin old Bark binding");
+        store
+            .commit_bark_binding(
+                "owner@example.com",
+                &user_id,
+                &provider_identity,
+                "••••_old",
+                "old_device_key",
+                &cipher,
+                &binding_config_fingerprint,
+                generation,
+            )
+            .await
+            .expect("commit old Bark binding");
+        let old_target = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT target FROM user_notification_channels
+                 WHERE user_id = ?1 AND channel = 'bark'",
+                params![user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read old encrypted Bark target")
+        };
+
+        let (_, rebound_user_id, rebound_generation) = store
+            .begin_bark_binding_attempt(
+                "owner@example.com",
+                None,
+                &provider_identity,
+                &binding_config_fingerprint,
+                &crate::bark::target_fingerprint(&provider_identity, "new_device_key"),
+            )
+            .await
+            .expect("begin replacement Bark binding");
+        assert_eq!(rebound_user_id, user_id);
+        store
+            .commit_bark_binding(
+                "owner@example.com",
+                &user_id,
+                &provider_identity,
+                "••••_new",
+                "new_device_key",
+                &cipher,
+                &binding_config_fingerprint,
+                rebound_generation,
+            )
+            .await
+            .expect("commit replacement Bark binding");
+        let new_target = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT target FROM user_notification_channels
+                 WHERE user_id = ?1 AND channel = 'bark'",
+                params![user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read replacement encrypted Bark target")
+        };
+        assert_ne!(new_target, old_target);
+
+        assert!(
+            !store
+                .invalidate_bark_binding_after_test_failure(
+                    &user_id,
+                    &provider_identity,
+                    &old_target,
+                    Utc::now(),
+                )
+                .await
+                .expect("ignore stale Bark test failure")
+        );
+        {
+            let conn = store.conn.lock().await;
+            let current: (String, String, i64) = conn
+                .query_row(
+                    "SELECT state, target, enabled FROM user_notification_channels
+                     WHERE user_id = ?1 AND channel = 'bark'",
+                    params![user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read replacement after stale test failure");
+            assert_eq!(current, ("ready".into(), new_target.clone(), 1));
+        }
+
+        assert!(
+            store
+                .invalidate_bark_binding_after_test_failure(
+                    &user_id,
+                    &provider_identity,
+                    &new_target,
+                    Utc::now(),
+                )
+                .await
+                .expect("invalidate current Bark binding")
+        );
+        let conn = store.conn.lock().await;
+        let invalidated: (String, Option<String>, i64, i64) = conn
+            .query_row(
+                "SELECT bark.state, bark.target, bark.enabled, email.enabled
+                 FROM user_notification_channels bark
+                 INNER JOIN user_notification_channels email
+                   ON email.user_id = bark.user_id AND email.channel = 'email'
+                 WHERE bark.user_id = ?1 AND bark.channel = 'bark'",
+                params![user_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read invalidated Bark binding and fallback");
+        assert_eq!(invalidated, ("invalid".into(), None, 0, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn unbinding_an_unselected_push_channel_preserves_the_selected_third_channel() {
+        let (store, config) = setup_store("notification-unselected-channel-unbind").await;
+        store
+            .get_notification_settings("owner@example.com")
+            .await
+            .expect("initialize notification account");
+        let user_id = {
+            let conn = store.conn.lock().await;
+            let user_id = conn
+                .query_row(
+                    "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read notification user");
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE user_notification_channels
+                 SET enabled = 0, revision = revision + 1, updated_at = ?2
+                 WHERE user_id = ?1 AND channel = 'email'",
+                params![user_id, now],
+            )
+            .expect("deselect Email");
+            conn.execute(
+                "INSERT INTO user_notification_channels (
+                    user_id, channel, enabled, state, target, provider_identity,
+                    revision, verified_at, created_at, updated_at
+                 ) VALUES (?1, 'telegram', 1, 'ready', '4242', 'bot-1', 1, ?2, ?2, ?2)",
+                params![user_id, now],
+            )
+            .expect("select Telegram");
+            conn.execute(
+                "INSERT INTO user_notification_channels (
+                    user_id, channel, enabled, state, target, target_label,
+                    provider_identity, credential_key_fingerprint, revision,
+                    credential_revision, verified_at, created_at, updated_at
+                 ) VALUES (?1, 'bark', 0, 'ready', 'encrypted-target', '••••1234',
+                           'bark-provider', 'bark-key', 1, 1, ?2, ?2, ?2)",
+                params![user_id, now],
+            )
+            .expect("seed unselected Bark binding");
+            user_id
+        };
+
+        store
+            .unbind_bark("owner@example.com")
+            .await
+            .expect("unbind unselected Bark");
+        let settings = store
+            .get_notification_settings("owner@example.com")
+            .await
+            .expect("read Telegram selection after Bark unbind");
+        assert_eq!(settings.delivery_channel, "telegram");
+
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE user_notification_channels
+                 SET enabled = 0, revision = revision + 1, updated_at = ?2
+                 WHERE user_id = ?1 AND channel = 'telegram'",
+                params![user_id, now],
+            )
+            .expect("deselect Telegram");
+            conn.execute(
+                "UPDATE user_notification_channels
+                 SET enabled = 1, state = 'ready', target = 'encrypted-target',
+                     target_label = '••••1234', provider_identity = 'bark-provider',
+                     credential_key_fingerprint = 'bark-key', updated_at = ?2
+                 WHERE user_id = ?1 AND channel = 'bark'",
+                params![user_id, now],
+            )
+            .expect("select Bark");
+        }
+
+        let settings = store
+            .unbind_telegram("owner@example.com")
+            .await
+            .expect("unbind unselected Telegram");
+        assert_eq!(settings.delivery_channel, crate::bark::CHANNEL);
+        let conn = store.conn.lock().await;
+        let selected: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT email.enabled, telegram.enabled, bark.enabled
+                 FROM user_notification_channels email
+                 INNER JOIN user_notification_channels telegram
+                   ON telegram.user_id = email.user_id AND telegram.channel = 'telegram'
+                 INNER JOIN user_notification_channels bark
+                   ON bark.user_id = email.user_id AND bark.channel = 'bark'
+                 WHERE email.user_id = ?1 AND email.channel = 'email'",
+                params![user_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read preserved Bark selection");
+        assert_eq!(selected, (0, 0, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn bark_selection_rejects_every_stale_or_unreadable_binding_shape() {
+        let mut config = enabled_notification_config("bark-selection-validation");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("31".repeat(32));
+        let cipher = crate::bark::CredentialCipher::from_settings(&config.bark)
+            .expect("validate Bark cipher")
+            .expect("configured Bark cipher");
+        let provider_identity =
+            crate::bark::provider_identity(&config.bark.server_url).expect("Bark Provider");
+        let binding_config_fingerprint =
+            crate::bark::binding_config_fingerprint(&provider_identity, cipher.key_fingerprint());
+        let store = AppStore::new(&config).expect("create store");
+        let (_, user_id, generation) = store
+            .begin_bark_binding_attempt(
+                "owner@example.com",
+                None,
+                &provider_identity,
+                &binding_config_fingerprint,
+                &crate::bark::target_fingerprint(&provider_identity, "device_key_987"),
+            )
+            .await
+            .expect("begin valid Bark binding");
+        store
+            .commit_bark_binding(
+                "owner@example.com",
+                &user_id,
+                &provider_identity,
+                "••••_987",
+                "device_key_987",
+                &cipher,
+                &binding_config_fingerprint,
+                generation,
+            )
+            .await
+            .expect("commit valid Bark binding");
+        store
+            .update_notification_settings(
+                "owner@example.com",
+                crate::models::UpdateNotificationSettingsRequest {
+                    channel: "email".into(),
+                },
+                None,
+            )
+            .await
+            .expect("leave Bark binding unselected");
+        let valid_target = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT target FROM user_notification_channels
+                 WHERE user_id = ?1 AND channel = 'bark'",
+                params![user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read encrypted Bark target")
+        };
+        let cases = [
+            (
+                "unbound",
+                "unbound",
+                None,
+                provider_identity.clone(),
+                cipher.key_fingerprint().to_string(),
+            ),
+            (
+                "invalid",
+                "invalid",
+                Some(valid_target.clone()),
+                provider_identity.clone(),
+                cipher.key_fingerprint().to_string(),
+            ),
+            (
+                "provider mismatch",
+                "ready",
+                Some(valid_target.clone()),
+                "stale-provider".into(),
+                cipher.key_fingerprint().to_string(),
+            ),
+            (
+                "credential key mismatch",
+                "ready",
+                Some(valid_target.clone()),
+                provider_identity.clone(),
+                "stale-key".into(),
+            ),
+            (
+                "undecryptable envelope",
+                "ready",
+                Some("v1:1:not-a-nonce:not-a-ciphertext".into()),
+                provider_identity.clone(),
+                cipher.key_fingerprint().to_string(),
+            ),
+        ];
+        for (name, state, target, binding_provider, key_fingerprint) in cases {
+            {
+                let conn = store.conn.lock().await;
+                conn.execute(
+                    "UPDATE user_notification_channels
+                     SET enabled = 0, state = ?2, target = ?3, provider_identity = ?4,
+                         credential_key_fingerprint = ?5
+                     WHERE user_id = ?1 AND channel = 'bark'",
+                    params![user_id, state, target, binding_provider, key_fingerprint],
+                )
+                .unwrap_or_else(|error| panic!("seed {name} Bark binding: {error}"));
+            }
+            let error = match store
+                .update_notification_settings(
+                    "owner@example.com",
+                    crate::models::UpdateNotificationSettingsRequest {
+                        channel: crate::bark::CHANNEL.into(),
+                    },
+                    Some(crate::bark::BindingRuntime {
+                        provider_identity: &provider_identity,
+                        binding_config_fingerprint: &binding_config_fingerprint,
+                        cipher: &cipher,
+                    }),
+                )
+                .await
+            {
+                Ok(_) => panic!("selected {name} Bark binding"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    &error,
+                    AppError::Coded {
+                        code: "USER_NOTIFICATION_BARK_BINDING_REQUIRED",
+                        ..
+                    }
+                ),
+                "unexpected error for {name}: {error}"
+            );
+        }
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn bark_binding_commit_is_fenced_when_configuration_changes_away_and_back() {
+        let mut config = enabled_notification_config("bark-binding-generation-fence");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("41".repeat(32));
+        let cipher = crate::bark::CredentialCipher::from_settings(&config.bark)
+            .expect("validate Bark cipher")
+            .expect("configured Bark cipher");
+        let provider_identity =
+            crate::bark::provider_identity(&config.bark.server_url).expect("Bark Provider");
+        let binding_config_fingerprint =
+            crate::bark::binding_config_fingerprint(&provider_identity, cipher.key_fingerprint());
+        let store = AppStore::new(&config).expect("create store");
+        let (_, user_id, stale_generation) = store
+            .begin_bark_binding_attempt(
+                "owner@example.com",
+                None,
+                &provider_identity,
+                &binding_config_fingerprint,
+                &crate::bark::target_fingerprint(&provider_identity, "device_key_456"),
+            )
+            .await
+            .expect("begin Bark verification");
+
+        let policy = notification_policy(&config);
+        let mut disabled_template = notification_template();
+        disabled_template.bark = crate::notifications::BarkNotificationContext::default();
+        store
+            .sync_client_notification_runtime(&policy, &disabled_template, Utc::now())
+            .await
+            .expect("disable Bark while verification is in flight");
+        let mut restored_template = notification_template();
+        restored_template.bark =
+            crate::notifications::BarkNotificationContext::from_settings(&config.bark);
+        store
+            .sync_client_notification_runtime(&policy, &restored_template, Utc::now())
+            .await
+            .expect("restore the same Bark configuration");
+
+        let error = store
+            .commit_bark_binding(
+                "owner@example.com",
+                &user_id,
+                &provider_identity,
+                "••••_456",
+                "device_key_456",
+                &cipher,
+                &binding_config_fingerprint,
+                stale_generation,
+            )
+            .await
+            .expect_err("stale Bark verification must not commit after generation changes");
+        assert!(matches!(error, AppError::Conflict(_)));
+        let conn = store.conn.lock().await;
+        let bark_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_notification_channels
+                 WHERE user_id = ?1 AND channel = 'bark'",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .expect("count rejected Bark bindings");
+        assert_eq!(bark_rows, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn clearing_bark_credential_key_invalidates_binding_and_selects_email() {
+        let mut config = enabled_notification_config("bark-clear-key-fallback");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("42".repeat(32));
+        let cipher = crate::bark::CredentialCipher::from_settings(&config.bark)
+            .expect("validate Bark cipher")
+            .expect("configured Bark cipher");
+        let provider_identity =
+            crate::bark::provider_identity(&config.bark.server_url).expect("Bark Provider");
+        let binding_config_fingerprint =
+            crate::bark::binding_config_fingerprint(&provider_identity, cipher.key_fingerprint());
+        let store = AppStore::new(&config).expect("create store");
+        let (_, user_id, generation) = store
+            .begin_bark_binding_attempt(
+                "owner@example.com",
+                None,
+                &provider_identity,
+                &binding_config_fingerprint,
+                &crate::bark::target_fingerprint(&provider_identity, "device_key_clear_test"),
+            )
+            .await
+            .expect("begin Bark binding");
+        store
+            .commit_bark_binding(
+                "owner@example.com",
+                &user_id,
+                &provider_identity,
+                "••••test",
+                "device_key_clear_test",
+                &cipher,
+                &binding_config_fingerprint,
+                generation,
+            )
+            .await
+            .expect("commit Bark binding");
+
+        let mut disabled = config.bark.clone();
+        disabled.enabled = false;
+        let mut template = notification_template();
+        template.bark = crate::notifications::BarkNotificationContext::from_settings(&disabled);
+        store
+            .sync_client_notification_runtime(&notification_policy(&config), &template, Utc::now())
+            .await
+            .expect("disable Bark while retaining its credential key");
+        {
+            let conn = store.conn.lock().await;
+            let retained: (String, i64, i64) = conn
+                .query_row(
+                    "SELECT state, enabled, target IS NOT NULL
+                     FROM user_notification_channels
+                     WHERE user_id = ?1 AND channel = 'bark'",
+                    params![user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read disabled Bark binding");
+            assert_eq!(retained, ("ready".into(), 1, 1));
+        }
+
+        disabled.credential_master_key = None;
+        template.bark = crate::notifications::BarkNotificationContext::from_settings(&disabled);
+        store
+            .sync_client_notification_runtime(&notification_policy(&config), &template, Utc::now())
+            .await
+            .expect("clear Bark credential key");
+        let conn = store.conn.lock().await;
+        let invalidated: (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT bark.state, bark.target, bark.provider_identity,
+                        bark.credential_key_fingerprint, bark.enabled, email.enabled
+                 FROM user_notification_channels bark
+                 INNER JOIN user_notification_channels email
+                   ON email.user_id = bark.user_id AND email.channel = 'email'
+                 WHERE bark.user_id = ?1 AND bark.channel = 'bark'",
+                params![user_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read key-invalidated Bark binding");
+        assert_eq!(invalidated, ("invalid".into(), None, None, None, 0, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn bark_provider_runtime_fails_closed_when_disabled_or_mismatched() {
+        let mut config = enabled_notification_config("bark-runtime-configuration-fence");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("43".repeat(32));
+        let provider_identity =
+            crate::bark::provider_identity(&config.bark.server_url).expect("Bark Provider");
+        let store = AppStore::new(&config).expect("create store");
+
+        let active = store
+            .bark_provider_runtime(&provider_identity)
+            .await
+            .expect("read active Bark runtime");
+        assert!(active.configuration_active);
+        assert_eq!(active.status, "ready");
+
+        let mismatched = store
+            .bark_provider_runtime("stale-provider-identity")
+            .await
+            .expect("read mismatched Bark runtime");
+        assert!(!mismatched.configuration_active);
+        assert!(mismatched.status.is_empty());
+
+        let mut disabled = config.bark.clone();
+        disabled.enabled = false;
+        let mut template = notification_template();
+        template.bark = crate::notifications::BarkNotificationContext::from_settings(&disabled);
+        store
+            .sync_client_notification_runtime(&notification_policy(&config), &template, Utc::now())
+            .await
+            .expect("disable Bark runtime");
+        let disabled = store
+            .bark_provider_runtime(&provider_identity)
+            .await
+            .expect("read disabled Bark runtime");
+        assert!(!disabled.configuration_active);
+        assert!(disabled.status.is_empty());
+
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     fn expect_notification_batch(
@@ -37230,6 +38487,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_prunes_expired_notification_binding_audit_rows() {
+        let (store, config) = setup_store("notification-binding-audit-retention").await;
+        let now = Utc::now();
+        let old = now
+            - Duration::seconds(
+                crate::notification_channels::CHANNEL_BINDING_AUDIT_RETENTION_SECS + 60,
+            );
+        let recent = now - Duration::hours(1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('binding-audit-user', 'binding-audit@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert binding audit user");
+            for (suffix, created_at) in [("old", old), ("recent", recent)] {
+                conn.execute(
+                    "INSERT INTO telegram_bind_tokens (
+                        token_hash, user_id, email_normalized, bot_id, created_at, expires_at
+                     ) VALUES (?1, 'binding-audit-user', 'binding-audit@example.com',
+                               'test-bot', ?2, ?3)",
+                    params![
+                        format!("telegram-{suffix}"),
+                        created_at.to_rfc3339(),
+                        (created_at + Duration::minutes(15)).to_rfc3339(),
+                    ],
+                )
+                .expect("insert Telegram binding audit row");
+                conn.execute(
+                    "INSERT INTO bark_binding_attempts (
+                        id, user_id, source_ip, provider_identity, target_fingerprint,
+                        status, created_at
+                     ) VALUES (?1, 'binding-audit-user', '192.0.2.10',
+                               'test-provider', ?2, 'failed', ?3)",
+                    params![
+                        format!("bark-{suffix}"),
+                        format!("target-{suffix}"),
+                        created_at.to_rfc3339(),
+                    ],
+                )
+                .expect("insert Bark binding audit row");
+            }
+        }
+
+        store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("cleanup binding audit history");
+
+        let conn = store.conn.lock().await;
+        let telegram = conn
+            .prepare("SELECT token_hash FROM telegram_bind_tokens ORDER BY token_hash")
+            .expect("prepare retained Telegram binding audit")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query retained Telegram binding audit")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read retained Telegram binding audit");
+        let bark = conn
+            .prepare("SELECT id FROM bark_binding_attempts ORDER BY id")
+            .expect("prepare retained Bark binding audit")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query retained Bark binding audit")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read retained Bark binding audit");
+        assert_eq!(telegram, vec!["telegram-recent"]);
+        assert_eq!(bark, vec!["bark-recent"]);
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn notification_delivery_view_masks_recipient_and_omits_message_body() {
         let (store, config) = setup_store("notification-delivery-view-privacy").await;
         let now = Utc::now();
@@ -37290,6 +38619,7 @@ mod tests {
             delivery_configured: false,
             delivery_config_fingerprint: "missing-sender".into(),
             telegram: crate::notifications::TelegramNotificationContext::default(),
+            bark: crate::notifications::BarkNotificationContext::default(),
         };
         let first_delivery_at = now + Duration::seconds(6);
         store
@@ -37990,6 +39320,389 @@ mod tests {
             )
             .expect("read unbound channel");
         assert_eq!(channel_state, (0, "unbound".into()));
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn bark_disable_cancels_unstarted_work_but_allows_a_started_send_to_finish() {
+        let mut config = enabled_notification_config("bark-disable-send-race");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("51".repeat(32));
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            for (id, status) in [
+                ("bark-pending", "pending"),
+                ("bark-retry", "retry"),
+                ("bark-blocked", "blocked_config"),
+            ] {
+                insert_test_notification_batch(
+                    &conn,
+                    id,
+                    "owner@example.com",
+                    status,
+                    now,
+                    None,
+                    None,
+                    None,
+                );
+                conn.execute(
+                    "UPDATE notification_deliveries SET channel = 'bark' WHERE id = ?1",
+                    params![id],
+                )
+                .expect("set Bark delivery channel");
+            }
+            for (id, attempt_status) in [("bark-reserved", "reserved"), ("bark-started", "started")]
+            {
+                insert_test_notification_batch(
+                    &conn,
+                    id,
+                    "owner@example.com",
+                    "claimed",
+                    now,
+                    Some("worker"),
+                    Some(now + Duration::seconds(30)),
+                    None,
+                );
+                conn.execute(
+                    "UPDATE notification_deliveries SET channel = 'bark' WHERE id = ?1",
+                    params![id],
+                )
+                .expect("set claimed Bark delivery channel");
+                conn.execute(
+                    "INSERT INTO notification_delivery_attempts (
+                        id, delivery_id, channel, notification_lane, recipient, status,
+                        reserved_at, reservation_expires_at, started_at
+                     ) VALUES (?1, ?2, 'bark', 'offline', 'owner@example.com', ?3,
+                               ?4, ?5, CASE WHEN ?3 = 'started' THEN ?4 ELSE NULL END)",
+                    params![
+                        format!("{id}-attempt"),
+                        id,
+                        attempt_status,
+                        now.to_rfc3339(),
+                        (now + Duration::seconds(30)).to_rfc3339()
+                    ],
+                )
+                .expect("insert Bark delivery attempt");
+            }
+        }
+
+        let mut disabled = config.bark.clone();
+        disabled.enabled = false;
+        let mut template = notification_template();
+        template.bark = crate::notifications::BarkNotificationContext::from_settings(&disabled);
+        store
+            .sync_client_notification_runtime(&notification_policy(&config), &template, now)
+            .await
+            .expect("disable Bark runtime");
+        store
+            .mark_client_notification_batch_sent(
+                "bark-started",
+                "worker",
+                "bark-message-1",
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("finish already-started Bark send");
+
+        let conn = store.conn.lock().await;
+        let states = conn
+            .prepare(
+                "SELECT id, status FROM notification_deliveries
+                 WHERE channel = 'bark' ORDER BY id",
+            )
+            .expect("prepare disabled Bark deliveries")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query disabled Bark deliveries")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read disabled Bark deliveries");
+        assert_eq!(
+            states,
+            vec![
+                ("bark-blocked".into(), "cancelled_channel_changed".into()),
+                ("bark-pending".into(), "cancelled_channel_changed".into()),
+                ("bark-reserved".into(), "cancelled_channel_changed".into()),
+                ("bark-retry".into(), "cancelled_channel_changed".into()),
+                ("bark-started".into(), "sent".into()),
+            ]
+        );
+        let attempt_states = conn
+            .prepare(
+                "SELECT delivery_id, status FROM notification_delivery_attempts
+                 WHERE channel = 'bark' ORDER BY delivery_id",
+            )
+            .expect("prepare disabled Bark attempts")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query disabled Bark attempts")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read disabled Bark attempts");
+        assert_eq!(
+            attempt_states,
+            vec![
+                ("bark-reserved".into(), "cancelled".into()),
+                ("bark-started".into(), "sent".into()),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn stale_bark_worker_snapshot_cannot_send_after_provider_is_disabled() {
+        let mut config = enabled_notification_config("bark-disable-runtime-fence");
+        config.bark.enabled = true;
+        config.bark.credential_master_key = Some("52".repeat(32));
+        let store = AppStore::new(&config).expect("create store");
+        let provider_identity =
+            crate::bark::provider_identity(&config.bark.server_url).expect("Bark Provider");
+        let policy = notification_policy(&config);
+        let mut stale_template = notification_template();
+        stale_template.bark =
+            crate::notifications::BarkNotificationContext::from_settings(&config.bark);
+
+        let mut disabled = config.bark.clone();
+        disabled.enabled = false;
+        let mut disabled_template = notification_template();
+        disabled_template.bark =
+            crate::notifications::BarkNotificationContext::from_settings(&disabled);
+        let now = Utc::now();
+        store
+            .sync_client_notification_runtime(&policy, &disabled_template, now)
+            .await
+            .expect("disable Bark runtime");
+
+        // Simulate an old worker snapshot aggregating immediately after the
+        // Settings transaction. Validation must consult the durable runtime
+        // row rather than trusting that stale in-memory `enabled=true` value.
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "stale-bark-runtime-delivery",
+                "owner@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "UPDATE notification_deliveries
+                 SET channel = 'bark', provider_identity = ?2
+                 WHERE id = ?1",
+                params!["stale-bark-runtime-delivery", provider_identity],
+            )
+            .expect("freeze stale Bark delivery");
+        }
+        assert!(stale_template.bark.enabled);
+        let batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch("stale-bark-worker", now, 30)
+                .await
+                .expect("claim stale Bark delivery"),
+            "stale Bark delivery",
+        );
+        assert!(
+            !store
+                .validate_client_notification_batch(&batch.id, "stale-bark-worker", &policy, now,)
+                .await
+                .expect("fence stale Bark delivery")
+        );
+        let conn = store.conn.lock().await;
+        let state: (String, String, String) = conn
+            .query_row(
+                "SELECT delivery.status, delivery.error_message, attempt.status
+                 FROM notification_deliveries delivery
+                 INNER JOIN notification_delivery_attempts attempt
+                   ON attempt.delivery_id = delivery.id
+                 WHERE delivery.id = 'stale-bark-runtime-delivery'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read fenced Bark delivery");
+        assert_eq!(
+            state,
+            (
+                "cancelled_channel_changed".into(),
+                "Bark Provider configuration changed before delivery".into(),
+                "cancelled".into(),
+            )
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn bark_circuit_defer_does_not_charge_a_provider_attempt() {
+        let (store, config) = setup_store("bark-circuit-attempt-budget").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "bark-circuit-delivery",
+                "owner@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "UPDATE notification_deliveries
+                 SET channel = 'bark' WHERE id = 'bark-circuit-delivery'",
+                [],
+            )
+            .expect("set Bark delivery channel");
+        }
+        let first = expect_notification_batch(
+            store
+                .claim_client_notification_batch("worker", now, 30)
+                .await
+                .expect("claim Bark delivery before circuit check"),
+            "Bark circuit delivery",
+        );
+        assert_eq!(first.attempts, 1, "claim exposes the prospective attempt");
+        let retry_at = now + Duration::minutes(5);
+        store
+            .defer_client_notification_batch_without_attempt(
+                &first.id,
+                "worker",
+                "Bark provider circuit is temporarily open",
+                retry_at,
+                now,
+            )
+            .await
+            .expect("defer Bark delivery while circuit is open");
+        {
+            let conn = store.conn.lock().await;
+            let deferred: (i64, String, String) = conn
+                .query_row(
+                    "SELECT delivery.attempts, delivery.status, attempt.status
+                     FROM notification_deliveries delivery
+                     INNER JOIN notification_delivery_attempts attempt
+                       ON attempt.delivery_id = delivery.id
+                     WHERE delivery.id = 'bark-circuit-delivery'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read uncharged circuit defer");
+            assert_eq!(deferred, (0, "retry".into(), "cancelled".into()));
+        }
+
+        let second = expect_notification_batch(
+            store
+                .claim_client_notification_batch("worker", retry_at + Duration::seconds(1), 30)
+                .await
+                .expect("reclaim Bark delivery after circuit closes"),
+            "Bark retry after circuit closes",
+        );
+        store
+            .start_client_notification_attempt(
+                &second.id,
+                &second.attempt_id,
+                "worker",
+                retry_at + Duration::seconds(2),
+            )
+            .await
+            .expect("charge real Bark provider attempt");
+        let conn = store.conn.lock().await;
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT attempts FROM notification_deliveries
+                 WHERE id = 'bark-circuit-delivery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read charged Bark attempt count");
+        assert_eq!(attempts, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn notification_settings_runtime_changes_roll_back_as_one_database_transaction() {
+        let (store, config) = setup_store("notification-settings-runtime-atomic").await;
+        let before = {
+            let conn = store.conn.lock().await;
+            let before = conn
+                .query_row(
+                    "SELECT notification.enabled, bark.generation, bark.enabled,
+                            telegram.readiness, telegram.config_fingerprint
+                     FROM client_notification_runtime notification
+                     CROSS JOIN bark_provider_runtime bark
+                     CROSS JOIN telegram_bot_runtime telegram
+                     WHERE notification.id = 1 AND bark.id = 1 AND telegram.id = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .expect("read runtime state before atomic apply");
+            conn.execute_batch(
+                "CREATE TRIGGER fail_atomic_telegram_runtime_apply
+                 BEFORE UPDATE ON telegram_bot_runtime
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced Telegram runtime failure');
+                 END;",
+            )
+            .expect("create failing Telegram runtime trigger");
+            before
+        };
+
+        let mut policy = notification_policy(&config);
+        policy.enabled = !policy.enabled;
+        let mut bark = config.bark.clone();
+        bark.enabled = true;
+        bark.credential_master_key = Some("61".repeat(32));
+        let mut template = notification_template();
+        template.bark = crate::notifications::BarkNotificationContext::from_settings(&bark);
+        let result = store
+            .apply_notification_settings_runtime(
+                &policy,
+                &template,
+                crate::telegram::bind::TelegramRuntimeTransition::Reconciling(
+                    "new-telegram-fingerprint",
+                ),
+                Utc::now(),
+            )
+            .await;
+        assert!(matches!(result, Err(AppError::Internal(_))));
+
+        let conn = store.conn.lock().await;
+        let after = conn
+            .query_row(
+                "SELECT notification.enabled, bark.generation, bark.enabled,
+                        telegram.readiness, telegram.config_fingerprint
+                 FROM client_notification_runtime notification
+                 CROSS JOIN bark_provider_runtime bark
+                 CROSS JOIN telegram_bot_runtime telegram
+                 WHERE notification.id = 1 AND bark.id = 1 AND telegram.id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .expect("read runtime state after failed atomic apply");
+        assert_eq!(after, before);
         drop(conn);
         let _ = std::fs::remove_file(&config.database.path);
     }

@@ -25,7 +25,8 @@ use crate::admin::{
     settings::{
         ApplyOutcome, SettingsSnapshotResponse, SettingsUpdateRequest, SettingsUpdateResponse,
         SettingsValidationResponse, apply_updates_to_dynamic, read_env_file, settings_revision,
-        snapshot_response, validate_and_diff, validation_response, write_env_file_atomic,
+        snapshot_response, validate_and_diff_with_runtime, validation_response_with_runtime,
+        write_env_file_atomic,
     },
     upgrade::{UpgradeLogEntry, UpgradeStatus},
     version::{
@@ -401,6 +402,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/me/notifications/telegram",
             delete(unbind_my_telegram_chat),
+        )
+        .route(
+            "/v1/me/notifications/bark",
+            post(bind_my_bark).delete(unbind_my_bark),
         )
         .route(
             crate::telegram::service::WEBHOOK_PATH,
@@ -2478,9 +2483,13 @@ async fn get_my_notification_settings(
     headers: HeaderMap,
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
+    // Settings apply holds the write side while it publishes the matching
+    // durable runtime rows. Take the read side first so this response cannot
+    // combine a pre-change binding snapshot with post-change configuration.
+    let dynamic = state.dynamic.read().await;
+    let bark = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
     let mut response = state.store.get_notification_settings(&email).await?;
-    let settings = state.dynamic.read().await.telegram_bot.clone();
-    align_notification_runtime_response(&mut response, &settings);
+    align_notification_runtime_response(&mut response, &dynamic.telegram_bot, &bark);
     Ok(Json(response))
 }
 
@@ -2490,12 +2499,43 @@ async fn update_my_notification_settings(
     Json(patch): Json<UpdateNotificationSettingsRequest>,
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
+    let selecting_bark = patch
+        .channel
+        .trim()
+        .eq_ignore_ascii_case(crate::bark::CHANNEL);
+    // Keep the read guard through the short SQLite transaction. Settings apply
+    // takes the write side before publishing its Bark generation, so selection
+    // cannot straddle a configuration change.
+    let dynamic = state.dynamic.read().await;
+    let bark = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
+    let bark_cipher = selecting_bark
+        .then(|| crate::bark::CredentialCipher::from_settings(&state.config.bark))
+        .transpose()?
+        .flatten();
+    let bark_context = crate::notifications::BarkNotificationContext::from_settings(&bark);
+    let bark_runtime = if selecting_bark {
+        if !bark_context.enabled {
+            return Err(bark_not_ready_error());
+        }
+        Some(crate::bark::BindingRuntime {
+            provider_identity: bark_context
+                .provider_identity
+                .as_deref()
+                .ok_or_else(bark_not_ready_error)?,
+            binding_config_fingerprint: bark_context
+                .binding_config_fingerprint
+                .as_deref()
+                .ok_or_else(bark_not_ready_error)?,
+            cipher: bark_cipher.as_ref().ok_or_else(bark_not_ready_error)?,
+        })
+    } else {
+        None
+    };
     let mut response = state
         .store
-        .update_notification_settings(&email, patch)
+        .update_notification_settings(&email, patch, bark_runtime)
         .await?;
-    let settings = state.dynamic.read().await.telegram_bot.clone();
-    align_notification_runtime_response(&mut response, &settings);
+    align_notification_runtime_response(&mut response, &dynamic.telegram_bot, &bark);
     Ok(Json(response))
 }
 
@@ -2506,6 +2546,34 @@ async fn update_my_notification_settings(
 /// runtime row carries the new fingerprint instead of showing a stale outage
 /// as if it belonged to the newly selected Bot.
 fn align_notification_runtime_response(
+    response: &mut NotificationSettingsResponse,
+    settings: &TelegramBotSettings,
+    bark: &crate::config::BarkSettings,
+) {
+    align_telegram_runtime_response(response, settings);
+    // A self-hosted Provider's port and base path are part of its identity;
+    // returning only the host can point users at the wrong Push URL.
+    let provider_label = crate::bark::normalize_server_url(&bark.server_url).ok();
+    for channel in &mut response.channels {
+        if channel.channel == crate::bark::CHANNEL {
+            channel.available = bark.is_operational();
+            channel.provider_label = provider_label.clone();
+        }
+    }
+}
+
+fn bark_settings_with_runtime_gate(
+    state: &ServerState,
+    settings: &crate::config::BarkSettings,
+) -> Result<crate::config::BarkSettings, AppError> {
+    let mut settings = settings.clone();
+    settings.credential_config_current = state
+        .settings_runtime
+        .bark_credentials_current(&state.env_path)?;
+    Ok(settings)
+}
+
+fn align_telegram_runtime_response(
     response: &mut NotificationSettingsResponse,
     settings: &TelegramBotSettings,
 ) {
@@ -2576,7 +2644,11 @@ async fn create_my_telegram_bind_link(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<TelegramBindLinkResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
-    let settings = state.dynamic.read().await.telegram_bot.clone();
+    // Serialize token creation with Bot identity transitions. Otherwise a
+    // token can be inserted just after the transition revoked every token
+    // minted for the prior configuration.
+    let dynamic = state.dynamic.read().await;
+    let settings = &dynamic.telegram_bot;
     if !settings.is_operational() {
         return Err(AppError::ServiceUnavailable(
             "the Telegram notification bot is disabled or not configured".into(),
@@ -2596,9 +2668,248 @@ async fn unbind_my_telegram_chat(
     headers: HeaderMap,
 ) -> Result<Json<NotificationSettingsResponse>, AppError> {
     let email = require_session_email(&state, &headers).await?;
+    let dynamic = state.dynamic.read().await;
+    let bark = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
     let mut response = state.store.unbind_telegram(&email).await?;
-    let settings = state.dynamic.read().await.telegram_bot.clone();
-    align_notification_runtime_response(&mut response, &settings);
+    align_notification_runtime_response(&mut response, &dynamic.telegram_bot, &bark);
+    Ok(Json(response))
+}
+
+async fn bind_my_bark(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<crate::bark::BindRequest>,
+) -> Result<Json<NotificationSettingsResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let dynamic = state.dynamic.read().await;
+    let bark = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
+    drop(dynamic);
+    if !bark.is_operational() {
+        return Err(bark_not_ready_error());
+    }
+    // The master key is deliberately boot-time state. A newly saved key is
+    // shown as pending restart and cannot create credentials under a key the
+    // delivery worker has not loaded.
+    let cipher = crate::bark::CredentialCipher::from_settings(&state.config.bark)
+        .map_err(|_| bark_not_ready_error())?
+        .ok_or_else(bark_not_ready_error)?;
+    let parsed = crate::bark::parse_push_url(&input.push_url, &bark.server_url)
+        .map_err(map_bark_push_url_error)?;
+    let provider_identity =
+        crate::bark::provider_identity(&bark.server_url).map_err(AppError::BadRequest)?;
+    let binding_config_fingerprint =
+        crate::bark::binding_config_fingerprint(&provider_identity, cipher.key_fingerprint());
+    // A binding probe deliberately bypasses an open circuit: it is an
+    // explicit, persistently rate-limited recovery action initiated by the
+    // account owner. The generation captured below still fences changes.
+    let target_fingerprint =
+        crate::bark::target_fingerprint(&provider_identity, &parsed.device_key);
+    let metadata = extract_client_metadata(&headers, addr);
+    let (attempt_id, user_id, config_generation) = state
+        .store
+        .begin_bark_binding_attempt(
+            &email,
+            metadata.ip.as_deref(),
+            &provider_identity,
+            &binding_config_fingerprint,
+            &target_fingerprint,
+        )
+        .await
+        .map_err(map_bark_binding_start_error)?;
+    let http =
+        crate::bark::build_http_client("cc-switch-router/0.1 bark-binding").map_err(|error| {
+            AppError::Internal(format!("build Bark binding HTTP client failed: {error}"))
+        })?;
+    let scheme = if state.config.use_localhost {
+        "http"
+    } else {
+        "https"
+    };
+    let dashboard_url = format!(
+        "{scheme}://{}/account/notifications",
+        state.config.tunnel_domain.trim_end_matches('/')
+    );
+    let validation_id = format!("bark-bind-{attempt_id}");
+    let request = crate::bark::PushRequest {
+        device_key: &parsed.device_key,
+        title: "CC-Switch Router / Bark channel test",
+        body: "Bark is now verified for your Router account.",
+        group: "cc-switch-router",
+        url: &dashboard_url,
+        id: &validation_id,
+        level: "active",
+    };
+    match crate::bark::send(&http, &bark.server_url, &request).await {
+        Ok(success) => {
+            // Re-read after the network call and retain the settings read lock
+            // through commit. The durable generation is a second CAS fence for
+            // changes that moved away from and back to the same values.
+            let dynamic = state.dynamic.read().await;
+            let current_bark = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
+            let current_context =
+                crate::notifications::BarkNotificationContext::from_settings(&current_bark);
+            if !current_context.enabled
+                || current_context.provider_identity.as_deref() != Some(&provider_identity)
+                || current_context.binding_config_fingerprint.as_deref()
+                    != Some(&binding_config_fingerprint)
+            {
+                drop(dynamic);
+                state
+                    .store
+                    .finish_bark_binding_attempt(
+                        &attempt_id,
+                        false,
+                        Some(success.http_status),
+                        Some("configuration_changed"),
+                    )
+                    .await?;
+                return Err(bark_configuration_changed_error());
+            }
+            let commit = state
+                .store
+                .commit_bark_binding(
+                    &email,
+                    &user_id,
+                    &provider_identity,
+                    &parsed.masked_key,
+                    &parsed.device_key,
+                    &cipher,
+                    &binding_config_fingerprint,
+                    config_generation,
+                )
+                .await;
+            drop(dynamic);
+            if let Err(error) = commit {
+                state
+                    .store
+                    .finish_bark_binding_attempt(
+                        &attempt_id,
+                        false,
+                        Some(success.http_status),
+                        Some("configuration_changed"),
+                    )
+                    .await?;
+                return Err(map_bark_configuration_changed_error(error));
+            }
+            state
+                .store
+                .finish_bark_binding_attempt(&attempt_id, true, Some(success.http_status), None)
+                .await?;
+            state
+                .store
+                .mark_bark_provider_healthy(&provider_identity, chrono::Utc::now())
+                .await?;
+        }
+        Err(failure) => {
+            state
+                .store
+                .finish_bark_binding_attempt(
+                    &attempt_id,
+                    false,
+                    failure.http_status,
+                    Some(&failure.code),
+                )
+                .await?;
+            if failure.target_invalid {
+                // A target-specific rejection still proves that this exact
+                // Provider configuration was reachable and spoke Bark.
+                state
+                    .store
+                    .mark_bark_provider_healthy(&provider_identity, chrono::Utc::now())
+                    .await?;
+            } else {
+                state
+                    .store
+                    .mark_bark_provider_failure(
+                        &provider_identity,
+                        Some(&failure.code),
+                        Some(&failure.hint),
+                        &failure.message,
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+            }
+            return Err(AppError::Coded {
+                status: StatusCode::BAD_GATEWAY,
+                code: "USER_NOTIFICATION_BARK_BIND_FAILED",
+                message: failure.hint,
+                details: serde_json::json!({
+                    "channel": crate::bark::CHANNEL,
+                    "httpStatus": failure.http_status,
+                    "failureCode": failure.code,
+                }),
+            });
+        }
+    }
+    let dynamic = state.dynamic.read().await;
+    let bark = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
+    let mut response = state.store.get_notification_settings(&email).await?;
+    align_notification_runtime_response(&mut response, &dynamic.telegram_bot, &bark);
+    Ok(Json(response))
+}
+
+fn bark_not_ready_error() -> AppError {
+    AppError::Coded {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "USER_NOTIFICATION_BARK_NOT_READY",
+        message: "Bark user notifications are disabled, misconfigured, or awaiting Router restart"
+            .into(),
+        details: serde_json::json!({ "channel": crate::bark::CHANNEL }),
+    }
+}
+
+fn map_bark_push_url_error(error: AppError) -> AppError {
+    match error {
+        AppError::BadRequest(message) => AppError::Coded {
+            status: StatusCode::BAD_REQUEST,
+            code: "USER_NOTIFICATION_BARK_PUSH_URL_INVALID",
+            message,
+            details: serde_json::json!({ "channel": crate::bark::CHANNEL }),
+        },
+        other => other,
+    }
+}
+
+fn map_bark_binding_start_error(error: AppError) -> AppError {
+    match error {
+        AppError::TooManyRequests(message) => AppError::Coded {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "USER_NOTIFICATION_BARK_BIND_RATE_LIMITED",
+            message,
+            details: serde_json::json!({ "channel": crate::bark::CHANNEL }),
+        },
+        AppError::Conflict(_) => bark_configuration_changed_error(),
+        other => other,
+    }
+}
+
+fn map_bark_configuration_changed_error(error: AppError) -> AppError {
+    match error {
+        AppError::Conflict(_) => bark_configuration_changed_error(),
+        other => other,
+    }
+}
+
+fn bark_configuration_changed_error() -> AppError {
+    AppError::Coded {
+        status: StatusCode::CONFLICT,
+        code: "USER_NOTIFICATION_BARK_CONFIGURATION_CHANGED",
+        message: "Bark configuration changed while the device was being verified".into(),
+        details: serde_json::json!({ "channel": crate::bark::CHANNEL }),
+    }
+}
+
+async fn unbind_my_bark(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<NotificationSettingsResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let dynamic = state.dynamic.read().await;
+    let bark = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
+    state.store.unbind_bark(&email).await?;
+    let mut response = state.store.get_notification_settings(&email).await?;
+    align_notification_runtime_response(&mut response, &dynamic.telegram_bot, &bark);
     Ok(Json(response))
 }
 
@@ -3054,6 +3365,26 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn bark_binding_errors_have_stable_user_facing_codes() {
+        assert_eq!(
+            map_bark_push_url_error(AppError::BadRequest("invalid URL".into())).code(),
+            Some("USER_NOTIFICATION_BARK_PUSH_URL_INVALID")
+        );
+        assert_eq!(
+            map_bark_binding_start_error(AppError::TooManyRequests("slow down".into())).code(),
+            Some("USER_NOTIFICATION_BARK_BIND_RATE_LIMITED")
+        );
+        assert_eq!(
+            map_bark_binding_start_error(AppError::Conflict("changed".into())).code(),
+            Some("USER_NOTIFICATION_BARK_CONFIGURATION_CHANGED")
+        );
+        assert!(matches!(
+            map_bark_push_url_error(AppError::Internal("database".into())),
+            AppError::Internal(_)
+        ));
+    }
 
     #[tokio::test]
     async fn regions_endpoint_preserves_file_order_with_free_first() {
@@ -5484,11 +5815,13 @@ async fn admin_settings_validate(
     require_admin_session(&state, &headers).await?;
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
-    let mut validation = validation_response(&existing, &input.updates);
+    let mut validation =
+        validation_response_with_runtime(&existing, &input.updates, &state.settings_runtime);
     if !validation.valid {
         return Ok(Json(validation));
     }
-    let outcome = validate_and_diff(&existing, &input.updates)?;
+    let outcome =
+        validate_and_diff_with_runtime(&existing, &input.updates, &state.settings_runtime)?;
     if let Some(release) = changed_client_server_release(&outcome) {
         let release_validation = state
             .client_server_release_validator
@@ -5542,16 +5875,22 @@ async fn admin_settings_apply(
     // stall unrelated dynamic-settings readers.
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
-    let outcome = validate_and_diff(&existing, &input.updates).map_err(|error| {
-        let validation = validation_response(&existing, &input.updates);
-        AppError::Coded {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "SETTINGS_VALIDATION_FAILED",
-            message: error.to_string(),
-            details: serde_json::to_value(validation)
-                .unwrap_or_else(|_| serde_json::json!({ "valid": false })),
-        }
-    })?;
+    let outcome =
+        validate_and_diff_with_runtime(&existing, &input.updates, &state.settings_runtime)
+            .map_err(|error| {
+                let validation = validation_response_with_runtime(
+                    &existing,
+                    &input.updates,
+                    &state.settings_runtime,
+                );
+                AppError::Coded {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "SETTINGS_VALIDATION_FAILED",
+                    message: error.to_string(),
+                    details: serde_json::to_value(validation)
+                        .unwrap_or_else(|_| serde_json::json!({ "valid": false })),
+                }
+            })?;
     if let Some(release) = changed_client_server_release(&outcome) {
         let release_validation = state
             .client_server_release_validator
@@ -5569,7 +5908,11 @@ async fn admin_settings_apply(
 
     let mut next_dynamic = dynamic_guard.clone();
     apply_updates_to_dynamic(&mut next_dynamic, &input.updates, &state.config);
+    next_dynamic.bark.credential_config_current = state
+        .settings_runtime
+        .bark_credentials_current_in(&outcome.new_env_kv);
     let telegram_settings_changed = next_dynamic.telegram_bot != dynamic_guard.telegram_bot;
+    let bark_settings_changed = next_dynamic.bark != dynamic_guard.bark;
     let telegram_identity_config_changed = next_dynamic.telegram_bot.enabled
         != dynamic_guard.telegram_bot.enabled
         || next_dynamic.telegram_bot.bot_token != dynamic_guard.telegram_bot.bot_token
@@ -5583,7 +5926,8 @@ async fn admin_settings_apply(
     // still advance the durable activation boundary after an interrupted sync.
     let needs_client_notification_sync = next_dynamic.client_notifications
         != dynamic_guard.client_notifications
-        || telegram_settings_changed;
+        || telegram_settings_changed
+        || bark_settings_changed;
     let needs_client_notification_validation = needs_client_notification_sync
         || outcome.updated_keys.iter().any(|key| {
             key == "CC_SWITCH_ROUTER_CLIENT_STALE_SECS"
@@ -5630,7 +5974,7 @@ async fn admin_settings_apply(
     // 4) persist the lifecycle-notification activation boundary before
     // publishing the new in-memory settings. The dynamic write lock keeps the
     // worker from observing a half-applied policy.
-    if needs_client_notification_sync {
+    if needs_client_notification_sync || telegram_identity_config_changed {
         let (policy, _) = ClientNotificationPolicy::for_runtime(
             &next_dynamic.client_notifications,
             &state.config,
@@ -5639,49 +5983,43 @@ async fn admin_settings_apply(
         template.telegram = crate::notifications::TelegramNotificationContext::from_settings(
             &next_dynamic.telegram_bot,
         );
+        template.bark =
+            crate::notifications::BarkNotificationContext::from_settings(&next_dynamic.bark);
+        let telegram_fingerprint =
+            (telegram_identity_config_changed && next_dynamic.telegram_bot.enabled).then(|| {
+                crate::telegram::bind::telegram_config_fingerprint(
+                    next_dynamic.telegram_bot.token().unwrap_or_default(),
+                    next_dynamic.telegram_bot.mode.as_str(),
+                    next_dynamic.telegram_bot.webhook_secret.as_deref(),
+                )
+            });
+        let telegram_transition = if !telegram_identity_config_changed {
+            crate::telegram::bind::TelegramRuntimeTransition::Unchanged
+        } else if let Some(fingerprint) = telegram_fingerprint.as_deref() {
+            crate::telegram::bind::TelegramRuntimeTransition::Reconciling(fingerprint)
+        } else {
+            crate::telegram::bind::TelegramRuntimeTransition::Disabled
+        };
         if let Err(sync_error) = state
             .store
-            .sync_client_notification_runtime(&policy, &template, chrono::Utc::now())
+            .apply_notification_settings_runtime(
+                &policy,
+                &template,
+                telegram_transition,
+                chrono::Utc::now(),
+            )
             .await
         {
-            let rollback_env = existing
+            let rollback_env = locked_existing
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect::<BTreeMap<_, _>>();
             if let Err(rollback_error) = write_env_file_atomic(&state.env_path, &rollback_env) {
                 return Err(AppError::Internal(format!(
-                    "sync client notification runtime failed: {sync_error}; env rollback also failed: {rollback_error}"
+                    "sync notification settings runtime failed: {sync_error}; env rollback also failed: {rollback_error}"
                 )));
             }
             return Err(sync_error);
-        }
-    }
-    if telegram_identity_config_changed {
-        let runtime_result = if next_dynamic.telegram_bot.enabled {
-            let token = next_dynamic.telegram_bot.token().unwrap_or_default();
-            let fingerprint = crate::telegram::bind::telegram_config_fingerprint(
-                token,
-                next_dynamic.telegram_bot.mode.as_str(),
-                next_dynamic.telegram_bot.webhook_secret.as_deref(),
-            );
-            state
-                .store
-                .mark_telegram_bot_reconciling(&fingerprint)
-                .await
-        } else {
-            state.store.mark_telegram_bot_disabled().await
-        };
-        if let Err(runtime_error) = runtime_result {
-            let rollback_env = existing
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<BTreeMap<_, _>>();
-            if let Err(rollback_error) = write_env_file_atomic(&state.env_path, &rollback_env) {
-                return Err(AppError::Internal(format!(
-                    "sync Telegram runtime failed: {runtime_error}; env rollback also failed: {rollback_error}"
-                )));
-            }
-            return Err(runtime_error);
         }
     }
     state
@@ -6672,10 +7010,20 @@ async fn admin_user_notification_channels(
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::user_notification_health::UserNotificationChannelState>>, AppError> {
     let session = require_admin_session(&state, &headers).await?;
-    let settings = state.dynamic.read().await.telegram_bot.clone();
+    // Keep the settings snapshot paired with the durable runtime rows read by
+    // `channel_states`; Settings apply uses the opposite side of this lock.
+    let dynamic = state.dynamic.read().await;
+    let bark_settings = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
+    let bark_cipher = crate::bark::CredentialCipher::from_settings(&state.config.bark)?;
     Ok(Json(
-        crate::user_notification_health::channel_states(&state.store, &settings, &session.email)
-            .await?,
+        crate::user_notification_health::channel_states(
+            &state.store,
+            &dynamic.telegram_bot,
+            &bark_settings,
+            bark_cipher.as_ref(),
+            &session.email,
+        )
+        .await?,
     ))
 }
 
@@ -6686,7 +7034,11 @@ async fn admin_user_notification_channel_test(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<crate::user_notification_health::UserNotificationChannelTestResponse>, AppError> {
     let session = require_admin_session(&state, &headers).await?;
-    let settings = state.dynamic.read().await.telegram_bot.clone();
+    let dynamic = state.dynamic.read().await;
+    let telegram_settings = dynamic.telegram_bot.clone();
+    let bark_settings = bark_settings_with_runtime_gate(&state, &dynamic.bark)?;
+    drop(dynamic);
+    let bark_cipher = crate::bark::CredentialCipher::from_settings(&state.config.bark)?;
     let scheme = if state.config.use_localhost {
         "http"
     } else {
@@ -6698,7 +7050,9 @@ async fn admin_user_notification_channel_test(
     );
     let result = crate::user_notification_health::test_channel(
         &state.store,
-        &settings,
+        &telegram_settings,
+        &bark_settings,
+        bark_cipher.as_ref(),
         &session.email,
         &channel,
         &dashboard_url,

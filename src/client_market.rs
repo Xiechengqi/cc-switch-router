@@ -8908,6 +8908,7 @@ mod tests {
             resend_reply_to: None,
             client_notifications: ClientNotificationSettings::default(),
             telegram_bot: crate::config::TelegramBotSettings::default(),
+            bark: crate::config::BarkSettings::default(),
             auth_code_ttl_secs: 600,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 7 * 24 * 60 * 60,

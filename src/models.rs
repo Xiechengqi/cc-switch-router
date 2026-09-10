@@ -2025,6 +2025,8 @@ pub struct NotificationChannelSettingsResponse {
     pub available: bool,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<String>,

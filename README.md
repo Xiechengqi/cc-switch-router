@@ -94,7 +94,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/account/*` | 5 | Session | `payment-profile`、`payment-assets/:id`、`binance-auto-settlement` 绑定/复验/停用 |
 | `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
-| `/v1/dashboard/*`、`/v1/me/*` | 14 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link` |
+| `/v1/dashboard/*`、`/v1/me/*` | 15 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link`、`me/notifications/bark` |
 | 其余单例 | 约 16 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`integrations/telegram/webhook`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
 
 ## 管理设置与运维
@@ -184,6 +184,10 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID` | 空 | Telegram 私聊、群组、超级群组或频道 ID |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID` | 空 | 论坛模式超级群组的可选 `message_thread_id` |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY` | `warning` | Telegram 最低投递级别：`info`、`warning` 或 `critical` |
+| `CC_SWITCH_ROUTER_ALERT_BARK_ENABLED` | `false` | 启用独立的运维 Bark 告警渠道；要求 Server URL 与 Device Key |
+| `CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL` | `https://api.day.app` | 运维告警使用的 Bark Server；远端只允许 HTTPS |
+| `CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY` | 空 | 运维 Bark 设备的 Device Key；Settings API 不回传明文 |
+| `CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY` | `warning` | Bark 最低投递级别：`info`、`warning` 或 `critical` |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔(秒) |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `86400` | 过期 lease 保留时长(秒) |
 | `CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS` | `30` | Share 请求记录和图片请求历史保留天数,范围 1-365;不影响累计 Token 用量 |
@@ -235,6 +239,12 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_TELEGRAM_BIND_TOKEN_TTL_SECS` | `900` | 绑定深链 token 有效期(秒) |
 | `CC_SWITCH_ROUTER_TELEGRAM_RECIPIENT_HOURLY_LIMIT` | `10` | 单用户每小时 Telegram 通知硬上限;与邮件额度互不占用 |
 | `CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT` | `50` | Router 全局每小时 Telegram 通知硬上限 |
+| `CC_SWITCH_ROUTER_BARK_ENABLED` | `false` | 用户 Bark 通知总开关；要求 Server URL 与凭据主密钥 |
+| `CC_SWITCH_ROUTER_BARK_SERVER_URL` | `https://api.day.app` | 用户 Push URL 必须属于此 Bark Server；远端只允许 HTTPS |
+| `CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY` | 空 | 加密用户 Device Key 的独立 32 字节 hex/base64 密钥；修改后需重启且 API 永不回传 |
+| `CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION` | `1` | Bark 密文密钥版本；修改后需重启并要求用户重新绑定 |
+| `CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT` | `10` | 单用户每小时 Bark 通知硬上限 |
+| `CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT` | `50` | Router 全局每小时 Bark 通知硬上限 |
 | `CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS` | `300` | 邮件验证码有效期(秒) |
 | `CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS` | `60` | 同邮箱 / 设备发验证码冷却(秒) |
 | `CC_SWITCH_ROUTER_AUTH_SESSION_TTL_SECS` | `1800` | Access token 有效期(秒) |
@@ -326,15 +336,17 @@ EOF
 
 Client 生命周期通知使用持久化 outbox、稳定幂等键和离线 episode 去重,注册与离线通知都只面向对应 Client 当前已验证的 Owner 账号。关闭总开关时,Router 会推进在线状态 baseline 并抑制待发记录;以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度,registration lane 使用独立的 `3/10` 小时额度,两者互不占用。未完成的 outbox 会持续保留,已发送、dead-letter、取消和抑制记录保留 30 天供审计。
 
-### 用户通知渠道（邮件 / Telegram）
+### 用户通知渠道（邮件 / Telegram / Bark）
 
-用户通知在「账户 → 通知设置」页从邮件和 Telegram 中二选一：一次只有一个投递渠道，不会同时发两份。偏好按渠道逐行保存在 `user_notification_channels`，每行带目标、Bot 身份和单调递增的 revision，并由 `user_id` 上的部分唯一索引保证同一账号最多只有一行处于选中状态；投递前会再次校验该 revision，因此解绑、换绑或切换渠道会使尚未发送的旧目标失效。Telegram 只有在 Bot 就绪且当前账号已完成绑定时才可选中，邮件始终可选。渠道偏好是账号级全局设置，不按 Client 或事件类型分别配置。
+用户通知在「账户 → 通知设置」页从邮件、Telegram 和 Bark 中三选一：一次只有一个投递渠道，不会同时发多份。偏好按渠道逐行保存在 `user_notification_channels`，每行带目标、Provider 身份和单调递增的 revision，并由 `user_id` 上的部分唯一索引保证同一账号最多只有一行处于选中状态；投递前会再次校验该 revision，因此解绑、换绑或切换渠道会使尚未发送的旧目标失效。Telegram 只有在 Bot 就绪且当前账号已完成绑定时才可选中；Bark 只有在 Router Provider 就绪且完整 Push URL 验证成功后才可选中；邮件始终可选。渠道偏好是账号级全局设置，不按 Client 或事件类型分别配置。
 
-绑定流程：点击「绑定 Telegram」时 Router 生成 128 位一次性 token（只存 SHA-256），并使用已经由 Telegram `getMe` 验证的 Bot username 在新标签页打开 `https://t.me/<username>?start=<token>`。用户点 Start 后，polling 或 webhook 会先把 update 持久化到 `telegram_inbound_updates`，后台处理器再消费 `/start <token>` 并写入 Telegram 渠道行。前端轮询 `GET /v1/me/notifications`，直到 `verifiedAt` 变化；弹窗被拦截时会展示可复制的深链与 `/start <token>` 命令。token 默认 900 秒过期且一次性消费，已撤销记录仍保留到清理期以防反复换链接绕过签发限额；同一个 Bot 下一个 chat 最多绑定一个账号。绑定成功会把投递渠道自动切到 Telegram，用户随后可随时切回邮件。解绑会切回邮件，取消尚未开始的 Telegram 投递；已经进入外部 provider 调用的发送可能完成。切换渠道不会丢消息：旧渠道尚未发出的投递被取消后，其事件会重新排队到新选中的渠道。
+Bark 绑定只接受管理员指定 Server 下的完整 Push URL，拒绝跨 Host、携带 query/fragment/凭据的 URL，以避免把 Router 变成任意请求代理。Device Key 使用 XChaCha20-Poly1305 加密后写入数据库，AAD 绑定 `user_id + credential_revision + provider_identity`，界面和日志只展示掩码。绑定成功前会向设备发送一次验证通知；用户/IP 绑定尝试使用持久化小时限额。只有 Bark 明确返回已知的 Device Token 查询失败时才使对应设备绑定失效并回退邮件；普通 HTTP 400/404 与 401/403 均视为 Provider/反向代理配置故障，不会误删用户目标。连续三次系统性故障会短暂打开 Bark Provider 熔断。可重试响应会遵守 `Retry-After`，但最多接受 24 小时。更换 Bark Server 会在通知运行时同步事务中使旧 Server 绑定失效并回退邮件。部署、轮换与故障处理详见 [Bark 通知运维手册](docs/runbook-bark-notifications.md)。
+
+绑定流程：点击「绑定 Telegram」时 Router 生成 128 位一次性 token（只存 SHA-256），并使用已经由 Telegram `getMe` 验证的 Bot username 在新标签页打开 `https://t.me/<username>?start=<token>`。用户点 Start 后，polling 或 webhook 会先把 update 持久化到 `telegram_inbound_updates`，后台处理器再消费 `/start <token>` 并写入 Telegram 渠道行。前端轮询 `GET /v1/me/notifications`，直到 `verifiedAt` 变化；弹窗被拦截时会展示可复制的深链与 `/start <token>` 命令。token 默认 900 秒过期且一次性消费，已使用或撤销记录保留 7 天，以防反复换链接绕过签发限额；Bark 的脱敏绑定尝试审计也保留 7 天。同一个 Bot 下一个 chat 最多绑定一个账号。绑定成功会把投递渠道自动切到 Telegram，用户随后可随时切回邮件。解绑会切回邮件，取消尚未开始的 Telegram 投递；已经进入外部 provider 调用的发送可能完成。切换渠道不会丢消息：旧渠道尚未发出的投递被取消后，其事件会重新排队到新选中的渠道。
 
 Router owner 的配置只有三步：向 `@BotFather` 申请一个 Bot、把 token 填入 `CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN`、打开 `CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED`。Settings 只校验 BotFather token 的本地结构并立即持久化，不依赖 Telegram 当时是否可达；后台服务随后调用 `getMe` 验证身份、写入 runtime 状态并在网络故障时自动重试。Bot ID 与 username 不接受人工配置。相同 Bot ID 的 token 轮换保留现有绑定，不同 Bot ID 会使旧绑定失效并启用邮件回落。以上键可在 Settings 热更新。默认 polling 不要求入站可达性；webhook 需要公网域名和 `CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET`，回调路径 `POST /v1/integrations/telegram/webhook` 已从 IP 黑名单中豁免。两种模式使用相同的持久化 inbox 和幂等 update key，poll cursor 与一批 updates 在同一事务提交，处理失败不会跳过 update。该 Bot 与运维告警 Telegram 渠道相互独立：前者面向终端用户并按账号扇出，后者是面向单一运维会话的告警 adapter；两者可以复用 token，但配置项和状态不共享。
 
-投递语义：同一事件只在当前选中的渠道上生成一条 `notification_deliveries`，冻结载荷、重试和结束状态。小时额度统计真实 started attempt 与仍有效的 reservation，不在 outbox 生成时预占；因此 Telegram 不会消耗或阻塞 Resend 额度。Telegram 暂时不可用时自动回落邮件；注册通知固定只走邮件，因为其正文包含首次登录口令提示。Bot 明确报告 chat 不可达时，当前 attempt 失败、仅匹配当前 Bot/目标的绑定被置为 invalid，并且原事件只重新排队一次邮件回落。Operations 中的投递历史只展示渠道、脱敏目标、结构化失败类型和阻断原因，不返回 Bot token 或原始 chat id。
+投递语义：同一事件只在当前选中的渠道上生成一条 `notification_deliveries`，冻结载荷、重试和结束状态。Bark 的标题、正文、Dashboard URL、幂等 ID 和目标凭据快照也在 outbox 创建时冻结，重启和重试不会按当前配置重新生成。小时额度统计真实 started attempt 与仍有效的 reservation，不在 outbox 生成时预占；因此 Telegram 不会消耗或阻塞 Resend 额度。Telegram 暂时不可用时自动回落邮件；注册通知固定只走邮件，因为其正文包含首次登录口令提示。Bot 明确报告 chat 不可达时，当前 attempt 失败、仅匹配当前 Bot/目标的绑定被置为 invalid，并且原事件只重新排队一次邮件回落。Operations 中的投递历史只展示渠道、脱敏目标、结构化失败类型和阻断原因，不返回 Bot token、原始 chat id 或 Bark Device Key。
 
 Telegram 消息使用独立于邮件的排版：`parse_mode=HTML`，按严重级别加彩色徽标（离线 🔴、事故 🚨、提醒 🟠、成功 🟢、信息 🔵），字段以 `<b>` 标签加 `<code>` 值呈现，URL 保留裸链以便 Telegram 自动识别，末尾附操作链接与通知设置入口。冻结的 Telegram 载荷带 `payload_version`（2 = HTML），升级前入队的纯文本消息仍按纯文本发送；截断按标签边界进行，投递前还会校验标签闭合，若 Telegram 仍判定解析失败则自动降级为纯文本重发一次，保证告警不会因排版而丢失。
 
@@ -354,7 +366,7 @@ Router 还会并发读取三路 HTTPS `Date` 响应,以两路仲裁和 RTT 中�
 
 每个 fingerprint 同时最多一个未恢复事故，状态为 `firing`、`acknowledged`、`silenced` 或 `resolved`。新建、升级、提醒、恢复通知、静默到期和手动恢复都会记录 transition；通知 payload 在 transition 创建时冻结。确认、静默或更新的可通知 transition 会把尚未发送的旧投递置为不可重试的 `superseded`，避免恢复后再送达过期 firing 消息；曾收到高等级告警的渠道仍会收到对应恢复通知。投递使用 claim lease、指数退避和最多 12 次自动尝试，失败后进入 dead-letter，可在 Metrics 页面手动重新排队。`DELETE /v1/admin/metrics` 只清采样与旧 metrics event，不删除事故、投递或待处理 Client 信号。
 
-告警投递、状态查询和测试 API 均以通用渠道 ID 工作，事故与 outbox 模型不依赖具体供应商；当前唯一注册的适配器是 Telegram，通过 Bot `sendMessage` 投递。Settings 页面可独立测试已注册渠道并显示最近真实投递/测试状态；Metrics 页面可确认、定时静默、恢复事故通知和重试失败投递。未来新增渠道只需增加配置、适配器和渠道注册，不需要重写事故状态机、投递存储或管理 API。
+告警投递、状态查询和测试 API 均以通用渠道 ID 工作，事故与 outbox 模型不依赖具体供应商；当前已注册 Telegram（Bot `sendMessage`）和 Bark（`/push`）适配器。Settings 页面可独立测试已注册渠道并显示最近真实投递/测试状态；Metrics 页面可确认、定时静默、恢复事故通知和重试失败投递。未来新增渠道只需增加配置、适配器和渠道注册，不需要重写事故状态机、投递存储或管理 API。
 
 Share Market 与 Client Market 按产品和价格类型使用四项独立供应商准入策略：免费商品默认黑名单模式（默认开放），付费商品默认白名单模式（仅可信买家）。供应商可预先按买家邮箱建立信任，也可处理买家从具体商品发起的准入申请；批准付费申请时必须原子授予 USD 有限或无限信用额度。切换付费作用域到黑名单模式必须显式确认风险，且未知买家只有在供应商另行开启有限公共额度后才能租用付费商品；公共额度不能设为无限。
 

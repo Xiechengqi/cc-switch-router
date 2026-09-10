@@ -106,7 +106,7 @@ const NOTIFICATION_SUBSECTION_IDS = {
 const NOTIFICATION_SUBSECTION_GROUPS = {
   system: ["Alerting"],
   business: ["Client notifications"],
-  channels: ["Email (Resend)", "Telegram alerts", "Telegram bot"],
+  channels: ["Email (Resend)", "Telegram alerts", "Telegram bot", "Bark alerts", "Bark channel"],
 } as const;
 
 const CATEGORY_ICONS: Record<SettingsCategoryId, React.ComponentType<{ className?: string }>> = {

@@ -232,6 +232,7 @@ function eventLabel(kind: string, t: ReturnType<typeof useLocaleText>["t"]) {
 function channelLabel(channel: string, t: ReturnType<typeof useLocaleText>["t"]) {
   if (channel === "email") return t("account.notifications.channel.email");
   if (channel === "telegram") return t("account.notifications.channel.telegram");
+  if (channel === "bark") return t("account.notifications.channel.bark");
   return channel;
 }
 

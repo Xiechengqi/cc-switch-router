@@ -475,6 +475,10 @@ pub struct AlertingSettings {
     pub telegram_chat_id: Option<String>,
     pub telegram_topic_id: Option<i64>,
     pub telegram_min_severity: String,
+    pub bark_enabled: bool,
+    pub bark_server_url: String,
+    pub bark_device_key: Option<String>,
+    pub bark_min_severity: String,
 }
 
 impl Default for AlertingSettings {
@@ -488,6 +492,10 @@ impl Default for AlertingSettings {
             telegram_chat_id: None,
             telegram_topic_id: None,
             telegram_min_severity: "warning".into(),
+            bark_enabled: false,
+            bark_server_url: DEFAULT_BARK_SERVER_URL.into(),
+            bark_device_key: None,
+            bark_min_severity: "warning".into(),
         }
     }
 }
@@ -507,6 +515,73 @@ impl fmt::Debug for AlertingSettings {
             .field("telegram_chat_id", &self.telegram_chat_id)
             .field("telegram_topic_id", &self.telegram_topic_id)
             .field("telegram_min_severity", &self.telegram_min_severity)
+            .field("bark_enabled", &self.bark_enabled)
+            .field("bark_server_url", &self.bark_server_url)
+            .field(
+                "bark_device_key",
+                &self.bark_device_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("bark_min_severity", &self.bark_min_severity)
+            .finish()
+    }
+}
+
+pub const DEFAULT_BARK_SERVER_URL: &str = "https://api.day.app";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BarkSettings {
+    pub enabled: bool,
+    pub server_url: String,
+    pub credential_master_key: Option<String>,
+    pub credential_key_version: i64,
+    /// False when the env file contains credential settings that this process
+    /// has not loaded yet.  The configured values remain visible in Settings,
+    /// but binding and delivery fail closed until restart.
+    pub credential_config_current: bool,
+    pub recipient_hourly_limit: i64,
+    pub global_hourly_limit: i64,
+}
+
+impl Default for BarkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: DEFAULT_BARK_SERVER_URL.into(),
+            credential_master_key: None,
+            credential_key_version: 1,
+            credential_config_current: true,
+            recipient_hourly_limit: 10,
+            global_hourly_limit: 50,
+        }
+    }
+}
+
+impl BarkSettings {
+    pub fn is_operational(&self) -> bool {
+        self.enabled
+            && self.credential_config_current
+            && self
+                .credential_master_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && crate::bark::normalize_server_url(&self.server_url).is_ok()
+    }
+}
+
+impl fmt::Debug for BarkSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BarkSettings")
+            .field("enabled", &self.enabled)
+            .field("server_url", &self.server_url)
+            .field(
+                "credential_master_key",
+                &self.credential_master_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("credential_key_version", &self.credential_key_version)
+            .field("credential_config_current", &self.credential_config_current)
+            .field("recipient_hourly_limit", &self.recipient_hourly_limit)
+            .field("global_hourly_limit", &self.global_hourly_limit)
             .finish()
     }
 }
@@ -676,6 +751,7 @@ pub struct Config {
     pub resend_reply_to: Option<String>,
     pub client_notifications: ClientNotificationSettings,
     pub telegram_bot: TelegramBotSettings,
+    pub bark: BarkSettings,
     pub auth_code_ttl_secs: i64,
     pub auth_code_cooldown_secs: i64,
     pub auth_session_ttl_secs: i64,
@@ -924,6 +1000,16 @@ impl Config {
                 ),
                 global_hourly_limit: env_i64("CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT", 50),
             },
+            bark: BarkSettings {
+                enabled: env_bool("CC_SWITCH_ROUTER_BARK_ENABLED", false),
+                server_url: env_var("CC_SWITCH_ROUTER_BARK_SERVER_URL")
+                    .unwrap_or_else(|| DEFAULT_BARK_SERVER_URL.into()),
+                credential_master_key: env_var("CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY"),
+                credential_key_version: env_i64("CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION", 1),
+                credential_config_current: true,
+                recipient_hourly_limit: env_i64("CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT", 10),
+                global_hourly_limit: env_i64("CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT", 50),
+            },
             auth_code_ttl_secs: env_var("CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5 * 60),
@@ -1001,6 +1087,12 @@ impl Config {
                     telegram_topic_id: env_var("CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID")
                         .and_then(|value| value.parse().ok()),
                     telegram_min_severity: env_var("CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY")
+                        .unwrap_or_else(|| "warning".into()),
+                    bark_enabled: env_bool("CC_SWITCH_ROUTER_ALERT_BARK_ENABLED", false),
+                    bark_server_url: env_var("CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL")
+                        .unwrap_or_else(|| DEFAULT_BARK_SERVER_URL.into()),
+                    bark_device_key: env_var("CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY"),
+                    bark_min_severity: env_var("CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY")
                         .unwrap_or_else(|| "warning".into()),
                 },
             },
@@ -1101,6 +1193,51 @@ impl Config {
             validate_optional_env_u64(key)?;
         }
         self.proxy_stream.validate()
+    }
+
+    pub fn validate_bark_config(&self) -> std::result::Result<(), String> {
+        for key in [
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION",
+            "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT",
+            "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT",
+        ] {
+            validate_optional_env_i64(key)?;
+        }
+        crate::bark::normalize_server_url(&self.bark.server_url)
+            .map_err(|message| format!("CC_SWITCH_ROUTER_BARK_SERVER_URL: {message}"))?;
+        if !(1..=1_000_000).contains(&self.bark.credential_key_version) {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION must be between 1 and 1000000, got: {}",
+                self.bark.credential_key_version
+            ));
+        }
+        if !(1..=1_000).contains(&self.bark.recipient_hourly_limit) {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT must be between 1 and 1000, got: {}",
+                self.bark.recipient_hourly_limit
+            ));
+        }
+        if !(1..=10_000).contains(&self.bark.global_hourly_limit) {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT must be between 1 and 10000, got: {}",
+                self.bark.global_hourly_limit
+            ));
+        }
+        if self.bark.recipient_hourly_limit > self.bark.global_hourly_limit {
+            return Err(format!(
+                "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT ({}) cannot exceed CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT ({})",
+                self.bark.recipient_hourly_limit, self.bark.global_hourly_limit
+            ));
+        }
+        let cipher = crate::bark::CredentialCipher::from_settings(&self.bark)
+            .map_err(|error| error.to_string())?;
+        if self.bark.enabled && cipher.is_none() {
+            return Err(
+                "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY is required when Bark user notifications are enabled"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     pub fn tunnel_url(&self, subdomain: &str) -> String {
@@ -1402,6 +1539,10 @@ CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN=
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID=
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID=
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY=warning
+CC_SWITCH_ROUTER_ALERT_BARK_ENABLED=false
+CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL=https://api.day.app
+CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY=
+CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY=warning
 CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED=false
 CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN=
 CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE=polling
@@ -1409,6 +1550,12 @@ CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET=
 CC_SWITCH_ROUTER_TELEGRAM_BIND_TOKEN_TTL_SECS=900
 CC_SWITCH_ROUTER_TELEGRAM_RECIPIENT_HOURLY_LIMIT=10
 CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT=50
+CC_SWITCH_ROUTER_BARK_ENABLED=false
+CC_SWITCH_ROUTER_BARK_SERVER_URL=https://api.day.app
+CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY=
+CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION=1
+CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT=10
+CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT=50
 ",
         default_data_dir().display(),
         default_db_path().display(),
@@ -1477,6 +1624,16 @@ fn validate_optional_env_usize(key: &str) -> std::result::Result<(), String> {
         .parse::<usize>()
         .map(|_| ())
         .map_err(|_| format!("{key} must be a non-negative integer, got: {value}"))
+}
+
+fn validate_optional_env_i64(key: &str) -> std::result::Result<(), String> {
+    let Some(value) = env_var(key) else {
+        return Ok(());
+    };
+    value
+        .parse::<i64>()
+        .map(|_| ())
+        .map_err(|_| format!("{key} must be an integer, got: {value}"))
 }
 
 fn validate_u64_range(
@@ -1661,6 +1818,7 @@ mod tests {
             resend_reply_to: None,
             client_notifications: ClientNotificationSettings::default(),
             telegram_bot: TelegramBotSettings::default(),
+            bark: BarkSettings::default(),
             auth_code_ttl_secs: 300,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 300,
@@ -1716,6 +1874,64 @@ mod tests {
         assert_eq!(settings.global_hourly_limit, 50);
         assert_eq!(settings.registration_recipient_hourly_limit, 3);
         assert_eq!(settings.registration_global_hourly_limit, 10);
+    }
+
+    #[test]
+    fn bark_runtime_validation_is_strict_even_while_disabled() {
+        let mut config = Config::from_env();
+        config.bark.enabled = false;
+        config.bark.credential_master_key = Some("not-a-32-byte-key".into());
+        assert!(
+            config
+                .validate_bark_config()
+                .expect_err("disabled Bark must not hide a malformed stored key")
+                .contains("master key")
+        );
+
+        config.bark.credential_master_key = Some("11".repeat(32));
+        config.bark.server_url = "http://bark.example.com".into();
+        assert!(
+            config
+                .validate_bark_config()
+                .expect_err("remote plaintext Bark URL")
+                .contains("BARK_SERVER_URL")
+        );
+
+        config.bark.server_url = DEFAULT_BARK_SERVER_URL.into();
+        config.bark.credential_key_version = 0;
+        assert!(
+            config
+                .validate_bark_config()
+                .expect_err("zero Bark key version")
+                .contains("KEY_VERSION")
+        );
+
+        config.bark.credential_key_version = 1;
+        config.bark.recipient_hourly_limit = 0;
+        assert!(
+            config
+                .validate_bark_config()
+                .expect_err("zero Bark recipient cap")
+                .contains("RECIPIENT_HOURLY_LIMIT")
+        );
+
+        config.bark.recipient_hourly_limit = 51;
+        config.bark.global_hourly_limit = 50;
+        assert!(
+            config
+                .validate_bark_config()
+                .expect_err("recipient cap above global cap")
+                .contains("cannot exceed")
+        );
+
+        config.bark.recipient_hourly_limit = 10;
+        config.bark.global_hourly_limit = 10_001;
+        assert!(
+            config
+                .validate_bark_config()
+                .expect_err("oversized Bark global cap")
+                .contains("GLOBAL_HOURLY_LIMIT")
+        );
     }
 
     #[test]

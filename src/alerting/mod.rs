@@ -33,7 +33,8 @@ const MAX_DELIVERY_ATTEMPTS: u32 = 12;
 pub struct AlertingService {
     store: AlertStore,
     dynamic: Arc<RwLock<DynamicSettings>>,
-    http: reqwest::Client,
+    telegram_http: reqwest::Client,
+    bark_http: reqwest::Client,
     dashboard_url: String,
 }
 
@@ -49,13 +50,17 @@ impl AlertingService {
             "https"
         };
         let dashboard_url = format!("{scheme}://{}", config.tunnel_domain.trim_end_matches('/'));
-        let http = channels::build_http_client().map_err(|error| {
-            AppError::Internal(format!("build alert HTTP client failed: {error}"))
+        let telegram_http = channels::build_http_client().map_err(|error| {
+            AppError::Internal(format!("build Telegram alert HTTP client failed: {error}"))
+        })?;
+        let bark_http = channels::build_bark_http_client().map_err(|error| {
+            AppError::Internal(format!("build Bark alert HTTP client failed: {error}"))
         })?;
         Ok(Arc::new(Self {
             store: AlertStore::new(metrics_db_path),
             dynamic,
-            http,
+            telegram_http,
+            bark_http,
             dashboard_url,
         }))
     }
@@ -147,7 +152,18 @@ impl AlertingService {
                 .unwrap_or_else(|| tested_at.to_string()),
             self.dashboard_url.trim_end_matches('/')
         );
-        match channels::send(&self.http, &settings, channel, &text).await {
+        let test_id = format!("alert-channel-test-{channel}-{}", Uuid::new_v4());
+        match channels::send(
+            &self.telegram_http,
+            &self.bark_http,
+            &settings,
+            channel,
+            &text,
+            &test_id,
+            &format!("{}/settings/", self.dashboard_url.trim_end_matches('/')),
+        )
+        .await
+        {
             Ok(success) => {
                 self.store
                     .record_channel_test(
@@ -361,10 +377,13 @@ impl AlertingService {
                 continue;
             }
             let send_result = channels::send(
-                &self.http,
+                &self.telegram_http,
+                &self.bark_http,
                 &current,
                 &delivery.channel,
                 &delivery.payload_text,
+                &delivery.id,
+                &format!("{}/settings/", self.dashboard_url.trim_end_matches('/')),
             )
             .await;
             let result = match send_result {
@@ -437,6 +456,7 @@ pub async fn run_alerting_service(
 fn channel_enabled(settings: &AlertingSettings, channel: &str) -> bool {
     match channel {
         channels::TELEGRAM_CHANNEL => settings.telegram_enabled,
+        channels::BARK_CHANNEL => settings.bark_enabled,
         _ => false,
     }
 }
@@ -447,6 +467,14 @@ fn channel_configured(settings: &AlertingSettings, channel: &str) -> bool {
             configured(settings.telegram_bot_token.as_deref())
                 && configured(settings.telegram_chat_id.as_deref())
         }
+        channels::BARK_CHANNEL => {
+            crate::bark::normalize_server_url(&settings.bark_server_url).is_ok()
+                && configured(settings.bark_device_key.as_deref())
+                && settings
+                    .bark_device_key
+                    .as_deref()
+                    .is_some_and(|value| crate::bark::validate_device_key(value).is_ok())
+        }
         _ => false,
     }
 }
@@ -454,6 +482,7 @@ fn channel_configured(settings: &AlertingSettings, channel: &str) -> bool {
 fn channel_min_severity<'a>(settings: &'a AlertingSettings, channel: &str) -> Option<&'a str> {
     match channel {
         channels::TELEGRAM_CHANNEL => Some(&settings.telegram_min_severity),
+        channels::BARK_CHANNEL => Some(&settings.bark_min_severity),
         _ => None,
     }
 }

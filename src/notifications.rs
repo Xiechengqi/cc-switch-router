@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{ClientNotificationSettings, Config, TelegramBotSettings};
+use crate::config::{BarkSettings, ClientNotificationSettings, Config, TelegramBotSettings};
 use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 use crate::notification_channels::NotificationChannelId;
@@ -24,6 +24,9 @@ const MAX_BATCHES_PER_CYCLE: usize = 25;
 const MAX_DELIVERY_ATTEMPTS: u32 = 12;
 const RESEND_EMAILS_ENDPOINT: &str = "https://api.resend.com/emails";
 const MAX_DIGEST_CLIENTS: usize = 50;
+pub(crate) const BARK_PAYLOAD_VERSION: i64 = 1;
+pub(crate) const BARK_MAX_BODY_BYTES: usize = 3_000;
+const BARK_MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 pub(crate) const MIN_OFFLINE_ALERT_SECS: i64 = 180;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,6 +159,7 @@ pub struct NotificationTemplateContext {
     /// Refreshed from dynamic settings on every delivery tick, so enabling or
     /// disabling the bot takes effect without a restart.
     pub telegram: TelegramNotificationContext,
+    pub bark: BarkNotificationContext,
 }
 
 /// Telegram half of the delivery configuration.
@@ -198,6 +202,46 @@ impl TelegramNotificationContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarkNotificationContext {
+    pub enabled: bool,
+    pub server_url: String,
+    pub recipient_hourly_limit: i64,
+    pub global_hourly_limit: i64,
+    pub provider_identity: Option<String>,
+    pub credential_key_fingerprint: Option<String>,
+    pub binding_config_fingerprint: Option<String>,
+}
+
+impl Default for BarkNotificationContext {
+    fn default() -> Self {
+        Self::from_settings(&BarkSettings::default())
+    }
+}
+
+impl BarkNotificationContext {
+    pub fn from_settings(settings: &BarkSettings) -> Self {
+        let provider_identity = crate::bark::provider_identity(&settings.server_url).ok();
+        let credential_key_fingerprint = crate::bark::CredentialCipher::from_settings(settings)
+            .ok()
+            .flatten()
+            .map(|cipher| cipher.key_fingerprint().to_string());
+        let binding_config_fingerprint = provider_identity
+            .as_deref()
+            .zip(credential_key_fingerprint.as_deref())
+            .map(|(provider, key)| crate::bark::binding_config_fingerprint(provider, key));
+        Self {
+            enabled: settings.is_operational(),
+            server_url: settings.server_url.clone(),
+            recipient_hourly_limit: settings.recipient_hourly_limit.max(0),
+            global_hourly_limit: settings.global_hourly_limit.max(0),
+            provider_identity,
+            credential_key_fingerprint,
+            binding_config_fingerprint,
+        }
+    }
+}
+
 impl NotificationTemplateContext {
     pub fn from_config(config: &Config) -> Self {
         let scheme = if config.use_localhost {
@@ -229,6 +273,7 @@ impl NotificationTemplateContext {
             delivery_configured,
             delivery_config_fingerprint,
             telegram: TelegramNotificationContext::from_settings(&config.telegram_bot),
+            bark: BarkNotificationContext::from_settings(&config.bark),
         }
     }
 }
@@ -276,7 +321,8 @@ impl NotificationAggregateStats {
 ///
 /// `channel` decides how the frozen fields are read: `Email` uses the RFC
 /// envelope (`from`/`reply_to`/`subject`/`html`), `Telegram` uses
-/// `subject` + `text` as the message body and `channel_target` as the chat id.
+/// `subject` + `text` as the message body and `channel_target` as the chat id,
+/// and Bark uses its versioned JSON payload plus the encrypted target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientNotificationBatch {
     pub id: String,
@@ -286,7 +332,10 @@ pub struct ClientNotificationBatch {
     pub channel: NotificationChannelId,
     pub channel_target: Option<String>,
     pub target_revision: i64,
+    pub credential_revision: i64,
     pub provider_identity: Option<String>,
+    pub payload_version: i64,
+    pub payload_json: String,
     pub from: String,
     pub reply_to: Option<String>,
     pub subject: String,
@@ -389,6 +438,20 @@ pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
         now: DateTime<Utc>,
     ) -> Result<(), AppError>;
 
+    /// Release a claimed delivery without consuming a provider-call attempt.
+    /// Used for provider-wide backoff decisions made before `start_*_attempt`.
+    async fn defer_client_notification_batch_without_attempt(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        reason: &str,
+        next_attempt_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.mark_client_notification_batch_retry(batch_id, worker_id, reason, next_attempt_at, now)
+            .await
+    }
+
     async fn mark_client_notification_batch_dead_letter(
         &self,
         batch_id: &str,
@@ -416,6 +479,17 @@ pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
         now: DateTime<Utc>,
     ) -> Result<Option<String>, AppError>;
 
+    async fn handle_invalid_bark_delivery(
+        &self,
+        _batch_id: &str,
+        _worker_id: &str,
+        _encrypted_target: &str,
+        _error: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<Option<String>, AppError> {
+        Ok(None)
+    }
+
     /// Background delivery is also a transport health signal in webhook
     /// mode, where there is no successful polling request to clear a failure.
     /// Test doubles can keep the default no-op behavior; the durable store
@@ -434,6 +508,33 @@ pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
     async fn mark_telegram_delivery_healthy(
         &self,
         _config_fingerprint: &str,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn bark_circuit_open_until(
+        &self,
+        _config_fingerprint: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, AppError> {
+        Ok(None)
+    }
+
+    async fn mark_bark_transport_failure(
+        &self,
+        _config_fingerprint: &str,
+        _failure_code: Option<&str>,
+        _failure_hint: Option<&str>,
+        _failure_message: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn mark_bark_delivery_healthy(
+        &self,
+        _config_fingerprint: &str,
+        _now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         Ok(())
     }
@@ -524,6 +625,25 @@ impl ClientNotificationStore for AppStore {
         .await
     }
 
+    async fn defer_client_notification_batch_without_attempt(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        reason: &str,
+        next_attempt_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        AppStore::defer_client_notification_batch_without_attempt(
+            self,
+            batch_id,
+            worker_id,
+            reason,
+            next_attempt_at,
+            now,
+        )
+        .await
+    }
+
     async fn mark_client_notification_batch_dead_letter(
         &self,
         batch_id: &str,
@@ -576,6 +696,25 @@ impl ClientNotificationStore for AppStore {
         .await
     }
 
+    async fn handle_invalid_bark_delivery(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        encrypted_target: &str,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>, AppError> {
+        AppStore::handle_invalid_bark_delivery(
+            self,
+            batch_id,
+            worker_id,
+            encrypted_target,
+            error,
+            now,
+        )
+        .await
+    }
+
     async fn mark_telegram_transport_failure(
         &self,
         config_fingerprint: &str,
@@ -602,6 +741,41 @@ impl ClientNotificationStore for AppStore {
         self.mark_telegram_bot_delivery_healthy(config_fingerprint)
             .await
     }
+
+    async fn bark_circuit_open_until(
+        &self,
+        config_fingerprint: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, AppError> {
+        AppStore::bark_circuit_open_until(self, config_fingerprint, now).await
+    }
+
+    async fn mark_bark_transport_failure(
+        &self,
+        config_fingerprint: &str,
+        failure_code: Option<&str>,
+        failure_hint: Option<&str>,
+        failure_message: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.mark_bark_provider_failure(
+            config_fingerprint,
+            failure_code,
+            failure_hint,
+            failure_message,
+            now,
+        )
+        .await
+    }
+
+    async fn mark_bark_delivery_healthy(
+        &self,
+        config_fingerprint: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.mark_bark_provider_healthy(config_fingerprint, now)
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -616,7 +790,10 @@ enum TransportValidationFailure {
 #[derive(Debug)]
 enum TransportSendFailure {
     Delivery(DeliveryFailure),
-    EndpointUnreachable(String),
+    EndpointInvalid {
+        message: String,
+        provider_reached: bool,
+    },
 }
 
 #[async_trait]
@@ -740,11 +917,172 @@ impl NotificationTransport for TelegramNotificationTransport<'_> {
         match sent {
             Ok(success) => Ok(success.provider_message_id.unwrap_or_default()),
             Err(failure) if failure.chat_unreachable => {
-                Err(TransportSendFailure::EndpointUnreachable(failure.message))
+                Err(TransportSendFailure::EndpointInvalid {
+                    message: failure.message,
+                    provider_reached: true,
+                })
             }
             Err(failure) => Err(TransportSendFailure::Delivery(telegram_delivery_failure(
                 failure,
             ))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FrozenBarkPayload {
+    title: String,
+    body: String,
+    group: String,
+    url: String,
+    id: String,
+    level: String,
+}
+
+fn frozen_bark_payload(batch: &ClientNotificationBatch) -> Option<FrozenBarkPayload> {
+    if batch.payload_version != BARK_PAYLOAD_VERSION
+        || batch.payload_json.len() > BARK_MAX_PAYLOAD_BYTES
+    {
+        return None;
+    }
+    let payload = serde_json::from_str::<FrozenBarkPayload>(&batch.payload_json).ok()?;
+    let url = url::Url::parse(&payload.url).ok()?;
+    let link_is_safe = payload.url.len() <= 2_048
+        && !payload.url.chars().any(char::is_control)
+        && matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none();
+    (payload.title == batch.subject
+        && !payload.title.trim().is_empty()
+        && payload.title.len() <= 200
+        && !payload.title.chars().any(char::is_control)
+        && payload.body == batch.text
+        && !payload.body.trim().is_empty()
+        && payload.body.len() <= BARK_MAX_BODY_BYTES
+        && payload.group == "cc-switch-router"
+        && link_is_safe
+        && payload.id == batch.idempotency_key
+        && (1..=256).contains(&payload.id.len())
+        && payload.id.is_ascii()
+        && !payload.id.chars().any(char::is_control)
+        && payload.level == "active")
+        .then_some(payload)
+}
+
+struct BarkNotificationTransport<'a> {
+    http: Option<&'a reqwest::Client>,
+    enabled: bool,
+    server_url: &'a str,
+    provider_identity: Option<&'a str>,
+    cipher: Option<&'a crate::bark::CredentialCipher>,
+}
+
+#[async_trait]
+impl NotificationTransport for BarkNotificationTransport<'_> {
+    fn channel(&self) -> &'static str {
+        crate::bark::CHANNEL
+    }
+
+    fn validate(&self, batch: &ClientNotificationBatch) -> Result<(), TransportValidationFailure> {
+        if !self.enabled {
+            return Err(TransportValidationFailure::BlockedConfig {
+                reason_code: "bark_provider_disabled",
+                message: "Bark user notifications are disabled or awaiting Router restart",
+            });
+        }
+        if self.http.is_none() || self.cipher.is_none() || self.provider_identity.is_none() {
+            return Err(TransportValidationFailure::BlockedConfig {
+                reason_code: "bark_provider_unavailable",
+                message: "Bark user notifications are not configured",
+            });
+        }
+        let user_id_valid = batch.recipient_user_id.as_deref().is_some_and(|user_id| {
+            (1..=256).contains(&user_id.len()) && !user_id.chars().any(char::is_control)
+        });
+        let target_valid = batch.channel_target.as_deref().is_some_and(|target| {
+            (1..=1_024).contains(&target.len())
+                && target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+        });
+        if !user_id_valid
+            || !target_valid
+            || batch.target_revision < 1
+            || batch.credential_revision < 1
+            || batch.provider_identity.as_deref() != self.provider_identity
+        {
+            return Err(TransportValidationFailure::InvalidPayload(
+                "frozen Bark target is invalid",
+            ));
+        }
+        if frozen_bark_payload(batch).is_none() {
+            return Err(TransportValidationFailure::InvalidPayload(
+                "frozen Bark message is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn send(&self, batch: &ClientNotificationBatch) -> Result<String, TransportSendFailure> {
+        let provider_identity = self
+            .provider_identity
+            .expect("validated Bark provider identity");
+        let user_id = batch
+            .recipient_user_id
+            .as_deref()
+            .expect("validated Bark user id");
+        let envelope = batch
+            .channel_target
+            .as_deref()
+            .expect("validated Bark target");
+        let payload = frozen_bark_payload(batch).expect("validated frozen Bark payload");
+        let aad =
+            crate::bark::credential_aad(user_id, batch.credential_revision, provider_identity);
+        let device_key = self
+            .cipher
+            .expect("validated Bark credential cipher")
+            .open(envelope, &aad)
+            .map_err(|error| TransportSendFailure::EndpointInvalid {
+                message: error.to_string(),
+                provider_reached: false,
+            })?;
+        let request = crate::bark::PushRequest {
+            device_key: &device_key,
+            title: &payload.title,
+            body: &payload.body,
+            group: &payload.group,
+            url: &payload.url,
+            id: &payload.id,
+            level: &payload.level,
+        };
+        match crate::bark::send(
+            self.http.expect("validated Bark HTTP client"),
+            self.server_url,
+            &request,
+        )
+        .await
+        {
+            Ok(success) => Ok(success.provider_message_id.unwrap_or_default()),
+            Err(failure) if failure.target_invalid => Err(TransportSendFailure::EndpointInvalid {
+                message: failure.message,
+                provider_reached: true,
+            }),
+            Err(failure) => Err(TransportSendFailure::Delivery(DeliveryFailure {
+                retryable: failure.retryable,
+                retry_at: failure
+                    .retry_at
+                    .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0)),
+                message: failure.message,
+                failure_code: Some(failure.code),
+                failure_hint: Some(failure.hint),
+                failure_details: failure.http_status.map(|status| {
+                    serde_json::json!({
+                        "httpStatus": status,
+                    })
+                }),
+            })),
         }
     }
 }
@@ -757,8 +1095,11 @@ impl<'a> NotificationChannelRegistry<'a> {
     fn new(
         email_http: &'a reqwest::Client,
         telegram_http: &'a reqwest::Client,
+        bark_http: Option<&'a reqwest::Client>,
         resend_api_key: Option<&'a str>,
         telegram_bot_token: Option<&'a str>,
+        template: &'a NotificationTemplateContext,
+        bark_cipher: Option<&'a crate::bark::CredentialCipher>,
     ) -> Self {
         let transports: Vec<Box<dyn NotificationTransport + 'a>> = vec![
             Box::new(EmailNotificationTransport {
@@ -768,6 +1109,13 @@ impl<'a> NotificationChannelRegistry<'a> {
             Box::new(TelegramNotificationTransport {
                 http: telegram_http,
                 token: telegram_bot_token,
+            }),
+            Box::new(BarkNotificationTransport {
+                http: bark_http,
+                enabled: template.bark.enabled,
+                server_url: &template.bark.server_url,
+                provider_identity: template.bark.provider_identity.as_deref(),
+                cipher: bark_cipher,
             }),
         ];
         Self {
@@ -801,6 +1149,22 @@ pub async fn run_client_notification_service(
     let telegram_http = crate::telegram::build_send_http_client(
         "cc-switch-router/0.1 client-notifications-telegram",
     )?;
+    let bark_http = match crate::bark::build_http_client(
+        "cc-switch-router/0.1 client-notifications-bark",
+    ) {
+        Ok(http) => Some(http),
+        Err(error) => {
+            warn!(error = %error, "Bark HTTP client is unavailable; other notification channels remain active");
+            None
+        }
+    };
+    let bark_cipher = match crate::bark::CredentialCipher::from_settings(&config.bark) {
+        Ok(cipher) => cipher,
+        Err(error) => {
+            warn!(error = %error, "Bark credential cipher is unavailable; other notification channels remain active");
+            None
+        }
+    };
     let worker_id = format!("router-{}", Uuid::new_v4());
     let mut template = NotificationTemplateContext::from_config(&config);
     let mut interval = tokio::time::interval(Duration::from_secs(DELIVERY_INTERVAL_SECS));
@@ -811,15 +1175,16 @@ pub async fn run_client_notification_service(
 
     loop {
         interval.tick().await;
-        let (settings, telegram_bot) = {
+        let (settings, telegram_bot, bark) = {
             let dynamic = dynamic.read().await;
             (
                 dynamic.client_notifications.clone(),
                 dynamic.telegram_bot.clone(),
+                dynamic.bark.clone(),
             )
         };
-        // Telegram is hot-reloadable; the email envelope is not, so only the
-        // Telegram half of the template is refreshed per tick.
+        // Push-channel settings are hot-reloadable; the email envelope is not,
+        // so refresh the Telegram and Bark portions of the template per tick.
         template.telegram = TelegramNotificationContext::from_settings(&telegram_bot);
         let telegram_fingerprint = telegram_bot.token().map(|token| {
             crate::telegram::bind::telegram_config_fingerprint(
@@ -843,6 +1208,8 @@ pub async fn run_client_notification_service(
         // outage permanently disable Telegram deliveries for the lifetime of
         // the worker, even after the transport becomes healthy again.
         template.telegram.enabled = telegram_bot.is_operational() && telegram_ready;
+        template.bark = BarkNotificationContext::from_settings(&bark);
+        template.bark.enabled = template.bark.enabled && bark_cipher.is_some();
         let telegram_token = (telegram_bot.is_operational() && telegram_ready)
             .then(|| telegram_bot.token())
             .flatten();
@@ -861,6 +1228,8 @@ pub async fn run_client_notification_service(
             telegram_token,
             &email_http,
             &telegram_http,
+            bark_http.as_ref(),
+            bark_cipher.as_ref(),
             &worker_id,
             should_reconcile_presence(tick_index, started_at.elapsed(), presence_grace),
         )
@@ -880,6 +1249,8 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
     telegram_bot_token: Option<&str>,
     email_http: &reqwest::Client,
     telegram_http: &reqwest::Client,
+    bark_http: Option<&reqwest::Client>,
+    bark_cipher: Option<&crate::bark::CredentialCipher>,
     worker_id: &str,
     reconcile_presence: bool,
 ) -> Result<(), AppError> {
@@ -924,8 +1295,11 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
     let registry = NotificationChannelRegistry::new(
         email_http,
         telegram_http,
+        bark_http,
         resend_api_key,
         telegram_bot_token,
+        template,
+        bark_cipher,
     );
     for _ in 0..MAX_BATCHES_PER_CYCLE {
         let claim_now = Utc::now();
@@ -990,6 +1364,23 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
                 continue;
             }
         }
+        if batch.channel.is_bark()
+            && let Some(config_fingerprint) = template.bark.provider_identity.as_deref()
+            && let Some(open_until) = store
+                .bark_circuit_open_until(config_fingerprint, Utc::now())
+                .await?
+        {
+            store
+                .defer_client_notification_batch_without_attempt(
+                    &batch.id,
+                    worker_id,
+                    "Bark provider circuit is temporarily open",
+                    open_until,
+                    Utc::now(),
+                )
+                .await?;
+            continue;
+        }
         store
             .start_client_notification_attempt(&batch.id, &batch.attempt_id, worker_id, Utc::now())
             .await?;
@@ -1018,21 +1409,73 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
                             );
                         }
                     }
+                } else if batch.channel.is_bark()
+                    && let Some(config_fingerprint) = template.bark.provider_identity.as_deref()
+                    && let Err(error) = store
+                        .mark_bark_delivery_healthy(config_fingerprint, Utc::now())
+                        .await
+                {
+                    warn!(
+                        batch_id = %batch.id,
+                        error = %error,
+                        "persist Bark notification transport recovery failed"
+                    );
                 }
                 info!(batch_id = %batch.id, channel = %batch.channel, provider_message_id, "client notification sent");
             }
-            Err(TransportSendFailure::EndpointUnreachable(message)) => {
+            Err(TransportSendFailure::EndpointInvalid {
+                message,
+                provider_reached,
+            }) => {
+                if provider_reached && batch.channel.is_telegram() {
+                    if let Some(config_fingerprint) =
+                        template.telegram.config_fingerprint.as_deref()
+                        && let Err(error) = store
+                            .mark_telegram_delivery_healthy(config_fingerprint)
+                            .await
+                    {
+                        warn!(
+                            batch_id = %batch.id,
+                            error = %error,
+                            "persist Telegram transport recovery after target rejection failed"
+                        );
+                    }
+                } else if provider_reached
+                    && batch.channel.is_bark()
+                    && let Some(config_fingerprint) = template.bark.provider_identity.as_deref()
+                    && let Err(error) = store
+                        .mark_bark_delivery_healthy(config_fingerprint, Utc::now())
+                        .await
+                {
+                    warn!(
+                        batch_id = %batch.id,
+                        error = %error,
+                        "persist Bark transport recovery after target rejection failed"
+                    );
+                }
                 let error = sanitize_delivery_error(&message);
-                let chat_id = batch.channel_target.as_deref().unwrap_or_default();
-                let unbound = store
-                    .handle_unreachable_telegram_delivery(
-                        &batch.id,
-                        worker_id,
-                        chat_id,
-                        &error,
-                        Utc::now(),
-                    )
-                    .await?;
+                let target = batch.channel_target.as_deref().unwrap_or_default();
+                let unbound = if batch.channel.is_bark() {
+                    store
+                        .handle_invalid_bark_delivery(
+                            &batch.id,
+                            worker_id,
+                            target,
+                            &error,
+                            Utc::now(),
+                        )
+                        .await?
+                } else {
+                    store
+                        .handle_unreachable_telegram_delivery(
+                            &batch.id,
+                            worker_id,
+                            target,
+                            &error,
+                            Utc::now(),
+                        )
+                        .await?
+                };
                 warn!(batch_id = %batch.id, unbound = unbound.is_some(), error, "notification endpoint invalidated after permanent failure");
             }
             Err(TransportSendFailure::Delivery(failure)) => {
@@ -1060,6 +1503,23 @@ async fn run_notification_cycle<S: ClientNotificationStore>(
                             );
                         }
                     }
+                } else if batch.channel.is_bark()
+                    && let Some(config_fingerprint) = template.bark.provider_identity.as_deref()
+                    && let Err(error) = store
+                        .mark_bark_transport_failure(
+                            config_fingerprint,
+                            failure.failure_code.as_deref(),
+                            failure.failure_hint.as_deref(),
+                            &failure.message,
+                            Utc::now(),
+                        )
+                        .await
+                {
+                    warn!(
+                        batch_id = %batch.id,
+                        error = %error,
+                        "persist Bark notification transport failure failed"
+                    );
                 }
                 record_delivery_failure(store, &batch, worker_id, failure).await?;
             }
@@ -1480,6 +1940,11 @@ pub fn mask_notification_target(
 ) -> String {
     if channel == crate::notification_channels::EMAIL_CHANNEL {
         return mask_email_address(recipient);
+    }
+    if channel == crate::notification_channels::BARK_CHANNEL {
+        // The frozen target is authenticated ciphertext, not a useful device
+        // identifier. Never render even a fragment of that envelope.
+        return "Bark ••••".into();
     }
     let target = channel_target.unwrap_or_default().trim();
     if target.is_empty() {
@@ -2384,6 +2849,38 @@ mod tests {
         (format!("http://{address}/emails"), requests, task)
     }
 
+    async fn start_mock_bark() -> (
+        String,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/push",
+            post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().await.push(payload);
+                    axum::Json(serde_json::json!({
+                        "code": 200,
+                        "data": { "id": "frozen-payload-message" },
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Bark transport mock");
+        let address = listener.local_addr().expect("Bark transport mock address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Bark transport mock");
+        });
+        (format!("http://{address}"), requests, task)
+    }
+
     fn test_batch() -> ClientNotificationBatch {
         ClientNotificationBatch {
             id: "b1".into(),
@@ -2393,7 +2890,10 @@ mod tests {
             channel: NotificationChannelId::email(),
             channel_target: None,
             target_revision: 1,
+            credential_revision: 0,
             provider_identity: None,
+            payload_version: 1,
+            payload_json: "{}".into(),
             from: "Router <noreply@example.com>".into(),
             reply_to: Some("support@example.com".into()),
             subject: "Client offline".into(),
@@ -2414,7 +2914,10 @@ mod tests {
             channel: NotificationChannelId::telegram(),
             channel_target: Some("4242".into()),
             target_revision: 1,
+            credential_revision: 0,
             provider_identity: Some("7".into()),
+            payload_version: 2,
+            payload_json: "{}".into(),
             from: String::new(),
             reply_to: None,
             subject: "Client offline".into(),
@@ -2456,6 +2959,7 @@ mod tests {
             delivery_configured: false,
             delivery_config_fingerprint: "test".into(),
             telegram: TelegramNotificationContext::default(),
+            bark: BarkNotificationContext::default(),
         };
         let http = reqwest::Client::new();
 
@@ -2467,6 +2971,8 @@ mod tests {
             None,
             &http,
             &http,
+            Some(&http),
+            None,
             "cycle-worker",
             false,
         )
@@ -2511,6 +3017,7 @@ mod tests {
             delivery_configured: true,
             delivery_config_fingerprint: "test".into(),
             telegram: TelegramNotificationContext::default(),
+            bark: BarkNotificationContext::default(),
         };
         let http = reqwest::Client::new();
 
@@ -2522,6 +3029,8 @@ mod tests {
             Some("bot-token"),
             &http,
             &http,
+            Some(&http),
+            None,
             "cycle-worker",
             false,
         )
@@ -2560,6 +3069,7 @@ mod tests {
             delivery_configured: true,
             delivery_config_fingerprint: "test".into(),
             telegram: TelegramNotificationContext::default(),
+            bark: BarkNotificationContext::default(),
         };
         let http = reqwest::Client::new();
 
@@ -2571,6 +3081,8 @@ mod tests {
             None,
             &http,
             &http,
+            Some(&http),
+            None,
             "cycle-worker",
             false,
         )
@@ -3031,6 +3543,196 @@ mod tests {
             "o***@example.com"
         );
         assert_eq!(mask_email_address("invalid"), "***");
+    }
+
+    #[test]
+    fn bark_delivery_view_never_renders_ciphertext_fragments() {
+        assert_eq!(
+            mask_notification_target(
+                crate::notification_channels::BARK_CHANNEL,
+                "owner@example.com",
+                Some("v1:1:nonce:ciphertext-secret-tail"),
+            ),
+            "Bark ••••"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_bark_credential_key_invalidates_the_endpoint_before_network_io() {
+        let settings = |key_byte: &str| crate::config::BarkSettings {
+            enabled: true,
+            credential_master_key: Some(key_byte.repeat(32)),
+            ..crate::config::BarkSettings::default()
+        };
+        let old_cipher = crate::bark::CredentialCipher::from_settings(&settings("11"))
+            .expect("old Bark key")
+            .expect("configured old Bark key");
+        let new_cipher = crate::bark::CredentialCipher::from_settings(&settings("22"))
+            .expect("new Bark key")
+            .expect("configured new Bark key");
+        let provider =
+            crate::bark::provider_identity("https://api.day.app").expect("Bark Provider identity");
+        let aad = crate::bark::credential_aad("user-1", 1, &provider);
+        let encrypted = old_cipher
+            .seal("device_key_123", &aad)
+            .expect("seal old Bark binding");
+        let mut batch = test_batch();
+        batch.channel = NotificationChannelId::bark();
+        batch.recipient_user_id = Some("user-1".into());
+        batch.channel_target = Some(encrypted);
+        batch.target_revision = 1;
+        batch.credential_revision = 1;
+        batch.provider_identity = Some(provider.clone());
+        batch.payload_version = BARK_PAYLOAD_VERSION;
+        batch.payload_json = serde_json::json!({
+            "title": &batch.subject,
+            "body": &batch.text,
+            "group": "cc-switch-router",
+            "url": "https://frozen-router.example.com/account/notifications",
+            "id": &batch.idempotency_key,
+            "level": "active",
+        })
+        .to_string();
+        let http = reqwest::Client::new();
+        let transport = BarkNotificationTransport {
+            http: Some(&http),
+            enabled: true,
+            server_url: "https://api.day.app",
+            provider_identity: Some(&provider),
+            cipher: Some(&new_cipher),
+        };
+        assert!(transport.validate(&batch).is_ok());
+        assert!(matches!(
+            transport.send(&batch).await,
+            Err(TransportSendFailure::EndpointInvalid {
+                provider_reached: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn bark_transport_sends_the_frozen_outbox_url_and_payload() {
+        let (server_url, requests, server) = start_mock_bark().await;
+        let settings = crate::config::BarkSettings {
+            enabled: true,
+            server_url: server_url.clone(),
+            credential_master_key: Some("41".repeat(32)),
+            ..crate::config::BarkSettings::default()
+        };
+        let cipher = crate::bark::CredentialCipher::from_settings(&settings)
+            .expect("valid Bark key")
+            .expect("configured Bark key");
+        let provider = crate::bark::provider_identity(&server_url).expect("Bark Provider identity");
+        let aad = crate::bark::credential_aad("user-1", 1, &provider);
+        let mut batch = test_batch();
+        batch.channel = NotificationChannelId::bark();
+        batch.channel_target = Some(
+            cipher
+                .seal("device_key_123", &aad)
+                .expect("seal Bark target"),
+        );
+        batch.target_revision = 1;
+        batch.credential_revision = 1;
+        batch.provider_identity = Some(provider.clone());
+        batch.payload_version = BARK_PAYLOAD_VERSION;
+        let frozen_url = "https://frozen-router.example.com/account/notifications";
+        batch.payload_json = serde_json::json!({
+            "title": &batch.subject,
+            "body": &batch.text,
+            "group": "cc-switch-router",
+            "url": frozen_url,
+            "id": &batch.idempotency_key,
+            "level": "active",
+        })
+        .to_string();
+        let http =
+            crate::bark::build_http_client("bark-frozen-payload-test").expect("Bark HTTP client");
+        let transport = BarkNotificationTransport {
+            http: Some(&http),
+            enabled: true,
+            server_url: &server_url,
+            provider_identity: Some(&provider),
+            cipher: Some(&cipher),
+        };
+
+        transport.validate(&batch).expect("valid Bark delivery");
+        assert_eq!(
+            transport.send(&batch).await.expect("send Bark delivery"),
+            "frozen-payload-message"
+        );
+        let captured = requests.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["device_key"], "device_key_123");
+        assert_eq!(captured[0]["title"], batch.subject);
+        assert_eq!(captured[0]["body"], batch.text);
+        assert_eq!(captured[0]["url"], frozen_url);
+        assert_eq!(captured[0]["id"], batch.idempotency_key);
+        drop(captured);
+        server.abort();
+    }
+
+    #[test]
+    fn bark_batch_requires_an_exact_bounded_versioned_payload() {
+        let settings = crate::config::BarkSettings {
+            enabled: true,
+            credential_master_key: Some("31".repeat(32)),
+            ..crate::config::BarkSettings::default()
+        };
+        let cipher = crate::bark::CredentialCipher::from_settings(&settings)
+            .expect("valid Bark key")
+            .expect("configured Bark key");
+        let provider =
+            crate::bark::provider_identity(&settings.server_url).expect("Bark Provider identity");
+        let aad = crate::bark::credential_aad("user-1", 1, &provider);
+        let mut batch = test_batch();
+        batch.channel = NotificationChannelId::bark();
+        batch.channel_target = Some(
+            cipher
+                .seal("device_key_123", &aad)
+                .expect("seal Bark target"),
+        );
+        batch.target_revision = 1;
+        batch.credential_revision = 1;
+        batch.provider_identity = Some(provider.clone());
+        batch.payload_version = BARK_PAYLOAD_VERSION;
+        batch.payload_json = serde_json::json!({
+            "title": &batch.subject,
+            "body": &batch.text,
+            "group": "cc-switch-router",
+            "url": "https://frozen-router.example.com/account/notifications",
+            "id": &batch.idempotency_key,
+            "level": "active",
+        })
+        .to_string();
+        let http = reqwest::Client::new();
+        let transport = BarkNotificationTransport {
+            http: Some(&http),
+            enabled: true,
+            server_url: &settings.server_url,
+            provider_identity: Some(&provider),
+            cipher: Some(&cipher),
+        };
+        assert!(transport.validate(&batch).is_ok());
+        assert_eq!(
+            frozen_bark_payload(&batch)
+                .expect("parse frozen Bark payload")
+                .url,
+            "https://frozen-router.example.com/account/notifications"
+        );
+
+        let original = batch.payload_json.clone();
+        batch.payload_json = original.replace("offline", "changed after freeze");
+        assert!(matches!(
+            transport.validate(&batch),
+            Err(TransportValidationFailure::InvalidPayload(_))
+        ));
+        batch.payload_json = original;
+        batch.payload_version += 1;
+        assert!(matches!(
+            transport.validate(&batch),
+            Err(TransportValidationFailure::InvalidPayload(_))
+        ));
     }
 
     #[test]

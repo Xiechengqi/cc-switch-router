@@ -101,14 +101,16 @@ export function AlertChannelsPanel({
                 <p className="mt-1 text-sm text-muted-foreground">
                   {t(item.channel === "telegram"
                     ? "settings.alertChannels.operator.telegramDescription"
-                    : "settings.alertChannels.operator.description")}
+                    : item.channel === "bark"
+                      ? "settings.alertChannels.operator.barkDescription"
+                      : "settings.alertChannels.operator.description")}
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   {item.lastSuccessAt
                     ? t("settings.alertChannels.lastSuccess", { time: formatDateTime(item.lastSuccessAt * 1000) })
                     : t("settings.alertChannels.neverSucceeded")}
                 </p>
-                <ChannelDiagnostic state={item} />
+                <ChannelDiagnostic channel={item.channel} state={item} />
               </div>
               <Button
                 variant="outline"
@@ -140,7 +142,9 @@ export function AlertChannelsPanel({
                 <p className="mt-1 text-sm text-muted-foreground">
                   {t(item.channel === "telegram"
                     ? "settings.alertChannels.user.telegramDescription"
-                    : "settings.alertChannels.user.description")}
+                    : item.channel === "bark"
+                      ? "settings.alertChannels.user.barkDescription"
+                      : "settings.alertChannels.user.description")}
                 </p>
                 <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                   {provider ? <span>{t("settings.alertChannels.user.provider", { provider })}</span> : null}
@@ -156,7 +160,7 @@ export function AlertChannelsPanel({
                     ? t("settings.alertChannels.lastSuccess", { time: formatDateTime(item.lastSuccessAt) })
                     : t("settings.alertChannels.neverSucceeded")}
                 </p>
-                <ChannelDiagnostic state={item} />
+                <ChannelDiagnostic channel={item.channel} state={item} />
                 {item.runtimeReady && !item.testTargetAvailable ? (
                   <p className="mt-2 text-xs text-muted-foreground">
                     {t("settings.alertChannels.user.bindingRequired")}{" "}
@@ -258,14 +262,19 @@ type ChannelDiagnosticState = {
   failureDetails?: Record<string, unknown> | null;
 };
 
-function ChannelDiagnostic({ state }: { state: ChannelDiagnosticState }) {
+function ChannelDiagnostic({
+  channel,
+  state,
+}: {
+  channel: string;
+  state: ChannelDiagnosticState;
+}) {
   const { t } = useLocaleText();
   if (!state.lastError && !state.failureCode && !state.failureHint) return null;
   const code = state.failureCode?.trim();
-  const key = code
-    ? `settings.alertChannels.diagnostic.${code}`
-    : "settings.alertChannels.diagnostic.legacy";
-  const hint = t(key as Parameters<typeof t>[0]);
+  const hint = translatedChannelDiagnostic(t, channel, code)
+    || state.failureHint?.trim()
+    || t("settings.alertChannels.diagnostic.legacy");
   const details = state.failureDetails;
   const resolved = formatDiagnosticAddresses(details?.resolvedAddresses);
   const reachable = formatDiagnosticAddresses(details?.reachableAddresses);
@@ -274,7 +283,7 @@ function ChannelDiagnostic({ state }: { state: ChannelDiagnosticState }) {
   return (
     <div className="mt-2 rounded-md border border-amber-200 bg-amber-50/70 p-2.5 text-xs text-amber-950">
       <p className="font-medium">{t("settings.alertChannels.diagnostic.title")}</p>
-      <p className="mt-1 leading-5">{hint === key ? state.failureHint || t("settings.alertChannels.diagnostic.legacy") : hint}</p>
+      <p className="mt-1 leading-5">{hint}</p>
       {hasTechnicalDetails ? (
         <details className="mt-2 text-amber-900/80">
           <summary className="cursor-pointer select-none font-medium">
@@ -297,17 +306,53 @@ function formatDiagnosticAddresses(value: unknown) {
   return value.filter((item): item is string => typeof item === "string").join(", ");
 }
 
+function translatedChannelDiagnostic(
+  translate: ReturnType<typeof useLocaleText>["t"],
+  channel: string | undefined,
+  code: string | undefined,
+) {
+  if (!code) return "";
+  const keys = [
+    channel ? `settings.alertChannels.diagnostic.${channel}.${code}` : "",
+    `settings.alertChannels.diagnostic.${code}`,
+  ].filter(Boolean);
+  for (const rawKey of keys) {
+    const key = rawKey as Parameters<typeof translate>[0];
+    const translated = translate(key);
+    if (translated !== key) return translated;
+  }
+  return "";
+}
+
 function formatChannelError(error: unknown, translate: ReturnType<typeof useLocaleText>["t"]) {
   if (error instanceof ApiError) {
     const code = error.details?.failureCode;
     if (typeof code === "string") {
-      const key = `settings.alertChannels.diagnostic.${code}` as Parameters<typeof translate>[0];
-      const translated = translate(key);
-      if (translated !== key) return translated;
+      const channel = typeof error.details?.channel === "string"
+        ? error.details.channel
+        : undefined;
+      const translated = translatedChannelDiagnostic(translate, channel, code.trim());
+      if (translated) return translated;
     }
     const hint = error.details?.failureHint;
     if (typeof hint === "string" && hint.trim()) return hint;
     if (error.code === "USER_NOTIFICATION_BOT_NOT_READY") {
+      return translate("settings.alertChannels.user.runtimeUnavailable");
+    }
+    if (
+      error.code === "USER_NOTIFICATION_TELEGRAM_BINDING_REQUIRED"
+      || error.code === "USER_NOTIFICATION_TELEGRAM_REBIND_REQUIRED"
+      || error.code === "USER_NOTIFICATION_BARK_BINDING_REQUIRED"
+      || error.code === "USER_NOTIFICATION_BARK_REBIND_REQUIRED"
+    ) {
+      return translate("settings.alertChannels.user.bindingRequired");
+    }
+    if (
+      error.code === "USER_NOTIFICATION_BARK_NOT_READY"
+      || error.code === "USER_NOTIFICATION_BARK_PROVIDER_UNAVAILABLE"
+      || error.code === "USER_NOTIFICATION_CHANNEL_DISABLED"
+      || error.code === "USER_NOTIFICATION_CHANNEL_MISCONFIGURED"
+    ) {
       return translate("settings.alertChannels.user.runtimeUnavailable");
     }
   }

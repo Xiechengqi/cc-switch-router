@@ -135,6 +135,7 @@ pub enum DynamicGroup {
     Alerting,
     ClientNotifications,
     TelegramBot,
+    Bark,
     MarketBilling,
     ServerLogs,
     ClientDistribution,
@@ -243,6 +244,56 @@ impl SettingsRuntimeSnapshot {
             startup_effective: Arc::new(HashMap::new()),
             startup_file_keys: Arc::new(HashSet::new()),
         }
+    }
+
+    pub fn bark_credentials_current(&self, env_path: &Path) -> Result<bool, AppError> {
+        let values = read_env_file(env_path)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        Ok(self.bark_credentials_current_in(&values))
+    }
+
+    pub fn bark_credentials_current_in(&self, values: &BTreeMap<String, String>) -> bool {
+        [
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION",
+        ]
+        .into_iter()
+        .all(|key| {
+            let field = SETTINGS_FIELDS
+                .iter()
+                .find(|field| field.key == key)
+                .expect("Bark credential setting is registered");
+            let configured = values
+                .get(key)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                // A value supplied by the service environment rather than
+                // the managed file remains effective after restart until that
+                // external environment changes. An absent file entry must not
+                // falsely fence an otherwise current boot credential. An
+                // explicitly empty entry is different: `load_env_file` will
+                // use it to clear the external value on the next start.
+                .or_else(|| {
+                    (!values.contains_key(key) && !self.startup_file_keys.contains(key))
+                        .then(|| {
+                            self.startup_effective
+                                .get(key)
+                                .filter(|value| !value.trim().is_empty())
+                                .cloned()
+                        })
+                        .flatten()
+                })
+                .or_else(|| resolved_default_value(field));
+            let effective = self
+                .startup_effective
+                .get(key)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .or_else(|| resolved_default_value(field));
+            normalized_field_comparison(field, configured.as_deref())
+                == normalized_field_comparison(field, effective.as_deref())
+        })
     }
 }
 
@@ -1810,6 +1861,128 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("50"),
         dynamic_group: Some(DynamicGroup::TelegramBot),
     },
+    // ---- User-facing Bark channel -----------------------------------------
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BARK_ENABLED",
+        label: "Enable Bark user notifications",
+        group: "Bark channel",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("false"),
+        description: "Let users verify a Bark Push URL and select Bark for account notifications.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::Bark),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BARK_SERVER_URL",
+        label: "Bark Server URL",
+        group: "Bark channel",
+        field_type: FieldType::Url,
+        required: false,
+        restart_required: false,
+        default: Some("https://api.day.app"),
+        description: "Only Push URLs from this HTTPS Bark Server can be bound. Loopback HTTP is allowed for a colocated self-hosted Server.",
+        placeholder: Some("https://api.day.app"),
+        dynamic_group: Some(DynamicGroup::Bark),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
+        label: "Bark credential master key",
+        group: "Bark channel",
+        field_type: FieldType::Secret,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Dedicated 32-byte key encoded as 64 hexadecimal characters or base64. Encrypts user Bark device keys and is never returned by the API.",
+        placeholder: Some("64 hexadecimal characters"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION",
+        label: "Bark credential key version",
+        group: "Bark channel",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("1"),
+        description: "Version recorded in encrypted Bark bindings. Changing the key or version requires users to bind again.",
+        placeholder: Some("1"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT",
+        label: "Bark per-user hourly cap",
+        group: "Bark channel",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("10"),
+        description: "Maximum Bark notifications delivered to one user per hour.",
+        placeholder: Some("10"),
+        dynamic_group: Some(DynamicGroup::Bark),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT",
+        label: "Bark global hourly cap",
+        group: "Bark channel",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("50"),
+        description: "Maximum Bark user notifications delivered by this Router per hour.",
+        placeholder: Some("50"),
+        dynamic_group: Some(DynamicGroup::Bark),
+    },
+    // ---- Send-only operator Bark channel ----------------------------------
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_BARK_ENABLED",
+        label: "Enable Bark alerts",
+        group: "Bark alerts",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("false"),
+        description: "Deliver operator incident transitions to a dedicated Bark device.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL",
+        label: "Operator Bark Server URL",
+        group: "Bark alerts",
+        field_type: FieldType::Url,
+        required: false,
+        restart_required: false,
+        default: Some("https://api.day.app"),
+        description: "Bark Server used only for operator alerts.",
+        placeholder: Some("https://api.day.app"),
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY",
+        label: "Operator Bark device key",
+        group: "Bark alerts",
+        field_type: FieldType::Secret,
+        required: false,
+        restart_required: false,
+        default: None,
+        description: "Device key copied from the operator Bark Push URL. Never returned by the Settings API or written to logs.",
+        placeholder: Some("Bark device key"),
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY",
+        label: "Bark minimum severity",
+        group: "Bark alerts",
+        field_type: FieldType::Select,
+        required: false,
+        restart_required: false,
+        default: Some("warning"),
+        description: "Lowest incident severity delivered to the operator Bark device.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::Alerting),
+    },
 ];
 
 pub fn schema_response() -> SettingsSchemaResponse {
@@ -1903,7 +2076,8 @@ fn field_to_view(field: &SettingsField) -> SettingsFieldView {
             "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE" => {
                 vec!["disabled".into(), "shadow".into(), "enabled".into()]
             }
-            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY"
+            | "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
                 vec!["info".into(), "warning".into(), "critical".into()]
             }
             "CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE" => {
@@ -1930,7 +2104,9 @@ fn category_for_group(group: &str) -> SettingsCategory {
         | "Client notifications"
         | "Alerting"
         | "Telegram alerts"
-        | "Telegram bot" => SettingsCategory::Notifications,
+        | "Telegram bot"
+        | "Bark alerts"
+        | "Bark channel" => SettingsCategory::Notifications,
         "Metrics" | "Clock health" | "Server logs" => SettingsCategory::Observability,
         "Free share" | "Market billing" | "Binance settlement" | "Client Market" => {
             SettingsCategory::Marketplace
@@ -1957,7 +2133,10 @@ fn risk_for_field(field: &SettingsField) -> RiskLevel {
         | "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY"
         | "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION"
         | "CC_SWITCH_ROUTER_BINANCE_API_BASE"
-        | "CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION" => RiskLevel::Critical,
+        | "CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION"
+        | "CC_SWITCH_ROUTER_BARK_SERVER_URL"
+        | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY"
+        | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION" => RiskLevel::Critical,
         _ if field.restart_required || matches!(field.field_type, FieldType::Secret) => {
             RiskLevel::Caution
         }
@@ -2077,6 +2256,9 @@ fn constraints_for_field(key: &str) -> FieldConstraints {
         "CC_SWITCH_ROUTER_TELEGRAM_BIND_TOKEN_TTL_SECS" => Some((60.0, 86_400.0)),
         "CC_SWITCH_ROUTER_TELEGRAM_RECIPIENT_HOURLY_LIMIT" => Some((1.0, 1_000.0)),
         "CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT" => Some((1.0, 10_000.0)),
+        "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION" => Some((1.0, 1_000_000.0)),
+        "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT" => Some((1.0, 1_000.0)),
+        "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT" => Some((1.0, 10_000.0)),
         _ => None,
     };
     if key == "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" {
@@ -2138,6 +2320,18 @@ fn dependencies_for_field(key: &str) -> Vec<FieldDependency> {
         }
         "CC_SWITCH_ROUTER_TELEGRAM_WEBHOOK_SECRET" => {
             Some(("CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE", "webhook"))
+        }
+        "CC_SWITCH_ROUTER_BARK_SERVER_URL"
+        | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY"
+        | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION"
+        | "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT"
+        | "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT" => {
+            Some(("CC_SWITCH_ROUTER_BARK_ENABLED", "true"))
+        }
+        "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL"
+        | "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY"
+        | "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
+            Some(("CC_SWITCH_ROUTER_ALERT_BARK_ENABLED", "true"))
         }
         "CC_SWITCH_ROUTER_METRICS_DB_PATH"
         | "CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS"
@@ -2263,7 +2457,7 @@ fn value_entries(
     SETTINGS_FIELDS
         .iter()
         .map(|field| {
-            let (source, configured) = configured_value(field, file_kv);
+            let (source, configured) = configured_value(field, file_kv, runtime);
             let live_dynamic = if field.dynamic_group.is_some() {
                 dynamic_state
                     .map(|(dynamic, config)| dynamic_effective_value(field, dynamic, config))
@@ -2290,7 +2484,7 @@ fn value_entries(
                 let source = if runtime.startup_file_keys.contains(field.key) {
                     ValueSource::EnvFile
                 } else {
-                    ValueSource::Default
+                    ValueSource::Runtime
                 };
                 (source, Some(value.clone()))
             } else {
@@ -2430,6 +2624,14 @@ fn dynamic_effective_value(
         "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
             non_empty_value(dynamic.alerting.telegram_min_severity.clone())
         }
+        "CC_SWITCH_ROUTER_ALERT_BARK_ENABLED" => Some(dynamic.alerting.bark_enabled.to_string()),
+        "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL" => {
+            non_empty_value(dynamic.alerting.bark_server_url.clone())
+        }
+        "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY" => dynamic.alerting.bark_device_key.clone(),
+        "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
+            non_empty_value(dynamic.alerting.bark_min_severity.clone())
+        }
         "CC_SWITCH_ROUTER_TELEGRAM_BOT_ENABLED" => Some(dynamic.telegram_bot.enabled.to_string()),
         "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN" => dynamic.telegram_bot.bot_token.clone(),
         "CC_SWITCH_ROUTER_TELEGRAM_BOT_MODE" => {
@@ -2444,6 +2646,14 @@ fn dynamic_effective_value(
         }
         "CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT" => {
             Some(dynamic.telegram_bot.global_hourly_limit.to_string())
+        }
+        "CC_SWITCH_ROUTER_BARK_ENABLED" => Some(dynamic.bark.enabled.to_string()),
+        "CC_SWITCH_ROUTER_BARK_SERVER_URL" => non_empty_value(dynamic.bark.server_url.clone()),
+        "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT" => {
+            Some(dynamic.bark.recipient_hourly_limit.to_string())
+        }
+        "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT" => {
+            Some(dynamic.bark.global_hourly_limit.to_string())
         }
         _ => {
             return Err(AppError::Internal(format!(
@@ -2504,12 +2714,27 @@ fn dynamic_effective_source(
 fn configured_value(
     field: &SettingsField,
     file_kv: &HashMap<String, String>,
+    runtime: &SettingsRuntimeSnapshot,
 ) -> (ValueSource, Option<String>) {
     if let Some(value) = file_kv
         .get(field.key)
         .filter(|value| !value.trim().is_empty())
     {
         return (ValueSource::EnvFile, Some(value.clone()));
+    }
+    // A launcher/systemd value outside the managed file is still the current
+    // configuration. Treat it as runtime-sourced so it is shown as present
+    // (while secrets remain redacted) and is not falsely labelled as waiting
+    // for restart. A key removed from, or explicitly cleared in, the file must
+    // retain the restart boundary instead of falling back to the boot value.
+    if !file_kv.contains_key(field.key)
+        && !runtime.startup_file_keys.contains(field.key)
+        && let Some(value) = runtime
+            .startup_effective
+            .get(field.key)
+            .filter(|value| !value.trim().is_empty())
+    {
+        return (ValueSource::Runtime, Some(value.clone()));
     }
     match resolved_default_value(field) {
         Some(value) => (ValueSource::Default, Some(value)),
@@ -2563,11 +2788,28 @@ fn normalized_field_comparison(field: &SettingsField, value: Option<&str>) -> Op
         .or_else(|| normalized_comparison(Some(value)))
 }
 
+#[cfg(test)]
 pub fn validation_response(
     existing: &HashMap<String, String>,
     updates: &BTreeMap<String, Option<String>>,
 ) -> SettingsValidationResponse {
-    match validate_and_diff(existing, updates) {
+    validation_response_inner(existing, updates, None)
+}
+
+pub fn validation_response_with_runtime(
+    existing: &HashMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    runtime: &SettingsRuntimeSnapshot,
+) -> SettingsValidationResponse {
+    validation_response_inner(existing, updates, Some(runtime))
+}
+
+fn validation_response_inner(
+    existing: &HashMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    runtime: Option<&SettingsRuntimeSnapshot>,
+) -> SettingsValidationResponse {
+    match validate_and_diff_inner(existing, updates, runtime) {
         Ok(outcome) => SettingsValidationResponse {
             valid: true,
             field_errors: BTreeMap::new(),
@@ -2614,9 +2856,26 @@ pub struct ApplyOutcome {
 /// Validate updates against the schema and compute the new in-memory env
 /// state. Does not touch disk — the caller writes the file under the same
 /// lock that protects DynamicSettings.
+#[cfg(test)]
 pub fn validate_and_diff(
     existing: &HashMap<String, String>,
     updates: &BTreeMap<String, Option<String>>,
+) -> Result<ApplyOutcome, AppError> {
+    validate_and_diff_inner(existing, updates, None)
+}
+
+pub fn validate_and_diff_with_runtime(
+    existing: &HashMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    runtime: &SettingsRuntimeSnapshot,
+) -> Result<ApplyOutcome, AppError> {
+    validate_and_diff_inner(existing, updates, Some(runtime))
+}
+
+fn validate_and_diff_inner(
+    existing: &HashMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    runtime: Option<&SettingsRuntimeSnapshot>,
 ) -> Result<ApplyOutcome, AppError> {
     let mut updated = Vec::new();
     let mut unchanged = Vec::new();
@@ -2688,6 +2947,10 @@ pub fn validate_and_diff(
     validate_client_notification_relations(&effective_next, updates)?;
     validate_alerting_relations(&effective_next, updates)?;
     validate_telegram_bot_relations(&effective_next, updates)?;
+    // Bark's runtime-aware validation must retain explicit empty entries:
+    // they deliberately shadow credentials supplied by the service
+    // environment. The other relation validators consume the compacted map.
+    validate_bark_relations(&next, updates, runtime)?;
     validate_database_relations(&effective_next, updates)?;
     validate_ssh_transport_relations(&effective_next, updates)?;
     validate_proxy_stream_relations(&effective_next, updates)?;
@@ -2898,7 +3161,8 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                     .map(|mode| Some(mode.as_str().to_string()))
                     .map_err(|error| AppError::BadRequest(error.to_string()))
             }
-            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY"
+            | "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
                 match trimmed.to_ascii_lowercase().as_str() {
                     "info" | "warning" | "critical" => Ok(Some(trimmed.to_ascii_lowercase())),
                     _ => Err(AppError::BadRequest(format!(
@@ -2984,6 +3248,14 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             }),
         FieldType::UrlList => normalize_url_list(field.key, trimmed).map(Some),
         FieldType::Url => {
+            if matches!(
+                field.key,
+                "CC_SWITCH_ROUTER_BARK_SERVER_URL" | "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL"
+            ) {
+                return crate::bark::normalize_server_url(trimmed)
+                    .map(Some)
+                    .map_err(|message| AppError::BadRequest(format!("{}: {message}", field.key)));
+            }
             let parsed = url::Url::parse(trimmed).map_err(|_| {
                 AppError::BadRequest(format!("{} must be a valid URL, got: {raw}", field.key))
             })?;
@@ -3071,6 +3343,20 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                     field.key
                 )));
             }
+            Ok(Some(trimmed.to_string()))
+        }
+        FieldType::Secret if field.key == "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY" => {
+            let settings = crate::config::BarkSettings {
+                credential_master_key: Some(trimmed.to_string()),
+                ..crate::config::BarkSettings::default()
+            };
+            crate::bark::CredentialCipher::from_settings(&settings)
+                .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
+            Ok(Some(trimmed.to_string()))
+        }
+        FieldType::Secret if field.key == "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY" => {
+            crate::bark::validate_device_key(trimmed)
+                .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
             Ok(Some(trimmed.to_string()))
         }
         FieldType::Path | FieldType::Text | FieldType::Secret => Ok(Some(trimmed.to_string())),
@@ -3673,6 +3959,10 @@ fn validate_alerting_relations(
         "CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID",
         "CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID",
         "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY",
+        "CC_SWITCH_ROUTER_ALERT_BARK_ENABLED",
+        "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL",
+        "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY",
+        "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY",
     ];
     if !updates.keys().any(|key| ALERT_KEYS.contains(&key.as_str())) {
         return Ok(());
@@ -3699,7 +3989,116 @@ fn validate_alerting_relations(
             }
         }
     }
+    if enabled("CC_SWITCH_ROUTER_ALERT_BARK_ENABLED") {
+        let server_key = "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL";
+        let server_url = configured(server_key).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "{server_key} is required when Bark alerts are enabled"
+            ))
+        })?;
+        crate::bark::normalize_server_url(&server_url)
+            .map_err(|message| AppError::BadRequest(format!("{server_key}: {message}")))?;
+
+        let device_key_name = "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY";
+        let device_key = configured(device_key_name).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "{device_key_name} is required when Bark alerts are enabled"
+            ))
+        })?;
+        crate::bark::validate_device_key(&device_key)
+            .map_err(|error| AppError::BadRequest(format!("{device_key_name}: {error}")))?;
+    }
     Ok(())
+}
+
+fn validate_bark_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+    runtime: Option<&SettingsRuntimeSnapshot>,
+) -> Result<(), AppError> {
+    const KEYS: &[&str] = &[
+        "CC_SWITCH_ROUTER_BARK_ENABLED",
+        "CC_SWITCH_ROUTER_BARK_SERVER_URL",
+        "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
+        "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION",
+        "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT",
+        "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT",
+    ];
+    if !updates.keys().any(|key| KEYS.contains(&key.as_str())) {
+        return Ok(());
+    }
+    let value = |key: &str| bark_relation_value(next, key, runtime);
+    let enabled = value(KEYS[0])?.as_deref().is_some_and(parse_bool_truthy);
+    let server_url = value(KEYS[1])?.unwrap_or_default();
+    crate::bark::normalize_server_url(&server_url)
+        .map_err(|message| AppError::BadRequest(format!("{}: {message}", KEYS[1])))?;
+
+    let master_key = value(KEYS[2])?;
+    if enabled && master_key.is_none() {
+        return Err(AppError::BadRequest(format!(
+            "{} is required when Bark user notifications are enabled",
+            KEYS[2]
+        )));
+    }
+    if let Some(master_key) = master_key.as_deref() {
+        let version = bark_relation_i64(next, KEYS[3], runtime)?;
+        let settings = crate::config::BarkSettings {
+            credential_master_key: Some(master_key.to_string()),
+            credential_key_version: version,
+            ..crate::config::BarkSettings::default()
+        };
+        crate::bark::CredentialCipher::from_settings(&settings)
+            .map_err(|error| AppError::BadRequest(format!("{}: {error}", KEYS[2])))?;
+    }
+
+    let recipient_cap = bark_relation_i64(next, KEYS[4], runtime)?;
+    let global_cap = bark_relation_i64(next, KEYS[5], runtime)?;
+    if recipient_cap > global_cap {
+        return Err(AppError::BadRequest(format!(
+            "{} ({recipient_cap}) cannot exceed {} ({global_cap})",
+            KEYS[4], KEYS[5]
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the persisted Bark value that will be effective after restart.
+/// Values injected outside the managed env file remain in force when that file
+/// has no override, but are used only for validation and are never copied into
+/// `ApplyOutcome::new_env_kv`.
+fn bark_relation_value(
+    next: &BTreeMap<String, String>,
+    key: &str,
+    runtime: Option<&SettingsRuntimeSnapshot>,
+) -> Result<Option<String>, AppError> {
+    let field = field_by_key(key)
+        .ok_or_else(|| AppError::Internal(format!("missing settings schema field: {key}")))?;
+    Ok(next
+        .get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            runtime
+                .filter(|snapshot| {
+                    !next.contains_key(key) && !snapshot.startup_file_keys.contains(key)
+                })
+                .and_then(|snapshot| snapshot.startup_effective.get(key))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| resolved_default_value(field)))
+}
+
+fn bark_relation_i64(
+    next: &BTreeMap<String, String>,
+    key: &str,
+    runtime: Option<&SettingsRuntimeSnapshot>,
+) -> Result<i64, AppError> {
+    let value = bark_relation_value(next, key, runtime)?
+        .ok_or_else(|| AppError::Internal(format!("missing settings default: {key}")))?;
+    value
+        .parse::<i64>()
+        .map_err(|_| AppError::BadRequest(format!("{key} must be an integer, got: {value}")))
 }
 
 /// The user-facing bot has three interlocking requirements that are cheap to
@@ -4003,6 +4402,21 @@ pub fn apply_updates_to_dynamic(
                 current.alerting.telegram_min_severity =
                     value.unwrap_or("warning").to_ascii_lowercase();
             }
+            "CC_SWITCH_ROUTER_ALERT_BARK_ENABLED" => {
+                current.alerting.bark_enabled = value.map(parse_bool_truthy).unwrap_or(false);
+            }
+            "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL" => {
+                current.alerting.bark_server_url = value
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::config::DEFAULT_BARK_SERVER_URL.to_string());
+            }
+            "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY" => {
+                current.alerting.bark_device_key = value.map(str::to_string);
+            }
+            "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
+                current.alerting.bark_min_severity =
+                    value.unwrap_or("warning").to_ascii_lowercase();
+            }
             "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED" => {
                 current.client_notifications.enabled = value.map(parse_bool_truthy).unwrap_or(true);
             }
@@ -4083,6 +4497,21 @@ pub fn apply_updates_to_dynamic(
             "CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT" => {
                 current.telegram_bot.global_hourly_limit =
                     value.and_then(|v| v.parse().ok()).unwrap_or(50);
+            }
+            "CC_SWITCH_ROUTER_BARK_ENABLED" => {
+                current.bark.enabled = value.map(parse_bool_truthy).unwrap_or(false);
+            }
+            "CC_SWITCH_ROUTER_BARK_SERVER_URL" => {
+                current.bark.server_url = value
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::config::DEFAULT_BARK_SERVER_URL.to_string());
+            }
+            "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT" => {
+                current.bark.recipient_hourly_limit =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(10);
+            }
+            "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT" => {
+                current.bark.global_hourly_limit = value.and_then(|v| v.parse().ok()).unwrap_or(50);
             }
             "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" => {
                 current.market_usd_cny_rate_micros = value
@@ -4308,6 +4737,25 @@ mod tests {
     }
 
     #[test]
+    fn alert_channel_severity_selects_share_canonical_validation() {
+        for key in [
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY",
+            "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY",
+        ] {
+            let field = field_by_key(key).expect("severity setting");
+            assert_eq!(
+                normalize_value(field, " CrItIcAl ").unwrap(),
+                Some("critical".into()),
+                "{key} should be normalized"
+            );
+            assert!(
+                normalize_value(field, "debug").is_err(),
+                "{key} should reject unsupported severities"
+            );
+        }
+    }
+
+    #[test]
     fn alert_channels_require_complete_credentials() {
         let existing = HashMap::new();
         let mut telegram = BTreeMap::from([
@@ -4328,6 +4776,188 @@ mod tests {
             Some("-100123".into()),
         );
         assert!(validate_and_diff(&existing, &telegram).is_ok());
+
+        let mut bark = BTreeMap::from([(
+            "CC_SWITCH_ROUTER_ALERT_BARK_ENABLED".into(),
+            Some("true".into()),
+        )]);
+        assert!(validate_and_diff(&existing, &bark).is_err());
+        bark.insert(
+            "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL".into(),
+            Some("https://api.day.app".into()),
+        );
+        bark.insert(
+            "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY".into(),
+            Some("device_key_123".into()),
+        );
+        assert!(validate_and_diff(&existing, &bark).is_ok());
+
+        let invalid_existing = HashMap::from([
+            (
+                "CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL".into(),
+                "http://bark.example.com".into(),
+            ),
+            (
+                "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY".into(),
+                "device_key_123".into(),
+            ),
+        ]);
+        let enable_only = BTreeMap::from([(
+            "CC_SWITCH_ROUTER_ALERT_BARK_ENABLED".into(),
+            Some("true".into()),
+        )]);
+        assert!(
+            validate_and_diff(&invalid_existing, &enable_only).is_err(),
+            "enabling must validate pre-existing Bark credentials too"
+        );
+    }
+
+    #[test]
+    fn bark_user_settings_require_a_boot_key_and_consistent_caps() {
+        let existing = HashMap::new();
+        let mut updates =
+            BTreeMap::from([("CC_SWITCH_ROUTER_BARK_ENABLED".into(), Some("true".into()))]);
+        assert!(validate_and_diff(&existing, &updates).is_err());
+        updates.insert(
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+            Some("11".repeat(32)),
+        );
+        updates.insert(
+            "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT".into(),
+            Some("51".into()),
+        );
+        assert!(validate_and_diff(&existing, &updates).is_err());
+        updates.insert(
+            "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT".into(),
+            Some("100".into()),
+        );
+        let outcome = validate_and_diff(&existing, &updates).expect("valid Bark settings");
+        assert!(
+            outcome
+                .restart_required_keys
+                .contains(&"CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into())
+        );
+        assert!(
+            outcome
+                .dynamic_groups
+                .iter()
+                .any(|group| matches!(group, DynamicGroup::Bark))
+        );
+    }
+
+    #[test]
+    fn bark_credential_gate_honors_external_boot_values_and_fences_overrides() {
+        let boot_key = "11".repeat(32);
+        let runtime = SettingsRuntimeSnapshot {
+            startup_effective: Arc::new(HashMap::from([
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+                    boot_key.clone(),
+                ),
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION".into(),
+                    "2".into(),
+                ),
+            ])),
+            // These values came from the service environment, not `.env`.
+            startup_file_keys: Arc::new(HashSet::new()),
+        };
+        let mut configured = BTreeMap::new();
+        assert!(runtime.bark_credentials_current_in(&configured));
+
+        configured.insert(
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+            "22".repeat(32),
+        );
+        assert!(!runtime.bark_credentials_current_in(&configured));
+        configured.insert(
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+            boot_key,
+        );
+        configured.insert(
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION".into(),
+            "3".into(),
+        );
+        assert!(!runtime.bark_credentials_current_in(&configured));
+    }
+
+    #[test]
+    fn bark_enable_accepts_external_boot_key_without_persisting_it() {
+        let runtime = SettingsRuntimeSnapshot {
+            startup_effective: Arc::new(HashMap::from([
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+                    "11".repeat(32),
+                ),
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION".into(),
+                    "2".into(),
+                ),
+            ])),
+            // The launcher supplied both values outside the managed `.env`.
+            startup_file_keys: Arc::new(HashSet::new()),
+        };
+        let existing = HashMap::new();
+        let updates =
+            BTreeMap::from([("CC_SWITCH_ROUTER_BARK_ENABLED".into(), Some("true".into()))]);
+
+        let validation = validation_response_with_runtime(&existing, &updates, &runtime);
+        assert!(validation.valid, "{validation:?}");
+
+        let outcome = validate_and_diff_with_runtime(&existing, &updates, &runtime)
+            .expect("external boot key should satisfy Bark enable validation");
+        assert_eq!(
+            outcome
+                .new_env_kv
+                .get("CC_SWITCH_ROUTER_BARK_ENABLED")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            !outcome
+                .new_env_kv
+                .contains_key("CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY"),
+            "external secrets must not be copied into the managed env file"
+        );
+        assert!(
+            !outcome
+                .new_env_kv
+                .contains_key("CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION"),
+            "external key metadata must not be copied into the managed env file"
+        );
+    }
+
+    #[test]
+    fn explicitly_clearing_external_bark_credentials_fences_and_rejects_enable() {
+        let runtime = SettingsRuntimeSnapshot {
+            startup_effective: Arc::new(HashMap::from([
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+                    "11".repeat(32),
+                ),
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION".into(),
+                    "2".into(),
+                ),
+            ])),
+            startup_file_keys: Arc::new(HashSet::new()),
+        };
+        let cleared = BTreeMap::from([(
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+            String::new(),
+        )]);
+        assert!(
+            !runtime.bark_credentials_current_in(&cleared),
+            "an explicit empty file entry must override the external boot key"
+        );
+
+        let updates = BTreeMap::from([
+            ("CC_SWITCH_ROUTER_BARK_ENABLED".into(), Some("true".into())),
+            ("CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(), None),
+        ]);
+        let error = validate_and_diff_with_runtime(&HashMap::new(), &updates, &runtime)
+            .expect_err("Bark cannot remain enabled after its external key is cleared");
+        assert!(error.to_string().contains("required"), "{error}");
     }
 
     #[test]
@@ -4338,7 +4968,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN=telegram-secret\n",
+            "CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN=telegram-secret\nCC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY=bark-device-secret\nCC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY=1111111111111111111111111111111111111111111111111111111111111111\n",
         )
         .expect("write alert settings fixture");
 
@@ -4351,6 +4981,20 @@ mod tests {
         assert!(entry.is_secret);
         assert!(entry.has_value);
         assert!(entry.value.is_none());
+        for key in [
+            "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY",
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
+        ] {
+            let entry = response
+                .values
+                .iter()
+                .find(|entry| entry.key == key)
+                .expect("Bark secret entry");
+            assert!(entry.is_secret);
+            assert!(entry.has_value);
+            assert!(entry.value.is_none());
+            assert!(entry.effective_value.is_none());
+        }
         let _ = std::fs::remove_file(path);
     }
 
@@ -4980,8 +5624,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 125);
-        assert_eq!(schema.fields.len(), 125);
+        assert_eq!(SETTINGS_FIELDS.len(), 135);
+        assert_eq!(schema.fields.len(), 135);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -4995,7 +5639,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            125
+            135
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema
@@ -5047,6 +5691,18 @@ mod tests {
             .expect("Binance poll interval field");
         assert_eq!(binance_poll.constraints.min, Some(2.0));
         assert_eq!(binance_poll.constraints.max, Some(60.0));
+        for key in [
+            "CC_SWITCH_ROUTER_BARK_SERVER_URL",
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
+            "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION",
+        ] {
+            let field = schema
+                .fields
+                .iter()
+                .find(|field| field.key == key)
+                .expect("Bark credential field");
+            assert!(matches!(field.risk, RiskLevel::Critical), "{key}");
+        }
         assert!(matches!(binance_poll.risk, RiskLevel::Caution));
     }
 
@@ -5127,6 +5783,72 @@ mod tests {
                 .pending_restart_keys
                 .contains(&"CC_SWITCH_ROUTER_ALERTING_ENABLED".to_string())
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_snapshot_treats_external_bark_credentials_as_current_runtime_values() {
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-settings-external-bark-{}.env",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "").expect("write empty settings fixture");
+        let runtime = SettingsRuntimeSnapshot {
+            startup_effective: Arc::new(HashMap::from([
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY".into(),
+                    "11".repeat(32),
+                ),
+                (
+                    "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION".into(),
+                    "2".into(),
+                ),
+            ])),
+            startup_file_keys: Arc::new(HashSet::new()),
+        };
+        let config = test_static_config();
+        let dynamic = DynamicSettings::from_config(&config);
+
+        let snapshot = snapshot_response(&path, &runtime, &dynamic, &config)
+            .expect("settings snapshot with external Bark credentials");
+        let master_key = snapshot
+            .values
+            .iter()
+            .find(|entry| entry.key == "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY")
+            .expect("Bark master key entry");
+        assert_eq!(master_key.source, ValueSource::Runtime);
+        assert_eq!(master_key.effective_source, ValueSource::Runtime);
+        assert!(master_key.has_value);
+        assert!(master_key.effective_has_value);
+        assert!(!master_key.pending_restart);
+        assert!(master_key.value.is_none());
+        assert!(master_key.effective_value.is_none());
+
+        let version = snapshot
+            .values
+            .iter()
+            .find(|entry| entry.key == "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION")
+            .expect("Bark key version entry");
+        assert_eq!(version.source, ValueSource::Runtime);
+        assert_eq!(version.effective_source, ValueSource::Runtime);
+        assert_eq!(version.value.as_deref(), Some("2"));
+        assert!(!version.pending_restart);
+
+        std::fs::write(&path, "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY=\n")
+            .expect("explicitly clear external Bark key");
+        let cleared = snapshot_response(&path, &runtime, &dynamic, &config)
+            .expect("settings snapshot after explicit Bark key clear");
+        let master_key = cleared
+            .values
+            .iter()
+            .find(|entry| entry.key == "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY")
+            .expect("cleared Bark master key entry");
+        assert_eq!(master_key.source, ValueSource::Unset);
+        assert_eq!(master_key.effective_source, ValueSource::Runtime);
+        assert!(!master_key.has_value);
+        assert!(master_key.effective_has_value);
+        assert!(master_key.pending_restart);
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -5351,6 +6073,7 @@ mod tests {
             resend_reply_to: None,
             client_notifications: crate::config::ClientNotificationSettings::default(),
             telegram_bot: crate::config::TelegramBotSettings::default(),
+            bark: crate::config::BarkSettings::default(),
             auth_code_ttl_secs: 300,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 1800,

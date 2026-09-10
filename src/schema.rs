@@ -137,6 +137,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         37,
         include_str!("../schema/0037_binance_auto_settlement.sql"),
     ),
+    (
+        38,
+        include_str!("../schema/0038_bark_notification_channels.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -664,7 +668,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 135);
+        assert_eq!(table_count, 137);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -748,6 +752,7 @@ mod tests {
         assert_eq!(versions[34], (35, migration_checksum(MIGRATIONS[33].1)));
         assert_eq!(versions[35], (36, migration_checksum(MIGRATIONS[34].1)));
         assert_eq!(versions[36], (37, migration_checksum(MIGRATIONS[35].1)));
+        assert_eq!(versions[37], (38, migration_checksum(MIGRATIONS[36].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1102,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_37_upgrade_a_version_26_database() {
+    fn migrations_27_through_38_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1165,13 +1170,74 @@ mod tests {
             )
             .expect("count upgrade rollout indexes after upgrade");
         assert_eq!(rollout_indexes, 1);
+        let bark_tables = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                    'bark_binding_attempts', 'bark_provider_runtime'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Bark notification tables after upgrade");
+        assert_eq!(bark_tables, 2);
+        let bark_runtime_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('client_notification_runtime')
+                 WHERE name IN ('bark_recipient_hourly_limit', 'bark_global_hourly_limit')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Bark notification runtime columns after upgrade");
+        assert_eq!(bark_runtime_columns, 2);
+        let bark_binding_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('user_notification_channels')
+                 WHERE name IN ('credential_revision', 'credential_key_fingerprint')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Bark binding credential columns after upgrade");
+        assert_eq!(bark_binding_columns, 2);
+        let bark_delivery_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('notification_deliveries')
+                 WHERE name = 'credential_revision'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Bark delivery credential columns after upgrade");
+        assert_eq!(bark_delivery_columns, 1);
+        let bark_provider_columns = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('bark_provider_runtime')
+                 WHERE name IN (
+                    'config_fingerprint', 'binding_config_fingerprint', 'generation', 'enabled'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Bark Provider fencing columns after upgrade");
+        assert_eq!(bark_provider_columns, 4);
+        let binding_cleanup_indexes = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                    'idx_bark_binding_attempts_created_at',
+                    'idx_telegram_bind_tokens_created_at'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count notification binding cleanup indexes");
+        assert_eq!(binding_cleanup_indexes, 2);
         let latest_version = conn
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 37);
-        check_compatibility(&conn).expect("upgraded version 37 is compatible");
+        assert_eq!(latest_version, 38);
+        check_compatibility(&conn).expect("upgraded version 38 is compatible");
     }
 
     #[test]
@@ -1233,7 +1299,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 37);
+        assert_eq!(latest_version, 38);
     }
 
     #[test]
@@ -1257,7 +1323,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 37);
+        assert_eq!(latest_version, 38);
     }
 
     #[test]
@@ -1437,7 +1503,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 37);
+        assert_eq!(latest_version, 38);
     }
 
     #[test]

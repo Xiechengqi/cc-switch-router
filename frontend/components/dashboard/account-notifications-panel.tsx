@@ -1,16 +1,18 @@
 "use client";
 
 import * as React from "react";
-import { Button } from "@heroui/react";
-import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, Send, Unlink } from "lucide-react";
+import { Button, Input } from "@heroui/react";
+import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, Send, Smartphone, Unlink } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   ApiError,
+  bindMyBark,
   createTelegramBindLink,
   getMyNotificationSettings,
   unbindMyTelegramChat,
+  unbindMyBark,
   updateMyNotificationSettings,
 } from "@/lib/api";
 import type { NotificationChannelSettings, NotificationSettings, TelegramBindLink } from "@/lib/types";
@@ -25,10 +27,14 @@ const BOT_ERROR_STATUS_POLL_INTERVAL_MS = 10_000;
 type ChannelOption = {
   value: string;
   icon: typeof Mail;
-  labelKey: "account.notifications.channel.email" | "account.notifications.channel.telegram";
+  labelKey:
+    | "account.notifications.channel.email"
+    | "account.notifications.channel.telegram"
+    | "account.notifications.channel.bark";
   hintKey:
     | "account.notifications.channel.emailHint"
-    | "account.notifications.channel.telegramHint";
+    | "account.notifications.channel.telegramHint"
+    | "account.notifications.channel.barkHint";
 };
 
 const CHANNEL_OPTIONS: ChannelOption[] = [
@@ -44,6 +50,12 @@ const CHANNEL_OPTIONS: ChannelOption[] = [
     labelKey: "account.notifications.channel.telegram",
     hintKey: "account.notifications.channel.telegramHint",
   },
+  {
+    value: "bark",
+    icon: Smartphone,
+    labelKey: "account.notifications.channel.bark",
+    hintKey: "account.notifications.channel.barkHint",
+  },
 ];
 
 export function AccountNotificationsPanel() {
@@ -54,18 +66,21 @@ export function AccountNotificationsPanel() {
   const [settings, setSettings] = React.useState<NotificationSettings | null>(null);
   const [bindLink, setBindLink] = React.useState<TelegramBindLink | null>(null);
   const [loading, setLoading] = React.useState(true);
-  const [busy, setBusy] = React.useState(false);
+  const [busyAction, setBusyAction] = React.useState("");
   const [waitingForBind, setWaitingForBind] = React.useState(false);
   const [error, setError] = React.useState("");
   const [unbindOpen, setUnbindOpen] = React.useState(false);
+  const [barkUnbindOpen, setBarkUnbindOpen] = React.useState(false);
+  const [barkPushUrl, setBarkPushUrl] = React.useState("");
   const [bindBaselineVerifiedAt, setBindBaselineVerifiedAt] = React.useState<string | undefined>();
+  const busy = busyAction !== "";
 
   const load = React.useCallback(async () => {
     setError("");
     try {
       setSettings(await getMyNotificationSettings());
     } catch (err) {
-      setError(formatTelegramError(err, t));
+      setError(formatNotificationError(err, t));
     } finally {
       setLoading(false);
     }
@@ -153,19 +168,19 @@ export function AccountNotificationsPanel() {
   // rather than adding to it, which is exactly what the API models.
   const selectChannel = async (channel: string) => {
     if (!settings || busy || settings.deliveryChannel === channel) return;
-    setBusy(true);
+    setBusyAction(`select:${channel}`);
     setError("");
     try {
       setSettings(await updateMyNotificationSettings(channel));
     } catch (err) {
-      setError(formatTelegramError(err, t));
+      setError(formatNotificationError(err, t));
     } finally {
-      setBusy(false);
+      setBusyAction("");
     }
   };
 
   const startBinding = async () => {
-    setBusy(true);
+    setBusyAction("telegram-bind");
     setError("");
     // Opened before the await so the browser still attributes the tab to the
     // click; a blocked popup falls back to the link rendered below.
@@ -180,14 +195,14 @@ export function AccountNotificationsPanel() {
     } catch (err) {
       tab?.close();
       setBindBaselineVerifiedAt(undefined);
-      setError(formatTelegramError(err, t));
+      setError(formatNotificationError(err, t));
     } finally {
-      setBusy(false);
+      setBusyAction("");
     }
   };
 
   const unbind = async () => {
-    setBusy(true);
+    setBusyAction("telegram-unbind");
     setError("");
     try {
       setSettings(await unbindMyTelegramChat());
@@ -196,9 +211,38 @@ export function AccountNotificationsPanel() {
       setBindBaselineVerifiedAt(undefined);
       setUnbindOpen(false);
     } catch (err) {
-      setError(formatTelegramError(err, t));
+      setError(formatNotificationError(err, t));
     } finally {
-      setBusy(false);
+      setBusyAction("");
+    }
+  };
+
+  const bindBark = async () => {
+    const pushUrl = barkPushUrl.trim();
+    if (!pushUrl || busy) return;
+    setBusyAction("bark-bind");
+    setError("");
+    try {
+      setSettings(await bindMyBark(pushUrl));
+      setBarkPushUrl("");
+    } catch (err) {
+      setError(formatNotificationError(err, t));
+    } finally {
+      setBusyAction("");
+    }
+  };
+
+  const unbindBark = async () => {
+    setBusyAction("bark-unbind");
+    setError("");
+    try {
+      setSettings(await unbindMyBark());
+      setBarkPushUrl("");
+      setBarkUnbindOpen(false);
+    } catch (err) {
+      setError(formatNotificationError(err, t));
+    } finally {
+      setBusyAction("");
     }
   };
 
@@ -225,6 +269,7 @@ export function AccountNotificationsPanel() {
   }
 
   const telegram = channelSettings(settings, "telegram");
+  const bark = channelSettings(settings, "bark");
   const botStatus = settings?.telegramBotStatus ?? "disabled";
   const botConfigured = settings?.telegramBotConfigured === true;
   const botTransportDegraded = settings?.telegramBotTransportStatus === "degraded";
@@ -239,7 +284,10 @@ export function AccountNotificationsPanel() {
   const selectedChannel = settings?.deliveryChannel ?? "email";
   // The backend silently delivers to email when the selection cannot carry the
   // alert. Say so, instead of showing a Telegram selection that is not running.
-  const fallbackActive = selectedChannel === "telegram" && telegram?.available !== true;
+  const selectedSettings = channelSettings(settings, selectedChannel);
+  const fallbackActive = selectedChannel !== "email" && selectedSettings?.available !== true;
+  const barkBound = bark?.state === "ready";
+  const barkAvailable = bark?.available === true;
   const botHint = botReady
     ? t("account.notifications.telegramHint")
     : botReconciling
@@ -290,15 +338,19 @@ export function AccountNotificationsPanel() {
             const Icon = option.icon;
             const channel = channelSettings(settings, option.value);
             const selected = selectedChannel === option.value;
-            // Email is always a valid destination; Telegram needs a live bot
-            // and a bound chat before it can carry anything.
+            // Email is always valid; external channels need a live provider
+            // and a verified private target before they can carry anything.
             const usable = option.value === "email"
               || (channel?.state === "ready" && channel?.available === true);
             const reason = usable
               ? ""
               : channel?.state === "ready"
-                ? t("account.notifications.channel.botUnavailable")
-                : t("account.notifications.channel.needsBinding");
+                ? t(option.value === "bark"
+                  ? "account.notifications.channel.barkUnavailable"
+                  : "account.notifications.channel.botUnavailable")
+                : t(option.value === "bark"
+                  ? "account.notifications.channel.needsBarkBinding"
+                  : "account.notifications.channel.needsBinding");
             // Not disabled while busy: `selectChannel` already ignores the
             // change, and disabling the focused radio mid-request would drop
             // keyboard focus out of the group.
@@ -453,7 +505,9 @@ export function AccountNotificationsPanel() {
             isDisabled={!botReady || busy}
             onClick={() => void startBinding()}
           >
-            {busy || botReconciling ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />}
+            {busyAction === "telegram-bind" || botReconciling
+              ? <Loader2 className="h-4 w-4 animate-spin" />
+              : <ExternalLink className="h-4 w-4" />}
             {bound ? t("account.notifications.rebind") : t("account.notifications.bind")}
           </Button>
           {bound ? (
@@ -496,6 +550,118 @@ export function AccountNotificationsPanel() {
         ) : null}
       </section>
 
+      <section className="grid gap-3 rounded-xl border border-border bg-card p-4 sm:p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
+              <Smartphone className="h-4 w-4 text-muted-foreground" aria-hidden />
+              {t("account.notifications.barkTitle")}
+            </h3>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              {barkAvailable
+                ? t("account.notifications.barkHint")
+                : t("account.notifications.barkUnavailable")}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium",
+                barkAvailable ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600",
+              )}
+            >
+              <span className={cn("h-1.5 w-1.5 rounded-full", barkAvailable ? "bg-emerald-500" : "bg-slate-400")} aria-hidden />
+              {barkAvailable
+                ? t("account.notifications.barkReady")
+                : t("account.notifications.barkDisabled")}
+            </span>
+            <span
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium",
+                barkBound ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600",
+              )}
+            >
+              <span className={cn("h-1.5 w-1.5 rounded-full", barkBound ? "bg-emerald-500" : "bg-slate-400")} aria-hidden />
+              {barkBound ? t("account.notifications.bound") : t("account.notifications.notBound")}
+            </span>
+          </div>
+        </div>
+
+        {barkBound ? (
+          <div className="grid gap-2 text-sm">
+            {bark?.providerLabel ? (
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground">{t("account.notifications.barkServer")}</span>
+                <span className="min-w-0 max-w-[70%] truncate text-right font-mono">{bark.providerLabel}</span>
+              </div>
+            ) : null}
+            {bark?.targetLabel ? (
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground">{t("account.notifications.barkDevice")}</span>
+                <span className="font-mono">{bark.targetLabel}</span>
+              </div>
+            ) : null}
+            {bark?.verifiedAt ? (
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground">{t("account.notifications.boundAt")}</span>
+                <span className="tabular-nums">{formatDateTime(bark.verifiedAt, locale)}</span>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        <form
+          className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void bindBark();
+          }}
+        >
+          <label className="grid gap-1 text-sm">
+            <span className="text-muted-foreground">{t("account.notifications.barkPushUrl")}</span>
+            <Input
+              type="password"
+              inputMode="url"
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              aria-label={t("account.notifications.barkPushUrl")}
+              placeholder="https://api.day.app/••••••••"
+              value={barkPushUrl}
+              onChange={(event) => setBarkPushUrl(event.target.value)}
+              disabled={!barkAvailable || busy}
+            />
+          </label>
+          <Button
+            type="submit"
+            size="sm"
+            variant={barkBound ? "outline" : "primary"}
+            isDisabled={!barkAvailable || busy || !barkPushUrl.trim()}
+          >
+            {busyAction === "bark-bind"
+              ? <Loader2 className="h-4 w-4 animate-spin" />
+              : <Smartphone className="h-4 w-4" />}
+            {barkBound ? t("account.notifications.rebind") : t("account.notifications.barkBind")}
+          </Button>
+        </form>
+        <p className="text-xs text-muted-foreground">{t("account.notifications.barkPrivacy")}</p>
+        {barkBound ? (
+          <div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-rose-700"
+              isDisabled={busy}
+              onClick={() => setBarkUnbindOpen(true)}
+            >
+              <Unlink className="h-4 w-4" />
+              {t("account.notifications.unbind")}
+            </Button>
+          </div>
+        ) : null}
+      </section>
+
       <ConfirmAlertDialog
         open={unbindOpen}
         title={t("account.notifications.unbindConfirmTitle")}
@@ -506,6 +672,17 @@ export function AccountNotificationsPanel() {
         busy={busy}
         onConfirm={() => void unbind()}
         onOpenChange={(next) => !busy && setUnbindOpen(next)}
+      />
+      <ConfirmAlertDialog
+        open={barkUnbindOpen}
+        title={t("account.notifications.barkUnbindConfirmTitle")}
+        description={t("account.notifications.barkUnbindConfirmDescription")}
+        confirmLabel={t("account.notifications.unbind")}
+        cancelLabel={t("common.cancel")}
+        tone="danger"
+        busy={busy}
+        onConfirm={() => void unbindBark()}
+        onOpenChange={(next) => !busy && setBarkUnbindOpen(next)}
       />
     </div>
   );
@@ -521,13 +698,9 @@ function channelSettings(
 function AccountTelegramDiagnostic({ settings }: { settings: NotificationSettings }) {
   const { t } = useLocaleText();
   const code = settings.telegramBotFailureCode?.trim();
-  const key = code
-    ? `settings.alertChannels.diagnostic.${code}`
-    : "settings.alertChannels.diagnostic.legacy";
-  const translated = t(key as Parameters<typeof t>[0]);
-  const hint = translated === key
-    ? settings.telegramBotFailureHint || t("settings.alertChannels.diagnostic.legacy")
-    : translated;
+  const hint = translatedChannelDiagnostic(t, "telegram", code)
+    || settings.telegramBotFailureHint?.trim()
+    || t("settings.alertChannels.diagnostic.legacy");
   const details = settings.telegramBotFailureDetails;
   const resolved = formatDiagnosticAddresses(details?.resolvedAddresses);
   const reachable = formatDiagnosticAddresses(details?.reachableAddresses);
@@ -559,18 +732,65 @@ function formatDiagnosticAddresses(value: unknown) {
   return value.filter((item): item is string => typeof item === "string").join(", ");
 }
 
-function formatTelegramError(error: unknown, translate: ReturnType<typeof useLocaleText>["t"]) {
+function translatedChannelDiagnostic(
+  translate: ReturnType<typeof useLocaleText>["t"],
+  channel: string | undefined,
+  code: string | undefined,
+) {
+  if (!code) return "";
+  const keys = [
+    channel ? `settings.alertChannels.diagnostic.${channel}.${code}` : "",
+    `settings.alertChannels.diagnostic.${code}`,
+  ].filter(Boolean);
+  for (const rawKey of keys) {
+    const key = rawKey as Parameters<typeof translate>[0];
+    const translated = translate(key);
+    if (translated !== key) return translated;
+  }
+  return "";
+}
+
+function formatNotificationError(error: unknown, translate: ReturnType<typeof useLocaleText>["t"]) {
   if (error instanceof ApiError) {
     const code = error.details?.failureCode;
     if (typeof code === "string") {
-      const key = `settings.alertChannels.diagnostic.${code}` as Parameters<typeof translate>[0];
-      const translated = translate(key);
-      if (translated !== key) return translated;
+      const channel = typeof error.details?.channel === "string"
+        ? error.details.channel
+        : undefined;
+      const translated = translatedChannelDiagnostic(translate, channel, code.trim());
+      if (translated) return translated;
     }
     const hint = error.details?.failureHint;
     if (typeof hint === "string" && hint.trim()) return hint;
     if (error.code === "USER_NOTIFICATION_BOT_NOT_READY") {
       return translate("account.notifications.telegramUnavailable");
+    }
+    if (
+      error.code === "USER_NOTIFICATION_TELEGRAM_BINDING_REQUIRED"
+      || error.code === "USER_NOTIFICATION_TELEGRAM_REBIND_REQUIRED"
+    ) {
+      return translate("account.notifications.channel.needsBinding");
+    }
+    if (error.code === "USER_NOTIFICATION_BARK_PUSH_URL_INVALID") {
+      return translate("account.notifications.barkPushUrlInvalid");
+    }
+    if (error.code === "USER_NOTIFICATION_BARK_BIND_RATE_LIMITED") {
+      return translate("account.notifications.barkBindRateLimited");
+    }
+    if (
+      error.code === "USER_NOTIFICATION_BARK_NOT_READY"
+      || error.code === "USER_NOTIFICATION_BARK_PROVIDER_UNAVAILABLE"
+    ) {
+      return translate("account.notifications.barkUnavailable");
+    }
+    if (
+      error.code === "USER_NOTIFICATION_BARK_BINDING_REQUIRED"
+      || error.code === "USER_NOTIFICATION_BARK_REBIND_REQUIRED"
+    ) {
+      return translate("account.notifications.channel.needsBarkBinding");
+    }
+    if (error.code === "USER_NOTIFICATION_BARK_CONFIGURATION_CHANGED") {
+      return translate("account.notifications.barkConfigurationChanged");
     }
   }
   return error instanceof Error ? error.message : String(error);

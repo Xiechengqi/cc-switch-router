@@ -624,6 +624,7 @@ export type NotificationChannelSettings = {
   available: boolean;
   state: "ready" | "unbound" | "invalid" | string;
   targetLabel?: string;
+  providerLabel?: string;
   verifiedAt?: string;
 };
 

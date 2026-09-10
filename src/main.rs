@@ -2,6 +2,7 @@ mod abuse;
 mod admin;
 mod alerting;
 mod api;
+mod bark;
 mod binance_settlement;
 mod cf;
 mod client_chat;
@@ -1444,6 +1445,7 @@ fn validate_runtime_config(config: &Config) -> Result<()> {
     config
         .validate_proxy_stream_config()
         .map_err(anyhow::Error::msg)?;
+    config.validate_bark_config().map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -1526,7 +1528,11 @@ fn check_database_compatibility(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TunnelRouteProbe, active_route_is_healthy, filter_registered_route_targets};
+    use super::{
+        TunnelRouteProbe, active_route_is_healthy, filter_registered_route_targets,
+        validate_runtime_config,
+    };
+    use crate::config::Config;
     use crate::store::ShareRouteTarget;
 
     #[test]
@@ -1569,5 +1575,20 @@ mod tests {
         assert!(active_route_is_healthy(TunnelRouteProbe::Healthy));
         assert!(!active_route_is_healthy(TunnelRouteProbe::Unavailable));
         assert!(!active_route_is_healthy(TunnelRouteProbe::Unhealthy));
+    }
+
+    #[test]
+    fn check_config_runtime_path_rejects_invalid_bark_configuration() {
+        let mut config = Config::from_env();
+        config.use_localhost = true;
+        config.bark.enabled = false;
+        config.bark.server_url = "http://bark.example.com".into();
+        let error = validate_runtime_config(&config)
+            .expect_err("check-config validation must include Bark settings");
+        assert!(
+            error
+                .to_string()
+                .contains("CC_SWITCH_ROUTER_BARK_SERVER_URL")
+        );
     }
 }

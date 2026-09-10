@@ -4,6 +4,8 @@ use crate::error::AppError;
 
 pub const EMAIL_CHANNEL: &str = "email";
 pub const TELEGRAM_CHANNEL: &str = "telegram";
+pub const BARK_CHANNEL: &str = "bark";
+pub(crate) const CHANNEL_BINDING_AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NotificationChannelId(String);
@@ -32,6 +34,10 @@ impl NotificationChannelId {
         Self(TELEGRAM_CHANNEL.into())
     }
 
+    pub fn bark() -> Self {
+        Self(BARK_CHANNEL.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -42,6 +48,10 @@ impl NotificationChannelId {
 
     pub fn is_telegram(&self) -> bool {
         self.0 == TELEGRAM_CHANNEL
+    }
+
+    pub fn is_bark(&self) -> bool {
+        self.0 == BARK_CHANNEL
     }
 }
 
@@ -56,6 +66,7 @@ pub struct NotificationTarget {
     pub channel: NotificationChannelId,
     pub address: String,
     pub revision: i64,
+    pub credential_revision: i64,
     pub provider_identity: Option<String>,
 }
 
@@ -73,6 +84,7 @@ impl NotificationTargets {
                 channel: NotificationChannelId::email(),
                 address: email.clone(),
                 revision: 0,
+                credential_revision: 0,
                 provider_identity: None,
             }],
             email,
@@ -99,10 +111,14 @@ impl NotificationTargets {
         &self,
         telegram_available: bool,
         telegram_allowed: bool,
+        bark_available: bool,
+        bark_allowed: bool,
     ) -> Vec<NotificationTarget> {
         let selected = self.targets.iter().find(|target| {
             if target.channel.is_telegram() {
                 telegram_available && telegram_allowed
+            } else if target.channel.is_bark() {
+                bark_available && bark_allowed
             } else {
                 true
             }
@@ -113,6 +129,7 @@ impl NotificationTargets {
                 channel: NotificationChannelId::email(),
                 address: self.email.clone(),
                 revision: 0,
+                credential_revision: 0,
                 provider_identity: None,
             }],
         }
@@ -124,7 +141,7 @@ impl NotificationTargets {
 /// request, never a silent fallback to email.
 pub fn parse_delivery_channel(value: &str) -> Result<NotificationChannelId, AppError> {
     let channel = NotificationChannelId::parse(value)?;
-    if !channel.is_email() && !channel.is_telegram() {
+    if !channel.is_email() && !channel.is_telegram() && !channel.is_bark() {
         return Err(AppError::BadRequest(format!(
             "unsupported notification channel: {channel}"
         )));
@@ -161,6 +178,7 @@ mod tests {
                 .is_telegram()
         );
         assert!(parse_delivery_channel("EMAIL").expect("email").is_email());
+        assert!(parse_delivery_channel("bark").expect("bark").is_bark());
         // Storable, but not something a user can be switched onto yet.
         assert!(parse_delivery_channel("matrix_v2").is_err());
         assert!(parse_delivery_channel("").is_err());
@@ -174,10 +192,11 @@ mod tests {
                 channel: NotificationChannelId::telegram(),
                 address: "42".into(),
                 revision: 3,
+                credential_revision: 1,
                 provider_identity: Some("7".into()),
             }],
         };
-        let resolved = targets.delivery_targets(false, true);
+        let resolved = targets.delivery_targets(false, true, false, true);
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].channel.is_email());
         assert_eq!(resolved[0].address, "owner@example.com");
@@ -195,13 +214,34 @@ mod tests {
                 channel: NotificationChannelId::telegram(),
                 address: "42".into(),
                 revision: 3,
+                credential_revision: 1,
                 provider_identity: Some("7".into()),
             }],
         };
-        let resolved = targets.delivery_targets(true, true);
+        let resolved = targets.delivery_targets(true, true, false, true);
         assert_eq!(resolved.len(), 1, "one notification, one destination");
         assert!(resolved[0].channel.is_telegram());
         assert_eq!(resolved[0].revision, 3);
+    }
+
+    #[test]
+    fn bark_selection_uses_its_own_availability_and_falls_back_to_email() {
+        let targets = NotificationTargets {
+            email: "owner@example.com".into(),
+            targets: vec![NotificationTarget {
+                channel: NotificationChannelId::bark(),
+                address: "encrypted-envelope".into(),
+                revision: 4,
+                credential_revision: 2,
+                provider_identity: Some("provider".into()),
+            }],
+        };
+        let available = targets.delivery_targets(false, true, true, true);
+        assert!(available[0].channel.is_bark());
+        assert_eq!(available[0].revision, 4);
+        let unavailable = targets.delivery_targets(true, true, false, true);
+        assert!(unavailable[0].channel.is_email());
+        assert_eq!(unavailable[0].address, "owner@example.com");
     }
 
     #[test]
@@ -212,10 +252,28 @@ mod tests {
                 channel: NotificationChannelId::telegram(),
                 address: "42".into(),
                 revision: 3,
+                credential_revision: 1,
                 provider_identity: Some("7".into()),
             }],
         };
-        let resolved = targets.delivery_targets(true, false);
+        let resolved = targets.delivery_targets(true, false, false, true);
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].channel.is_email());
+    }
+
+    #[test]
+    fn a_lane_that_refuses_bark_falls_back_to_email() {
+        let targets = NotificationTargets {
+            email: "owner@example.com".into(),
+            targets: vec![NotificationTarget {
+                channel: NotificationChannelId::bark(),
+                address: "encrypted-envelope".into(),
+                revision: 4,
+                credential_revision: 2,
+                provider_identity: Some("provider".into()),
+            }],
+        };
+        let resolved = targets.delivery_targets(false, true, true, false);
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].channel.is_email());
     }

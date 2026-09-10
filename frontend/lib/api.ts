@@ -463,6 +463,22 @@ export async function unbindMyTelegramChat() {
   );
 }
 
+export async function bindMyBark(pushUrl: string) {
+  return parseJson<NotificationSettings>(
+    await authFetch("/v1/me/notifications/bark", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pushUrl }),
+    }),
+  );
+}
+
+export async function unbindMyBark() {
+  return parseJson<NotificationSettings>(
+    await authFetch("/v1/me/notifications/bark", { method: "DELETE" }),
+  );
+}
+
 export async function getMyUsageConsumer(period: AccountUsagePeriod | string) {
   const params = new URLSearchParams({ period });
   return parseJson<AccountUsageResponse>(

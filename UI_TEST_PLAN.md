@@ -695,13 +695,17 @@ location.reload();
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
 | X-01 | 非管理员 | 打开 `/settings` | 提示无权限;**仍显示只读的版本面板与地图面板** |
-| X-02 | 管理员 | 打开 | 左侧分组导航 + 表单;85 个字段 / 18 个分组 |
+| X-02 | 管理员 | 打开 | 左侧分组导航 + 表单；135 个字段 / 26 个分组 |
 | X-03 | 管理员 | 修改任意字段 | 该分组出现未保存计数角标;顶部保存按钮显示总数 |
 | X-04 | 管理员 | 点保存 | 返回更新/未变/需重启的键数量 |
 | X-05 | 管理员 | 改需重启字段 | 字段显示「需重启」chip |
 | X-06 | 管理员 | 点「保存并重启」 | 保存后重启;轮询 `/v1/healthz` 至恢复后自动刷新 |
-| X-07 | 管理员 | 点击当前已注册渠道 Telegram 的「发送测试」 | 成功或失败横幅；状态、最近成功时间和安全错误同步刷新 |
-| X-39 | Telegram 未配置或供应商请求失败 | 观察渠道状态并发送测试 | 未配置时按钮禁用；请求失败时显示 degraded 和可理解错误，不泄露 Bot Token |
+| X-07 | 管理员 | 分别点击已注册运维渠道 Telegram、Bark 的「发送测试」 | 成功或失败横幅；状态、最近成功时间和安全错误同步刷新 |
+| X-39 | Telegram/Bark 未配置或 Provider 请求失败 | 观察渠道状态并发送测试 | 未配置时按钮禁用；请求失败时显示 degraded 和可理解错误，不泄露 Bot Token、Push URL 或 Device Key |
+| X-40 | 已登录账号，Bark 用户 Provider 就绪 | 在账户通知页粘贴完整 Push URL 并提交 | 收到一次验证 Push；页面自动选中 Bark，只回显 Server 与设备后四位掩码 |
+| X-41 | Bark 未绑定、配置待重启或 Provider 不可用 | 尝试选择 Bark | 单选项不可用并显示本地化原因；已选但临时不可用时明确显示 Email 回落 |
+| X-42 | 已绑定 Bark 且存在尚未开始的 Bark 投递 | 解绑或重新绑定 | 弹出确认；旧投递取消并按当前渠道重新聚合，started 请求可能完成，完整 Push URL 不回显 |
+| X-43 | Bark Server 返回已知 Device Key 无效错误 | 发送用户通知或管理员用户渠道测试 | 只失效匹配的当前绑定并回落 Email；普通 400/404/401/403 不误删绑定 |
 | X-08 | 管理员 | 打开持久化分组 | 显示 provision 公钥与 authorized_keys 行,可复制 |
 | X-25 | 管理员 | 逐类字段验证控件类型 | bool→复选框;email_list/ip_list→多行文本域;secret→密码框且已设置时有提示;int/url/email→对应 input type |
 | X-26 | 管理员 | 观察字段来源标注 | 每个字段显示取值来源(env / 文件 / 默认) |
@@ -861,6 +865,7 @@ location.reload();
 | `dashboard/share-edit-dialog.tsx`, `share-edit/*` | S-08~S-25 |
 | `dashboard/share-connect-dialog.tsx` | S-01~S-07 |
 | `dashboard/account-page.tsx` | AC-01~AC-18 |
+| `dashboard/account-notifications-panel.tsx` | X-40~X-43 |
 | `dashboard/account-billing-page.tsx` | MB-01~MB-17 |
 | `dashboard/operation-verification.tsx` | S-24, D-06, D-07 |
 | `dashboard/provision-job-log.tsx` | H-45, D-10, Q-13 |
@@ -872,6 +877,7 @@ location.reload();
 | `settings/announcement-panel.tsx` | X-19, X-20, X-33, X-34 |
 | `settings/map-display-panel.tsx` | X-21, X-22, X-35, X-36 |
 | `settings/client-notification-deliveries-panel.tsx` | X-23, X-24, X-37, X-38 |
+| `settings/alert-channels-panel.tsx` | X-07, X-39, X-43 |
 | `metrics/*` | N-01~N-14 |
 | `chat/*` | CH-01~CH-19 |
 | `common/confirm-alert-dialog.tsx` | G-05, G-08, G-09 |
@@ -895,7 +901,7 @@ location.reload();
 
 | 域 | 代表 API 函数 | 覆盖用例 |
 |---|---|---|
-| Admin(设置/版本/日志/公告/地图/通知) | `getSettings*`、`saveSettings` | X-02~X-08, X-10~X-13, X-17, X-19~X-24 |
+| Admin(设置/版本/日志/公告/地图/通知) | `getSettings*`、`saveSettings`、`getAlertingChannels`、`test*NotificationChannel` | X-02~X-08, X-10~X-13, X-17, X-19~X-24, X-39, X-43 |
 | Client Market(主机/作业/报价/终端/子域名) | `getClientMarketHosts`、`createClientMarketQuote`、`commitClientMarketQuote` | H-20~H-29, H-43~H-48, H-80~H-84, T-01, Q-02, Q-06, Q-11, Q-12 |
 | Client 租用生命周期 | `getMyClientMarketRentals`、`releaseClientMarketRental`、`cleanupClientMarketProviderRental` | R-01~R-35, H-44~H-48 |
 | 市场准入与授信 | `getMarketAccessDashboard`、`updateMarketAccessPolicy`、`upsertMarketCounterparty`、`updateMarketCounterparty`、`updateMarketCounterpartyCredit`、`updateMarketPublicCredit` | MA-01~MA-15 |
@@ -908,6 +914,7 @@ location.reload();
 | Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
 | 用户 API Token | `getUserApiToken`、`resetUserApiToken` | A-10, A-11 |
 | 用户模型路由 | `getUserModelRouting`、`replaceUserModelRouting` | MH-01~MH-20 |
+| 用户通知渠道 | `getMyNotificationSettings`、`updateMyNotificationSettings`、`bindMyBark`、`unbindMyBark` | X-40~X-43 |
 | Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10 |
 | 其他(regions / 公告读取) | `getRegions`、`getAnnouncement` | A-14, A-16 |
 
@@ -923,15 +930,15 @@ location.reload();
 
 ## 20. 一轮完整回归的建议顺序
 
-共 **406 条用例**。单人跑完约需 5–6 小时。按角色分轮次,减少环境切换:
+共 **410 条用例**。单人跑完约需 5–6 小时。按角色分轮次,减少环境切换:
 
 | 轮次 | 环境 | 用例 | 约计 |
 |---|---|---|---|
 | 1. 匿名 | `DEV_AUTH_BYPASS=0`,不登录 | A-01, C-01~C-06, L-01~L-04, H-06, H-32, S-40, S-41, S-46, CH-02, N-01, X-01 | 25 分钟 |
-| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, H-51, SM-16, R-01, R-02, C-07~C-23, MH-01~MH-13 | 70 分钟 |
+| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, H-51, SM-16, R-01, R-02, C-07~C-23, MH-01~MH-13, X-40~X-42 | 70 分钟 |
 | 3. 供给方 | 名下有多状态主机 | H-03~H-05, H-07, H-10~H-18, H-20~H-29, H-40~H-50, H-60~H-84, T-01, T-04~T-19, T-30~T-36, Q-01~Q-14, D-10 | 120 分钟 |
 | 4. 租客 | 有租用中 Client | R-03~R-12, R-20~R-35, T-02, H-30, S-42~S-45, D-01~D-04 | 55 分钟 |
-| 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-38, N-02~N-14, L-01~L-05, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |
+| 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-39, X-43, N-02~N-14, L-01~L-05, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |
 | 6. 跨界面 | 任意角色 | G-01~G-12, MH-14~MH-20 | 40 分钟 |
 
 **冒烟子集**(每次提交前跑,约 15 分钟):
