@@ -1,6 +1,6 @@
 "use client";
 
-import { Eye, Link2, Maximize2, Pencil } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
@@ -16,6 +16,7 @@ import {
   getShareUsageByEmail,
   getShareUserLimitStatus,
 } from "@/lib/api";
+import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
 import type { AppLocale } from "@/lib/i18n";
 import type {
   DashboardClient,
@@ -28,7 +29,10 @@ import type {
   ShareUpstreamProvider,
   ShareUsageByEmailResponse,
   ShareUserGrant,
+  ShareUsagePricingNote,
   ShareUserLimitStatusRow,
+  ShareUserUsageBreakdownMap,
+  ShareUserUsageBreakdownRow,
   ShareView,
 } from "@/lib/types";
 import {
@@ -37,6 +41,13 @@ import {
   formatNumber,
   formatRelativeTime,
 } from "@/lib/utils";
+import { formatTokenMillions } from "@/lib/token-units";
+import {
+  formatPercent as formatCoveragePercent,
+  formatUsdMicros,
+  formatUsdMicrosPerMillion,
+  formatUsdMicrosRange,
+} from "@/lib/usd-micros";
 import {
   resolveShareCoreApp,
   shareEnabledApps,
@@ -804,6 +815,13 @@ export function ShareEmailUsagePanel({
     () => activeUserLimitGrants(share),
     [share],
   );
+  const {
+    breakdown,
+    breakdownRevision,
+    onExpand,
+    errors: breakdownErrors,
+    loaded: breakdownLoaded,
+  } = useShareUserUsageBreakdown(share.shareId);
 
   React.useEffect(() => {
     if (!showUsage) return;
@@ -919,6 +937,11 @@ export function ShareEmailUsagePanel({
           rows={limitRows || undefined}
           grants={limitGrants}
           t={t}
+          breakdown={breakdown}
+          breakdownRevision={breakdownRevision}
+          breakdownErrors={breakdownErrors}
+          breakdownLoaded={breakdownLoaded}
+          onExpand={onExpand}
         />
       ) : null}
       {showLimits && !(limitRows?.length || limitGrants.length) && loading ? (
@@ -1004,6 +1027,306 @@ function userLimitRoleTag(
   return "shareto";
 }
 
+type UsageNoteChipKind = "info" | "degraded" | "estimate";
+
+/**
+ * §12.4: the three chip families must be visually distinguishable. "Priced at a
+ * different rate" and "we could not find that rate and fell back" look alike in
+ * a table but mean opposite things about how much to trust the number.
+ */
+const USAGE_NOTE_KIND: Record<ShareUsagePricingNote, UsageNoteChipKind> = {
+  longContextApplied: "info",
+  priceKeyNotFound: "degraded",
+  serviceTierFellBack: "degraded",
+  contextTierFellBack: "degraded",
+  unknownServiceTier: "degraded",
+  cacheWriteAssumed5m: "estimate",
+  usageStateNotFullyObserved: "estimate",
+};
+
+function usageNoteChipProps(kind: UsageNoteChipKind): {
+  variant: "soft" | "tertiary";
+  color?: "warning";
+} {
+  // Degraded = warning (rate fell back / unknown). Estimate stays the
+  // weakened tertiary so the two remaining families cannot be read as one.
+  if (kind === "degraded") return { variant: "soft", color: "warning" };
+  if (kind === "estimate") return { variant: "tertiary" };
+  return { variant: "soft" };
+}
+
+const USAGE_NOTE_MESSAGE_KEY: Record<
+  ShareUsagePricingNote,
+  | "dashboard.userLimit.note.priceKeyNotFound"
+  | "dashboard.userLimit.note.cacheWriteAssumed5m"
+  | "dashboard.userLimit.note.longContextApplied"
+  | "dashboard.userLimit.note.serviceTierFellBack"
+  | "dashboard.userLimit.note.contextTierFellBack"
+  | "dashboard.userLimit.note.unknownServiceTier"
+  | "dashboard.userLimit.note.usageStateNotFullyObserved"
+> = {
+  priceKeyNotFound: "dashboard.userLimit.note.priceKeyNotFound",
+  cacheWriteAssumed5m: "dashboard.userLimit.note.cacheWriteAssumed5m",
+  longContextApplied: "dashboard.userLimit.note.longContextApplied",
+  serviceTierFellBack: "dashboard.userLimit.note.serviceTierFellBack",
+  contextTierFellBack: "dashboard.userLimit.note.contextTierFellBack",
+  unknownServiceTier: "dashboard.userLimit.note.unknownServiceTier",
+  usageStateNotFullyObserved: "dashboard.userLimit.note.usageStateNotFullyObserved",
+};
+
+function usageNoteMessageKey(note: ShareUsagePricingNote) {
+  return USAGE_NOTE_MESSAGE_KEY[note];
+}
+
+/** `—`, never `$0`: a confident zero reads as "this was free" (§12.4). */
+const NO_AMOUNT = "—";
+
+function formatUsageTokens(value: number, locale: AppLocale) {
+  return value === 0 ? NO_AMOUNT : formatTokenMillions(value, locale);
+}
+
+function ShareUserUsageNoteList({
+  notes,
+  t,
+}: {
+  notes: ShareUsagePricingNote[];
+  t: TFn;
+}) {
+  if (!notes.length) return null;
+  return (
+    <ul className="mt-1 space-y-0.5 text-[10px] leading-4 text-muted-foreground">
+      {notes.map((note) => (
+        <li key={note} className="flex gap-1.5">
+          <span aria-hidden className="text-muted-foreground/60">
+            ·
+          </span>
+          <span>{t(usageNoteMessageKey(note))}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function ShareUserUsageBreakdownPanel({
+  row,
+  locale,
+  revision,
+  t,
+}: {
+  row: ShareUserUsageBreakdownRow;
+  locale: AppLocale;
+  revision: string;
+  t: TFn;
+}) {
+  const [openLines, setOpenLines] = React.useState<string | null>(null);
+  const unattributed = row.observedTotals.unattributed;
+
+  if (!row.byModel.length && !unattributed) {
+    return (
+      <div className="px-2 py-2 text-[11px] text-muted-foreground">
+        {t("dashboard.userLimit.byModel.empty")}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2 px-2 py-2">
+      {row.rebaseApplied ? (
+        <div className="rounded-md border border-warning/40 bg-warning/5 px-2 py-1.5 text-[10px] leading-4 text-warning-foreground">
+          {t("dashboard.userLimit.equivalent.rebaseNotice")}
+        </div>
+      ) : null}
+
+      <table className="w-full table-fixed border-collapse text-[11px]">
+        <colgroup>
+          <col className="w-[36%]" />
+          <col className="w-[11%]" />
+          <col className="w-[11%]" />
+          <col className="w-[11%]" />
+          <col className="w-[11%]" />
+          <col className="w-[20%]" />
+        </colgroup>
+        <thead className="text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
+          <tr>
+            <th className="px-1.5 py-1">{t("dashboard.userLimit.byModel.model")}</th>
+            <th className="px-1.5 py-1 text-right">
+              {t("dashboard.userLimit.byModel.input")}
+            </th>
+            <th className="px-1.5 py-1 text-right">
+              {t("dashboard.userLimit.byModel.output")}
+            </th>
+            <th className="px-1.5 py-1 text-right">
+              {t("dashboard.userLimit.byModel.cacheRead")}
+            </th>
+            <th className="px-1.5 py-1 text-right">
+              {t("dashboard.userLimit.byModel.cacheWrite")}
+            </th>
+            <th className="px-1.5 py-1 text-right">
+              {t("dashboard.userLimit.byModel.equivalent")}
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {row.byModel.map((model, index) => {
+            // §8.2 groups by three dimensions, so one model can legitimately
+            // appear on several rows. The key must carry all three or React
+            // collapses them.
+            const key = `${model.modelKey}:${model.serviceTier}:${model.contextTier}:${model.appType}:${index}`;
+            const amount = model.priced
+              ? formatUsdMicrosRange(
+                  model.equivalentUsdMicros,
+                  model.equivalentUsdMicrosUpperBound,
+                  locale,
+                )
+              : null;
+            const linesOpen = openLines === key;
+            return (
+              <React.Fragment key={key}>
+                <tr className="border-t">
+                  <td className="px-1.5 py-1">
+                    <div className="flex min-w-0 flex-wrap items-center gap-1">
+                      <span className="min-w-0 break-all font-medium leading-4">
+                        {model.displayName}
+                      </span>
+                      {model.contextTier === "long" ? (
+                        <Chip size="sm" variant="soft" className="shrink-0">
+                          {t("dashboard.userLimit.byModel.longContext")}
+                        </Chip>
+                      ) : null}
+                      {model.serviceTier !== "standard" ? (
+                        <Chip size="sm" variant="soft" className="shrink-0">
+                          {model.serviceTier}
+                        </Chip>
+                      ) : null}
+                      {!model.priced ? (
+                        <Chip size="sm" variant="tertiary" className="shrink-0 text-amber-800">
+                          {t("dashboard.userLimit.byModel.unpriced")}
+                        </Chip>
+                      ) : null}
+                      {model.notes
+                        .filter((note) => USAGE_NOTE_KIND[note] !== "info")
+                        .filter((note) => note !== "priceKeyNotFound")
+                        .map((note) => (
+                          <Chip
+                            key={note}
+                            size="sm"
+                            className="shrink-0"
+                            title={t(usageNoteMessageKey(note))}
+                            {...usageNoteChipProps(USAGE_NOTE_KIND[note])}
+                          >
+                            {note}
+                          </Chip>
+                        ))}
+                    </div>
+                  </td>
+                  <td className="px-1.5 py-1 text-right font-mono">
+                    {formatUsageTokens(model.input, locale)}
+                  </td>
+                  <td className="px-1.5 py-1 text-right font-mono">
+                    {formatUsageTokens(model.output, locale)}
+                  </td>
+                  <td className="px-1.5 py-1 text-right font-mono">
+                    {formatUsageTokens(model.cacheRead, locale)}
+                  </td>
+                  <td className="px-1.5 py-1 text-right font-mono">
+                    {formatUsageTokens(model.cacheWrite, locale)}
+                  </td>
+                  <td className="px-1.5 py-1 text-right font-mono">
+                    {amount ? (
+                      <button
+                        type="button"
+                        className="rounded underline decoration-dotted underline-offset-2 hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+                        aria-expanded={linesOpen}
+                        title={
+                          amount.includes("~")
+                            ? t("dashboard.userLimit.equivalent.range")
+                            : t("dashboard.userLimit.equivalent.hint")
+                        }
+                        onClick={() => setOpenLines(linesOpen ? null : key)}
+                      >
+                        {amount}
+                      </button>
+                    ) : (
+                      <span className="text-muted-foreground">{NO_AMOUNT}</span>
+                    )}
+                  </td>
+                </tr>
+                {linesOpen ? (
+                  <tr className="bg-muted/30">
+                    <td colSpan={6} className="px-1.5 py-1.5">
+                      <ul className="space-y-0.5 font-mono text-[10px] leading-4 text-muted-foreground">
+                        {model.lines.map((line) => (
+                          <li key={line.kind}>
+                            {t(
+                              line.kind === "cacheRead"
+                                ? "dashboard.userLimit.byModel.cacheRead"
+                                : line.kind === "cacheWrite"
+                                  ? "dashboard.userLimit.byModel.cacheWrite"
+                                  : line.kind === "output"
+                                    ? "dashboard.userLimit.byModel.output"
+                                    : "dashboard.userLimit.byModel.input",
+                            )}
+                            {": "}
+                            {t("dashboard.userLimit.equivalent.lineFormula", {
+                              tokens: formatTokenMillions(line.tokens, locale),
+                              rate:
+                                formatUsdMicrosPerMillion(
+                                  line.rateMicrosPer1m,
+                                  locale,
+                                ) ?? NO_AMOUNT,
+                              amount:
+                                formatUsdMicros(line.amountMicros, locale) ??
+                                NO_AMOUNT,
+                            })}
+                          </li>
+                        ))}
+                      </ul>
+                      <ShareUserUsageNoteList notes={model.notes} t={t} />
+                      <div className="mt-1 text-[10px] text-muted-foreground">
+                        {t("dashboard.userLimit.byModel.requests", {
+                          count: String(model.requestCount),
+                        })}
+                      </div>
+                    </td>
+                  </tr>
+                ) : null}
+              </React.Fragment>
+            );
+          })}
+
+          {/* §12.2 rule 3: this row is the reason the breakdown adds up to the
+              quota column. It has tokens but by definition no amount. */}
+          {unattributed ? (
+            <tr className="border-t text-muted-foreground">
+              <td className="px-1.5 py-1 italic">
+                {t("dashboard.userLimit.byModel.unattributed")}
+                {" · "}
+                <span className="font-mono not-italic">
+                  {formatTokenMillions(unattributed, locale)}
+                </span>
+              </td>
+              <td className="px-1.5 py-1 text-right">{NO_AMOUNT}</td>
+              <td className="px-1.5 py-1 text-right">{NO_AMOUNT}</td>
+              <td className="px-1.5 py-1 text-right">{NO_AMOUNT}</td>
+              <td className="px-1.5 py-1 text-right">{NO_AMOUNT}</td>
+              <td className="px-1.5 py-1 text-right">{NO_AMOUNT}</td>
+            </tr>
+          ) : null}
+        </tbody>
+      </table>
+
+      <div className="text-[10px] leading-4 text-muted-foreground">
+        {t("dashboard.userLimit.byModel.coverage", {
+          coverage: formatCoveragePercent(row.pricedCoveragePercent, locale),
+          estimated: formatCoveragePercent(row.estimatedRequestPercent, locale),
+          revision,
+        })}
+      </div>
+      <ShareUserUsageNoteList notes={row.notes} t={t} />
+    </div>
+  );
+}
+
 export function ShareUserLimitsTable({
   rows,
   grants,
@@ -1011,6 +1334,11 @@ export function ShareUserLimitsTable({
   leading,
   trailing,
   renderEmailMeta,
+  breakdown,
+  breakdownRevision,
+  breakdownErrors,
+  breakdownLoaded,
+  onExpand,
 }: {
   rows?: ShareUserLimitStatusRow[];
   grants?: ShareUserGrant[];
@@ -1024,6 +1352,20 @@ export function ShareUserLimitsTable({
     cell: (row: ShareUserLimitStatusRow) => React.ReactNode;
   };
   renderEmailMeta?: (row: ShareUserLimitStatusRow) => React.ReactNode;
+  /**
+   * §12.3: both breakdown props are optional and, when absent, the table
+   * renders byte-for-byte as before. That is the whole point — two call sites
+   * (the editor and the read view) share this component, and neither should
+   * change until it opts in.
+   */
+  breakdown?: ShareUserUsageBreakdownMap;
+  breakdownRevision?: string;
+  /** Per-email fetch failures. Presence of a key means the last expand failed. */
+  breakdownErrors?: Record<string, string>;
+  /** Successful fetch with no matching email still counts as loaded (empty, not loading). */
+  breakdownLoaded?: Record<string, true>;
+  /** Lazy load: fired on first expand only, never on mount. */
+  onExpand?: (email: string) => void;
 }) {
   const unlimited = t("common.unlimited");
   const permanent = t("dashboard.userLimit.permanent");
@@ -1062,6 +1404,29 @@ export function ShareUserLimitsTable({
   }, [rows, grants, grantByEmail]);
   const hasCountdown = displayRows.some((row) => Boolean(row.resetsAt));
   const [nowMs, setNowMs] = React.useState(() => Date.now());
+  const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
+  const expandable =
+    Boolean(onExpand) || Object.keys(breakdown || {}).length > 0;
+  const locale = useLocaleText().locale;
+  const columnCount =
+    4 + (leading ? 1 : 0) + (trailing ? 1 : 0) + (expandable ? 1 : 0);
+
+  const toggleExpanded = React.useCallback(
+    (email: string) => {
+      const key = email.trim().toLowerCase();
+      setExpanded((current) => {
+        const next = new Set(current);
+        if (next.has(key)) {
+          next.delete(key);
+        } else {
+          next.add(key);
+          onExpand?.(key);
+        }
+        return next;
+      });
+    },
+    [onExpand],
+  );
 
   React.useEffect(() => {
     if (!hasCountdown) return;
@@ -1074,6 +1439,7 @@ export function ShareUserLimitsTable({
       <table className="w-full table-fixed border-collapse text-[11px]">
         <colgroup>
           {leading ? <col className="w-10" /> : null}
+          {expandable ? <col className="w-6" /> : null}
           <col className="w-[34%]" />
           <col className="w-[12%]" />
           <col className="w-[34%]" />
@@ -1083,6 +1449,7 @@ export function ShareUserLimitsTable({
         <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
           <tr>
             {leading ? <th className="px-1.5 py-2">{leading.header}</th> : null}
+            {expandable ? <th className="w-6 px-0 py-2" /> : null}
             <th className="px-1.5 py-2">{t("dashboard.usageEmail.email")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.parallel")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.token")}</th>
@@ -1102,10 +1469,42 @@ export function ShareUserLimitsTable({
             const countdown = formatResetCountdown(row.resetsAt, nowMs);
             const grant = grantByEmail.get(row.email.trim().toLowerCase());
             const roleTag = userLimitRoleTag(row, grant);
+            const emailKey = row.email.trim().toLowerCase();
+            const isExpanded = expanded.has(emailKey);
+            const breakdownRow = breakdown?.[emailKey];
+            const equivalent = breakdownRow
+              ? formatUsdMicrosRange(
+                  breakdownRow.equivalentUsdMicros,
+                  breakdownRow.equivalentUsdMicrosUpperBound,
+                  locale,
+                )
+              : null;
             return (
-              <tr key={`${row.role}:${row.email}`} className="border-t">
+              <React.Fragment key={`${row.role}:${row.email}`}>
+              <tr className="border-t">
                 {leading ? (
                   <td className="px-1.5 py-2 align-middle">{leading.cell(row)}</td>
+                ) : null}
+                {expandable ? (
+                  <td className="w-6 px-0 py-2 align-top">
+                    <button
+                      type="button"
+                      className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground transition hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1"
+                      aria-expanded={isExpanded}
+                      aria-label={t(
+                        isExpanded
+                          ? "dashboard.userLimit.byModel.collapse"
+                          : "dashboard.userLimit.byModel.expand",
+                      )}
+                      onClick={() => toggleExpanded(row.email)}
+                    >
+                      {isExpanded ? (
+                        <ChevronDown className="h-3.5 w-3.5" />
+                      ) : (
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  </td>
                 ) : null}
                 <td className="px-1.5 py-2">
                   <div className="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -1121,6 +1520,18 @@ export function ShareUserLimitsTable({
                     </Chip>
                     {renderEmailMeta?.(row)}
                   </div>
+                  {equivalent ? (
+                    <div
+                      className="mt-0.5 font-mono text-[10px] leading-4 text-muted-foreground"
+                      title={
+                        equivalent.includes("~")
+                          ? `${t("dashboard.userLimit.equivalent.hint")} ${t("dashboard.userLimit.equivalent.range")}`
+                          : t("dashboard.userLimit.equivalent.hint")
+                      }
+                    >
+                      ≈ {equivalent}
+                    </div>
+                  ) : null}
                 </td>
                 <td className="overflow-hidden px-1.5 py-2 font-mono">
                   {displayUserLimitValue(row.parallelLimit, unlimited)}
@@ -1172,6 +1583,44 @@ export function ShareUserLimitsTable({
                   </td>
                 ) : null}
               </tr>
+              {/* §12.3: a full-width inserted row, so the colgroup above keeps
+                  governing the main table's column widths. */}
+              {isExpanded ? (
+                <tr className="border-t bg-muted/20">
+                  <td colSpan={columnCount} className="p-0">
+                    {breakdownRow ? (
+                      <ShareUserUsageBreakdownPanel
+                        row={breakdownRow}
+                        locale={locale}
+                        revision={breakdownRevision || "-"}
+                        t={t}
+                      />
+                    ) : breakdownErrors?.[emailKey] ? (
+                      <div className="flex flex-wrap items-center gap-2 px-2 py-2 text-[11px] text-danger">
+                        <span className="min-w-0 flex-1 break-words">
+                          {t("dashboard.userLimit.byModel.loadFailed")}
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => onExpand?.(emailKey)}
+                        >
+                          {t("common.retry")}
+                        </Button>
+                      </div>
+                    ) : breakdownLoaded?.[emailKey] ? (
+                      <div className="px-2 py-2 text-[11px] text-muted-foreground">
+                        {t("dashboard.userLimit.byModel.empty")}
+                      </div>
+                    ) : (
+                      <div className="px-2 py-2 text-[11px] text-muted-foreground">
+                        {t("dashboard.userLimit.byModel.loading")}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ) : null}
+              </React.Fragment>
             );
           })}
         </tbody>

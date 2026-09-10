@@ -6,6 +6,16 @@
     "runtimeAndBuildInputsMustBeRepositoryOwned": true,
     "historicalAttributionIsNotATechnicalDependency": true
   },
+  "historicalAttributions": [
+    {
+      "id": "litellm-model-prices-and-context-window",
+      "source": "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json",
+      "license": "MIT",
+      "derivedBy": "scripts/pricing/derive-model-prices.mjs",
+      "artifact": "pricing/model-prices.json",
+      "note": "Repository-owned derivation of LiteLLM's public model price table. Not a vendored technical input: the Router never fetches LiteLLM at runtime, and the JSON committed here is reviewed as our own artifact."
+    }
+  ],
   "vendoredSources": [
     {
       "id": "lobehub-icons-static-svg",

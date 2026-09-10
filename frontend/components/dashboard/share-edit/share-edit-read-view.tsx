@@ -16,6 +16,7 @@ import {
   ShareCeilingBar,
 } from "./share-ceiling-bar";
 import { getShareUserLimitStatus } from "@/lib/api";
+import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { shareProviderSupportedApps, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
@@ -71,6 +72,13 @@ export function ShareEditReadView({
   const tokenUnlimited = isUnlimitedTokenLimit(tokenLimit);
   const parallelUnlimited = isUnlimitedParallelLimit(parallelLimit);
   const limitGrants = React.useMemo(() => activeUserLimitGrants(share), [share]);
+  const {
+    breakdown,
+    breakdownRevision,
+    onExpand,
+    errors: breakdownErrors,
+    loaded: breakdownLoaded,
+  } = useShareUserUsageBreakdown(share.shareId);
   const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[] | null>(null);
   const [limitLoading, setLimitLoading] = React.useState(false);
   const [limitError, setLimitError] = React.useState("");
@@ -178,7 +186,16 @@ export function ShareEditReadView({
             <div className="grid gap-2">
               <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
               {limitRows?.length || limitGrants.length ? (
-                <ShareUserLimitsTable rows={limitRows || undefined} grants={limitGrants} t={t} />
+                <ShareUserLimitsTable
+                  rows={limitRows || undefined}
+                  grants={limitGrants}
+                  t={t}
+                  breakdown={breakdown}
+                  breakdownRevision={breakdownRevision}
+                  breakdownErrors={breakdownErrors}
+                  breakdownLoaded={breakdownLoaded}
+                  onExpand={onExpand}
+                />
               ) : limitLoading ? (
                 <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock>
               ) : limitError ? (

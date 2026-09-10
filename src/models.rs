@@ -2112,6 +2112,171 @@ pub struct ShareUserLimitStatusResponse {
     pub rows: Vec<ShareUserLimitStatusRow>,
 }
 
+// ---------------------------------------------------------------------------
+// Per-user model usage breakdown (owner surface).
+// docs/design-share-user-model-usage-and-pricing.md §9.1
+//
+// R1: every amount here is an official-price EQUIVALENT for display only. It
+// never reaches `market_accrual_entries`, `market_invoices`, or any settlement
+// path. Amounts are strings in micro-USD so the frontend only formats and never
+// does arithmetic on them.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageBreakdownResponse {
+    pub share_id: String,
+    /// `sha256:<hex>` of the effective price set that produced these amounts.
+    pub pricing_revision: String,
+    pub priced_at: i64,
+    pub rows: Vec<ShareUserUsageBreakdownRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageBreakdownRow {
+    pub email: String,
+    pub window_starts_at: Option<String>,
+    pub resets_at: Option<String>,
+    /// Whether the quota column for this user is rebased (§10). When true the
+    /// quota number and the sum of `observedTotals` legitimately differ.
+    pub rebase_applied: bool,
+    pub observed_totals: ShareUserUsageTotals,
+    /// Point estimate; cache writes priced at the 5m rate (§11.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equivalent_usd_micros: Option<String>,
+    /// Upper bound; all cache writes repriced at the 1h rate (§7.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equivalent_usd_micros_upper_bound: Option<String>,
+    /// Priced tokens / total tokens, 0-100. Makes §6.4 measurable.
+    pub priced_coverage_percent: f64,
+    pub estimated_request_percent: f64,
+    pub by_model: Vec<ShareUserUsageModelRow>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Tokens that reached the quota column but carry no category split, so
+    /// they can be counted but never priced (§7.6).
+    pub unattributed: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageModelRow {
+    pub model_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_key: Option<String>,
+    pub display_name: String,
+    pub app_type: String,
+    /// `standard` | `priority` | `flex`. The same model at two tiers is two
+    /// rows on purpose: priority runs about 2x standard, and merging them would
+    /// hide where the cost came from.
+    pub service_tier: String,
+    /// `base` | `long`.
+    pub context_tier: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub unattributed: u64,
+    pub total: u64,
+    pub request_count: u64,
+    pub priced: bool,
+    /// `null` when `priced` is false — never `"0"`, which would read as free.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equivalent_usd_micros: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equivalent_usd_micros_upper_bound: Option<String>,
+    pub lines: Vec<ShareUserUsagePriceLine>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsagePriceLine {
+    pub kind: String,
+    pub tokens: u64,
+    pub rate_micros_per_1m: i64,
+    pub amount_micros: String,
+}
+
+// ---------------------------------------------------------------------------
+// Public listing pricing (buyer + anonymous surface).
+// docs/design-share-user-model-usage-and-pricing.md §9.2
+//
+// Carries the price CATALOG, which is a genuine property of the listing, plus a
+// usage COMPOSITION. Deliberately no equivalent-dollar total and no
+// dollars-per-quota density: the same upstream model costs the same everywhere,
+// so cross-listing density differences would only reflect previous buyers'
+// workload mix, which spans ~21x.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareListingPricingResponse {
+    pub listing_id: String,
+    pub catalog_revision: String,
+    pub models: Vec<ShareListingPricingModel>,
+    /// `null` when the rollup is missing or fewer than 3 distinct users have
+    /// used the listing (k-anonymity floor).
+    pub usage_mix: Option<ShareListingUsageMix>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareListingPricingModel {
+    pub model_key: String,
+    pub display_name: String,
+    pub rates: ShareListingPricingRates,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_context_threshold: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareListingPricingRates {
+    pub input: String,
+    pub output: String,
+    pub cache_read: String,
+    pub cache_write5m: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareListingUsageMix {
+    pub window_days: u32,
+    /// Fractions of the priced token total, summing to ~1.0. Proportions only —
+    /// no absolute token, request or user counts.
+    pub composition: ShareListingUsageComposition,
+    pub model_share: Vec<ShareListingModelShare>,
+    pub stale_after: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareListingUsageComposition {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareListingModelShare {
+    pub model_key: String,
+    pub display_name: String,
+    pub share: f64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeaseResponse {

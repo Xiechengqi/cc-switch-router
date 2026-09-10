@@ -658,6 +658,25 @@ location.reload();
 | S-45 | 已解锁 | 点退出 | 清空凭据并刷新回只读态 |
 | S-46 | share 离线 | 访问 | 状态 chip 显示离线 |
 
+### 11.5 按模型用量与官方价等价(S-47~S-58)
+
+覆盖 owner 编辑/只读弹窗与 Share 抽屉的展开明细，以及公开市场 listing 详情的价目卡。金额为只读展示，不进入账务。
+
+| ID | 前置 | 步骤 | 预期 |
+|---|---|---|---|
+| S-47 | 有多模型流量的 Share | 打开编辑弹窗，展开某用户 | 按模型列出四分拆与等价；金额 `font-mono` 带 `≈` |
+| S-48 | 承上 | 观察未定价模型行 | 金额显示 `—` 与未定价 Chip，**不显示 $0** |
+| S-49 | 该用户存在 usageRebase | 展开 | 顶部显示重基线提示；明细之和 ≠ 配额列属预期 |
+| S-50 | — | 打开弹窗但不展开 | 不发起 breakdown 请求（Network 面板核对） |
+| S-51 | 只读态弹窗 | 展开 | 与编辑态展示一致，无编辑控件 |
+| S-52 | 存在 priority 或长上下文流量的 Share | 展开 | 同一模型出现多行且带层级/档位 Chip，视觉可区分；无 Chip 行即标准档。fallback 类 note（`serviceTierFellBack` / `contextTierFellBack` / `unknownServiceTier`）为 warning Chip，estimate 类（`cacheWriteAssumed5m`）为 tertiary，二者不可同色 |
+| S-53 | 存在 `quota_tokens > 0` 但四项全零的请求 | 展开 | 出现「未归属」行，token 数非零、四个分拆列与金额列均为 `—` |
+| S-58 | 展开时 breakdown 接口 5xx / 断网 | 保持展开 | 显示失败文案与「重试」按钮，**不是**一直「正在加载」；点重试后重新请求 |
+| S-54 | **未登录**，公开市场目录 | 打开某公开 listing 详情 | 渲染可用模型与官方标价；无任何 email、无等价美元总额 |
+| S-55 | 承上，该 listing 活跃用户 < 3 | 同上 | 用量构成区**整块不渲染**，且不出现空状态占位 |
+| S-56 | 承上，活跃用户 ≥ 3 | 同上 | 渲染四类占比条与免责文案；条上不含绝对 token 数 |
+| S-57 | 非 `publicly_listed` 的 listing | 直接访问 `/pricing` | 404（非 403，不泄露存在性） |
+
 ---
 
 ## 12. 聊天(CH)
@@ -851,9 +870,10 @@ location.reload();
 | `dashboard/client-board.tsx` | C-07~C-16, C-22, MH-01~MH-06, MH-11 |
 | `dashboard/model-hub-panel.tsx` | MH-01~MH-13 |
 | `dashboard/share-card.tsx` | C-17~C-20, MH-03~MH-06 |
-| `dashboard/drawer-panels.tsx` | C-13, C-18, D-05 |
+| `dashboard/drawer-panels.tsx` | C-13, C-18, D-05, S-47~S-53, S-58 |
 | `app/(dashboard)/markets/page.tsx` | L-01 |
-| `dashboard/share-market/*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10 |
+| `dashboard/share-market/*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10, S-54~S-57 |
+| `dashboard/share-market/listing-pricing-card.tsx` | S-54~S-57 |
 | `dashboard/account-share-page.tsx` | AS-01~AS-08 |
 | `dashboard/account-client-page.tsx` | 账户 Client 只读监控(镜像 AS) |
 | `dashboard/client-market-page.tsx` | H-01~H-18(归属/筛选/排序/分页), H-60~H-71(选择与批量), H-80~H-84(导入导出) |
@@ -870,7 +890,7 @@ location.reload();
 | `dashboard/create-client-dialog.tsx` | C-19, H-40, 见 §17 |
 | `dashboard/web-terminal/*` | T-01~T-19 |
 | `dashboard/client-console/*` | C-15, T-30~T-36 |
-| `dashboard/share-edit-dialog.tsx`, `share-edit/*` | S-08~S-25 |
+| `dashboard/share-edit-dialog.tsx`, `share-edit/*` | S-08~S-25, S-47~S-53, S-58 |
 | `dashboard/share-connect-dialog.tsx` | S-01~S-07 |
 | `dashboard/account-page.tsx` | AC-01~AC-18 |
 | `dashboard/account-notifications-panel.tsx` | X-40~X-43 |
@@ -901,6 +921,7 @@ location.reload();
 | `lib/model-routing.ts` | MH-01, MH-04~MH-11 |
 | `lib/use-persistent-state.ts` | §3 全部持久化用例, G-12 |
 | `lib/api.ts` | 见 §19 覆盖核对表 |
+| `lib/use-share-user-usage-breakdown.ts` | S-47~S-53, S-58 |
 
 ---
 
@@ -917,14 +938,14 @@ location.reload();
 | 统一市场账务 | `getMarketBillingDashboard`、`settleMarketBillingAccount`、`requestMarketBillingSettlement`、`declareMarketBillingPayment`、`confirmMarketBillingPayment`、争议/作废端点 | MB-01~MB-19 |
 | 聊天 | `getClientChat*`、`postClientChatMessage` | CH-01~CH-19 |
 | 指标 | `getMetrics*`、`getLlmMetrics*` | N-02~N-14 |
-| Shares | `updateShareSettings`、`getShareUsageByEmail`、`refreshShareUsage` | S-05, S-06, S-08~S-25, S-34, S-35 |
+| Shares | `updateShareSettings`、`getShareUsageByEmail`、`refreshShareUsage`、`getShareUserUsageBreakdown` | S-05, S-06, S-08~S-25, S-34, S-35, S-47~S-53, S-58 |
 | 账户收款资料 | `getAccountPaymentProfile`、`updateAccountPaymentProfile` | AC-03~AC-16, MB-03, MB-17 |
 | Dashboard | `getDashboard`、`getMapDisplay` | C-01, C-22 |
 | Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
 | 用户 API Token | `getUserApiToken`、`resetUserApiToken` | A-10, A-11 |
 | 用户模型路由 | `getUserModelRouting`、`replaceUserModelRouting` | MH-01~MH-20 |
 | 用户通知渠道 | `getMyNotificationSettings`、`updateMyNotificationSettings`、`bindMyBark`、`unbindMyBark` | X-40~X-43 |
-| Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-23, SM-E2E-01~SM-E2E-10 |
+| Share Market | `getShareMarket*`、`*ShareMarket*`、`getShareListingPricing` | SM-01~SM-23, SM-E2E-01~SM-E2E-10, S-54~S-57 |
 | 其他(regions / 公告读取) | `getRegions`、`getAnnouncement` | A-14, A-16 |
 
 认证相关在 `lib/auth.ts`(非 `api.ts`):`requestEmailCode` / `verifyEmailCode` / `refreshAccessToken` / `sessionStatus` / `logoutSession` / `ensureAuthDeviceIdentity` → 用例 A-02~A-06, A-12。

@@ -141,6 +141,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         38,
         include_str!("../schema/0038_bark_notification_channels.sql"),
     ),
+    (
+        39,
+        include_str!("../schema/0039_model_price_catalog.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -668,7 +672,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 137);
+        assert_eq!(table_count, 141);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -753,6 +757,7 @@ mod tests {
         assert_eq!(versions[35], (36, migration_checksum(MIGRATIONS[34].1)));
         assert_eq!(versions[36], (37, migration_checksum(MIGRATIONS[35].1)));
         assert_eq!(versions[37], (38, migration_checksum(MIGRATIONS[36].1)));
+        assert_eq!(versions[38], (39, migration_checksum(MIGRATIONS[37].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1107,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_38_upgrade_a_version_26_database() {
+    fn migrations_27_through_39_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1236,8 +1241,37 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 38);
-        check_compatibility(&conn).expect("upgraded version 38 is compatible");
+        assert_eq!(latest_version, 39);
+        check_compatibility(&conn).expect("upgraded version 39 is compatible");
+        let price_catalog_tables = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                    'model_price_catalog',
+                    'model_price_rates',
+                    'model_price_aliases',
+                    'share_listing_usage_rollup'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count model price catalog tables after upgrade");
+        assert_eq!(price_catalog_tables, 4);
+        let alias_pk = conn
+            .prepare("PRAGMA table_info('model_price_aliases')")
+            .expect("prepare alias columns")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })
+            .expect("query alias columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read alias columns");
+        let pk_columns: Vec<&str> = alias_pk
+            .iter()
+            .filter(|(_, pk)| *pk > 0)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(pk_columns, vec!["pattern", "match_kind"]);
     }
 
     #[test]
@@ -1299,7 +1333,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 38);
+        assert_eq!(latest_version, 39);
     }
 
     #[test]
@@ -1323,7 +1357,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 38);
+        assert_eq!(latest_version, 39);
     }
 
     #[test]
@@ -1503,7 +1537,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 38);
+        assert_eq!(latest_version, 39);
     }
 
     #[test]

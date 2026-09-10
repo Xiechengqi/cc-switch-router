@@ -18,7 +18,9 @@ import type {
   ShareUsageRefreshResponse,
   ImageGenerationRequestLog,
   ShareUsageByEmailResponse,
+  ShareListingPricingResponse,
   ShareUserLimitStatusResponse,
+  ShareUserUsageBreakdownResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
   UserModelRoutingResponse,
@@ -396,6 +398,24 @@ export async function getShareUserLimitStatus(shareId: string) {
     await fetch(`/v1/shares/${encodeURIComponent(shareId)}/user-limit-status`, {
       cache: "no-store",
     }),
+  );
+}
+
+export async function getShareUserUsageBreakdown(shareId: string, email?: string) {
+  const query = email ? `?email=${encodeURIComponent(email)}` : "";
+  return parseJson<ShareUserUsageBreakdownResponse>(
+    await fetch(
+      `/v1/shares/${encodeURIComponent(shareId)}/user-usage-breakdown${query}`,
+      { cache: "no-store" },
+    ),
+  );
+}
+
+export async function getShareListingPricing(listingId: string) {
+  return parseJson<ShareListingPricingResponse>(
+    await fetch(
+      `/v1/share-market/listings/${encodeURIComponent(listingId)}/pricing`,
+    ),
   );
 }
 

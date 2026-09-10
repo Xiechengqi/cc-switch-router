@@ -847,6 +847,117 @@ export type ShareUserLimitStatusResponse = {
   rows: ShareUserLimitStatusRow[];
 };
 
+/**
+ * §9 notes enum. Kept as a closed union so a backend addition is a type error
+ * here rather than a silently unlabelled chip; `audit:model-prices` asserts
+ * this list, the Rust enum and the i18n keys stay in lockstep.
+ */
+export type ShareUsagePricingNote =
+  | "priceKeyNotFound"
+  | "cacheWriteAssumed5m"
+  | "longContextApplied"
+  | "serviceTierFellBack"
+  | "contextTierFellBack"
+  | "unknownServiceTier"
+  | "usageStateNotFullyObserved";
+
+export type ShareUserUsagePriceLine = {
+  kind: "input" | "output" | "cacheRead" | "cacheWrite";
+  tokens: number;
+  rateMicrosPer1m: number;
+  /** Micro-USD as a decimal string; never parse with `Number`. */
+  amountMicros: string;
+};
+
+export type ShareUserUsageModelRow = {
+  modelKey: string;
+  priceKey?: string;
+  displayName: string;
+  appType: string;
+  serviceTier: "standard" | "priority" | "flex";
+  contextTier: "base" | "long";
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  unattributed: number;
+  total: number;
+  requestCount: number;
+  priced: boolean;
+  equivalentUsdMicros?: string;
+  equivalentUsdMicrosUpperBound?: string;
+  lines: ShareUserUsagePriceLine[];
+  notes: ShareUsagePricingNote[];
+};
+
+export type ShareUserUsageTotals = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  unattributed: number;
+  total: number;
+};
+
+export type ShareUserUsageBreakdownRow = {
+  email: string;
+  windowStartsAt?: string | null;
+  resetsAt?: string | null;
+  /** §10: the quota column carries a rebase offset the breakdown cannot show. */
+  rebaseApplied: boolean;
+  observedTotals: ShareUserUsageTotals;
+  equivalentUsdMicros?: string;
+  equivalentUsdMicrosUpperBound?: string;
+  pricedCoveragePercent: number;
+  estimatedRequestPercent: number;
+  byModel: ShareUserUsageModelRow[];
+  notes: ShareUsagePricingNote[];
+};
+
+export type ShareUserUsageBreakdownResponse = {
+  shareId: string;
+  pricingRevision: string;
+  pricedAt: number;
+  rows: ShareUserUsageBreakdownRow[];
+};
+
+/** email (lowercased) -> breakdown row. */
+export type ShareUserUsageBreakdownMap = Record<string, ShareUserUsageBreakdownRow>;
+
+export type ShareListingPricingRates = {
+  input: string;
+  output: string;
+  cacheRead: string;
+  cacheWrite5m: string;
+};
+
+export type ShareListingPricingModel = {
+  modelKey: string;
+  displayName: string;
+  rates: ShareListingPricingRates;
+  longContextThreshold?: number;
+};
+
+export type ShareListingUsageMix = {
+  windowDays: number;
+  composition: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  modelShare: { modelKey: string; displayName: string; share: number }[];
+  staleAfter: number;
+};
+
+export type ShareListingPricingResponse = {
+  listingId: string;
+  catalogRevision: string;
+  models: ShareListingPricingModel[];
+  /** `null` below the k-anonymity floor, or when the rollup has no bucket yet. */
+  usageMix: ShareListingUsageMix | null;
+};
+
 export type ShareModelHealthCheck = {
   requestId: string;
   shareId: string;

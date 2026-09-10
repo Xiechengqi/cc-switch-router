@@ -74,6 +74,41 @@ for (const relativePath of [
   }
 }
 
+const usdMicrosSource = fs.readFileSync(path.join(frontendRoot, "lib/usd-micros.ts"), "utf8");
+for (const marker of [
+  "MICROS_PER_USD = 1_000_000n",
+  "export function parseUsdMicros",
+  "export function formatUsdMicros",
+  "export function formatUsdMicrosRange",
+  "export function formatUsdMicrosPerMillion",
+  "BigInt(trimmed)",
+]) {
+  if (!usdMicrosSource.includes(marker)) {
+    errors.push(`frontend/lib/usd-micros.ts is missing ${marker}`);
+  }
+}
+
+const amountSurfaces = [
+  "frontend/lib/usd-micros.ts",
+  "frontend/components/dashboard/drawer-panels.tsx",
+  "frontend/components/dashboard/share-market/listing-pricing-card.tsx",
+  "frontend/lib/use-share-user-usage-breakdown.ts",
+];
+for (const relativePath of amountSurfaces) {
+  const absolutePath = path.join(root, relativePath);
+  if (!fs.existsSync(absolutePath)) {
+    errors.push(`${relativePath} is missing`);
+    continue;
+  }
+  const source = fs.readFileSync(absolutePath, "utf8");
+  if (/\bparseFloat\s*\(/.test(source)) {
+    errors.push(`${relativePath} uses parseFloat on the equivalent-USD path`);
+  }
+  if (/(?<![\w.])Number\s*\(/.test(source)) {
+    errors.push(`${relativePath} uses Number( on the equivalent-USD path`);
+  }
+}
+
 const messages = fs.readFileSync(path.join(frontendRoot, "lib/i18n.ts"), "utf8");
 for (const marker of [
   '"shareMarket.tokensMillions": "Token limit (M)"',

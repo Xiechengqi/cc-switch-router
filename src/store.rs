@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::net::IpAddr;
 use std::path::{Component, PathBuf};
 use std::sync::{
-    Arc, Weak,
+    Arc, RwLock as StdRwLock, Weak,
     atomic::{AtomicI64, Ordering as AtomicOrdering},
 };
 use std::time::{Duration as StdDuration, Instant as StdInstant};
@@ -897,6 +897,9 @@ pub struct AppStore {
     ip_hash_salt: Arc<String>,
     geo_lookup_base_url: Arc<String>,
     market_usd_cny_rate_micros: Arc<AtomicI64>,
+    /// Snapshot of the model price catalog (§5.4). Instance-scoped rather than
+    /// process-global so it always matches this store's database.
+    pricing_catalog: Arc<StdRwLock<Arc<crate::model_price_catalog::PricingCatalog>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1512,6 +1515,9 @@ impl AppStore {
                 .map_err(|e| AppError::Internal(format!("enable sqlite WAL failed: {e}")))?;
         }
         crate::schema::apply(&conn)?;
+        // Fail-closed, like the baseline checksum: a half-loaded price catalog
+        // would render plausible numbers that are wrong (§5.4).
+        let pricing_catalog = crate::model_price_catalog::load(&conn, Utc::now().timestamp())?;
         let (boot_notification_policy, _) =
             ClientNotificationPolicy::for_runtime(&config.client_notifications, config);
         let boot_notification_template = NotificationTemplateContext::from_config(config);
@@ -1532,6 +1538,7 @@ impl AppStore {
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
             market_usd_cny_rate_micros: Arc::new(AtomicI64::new(config.market_usd_cny_rate_micros)),
+            pricing_catalog: Arc::new(StdRwLock::new(pricing_catalog)),
         })
     }
 
@@ -1790,7 +1797,38 @@ impl AppStore {
             market_usd_cny_rate_micros: Arc::new(AtomicI64::new(
                 crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
             )),
+            // Left empty on purpose: loading ~170 models per test constructor
+            // costs more than it buys. Pricing tests call
+            // `reload_pricing_catalog()` explicitly.
+            pricing_catalog: Arc::new(StdRwLock::new(Arc::new(
+                crate::model_price_catalog::PricingCatalog::default(),
+            ))),
         })
+    }
+
+    /// The price catalog in force for this store.
+    pub(crate) fn pricing_catalog(&self) -> Arc<crate::model_price_catalog::PricingCatalog> {
+        match self.pricing_catalog.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Re-reads the catalog from the database, picking up admin overrides
+    /// without a restart. The embedded derived rows are rewritten identically,
+    /// so this is safe to call at any time.
+    pub(crate) async fn reload_pricing_catalog(
+        &self,
+    ) -> Result<Arc<crate::model_price_catalog::PricingCatalog>, AppError> {
+        let catalog = {
+            let conn = self.conn.lock().await;
+            crate::model_price_catalog::load(&conn, Utc::now().timestamp())?
+        };
+        match self.pricing_catalog.write() {
+            Ok(mut guard) => *guard = Arc::clone(&catalog),
+            Err(poisoned) => *poisoned.into_inner() = Arc::clone(&catalog),
+        }
+        Ok(catalog)
     }
 
     pub(crate) fn market_usd_cny_rate_micros(&self) -> i64 {
@@ -8668,6 +8706,537 @@ impl AppStore {
 
         Ok(ShareUserLimitStatusResponse {
             share_id: share_id.to_string(),
+            rows,
+        })
+    }
+
+    /// Rebuilds the public usage rollup for whole UTC days (§8.5).
+    ///
+    /// Idempotent by contract: `(share_id, bucket_start)` is a pure function of
+    /// `share_request_logs`, so the buckets in range are deleted and recomputed
+    /// rather than incremented. Cheap enough at day granularity, and it means a
+    /// backfill, a retry and a routine tick all converge on the same rows.
+    ///
+    /// `window_days` bounds the rebuild; the caller's cadence decides freshness.
+    pub async fn rebuild_share_listing_usage_rollup(
+        &self,
+        window_days: u32,
+    ) -> Result<u64, AppError> {
+        let catalog = self.pricing_catalog();
+        let now_unix = Utc::now().timestamp();
+        let horizon = rollup_bucket_start(now_unix)
+            - i64::from(window_days).saturating_mul(ROLLUP_BUCKET_SECONDS);
+
+        // Long-context classification has to follow the same resolve path as
+        // the owner breakdown: `e.model_key` is the wire text
+        // (`actual_model`/`model`), which is not always the catalog
+        // `price_key` (aliases, date suffixes). Joining thresholds on
+        // `price_key` would silently classify aliased long-context traffic
+        // as `base`.
+        let conn = self.conn.lock().await;
+        let mut observed_stmt = conn
+            .prepare(
+                "SELECT DISTINCT lower(COALESCE(NULLIF(trim(actual_model), ''),
+                                                NULLIF(trim(model), ''), ''))
+                   FROM share_request_logs
+                  WHERE created_at >= ?1
+                    AND is_health_check = 0",
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("prepare rollup model keys failed: {e}"))
+            })?;
+        let observed_models: Vec<String> = observed_stmt
+            .query_map(params![horizon], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Internal(format!("query rollup model keys failed: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Internal(format!("read rollup model key failed: {e}")))?;
+        drop(observed_stmt);
+
+        let mut thresholds: Vec<(String, i64, bool)> = Vec::new();
+        let mut seen_observed = BTreeSet::new();
+        for model_key in observed_models {
+            if model_key.is_empty() || !seen_observed.insert(model_key.clone()) {
+                continue;
+            }
+            if let Some((_, price)) = catalog.lookup(&model_key, now_unix)
+                && let Some(threshold) = price.long_context_threshold
+            {
+                thresholds.push((
+                    model_key,
+                    threshold as i64,
+                    price.long_context_inclusive,
+                ));
+            }
+        }
+
+        let mut values: Vec<crate::db::types::Value> =
+            vec![crate::db::types::Value::Integer(horizon)];
+        let (thresholds_cte, thresholds_join, long_ctx_expr) = if thresholds.is_empty() {
+            (String::new(), String::new(), "'base'".to_string())
+        } else {
+            let mut rendered = Vec::with_capacity(thresholds.len());
+            for (model_key, threshold, inclusive) in &thresholds {
+                let base = values.len() + 1;
+                rendered.push(format!("(?{base}, ?{}, ?{})", base + 1, base + 2));
+                values.push(crate::db::types::Value::Text(model_key.clone()));
+                values.push(crate::db::types::Value::Integer(*threshold));
+                values.push(crate::db::types::Value::Integer(i64::from(*inclusive)));
+            }
+            (
+                format!(
+                    "thresholds(model_key, threshold, inclusive) AS (VALUES {}),",
+                    rendered.join(", ")
+                ),
+                " LEFT JOIN thresholds th ON th.model_key = e.model_key".to_string(),
+                "CASE WHEN th.threshold IS NULL THEN 'base'
+                      WHEN th.inclusive = 1 AND e.input_tokens >= th.threshold THEN 'long'
+                      WHEN th.inclusive = 0 AND e.input_tokens >  th.threshold THEN 'long'
+                      ELSE 'base' END"
+                    .to_string(),
+            )
+        };
+        values.push(crate::db::types::Value::Integer(now_unix));
+
+        // Service tier is normalised in SQL here (unlike the owner path, which
+        // needs the note that an unknown tier was seen): the rollup column has
+        // a CHECK constraint, so anything unrecognised must land on 'standard'.
+        let sql = format!(
+            "WITH {thresholds_cte}
+                  entries AS (
+                    SELECT sr.share_id AS share_id,
+                           (sr.created_at / {ROLLUP_BUCKET_SECONDS}) * {ROLLUP_BUCKET_SECONDS} AS bucket_start,
+                           lower(COALESCE(NULLIF(trim(sr.actual_model), ''), NULLIF(trim(sr.model), ''), '')) AS model_key,
+                           CASE lower(COALESCE(NULLIF(trim(sr.effective_service_tier), ''),
+                                               NULLIF(trim(sr.client_service_tier), ''), 'standard'))
+                                WHEN 'priority' THEN 'priority'
+                                WHEN 'fast'     THEN 'priority'
+                                WHEN 'flex'     THEN 'flex'
+                                WHEN 'batch'    THEN 'flex'
+                                ELSE 'standard' END AS service_tier,
+                           lower(trim(COALESCE(sr.user_email, ''))) AS user_email,
+                           COALESCE(sr.input_tokens, 0) AS input_tokens,
+                           COALESCE(sr.output_tokens, 0) AS output_tokens,
+                           COALESCE(sr.cache_read_tokens, 0) AS cache_read_tokens,
+                           COALESCE(sr.cache_creation_tokens, 0) AS cache_write_tokens,
+                           CASE WHEN COALESCE(sr.input_tokens, 0) + COALESCE(sr.output_tokens, 0)
+                                     + COALESCE(sr.cache_read_tokens, 0) + COALESCE(sr.cache_creation_tokens, 0) = 0
+                                THEN COALESCE(sr.quota_tokens, 0) ELSE 0 END AS unattributed_tokens
+                      FROM share_request_logs sr
+                     WHERE sr.created_at >= ?1
+                       AND sr.is_health_check = 0
+                  )
+             INSERT INTO share_listing_usage_rollup (
+                 share_id, bucket_start, model_key, service_tier, context_tier,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 unattributed_tokens, distinct_users, request_count, computed_at)
+             SELECT e.share_id, e.bucket_start, e.model_key, e.service_tier,
+                    {long_ctx_expr} AS context_tier,
+                    SUM(e.input_tokens), SUM(e.output_tokens), SUM(e.cache_read_tokens),
+                    SUM(e.cache_write_tokens), SUM(e.unattributed_tokens),
+                    COUNT(DISTINCT NULLIF(e.user_email, '')),
+                    COUNT(*), ?{computed_at}
+               FROM entries e{thresholds_join}
+              GROUP BY e.share_id, e.bucket_start, e.model_key, e.service_tier, context_tier",
+            computed_at = values.len()
+        );
+
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| AppError::Internal(format!("begin usage rollup rebuild failed: {e}")))?;
+        tx.execute(
+            "DELETE FROM share_listing_usage_rollup WHERE bucket_start >= ?1",
+            params![horizon],
+        )
+        .map_err(|e| AppError::Internal(format!("clear usage rollup buckets failed: {e}")))?;
+        let inserted = tx
+            .execute(&sql, params_from_iter(values))
+            .map_err(|e| AppError::Internal(format!("rebuild usage rollup failed: {e}")))?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit usage rollup rebuild failed: {e}")))?;
+        Ok(inserted as u64)
+    }
+
+    /// Public listing pricing (§9.2). Anonymous; the model price list is the
+    /// substance, `usageMix` is a secondary proof-of-life.
+    pub async fn share_listing_pricing(
+        &self,
+        listing_id: &str,
+    ) -> Result<crate::models::ShareListingPricingResponse, AppError> {
+        use crate::model_pricing::{ContextTier, ServiceTier};
+
+        let catalog = self.pricing_catalog();
+        let now_unix = Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+
+        // Same `publicly_listed` predicate as the rest of the public surface
+        // (`share_market::publicly_listed_sql`). A listing that is not public
+        // 404s: 403 would confirm it exists.
+        let public_listing = crate::share_market::publicly_listed_sql("shares");
+        let sql = format!(
+            "SELECT listing.share_id
+               FROM share_market_listings listing
+               JOIN shares ON shares.share_id = listing.share_id
+              WHERE listing.id = ?1
+                AND listing.deleted_at IS NULL
+                AND ({public_listing})"
+        );
+        let share_id: Option<String> = conn
+            .query_row(&sql, params![listing_id], |row| row.get(0))
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query listing pricing failed: {e}")))?;
+        let Some(share_id) = share_id else {
+            return Err(AppError::NotFound("listing not found".into()));
+        };
+
+        // Which models this listing actually serves. `share_model_health_state`
+        // is already public for publicly listed shares (the model-health
+        // calendar reads it), so this adds no new disclosure.
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT lower(COALESCE(NULLIF(trim(actual_model), ''),
+                                                NULLIF(trim(requested_model), ''), ''))
+                   FROM share_model_health_state
+                  WHERE share_id = ?1
+                    AND last_success_at IS NOT NULL",
+            )
+            .map_err(|e| AppError::Internal(format!("prepare listing models failed: {e}")))?;
+        let observed_models = stmt
+            .query_map(params![share_id], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Internal(format!("query listing models failed: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Internal(format!("read listing model failed: {e}")))?;
+        drop(stmt);
+
+        let mut models = Vec::new();
+        let mut seen_price_keys = BTreeSet::new();
+        for model_text in &observed_models {
+            let Some((price_key, price)) = catalog.lookup(model_text, now_unix) else {
+                continue;
+            };
+            if !seen_price_keys.insert(price_key.to_string()) {
+                continue;
+            }
+            // Standard/base is the headline rate. Tier and long-context
+            // variants are a per-request property of the buyer's own traffic,
+            // not of the listing, so they stay off the public card.
+            let Some(rates) = price.rate_at(ServiceTier::Standard, ContextTier::Base) else {
+                continue;
+            };
+            models.push(crate::models::ShareListingPricingModel {
+                model_key: price_key.to_string(),
+                display_name: if price.display_name.is_empty() {
+                    price_key.to_string()
+                } else {
+                    price.display_name.clone()
+                },
+                rates: crate::models::ShareListingPricingRates {
+                    input: rates.input_micros_per_1m.to_string(),
+                    output: rates.output_micros_per_1m.to_string(),
+                    cache_read: rates.cache_read_micros_per_1m.to_string(),
+                    cache_write5m: rates.cache_write_5m_micros_per_1m.to_string(),
+                },
+                long_context_threshold: price.long_context_threshold,
+            });
+        }
+        // Most expensive first: the priciest model a listing can serve is the
+        // single most decision-relevant number on the card.
+        models.sort_by(|left, right| {
+            let left_output = left.rates.output.parse::<i64>().unwrap_or(0);
+            let right_output = right.rates.output.parse::<i64>().unwrap_or(0);
+            right_output
+                .cmp(&left_output)
+                .then_with(|| left.model_key.cmp(&right.model_key))
+        });
+
+        let usage_mix = read_share_listing_usage_mix(&conn, &share_id, now_unix, &catalog)?;
+        drop(conn);
+
+        Ok(crate::models::ShareListingPricingResponse {
+            listing_id: listing_id.to_string(),
+            catalog_revision: crate::model_price_catalog::short_revision(catalog.revision()),
+            models,
+            usage_mix,
+        })
+    }
+
+    /// Owner-facing per-user, per-model usage with an official-price
+    /// equivalent (§9.1).
+    ///
+    /// Reads `share_request_logs` only (§8.4) and uses the SAME quota window as
+    /// `share_user_limit_status` (§8.1) — a different window would make the two
+    /// numbers disagree and read as a bug.
+    ///
+    /// R1: the amounts returned here are display-only and never touch billing.
+    pub async fn share_user_usage_breakdown(
+        &self,
+        share_id: &str,
+        email_filter: Option<&str>,
+    ) -> Result<crate::models::ShareUserUsageBreakdownResponse, AppError> {
+        use crate::model_pricing::{
+            ContextTier, PricingNote, ServiceTier, TokenSplit, price_usage_in_tier,
+        };
+
+        let catalog = self.pricing_catalog();
+        let conn = self.conn.lock().await;
+        let Some(user_grants_json): Option<String> = conn
+            .query_row(
+                "SELECT COALESCE(user_grants_json, '{}')
+                 FROM shares
+                 WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                AppError::Internal(format!("query share usage breakdown grants failed: {e}"))
+            })?
+        else {
+            return Err(AppError::NotFound("share not found".into()));
+        };
+
+        let wanted = email_filter.and_then(normalize_usage_email);
+        let user_grants = parse_share_user_grants(Some(user_grants_json))
+            .map_err(|e| AppError::Internal(format!("parse share user grants failed: {e}")))?;
+        let mut grants: Vec<ShareUserGrant> = user_grants
+            .into_values()
+            .filter(|grant| grant.active)
+            .filter(|grant| {
+                wanted.as_deref().is_none_or(|wanted| {
+                    normalize_usage_email(&grant.email).as_deref() == Some(wanted)
+                })
+            })
+            .collect();
+        grants.sort_by(|left, right| {
+            left.email
+                .to_ascii_lowercase()
+                .cmp(&right.email.to_ascii_lowercase())
+        });
+
+        let now = Utc::now();
+        let now_unix = now.timestamp();
+        let mut targets = Vec::with_capacity(grants.len());
+        let mut windows = Vec::with_capacity(grants.len());
+        for grant in &grants {
+            let (start, end) = token_period_window(&grant.policy, now)?;
+            let email = normalize_usage_email(&grant.email)
+                .unwrap_or_else(|| grant.email.trim().to_ascii_lowercase());
+            targets.push(UsageBreakdownTarget {
+                email: email.clone(),
+                start: start.map(|ts| ts.timestamp()),
+                end: end.map(|ts| ts.timestamp()),
+            });
+            windows.push((email, start, end));
+        }
+
+        // Two passes (§8.2): the long-context threshold is per model, so the
+        // set of models in the window has to be known before the grouped
+        // aggregate can classify each request.
+        let model_keys = query_share_user_model_keys(&conn, share_id, &targets)?;
+        // §8.3: price at the earliest window end still in scope, so a window
+        // that closed before a price change keeps the price it was billed at.
+        let pricing_at = windows
+            .iter()
+            .filter_map(|(_, _, end)| end.map(|ts| ts.timestamp()))
+            .min()
+            .map_or(now_unix, |end| end.min(now_unix));
+        let mut thresholds: Vec<(String, i64, bool)> = Vec::new();
+        for model_key in &model_keys {
+            if let Some((_, price)) = catalog.lookup(model_key, pricing_at)
+                && let Some(threshold) = price.long_context_threshold
+            {
+                thresholds.push((
+                    model_key.clone(),
+                    threshold as i64,
+                    price.long_context_inclusive,
+                ));
+            }
+        }
+
+        let groups = query_share_user_model_usage(&conn, share_id, &targets, &thresholds)?;
+        drop(conn);
+
+        let mut by_email: HashMap<String, Vec<&UsageBreakdownGroup>> = HashMap::new();
+        for group in &groups {
+            by_email.entry(group.email.clone()).or_default().push(group);
+        }
+
+        let mut rows = Vec::with_capacity(grants.len());
+        for (grant, (email, window_start, window_end)) in grants.into_iter().zip(windows) {
+            // §8.3: prices are read at the window end, or now for a window that
+            // has not closed yet, whichever is earlier.
+            let pricing_at = window_end.map_or(now_unix, |end| end.timestamp().min(now_unix));
+
+            let mut totals = crate::models::ShareUserUsageTotals::default();
+            let mut by_model = Vec::new();
+            let mut priced_tokens: u64 = 0;
+            let mut request_count: u64 = 0;
+            let mut estimated_count: u64 = 0;
+            let mut equivalent: i128 = 0;
+            let mut equivalent_upper: i128 = 0;
+            let mut any_priced = false;
+
+            for group in by_email.remove(&email).unwrap_or_default() {
+                let split = TokenSplit {
+                    input: group.input,
+                    output: group.output,
+                    cache_read: group.cache_read,
+                    cache_write: group.cache_write,
+                };
+                let group_total = split.total().saturating_add(group.unattributed);
+                totals.input = totals.input.saturating_add(split.input);
+                totals.output = totals.output.saturating_add(split.output);
+                totals.cache_read = totals.cache_read.saturating_add(split.cache_read);
+                totals.cache_write = totals.cache_write.saturating_add(split.cache_write);
+                totals.unattributed = totals.unattributed.saturating_add(group.unattributed);
+                totals.total = totals.total.saturating_add(group_total);
+                request_count = request_count.saturating_add(group.request_count);
+                estimated_count = estimated_count.saturating_add(group.estimated_count);
+
+                let mut notes = Vec::new();
+                let (tier, tier_known) = match ServiceTier::parse(&group.tier_raw) {
+                    Some(tier) => (tier, true),
+                    None => (ServiceTier::Standard, false),
+                };
+                if !tier_known {
+                    notes.push(PricingNote::UnknownServiceTier);
+                }
+                let ctx = if group.long_context {
+                    ContextTier::Long
+                } else {
+                    ContextTier::Base
+                };
+
+                let resolved = catalog.lookup(&group.model_key, pricing_at);
+                // Unattributed-only groups have no billable split. Pricing
+                // them would emit a confident $0, which §6.4 forbids; the
+                // amount stays absent and the unattributed row carries the
+                // tokens instead.
+                let priced = if split.total() == 0 {
+                    None
+                } else {
+                    resolved.and_then(|(_, price)| price_usage_in_tier(price, tier, ctx, &split))
+                };
+
+                let (price_key, display_name) = match resolved {
+                    Some((key, price)) => (
+                        Some(key.to_string()),
+                        if price.display_name.is_empty() {
+                            group.model_key.clone()
+                        } else {
+                            price.display_name.clone()
+                        },
+                    ),
+                    None => (None, group.model_key.clone()),
+                };
+
+                let (amount, upper, lines) = match &priced {
+                    Some(usage) => {
+                        any_priced = true;
+                        priced_tokens = priced_tokens.saturating_add(split.total());
+                        equivalent += usage.total_micros;
+                        equivalent_upper += usage.upper_bound_micros;
+                        notes.extend(usage.notes.iter().copied());
+                        (
+                            Some(usage.total_micros.to_string()),
+                            Some(usage.upper_bound_micros.to_string()),
+                            usage
+                                .lines
+                                .iter()
+                                .map(|line| crate::models::ShareUserUsagePriceLine {
+                                    kind: line.kind.as_str().to_string(),
+                                    tokens: line.tokens,
+                                    rate_micros_per_1m: line.rate_micros_per_1m,
+                                    amount_micros: line.amount_micros.to_string(),
+                                })
+                                .collect(),
+                        )
+                    }
+                    // §6.4: an unpriced model shows no amount at all. Never
+                    // "0" — a confident-looking low number is worse than none.
+                    None => {
+                        if resolved.is_none() {
+                            notes.push(PricingNote::PriceKeyNotFound);
+                        }
+                        (None, None, Vec::new())
+                    }
+                };
+
+                notes.sort();
+                notes.dedup();
+                by_model.push(crate::models::ShareUserUsageModelRow {
+                    model_key: group.model_key.clone(),
+                    price_key,
+                    display_name,
+                    app_type: group.app_type.clone(),
+                    service_tier: tier.as_str().to_string(),
+                    context_tier: ctx.as_str().to_string(),
+                    input: split.input,
+                    output: split.output,
+                    cache_read: split.cache_read,
+                    cache_write: split.cache_write,
+                    unattributed: group.unattributed,
+                    total: group_total,
+                    request_count: group.request_count,
+                    priced: resolved.is_some(),
+                    equivalent_usd_micros: amount,
+                    equivalent_usd_micros_upper_bound: upper,
+                    lines,
+                    notes: notes.iter().map(|note| note.as_str().to_string()).collect(),
+                });
+            }
+
+            by_model.sort_by(|left, right| {
+                right
+                    .total
+                    .cmp(&left.total)
+                    .then_with(|| left.model_key.cmp(&right.model_key))
+                    .then_with(|| left.service_tier.cmp(&right.service_tier))
+                    .then_with(|| left.context_tier.cmp(&right.context_tier))
+            });
+
+            let estimated_request_percent = if request_count == 0 {
+                0.0
+            } else {
+                (estimated_count as f64 / request_count as f64) * 100.0
+            };
+            let priced_coverage_percent = if totals.total == 0 {
+                0.0
+            } else {
+                (priced_tokens as f64 / totals.total as f64) * 100.0
+            };
+
+            let mut row_notes = Vec::new();
+            // §11.3: estimated rows are counted, never excluded — excluding them
+            // would make the breakdown fall short of the quota column and
+            // create a new mismatch. They are disclosed instead.
+            if estimated_request_percent > 5.0 {
+                row_notes.push(PricingNote::UsageStateNotFullyObserved.as_str().to_string());
+            }
+
+            let rebase_applied = share_user_usage_rebase_applied(&grant, window_start.as_ref());
+            rows.push(crate::models::ShareUserUsageBreakdownRow {
+                email: grant.email,
+                window_starts_at: window_start.map(|ts| ts.to_rfc3339()),
+                resets_at: window_end.map(|ts| ts.to_rfc3339()),
+                // §10 (口径 A): the quota column may be rebased, the breakdown
+                // never is. Flagging it lets the UI explain the gap instead of
+                // fabricating an attribution for a scalar offset.
+                rebase_applied,
+                observed_totals: totals,
+                equivalent_usd_micros: any_priced.then(|| equivalent.to_string()),
+                equivalent_usd_micros_upper_bound: any_priced
+                    .then(|| equivalent_upper.to_string()),
+                priced_coverage_percent,
+                estimated_request_percent,
+                by_model,
+                notes: row_notes,
+            });
+        }
+
+        Ok(crate::models::ShareUserUsageBreakdownResponse {
+            share_id: share_id.to_string(),
+            pricing_revision: crate::model_price_catalog::qualified_revision(catalog.revision()),
+            priced_at: now_unix,
             rows,
         })
     }
@@ -19532,6 +20101,339 @@ impl crate::models::ShareUserUsageRebase {
             _ => false,
         }
     }
+}
+
+/// UTC day granularity for the public rollup.
+const ROLLUP_BUCKET_SECONDS: i64 = 86_400;
+/// §9.2 fixes the public window at 30 days.
+const LISTING_USAGE_MIX_WINDOW_DAYS: u32 = 30;
+/// R4's k-anonymity floor: below this, usage-derived public fields disappear.
+const LISTING_USAGE_MIX_MIN_USERS: i64 = 3;
+
+fn rollup_bucket_start(unix: i64) -> i64 {
+    unix.div_euclid(ROLLUP_BUCKET_SECONDS) * ROLLUP_BUCKET_SECONDS
+}
+
+/// Public mix is rollup-only. Named so tests can pin that this path never
+/// mentions `share_request_logs` (§14.1: missing bucket degrades to null).
+const LISTING_USAGE_MIX_SQL: &str = "SELECT model_key,
+                    SUM(input_tokens), SUM(output_tokens),
+                    SUM(cache_read_tokens), SUM(cache_write_tokens),
+                    MAX(distinct_users)
+               FROM share_listing_usage_rollup
+              WHERE share_id = ?1 AND bucket_start >= ?2
+              GROUP BY model_key";
+
+/// Reads the public usage mix from the rollup (§8.5, §9.2).
+///
+/// Returns `None` — never a live scan — when the rollup holds nothing for this
+/// window. Falling back to raw would reinstate exactly the unauthenticated
+/// amplification the rollup exists to prevent.
+fn read_share_listing_usage_mix(
+    conn: &Connection,
+    share_id: &str,
+    now_unix: i64,
+    catalog: &crate::model_price_catalog::PricingCatalog,
+) -> Result<Option<crate::models::ShareListingUsageMix>, AppError> {
+    let horizon = rollup_bucket_start(now_unix)
+        - i64::from(LISTING_USAGE_MIX_WINDOW_DAYS) * ROLLUP_BUCKET_SECONDS;
+    let mut stmt = conn
+        .prepare(LISTING_USAGE_MIX_SQL)
+        .map_err(|e| AppError::Internal(format!("prepare listing usage mix failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![share_id, horizon], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u128,
+                row.get::<_, i64>(2)?.max(0) as u128,
+                row.get::<_, i64>(3)?.max(0) as u128,
+                row.get::<_, i64>(4)?.max(0) as u128,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query listing usage mix failed: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| AppError::Internal(format!("read listing usage mix failed: {e}")))?;
+    drop(stmt);
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    // `MAX(distinct_users)` over day buckets is a lower bound on the true
+    // distinct count over the window, which is the safe direction for a
+    // k-anonymity floor: it can suppress, never over-disclose.
+    let peak_users = rows.iter().map(|row| row.5).max().unwrap_or(0);
+    if peak_users < LISTING_USAGE_MIX_MIN_USERS {
+        return Ok(None);
+    }
+
+    let mut input = 0u128;
+    let mut output = 0u128;
+    let mut cache_read = 0u128;
+    let mut cache_write = 0u128;
+    for row in &rows {
+        input += row.1;
+        output += row.2;
+        cache_read += row.3;
+        cache_write += row.4;
+    }
+    let total = input + output + cache_read + cache_write;
+    if total == 0 {
+        return Ok(None);
+    }
+    let fraction = |part: u128| (part as f64) / (total as f64);
+
+    let mut model_share: Vec<crate::models::ShareListingModelShare> = rows
+        .iter()
+        .filter_map(|row| {
+            let model_total = row.1 + row.2 + row.3 + row.4;
+            if model_total == 0 {
+                return None;
+            }
+            let (model_key, display_name) = match catalog.lookup(&row.0, now_unix) {
+                Some((price_key, price)) if !price.display_name.is_empty() => {
+                    (price_key.to_string(), price.display_name.clone())
+                }
+                Some((price_key, _)) => (price_key.to_string(), price_key.to_string()),
+                None => (row.0.clone(), row.0.clone()),
+            };
+            Some(crate::models::ShareListingModelShare {
+                model_key,
+                display_name,
+                share: fraction(model_total),
+            })
+        })
+        .collect();
+    model_share.sort_by(|left, right| {
+        right
+            .share
+            .partial_cmp(&left.share)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.model_key.cmp(&right.model_key))
+    });
+
+    Ok(Some(crate::models::ShareListingUsageMix {
+        window_days: LISTING_USAGE_MIX_WINDOW_DAYS,
+        composition: crate::models::ShareListingUsageComposition {
+            input: fraction(input),
+            output: fraction(output),
+            cache_read: fraction(cache_read),
+            cache_write: fraction(cache_write),
+        },
+        model_share,
+        // The next UTC day boundary: the rollup cannot change a closed bucket,
+        // so a public cache is safe until then.
+        stale_after: rollup_bucket_start(now_unix) + ROLLUP_BUCKET_SECONDS,
+    }))
+}
+
+/// One `(email, quota window)` pair to aggregate over. Pairing them avoids the
+/// cross product a shared window list would produce.
+#[derive(Debug, Clone)]
+struct UsageBreakdownTarget {
+    email: String,
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+/// One pre-aggregated pricing group (§8.2). Every request inside a group shares
+/// one `(model, service tier, context tier)` verdict, which is exactly what
+/// makes "sum then price" equal to "price then sum".
+#[derive(Debug, Clone)]
+struct UsageBreakdownGroup {
+    email: String,
+    model_key: String,
+    tier_raw: String,
+    long_context: bool,
+    app_type: String,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    unattributed: u64,
+    request_count: u64,
+    estimated_count: u64,
+}
+
+/// Whether the quota column for this grant carries a rebase offset (§10).
+fn share_user_usage_rebase_applied(
+    grant: &ShareUserGrant,
+    window_start: Option<&DateTime<Utc>>,
+) -> bool {
+    if let Some(rebase) = grant.usage_rebase.as_ref()
+        && rebase.rebase_window_matches(window_start)
+    {
+        return true;
+    }
+    grant
+        .usage_quota
+        .is_some_and(|quota| quota.rebase_applies)
+}
+
+/// Renders the `targets` VALUES list, appending its bound values.
+fn push_usage_breakdown_targets(
+    targets: &[UsageBreakdownTarget],
+    values: &mut Vec<crate::db::types::Value>,
+) -> String {
+    let mut rendered = Vec::with_capacity(targets.len());
+    for target in targets {
+        let base = values.len() + 1;
+        rendered.push(format!("(?{base}, ?{}, ?{})", base + 1, base + 2));
+        values.push(crate::db::types::Value::Text(target.email.clone()));
+        values.push(match target.start {
+            Some(start) => crate::db::types::Value::Integer(start),
+            None => crate::db::types::Value::Null,
+        });
+        values.push(match target.end {
+            Some(end) => crate::db::types::Value::Integer(end),
+            None => crate::db::types::Value::Null,
+        });
+    }
+    rendered.join(", ")
+}
+
+/// The projection shared by both passes. `model_key` follows §6.1
+/// (`actual_model` first, `model` as the fallback) because the equivalent price
+/// has to describe what actually ran, not what the client asked for.
+const USAGE_BREAKDOWN_ENTRIES_SQL: &str = "
+       SELECT t.email AS email,
+              lower(COALESCE(NULLIF(trim(sr.actual_model), ''), NULLIF(trim(sr.model), ''), '')) AS model_key,
+              lower(COALESCE(NULLIF(trim(sr.effective_service_tier), ''),
+                             NULLIF(trim(sr.client_service_tier), ''), 'standard')) AS tier_raw,
+              lower(trim(COALESCE(sr.app_type, ''))) AS app_type,
+              COALESCE(sr.input_tokens, 0) AS input_tokens,
+              COALESCE(sr.output_tokens, 0) AS output_tokens,
+              COALESCE(sr.cache_read_tokens, 0) AS cache_read_tokens,
+              COALESCE(sr.cache_creation_tokens, 0) AS cache_write_tokens,
+              CASE WHEN COALESCE(sr.input_tokens, 0) + COALESCE(sr.output_tokens, 0)
+                        + COALESCE(sr.cache_read_tokens, 0) + COALESCE(sr.cache_creation_tokens, 0) = 0
+                   THEN COALESCE(sr.quota_tokens, 0) ELSE 0 END AS unattributed_tokens,
+              CASE WHEN sr.usage_state != 'observed' THEN 1 ELSE 0 END AS estimated
+         FROM targets t
+         JOIN share_request_logs sr
+           ON lower(trim(sr.user_email)) = t.email
+          AND (t.start_ts IS NULL OR sr.created_at >= t.start_ts)
+          AND (t.end_ts IS NULL OR sr.created_at < t.end_ts)
+        WHERE sr.share_id = ?1
+          AND sr.is_health_check = 0
+          AND sr.user_email IS NOT NULL
+          AND trim(sr.user_email) != ''
+";
+
+/// Pass one: which models appear in these windows at all.
+fn query_share_user_model_keys(
+    conn: &Connection,
+    share_id: &str,
+    targets: &[UsageBreakdownTarget],
+) -> Result<BTreeSet<String>, AppError> {
+    if targets.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut values = vec![crate::db::types::Value::Text(share_id.to_string())];
+    let targets_sql = push_usage_breakdown_targets(targets, &mut values);
+    let sql = format!(
+        "WITH targets(email, start_ts, end_ts) AS (VALUES {targets_sql}),
+              entries AS ({USAGE_BREAKDOWN_ENTRIES_SQL})
+         SELECT DISTINCT model_key FROM entries WHERE model_key != ''"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        AppError::Internal(format!("prepare usage breakdown model keys failed: {e}"))
+    })?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| row.get::<_, String>(0))
+        .map_err(|e| AppError::Internal(format!("query usage breakdown model keys failed: {e}")))?;
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        keys.insert(row.map_err(|e| {
+            AppError::Internal(format!("read usage breakdown model key failed: {e}"))
+        })?);
+    }
+    Ok(keys)
+}
+
+/// Pass two: the three-dimension grouped aggregate.
+///
+/// `thresholds` carries `(model_key, threshold, inclusive)` for the models that
+/// have a long-context tier; everything else groups with `long_ctx = 0`. The
+/// tier string is normalised in Rust rather than SQL (§8.2) — the mapping will
+/// keep evolving, and it is safer in unit-testable code than embedded in a
+/// query string.
+fn query_share_user_model_usage(
+    conn: &Connection,
+    share_id: &str,
+    targets: &[UsageBreakdownTarget],
+    thresholds: &[(String, i64, bool)],
+) -> Result<Vec<UsageBreakdownGroup>, AppError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut values = vec![crate::db::types::Value::Text(share_id.to_string())];
+    let targets_sql = push_usage_breakdown_targets(targets, &mut values);
+
+    let (thresholds_cte, thresholds_join, long_ctx_expr) = if thresholds.is_empty() {
+        (String::new(), String::new(), "0".to_string())
+    } else {
+        let mut rendered = Vec::with_capacity(thresholds.len());
+        for (model_key, threshold, inclusive) in thresholds {
+            let base = values.len() + 1;
+            rendered.push(format!("(?{base}, ?{}, ?{})", base + 1, base + 2));
+            values.push(crate::db::types::Value::Text(model_key.clone()));
+            values.push(crate::db::types::Value::Integer(*threshold));
+            values.push(crate::db::types::Value::Integer(i64::from(*inclusive)));
+        }
+        (
+            format!(
+                ", thresholds(model_key, threshold, inclusive) AS (VALUES {})",
+                rendered.join(", ")
+            ),
+            " LEFT JOIN thresholds th ON th.model_key = e.model_key".to_string(),
+            "CASE WHEN th.threshold IS NULL THEN 0
+                  WHEN th.inclusive = 1 AND e.input_tokens >= th.threshold THEN 1
+                  WHEN th.inclusive = 0 AND e.input_tokens >  th.threshold THEN 1
+                  ELSE 0 END"
+                .to_string(),
+        )
+    };
+
+    let sql = format!(
+        "WITH targets(email, start_ts, end_ts) AS (VALUES {targets_sql}){thresholds_cte},
+              entries AS ({USAGE_BREAKDOWN_ENTRIES_SQL})
+         SELECT e.email, e.model_key, e.tier_raw, {long_ctx_expr} AS long_ctx, e.app_type,
+                SUM(e.input_tokens), SUM(e.output_tokens), SUM(e.cache_read_tokens),
+                SUM(e.cache_write_tokens), SUM(e.unattributed_tokens),
+                COUNT(*), SUM(e.estimated)
+           FROM entries e{thresholds_join}
+          GROUP BY e.email, e.model_key, e.tier_raw, long_ctx, e.app_type"
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| AppError::Internal(format!("prepare usage breakdown failed: {e}")))?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| {
+            Ok(UsageBreakdownGroup {
+                email: row.get::<_, String>(0)?,
+                model_key: row.get::<_, String>(1)?,
+                tier_raw: row.get::<_, String>(2)?,
+                long_context: row.get::<_, i64>(3)? != 0,
+                app_type: row.get::<_, String>(4)?,
+                input: row.get::<_, i64>(5)?.max(0) as u64,
+                output: row.get::<_, i64>(6)?.max(0) as u64,
+                cache_read: row.get::<_, i64>(7)?.max(0) as u64,
+                cache_write: row.get::<_, i64>(8)?.max(0) as u64,
+                unattributed: row.get::<_, i64>(9)?.max(0) as u64,
+                request_count: row.get::<_, i64>(10)?.max(0) as u64,
+                estimated_count: row.get::<_, i64>(11)?.max(0) as u64,
+            })
+        })
+        .map_err(|e| AppError::Internal(format!("query usage breakdown failed: {e}")))?;
+    let mut groups = Vec::new();
+    for row in rows {
+        groups.push(
+            row.map_err(|e| AppError::Internal(format!("read usage breakdown row failed: {e}")))?,
+        );
+    }
+    Ok(groups)
 }
 
 fn query_share_email_token_totals_for_windows(
@@ -32726,6 +33628,633 @@ mod tests {
             .expect("limit status");
         assert_eq!(status.rows[0].email, "user@example.com");
         assert_eq!(status.rows[0].tokens_used, 10_500);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    fn set_share_grants(conn: &Connection, share_id: &str, grants: BTreeMap<String, ShareUserGrant>) {
+        conn.execute(
+            "UPDATE shares SET user_grants_json = ?2 WHERE share_id = ?1",
+            params![
+                share_id,
+                serde_json::to_string(&grants).expect("serialize grants")
+            ],
+        )
+        .expect("set grants");
+    }
+
+    fn lifetime_grant(email: &str, role: &str, token_limit: u64) -> ShareUserGrant {
+        let mut grant = test_share_user_grant(email, role, token_limit);
+        grant.policy.token_period = ShareTokenPeriod::Lifetime;
+        grant.usage.lifetime.tokens_used = 0;
+        grant
+    }
+
+    async fn insert_public_listing(
+        store: &AppStore,
+        listing_id: &str,
+        share_id: &str,
+        installation_id: &str,
+        status: &str,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO share_market_listings (
+                id, share_id, installation_id, owner_user_id, owner_email,
+                status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'owner-user', 'owner@example.com', ?4, ?5, ?5)",
+            params![listing_id, share_id, installation_id, status, now],
+        )
+        .expect("insert listing");
+    }
+
+    async fn insert_health_success(
+        store: &AppStore,
+        share_id: &str,
+        requested_model: &str,
+        actual_model: &str,
+    ) {
+        let now = Utc::now().timestamp();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO share_model_health_state (
+                share_id, app_type, requested_model, actual_model, last_status,
+                last_success_at, last_failed_at, last_checked_at, recent_results_json,
+                error_message, updated_at
+             ) VALUES (?1, 'codex', ?2, ?3, 'success', ?4, NULL, ?4, '[]', NULL, ?4)",
+            params![share_id, requested_model, actual_model, now],
+        )
+        .expect("insert health success");
+    }
+
+    #[tokio::test]
+    async fn share_user_usage_breakdown_matches_limit_status_without_rebase() {
+        let (store, config) = setup_store("share-usage-breakdown-window").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-bd", "bd-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            set_share_grants(
+                &conn,
+                "share-bd",
+                BTreeMap::from([(
+                    "user@example.com".into(),
+                    lifetime_grant("user@example.com", "shareto", 20_000),
+                )]),
+            );
+            let mut log = test_share_request_log_entry("bd-observed", "share-bd", now);
+            log.user_email = Some("user@example.com".into());
+            log.input_tokens = 40;
+            log.output_tokens = 10;
+            log.cache_read_tokens = 5;
+            log.cache_creation_tokens = 2;
+            log.quota_tokens = Some(57);
+            upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert observed");
+
+            let mut health = test_share_request_log_entry("bd-health", "share-bd", now);
+            health.user_email = Some("user@example.com".into());
+            health.input_tokens = 999;
+            health.output_tokens = 999;
+            health.is_health_check = true;
+            upsert_share_request_log_tx(&conn, "inst-1", health).expect("insert health check");
+        }
+
+        let status = store
+            .share_user_limit_status("share-bd")
+            .await
+            .expect("limit status");
+        let breakdown = store
+            .share_user_usage_breakdown("share-bd", Some("user@example.com"))
+            .await
+            .expect("breakdown");
+        assert_eq!(status.rows[0].tokens_used, 57);
+        assert_eq!(breakdown.rows.len(), 1);
+        assert!(!breakdown.rows[0].rebase_applied);
+        assert_eq!(breakdown.rows[0].observed_totals.total, 57);
+        assert_eq!(breakdown.rows[0].observed_totals.input, 40);
+        assert_eq!(breakdown.rows[0].observed_totals.output, 10);
+        assert_eq!(breakdown.rows[0].observed_totals.cache_read, 5);
+        assert_eq!(breakdown.rows[0].observed_totals.cache_write, 2);
+        assert_eq!(breakdown.rows[0].by_model.len(), 1);
+        assert_eq!(breakdown.rows[0].by_model[0].model_key, "gpt-5");
+        assert!(breakdown.rows[0].by_model[0].priced);
+        assert!(breakdown.rows[0].equivalent_usd_micros.is_some());
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_user_usage_breakdown_puts_unattributed_tokens_aside() {
+        let (store, config) = setup_store("share-usage-breakdown-unattributed").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-unattr", "unattr-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            set_share_grants(
+                &conn,
+                "share-unattr",
+                BTreeMap::from([(
+                    "user@example.com".into(),
+                    lifetime_grant("user@example.com", "shareto", 20_000),
+                )]),
+            );
+            let mut log = test_share_request_log_entry("unattr-only", "share-unattr", now);
+            log.user_email = Some("user@example.com".into());
+            log.input_tokens = 0;
+            log.output_tokens = 0;
+            log.cache_read_tokens = 0;
+            log.cache_creation_tokens = 0;
+            log.quota_tokens = Some(80);
+            upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert unattributed");
+        }
+
+        let breakdown = store
+            .share_user_usage_breakdown("share-unattr", Some("user@example.com"))
+            .await
+            .expect("breakdown");
+        let row = &breakdown.rows[0];
+        assert_eq!(row.observed_totals.unattributed, 80);
+        assert_eq!(row.observed_totals.total, 80);
+        assert_eq!(row.by_model[0].unattributed, 80);
+        assert!(row.by_model[0].equivalent_usd_micros.is_none());
+        assert!(row.equivalent_usd_micros.is_none());
+        assert!(!row.by_model[0].notes.iter().any(|note| note == "priceKeyNotFound"));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_user_usage_breakdown_keeps_rebase_out_of_observed_totals() {
+        let (store, config) = setup_store("share-usage-breakdown-rebase").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-rebase", "rebase-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            let mut user = lifetime_grant("user@example.com", "shareto", 20_000);
+            user.usage.lifetime.tokens_used = 10_000;
+            user.usage_rebase = Some(crate::models::ShareUserUsageRebase {
+                period: ShareTokenPeriod::Lifetime,
+                anchor_at_ms: None,
+                window_starts_at_ms: None,
+                window_ends_at_ms: None,
+                target_tokens: 10_000,
+                observed_tokens_at_rebase: 0,
+                observed_requests_at_rebase: 0,
+                usage_watermark: 0,
+                applied_at_ms: 1,
+                applied_by: None,
+                source: crate::models::ShareUsageRebaseSource::Manual,
+            });
+            set_share_grants(
+                &conn,
+                "share-rebase",
+                BTreeMap::from([(user.email.clone(), user)]),
+            );
+            let mut log = test_share_request_log_entry("rebase-new", "share-rebase", now);
+            log.user_email = Some("user@example.com".into());
+            log.input_tokens = 400;
+            log.output_tokens = 100;
+            log.quota_tokens = Some(500);
+            upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert rebased usage");
+        }
+
+        let status = store
+            .share_user_limit_status("share-rebase")
+            .await
+            .expect("limit status");
+        let breakdown = store
+            .share_user_usage_breakdown("share-rebase", Some("user@example.com"))
+            .await
+            .expect("breakdown");
+        assert_eq!(status.rows[0].tokens_used, 10_500);
+        assert!(breakdown.rows[0].rebase_applied);
+        assert_eq!(breakdown.rows[0].observed_totals.total, 500);
+        let by_model_sum: u64 = breakdown.rows[0].by_model.iter().map(|row| row.total).sum();
+        assert_eq!(by_model_sum, breakdown.rows[0].observed_totals.total);
+        assert_ne!(
+            breakdown.rows[0].observed_totals.total,
+            status.rows[0].tokens_used
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_user_usage_breakdown_leaves_unknown_models_unpriced() {
+        let (store, config) = setup_store("share-usage-breakdown-unpriced").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-unpriced", "unpriced-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            set_share_grants(
+                &conn,
+                "share-unpriced",
+                BTreeMap::from([(
+                    "user@example.com".into(),
+                    lifetime_grant("user@example.com", "shareto", 20_000),
+                )]),
+            );
+            let mut log = test_share_request_log_entry("unpriced-model", "share-unpriced", now);
+            log.user_email = Some("user@example.com".into());
+            log.model = "totally-unknown-model".into();
+            log.actual_model = "totally-unknown-model".into();
+            log.input_tokens = 10;
+            log.output_tokens = 5;
+            upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert unpriced");
+        }
+
+        let breakdown = store
+            .share_user_usage_breakdown("share-unpriced", Some("user@example.com"))
+            .await
+            .expect("breakdown");
+        let model = &breakdown.rows[0].by_model[0];
+        assert!(!model.priced);
+        assert!(model.equivalent_usd_micros.is_none());
+        assert!(model.notes.iter().any(|note| note == "priceKeyNotFound"));
+        assert!(breakdown.rows[0].equivalent_usd_micros.is_none());
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_user_usage_breakdown_splits_priority_and_long_context() {
+        let (store, config) = setup_store("share-usage-breakdown-tiers").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-tiers", "tiers-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            set_share_grants(
+                &conn,
+                "share-tiers",
+                BTreeMap::from([(
+                    "user@example.com".into(),
+                    lifetime_grant("user@example.com", "shareto", 1_000_000),
+                )]),
+            );
+            let mut standard = test_share_request_log_entry("tier-standard", "share-tiers", now);
+            standard.user_email = Some("user@example.com".into());
+            standard.model = "claude-4-sonnet-20250514".into();
+            standard.actual_model = "claude-4-sonnet-20250514".into();
+            standard.effective_service_tier = Some("standard".into());
+            standard.input_tokens = 100;
+            standard.output_tokens = 10;
+            upsert_share_request_log_tx(&conn, "inst-1", standard).expect("insert standard");
+
+            let mut priority = test_share_request_log_entry("tier-priority", "share-tiers", now);
+            priority.user_email = Some("user@example.com".into());
+            priority.model = "claude-4-sonnet-20250514".into();
+            priority.actual_model = "claude-4-sonnet-20250514".into();
+            priority.effective_service_tier = Some("priority".into());
+            priority.input_tokens = 50;
+            priority.output_tokens = 5;
+            upsert_share_request_log_tx(&conn, "inst-1", priority).expect("insert priority");
+
+            let mut long_ctx = test_share_request_log_entry("tier-long", "share-tiers", now);
+            long_ctx.user_email = Some("user@example.com".into());
+            long_ctx.model = "claude-4-sonnet-20250514".into();
+            long_ctx.actual_model = "claude-4-sonnet-20250514".into();
+            long_ctx.effective_service_tier = Some("standard".into());
+            long_ctx.input_tokens = 200_001;
+            long_ctx.output_tokens = 1;
+            upsert_share_request_log_tx(&conn, "inst-1", long_ctx).expect("insert long context");
+        }
+
+        let breakdown = store
+            .share_user_usage_breakdown("share-tiers", Some("user@example.com"))
+            .await
+            .expect("breakdown");
+        let rows = &breakdown.rows[0].by_model;
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .any(|row| row.service_tier == "priority" && row.context_tier == "base")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.service_tier == "standard" && row.context_tier == "long")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.service_tier == "standard" && row.context_tier == "base")
+        );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_listing_pricing_hides_mix_below_k_anonymity() {
+        let (store, config) = setup_store("listing-pricing-k-anon").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-public", "public-sub", "active").await;
+        insert_public_listing(&store, "listing-public", "share-public", "inst-1", "active").await;
+        insert_health_success(&store, "share-public", "gpt-5", "gpt-5").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            for (request_id, email) in [
+                ("mix-a", "a@example.com"),
+                ("mix-b", "b@example.com"),
+            ] {
+                let mut log = test_share_request_log_entry(request_id, "share-public", now);
+                log.user_email = Some(email.into());
+                log.input_tokens = 10;
+                log.output_tokens = 2;
+                upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert mix user");
+            }
+        }
+        store
+            .rebuild_share_listing_usage_rollup(31)
+            .await
+            .expect("rebuild rollup");
+
+        let pricing = store
+            .share_listing_pricing("listing-public")
+            .await
+            .expect("pricing");
+        assert!(pricing.usage_mix.is_none());
+        assert!(
+            pricing
+                .models
+                .iter()
+                .any(|model| model.model_key == "gpt-5")
+        );
+        let encoded = serde_json::to_value(&pricing).expect("encode pricing");
+        let encoded_text = encoded.to_string();
+        assert!(!encoded_text.contains("example.com"));
+        assert!(encoded.get("distinctUsers").is_none());
+        assert!(encoded.get("requestCount").is_none());
+        assert!(encoded.get("equivalentUsdMicros").is_none());
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_listing_pricing_returns_mix_at_k_anonymity_floor() {
+        let (store, config) = setup_store("listing-pricing-mix").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-mix", "mix-sub", "active").await;
+        insert_public_listing(&store, "listing-mix", "share-mix", "inst-1", "active").await;
+        insert_health_success(&store, "share-mix", "gpt-5", "gpt-5").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            for (request_id, email) in [
+                ("mix-a", "a@example.com"),
+                ("mix-b", "b@example.com"),
+                ("mix-c", "c@example.com"),
+            ] {
+                let mut log = test_share_request_log_entry(request_id, "share-mix", now);
+                log.user_email = Some(email.into());
+                log.input_tokens = 10;
+                log.output_tokens = 2;
+                upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert mix user");
+            }
+        }
+        store
+            .rebuild_share_listing_usage_rollup(31)
+            .await
+            .expect("rebuild rollup");
+
+        let pricing = store
+            .share_listing_pricing("listing-mix")
+            .await
+            .expect("pricing");
+        let mix = pricing
+            .usage_mix
+            .as_ref()
+            .expect("mix above k-anonymity floor");
+        assert_eq!(mix.window_days, 30);
+        assert!(mix.composition.input > 0.0);
+        assert!(mix.composition.output > 0.0);
+        let encoded = serde_json::to_value(&pricing).expect("encode pricing");
+        assert!(encoded.get("usageMix").unwrap().get("distinctUsers").is_none());
+        assert!(encoded.get("usageMix").unwrap().get("requestCount").is_none());
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_listing_pricing_404s_when_not_publicly_listed() {
+        let (store, config) = setup_store("listing-pricing-private").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-private", "private-sub", "active").await;
+        insert_public_listing(
+            &store,
+            "listing-private",
+            "share-private",
+            "inst-1",
+            "closed",
+        )
+        .await;
+        insert_health_success(&store, "share-private", "gpt-5", "gpt-5").await;
+
+        let error = store
+            .share_listing_pricing("listing-private")
+            .await
+            .expect_err("private listing must 404");
+        assert!(
+            matches!(error, AppError::NotFound(_)),
+            "expected NotFound, got {error:?}"
+        );
+        let missing = store
+            .share_listing_pricing("listing-does-not-exist")
+            .await
+            .expect_err("unknown listing must 404");
+        assert!(matches!(missing, AppError::NotFound(_)));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_listing_usage_rollup_is_idempotent_and_resolves_aliases() {
+        let (store, config) = setup_store("listing-rollup-idempotent").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-rollup", "rollup-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO model_price_aliases (pattern, match_kind, price_key, priority, source, updated_at)
+                 VALUES ('claude-4-sonnet-alias', 'exact', 'claude-4-sonnet-20250514', 0, 'admin', 1)",
+                [],
+            )
+            .expect("insert alias");
+            let mut aliased = test_share_request_log_entry("rollup-alias", "share-rollup", now);
+            aliased.user_email = Some("a@example.com".into());
+            aliased.model = "claude-4-sonnet-alias".into();
+            aliased.actual_model = "claude-4-sonnet-alias".into();
+            aliased.input_tokens = 200_001;
+            aliased.output_tokens = 1;
+            upsert_share_request_log_tx(&conn, "inst-1", aliased).expect("insert aliased long");
+        }
+        store.reload_pricing_catalog().await.expect("reload catalog");
+        store
+            .rebuild_share_listing_usage_rollup(31)
+            .await
+            .expect("first rebuild");
+        let first = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT model_key, context_tier, input_tokens, request_count
+                   FROM share_listing_usage_rollup
+                  WHERE share_id = 'share-rollup'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("read first rollup")
+        };
+        assert_eq!(first.0, "claude-4-sonnet-alias");
+        assert_eq!(first.1, "long");
+        assert_eq!(first.2, 200_001);
+
+        store
+            .rebuild_share_listing_usage_rollup(31)
+            .await
+            .expect("second rebuild");
+        let second = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT model_key, context_tier, input_tokens, request_count
+                   FROM share_listing_usage_rollup
+                  WHERE share_id = 'share-rollup'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("read second rollup")
+        };
+        assert_eq!(first, second);
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM share_listing_usage_rollup", [])
+                .expect("wipe rollup");
+        }
+        store
+            .rebuild_share_listing_usage_rollup(31)
+            .await
+            .expect("rebuild after wipe");
+        let third = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT model_key, context_tier, input_tokens, request_count
+                   FROM share_listing_usage_rollup
+                  WHERE share_id = 'share-rollup'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("read rebuilt rollup")
+        };
+        assert_eq!(first, third);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_listing_pricing_does_not_scan_raw_logs_when_rollup_is_empty() {
+        let (store, config) = setup_store("listing-pricing-no-raw-scan").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-empty", "empty-sub", "active").await;
+        insert_public_listing(&store, "listing-empty", "share-empty", "inst-1", "active").await;
+        insert_health_success(&store, "share-empty", "gpt-5", "gpt-5").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            let mut log = test_share_request_log_entry("empty-raw", "share-empty", now);
+            log.user_email = Some("a@example.com".into());
+            log.input_tokens = 10;
+            upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert raw log");
+        }
+
+        let mix_sql = LISTING_USAGE_MIX_SQL.to_ascii_lowercase();
+        assert!(
+            mix_sql.contains("share_listing_usage_rollup"),
+            "mix SQL must actually read the rollup: {LISTING_USAGE_MIX_SQL}"
+        );
+        assert!(
+            !mix_sql.contains("share_request_logs"),
+            "mix SQL must stay rollup-only: {LISTING_USAGE_MIX_SQL}"
+        );
+        let mix_fn_src = include_str!("store.rs");
+        let mix_fn_start = mix_fn_src
+            .find("fn read_share_listing_usage_mix")
+            .expect("mix fn present");
+        let mix_fn_end = mix_fn_src[mix_fn_start..]
+            .find("struct UsageBreakdownGroup")
+            .map(|offset| mix_fn_start + offset)
+            .expect("mix fn bounded by UsageBreakdownGroup");
+        let mix_fn_body = &mix_fn_src[mix_fn_start..mix_fn_end];
+        assert!(
+            mix_fn_body.contains("LISTING_USAGE_MIX_SQL"),
+            "read_share_listing_usage_mix must prepare LISTING_USAGE_MIX_SQL, otherwise a later live-scan string would slip past the constant pin"
+        );
+        assert!(
+            !mix_fn_body.to_ascii_lowercase().contains("share_request_logs"),
+            "read_share_listing_usage_mix must not mention share_request_logs: {mix_fn_body}"
+        );
+        let pricing_fn_start = mix_fn_src
+            .find("pub async fn share_listing_pricing")
+            .expect("pricing fn present");
+        // Bound at the next function's doc comment so that comment's
+        // `share_request_logs` mention (owner breakdown, not this path) is
+        // not counted against the public pricing function.
+        let pricing_fn_end = mix_fn_src[pricing_fn_start..]
+            .find("/// Owner-facing per-user")
+            .map(|offset| pricing_fn_start + offset)
+            .expect("pricing fn bounded before owner breakdown");
+        let pricing_fn_body = &mix_fn_src[pricing_fn_start..pricing_fn_end];
+        assert!(
+            pricing_fn_body.contains("read_share_listing_usage_mix"),
+            "share_listing_pricing must call the rollup mix reader"
+        );
+        assert!(
+            !pricing_fn_body
+                .to_ascii_lowercase()
+                .contains("share_request_logs"),
+            "share_listing_pricing must not mention share_request_logs: {pricing_fn_body}"
+        );
+        let pricing = store
+            .share_listing_pricing("listing-empty")
+            .await
+            .expect("pricing without rollup");
+        assert!(pricing.usage_mix.is_none());
+        {
+            let conn = store.conn.lock().await;
+            let mix_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM share_listing_usage_rollup WHERE share_id = 'share-empty'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count rollup");
+            assert_eq!(mix_rows, 0);
+        }
 
         let _ = std::fs::remove_file(&config.database.path);
     }

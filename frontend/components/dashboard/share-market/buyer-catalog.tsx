@@ -33,6 +33,7 @@ import {
   listingUptimeValue,
 } from "@/components/dashboard/share-market/market-share-card";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
+import { ListingPricingCard } from "@/components/dashboard/share-market/listing-pricing-card";
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
@@ -553,6 +554,7 @@ export function ShareMarketBuyerCatalog({
                         : t("shareMarket.catalog.coverageInsufficient", { count: selected.listing.reliability.observedMinutes24h })}
                     </p>
                   </section>
+                  <ListingPricingCard listingId={selected.listing.id} />
                   <ShareModelHealthHeatmap shareId={selected.listing.shareId} />
                   <section className="grid gap-3">
                     <div className="flex items-center justify-between">

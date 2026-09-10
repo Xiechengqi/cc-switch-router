@@ -28,6 +28,8 @@ mod ip_iq;
 mod market_access;
 mod market_billing;
 mod metrics;
+mod model_price_catalog;
+mod model_pricing;
 mod models;
 mod namespace;
 mod notification_channels;
@@ -95,6 +97,9 @@ const SSH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const ROUTE_HEALTH_PROBE_CONCURRENCY: usize = 16;
 const SHARE_RUNTIME_REFRESH_CONCURRENCY: usize = 16;
+/// Rebuild horizon for the public usage rollup. One day of slack past the
+/// 30-day public window so a bucket is never missed at the boundary.
+const USAGE_ROLLUP_WINDOW_DAYS: u32 = 31;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -324,6 +329,7 @@ async fn main() -> Result<()> {
     let runtime_config = config.clone();
     let runtime_traffic = state.recent_traffic.clone();
     let model_health_store = state.store.clone();
+    let usage_rollup_store = state.store.clone();
     let model_health_proxy = state.proxy.clone();
     let model_health_config = config.clone();
     let request_log_recovery_store = state.store.clone();
@@ -585,6 +591,33 @@ async fn main() -> Result<()> {
             Ok::<_, anyhow::Error>(())
         },
     );
+    // §8.5: the public usage mix is materialised, never scanned live. Day
+    // buckets, so hourly is well inside the freshness the surface needs; the
+    // rebuild is idempotent, so a missed tick costs nothing but staleness.
+    let usage_rollup_task = spawn_background_task(
+        "Share listing usage rollup",
+        background_shutdown_rx.clone(),
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match usage_rollup_store
+                    .rebuild_share_listing_usage_rollup(USAGE_ROLLUP_WINDOW_DAYS)
+                    .await
+                {
+                    Ok(rows) => {
+                        tracing::debug!(rows, "rebuilt Share listing usage rollup")
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Share listing usage rollup rebuild failed")
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
     let request_log_recovery_task = spawn_background_task(
         "Share request log recovery",
         background_shutdown_rx.clone(),
@@ -838,6 +871,7 @@ async fn main() -> Result<()> {
         ("Share runtime refresh", runtime_task),
         ("Share model health", model_health_task),
         ("Share request log recovery", request_log_recovery_task),
+        ("Share listing usage rollup", usage_rollup_task),
         ("Resend usage refresh", resend_usage_task),
         ("metrics collector", metrics_task),
         ("clock health", clock_health_task),

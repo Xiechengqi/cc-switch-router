@@ -15,6 +15,7 @@
     "test:share-dashboard-utils": "tsx --test components/dashboard/share-dashboard-utils.test.ts",
     "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts components/dashboard/share-market/owner-workspace-utils.test.ts components/dashboard/share-market/subscription-utils.test.ts",
     "test:token-units": "tsx --test lib/token-units.test.ts",
+    "test:usd-micros": "tsx --test lib/usd-micros.test.ts",
     "test:share-settings": "tsx --test lib/share-settings.test.ts components/dashboard/share-edit/share-edit-draft.test.ts",
     "test:share-model-probe": "tsx --test lib/share-model-probe.test.ts",
     "test:model-routing": "tsx --test lib/model-routing.test.ts",
@@ -23,7 +24,8 @@
     "audit:settings-contract": "node ../scripts/audit/audit-settings-contract.mjs --check",
     "audit:market-billing-contract": "node ../scripts/audit/audit-market-billing-contract.mjs --check",
     "audit:web-token-units": "node ../scripts/audit/audit-web-token-units.mjs --check",
-    "audit:share-model-health-contract": "node ../scripts/audit/audit-share-model-health-contract.mjs --check"
+    "audit:share-model-health-contract": "node ../scripts/audit/audit-share-model-health-contract.mjs --check",
+    "audit:model-prices": "node ../scripts/audit/audit-model-prices.mjs --check"
   },
   "dependencies": {
     "@heroui/react": "^3.0.4",

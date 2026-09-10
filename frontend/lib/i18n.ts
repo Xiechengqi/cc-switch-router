@@ -86,6 +86,17 @@ export const messages = {
     "clientLogs.lineCount": "{count} / {limit} lines",
     "clientLogs.updatedAt": "Updated {time}",
     "shareMarket.title": "Share Market",
+    "shareMarket.pricing.title": "Available models and list prices",
+    "shareMarket.pricing.perMillion": "per 1M tokens",
+    "shareMarket.pricing.input": "Input",
+    "shareMarket.pricing.output": "Output",
+    "shareMarket.pricing.cacheRead": "Cache read",
+    "shareMarket.pricing.cacheWrite": "Cache write",
+    "shareMarket.pricing.longContext": "Long context {threshold}",
+    "shareMarket.pricing.usageMix": "Usage mix, last {days} days",
+    "shareMarket.pricing.mixDisclaimer":
+      "What this converts to for you depends on your own usage. Between two typical workloads the difference can be tens of times over.",
+    "shareMarket.pricing.catalogRevision": "Catalog {revision}",
     "shareMarket.workspace.label": "Share Market workspace",
     "shareMarket.workspace.catalog": "Find a seat",
     "shareMarket.workspace.rentals": "My rentals",
@@ -3210,6 +3221,47 @@ export const messages = {
     "dashboard.userLimit.nearLimit": "Near limit",
     "dashboard.userLimit.atLimit": "At limit",
     "dashboard.userLimit.loading": "Loading user limits…",
+    "dashboard.userLimit.byModel.title": "By model",
+    "dashboard.userLimit.byModel.model": "Model",
+    "dashboard.userLimit.byModel.input": "Input",
+    "dashboard.userLimit.byModel.output": "Output",
+    "dashboard.userLimit.byModel.cacheRead": "Cache read",
+    "dashboard.userLimit.byModel.cacheWrite": "Cache write",
+    "dashboard.userLimit.byModel.equivalent": "Equivalent",
+    "dashboard.userLimit.byModel.unpriced": "Unpriced",
+    "dashboard.userLimit.byModel.unattributed": "Unattributed",
+    "dashboard.userLimit.byModel.coverage":
+      "{coverage}% of tokens priced · {estimated}% of requests estimated · catalog {revision}",
+    "dashboard.userLimit.byModel.expand": "Show model breakdown",
+    "dashboard.userLimit.byModel.collapse": "Hide model breakdown",
+    "dashboard.userLimit.byModel.empty": "No usage in the current window.",
+    "dashboard.userLimit.byModel.loading": "Loading breakdown…",
+    "dashboard.userLimit.byModel.loadFailed": "Could not load the model breakdown.",
+    "dashboard.userLimit.byModel.longContext": "Long context",
+    "dashboard.userLimit.byModel.requests": "{count} requests",
+    "dashboard.userLimit.equivalent.label": "Equivalent",
+    "dashboard.userLimit.equivalent.hint":
+      "Official list price for the tokens actually consumed. Not a bill, and not what the seat costs.",
+    "dashboard.userLimit.equivalent.range":
+      "A range because the cache-write duration is not recorded; the two ends are the 5m and 1h prices.",
+    "dashboard.userLimit.equivalent.rebaseNotice":
+      "This user's quota was rebased. The quota bar includes the offset; the figures below are observed usage only.",
+    "dashboard.userLimit.equivalent.catalogRevision": "Price catalog {revision}",
+    "dashboard.userLimit.equivalent.lineFormula": "{tokens} × {rate} / 1M = {amount}",
+    "dashboard.userLimit.note.priceKeyNotFound":
+      "No price for this model in the catalog, so it is left out of the equivalent total.",
+    "dashboard.userLimit.note.cacheWriteAssumed5m":
+      "Cache writes are priced at the 5-minute rate; the actual TTL is not recorded.",
+    "dashboard.userLimit.note.longContextApplied":
+      "Priced at the above-threshold long-context rate.",
+    "dashboard.userLimit.note.serviceTierFellBack":
+      "No price for the requested service tier, so the standard-tier price was used.",
+    "dashboard.userLimit.note.contextTierFellBack":
+      "No separate long-context price, so the base price was used.",
+    "dashboard.userLimit.note.unknownServiceTier":
+      "Unrecognised service tier on these requests; priced as standard.",
+    "dashboard.userLimit.note.usageStateNotFullyObserved":
+      "Some requests report estimated rather than observed token counts.",
     "dashboard.field.maintenanceMessage": "Maintenance message",
     "dashboard.hint.maxChars": "Maximum 200 characters.",
     "dashboard.hint.freeAccess":
@@ -3376,6 +3428,17 @@ export const messages = {
     "clientLogs.lineCount": "{count} / {limit} 行",
     "clientLogs.updatedAt": "更新于 {time}",
     "shareMarket.title": "Share 市场",
+    "shareMarket.pricing.title": "可用模型与官方标价",
+    "shareMarket.pricing.perMillion": "每 1M token",
+    "shareMarket.pricing.input": "输入",
+    "shareMarket.pricing.output": "输出",
+    "shareMarket.pricing.cacheRead": "缓存读",
+    "shareMarket.pricing.cacheWrite": "缓存写",
+    "shareMarket.pricing.longContext": "长上下文 {threshold}",
+    "shareMarket.pricing.usageMix": "近 {days} 天用量构成",
+    "shareMarket.pricing.mixDisclaimer":
+      "实际折算取决于你自己的用法，两种典型负载之间差异可达数十倍。",
+    "shareMarket.pricing.catalogRevision": "目录 {revision}",
     "shareMarket.workspace.label": "Share 市场工作区",
     "shareMarket.workspace.catalog": "选购拼车位",
     "shareMarket.workspace.rentals": "我的租用",
@@ -6391,6 +6454,47 @@ export const messages = {
     "dashboard.userLimit.nearLimit": "接近限额",
     "dashboard.userLimit.atLimit": "已达限额",
     "dashboard.userLimit.loading": "正在加载用户限制…",
+    "dashboard.userLimit.byModel.title": "分模型明细",
+    "dashboard.userLimit.byModel.model": "模型",
+    "dashboard.userLimit.byModel.input": "输入",
+    "dashboard.userLimit.byModel.output": "输出",
+    "dashboard.userLimit.byModel.cacheRead": "缓存读",
+    "dashboard.userLimit.byModel.cacheWrite": "缓存写",
+    "dashboard.userLimit.byModel.equivalent": "等价",
+    "dashboard.userLimit.byModel.unpriced": "未定价",
+    "dashboard.userLimit.byModel.unattributed": "未归属",
+    "dashboard.userLimit.byModel.coverage":
+      "已定价覆盖 {coverage}% · {estimated}% 请求为估算 · 目录 {revision}",
+    "dashboard.userLimit.byModel.expand": "展开分模型明细",
+    "dashboard.userLimit.byModel.collapse": "收起分模型明细",
+    "dashboard.userLimit.byModel.empty": "当前窗口内没有用量。",
+    "dashboard.userLimit.byModel.loading": "正在加载明细…",
+    "dashboard.userLimit.byModel.loadFailed": "无法加载分模型明细。",
+    "dashboard.userLimit.byModel.longContext": "长上下文",
+    "dashboard.userLimit.byModel.requests": "{count} 次请求",
+    "dashboard.userLimit.equivalent.label": "等价",
+    "dashboard.userLimit.equivalent.hint":
+      "按实际消耗 Token 折算的官方标价。不是账单，也不等于这个席位的价格。",
+    "dashboard.userLimit.equivalent.range":
+      "区间是因为缓存写入的时长未被记录，两端分别按 5m 与 1h 价格计算。",
+    "dashboard.userLimit.equivalent.rebaseNotice":
+      "该用户配额已重基线。配额进度条含偏移量，下方为实测用量。",
+    "dashboard.userLimit.equivalent.catalogRevision": "价目目录 {revision}",
+    "dashboard.userLimit.equivalent.lineFormula": "{tokens} × {rate} / 1M = {amount}",
+    "dashboard.userLimit.note.priceKeyNotFound":
+      "目录中没有该模型的价格，因此不计入等价总额。",
+    "dashboard.userLimit.note.cacheWriteAssumed5m":
+      "缓存写入按 5 分钟价格计算；实际 TTL 未被记录。",
+    "dashboard.userLimit.note.longContextApplied":
+      "按超阈值的长上下文价格计算。",
+    "dashboard.userLimit.note.serviceTierFellBack":
+      "该服务档位没有价格，已回退到标准档价格。",
+    "dashboard.userLimit.note.contextTierFellBack":
+      "没有单独的长上下文价格，已使用基础价格。",
+    "dashboard.userLimit.note.unknownServiceTier":
+      "这些请求的服务档位无法识别，按标准档计价。",
+    "dashboard.userLimit.note.usageStateNotFullyObserved":
+      "部分请求上报的是估算值而非实测 Token 数。",
     "dashboard.field.maintenanceMessage": "维护提示",
     "dashboard.hint.maxChars": "最多 200 字。",
     "dashboard.hint.freeAccess":

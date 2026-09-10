@@ -815,6 +815,10 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/share-market/owned-shares", get(list_owned_shares))
         .route("/v1/share-market/listings/:id", delete(close_listing))
+        .route(
+            "/v1/share-market/listings/:id/pricing",
+            get(get_listing_pricing),
+        )
         .route("/v1/share-market/listings/:id/delete", post(delete_listing))
         .route("/v1/share-market/listings/:id/reopen", post(reopen_listing))
         .route("/v1/share-market/listings/:id/seats", post(add_seat))
@@ -3882,11 +3886,23 @@ enum ShareMarketCatalogScope {
     RenterListings,
 }
 
-fn catalog_visibility_predicate(scope: ShareMarketCatalogScope, share_alias: &str) -> String {
-    let public_listing = format!(
+/// SQL fragment for "this listing is publicly listed": the same three
+/// conditions `ListingView.publicly_listed` uses, so the anonymous catalog
+/// and `GET /listings/:id/pricing` cannot drift.
+///
+/// Callers still filter `listing.deleted_at IS NULL` themselves (catalog
+/// queries do it at the listing-row level so owner/renter scopes can see
+/// deleted listings they still have a relationship with).
+pub(crate) fn publicly_listed_sql(share_alias: &str) -> String {
+    format!(
         "listing.status = 'active'
+         AND COALESCE({share_alias}.share_status, 'missing') = 'active'
          AND lower(COALESCE({share_alias}.owner_email, '')) = lower(listing.owner_email)"
-    );
+    )
+}
+
+fn catalog_visibility_predicate(scope: ShareMarketCatalogScope, share_alias: &str) -> String {
+    let public_listing = publicly_listed_sql(share_alias);
     match scope {
         ShareMarketCatalogScope::Visible => format!(
             "({public_listing})
@@ -5852,6 +5868,46 @@ fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
                 candidate == "*" || candidate == etag || candidate.strip_prefix("W/") == Some(etag)
             })
         })
+}
+
+/// §9.2: identical for every viewer, so it may be cached publicly. Freshness is
+/// bounded by `staleAfter` (the next UTC day boundary) inside the body; the
+/// short max-age just keeps a price-catalog change from lingering.
+fn public_etag_json<T: Serialize>(headers: &HeaderMap, value: &T) -> Result<Response, AppError> {
+    let body = serde_json::to_vec(value).map_err(|error| {
+        AppError::Internal(format!("encode Share Market response failed: {error}"))
+    })?;
+    let etag = format!("\"{}\"", crate::api::sha256_hex(&body));
+    let not_modified = if_none_match_matches(headers, &etag);
+    Response::builder()
+        .status(if not_modified {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        })
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "public, max-age=300")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(if not_modified {
+            Body::empty()
+        } else {
+            Body::from(body)
+        })
+        .map_err(|error| AppError::Internal(format!("build Share Market response failed: {error}")))
+}
+
+/// Anonymous listing price card (§9.2).
+///
+/// No session is resolved: there is nothing viewer-dependent to resolve. A
+/// listing that is not publicly listed 404s rather than 403s, so the endpoint
+/// cannot be used to probe for private listings.
+async fn get_listing_pricing(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let pricing = state.store.share_listing_pricing(&id).await?;
+    public_etag_json(&headers, &pricing)
 }
 
 fn private_etag_json<T: Serialize>(headers: &HeaderMap, value: &T) -> Result<Response, AppError> {

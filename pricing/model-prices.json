@@ -1,0 +1,4062 @@
+{
+  "schemaVersion": 1,
+  "revision": "35739a1cac24",
+  "derivedAt": "2026-09-10",
+  "source": {
+    "name": "LiteLLM model_prices_and_context_window.json",
+    "url": "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json",
+    "sha256": "9bd463cfa9a5848a6b0c26f520206f149097a376e1d06525253287132bc06dbf",
+    "license": "MIT"
+  },
+  "models": [
+    {
+      "priceKey": "claude-3-7-sonnet-20250219",
+      "displayName": "Claude 3 7 Sonnet 20250219",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-3-7-sonnet-20250219` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": "6000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-3-haiku-20240307",
+      "displayName": "Claude 3 Haiku 20240307",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-3-haiku-20240307` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "250000",
+          "output": "1250000",
+          "cacheRead": "30000",
+          "cacheWrite5m": "300000",
+          "cacheWrite1h": "6000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-3-opus-20240229",
+      "displayName": "Claude 3 Opus 20240229",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-3-opus-20240229` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "75000000",
+          "cacheRead": "1500000",
+          "cacheWrite5m": "18750000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-4-opus-20250514",
+      "displayName": "Claude 4 Opus 20250514",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-4-opus-20250514` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "75000000",
+          "cacheRead": "1500000",
+          "cacheWrite5m": "18750000",
+          "cacheWrite1h": "30000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-4-sonnet-20250514",
+      "displayName": "Claude 4 Sonnet 20250514",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-4-sonnet-20250514` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": "6000000"
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "6000000",
+          "output": "22500000",
+          "cacheRead": "600000",
+          "cacheWrite5m": "7500000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-haiku-4-5",
+      "displayName": "Claude Haiku 4 5",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-haiku-4-5` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1000000",
+          "output": "5000000",
+          "cacheRead": "100000",
+          "cacheWrite5m": "1250000",
+          "cacheWrite1h": "2000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-haiku-4-5-20251001",
+      "displayName": "Claude Haiku 4 5 20251001",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-haiku-4-5-20251001` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1000000",
+          "output": "5000000",
+          "cacheRead": "100000",
+          "cacheWrite5m": "1250000",
+          "cacheWrite1h": "2000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-1",
+      "displayName": "Claude Opus 4 1",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-1` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "75000000",
+          "cacheRead": "1500000",
+          "cacheWrite5m": "18750000",
+          "cacheWrite1h": "30000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-1-20250805",
+      "displayName": "Claude Opus 4 1 20250805",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-1-20250805` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "75000000",
+          "cacheRead": "1500000",
+          "cacheWrite5m": "18750000",
+          "cacheWrite1h": "30000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-20250514",
+      "displayName": "Claude Opus 4 20250514",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-20250514` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "75000000",
+          "cacheRead": "1500000",
+          "cacheWrite5m": "18750000",
+          "cacheWrite1h": "30000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-5",
+      "displayName": "Claude Opus 4 5",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-5` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-5-20251101",
+      "displayName": "Claude Opus 4 5 20251101",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-5-20251101` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-6",
+      "displayName": "Claude Opus 4 6",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-6` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-6-20260205",
+      "displayName": "Claude Opus 4 6 20260205",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-6-20260205` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-6-thinking",
+      "displayName": "Claude Opus 4 6 Thinking",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-6-thinking` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-7",
+      "displayName": "Claude Opus 4 7",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-7` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-7-20260416",
+      "displayName": "Claude Opus 4 7 20260416",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-7-20260416` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-opus-4-8",
+      "displayName": "Claude Opus 4 8",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-opus-4-8` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "25000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": "10000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-sonnet-4-20250514",
+      "displayName": "Claude Sonnet 4 20250514",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-sonnet-4-20250514` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": "6000000"
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "6000000",
+          "output": "22500000",
+          "cacheRead": "600000",
+          "cacheWrite5m": "7500000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-sonnet-4-5",
+      "displayName": "Claude Sonnet 4 5",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-sonnet-4-5` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": "6000000"
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "6000000",
+          "output": "22500000",
+          "cacheRead": "600000",
+          "cacheWrite5m": "7500000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-sonnet-4-5-20250929",
+      "displayName": "Claude Sonnet 4 5 20250929",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-sonnet-4-5-20250929` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": "6000000"
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "6000000",
+          "output": "22500000",
+          "cacheRead": "600000",
+          "cacheWrite5m": "7500000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-sonnet-4-5-20250929-v1:0",
+      "displayName": "Claude Sonnet 4 5 20250929 V1:0",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-sonnet-4-5-20250929-v1:0` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": "6000000"
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "6000000",
+          "output": "22500000",
+          "cacheRead": "600000",
+          "cacheWrite5m": "7500000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-sonnet-4-6",
+      "displayName": "Claude Sonnet 4 6",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": true,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `claude-sonnet-4-6` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": "6000000"
+        }
+      ]
+    },
+    {
+      "priceKey": "codex-auto-review",
+      "displayName": "Codex Auto Review",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `codex-auto-review` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "200000",
+          "output": "1200000",
+          "cacheRead": "20000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "deepseek-v4-flash",
+      "displayName": "Deepseek V4 Flash",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `deepseek-v4-flash` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "220000",
+          "output": "660000",
+          "cacheRead": "7000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "deepseek-v4-flash-vision-exp",
+      "displayName": "Deepseek V4 Flash Vision Exp",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `deepseek-v4-flash-vision-exp` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "220000",
+          "output": "660000",
+          "cacheRead": "7000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "deepseek-v4-pro",
+      "displayName": "Deepseek V4 Pro",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `deepseek-v4-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "660000",
+          "output": "1980000",
+          "cacheRead": "22000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.0-flash",
+      "displayName": "Gemini 2 0 Flash",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.0-flash` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "400000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.0-flash-001",
+      "displayName": "Gemini 2 0 Flash 001",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.0-flash-001` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000",
+          "output": "600000",
+          "cacheRead": "37500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.0-flash-lite",
+      "displayName": "Gemini 2 0 Flash Lite",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.0-flash-lite` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "75000",
+          "output": "300000",
+          "cacheRead": "18750",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.0-flash-lite-001",
+      "displayName": "Gemini 2 0 Flash Lite 001",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.0-flash-lite-001` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "75000",
+          "output": "300000",
+          "cacheRead": "18750",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-computer-use-preview-10-2025",
+      "displayName": "Gemini 2 5 Computer Use Preview 10 2025",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-computer-use-preview-10-2025` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash",
+      "displayName": "Gemini 2 5 Flash",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "30000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash-lite",
+      "displayName": "Gemini 2 5 Flash Lite",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash-lite` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "400000",
+          "cacheRead": "10000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash-lite-preview-06-17",
+      "displayName": "Gemini 2 5 Flash Lite Preview 06 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash-lite-preview-06-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "400000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash-lite-preview-09-2025",
+      "displayName": "Gemini 2 5 Flash Lite Preview 09 2025",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash-lite-preview-09-2025` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "400000",
+          "cacheRead": "10000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash-native-audio-latest",
+      "displayName": "Gemini 2 5 Flash Native Audio Latest",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash-native-audio-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash-native-audio-preview-09-2025",
+      "displayName": "Gemini 2 5 Flash Native Audio Preview 09 2025",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash-native-audio-preview-09-2025` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash-native-audio-preview-12-2025",
+      "displayName": "Gemini 2 5 Flash Native Audio Preview 12 2025",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash-native-audio-preview-12-2025` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-flash-preview-09-2025",
+      "displayName": "Gemini 2 5 Flash Preview 09 2025",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-flash-preview-09-2025` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "75000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-pro",
+      "displayName": "Gemini 2 5 Pro",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "1250000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "2500000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-2.5-pro-preview-tts",
+      "displayName": "Gemini 2 5 Pro Preview TTS",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-2.5-pro-preview-tts` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3-flash",
+      "displayName": "Gemini 3 Flash",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3-flash` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "500000",
+          "output": "3000000",
+          "cacheRead": "50000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "900000",
+          "output": "5400000",
+          "cacheRead": "90000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3-flash-preview",
+      "displayName": "Gemini 3 Flash Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3-flash-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "500000",
+          "output": "3000000",
+          "cacheRead": "50000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "900000",
+          "output": "5400000",
+          "cacheRead": "90000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3-pro-preview",
+      "displayName": "Gemini 3 Pro Preview",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3-pro-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "12000000",
+          "cacheRead": "200000",
+          "cacheWrite5m": "2000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "4000000",
+          "output": "18000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "4000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3600000",
+          "output": "21600000",
+          "cacheRead": "360000",
+          "cacheWrite5m": "3600000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "long",
+          "input": "7200000",
+          "output": "32400000",
+          "cacheRead": "720000",
+          "cacheWrite5m": "7200000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.1-flash-lite",
+      "displayName": "Gemini 3 1 Flash Lite",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.1-flash-lite` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "250000",
+          "output": "1500000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "450000",
+          "output": "2700000",
+          "cacheRead": "45000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "125000",
+          "output": "750000",
+          "cacheRead": "12500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.1-flash-lite-preview",
+      "displayName": "Gemini 3 1 Flash Lite Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.1-flash-lite-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "250000",
+          "output": "1500000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.1-flash-live-preview",
+      "displayName": "Gemini 3 1 Flash Live Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.1-flash-live-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "750000",
+          "output": "4500000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.1-pro-high",
+      "displayName": "Gemini 3 1 Pro High",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.1-pro-high` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "12000000",
+          "cacheRead": "200000",
+          "cacheWrite5m": "2000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "4000000",
+          "output": "18000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "4000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3600000",
+          "output": "21600000",
+          "cacheRead": "360000",
+          "cacheWrite5m": "3600000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "long",
+          "input": "7200000",
+          "output": "32400000",
+          "cacheRead": "720000",
+          "cacheWrite5m": "7200000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.1-pro-low",
+      "displayName": "Gemini 3 1 Pro Low",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.1-pro-low` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "12000000",
+          "cacheRead": "200000",
+          "cacheWrite5m": "2000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "4000000",
+          "output": "18000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "4000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3600000",
+          "output": "21600000",
+          "cacheRead": "360000",
+          "cacheWrite5m": "3600000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "long",
+          "input": "7200000",
+          "output": "32400000",
+          "cacheRead": "720000",
+          "cacheWrite5m": "7200000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.1-pro-preview",
+      "displayName": "Gemini 3 1 Pro Preview",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.1-pro-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "12000000",
+          "cacheRead": "200000",
+          "cacheWrite5m": "2000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "4000000",
+          "output": "18000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "4000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3600000",
+          "output": "21600000",
+          "cacheRead": "360000",
+          "cacheWrite5m": "3600000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "long",
+          "input": "7200000",
+          "output": "32400000",
+          "cacheRead": "720000",
+          "cacheWrite5m": "7200000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.1-pro-preview-customtools",
+      "displayName": "Gemini 3 1 Pro Preview Customtools",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.1-pro-preview-customtools` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "12000000",
+          "cacheRead": "200000",
+          "cacheWrite5m": "2000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "4000000",
+          "output": "18000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "4000000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.5-flash",
+      "displayName": "Gemini 3 5 Flash",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.5-flash` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1500000",
+          "output": "9000000",
+          "cacheRead": "150000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2700000",
+          "output": "16200000",
+          "cacheRead": "270000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-3.6-flash",
+      "displayName": "Gemini 3 6 Flash",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-3.6-flash` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1500000",
+          "output": "7500000",
+          "cacheRead": "150000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2700000",
+          "output": "13500000",
+          "cacheRead": "270000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-exp-1206",
+      "displayName": "Gemini Exp 1206",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-exp-1206` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "30000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-flash-latest",
+      "displayName": "Gemini Flash Latest",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-flash-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "30000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-flash-lite-latest",
+      "displayName": "Gemini Flash Lite Latest",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-flash-lite-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "400000",
+          "cacheRead": "10000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-pro-latest",
+      "displayName": "Gemini Pro Latest",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-pro-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gemini-robotics-er-1.5-preview",
+      "displayName": "Gemini Robotics Er 1 5 Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gemini-robotics-er-1.5-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "300000",
+          "output": "2500000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-3.5-turbo",
+      "displayName": "GPT 3 5 Turbo",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-3.5-turbo` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "500000",
+          "output": "1500000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-3.5-turbo-0125",
+      "displayName": "GPT 3 5 Turbo 0125",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-3.5-turbo-0125` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "500000",
+          "output": "1500000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-3.5-turbo-1106",
+      "displayName": "GPT 3 5 Turbo 1106",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-3.5-turbo-1106` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1000000",
+          "output": "2000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-3.5-turbo-16k",
+      "displayName": "GPT 3 5 Turbo 16k",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-3.5-turbo-16k` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "4000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4",
+      "displayName": "GPT 4",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "30000000",
+          "output": "60000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4-0125-preview",
+      "displayName": "GPT 4 0125 Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4-0125-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "30000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4-0314",
+      "displayName": "GPT 4 0314",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4-0314` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "30000000",
+          "output": "60000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4-0613",
+      "displayName": "GPT 4 0613",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4-0613` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "30000000",
+          "output": "60000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4-1106-preview",
+      "displayName": "GPT 4 1106 Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4-1106-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "30000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4-turbo",
+      "displayName": "GPT 4 Turbo",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4-turbo` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "30000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4-turbo-2024-04-09",
+      "displayName": "GPT 4 Turbo 2024 04 09",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4-turbo-2024-04-09` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "30000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4-turbo-preview",
+      "displayName": "GPT 4 Turbo Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4-turbo-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "30000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4.1",
+      "displayName": "GPT 4 1",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4.1` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "8000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "14000000",
+          "cacheRead": "875000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4.1-2025-04-14",
+      "displayName": "GPT 4 1 2025 04 14",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4.1-2025-04-14` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "8000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4.1-mini",
+      "displayName": "GPT 4 1 Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4.1-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "400000",
+          "output": "1600000",
+          "cacheRead": "100000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "700000",
+          "output": "2800000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4.1-mini-2025-04-14",
+      "displayName": "GPT 4 1 Mini 2025 04 14",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4.1-mini-2025-04-14` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "400000",
+          "output": "1600000",
+          "cacheRead": "100000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4.1-nano",
+      "displayName": "GPT 4 1 Nano",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4.1-nano` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "400000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "200000",
+          "output": "800000",
+          "cacheRead": "50000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4.1-nano-2025-04-14",
+      "displayName": "GPT 4 1 Nano 2025 04 14",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4.1-nano-2025-04-14` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "400000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o",
+      "displayName": "GPT 4o",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "1250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "4250000",
+          "output": "17000000",
+          "cacheRead": "2125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-2024-05-13",
+      "displayName": "GPT 4o 2024 05 13",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-2024-05-13` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "15000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "8750000",
+          "output": "26250000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-2024-08-06",
+      "displayName": "GPT 4o 2024 08 06",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-2024-08-06` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "1250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-2024-11-20",
+      "displayName": "GPT 4o 2024 11 20",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-2024-11-20` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "1250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-audio-preview",
+      "displayName": "GPT 4o Audio Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-audio-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-audio-preview-2024-12-17",
+      "displayName": "GPT 4o Audio Preview 2024 12 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-audio-preview-2024-12-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-audio-preview-2025-06-03",
+      "displayName": "GPT 4o Audio Preview 2025 06 03",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-audio-preview-2025-06-03` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini",
+      "displayName": "GPT 4o Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000",
+          "output": "600000",
+          "cacheRead": "75000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "250000",
+          "output": "1000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini-2024-07-18",
+      "displayName": "GPT 4o Mini 2024 07 18",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini-2024-07-18` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000",
+          "output": "600000",
+          "cacheRead": "75000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini-audio-preview",
+      "displayName": "GPT 4o Mini Audio Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini-audio-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000",
+          "output": "600000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini-audio-preview-2024-12-17",
+      "displayName": "GPT 4o Mini Audio Preview 2024 12 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini-audio-preview-2024-12-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000",
+          "output": "600000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini-realtime-preview",
+      "displayName": "GPT 4o Mini Realtime Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini-realtime-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini-realtime-preview-2024-12-17",
+      "displayName": "GPT 4o Mini Realtime Preview 2024 12 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini-realtime-preview-2024-12-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini-search-preview",
+      "displayName": "GPT 4o Mini Search Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini-search-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000",
+          "output": "600000",
+          "cacheRead": "75000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-mini-search-preview-2025-03-11",
+      "displayName": "GPT 4o Mini Search Preview 2025 03 11",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-mini-search-preview-2025-03-11` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000",
+          "output": "600000",
+          "cacheRead": "75000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-realtime-preview",
+      "displayName": "GPT 4o Realtime Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-realtime-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "20000000",
+          "cacheRead": "2500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-realtime-preview-2024-12-17",
+      "displayName": "GPT 4o Realtime Preview 2024 12 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-realtime-preview-2024-12-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "20000000",
+          "cacheRead": "2500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-realtime-preview-2025-06-03",
+      "displayName": "GPT 4o Realtime Preview 2025 06 03",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-realtime-preview-2025-06-03` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "20000000",
+          "cacheRead": "2500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-search-preview",
+      "displayName": "GPT 4o Search Preview",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-search-preview` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "1250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-4o-search-preview-2025-03-11",
+      "displayName": "GPT 4o Search Preview 2025 03 11",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-4o-search-preview-2025-03-11` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "1250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5",
+      "displayName": "GPT 5",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "20000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "625000",
+          "output": "5000000",
+          "cacheRead": "62500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-2025-08-07",
+      "displayName": "GPT 5 2025 08 07",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-2025-08-07` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "20000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "625000",
+          "output": "5000000",
+          "cacheRead": "62500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-chat",
+      "displayName": "GPT 5 Chat",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-chat` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-chat-latest",
+      "displayName": "GPT 5 Chat Latest",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-chat-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-codex",
+      "displayName": "GPT 5 Codex",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-codex` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-mini",
+      "displayName": "GPT 5 Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "250000",
+          "output": "2000000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "450000",
+          "output": "3600000",
+          "cacheRead": "45000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "125000",
+          "output": "1000000",
+          "cacheRead": "12500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-mini-2025-08-07",
+      "displayName": "GPT 5 Mini 2025 08 07",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-mini-2025-08-07` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "250000",
+          "output": "2000000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "450000",
+          "output": "3600000",
+          "cacheRead": "45000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "125000",
+          "output": "1000000",
+          "cacheRead": "12500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-nano",
+      "displayName": "GPT 5 Nano",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-nano` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "50000",
+          "output": "400000",
+          "cacheRead": "5000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "400000",
+          "cacheRead": "5000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "25000",
+          "output": "200000",
+          "cacheRead": "2500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-nano-2025-08-07",
+      "displayName": "GPT 5 Nano 2025 08 07",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-nano-2025-08-07` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "50000",
+          "output": "400000",
+          "cacheRead": "5000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "25000",
+          "output": "200000",
+          "cacheRead": "2500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-pro",
+      "displayName": "GPT 5 Pro",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "120000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-pro-2025-10-06",
+      "displayName": "GPT 5 Pro 2025 10 06",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-pro-2025-10-06` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "120000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-search-api",
+      "displayName": "GPT 5 Search Api",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-search-api` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5-search-api-2025-10-14",
+      "displayName": "GPT 5 Search Api 2025 10 14",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5-search-api-2025-10-14` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.1",
+      "displayName": "GPT 5 1",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.1` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "20000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.1-2025-11-13",
+      "displayName": "GPT 5 1 2025 11 13",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.1-2025-11-13` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "20000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.1-chat-latest",
+      "displayName": "GPT 5 1 Chat Latest",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.1-chat-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "20000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.1-codex",
+      "displayName": "GPT 5 1 Codex",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.1-codex` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "20000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.1-codex-max",
+      "displayName": "GPT 5 1 Codex Max",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.1-codex-max` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "10000000",
+          "cacheRead": "125000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.1-codex-mini",
+      "displayName": "GPT 5 1 Codex Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.1-codex-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "250000",
+          "output": "2000000",
+          "cacheRead": "25000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "450000",
+          "output": "3600000",
+          "cacheRead": "45000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.2",
+      "displayName": "GPT 5 2",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.2` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1750000",
+          "output": "14000000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "28000000",
+          "cacheRead": "350000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.2-2025-12-11",
+      "displayName": "GPT 5 2 2025 12 11",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.2-2025-12-11` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1750000",
+          "output": "14000000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "28000000",
+          "cacheRead": "350000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.2-chat-latest",
+      "displayName": "GPT 5 2 Chat Latest",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.2-chat-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1750000",
+          "output": "14000000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "28000000",
+          "cacheRead": "350000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.2-codex",
+      "displayName": "GPT 5 2 Codex",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.2-codex` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1750000",
+          "output": "14000000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "28000000",
+          "cacheRead": "350000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.2-pro",
+      "displayName": "GPT 5 2 Pro",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.2-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "21000000",
+          "output": "168000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.2-pro-2025-12-11",
+      "displayName": "GPT 5 2 Pro 2025 12 11",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.2-pro-2025-12-11` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "21000000",
+          "output": "168000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.3-chat-latest",
+      "displayName": "GPT 5 3 Chat Latest",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.3-chat-latest` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1750000",
+          "output": "14000000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "28000000",
+          "cacheRead": "350000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.3-codex",
+      "displayName": "GPT 5 3 Codex",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.3-codex` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1750000",
+          "output": "14000000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "28000000",
+          "cacheRead": "350000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.3-codex-spark",
+      "displayName": "GPT 5 3 Codex Spark",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.3-codex-spark` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1750000",
+          "output": "14000000",
+          "cacheRead": "175000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "28000000",
+          "cacheRead": "350000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4",
+      "displayName": "GPT 5 4",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "5000000",
+          "output": "22500000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "30000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "7500000",
+          "cacheRead": "130000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4-2026-03-05",
+      "displayName": "GPT 5 4 2026 03 05",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4-2026-03-05` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "5000000",
+          "output": "22500000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "30000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "1250000",
+          "output": "7500000",
+          "cacheRead": "130000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4-mini",
+      "displayName": "GPT 5 4 Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "750000",
+          "output": "4500000",
+          "cacheRead": "75000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "1500000",
+          "output": "9000000",
+          "cacheRead": "150000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "375000",
+          "output": "2250000",
+          "cacheRead": "37500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4-mini-2026-03-17",
+      "displayName": "GPT 5 4 Mini 2026 03 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4-mini-2026-03-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "750000",
+          "output": "4500000",
+          "cacheRead": "75000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "1500000",
+          "output": "9000000",
+          "cacheRead": "150000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "375000",
+          "output": "2250000",
+          "cacheRead": "37500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4-nano",
+      "displayName": "GPT 5 4 Nano",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4-nano` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "200000",
+          "output": "1250000",
+          "cacheRead": "20000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "625000",
+          "cacheRead": "10000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4-nano-2026-03-17",
+      "displayName": "GPT 5 4 Nano 2026 03 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4-nano-2026-03-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "200000",
+          "output": "1250000",
+          "cacheRead": "20000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "625000",
+          "cacheRead": "10000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4-pro",
+      "displayName": "GPT 5 4 Pro",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "30000000",
+          "output": "180000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "60000000",
+          "output": "270000000",
+          "cacheRead": "6000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "90000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.4-pro-2026-03-05",
+      "displayName": "GPT 5 4 Pro 2026 03 05",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.4-pro-2026-03-05` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "30000000",
+          "output": "180000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "60000000",
+          "output": "270000000",
+          "cacheRead": "6000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "90000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.5",
+      "displayName": "GPT 5 5",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.5` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "30000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "10000000",
+          "output": "45000000",
+          "cacheRead": "1000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "12500000",
+          "output": "75000000",
+          "cacheRead": "1250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.5-2026-04-23",
+      "displayName": "GPT 5 5 2026 04 23",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.5-2026-04-23` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "30000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "10000000",
+          "output": "45000000",
+          "cacheRead": "1000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "12500000",
+          "output": "75000000",
+          "cacheRead": "1250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.5-pro",
+      "displayName": "GPT 5 5 Pro",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.5-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "30000000",
+          "output": "180000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "60000000",
+          "output": "270000000",
+          "cacheRead": "6000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "90000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.5-pro-2026-04-23",
+      "displayName": "GPT 5 5 Pro 2026 04 23",
+      "longContextThreshold": 272000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.5-pro-2026-04-23` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "30000000",
+          "output": "180000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "60000000",
+          "output": "270000000",
+          "cacheRead": "6000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "90000000",
+          "cacheRead": "3000000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.6-luna",
+      "displayName": "GPT 5 6 Luna",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.6-luna` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "200000",
+          "output": "1200000",
+          "cacheRead": "20000",
+          "cacheWrite5m": "250000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "400000",
+          "output": "2400000",
+          "cacheRead": "40000",
+          "cacheWrite5m": "500000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "100000",
+          "output": "600000",
+          "cacheRead": "10000",
+          "cacheWrite5m": "125000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.6-sol",
+      "displayName": "GPT 5 6 Sol",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.6-sol` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "5000000",
+          "output": "30000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "6250000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "60000000",
+          "cacheRead": "1000000",
+          "cacheWrite5m": "12500000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "15000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "3125000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-5.6-terra",
+      "displayName": "GPT 5 6 Terra",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-5.6-terra` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "12000000",
+          "cacheRead": "200000",
+          "cacheWrite5m": "2500000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "4000000",
+          "output": "24000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "5000000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "1000000",
+          "output": "6000000",
+          "cacheRead": "100000",
+          "cacheWrite5m": "1250000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-6-astra",
+      "displayName": "GPT 6 Astra",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-6-astra` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "50000000",
+          "cacheRead": "1000000",
+          "cacheWrite5m": "12500000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-audio",
+      "displayName": "GPT Audio",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-audio` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-audio-1.5",
+      "displayName": "GPT Audio 1 5",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-audio-1.5` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-audio-2025-08-28",
+      "displayName": "GPT Audio 2025 08 28",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-audio-2025-08-28` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2500000",
+          "output": "10000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-audio-mini",
+      "displayName": "GPT Audio Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-audio-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-audio-mini-2025-10-06",
+      "displayName": "GPT Audio Mini 2025 10 06",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-audio-mini-2025-10-06` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-audio-mini-2025-12-15",
+      "displayName": "GPT Audio Mini 2025 12 15",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-audio-mini-2025-12-15` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-realtime",
+      "displayName": "GPT Realtime",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-realtime` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "4000000",
+          "output": "16000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-realtime-1.5",
+      "displayName": "GPT Realtime 1 5",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-realtime-1.5` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "4000000",
+          "output": "16000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-realtime-2",
+      "displayName": "GPT Realtime 2",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-realtime-2` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "4000000",
+          "output": "16000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-realtime-2025-08-28",
+      "displayName": "GPT Realtime 2025 08 28",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-realtime-2025-08-28` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "4000000",
+          "output": "16000000",
+          "cacheRead": "400000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-realtime-mini",
+      "displayName": "GPT Realtime Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-realtime-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-realtime-mini-2025-10-06",
+      "displayName": "GPT Realtime Mini 2025 10 06",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-realtime-mini-2025-10-06` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "60000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "gpt-realtime-mini-2025-12-15",
+      "displayName": "GPT Realtime Mini 2025 12 15",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `gpt-realtime-mini-2025-12-15` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "600000",
+          "output": "2400000",
+          "cacheRead": "60000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o1-2024-12-17",
+      "displayName": "O1 2024 12 17",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o1-2024-12-17` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "15000000",
+          "output": "60000000",
+          "cacheRead": "7500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o1-pro",
+      "displayName": "O1 Pro",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o1-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000000",
+          "output": "600000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o1-pro-2025-03-19",
+      "displayName": "O1 Pro 2025 03 19",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o1-pro-2025-03-19` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "150000000",
+          "output": "600000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3",
+      "displayName": "O3",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "8000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "3500000",
+          "output": "14000000",
+          "cacheRead": "875000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "1000000",
+          "output": "4000000",
+          "cacheRead": "250000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3-2025-04-16",
+      "displayName": "O3 2025 04 16",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3-2025-04-16` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "8000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3-deep-research",
+      "displayName": "O3 Deep Research",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3-deep-research` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "40000000",
+          "cacheRead": "2500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3-deep-research-2025-06-26",
+      "displayName": "O3 Deep Research 2025 06 26",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3-deep-research-2025-06-26` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "10000000",
+          "output": "40000000",
+          "cacheRead": "2500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3-mini",
+      "displayName": "O3 Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1100000",
+          "output": "4400000",
+          "cacheRead": "550000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3-mini-2025-01-31",
+      "displayName": "O3 Mini 2025 01 31",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3-mini-2025-01-31` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1100000",
+          "output": "4400000",
+          "cacheRead": "550000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3-pro",
+      "displayName": "O3 Pro",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3-pro` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "20000000",
+          "output": "80000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o3-pro-2025-06-10",
+      "displayName": "O3 Pro 2025 06 10",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o3-pro-2025-06-10` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "20000000",
+          "output": "80000000",
+          "cacheRead": "0",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o4-mini",
+      "displayName": "O4 Mini",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o4-mini` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1100000",
+          "output": "4400000",
+          "cacheRead": "275000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "priority",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "8000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "flex",
+          "contextTier": "base",
+          "input": "550000",
+          "output": "2200000",
+          "cacheRead": "137500",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o4-mini-2025-04-16",
+      "displayName": "O4 Mini 2025 04 16",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o4-mini-2025-04-16` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "1100000",
+          "output": "4400000",
+          "cacheRead": "275000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o4-mini-deep-research",
+      "displayName": "O4 Mini Deep Research",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o4-mini-deep-research` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "8000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "o4-mini-deep-research-2025-06-26",
+      "displayName": "O4 Mini Deep Research 2025 06 26",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `o4-mini-deep-research-2025-06-26` (sha256 9bd463cfa9a5) on 2026-09-10",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "2000000",
+          "output": "8000000",
+          "cacheRead": "500000",
+          "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    }
+  ],
+  "aliases": []
+}

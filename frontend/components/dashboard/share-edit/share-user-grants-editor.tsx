@@ -7,6 +7,7 @@ import * as React from "react";
 import { ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import { getShareUserLimitStatus } from "@/lib/api";
+import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
 import type {
   ShareTokenPeriod,
   ShareUserGrant,
@@ -222,6 +223,13 @@ export function ShareUserGrantsEditor({
   const [batchDraft, setBatchDraft] = React.useState<BatchGrantDraft | null>(null);
   const [error, setError] = React.useState("");
   const [liveRows, setLiveRows] = React.useState<ShareUserLimitStatusRow[] | null>(null);
+  const {
+    breakdown,
+    breakdownRevision,
+    onExpand,
+    errors: breakdownErrors,
+    loaded: breakdownLoaded,
+  } = useShareUserUsageBreakdown(shareId);
   const supported = new Set<ShareTokenPeriod>(
     supportedPeriods?.length
       ? supportedPeriods
@@ -721,6 +729,11 @@ export function ShareUserGrantsEditor({
           rows={displayRows}
           grants={grants}
           t={t}
+          breakdown={shareId ? breakdown : undefined}
+          breakdownRevision={shareId ? breakdownRevision : undefined}
+          breakdownErrors={shareId ? breakdownErrors : undefined}
+          breakdownLoaded={shareId ? breakdownLoaded : undefined}
+          onExpand={shareId ? onExpand : undefined}
           leading={selecting ? {
             header: (
               <Checkbox

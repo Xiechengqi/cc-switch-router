@@ -100,11 +100,34 @@ export function auditSourceProvenance(root = repoRoot) {
   ) {
     violations.push("SOURCE_PROVENANCE.json: repository-owned input policy missing");
   }
+  if (
+    provenance.historicalAttributions != null &&
+    !Array.isArray(provenance.historicalAttributions)
+  ) {
+    violations.push("SOURCE_PROVENANCE.json: historicalAttributions must be an array when present");
+  }
+  for (const entry of provenance.historicalAttributions || []) {
+    if (entry.technicalInput === true) {
+      violations.push(
+        `SOURCE_PROVENANCE.json: historical attribution ${entry.id ?? "unknown source"} must not be a technical input`,
+      );
+    }
+  }
   if (!Array.isArray(provenance.vendoredSources)) {
     violations.push("SOURCE_PROVENANCE.json: vendoredSources must be an array");
     return violations;
   }
+  const historicalIds = new Set(
+    (provenance.historicalAttributions || [])
+      .map((entry) => entry.id)
+      .filter((id) => typeof id === "string" && id.length > 0),
+  );
   for (const entry of provenance.vendoredSources) {
+    if (historicalIds.has(entry.id)) {
+      violations.push(
+        `SOURCE_PROVENANCE.json: ${entry.id} is a historical attribution and must not also be vendored`,
+      );
+    }
     if (entry.technicalInput !== false) {
       violations.push(
         `SOURCE_PROVENANCE.json: ${entry.id ?? "unknown source"} must declare technicalInput=false`,

@@ -181,6 +181,12 @@ struct ShareUsageByEmailQuery {
     period: Option<String>,
 }
 
+/// `?email=` narrows the breakdown to one grant; absent means every active grant.
+#[derive(Debug, Deserialize)]
+struct ShareUserUsageBreakdownQuery {
+    email: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ShareModelHealthCalendarQuery {
     #[serde(default)]
@@ -445,6 +451,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/user-limit-status",
             get(share_user_limit_status),
+        )
+        .route(
+            "/v1/shares/:share_id/user-usage-breakdown",
+            get(share_user_usage_breakdown),
         )
         .route(
             "/v1/shares/:share_id/test-connection",
@@ -4870,6 +4880,23 @@ async fn share_user_limit_status(
     Path(share_id): Path<String>,
 ) -> Result<Json<crate::models::ShareUserLimitStatusResponse>, AppError> {
     Ok(Json(state.store.share_user_limit_status(&share_id).await?))
+}
+
+/// Owner-facing per-user equivalent-USD breakdown (§9.1).
+///
+/// Registered beside `user-limit-status` and carrying the same access posture:
+/// both read the same grants for the same share.
+async fn share_user_usage_breakdown(
+    State(state): State<ServerState>,
+    Path(share_id): Path<String>,
+    Query(query): Query<ShareUserUsageBreakdownQuery>,
+) -> Result<Json<crate::models::ShareUserUsageBreakdownResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .share_user_usage_breakdown(&share_id, query.email.as_deref())
+            .await?,
+    ))
 }
 
 async fn update_share_settings_with_email(
