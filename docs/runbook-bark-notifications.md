@@ -4,7 +4,7 @@ Router 原生调用 Bark Server 的 `POST /push` JSON 协议，不依赖 `/data/
 
 ## 用户 Bark
 
-在“管理员 → Settings → 通知渠道 → Bark user notifications”中设置：
+在“管理员 → Settings → 通知 → Bark”的用户通知分组中设置：
 
 - `CC_SWITCH_ROUTER_BARK_SERVER_URL`：允许用户绑定的唯一 Bark Server。远端必须为 HTTPS；只有 `localhost` 或 loopback IP 可使用 HTTP。
 - `CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY`：独立的 32 字节随机密钥，以 64 位十六进制或标准 base64 表示。不要复用数据库、Binance 或其他业务密钥。
@@ -29,7 +29,7 @@ Router 原生调用 Bark Server 的 `POST /push` JSON 协议，不依赖 `/data/
 
 ## 运维 Bark
 
-在“Bark operator alerts”中设置独立的 Server URL、Device Key、最低严重级别并启用。此 Device Key 是热更新 secret，不会由 Settings API 回显。保存后在同页的“通知渠道验证”发送测试消息；该测试不会使用或影响任何用户绑定。
+在“Bark operator alerts”中设置独立的 Server URL、Device Key、最低严重级别并启用。此 Device Key 是热更新 secret，不会由 Settings API 回显。保存后在同页底部的渠道验证发送测试消息；该测试不会使用或影响任何用户绑定。
 
 ## 故障判定
 
@@ -39,7 +39,7 @@ Router 原生调用 Bark Server 的 `POST /push` JSON 协议，不依赖 `/data/
 - `408/425/429/5xx`、连接或超时：可重试故障，遵守 `Retry-After` 和 outbox 退避；服务端给出的等待时间最多接受 24 小时，零值、过去时间或更长时间都会被夹取到安全范围。
 - 连续 3 次系统性失败：用户 Bark Provider 熔断 5 分钟，避免故障风暴；成功投递或成功测试会清零熔断状态。
 
-排障时先查看“管理员 → Settings → 通知渠道”的 Provider 状态和最近测试，再查看 Operations 中的通知投递记录。投递列表对 Bark 固定显示 `Bark ••••`，不会泄露密文片段。确认 Server 切换后，旧 Server 的用户绑定会被标为 invalid 并自动回退 Email，这是预期的安全行为。
+排障时先查看“管理员 → Settings → 通知 → Bark”的 Provider 状态和最近测试，再查看 Operations 中的通知投递记录。投递列表对 Bark 固定显示 `Bark ••••`，不会泄露密文片段。确认 Server 切换后，旧 Server 的用户绑定会被标为 invalid 并自动回退 Email，这是预期的安全行为。
 
 ## 首版边界
 

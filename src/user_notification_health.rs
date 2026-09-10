@@ -11,7 +11,11 @@ use uuid::Uuid;
 use crate::config::{BarkSettings, TelegramBotMode, TelegramBotSettings};
 use crate::db::{OptionalExtension, params};
 use crate::error::AppError;
-use crate::notification_channels::{BARK_CHANNEL, TELEGRAM_CHANNEL};
+use crate::notification_channels::{BARK_CHANNEL, EMAIL_CHANNEL, TELEGRAM_CHANNEL};
+use crate::notifications::{
+    FrozenEmailEnvelope, email_sender, is_basic_email, mask_email_address, sanitize_delivery_error,
+    send_resend_frozen_email_to,
+};
 use crate::store::AppStore;
 use crate::telegram::bind::{TelegramBotRuntime, telegram_config_fingerprint};
 
@@ -128,6 +132,14 @@ pub async fn channel_states(
         bark_binding,
     );
     Ok(vec![telegram, bark])
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EmailProviderSettings<'a> {
+    pub api_key: Option<&'a str>,
+    pub from: Option<&'a str>,
+    pub from_name: Option<&'a str>,
+    pub reply_to: Option<&'a str>,
 }
 
 pub async fn test_channel(
@@ -340,6 +352,99 @@ pub async fn test_channel(
                 }),
             })
         }
+    }
+}
+
+pub async fn test_email_channel(
+    http: &reqwest::Client,
+    settings: EmailProviderSettings<'_>,
+    actor_email: &str,
+    dashboard_url: &str,
+    endpoint: Option<&str>,
+) -> Result<UserNotificationChannelTestResponse, AppError> {
+    let now = Utc::now();
+    let recipient = actor_email.trim().to_ascii_lowercase();
+    if !is_basic_email(&recipient) {
+        return Err(AppError::coded_conflict(
+            "USER_NOTIFICATION_CHANNEL_MISCONFIGURED",
+            "the signed-in administrator email is not a valid test recipient",
+            serde_json::json!({ "channel": EMAIL_CHANNEL }),
+        ));
+    }
+    let api_key = settings
+        .api_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::coded_conflict(
+                "USER_NOTIFICATION_CHANNEL_MISCONFIGURED",
+                "Resend API key is not configured",
+                serde_json::json!({ "channel": EMAIL_CHANNEL }),
+            )
+        })?;
+    let from = email_sender(settings.from, settings.from_name).ok_or_else(|| {
+        AppError::coded_conflict(
+            "USER_NOTIFICATION_CHANNEL_MISCONFIGURED",
+            "Resend sender address is not configured",
+            serde_json::json!({ "channel": EMAIL_CHANNEL }),
+        )
+    })?;
+    let reply_to = settings
+        .reply_to
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| is_basic_email(value));
+    let dashboard = dashboard_url.trim_end_matches('/');
+    let settings_url = format!("{dashboard}/settings");
+    let stamped = now.to_rfc3339();
+    let subject = "CC-Switch Router email channel test";
+    let escaped_recipient = html_escape_text(&recipient);
+    let escaped_time = html_escape_text(&stamped);
+    let escaped_settings_url = html_escape_text(&settings_url);
+    let text = format!(
+        "This is an email channel test from CC-Switch Router.\n\nAccount: {recipient}\nTime: {stamped}\nSettings: {settings_url}\n"
+    );
+    let html = format!(
+        "<p>This is an email channel test from CC-Switch Router.</p><p>Account: {escaped_recipient}</p><p>Time: {escaped_time}</p><p><a href=\"{escaped_settings_url}\">Open Settings</a></p>"
+    );
+    let idempotency_key = format!("user-notification-email-test-{}", Uuid::new_v4());
+    let envelope = FrozenEmailEnvelope {
+        from: &from,
+        recipient: &recipient,
+        subject,
+        html: &html,
+        text: &text,
+        reply_to,
+        idempotency_key: &idempotency_key,
+    };
+    let target_label = mask_email_address(&recipient);
+    match send_resend_frozen_email_to(
+        http,
+        api_key,
+        envelope,
+        endpoint.unwrap_or("https://api.resend.com/emails"),
+    )
+    .await
+    {
+        Ok(provider_message_id) => Ok(UserNotificationChannelTestResponse {
+            ok: true,
+            channel: EMAIL_CHANNEL.into(),
+            target_label: Some(target_label),
+            provider_message_id: Some(provider_message_id),
+            tested_at: stamped,
+        }),
+        Err(failure) => Err(AppError::Coded {
+            status: StatusCode::CONFLICT,
+            code: "USER_NOTIFICATION_CHANNEL_TEST_FAILED",
+            message: sanitize_delivery_error(&failure.message),
+            details: serde_json::json!({
+                "channel": EMAIL_CHANNEL,
+                "retryable": failure.retryable,
+                "failureHint": sanitize_delivery_error(&failure.message),
+                "technicalError": sanitize_delivery_error(&failure.message),
+                "targetLabel": target_label,
+            }),
+        }),
     }
 }
 
@@ -726,6 +831,15 @@ fn telegram_channel_state(
             .then(|| binding.and_then(|value| value.verified_at))
             .flatten(),
     }
+}
+
+fn html_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn telegram_configured(settings: &TelegramBotSettings) -> bool {
@@ -1234,5 +1348,138 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.len(), 64);
         assert_eq!(second.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn email_channel_test_requires_resend_configuration() {
+        let error = test_email_channel(
+            &reqwest::Client::new(),
+            EmailProviderSettings {
+                api_key: None,
+                from: Some("noreply@example.com"),
+                from_name: None,
+                reply_to: None,
+            },
+            "admin@example.com",
+            "https://router.example.com",
+            None,
+        )
+        .await
+        .expect_err("missing API key");
+        assert_eq!(error.code(), Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED"));
+
+        let error = test_email_channel(
+            &reqwest::Client::new(),
+            EmailProviderSettings {
+                api_key: Some("re_test"),
+                from: None,
+                from_name: None,
+                reply_to: None,
+            },
+            "admin@example.com",
+            "https://router.example.com",
+            None,
+        )
+        .await
+        .expect_err("missing sender");
+        assert_eq!(error.code(), Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED"));
+    }
+
+    #[tokio::test]
+    async fn email_channel_test_rejects_invalid_administrator_email() {
+        let error = test_email_channel(
+            &reqwest::Client::new(),
+            EmailProviderSettings {
+                api_key: Some("re_test"),
+                from: Some("noreply@example.com"),
+                from_name: None,
+                reply_to: None,
+            },
+            "not-an-email",
+            "https://router.example.com",
+            None,
+        )
+        .await
+        .expect_err("invalid administrator email");
+        assert_eq!(error.code(), Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED"));
+    }
+
+    #[tokio::test]
+    async fn email_channel_test_sends_to_administrator() {
+        let (endpoint, requests, server) = start_mock_resend().await;
+        let result = test_email_channel(
+            &reqwest::Client::new(),
+            EmailProviderSettings {
+                api_key: Some("re_test"),
+                from: Some("noreply@example.com"),
+                from_name: Some("CC-Switch Router"),
+                reply_to: None,
+            },
+            "Admin@example.com",
+            "https://router.example.com",
+            Some(&endpoint),
+        )
+        .await;
+        server.abort();
+        let result = result.expect("email test sent");
+        assert!(result.ok);
+        assert_eq!(result.channel, EMAIL_CHANNEL);
+        assert_eq!(result.target_label.as_deref(), Some("a***@example.com"));
+        assert_eq!(result.provider_message_id.as_deref(), Some("email_test_1"));
+        let requests = requests.lock().await;
+        let payload: serde_json::Value = serde_json::from_slice(&requests[0]).unwrap();
+        assert_eq!(
+            payload
+                .get("to")
+                .and_then(|value| value.get(0))
+                .and_then(|value| value.as_str()),
+            Some("admin@example.com")
+        );
+        assert_eq!(
+            payload.get("from").and_then(|value| value.as_str()),
+            Some("CC-Switch Router <noreply@example.com>")
+        );
+    }
+
+    async fn start_mock_resend() -> (
+        String,
+        std::sync::Arc<tokio::sync::Mutex<Vec<axum::body::Bytes>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::StatusCode as AxumStatus;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = Router::new()
+            .route(
+                "/emails",
+                post(
+                    move |State(captured): State<Arc<Mutex<Vec<axum::body::Bytes>>>>,
+                          body: axum::body::Bytes| async move {
+                        captured.lock().await.push(body);
+                        (
+                            AxumStatus::OK,
+                            [("content-type", "application/json")],
+                            r#"{"id":"email_test_1"}"#,
+                        )
+                    },
+                ),
+            )
+            .with_state(captured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind email test mock");
+        let address = listener.local_addr().expect("email test mock address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve email test mock");
+        });
+        (format!("http://{address}/emails"), requests, task)
     }
 }

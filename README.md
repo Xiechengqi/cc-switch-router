@@ -99,7 +99,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 ## 管理设置与运维
 
-管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；Binance settlement 位于 Marketplace，地图和公告留在 General & Display，通知渠道健康检查留在 Notifications。
+管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；Binance settlement 位于 Marketplace，地图和公告留在 General & Display，通知渠道验证分别留在 Notifications 的邮件、Telegram、Bark tab。
 
 Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。
 

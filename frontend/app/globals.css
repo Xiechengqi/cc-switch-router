@@ -322,7 +322,8 @@ textarea:-webkit-autofill:focus {
 .alert-dialog__dialog,
 .dropdown__popover,
 .select__popover,
-.popover {
+.popover,
+.toast {
   color-scheme: light;
   --foreground: rgb(var(--router-foreground));
   --muted: rgb(var(--router-muted-foreground));
@@ -395,6 +396,16 @@ textarea:-webkit-autofill:focus {
 .drawer__body .text-muted-foreground,
 .alert-dialog__body .text-muted-foreground {
   color: rgb(var(--router-muted-foreground)) !important;
+}
+
+/*
+ * HeroUI toast descriptions use `text-muted` on a white surface. That token is
+ * a light fill in our theme and a faint overlay ink in HeroUI, so upgrade
+ * failure details (and any other toast body) become unreadable. Keep titles on
+ * their variant colors; force the body copy to primary ink.
+ */
+.toast__description {
+  color: rgb(var(--router-foreground)) !important;
 }
 
 

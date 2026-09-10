@@ -1694,7 +1694,7 @@ pub(crate) async fn send_resend_frozen_email(
     send_resend_frozen_email_to(http, api_key, envelope, RESEND_EMAILS_ENDPOINT).await
 }
 
-async fn send_resend_frozen_email_to(
+pub(crate) async fn send_resend_frozen_email_to(
     http: &reqwest::Client,
     api_key: &str,
     envelope: FrozenEmailEnvelope<'_>,
@@ -2038,8 +2038,12 @@ fn strip_header_controls(value: &str) -> String {
         .to_string()
 }
 
-fn notification_sender(config: &Config) -> Option<String> {
-    let raw = strip_header_controls(config.resend_from.as_deref()?);
+pub(crate) fn notification_sender(config: &Config) -> Option<String> {
+    email_sender(config.resend_from.as_deref(), config.resend_from_name.as_deref())
+}
+
+pub(crate) fn email_sender(from: Option<&str>, from_name: Option<&str>) -> Option<String> {
+    let raw = strip_header_controls(from?);
     if raw.is_empty() || raw.len() > 500 {
         return None;
     }
@@ -2053,9 +2057,7 @@ fn notification_sender(config: &Config) -> Option<String> {
     if !is_basic_email(&raw) {
         return None;
     }
-    let name = config
-        .resend_from_name
-        .as_deref()
+    let name = from_name
         .map(strip_header_controls)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "TokenSwitch".to_string());

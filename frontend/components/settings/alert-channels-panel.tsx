@@ -28,6 +28,7 @@ export function AlertChannelsPanel({
   const [operatorChannels, setOperatorChannels] = React.useState<AlertChannelState[]>([]);
   const [userChannels, setUserChannels] = React.useState<UserNotificationChannelState[]>([]);
   const [busy, setBusy] = React.useState("");
+  const [loaded, setLoaded] = React.useState(false);
   const [error, setError] = React.useState("");
   const [success, setSuccess] = React.useState("");
 
@@ -52,6 +53,7 @@ export function AlertChannelsPanel({
         failures.push(errorMessage(user.reason));
       }
       setError(failures.join(" · "));
+      setLoaded(true);
     } finally {
       setBusy("");
     }
@@ -73,7 +75,11 @@ export function AlertChannelsPanel({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold">{t("settings.alertChannels.title")}</h3>
-          <p className="mt-1 text-sm text-muted-foreground">{t("settings.alertChannels.description")}</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t(channel
+              ? `settings.alertChannels.description.${channel}` as Parameters<typeof t>[0]
+              : "settings.alertChannels.description")}
+          </p>
         </div>
         <Button variant="ghost" size="sm" onClick={() => void load()} isDisabled={!!busy}>
           {busy === "load" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
@@ -188,8 +194,11 @@ export function AlertChannelsPanel({
             </div>
           );
         })}
-        {busy === "load" && visibleOperator.length === 0 && visibleUser.length === 0 ? (
+        {(!loaded || busy === "load") && visibleOperator.length === 0 && visibleUser.length === 0 ? (
           <p className="text-sm text-muted-foreground">{t("common.loading")}</p>
+        ) : null}
+        {loaded && busy !== "load" && visibleOperator.length === 0 && visibleUser.length === 0 ? (
+          <p className="text-sm text-muted-foreground">{t("settings.alertChannels.empty")}</p>
         ) : null}
       </div>
     </section>

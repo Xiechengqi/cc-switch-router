@@ -699,9 +699,16 @@ location.reload();
 | X-03 | 管理员 | 修改任意字段 | 该分组出现未保存计数角标;顶部保存按钮显示总数 |
 | X-04 | 管理员 | 点保存 | 返回更新/未变/需重启的键数量 |
 | X-05 | 管理员 | 改需重启字段 | 字段显示「需重启」chip |
+| X-05a | 管理员，存在待重启字段 | 打开设置「概览」 | 列出全部待重启生效项（名称、配置域、分组、环境变量 Key、已保存/运行值或密钥差异）；点击一项跳到对应字段并滚入视野。非概览页的顶部横幅可回到概览 |
 | X-06 | 管理员 | 点「保存并重启」 | 保存后重启;轮询 `/v1/healthz` 至恢复后自动刷新 |
-| X-07 | 管理员 | 分别点击已注册运维渠道 Telegram、Bark 的「发送测试」 | 成功或失败横幅；状态、最近成功时间和安全错误同步刷新 |
-| X-39 | Telegram/Bark 未配置或 Provider 请求失败 | 观察渠道状态并发送测试 | 未配置时按钮禁用；请求失败时显示 degraded 和可理解错误，不泄露 Bot Token、Push URL 或 Device Key |
+| X-07 | 管理员 | 分别进入 Telegram、Bark tab，点击已注册运维渠道的「发送测试」 | 成功或失败横幅；状态、最近成功时间和安全错误同步刷新 |
+| X-07a | 管理员 | 打开通知分类 | 横向 tab 为 系统告警 / 业务通知 / 邮件 / Telegram / Bark，没有「通知渠道」 |
+| X-07b | 管理员 | 打开邮件 tab，点底部「发送测试」 | 只有 Resend 字段 + 底部验证；配置完整时当前管理员收到测试信，未配置时按钮禁用或显示明确错误 |
+| X-07c | 管理员 | 打开 Telegram tab | 同时有运维告警组和用户 Bot 组，底部只有 Telegram 两张验证卡 |
+| X-07d | 管理员 | 打开 Bark tab | 同时有运维 Bark 和用户 Bark，底部只有 Bark 两张验证卡 |
+| X-07e | 管理员，对应字段校验失败 | 保存非法的 Resend / Telegram / Bark 字段 | 分别跳到邮件 / Telegram / Bark tab |
+| X-07f | 管理员，窄屏 | 观察通知横向 tab | 5 个 tab 可横向滚动，不把主表单挤出视口 |
+| X-39 | Telegram/Bark 未配置或 Provider 请求失败 | 在对应渠道 tab 观察状态并发送测试 | 未配置时按钮禁用；请求失败时显示 degraded 和可理解错误，不泄露 Bot Token、Push URL 或 Device Key |
 | X-40 | 已登录账号，Bark 用户 Provider 就绪 | 在账户通知页粘贴完整 Push URL 并提交 | 收到一次验证 Push；页面自动选中 Bark，只回显 Server 与设备后四位掩码 |
 | X-41 | Bark 未绑定、配置待重启或 Provider 不可用 | 尝试选择 Bark | 单选项不可用并显示本地化原因；已选但临时不可用时明确显示 Email 回落 |
 | X-42 | 已绑定 Bark 且存在尚未开始的 Bark 投递 | 解绑或重新绑定 | 弹出确认；旧投递取消并按当前渠道重新聚合，started 请求可能完成，完整 Push URL 不回显 |
@@ -781,6 +788,7 @@ location.reload();
 | D-06 | 保存 share 配置后 | 观察 30 秒 | `OperationVerification` 区分「API 提交成功」与「Dashboard 已观察到生效」两个 toast |
 | D-07 | 配置被拒绝 | 观察 | 明确的拒绝 toast,而非静默 |
 | D-08 | 有可升级 client | 点升级 | 二次确认 → 进度可见 |
+| D-08a | 承 D-08 且升级失败 | 观察失败 toast | 标题为危险色；详情（如 `[resource_preflight/resource_preflight_failed] …`）为深色正文，不得浅灰 |
 | D-09 | 承 D-08 | 升级中刷新页面 | 状态从 `cc-switch-router-client-upgrade-state` 恢复 |
 | D-10 | 任意开通/清理作业 | 观察 `ProvisionJobLog` | 日志实时追加,可滚动;失败时高亮 |
 
@@ -871,13 +879,14 @@ location.reload();
 | `dashboard/provision-job-log.tsx` | H-45, D-10, Q-13 |
 | `dashboard/client-upgrade-button.tsx` | C-21, D-08, D-09 |
 | `share/share-page.tsx` | S-40~S-46 |
-| `settings/settings-page.tsx` | X-01~X-08, X-25~X-28 |
+| `settings/settings-page.tsx` | X-01~X-08, X-05a, X-07a~X-07f, X-25~X-28 |
 | `settings/version-panel.tsx` | X-09~X-13, X-29, X-30 |
 | `settings/logs-panel.tsx` | X-14~X-18, X-31, X-32 |
 | `settings/announcement-panel.tsx` | X-19, X-20, X-33, X-34 |
 | `settings/map-display-panel.tsx` | X-21, X-22, X-35, X-36 |
 | `settings/client-notification-deliveries-panel.tsx` | X-23, X-24, X-37, X-38 |
-| `settings/alert-channels-panel.tsx` | X-07, X-39, X-43 |
+| `settings/alert-channels-panel.tsx` | X-07, X-07c, X-07d, X-39, X-43 |
+| `settings/email-channel-panel.tsx` | X-07b |
 | `metrics/*` | N-01~N-14 |
 | `chat/*` | CH-01~CH-19 |
 | `common/confirm-alert-dialog.tsx` | G-05, G-08, G-09 |

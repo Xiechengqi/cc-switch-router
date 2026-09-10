@@ -7048,16 +7048,32 @@ async fn admin_user_notification_channel_test(
         "{scheme}://{}",
         state.config.tunnel_domain.trim_end_matches('/')
     );
-    let result = crate::user_notification_health::test_channel(
-        &state.store,
-        &telegram_settings,
-        &bark_settings,
-        bark_cipher.as_ref(),
-        &session.email,
-        &channel,
-        &dashboard_url,
-    )
-    .await;
+    let result = if channel == crate::notification_channels::EMAIL_CHANNEL {
+        crate::user_notification_health::test_email_channel(
+            &state.proxy_http,
+            crate::user_notification_health::EmailProviderSettings {
+                api_key: state.config.resend_api_key.as_deref(),
+                from: state.config.resend_from.as_deref(),
+                from_name: state.config.resend_from_name.as_deref(),
+                reply_to: state.config.resend_reply_to.as_deref(),
+            },
+            &session.email,
+            &dashboard_url,
+            None,
+        )
+        .await
+    } else {
+        crate::user_notification_health::test_channel(
+            &state.store,
+            &telegram_settings,
+            &bark_settings,
+            bark_cipher.as_ref(),
+            &session.email,
+            &channel,
+            &dashboard_url,
+        )
+        .await
+    };
     record_notification_admin_audit(
         &state,
         &headers,

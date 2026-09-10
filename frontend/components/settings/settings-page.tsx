@@ -23,6 +23,7 @@ import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { AlertChannelsPanel } from "@/components/settings/alert-channels-panel";
+import { EmailChannelPanel } from "@/components/settings/email-channel-panel";
 import { AnnouncementPanel } from "@/components/settings/announcement-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import {
@@ -70,6 +71,7 @@ type SettingsSubsection = {
   label: string;
   groups?: string[];
   panel?: SettingsPanel;
+  channel?: "email" | "telegram" | "bark";
   fieldCount?: number;
   dirtyCount: number;
 };
@@ -100,13 +102,19 @@ const PANEL_SUBSECTION_IDS: Record<SettingsPanel, string> = {
 const NOTIFICATION_SUBSECTION_IDS = {
   system: "notifications:system",
   business: "notifications:business",
-  channels: "notifications:channels",
+  email: "notifications:email",
+  telegram: "notifications:telegram",
+  bark: "notifications:bark",
 } as const;
+
+const LEGACY_NOTIFICATION_CHANNELS_SUBSECTION = "notifications:channels";
 
 const NOTIFICATION_SUBSECTION_GROUPS = {
   system: ["Alerting"],
   business: ["Client notifications"],
-  channels: ["Email (Resend)", "Telegram alerts", "Telegram bot", "Bark alerts", "Bark channel"],
+  email: ["Email (Resend)"],
+  telegram: ["Telegram alerts", "Telegram bot"],
+  bark: ["Bark alerts", "Bark channel"],
 } as const;
 
 const CATEGORY_ICONS: Record<SettingsCategoryId, React.ComponentType<{ className?: string }>> = {
@@ -137,6 +145,7 @@ export function SettingsPage() {
   const [provisionSshKey, setProvisionSshKey] = React.useState<ProvisionSshKey | null>(null);
   const [provisionError, setProvisionError] = React.useState("");
   const [settingsRevision, setSettingsRevision] = React.useState(0);
+  const [pendingRevealKey, setPendingRevealKey] = React.useState("");
   const [clientServerReleaseCheck, setClientServerReleaseCheck] = React.useState<ClientServerReleaseCheck>({
     release: "",
     phase: "idle",
@@ -256,6 +265,14 @@ export function SettingsPage() {
     };
   }, [clientServerReleaseCandidate, clientServerReleaseField, isAdmin, normalizedClientServerRelease]);
 
+  React.useEffect(() => {
+    if (!pendingRevealKey) return;
+    const node = document.getElementById(`settings-field-${pendingRevealKey}`);
+    if (!node) return;
+    node.scrollIntoView({ block: "center", behavior: "smooth" });
+    setPendingRevealKey("");
+  }, [pendingRevealKey, activeSection, activeSubsections, snapshot]);
+
   if (loading) {
     return <main className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-12 text-muted-foreground">{t("common.loadingSession")}</main>;
   }
@@ -276,7 +293,11 @@ export function SettingsPage() {
   const subsections = activeCategory
     ? buildSettingsSubsections(activeCategory, categoryFields, values, dirty, mapDirty, t)
     : [];
-  const requestedSubsection = activeCategory ? activeSubsections[activeCategory] : undefined;
+  const requestedSubsection = activeCategory
+    ? (activeCategory === "notifications"
+      ? normalizeNotificationSubsectionId(activeSubsections[activeCategory])
+      : activeSubsections[activeCategory])
+    : undefined;
   const activeSubsection = subsections.find((item) => item.id === requestedSubsection) || subsections[0];
   const activeSubsectionIndex = Math.max(0, subsections.findIndex((item) => item.id === activeSubsection?.id));
   const matchingFields = (schema?.fields || []).filter((field) => {
@@ -326,7 +347,14 @@ export function SettingsPage() {
       {banner ? <Alert status={bannerStatus(banner.kind)} className="!text-slate-900">{banner.text}</Alert> : null}
       {snapshot?.pendingRestartKeys.length ? (
         <Alert status="warning" className="!text-slate-900">
-          {t("settings.pendingRestart", { count: snapshot.pendingRestartKeys.length })}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>{t("settings.pendingRestart", { count: snapshot.pendingRestartKeys.length })}</span>
+            {activeSection !== "overview" || normalizedQuery ? (
+              <Button size="sm" variant="ghost" onClick={() => selectCategory("overview")}>
+                {t("settings.pendingRestartOpenOverview")}
+              </Button>
+            ) : null}
+          </div>
         </Alert>
       ) : null}
 
@@ -374,7 +402,12 @@ export function SettingsPage() {
               {t("settings.loading")}
             </div>
           ) : activeSection === "overview" && !normalizedQuery ? (
-            <SettingsOverview snapshot={snapshot} dirtyCount={dirtyCount} onSelect={selectCategory} />
+            <SettingsOverview
+              snapshot={snapshot}
+              dirtyCount={dirtyCount}
+              onSelect={selectCategory}
+              onRevealField={revealField}
+            />
           ) : (
             <div className="grid gap-8">
               <div>
@@ -461,9 +494,30 @@ export function SettingsPage() {
                 ) : null}
 
                 {keepChannelHealthMounted ? (
-                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "channel_health"}>
-                    <AlertChannelsPanel refreshToken={settingsRevision} />
-                  </div>
+                  <>
+                    <div hidden={!!normalizedQuery || activeSubsection?.channel !== "email"}>
+                      <EmailChannelPanel
+                        refreshToken={settingsRevision}
+                        apiKeyConfigured={!!values.CC_SWITCH_ROUTER_RESEND_API_KEY?.hasValue}
+                        fromConfigured={
+                          !!(values.CC_SWITCH_ROUTER_RESEND_FROM?.hasValue
+                            || values.CC_SWITCH_ROUTER_RESEND_FROM?.effectiveHasValue)
+                        }
+                        pendingRestart={
+                          !!values.CC_SWITCH_ROUTER_RESEND_API_KEY?.pendingRestart
+                          || !!values.CC_SWITCH_ROUTER_RESEND_FROM?.pendingRestart
+                          || !!values.CC_SWITCH_ROUTER_RESEND_FROM_NAME?.pendingRestart
+                          || !!values.CC_SWITCH_ROUTER_RESEND_REPLY_TO?.pendingRestart
+                        }
+                      />
+                    </div>
+                    <div hidden={!!normalizedQuery || activeSubsection?.channel !== "telegram"}>
+                      <AlertChannelsPanel channel="telegram" refreshToken={settingsRevision} />
+                    </div>
+                    <div hidden={!!normalizedQuery || activeSubsection?.channel !== "bark"}>
+                      <AlertChannelsPanel channel="bark" refreshToken={settingsRevision} />
+                    </div>
+                  </>
                 ) : null}
               </div>
             </div>
@@ -496,15 +550,23 @@ export function SettingsPage() {
   }
 
   function selectSubsection(category: SettingsCategoryId, id: string) {
-    setActiveSubsections((current) => ({ ...current, [category]: id }));
+    setActiveSubsections((current) => ({
+      ...current,
+      [category]: category === "notifications" ? normalizeNotificationSubsectionId(id) || id : id,
+    }));
+  }
+
+  function revealField(field: SettingsField) {
+    setActiveSection(field.category);
+    selectSubsection(field.category, subsectionIdForField(field));
+    setQuery("");
+    setPendingRevealKey(field.key);
   }
 
   function revealFirstFieldError(errors: Record<string, string[]>) {
     const field = snapshot?.schema.fields.find((candidate) => errors[candidate.key]?.length);
     if (!field) return;
-    setActiveSection(field.category);
-    selectSubsection(field.category, subsectionIdForField(field));
-    setQuery("");
+    revealField(field);
   }
 
   function resetDraft() {
@@ -641,13 +703,27 @@ function SettingsOverview({
   snapshot,
   dirtyCount,
   onSelect,
+  onRevealField,
 }: {
   snapshot: SettingsSnapshot | null;
   dirtyCount: number;
   onSelect: (category: SettingsCategoryId) => void;
+  onRevealField: (field: SettingsField) => void;
 }) {
   const { t } = useLocaleText();
   if (!snapshot) return null;
+  const valuesByKey = Object.fromEntries(snapshot.values.map((entry) => [entry.key, entry]));
+  const pendingItems = snapshot.pendingRestartKeys.flatMap((key) => {
+    const field = snapshot.schema.fields.find((candidate) => candidate.key === key);
+    if (!field) return [];
+    return [{ field, entry: valuesByKey[key] as SettingValueEntry | undefined }];
+  }).sort((left, right) => {
+    const category = left.field.category.localeCompare(right.field.category);
+    if (category) return category;
+    const group = left.field.group.localeCompare(right.field.group);
+    if (group) return group;
+    return settingsFieldLabel(t, left.field).localeCompare(settingsFieldLabel(t, right.field), undefined, { sensitivity: "base" });
+  });
   return (
     <div className="grid gap-7">
       <section className="grid rounded-md bg-muted/35 sm:grid-cols-2">
@@ -656,6 +732,45 @@ function SettingsOverview({
       </section>
 
       {dirtyCount ? <Alert status="warning">{t("settings.unsavedChanges", { count: dirtyCount })}</Alert> : null}
+
+      {pendingItems.length ? (
+        <section>
+          <h2 className="font-display text-2xl">{t("settings.pendingRestartTitle")}</h2>
+          <p className="mt-2 text-sm text-muted-foreground">{t("settings.pendingRestartListDescription")}</p>
+          <div className="mt-4 grid gap-1 rounded-md bg-muted/30 p-1">
+            {pendingItems.map(({ field, entry }) => {
+              const category = snapshot.schema.categories.find((item) => item.id === field.category);
+              return (
+                <button
+                  key={field.key}
+                  type="button"
+                  onClick={() => onRevealField(field)}
+                  className="grid w-full gap-2 rounded-sm px-3 py-4 text-left transition-colors hover:bg-background/80"
+                >
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{settingsFieldLabel(t, field)}</span>
+                    <Chip color="warning" size="sm" variant="soft">{t("settings.pendingRestartShort")}</Chip>
+                  </span>
+                  <span className="text-sm text-muted-foreground">
+                    {settingsCategoryLabel(t, category)}
+                    <span className="px-1.5">·</span>
+                    {settingsGroupLabel(t, field.group)}
+                  </span>
+                  <span className="break-all font-mono text-xs text-muted-foreground">{field.key}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {entry?.isSecret
+                      ? t("settings.pendingRestartSecretChanged")
+                      : t("settings.pendingRestartValues", {
+                        saved: formatOverviewSettingValue(entry?.value, t),
+                        runtime: formatOverviewSettingValue(entry?.effectiveValue, t),
+                      })}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
 
       <section>
         <h2 className="font-display text-2xl">{t("settings.configurationDomains")}</h2>
@@ -687,6 +802,14 @@ function SettingsOverview({
       </section>
     </div>
   );
+}
+
+function formatOverviewSettingValue(
+  value: string | null | undefined,
+  t: ReturnType<typeof useLocaleText>["t"],
+) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : t("common.unset");
 }
 
 function OverviewStat({ label, value, tone = "default" }: { label: string; value: number; tone?: "default" | "warning" }) {
@@ -840,7 +963,7 @@ function SettingsFieldRow({
         ? "bg-warning/10 hover:bg-warning/15"
         : "hover:bg-background/75";
   return (
-    <div className={`grid gap-4 rounded-sm px-4 py-5 transition-colors md:grid-cols-[minmax(230px,0.9fr)_minmax(0,1.1fr)] ${rowState}`}>
+    <div id={`settings-field-${field.key}`} className={`grid gap-4 rounded-sm px-4 py-5 transition-colors md:grid-cols-[minmax(230px,0.9fr)_minmax(0,1.1fr)] ${rowState}`}>
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <label className="font-medium" htmlFor={field.key}>{settingsFieldLabel(t, field)}</label>
@@ -1082,6 +1205,7 @@ function buildNotificationSubsections(
     label: string,
     groups: readonly string[],
     panel?: SettingsPanel,
+    channel?: SettingsSubsection["channel"],
   ): SettingsSubsection => {
     const subsectionFields = fields.filter((field) => groups.includes(field.group));
     return {
@@ -1089,6 +1213,7 @@ function buildNotificationSubsections(
       label,
       groups: [...groups],
       panel,
+      channel,
       fieldCount: subsectionFields.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length,
       dirtyCount: subsectionFields.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length,
     };
@@ -1106,10 +1231,25 @@ function buildNotificationSubsections(
       NOTIFICATION_SUBSECTION_GROUPS.business,
     ),
     subsection(
-      NOTIFICATION_SUBSECTION_IDS.channels,
-      t("settings.notifications.channels"),
-      NOTIFICATION_SUBSECTION_GROUPS.channels,
+      NOTIFICATION_SUBSECTION_IDS.email,
+      t("settings.notifications.email"),
+      NOTIFICATION_SUBSECTION_GROUPS.email,
       "channel_health",
+      "email",
+    ),
+    subsection(
+      NOTIFICATION_SUBSECTION_IDS.telegram,
+      t("settings.notifications.telegram"),
+      NOTIFICATION_SUBSECTION_GROUPS.telegram,
+      "channel_health",
+      "telegram",
+    ),
+    subsection(
+      NOTIFICATION_SUBSECTION_IDS.bark,
+      t("settings.notifications.bark"),
+      NOTIFICATION_SUBSECTION_GROUPS.bark,
+      "channel_health",
+      "bark",
     ),
   ];
 
@@ -1133,6 +1273,13 @@ function subsectionIdForField(field: SettingsField) {
     }
   }
   return groupSubsectionId(field.group);
+}
+
+function normalizeNotificationSubsectionId(id: string | undefined) {
+  if (id === LEGACY_NOTIFICATION_CHANNELS_SUBSECTION) {
+    return NOTIFICATION_SUBSECTION_IDS.email;
+  }
+  return id;
 }
 
 function categoryDirtyCount(category: SettingsCategoryId, fields: SettingsField[], dirty: Record<string, DirtyValue>) {
