@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub(crate) const MAX_PROXY_STREAM_EVENT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_PROXY_RESPONSES_STREAM_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -360,6 +360,138 @@ fn next_event_boundary(buffer: &[u8], scan_from: usize) -> Option<(usize, usize)
     None
 }
 
+/// Why a proxied stream stopped before it reached a terminal event.
+///
+/// The distinction matters only for what the client is told: every variant ends
+/// the response the same way. Codes are prefixed `router_` so a client can tell a
+/// failure the router generated from one the provider itself reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyStreamFailure {
+    UpstreamError,
+    FirstEventTimeout,
+    IdleTimeout,
+    HardLifetime,
+    EventTooLarge,
+}
+
+impl ProxyStreamFailure {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::UpstreamError => "router_upstream_stream_failed",
+            Self::FirstEventTimeout => "router_stream_first_event_timeout",
+            Self::IdleTimeout => "router_stream_idle_timeout",
+            Self::HardLifetime => "router_request_lifetime_exceeded",
+            Self::EventTooLarge => "router_stream_event_too_large",
+        }
+    }
+
+    /// The client-facing wording. Deliberately fixed rather than derived from the
+    /// upstream error: a transport error's `Display` can quote the upstream URL,
+    /// and the detail belongs in the router log, which already records it.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::UpstreamError => "upstream response stream failed",
+            Self::FirstEventTimeout => {
+                "upstream sent no stream event before the first-event timeout"
+            }
+            Self::IdleTimeout => "upstream stream went idle beyond the idle timeout",
+            Self::HardLifetime => "request exceeded its maximum lifetime",
+            Self::EventTooLarge => "upstream stream event exceeded the parser capacity",
+        }
+    }
+
+    /// The status this failure would have carried had it happened before the
+    /// response was committed. Only the Gemini frame quotes it; the other
+    /// protocols carry `code` instead.
+    fn http_status(self) -> u16 {
+        match self {
+            Self::UpstreamError | Self::EventTooLarge => 502,
+            Self::FirstEventTimeout | Self::IdleTimeout | Self::HardLifetime => 504,
+        }
+    }
+}
+
+/// The SSE frame a proxied stream ends with once it can no longer fail with a
+/// status code.
+///
+/// After the 200 and `content-type: text/event-stream` have reached the client
+/// the status is spent, so a failure that merely stops the body is
+/// indistinguishable from a completed stream: every client that checks for a
+/// terminal event reports "stream ended before …" and blames the provider. An
+/// explicit error frame is the only channel left, and it has to be framed in the
+/// protocol the client is already parsing — an Anthropic client ignores a bare
+/// `data:` payload, and a Responses client ignores an `error` event it cannot
+/// decode.
+///
+/// `[DONE]` is appended only for the chat-completions protocol, where it is the
+/// documented terminator. The Responses, Anthropic and Gemini streams have no
+/// such sentinel and their error frame is itself terminal.
+pub(crate) fn proxy_stream_error_frame(
+    protocol: Option<ProxyStreamProtocol>,
+    failure: ProxyStreamFailure,
+) -> Bytes {
+    let code = failure.code();
+    let message = failure.message();
+    let frame = match protocol {
+        Some(ProxyStreamProtocol::AnthropicMessages) => format!(
+            "event: error\ndata: {}\n\n",
+            json!({
+                "type": "error",
+                "error": {"type": "api_error", "code": code, "message": message},
+            })
+        ),
+        Some(ProxyStreamProtocol::OpenAiResponses | ProxyStreamProtocol::OpenAiImages) => format!(
+            "event: error\ndata: {}\n\n",
+            json!({
+                "type": "error",
+                "code": code,
+                "message": message,
+                "param": Value::Null,
+            })
+        ),
+        Some(ProxyStreamProtocol::OpenAiChat) => format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "error": {
+                    "type": "server_error",
+                    "code": code,
+                    "message": message,
+                    "param": Value::Null,
+                },
+            })
+        ),
+        Some(ProxyStreamProtocol::Gemini) => format!(
+            "data: {}\n\n",
+            json!({
+                "error": {
+                    "code": failure.http_status(),
+                    "message": message,
+                    "status": google_rpc_status(failure.http_status()),
+                },
+            })
+        ),
+        // An unrecognised path still gets a frame: `event: error` is what the
+        // three protocols that name their events use, and a client that does not
+        // understand the event name skips it rather than mistaking the stream for
+        // one that completed.
+        None => format!(
+            "event: error\ndata: {}\n\n",
+            json!({
+                "type": "error",
+                "error": {"type": "api_error", "code": code, "message": message},
+            })
+        ),
+    };
+    Bytes::from(frame)
+}
+
+fn google_rpc_status(http_status: u16) -> &'static str {
+    match http_status {
+        504 => "DEADLINE_EXCEEDED",
+        _ => "UNAVAILABLE",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +742,103 @@ mod tests {
         assert_eq!(
             detector.push(&Bytes::from_static(b"data: 123")),
             Err(ProxyStreamParseError::EventTooLarge)
+        );
+    }
+
+    /// The frame has to be terminal by the same rules the detector applies to the
+    /// upstream, or the router would emit an error the client parses as one more
+    /// intermediate event and keep waiting for a terminal one.
+    #[test]
+    fn error_frames_are_terminal_in_their_own_protocol() {
+        for protocol in [
+            ProxyStreamProtocol::OpenAiResponses,
+            ProxyStreamProtocol::OpenAiChat,
+            ProxyStreamProtocol::OpenAiImages,
+            ProxyStreamProtocol::AnthropicMessages,
+            ProxyStreamProtocol::Gemini,
+        ] {
+            let frame =
+                proxy_stream_error_frame(Some(protocol), ProxyStreamFailure::FirstEventTimeout);
+            let mut detector = ProxyStreamDetector::new(protocol);
+            let observation = detector.push(&frame).unwrap();
+            assert!(
+                observation.terminal_chunk_end.is_some(),
+                "frame is not terminal for {protocol:?}: {}",
+                String::from_utf8_lossy(&frame)
+            );
+        }
+    }
+
+    #[test]
+    fn error_frames_carry_the_failure_code() {
+        for failure in [
+            ProxyStreamFailure::UpstreamError,
+            ProxyStreamFailure::FirstEventTimeout,
+            ProxyStreamFailure::IdleTimeout,
+            ProxyStreamFailure::HardLifetime,
+            ProxyStreamFailure::EventTooLarge,
+        ] {
+            let frame =
+                proxy_stream_error_frame(Some(ProxyStreamProtocol::AnthropicMessages), failure);
+            let frame = String::from_utf8(frame.to_vec()).unwrap();
+            assert!(frame.starts_with("event: error\ndata: "), "{frame}");
+            assert!(frame.ends_with("\n\n"), "{frame}");
+            assert!(frame.contains(failure.code()), "{frame}");
+            assert!(frame.contains(failure.message()), "{frame}");
+        }
+    }
+
+    /// Only chat-completions terminates on `[DONE]`; appending it elsewhere would
+    /// hand a Responses or Gemini client a sentinel its protocol never defines.
+    #[test]
+    fn done_sentinel_is_chat_completions_only() {
+        for (protocol, expected) in [
+            (ProxyStreamProtocol::OpenAiChat, true),
+            (ProxyStreamProtocol::OpenAiResponses, false),
+            (ProxyStreamProtocol::OpenAiImages, false),
+            (ProxyStreamProtocol::AnthropicMessages, false),
+            (ProxyStreamProtocol::Gemini, false),
+        ] {
+            let frame = proxy_stream_error_frame(Some(protocol), ProxyStreamFailure::UpstreamError);
+            let frame = String::from_utf8(frame.to_vec()).unwrap();
+            assert_eq!(frame.contains("[DONE]"), expected, "{protocol:?}: {frame}");
+        }
+    }
+
+    #[test]
+    fn unknown_protocol_still_emits_a_named_error_event() {
+        let frame = proxy_stream_error_frame(None, ProxyStreamFailure::HardLifetime);
+        let frame = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(frame.starts_with("event: error\n"), "{frame}");
+        assert!(
+            frame.contains(ProxyStreamFailure::HardLifetime.code()),
+            "{frame}"
+        );
+    }
+
+    /// The upstream transport error's own text never reaches the client: it can
+    /// quote the upstream URL, and the router log already records it in full. The
+    /// frame carries exactly the fields the Responses error event defines.
+    #[test]
+    fn upstream_error_frame_quotes_no_upstream_detail() {
+        let frame = proxy_stream_error_frame(
+            Some(ProxyStreamProtocol::OpenAiResponses),
+            ProxyStreamFailure::UpstreamError,
+        );
+        let frame = String::from_utf8(frame.to_vec()).unwrap();
+        let payload = frame
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .unwrap_or_else(|| panic!("unexpected framing: {frame}"));
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "type": "error",
+                "code": ProxyStreamFailure::UpstreamError.code(),
+                "message": ProxyStreamFailure::UpstreamError.message(),
+                "param": Value::Null,
+            })
         );
     }
 }

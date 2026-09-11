@@ -3890,6 +3890,16 @@ enum ShareMarketCatalogScope {
 /// conditions `ListingView.publicly_listed` uses, so the anonymous catalog
 /// and `GET /listings/:id/pricing` cannot drift.
 ///
+/// The `share_status` term is the one this fragment exists to keep. Before it
+/// was extracted the catalog SQL tested only the listing's own status and the
+/// owner match, so a listing whose Share had stopped being active went on
+/// appearing in the public catalog while that very listing reported
+/// `publiclyListed: false` through `ListingView` — two answers to one
+/// question, from two places that were meant to agree. Dropping the term
+/// would reopen that. It costs sellers nothing: every owner scope matches on
+/// `listing.owner_user_id` and never consults this fragment, so an owner
+/// keeps seeing a listing the public no longer does.
+///
 /// Callers still filter `listing.deleted_at IS NULL` themselves (catalog
 /// queries do it at the listing-row level so owner/renter scopes can see
 /// deleted listings they still have a relationship with).
@@ -16251,6 +16261,65 @@ mod tests {
             assert!(!columns.iter().any(|column| column == "free_duration_days"));
             assert!(!columns.iter().any(|column| column == "period_unit"));
             assert!(!columns.iter().any(|column| column == "period_count"));
+        }
+    }
+
+    /// Pins `publicly_listed_sql` to the Rust rule it mirrors.
+    ///
+    /// The two used to disagree about a Share that had stopped being active,
+    /// which is the whole reason the fragment was extracted. Asserting the
+    /// full matrix rather than that one case means a future edit to either
+    /// side has to change the other in the same commit.
+    #[test]
+    fn publicly_listed_sql_agrees_with_the_listing_views_own_rule() {
+        let conn = Connection::open_in_memory().expect("memory database");
+        conn.execute_batch(
+            "CREATE TABLE listing (status TEXT, owner_email TEXT);
+             CREATE TABLE shares (share_status TEXT, owner_email TEXT);",
+        )
+        .expect("predicate fixtures");
+        let sql = format!(
+            "SELECT {} FROM listing, shares",
+            publicly_listed_sql("shares")
+        );
+
+        for listing_status in ["active", "closed"] {
+            for share_status in [Some("active"), Some("paused"), None] {
+                // Mixed case on purpose: the owner match is case-insensitive
+                // on both sides and has to stay that way.
+                for share_owner in [Some("Owner@Example.com"), Some("other@example.com"), None] {
+                    conn.execute("DELETE FROM listing", [])
+                        .expect("reset listing");
+                    conn.execute("DELETE FROM shares", [])
+                        .expect("reset shares");
+                    conn.execute(
+                        "INSERT INTO listing VALUES (?1, ?2)",
+                        params![listing_status, "owner@example.com"],
+                    )
+                    .expect("insert listing");
+                    conn.execute(
+                        "INSERT INTO shares VALUES (?1, ?2)",
+                        params![share_status, share_owner],
+                    )
+                    .expect("insert share");
+
+                    let sql_says: bool = conn
+                        .query_row(&sql, [], |row| row.get(0))
+                        .expect("evaluate the public-listing predicate");
+                    // The rule `ListingView` applies in Rust when it fills in
+                    // `publicly_listed`.
+                    let view_says = listing_status == "active"
+                        && share_status == Some("active")
+                        && share_owner
+                            .is_some_and(|email| email.eq_ignore_ascii_case("owner@example.com"));
+
+                    assert_eq!(
+                        sql_says, view_says,
+                        "listing_status={listing_status:?} share_status={share_status:?} \
+                         share_owner={share_owner:?}"
+                    );
+                }
+            }
         }
     }
 

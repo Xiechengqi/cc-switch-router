@@ -27,8 +27,8 @@ use crate::error::AppError;
 use crate::metrics::models::LlmRequestMetric;
 use crate::metrics::{MetricsPermit, MetricsRegistry};
 use crate::proxy_stream::{
-    MAX_PROXY_IMAGE_STREAM_EVENT_BYTES, ProxyStreamDetector, ProxyStreamParseError,
-    ProxyStreamProtocol,
+    MAX_PROXY_IMAGE_STREAM_EVENT_BYTES, ProxyStreamDetector, ProxyStreamFailure,
+    ProxyStreamParseError, ProxyStreamProtocol, proxy_stream_error_frame,
 };
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{
@@ -4087,11 +4087,21 @@ pub async fn proxy_handler(
         share_request_app,
     );
     if is_health_check_request {
-        if status.is_success() {
+        if status.is_success() || !probe_status_indicts_route(status) {
             state
                 .proxy
                 .clear_health_probe_failure(&route.subdomain)
                 .await;
+            if !status.is_success() {
+                debug!(
+                    host = %host,
+                    path = %path_and_query,
+                    backend = %backend,
+                    share_id = %log_share_id,
+                    status = status.as_u16(),
+                    "proxy health probe refused by the backend, route left healthy"
+                );
+            }
         } else {
             state
                 .proxy
@@ -4200,6 +4210,31 @@ pub async fn proxy_handler(
         );
     }
     response
+}
+
+/// Whether a non-2xx probe answer is evidence that the *route* is unhealthy.
+///
+/// A probe that comes back rate limited or malformed reached the backend over
+/// the tunnel and got a deliberate answer about *that request* — which is the
+/// one thing a health probe exists to establish. Counting those as probe
+/// failures poisons the subdomain's failure cache for its whole TTL (every
+/// later probe then short-circuits to `connection-lost-cached`) and, on a
+/// client-web route, retires a target that was working, so a share sitting in
+/// its own account cooldown takes its route down with it.
+///
+/// Everything else still counts, deliberately including 401 and 403: the caller
+/// here is the router presenting the secret registered with this route, so a
+/// refusal is evidence the registration is stale, and retiring the route is the
+/// cure rather than the damage.
+fn probe_status_indicts_route(status: StatusCode) -> bool {
+    !matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::CONFLICT
+            | StatusCode::PAYLOAD_TOO_LARGE
+            | StatusCode::UNPROCESSABLE_ENTITY
+            | StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 async fn retire_failed_client_web_probe(state: &ServerState, route: &RouteEntry) {
@@ -6624,6 +6659,47 @@ enum ProxyChunkSendError {
     HardLifetime,
 }
 
+/// Ends a proxied response with the strongest signal the transport still allows.
+///
+/// Before the response is committed a failure is a status code. After it, an
+/// event stream has no status left to change, so failing the body only makes the
+/// client report the provider truncating the stream — the failure has to be
+/// reframed as a terminal SSE error event instead. Every other response type
+/// keeps failing the body, which is how a truncated non-SSE response is detected.
+fn proxy_stream_failure_chunk(
+    protocol: Option<ProxyStreamProtocol>,
+    is_event_stream: bool,
+    failure: ProxyStreamFailure,
+    fallback: std::io::Error,
+) -> Result<Bytes, std::io::Error> {
+    if is_event_stream {
+        Ok(proxy_stream_error_frame(protocol, failure))
+    } else {
+        Err(fallback)
+    }
+}
+
+/// Queues a [`proxy_stream_failure_chunk`] without waiting for room.
+///
+/// `try_send` rather than an await, because every caller is a timeout arm that
+/// is already past the point of no return and must not block the pump. The
+/// channel is drained by the response body, so a full channel means the client
+/// stopped reading and has no use for the frame anyway.
+fn send_proxy_stream_failure(
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    protocol: Option<ProxyStreamProtocol>,
+    is_event_stream: bool,
+    failure: ProxyStreamFailure,
+    fallback: std::io::Error,
+) {
+    let _ = sender.try_send(proxy_stream_failure_chunk(
+        protocol,
+        is_event_stream,
+        failure,
+        fallback,
+    ));
+}
+
 async fn send_proxy_response_chunk(
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     chunk: Result<Bytes, std::io::Error>,
@@ -6711,38 +6787,55 @@ where
                             "proxy response pump closed at request hard lifetime"
                         );
                     }
-                    let _ = sender.try_send(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "proxy request hard lifetime exceeded",
-                    )));
+                    send_proxy_stream_failure(
+                        &sender,
+                        protocol,
+                        is_event_stream,
+                        ProxyStreamFailure::HardLifetime,
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "proxy request hard lifetime exceeded",
+                        ),
+                    );
                     break;
                 }
                 _ = tokio::time::sleep_until(progress_deadline) => {
                     let owns_share_release =
                         finish_proxy_response_lifecycle(&mut lifecycle);
-                    let message = if meaningful_progress_seen {
+                    let (failure, message) = if meaningful_progress_seen {
                         if owns_share_release {
                             metrics.record_proxy_stream_idle_timeout();
                             warn!(
                                 timeout_secs = timeouts.idle.as_secs(),
+                                error_frame = is_event_stream,
                                 "proxy stream closed after business idle timeout"
                             );
                         }
-                        "proxy stream business idle timeout"
+                        (
+                            ProxyStreamFailure::IdleTimeout,
+                            "proxy stream business idle timeout",
+                        )
                     } else {
                         if owns_share_release {
                             metrics.record_proxy_stream_first_event_timeout();
                             warn!(
                                 timeout_secs = timeouts.first_event.as_secs(),
+                                error_frame = is_event_stream,
                                 "proxy stream closed after first event timeout"
                             );
                         }
-                        "proxy stream first event timeout"
+                        (
+                            ProxyStreamFailure::FirstEventTimeout,
+                            "proxy stream first event timeout",
+                        )
                     };
-                    let _ = sender.try_send(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        message,
-                    )));
+                    send_proxy_stream_failure(
+                        &sender,
+                        protocol,
+                        is_event_stream,
+                        failure,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, message),
+                    );
                     break;
                 }
                 next = upstream_stream.next() => next,
@@ -6759,13 +6852,21 @@ where
                             }
                             Err(ProxyStreamParseError::EventTooLarge) => {
                                 metrics.record_proxy_stream_parser_overflow();
-                                warn!("proxy stream protocol event exceeded parser capacity");
-                                drop(lifecycle.take());
-                                let error = std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "proxy stream protocol event exceeded parser capacity",
+                                warn!(
+                                    error_frame = is_event_stream,
+                                    "proxy stream protocol event exceeded parser capacity"
                                 );
-                                let _ = sender.try_send(Err(error));
+                                drop(lifecycle.take());
+                                send_proxy_stream_failure(
+                                    &sender,
+                                    protocol,
+                                    is_event_stream,
+                                    ProxyStreamFailure::EventTooLarge,
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "proxy stream protocol event exceeded parser capacity",
+                                    ),
+                                );
                                 break;
                             }
                         }
@@ -6814,28 +6915,38 @@ where
                 }
                 Some(Err(error)) => {
                     metrics.record_proxy_stream_upstream_error();
-                    warn!(error = %error, "proxy upstream response stream failed");
+                    warn!(
+                        error = %error,
+                        error_frame = is_event_stream,
+                        "proxy upstream response stream failed"
+                    );
                     drop(lifecycle.take());
-                    if !is_event_stream {
-                        let send_error = send_proxy_response_chunk(
-                            &sender,
-                            Err(std::io::Error::other(error.to_string())),
-                            &cancellation,
+                    // Unlike the timeout paths this one still awaits the send: the
+                    // pump has upstream bytes behind it, so the frame has to queue
+                    // behind them rather than jump a full channel.
+                    let chunk = proxy_stream_failure_chunk(
+                        protocol,
+                        is_event_stream,
+                        ProxyStreamFailure::UpstreamError,
+                        std::io::Error::other(error.to_string()),
+                    );
+                    let send_error = send_proxy_response_chunk(
+                        &sender,
+                        chunk,
+                        &cancellation,
+                        timeouts.downstream_stall,
+                        hard_deadline,
+                    )
+                    .await;
+                    if let Err(error) = send_error {
+                        let owns_share_release = finish_proxy_response_lifecycle(&mut lifecycle);
+                        record_proxy_chunk_send_failure(
+                            error,
+                            &metrics,
                             timeouts.downstream_stall,
-                            hard_deadline,
-                        )
-                        .await;
-                        if let Err(error) = send_error {
-                            let owns_share_release =
-                                finish_proxy_response_lifecycle(&mut lifecycle);
-                            record_proxy_chunk_send_failure(
-                                error,
-                                &metrics,
-                                timeouts.downstream_stall,
-                                timeouts.max_lifetime,
-                                owns_share_release,
-                            );
-                        }
+                            timeouts.max_lifetime,
+                            owns_share_release,
+                        );
                     }
                     break;
                 }
@@ -9071,6 +9182,38 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
                 .await
                 .is_some()
         );
+    }
+
+    #[test]
+    fn probe_failures_the_backend_chose_do_not_indict_the_route() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(
+                !probe_status_indicts_route(status),
+                "{status} is the backend answering, not the route failing"
+            );
+        }
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::NOT_FOUND,
+            // A refused router secret means the registration is stale, which is
+            // exactly what retiring the route repairs.
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+        ] {
+            assert!(
+                probe_status_indicts_route(status),
+                "{status} still counts against the route"
+            );
+        }
     }
 
     #[tokio::test]

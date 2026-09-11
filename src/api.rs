@@ -4658,6 +4658,122 @@ mod tests {
         assert_eq!(body.terminal_event.as_deref(), Some("image_json.completed"));
         assert!(body.error.is_none());
     }
+
+    #[test]
+    fn probe_error_detail_keeps_the_code_beside_the_message() {
+        let detail = probe_error_detail(
+            br#"{"error":{"message":"account is cooling down","type":"cc_switch_rate_limited"}}"#,
+        );
+        assert_eq!(
+            detail.as_deref(),
+            Some("cc_switch_rate_limited: account is cooling down")
+        );
+    }
+
+    #[test]
+    fn probe_error_detail_reads_the_flatter_shapes_too() {
+        assert_eq!(
+            probe_error_detail(br#"{"error":"upstream refused"}"#).as_deref(),
+            Some("upstream refused")
+        );
+        assert_eq!(
+            probe_error_detail(br#"{"message":"no capacity"}"#).as_deref(),
+            Some("no capacity")
+        );
+        // A preview cut off mid-body cannot be parsed; the status has to stand alone.
+        assert_eq!(probe_error_detail(br#"{"error":{"message":"tru"#), None);
+    }
+
+    #[test]
+    fn probe_error_detail_skips_geminis_numeric_code_for_its_rpc_status() {
+        // Gemini puts the HTTP status in `error.code`, so the only string the
+        // caller can act on is `error.status`.
+        assert_eq!(
+            probe_error_detail(
+                br#"{"error":{"code":429,"message":"account is cooling down","status":"RESOURCE_EXHAUSTED"}}"#
+            )
+            .as_deref(),
+            Some("RESOURCE_EXHAUSTED: account is cooling down")
+        );
+    }
+
+    #[test]
+    fn probe_status_error_leads_with_the_status() {
+        let error = probe_status_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"message":"slow  down","code":"rate_limit_error"}}"#,
+            None,
+        );
+        assert_eq!(
+            error,
+            "upstream returned HTTP 429 Too Many Requests: rate_limit_error: slow down"
+        );
+        assert_eq!(
+            probe_status_error(reqwest::StatusCode::BAD_GATEWAY, b"<html>nope</html>", None),
+            "upstream returned HTTP 502 Bad Gateway"
+        );
+    }
+
+    #[test]
+    fn probe_status_error_falls_back_to_the_routers_own_reason() {
+        // The router's refusals are plain text with the reason in a header.
+        assert_eq!(
+            probe_status_error(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                b"connection-lost-cached",
+                Some("connection-lost-cached"),
+            ),
+            "upstream returned HTTP 503 Service Unavailable: connection-lost-cached"
+        );
+        // A real upstream body still wins over the header.
+        assert_eq!(
+            probe_status_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                br#"{"error":{"message":"cooling down","code":"cc_switch_rate_limited"}}"#,
+                Some("share-request-cancelled"),
+            ),
+            "upstream returned HTTP 429 Too Many Requests: cc_switch_rate_limited: cooling down"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_reports_the_status_rather_than_a_missing_terminal_event() {
+        let app = Router::new().route(
+            "/probe",
+            get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"error":{"message":"account is cooling down","type":"cc_switch_rate_limited"}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rate limited probe server");
+        let address = listener.local_addr().expect("rate limited probe address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve rate limited probe response");
+        });
+
+        let response = reqwest::get(format!("http://{address}/probe"))
+            .await
+            .expect("request rate limited probe response");
+        // The probe asked for a Responses stream and got a JSON refusal: the old
+        // reading blamed the provider for a missing `response.completed`.
+        let body = read_probe_body(response, ProbeResponseMode::ResponsesSse).await;
+        server.abort();
+
+        assert_eq!(body.terminal_event, None);
+        assert_eq!(
+            body.error.as_deref(),
+            Some(
+                "upstream returned HTTP 429 Too Many Requests: cc_switch_rate_limited: account is cooling down"
+            )
+        );
+    }
 }
 
 async fn sync_share(
@@ -4862,6 +4978,38 @@ async fn unban_share_client(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Per-buyer usage surface: unauthenticated on purpose.
+//
+// These three read no credentials by design. Market transparency is the
+// product decision here: which buyers a Share serves, what they spent it on
+// and the official-price equivalent are meant to be readable by anyone
+// holding the Share id, the same way the listing itself is. Do not "fix" this
+// by adding `require_user_email` — that removes a surface the market is built
+// on. The neighbours in this same router that *do* authenticate
+// (`test_share_connection`, `get_share_model_health_calendar`) either act on
+// the Share or expose its operational history, which is a different thing
+// from publishing its ledger.
+//
+// Two consequences, recorded so they are decided rather than rediscovered:
+//   * `share_id` is the only thing gating this. It is 64 bits of randomness,
+//     so it is not enumerable, but nothing else here treats it as a secret —
+//     it is a plain path parameter on dozens of routes and travels through the
+//     frontend in the clear.
+//   * A user who set `public_stats_enabled = false` still appears in these
+//     rows. That flag gates their own profile card
+//     (`usage_account::usage_consumer_by_user_id`), not a seller's view of the
+//     Share they are buying from.
+//
+// Revisit this posture when one listing first carries two buyers on different
+// terms at the same price. Until then the quota fields read as "how contended
+// is this Share", which is what a buyer is entitled to weigh; after then they
+// read as "what deal did the other buyer get", which is a most-favoured-nation
+// ratchet no seller agreed to. Nothing under `frontend/app` calls these three
+// today — every caller is under `components/dashboard/` — so narrowing them
+// later breaks no shipped screen.
+// ---------------------------------------------------------------------------
+
 async fn share_usage_by_email(
     State(state): State<ServerState>,
     Path(share_id): Path<String>,
@@ -4875,6 +5023,14 @@ async fn share_usage_by_email(
     ))
 }
 
+/// Per-user quota status for a Share.
+///
+/// Public like its neighbours, but note what it publishes beyond usage: the
+/// row carries the *terms* as well as the consumption — `role`,
+/// `parallel_limit`, `token_limit`, `token_period` and `expires_at` are the
+/// seller's per-buyer arrangement, not a number the buyer spent. If the
+/// market should ever publish spend without publishing the contract behind
+/// it, this is the endpoint to split, not `user-usage-breakdown`.
 async fn share_user_limit_status(
     State(state): State<ServerState>,
     Path(share_id): Path<String>,
@@ -4882,10 +5038,10 @@ async fn share_user_limit_status(
     Ok(Json(state.store.share_user_limit_status(&share_id).await?))
 }
 
-/// Owner-facing per-user equivalent-USD breakdown (§9.1).
+/// The owner dashboard's per-user equivalent-USD breakdown (§9.1).
 ///
-/// Registered beside `user-limit-status` and carrying the same access posture:
-/// both read the same grants for the same share.
+/// Public, like the two above it — see the banner on `share_usage_by_email`
+/// for why, and for what `share_id` is and is not doing as the only gate.
 async fn share_user_usage_breakdown(
     State(state): State<ServerState>,
     Path(share_id): Path<String>,
@@ -7545,7 +7701,119 @@ fn gemini_sse_event(data: &[u8], truncated: bool) -> Option<String> {
         .then(|| "gemini.completed".to_string())
 }
 
+/// How much of an upstream error message the probe result quotes.
+///
+/// Long enough for a provider's rate-limit wording to survive intact, short
+/// enough that it still fits the one-line chip the dashboard renders it in.
+const PROBE_ERROR_DETAIL_CAP: usize = 300;
+
+/// Pulls the human-readable part out of an upstream error body.
+///
+/// Each shape in play nests it differently — OpenAI and cc-switch use
+/// `error.message`, Gemini adds `error.status`, some gateways return a bare
+/// `message` — and a preview truncated at [`TEST_BODY_CAP`] may not parse at
+/// all, in which case the status alone has to carry the report.
+fn probe_error_detail(preview: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(preview).ok()?;
+    let error = value.get("error").filter(|error| !error.is_null());
+    // Each candidate is checked for being a string before the next is tried, not
+    // after the whole chain: Gemini's shape puts a *number* in `error.code`, and
+    // a chain that stops at the first key that merely exists would take that 429
+    // and then discard it, losing the `RESOURCE_EXHAUSTED` sitting one key over.
+    let message = first_probe_string(
+        [
+            error.and_then(|error| error.get("message")),
+            error.filter(|error| error.is_string()),
+            value.get("message"),
+            value.get("detail"),
+        ]
+        .into_iter()
+        .flatten(),
+    )?;
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if message.is_empty() {
+        return None;
+    }
+    // The code names the failure class (`cc_switch_rate_limited`,
+    // `rate_limit_error`, `RESOURCE_EXHAUSTED`) where the message usually only
+    // describes the symptom, so keep both when the body carries both.
+    let code = error.and_then(|error| {
+        first_probe_string(
+            ["code", "type", "status"]
+                .into_iter()
+                .filter_map(|key| error.get(key)),
+        )
+    });
+    let detail = match code {
+        Some(code) => format!("{code}: {message}"),
+        None => message,
+    };
+    Some(truncate_probe_detail(&detail))
+}
+
+fn first_probe_string<'a>(
+    candidates: impl Iterator<Item = &'a serde_json::Value>,
+) -> Option<&'a str> {
+    candidates
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+fn truncate_probe_detail(detail: &str) -> String {
+    let mut out = String::new();
+    for ch in detail.chars() {
+        if out.len() + ch.len_utf8() > PROBE_ERROR_DETAIL_CAP {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The probe failure for an answer that never got past the HTTP status line.
+///
+/// Leads with the status so the reader sees the code the upstream actually
+/// chose, then quotes the body's own wording when it has any.
+fn probe_status_error(
+    status: reqwest::StatusCode,
+    preview: &[u8],
+    router_reason: Option<&str>,
+) -> String {
+    let head = match status.canonical_reason() {
+        Some(reason) => format!("upstream returned HTTP {} {reason}", status.as_u16()),
+        None => format!("upstream returned HTTP {}", status.as_u16()),
+    };
+    // A refusal the router generated itself carries no JSON body at all — its
+    // reason (`connection-lost-cached`, `share-request-cancelled`, …) lives only
+    // in the header, and it is the whole answer to "why did this fail".
+    let detail = probe_error_detail(preview).or_else(|| {
+        router_reason
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(truncate_probe_detail)
+    });
+    match detail {
+        Some(detail) => format!("{head}: {detail}"),
+        None => head,
+    }
+}
+
 async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> ProbeBodyRead {
+    // A non-2xx answer is already the diagnosis, so its body is read for the
+    // preview only. Running it through the SSE or JSON validators as well would
+    // overwrite "429 Too Many Requests" with "stream ended before required
+    // terminal event response.completed" — a message that blames the provider
+    // for truncating a stream it never agreed to start, and the single most
+    // misleading thing this endpoint can say.
+    let status = resp.status();
+    let validate_body = status.is_success();
+    let router_reason = resp
+        .headers()
+        .get("x-share-router-error-reason")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let mut stream = resp.bytes_stream();
     let mut preview = Vec::new();
     let mut total_bytes = 0_usize;
@@ -7556,18 +7824,27 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
     } else {
         TEST_JSON_PARSE_CAP
     };
-    let mut sse_tracker = (!matches!(mode, ProbeResponseMode::Json | ProbeResponseMode::ImageJson))
-        .then(|| ProbeSseTracker::new(mode));
+    let mut sse_tracker = (validate_body
+        && !matches!(mode, ProbeResponseMode::Json | ProbeResponseMode::ImageJson))
+    .then(|| ProbeSseTracker::new(mode));
 
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
+                // A read that dies mid-body is a transport failure in its own
+                // right, but on a non-2xx answer the status is still the better
+                // headline — the body was never going to be the answer.
+                let error = if validate_body {
+                    format!("response body read failed: {error}")
+                } else {
+                    probe_status_error(status, &preview, router_reason.as_deref())
+                };
                 return ProbeBodyRead {
                     preview,
                     total_bytes,
                     terminal_event: None,
-                    error: Some(format!("response body read failed: {error}")),
+                    error: Some(error),
                 };
             }
         };
@@ -7578,11 +7855,23 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
         }
         if let Some(tracker) = sse_tracker.as_mut() {
             tracker.push(&chunk);
+        } else if !validate_body {
+            // Preview only.
         } else if json_body.len().saturating_add(chunk.len()) <= json_parse_cap {
             json_body.extend_from_slice(&chunk);
         } else {
             json_too_large = true;
         }
+    }
+
+    if !validate_body {
+        let error = probe_status_error(status, &preview, router_reason.as_deref());
+        return ProbeBodyRead {
+            preview,
+            total_bytes,
+            terminal_event: None,
+            error: Some(error),
+        };
     }
 
     if let Some(tracker) = sse_tracker {
@@ -7606,7 +7895,7 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
     }
     let parsed = serde_json::from_slice::<serde_json::Value>(&json_body);
     let error = match parsed {
-        Ok(value) if !value.get("error").is_some_and(|error| !error.is_null()) => None,
+        Ok(value) if value.get("error").is_none_or(serde_json::Value::is_null) => None,
         Ok(_) => Some("JSON response contains an error object".to_string()),
         Err(error) => Some(format!("response body is not valid JSON: {error}")),
     };

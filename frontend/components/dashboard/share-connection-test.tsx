@@ -300,9 +300,11 @@ export function ShareConnectionTestRow({
 
       {result ? (
         <div className="grid gap-2">
-          {result.error ? (
-            <p className="text-xs text-red-600">{result.error}</p>
-          ) : result.response ? (
+          {/* Status and reason are shown together, never one instead of the other:
+              the code says what the upstream decided and the message says why, and
+              hiding the code behind the message is what made a 429 read as a
+              truncated stream. */}
+          {result.response ? (
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
               <span className={`font-semibold ${statusColor}`}>
                 {result.response.statusCode} {result.response.statusText}
@@ -311,6 +313,16 @@ export function ShareConnectionTestRow({
               <span className="text-slate-500">
                 {t("dashboard.connectDialog.test.durationMs", { ms: String(result.durationMs) })}
               </span>
+              {result.terminalEvent ? (
+                <>
+                  <span className="text-slate-400">·</span>
+                  <span className="text-slate-500">
+                    {t("dashboard.connectDialog.test.terminalEvent", {
+                      event: result.terminalEvent,
+                    })}
+                  </span>
+                </>
+              ) : null}
               {result.schedulingRecovery ? (
                 <>
                   <span className="text-slate-400">·</span>
@@ -320,6 +332,10 @@ export function ShareConnectionTestRow({
                 </>
               ) : null}
             </div>
+          ) : null}
+
+          {result.error ? (
+            <p className="text-xs text-red-600">{result.error}</p>
           ) : null}
 
           {result.response ? (
