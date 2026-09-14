@@ -89,6 +89,7 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 // DevTools Console
 Object.keys(localStorage).filter(k => k.startsWith('cc-switch') || k.startsWith('cc_switch')).forEach(k => localStorage.removeItem(k));
 sessionStorage.removeItem('cc_switch_router_web_terminal_windows_v1');
+Object.keys(sessionStorage).filter(k => k.startsWith('cc_switch_router_client_upgrade_')).forEach(k => sessionStorage.removeItem(k));
 location.reload();
 ```
 
@@ -106,6 +107,7 @@ location.reload();
 | 新建 Client | `..._create_client_providers_v2`, `..._create_client_regions_v2` |
 | 窗口 | `..._console_windows_v1/v2`, `..._web_terminal_windows_v1`(sessionStorage) |
 | Share 页 | `cc_switch_share_api_email_v1`, `cc_switch_share_api_token_v1` |
+| Client 升级 | `cc_switch_router_client_upgrade_v3:<installationId>`（sessionStorage；只存 starting/recovering/running。旧 `v2` 失败闩读取后丢弃） |
 | 其他 | `..._chat_anon_visits_v1`, `..._map_request_ticker_expanded_v1`, `cc-switch-router-client-upgrade-state` |
 
 > **注意版本号后缀**。`owner_scope_v2` / `sort_v2` / `status_filter_v2` 是近期升版的键;老用户升级后会被重置一次,用例 H-01 覆盖这个首次进入行为。
@@ -822,7 +824,10 @@ location.reload();
 | D-07 | 配置被拒绝 | 观察 | 明确的拒绝 toast,而非静默 |
 | D-08 | 有可升级 client | 点升级 | 二次确认 → 进度可见 |
 | D-08a | 承 D-08 且升级失败 | 观察失败 toast | 标题为危险色；详情（如 `[resource_preflight/resource_preflight_failed] …`）为深色正文，不得浅灰 |
-| D-09 | 承 D-08 | 升级中刷新页面 | 状态从 `cc-switch-router-client-upgrade-state` 恢复 |
+| D-08b | 承 D-08a，Client 仍报同一 commit | 不刷新，观察按钮 | 保持「重试升级」；`updateAvailable=false` 且隧道在线也不得自行消失 |
+| D-08c | 承 D-08a | 刷新同一标签 | 无 running task 时回到普通「升级」，不得从 sessionStorage 恢复「重试升级」 |
+| D-08d | 承 D-08a 后，机器已换成不同 commit 且隧道在线 | 等 Dashboard 刷新 | 同 tab 静默回到普通「升级」，不再 toast 成功 |
+| D-09 | 承 D-08 | 升级中刷新页面 | 进行中状态从 `cc_switch_router_client_upgrade_v3:` 恢复 |
 | D-10 | 任意开通/清理作业 | 观察 `ProvisionJobLog` | 日志实时追加,可滚动;失败时高亮 |
 
 ---
@@ -911,7 +916,7 @@ location.reload();
 | `dashboard/account-billing-page.tsx` | MB-01~MB-17 |
 | `dashboard/operation-verification.tsx` | S-24, D-06, D-07 |
 | `dashboard/provision-job-log.tsx` | H-45, D-10, Q-13 |
-| `dashboard/client-upgrade-button.tsx` | C-21, D-08, D-09 |
+| `dashboard/client-upgrade-button.tsx` | C-21, D-08, D-08a~D-08d, D-09 |
 | `share/share-page.tsx` | S-40~S-46 |
 | `settings/settings-page.tsx` | X-01~X-08, X-05a, X-07a~X-07f, X-25~X-28 |
 | `settings/version-panel.tsx` | X-09~X-13, X-29, X-30 |
@@ -955,7 +960,7 @@ location.reload();
 | Shares | `updateShareSettings`、`getShareUsageByEmail`、`refreshShareUsage`、`getShareUserUsageBreakdown`、`getShareRecentErrors` | S-05, S-06, S-08~S-25, S-34, S-35, S-47~S-53, S-58, S-59~S-65 |
 | 账户收款资料 | `getAccountPaymentProfile`、`updateAccountPaymentProfile` | AC-03~AC-16, MB-03, MB-17 |
 | Dashboard | `getDashboard`、`getMapDisplay` | C-01, C-22 |
-| Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
+| Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-08a~D-08d, D-09 |
 | 用户 API Token | `getUserApiToken`、`resetUserApiToken` | A-10, A-11 |
 | 用户模型路由 | `getUserModelRouting`、`replaceUserModelRouting` | MH-01~MH-20 |
 | 用户通知渠道 | `getMyNotificationSettings`、`updateMyNotificationSettings`、`bindMyBark`、`unbindMyBark` | X-40~X-43 |
@@ -1009,3 +1014,4 @@ location.reload();
 | 2026-08-10 | Share 下拉补充 subdomain、owner 与支持应用；Token 不限额时隐藏并归一周期；免费/付费统一独立服务期限并从租用成功起算，补齐到期状态机、聊天室事件和 SM/AS 回归用例。 |
 | 2026-08-25 | 新增区域统一模型入口与 Clients「我的」中的模型中枢；补齐精确路由、直连兼容、ACL 重检、无 fallback、CORS、日志归因和 URL 深链 MH-01~MH-20，总数 406。 |
 | 2026-09-14 | Share 编辑/查看弹窗新增最近 3 条非 2xx 快照表（S-59~S-65）；公开 `GET /v1/shares/:id/recent-errors`，匿名 mask 邮箱、正文原样截到 8 KiB。 |
+| 2026-09-14 | Client 升级失败闩不再写入 sessionStorage；同 tab 仅在 live commit 相对失败快照变化且隧道在线时静默清除。新增 D-08b~D-08d。 |

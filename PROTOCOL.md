@@ -412,6 +412,8 @@ Router 在向 Client 发起目标 commit 可确定的升级前检查历史失败
 
 `upgrade_failed`、`resource_preflight_failed`、`health_check_timeout` 等不进入熔断计数。熔断按目标 commit 隔离，不影响其他 release；Router Web 收到该 409 后禁用当前 installation 的连续重试。
 
+Router Web 的升级按钮只把进行中的任务写入 `sessionStorage`（`cc_switch_router_client_upgrade_v3:`）。`failed` / `idle` 不落盘，刷新走 discovery：没有 running task 则回到普通「升级」，不把历史失败闩回「重试升级」。同一标签里的失败闩只在隧道在线且 `installations.status` 上报的 `commitId` 相对失败时快照发生变化时静默清除；不使用 `updateAvailable=false`（已经是最新仍预检失败时会抹掉诊断）。`CLIENT_UPGRADE_ROLLOUT_CIRCUIT_OPEN` 的 `retryBlocked` 保持到离开该标签。`installation_upgrade_tasks` 终态仍以 Server 上报为准，手动换二进制不会把失败任务改成 success。
+
 ---
 
 ## 8. 探针:`/_share-router/*`
