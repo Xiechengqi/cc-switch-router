@@ -34066,6 +34066,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_user_usage_breakdown_prices_server_wire_names() {
+        let (store, config) = setup_store("share-usage-breakdown-wire-names").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-wire", "wire-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            set_share_grants(
+                &conn,
+                "share-wire",
+                BTreeMap::from([(
+                    "user@example.com".into(),
+                    lifetime_grant("user@example.com", "shareto", 20_000),
+                )]),
+            );
+            let mut thinking = test_share_request_log_entry("wire-thinking", "share-wire", now);
+            thinking.user_email = Some("user@example.com".into());
+            thinking.model = "claude-sonnet-4-5-thinking".into();
+            thinking.actual_model = "claude-sonnet-4-5-thinking".into();
+            thinking.input_tokens = 10;
+            thinking.output_tokens = 5;
+            upsert_share_request_log_tx(&conn, "inst-1", thinking).expect("insert thinking");
+
+            let mut bedrock = test_share_request_log_entry("wire-bedrock", "share-wire", now);
+            bedrock.user_email = Some("user@example.com".into());
+            bedrock.model = "anthropic.claude-sonnet-4-5-20250514-v1:0".into();
+            bedrock.actual_model = "anthropic.claude-sonnet-4-5-20250514-v1:0".into();
+            bedrock.input_tokens = 20;
+            bedrock.output_tokens = 4;
+            upsert_share_request_log_tx(&conn, "inst-1", bedrock).expect("insert bedrock");
+
+            let mut antigravity =
+                test_share_request_log_entry("wire-antigravity", "share-wire", now);
+            antigravity.user_email = Some("user@example.com".into());
+            antigravity.model = "publishers/anthropic/models/claude-sonnet-4-5".into();
+            antigravity.actual_model = "publishers/anthropic/models/claude-sonnet-4-5".into();
+            antigravity.input_tokens = 8;
+            antigravity.output_tokens = 2;
+            upsert_share_request_log_tx(&conn, "inst-1", antigravity).expect("insert antigravity");
+        }
+
+        let breakdown = store
+            .share_user_usage_breakdown("share-wire", Some("user@example.com"))
+            .await
+            .expect("breakdown");
+        let rows = &breakdown.rows[0].by_model;
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.priced), "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row.price_key.as_deref() == Some("claude-sonnet-4-5")),
+            "{rows:?}"
+        );
+        assert!(breakdown.rows[0].equivalent_usd_micros.is_some());
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn share_user_usage_breakdown_splits_priority_and_long_context() {
         let (store, config) = setup_store("share-usage-breakdown-tiers").await;
         insert_installation(&store, "inst-1").await;

@@ -12,7 +12,7 @@
 //! existing convention for `regions` (`src/api.rs:124`) and `schema/*.sql`
 //! (`src/schema.rs:12`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -163,20 +163,47 @@ impl PricingCatalog {
     ///
     /// Deliberately NOT a fuzzy family guess in the style of new-api's
     /// `strings.Contains` matching: a wrong price is worse than no price.
+    ///
+    /// Share logs store the Server wire name (`actual_model`, then `model`),
+    /// which is often the catalog identity wrapped in a provider qualifier
+    /// (`anthropic.`, `publishers/anthropic/models/`) or a runtime suffix
+    /// (`-thinking`, `[1m]`, Bedrock `-v1:0`). Those wrappers are peeled
+    /// into exact-match candidates; a candidate only wins if it is itself a
+    /// catalog key or exact alias. `gpt-5-mini` therefore cannot collapse
+    /// onto `gpt-5`.
     pub fn resolve_price_key(&self, model_text: &str) -> Option<&str> {
-        let needle = model_text.trim().to_ascii_lowercase();
-        if needle.is_empty() {
+        let candidates = identity_candidates(model_text);
+        if candidates.is_empty() {
             return None;
         }
-        if let Some(key) = self.exact_aliases.get(&needle) {
+        for candidate in &candidates {
+            if let Some(resolved) = self.resolve_exact(candidate) {
+                return Some(resolved);
+            }
+        }
+        for candidate in &candidates {
+            if let Some(resolved) = self.resolve_prefix(candidate) {
+                return Some(resolved);
+            }
+        }
+        None
+    }
+
+    fn resolve_exact(&self, needle: &str) -> Option<&str> {
+        if let Some(key) = self.exact_aliases.get(needle) {
             return self.models.get_key_value(key).map(|(key, _)| key.as_str());
         }
-        if let Some((key, _)) = self.models.get_key_value(&needle) {
-            return Some(key.as_str());
-        }
+        self.models
+            .get_key_value(needle)
+            .map(|(key, _)| key.as_str())
+    }
+
+    fn resolve_prefix(&self, needle: &str) -> Option<&str> {
         self.prefix_aliases
             .iter()
-            .find(|(pattern, key)| needle.starts_with(pattern.as_str()) && self.models.contains_key(key))
+            .find(|(pattern, key)| {
+                needle.starts_with(pattern.as_str()) && self.models.contains_key(key)
+            })
             .and_then(|(_, key)| self.models.get_key_value(key).map(|(key, _)| key.as_str()))
     }
 
@@ -189,9 +216,7 @@ impl PricingCatalog {
             .rev()
             .find(|generation| {
                 generation.effective_from <= at_unix
-                    && generation
-                        .effective_to
-                        .is_none_or(|until| until > at_unix)
+                    && generation.effective_to.is_none_or(|until| until > at_unix)
             })
             .map(|generation| &generation.price)
     }
@@ -207,7 +232,10 @@ impl PricingCatalog {
     pub fn effective_models(&self, at_unix: i64) -> Vec<(&str, &ModelPrice)> {
         self.models
             .keys()
-            .filter_map(|key| self.price_at(key, at_unix).map(|price| (key.as_str(), price)))
+            .filter_map(|key| {
+                self.price_at(key, at_unix)
+                    .map(|price| (key.as_str(), price))
+            })
             .collect()
     }
 }
@@ -374,7 +402,9 @@ fn read_snapshot(conn: &Connection) -> Result<PricingCatalog, AppError> {
              FROM model_price_catalog
              ORDER BY price_key ASC, effective_from ASC",
         )
-        .map_err(|error| AppError::Internal(format!("prepare price catalog read failed: {error}")))?;
+        .map_err(|error| {
+            AppError::Internal(format!("prepare price catalog read failed: {error}"))
+        })?;
     let header_rows = headers
         .query_map(params![], |row| {
             Ok((
@@ -391,10 +421,17 @@ fn read_snapshot(conn: &Connection) -> Result<PricingCatalog, AppError> {
 
     let mut models: BTreeMap<String, Vec<Generation>> = BTreeMap::new();
     for row in header_rows {
-        let (price_key, effective_from, effective_to, display_name, threshold, inclusive, cache_breakdown) =
-            row.map_err(|error| {
-                AppError::Internal(format!("read price catalog row failed: {error}"))
-            })?;
+        let (
+            price_key,
+            effective_from,
+            effective_to,
+            display_name,
+            threshold,
+            inclusive,
+            cache_breakdown,
+        ) = row.map_err(|error| {
+            AppError::Internal(format!("read price catalog row failed: {error}"))
+        })?;
         models
             .entry(price_key.clone())
             .or_default()
@@ -439,9 +476,7 @@ fn read_snapshot(conn: &Connection) -> Result<PricingCatalog, AppError> {
 
     for row in rate_rows {
         let (price_key, effective_from, tier, ctx, input, output, cache_read, write_5m, write_1h) =
-            row.map_err(|error| {
-                AppError::Internal(format!("read price rate row failed: {error}"))
-            })?;
+            row.map_err(|error| AppError::Internal(format!("read price rate row failed: {error}")))?;
         // The schema CHECKs already constrain these columns; an unrecognised
         // value here means the table was written outside the loader, so drop
         // the row rather than guess a tier.
@@ -497,9 +532,8 @@ fn read_snapshot(conn: &Connection) -> Result<PricingCatalog, AppError> {
     let mut exact_aliases = HashMap::new();
     let mut prefix_aliases = Vec::new();
     for row in alias_rows {
-        let (pattern, kind, price_key) = row.map_err(|error| {
-            AppError::Internal(format!("read price alias row failed: {error}"))
-        })?;
+        let (pattern, kind, price_key) = row
+            .map_err(|error| AppError::Internal(format!("read price alias row failed: {error}")))?;
         match kind.as_str() {
             // §6.2 rule 1: exact wins over prefix, so they live in separate
             // structures and are consulted in order.
@@ -616,6 +650,193 @@ fn compute_revision(
     format!("{:x}", hasher.finalize())
 }
 
+/// Exact-match candidates derived from a logged model name.
+///
+/// Order is most-specific first: the original text, then successively
+/// unwrapped identities. Every candidate is a whole-string identity, never a
+/// family prefix, so `claude-sonnet-4-5-thinking` can land on
+/// `claude-sonnet-4-5` while `gpt-5-mini` cannot land on `gpt-5`.
+fn identity_candidates(model_text: &str) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(model_text.trim().to_ascii_lowercase());
+    while let Some(current) = queue.pop_front() {
+        if current.is_empty() || !seen.insert(current.clone()) {
+            continue;
+        }
+        ordered.push(current.clone());
+        for next in unwrap_identity(&current) {
+            if !next.is_empty() && !seen.contains(&next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    ordered
+}
+
+fn unwrap_identity(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    push_unique(&mut out, strip_path_leaf(value));
+    push_unique(&mut out, strip_provider_dot_prefix(value));
+    push_unique(&mut out, strip_runtime_suffix(value));
+    push_unique(&mut out, strip_date_stamp(value));
+    push_unique(&mut out, claude_dot_version_to_hyphen(value));
+    out
+}
+
+fn push_unique(out: &mut Vec<String>, next: Option<String>) {
+    if let Some(next) = next {
+        if !out.iter().any(|existing| existing == &next) {
+            out.push(next);
+        }
+    }
+}
+
+/// `publishers/anthropic/models/claude-sonnet-4-5` → `claude-sonnet-4-5`.
+/// Also covers `moonshotai/kimi-k2.5` and OpenRouter-style `anthropic/...`.
+fn strip_path_leaf(value: &str) -> Option<String> {
+    let leaf = value.rsplit('/').next()?.trim();
+    if leaf.is_empty() || leaf == value {
+        return None;
+    }
+    Some(leaf.to_string())
+}
+
+/// `anthropic.claude-sonnet-4-5-20250514-v1:0` → `claude-sonnet-4-5-20250514-v1:0`
+/// and `global.anthropic.claude-opus-4-8` → `claude-opus-4-8`.
+///
+/// Only a known vendor token before the first `claude-` / `gpt-` / `o[0-9]`
+/// stem is peeled, so `gpt-5.5` is left alone.
+fn strip_provider_dot_prefix(value: &str) -> Option<String> {
+    const STEMS: &[&str] = &[
+        "claude-",
+        "gpt-",
+        "gemini-",
+        "kimi-",
+        "glm-",
+        "deepseek-",
+        "codex-",
+    ];
+    let mut stem_at = None;
+    for stem in STEMS {
+        if let Some(at) = value.find(stem) {
+            if at > 0 && value.as_bytes()[at - 1] == b'.' {
+                stem_at = Some(stem_at.map_or(at, |current: usize| current.min(at)));
+            }
+        }
+    }
+    // OpenAI o-series keys (`o1`, `o3`, `o4-mini`) sit after a vendor
+    // qualifier too, but the stem is a single letter+digit so it must be
+    // bounded or `global.` would match the `o1` inside `anthropic`.
+    for (i, _) in value.match_indices('o') {
+        if i == 0 || value.as_bytes()[i - 1] != b'.' {
+            continue;
+        }
+        let after = &value[i + 1..];
+        if after.starts_with(|ch: char| ch.is_ascii_digit()) {
+            stem_at = Some(stem_at.map_or(i, |current| current.min(i)));
+        }
+    }
+    let stem_at = stem_at?;
+    let prefix = &value[..stem_at - 1];
+    if prefix.is_empty()
+        || !prefix
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+    Some(value[stem_at..].to_string())
+}
+
+/// Runtime / vendor packaging that does not change the priced identity:
+/// `-thinking`, `-latest`, `[1m]`, `-1m`, Bedrock `-v1:0` / `:0`.
+/// Date stamps stay — they are themselves catalog keys.
+fn strip_runtime_suffix(value: &str) -> Option<String> {
+    let mut current = value.to_string();
+    let mut changed = false;
+    loop {
+        let mut stripped = false;
+        for suffix in ["-thinking", "-latest"] {
+            if let Some(next) = current.strip_suffix(suffix) {
+                if next.is_empty() {
+                    break;
+                }
+                current = next.to_string();
+                stripped = true;
+                changed = true;
+            }
+        }
+        for suffix in ["[1m]", "-1m"] {
+            if let Some(next) = current.strip_suffix(suffix) {
+                if next.is_empty() {
+                    break;
+                }
+                current = next.to_string();
+                stripped = true;
+                changed = true;
+            }
+        }
+        if let Some(next) = strip_bedrock_revision(&current) {
+            current = next;
+            stripped = true;
+            changed = true;
+        }
+        if !stripped {
+            break;
+        }
+    }
+    changed.then_some(current)
+}
+
+/// `claude-sonnet-4-5-20250929-v1:0` → `claude-sonnet-4-5-20250929`.
+/// The dated-v1:0 form is itself a catalog key, so the original is tried
+/// first; this only fires when that exact key is absent.
+fn strip_bedrock_revision(value: &str) -> Option<String> {
+    if let Some(next) = value.strip_suffix(":0") {
+        if let Some(base) = next.rsplit_once("-v") {
+            if !base.0.is_empty() && base.1.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Some(base.0.to_string());
+            }
+        }
+        if !next.is_empty() {
+            return Some(next.to_string());
+        }
+    }
+    None
+}
+
+/// `claude-sonnet-4-5-20250514` → `claude-sonnet-4-5`.
+///
+/// Date stamps that are themselves catalog keys are tried first (BFS
+/// most-specific-first). This only fires when that dated key is absent, so
+/// `claude-sonnet-4-5-20250929` still prefers its own catalog row.
+fn strip_date_stamp(value: &str) -> Option<String> {
+    let (base, suffix) = value.rsplit_once('-')?;
+    if suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit()) && !base.is_empty() {
+        return Some(base.to_string());
+    }
+    None
+}
+
+/// Kiro writes `claude-sonnet-4.8`; the catalog key is `claude-sonnet-4-8`.
+fn claude_dot_version_to_hyphen(value: &str) -> Option<String> {
+    let rest = value.strip_prefix("claude-")?;
+    let (family, version) = rest.split_once('-')?;
+    if !matches!(family, "sonnet" | "opus" | "haiku") {
+        return None;
+    }
+    if !version.contains('.')
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    Some(format!("claude-{family}-{}", version.replace('.', "-")))
+}
+
 /// `sha256:<full hex>` for the owner surface (§9.1).
 pub fn qualified_revision(revision: &str) -> String {
     if revision.is_empty() {
@@ -729,7 +950,10 @@ mod tests {
     #[test]
     fn revision_moves_when_a_price_moves() {
         let conn = fixture_conn();
-        let before = load(&conn, 1_757_462_400).expect("load").revision().to_string();
+        let before = load(&conn, 1_757_462_400)
+            .expect("load")
+            .revision()
+            .to_string();
         conn.execute(
             "UPDATE model_price_rates SET output_micros_per_1m = output_micros_per_1m + 1
              WHERE price_key = (SELECT MIN(price_key) FROM model_price_rates)",
@@ -771,6 +995,74 @@ mod tests {
         assert!(catalog.resolve_price_key("totally-made-up-model").is_none());
         assert!(catalog.resolve_price_key("").is_none());
         assert!(catalog.resolve_price_key("   ").is_none());
+        // A more-specific sibling must not collapse onto a shorter catalog
+        // key: that would be the family guess §6.2 forbids.
+        assert!(catalog.resolve_price_key("gpt-5-unknown-variant").is_none());
+        assert!(
+            catalog
+                .resolve_price_key("claude-sonnet-4-5-unknown")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unwraps_server_wire_names_onto_catalog_keys() {
+        let conn = fixture_conn();
+        let catalog = load(&conn, 1_757_462_400).expect("load");
+        // Runtime wrappers around a catalog identity.
+        assert_eq!(
+            catalog.resolve_price_key("claude-sonnet-4-5-thinking"),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            catalog.resolve_price_key("claude-sonnet-4-5[1m]"),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            catalog.resolve_price_key("claude-sonnet-4-5-thinking[1m]"),
+            Some("claude-sonnet-4-5")
+        );
+        // Provider-qualified wire names from Bedrock / Antigravity / Kiro.
+        assert_eq!(
+            catalog.resolve_price_key("anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            Some("claude-sonnet-4-5-20250929-v1:0")
+        );
+        assert_eq!(
+            catalog.resolve_price_key("anthropic.claude-sonnet-4-5-20250514-v1:0"),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            catalog.resolve_price_key("publishers/anthropic/models/claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            catalog.resolve_price_key("global.anthropic.claude-opus-4-8"),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            catalog.resolve_price_key("claude-opus-4.8"),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            catalog.resolve_price_key("claude-sonnet-4-6[1m][1M]"),
+            Some("claude-sonnet-4-6")
+        );
+        // Dated catalog keys stay themselves; undated dates fall back.
+        assert_eq!(
+            catalog.resolve_price_key("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        // A more-specific catalog key must win over its shorter sibling.
+        assert_eq!(catalog.resolve_price_key("gpt-5-mini"), Some("gpt-5-mini"));
+        assert_eq!(
+            catalog.resolve_price_key("claude-opus-4-6-thinking"),
+            Some("claude-opus-4-6-thinking")
+        );
+        // Bare catalog keys still resolve exactly.
+        assert_eq!(
+            catalog.resolve_price_key("  Claude-Sonnet-4-5 "),
+            Some("claude-sonnet-4-5")
+        );
     }
 
     #[test]
@@ -795,7 +1087,10 @@ mod tests {
             Some("claude-3-7-sonnet-20250219")
         );
         assert_eq!(
-            catalog.prefix_aliases.first().map(|(pattern, _)| pattern.as_str()),
+            catalog
+                .prefix_aliases
+                .first()
+                .map(|(pattern, _)| pattern.as_str()),
             Some("claude-3-7-sonnet-thinking")
         );
     }

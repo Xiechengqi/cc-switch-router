@@ -425,6 +425,8 @@ lower(trim(actual_model))  非空 → 用之
 3. 同 priority 的 `prefix` 中**最长 pattern 优先**（避免 `claude-` 抢走 `claude-sonnet-4-5`）
 4. 全部未命中 → `priced = false`
 
+日志里的 `actual_model` 经常是价目身份再包一层供应商限定或运行时包装（`anthropic.`、`publishers/anthropic/models/`、`-thinking`、`[1m]`、Bedrock `-v1:0`）。解析时先剥成一组**完整身份候选**（原文优先、逐层展开），每个候选只在它本身就是 catalog key 或 exact alias 时才命中。`gpt-5-mini` 因此不会塌到 `gpt-5`。这不是模糊猜族。
+
 > 明确**不做** new-api 式的 `strings.Contains` 模糊猜族（`setting/ratio_setting/model_ratio.go:483,525`）。猜错的价格比没有价格更有害。
 
 ### 6.3 `actual_model_source` 的作用
