@@ -2380,7 +2380,6 @@ pub async fn gateway_proxy_handler(
             error_snapshot: share_error_snapshot_context(
                 &state,
                 Some(share_id.as_str()),
-                false,
                 method.as_str(),
                 &path_and_query,
                 Some(live_request_id.as_str()),
@@ -3267,7 +3266,7 @@ pub async fn proxy_handler(
     let error_capture = StdMutex::new(ShareErrorCapture {
         store: state.store.clone(),
         share_id: None,
-        skip: is_share_router_probe || is_dashboard_connection_test,
+        skip: false,
         method: method.as_str().to_string(),
         path: path_and_query.clone(),
         request_id: None,
@@ -4294,7 +4293,6 @@ pub async fn proxy_handler(
             error_snapshot: share_error_snapshot_context(
                 &state,
                 route.share_id.as_deref(),
-                is_share_router_probe || is_health_check_request,
                 method.as_str(),
                 &path_and_query,
                 live_request_id.as_deref(),
@@ -6153,7 +6151,6 @@ fn persist_stream_error_snapshot(
 fn share_error_snapshot_context(
     state: &ServerState,
     share_id: Option<&str>,
-    skip: bool,
     method: &str,
     path: &str,
     request_id: Option<&str>,
@@ -6162,7 +6159,7 @@ fn share_error_snapshot_context(
     headers: &HeaderMap,
     is_event_stream: bool,
 ) -> Option<ShareErrorSnapshotContext> {
-    if skip || (200..300).contains(&status.as_u16()) {
+    if (200..300).contains(&status.as_u16()) {
         return None;
     }
     let share_id = share_id.filter(|value| !value.is_empty())?;
@@ -10366,6 +10363,62 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
         );
         assert_eq!(listed[0].body_capture_reason, "buffered");
         assert_eq!(listed[0].caller_email.as_deref(), Some("alice@example.com"));
+        let _ = std::fs::remove_file(&config.database.path);
+        let _ = std::fs::remove_file(&config.metrics.db_path);
+    }
+
+    #[test]
+    fn share_error_snapshot_context_keeps_health_probe_and_test_connection_failures() {
+        let config = proxy_test_config("error-snapshot-health-keep");
+        let state = proxy_test_state(&config, Arc::new(ProxyRegistry::default()));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let snapshot = share_error_snapshot_context(
+            &state,
+            Some("share-probe"),
+            "GET",
+            "/_share-router/health",
+            Some("req-probe"),
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &headers,
+            false,
+        )
+        .expect("health probe failure should snapshot");
+        assert_eq!(snapshot.share_id, "share-probe");
+        assert_eq!(snapshot.path, "/_share-router/health");
+        assert_eq!(snapshot.status_code, 503);
+
+        let snapshot = share_error_snapshot_context(
+            &state,
+            Some("share-test"),
+            "POST",
+            "/v1/messages",
+            Some("req-test"),
+            None,
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            false,
+        )
+        .expect("dashboard test-connection failure should snapshot");
+        assert_eq!(snapshot.path, "/v1/messages");
+        assert_eq!(snapshot.status_code, 429);
+        assert!(
+            share_error_snapshot_context(
+                &state,
+                Some("share-ok"),
+                "GET",
+                "/_share-router/health",
+                None,
+                None,
+                StatusCode::NO_CONTENT,
+                &headers,
+                false,
+            )
+            .is_none()
+        );
+
         let _ = std::fs::remove_file(&config.database.path);
         let _ = std::fs::remove_file(&config.metrics.db_path);
     }

@@ -3169,7 +3169,7 @@ export const messages = {
     "dashboard.shareClientBans.reason.share_policy_abuse": "Share policy abuse",
     "dashboard.shareRecentErrors.title": "Recent errors",
     "dashboard.shareRecentErrors.description":
-      "The last 3 non-success HTTP responses for this Share. The body is stored as returned, truncated only after 8 KiB.",
+      "The last 3 non-success responses for this Share, including connection tests and model-health probes. The body is stored as returned, truncated only after 8 KiB.",
     "dashboard.shareRecentErrors.loading": "Loading recent errors…",
     "dashboard.shareRecentErrors.empty": "No recent non-success responses for this Share.",
     "dashboard.shareRecentErrors.refresh": "Refresh recent errors",
@@ -6440,7 +6440,7 @@ export const messages = {
     "dashboard.shareClientBans.reason.share_policy_abuse": "Share 策略违规",
     "dashboard.shareRecentErrors.title": "最近错误",
     "dashboard.shareRecentErrors.description":
-      "此 Share 最近 3 条非成功 HTTP 响应。正文按原样保存，仅在超过 8 KiB 时截断。",
+      "此 Share 最近 3 条非成功响应，包含测试连接和模型健康探针。正文按原样保存，仅在超过 8 KiB 时截断。",
     "dashboard.shareRecentErrors.loading": "正在加载最近错误…",
     "dashboard.shareRecentErrors.empty": "此 Share 暂无最近的非成功响应。",
     "dashboard.shareRecentErrors.refresh": "刷新最近错误",

@@ -8118,63 +8118,13 @@ impl AppStore {
         &self,
         snapshot: NewShareRequestErrorSnapshot,
     ) -> Result<(), AppError> {
-        if snapshot.share_id.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "share request error snapshot requires share_id".into(),
-            ));
-        }
-        let captured_at = Utc::now().to_rfc3339();
-        let id = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
         let tx = conn.unchecked_transaction().map_err(|error| {
             AppError::Internal(format!(
                 "begin share request error snapshot tx failed: {error}"
             ))
         })?;
-        tx.execute(
-            "INSERT INTO share_request_error_snapshots (
-                id, share_id, request_id, captured_at, status_code, method, path,
-                content_type, caller_email, body_text, body_truncated, body_capture_reason
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                id,
-                snapshot.share_id,
-                snapshot.request_id,
-                captured_at,
-                snapshot.status_code as i64,
-                snapshot.method,
-                snapshot.path,
-                snapshot.content_type,
-                snapshot.caller_email,
-                snapshot.body_text,
-                if snapshot.body_truncated { 1 } else { 0 },
-                snapshot.body_capture_reason,
-            ],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "insert share request error snapshot failed: {error}"
-            ))
-        })?;
-        tx.execute(
-            "DELETE FROM share_request_error_snapshots
-              WHERE share_id = ?1
-                AND id NOT IN (
-                    SELECT id FROM share_request_error_snapshots
-                     WHERE share_id = ?1
-                     ORDER BY captured_at DESC, id DESC
-                     LIMIT ?2
-                )",
-            params![
-                snapshot.share_id,
-                SHARE_REQUEST_ERROR_SNAPSHOT_RETAIN_PER_SHARE as i64
-            ],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "trim share request error snapshots failed: {error}"
-            ))
-        })?;
+        insert_share_request_error_snapshot_tx(&tx, &snapshot)?;
         tx.commit().map_err(|error| {
             AppError::Internal(format!(
                 "commit share request error snapshot failed: {error}"
@@ -8182,6 +8132,7 @@ impl AppStore {
         })?;
         Ok(())
     }
+
 
     pub async fn list_share_request_error_snapshots(
         &self,
@@ -14177,20 +14128,21 @@ impl AppStore {
                         result.checked_at,
                     ),
                     share_id: share_id.to_string(),
-                    subdomain: result.subdomain,
-                    app_type: result.app_type,
+                    subdomain: result.subdomain.clone(),
+                    app_type: result.app_type.clone(),
                     requested_model,
                     actual_model,
-                    status: result.status,
+                    status: result.status.clone(),
                     status_code: result.status_code,
                     latency_ms: result.latency_ms,
                     first_token_ms: None,
-                    error_message: result.error_message,
+                    error_message: result.error_message.clone(),
                     checked_at: result.checked_at,
-                    source: result.source,
+                    source: result.source.clone(),
                 },
             )?;
         }
+        insert_share_model_probe_error_snapshot_tx(&tx, share_id, &result)?;
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit Share model health slot failed: {error}"))
         })?;
@@ -21986,6 +21938,144 @@ fn share_model_health_check_request_id(
     checked_at: i64,
 ) -> String {
     format!("share-model-health:{share_id}:{app_type}:{requested_model}:{checked_at}")
+}
+
+fn insert_share_model_probe_error_snapshot_tx(
+    conn: &Connection,
+    share_id: &str,
+    result: &ShareModelHealthSlotResult,
+) -> Result<(), AppError> {
+    let Some(snapshot) = share_model_probe_error_snapshot(share_id, result) else {
+        return Ok(());
+    };
+    insert_share_request_error_snapshot_tx(conn, &snapshot)
+}
+
+fn share_model_probe_error_snapshot(
+    share_id: &str,
+    result: &ShareModelHealthSlotResult,
+) -> Option<NewShareRequestErrorSnapshot> {
+    if share_id.trim().is_empty() {
+        return None;
+    }
+    if matches!(result.status.as_str(), "success" | "degraded") || result.outcome != "failure" {
+        return None;
+    }
+    let status_code = result
+        .status_code
+        .filter(|code| !(200..300).contains(code))
+        .unwrap_or(599);
+    let body = share_model_probe_error_snapshot_body(result);
+    let (body_text, body_truncated) = truncate_error_snapshot_body(body.as_bytes());
+    Some(NewShareRequestErrorSnapshot {
+        share_id: share_id.to_string(),
+        request_id: result.observation_id.clone().or_else(|| {
+            Some(share_model_health_check_request_id(
+                share_id,
+                &result.app_type,
+                if result.requested_model.trim().is_empty() {
+                    &result.app_type
+                } else {
+                    &result.requested_model
+                },
+                result.checked_at,
+            ))
+        }),
+        status_code,
+        method: Some("PROBE".into()),
+        path: Some(format!(
+            "/_share-router/model-health/{}{}",
+            result.app_type,
+            if result.requested_model.trim().is_empty() {
+                String::new()
+            } else {
+                format!("/{}", result.requested_model)
+            }
+        )),
+        content_type: Some("application/json".into()),
+        caller_email: None,
+        body_text,
+        body_truncated,
+        body_capture_reason: "router_local".into(),
+    })
+}
+
+fn share_model_probe_error_snapshot_body(result: &ShareModelHealthSlotResult) -> String {
+    serde_json::json!({
+        "source": result.source,
+        "status": result.status,
+        "statusCode": result.status_code,
+        "latencyMs": result.latency_ms,
+        "appType": result.app_type,
+        "requestedModel": result.requested_model,
+        "actualModel": result.actual_model,
+        "providerId": result.provider_id,
+        "providerName": result.provider_name,
+        "outcome": result.outcome,
+        "failureDomain": result.failure_domain,
+        "reasonCode": result.reason_code,
+        "errorCategory": result.error_category,
+        "errorMessage": result.error_message,
+    })
+    .to_string()
+}
+
+fn insert_share_request_error_snapshot_tx(
+    conn: &Connection,
+    snapshot: &NewShareRequestErrorSnapshot,
+) -> Result<(), AppError> {
+    if snapshot.share_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "share request error snapshot requires share_id".into(),
+        ));
+    }
+    let captured_at = Utc::now().to_rfc3339();
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO share_request_error_snapshots (
+            id, share_id, request_id, captured_at, status_code, method, path,
+            content_type, caller_email, body_text, body_truncated, body_capture_reason
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            id,
+            snapshot.share_id,
+            snapshot.request_id,
+            captured_at,
+            snapshot.status_code as i64,
+            snapshot.method,
+            snapshot.path,
+            snapshot.content_type,
+            snapshot.caller_email,
+            snapshot.body_text,
+            if snapshot.body_truncated { 1 } else { 0 },
+            snapshot.body_capture_reason,
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "insert share request error snapshot failed: {error}"
+        ))
+    })?;
+    conn.execute(
+        "DELETE FROM share_request_error_snapshots
+          WHERE share_id = ?1
+            AND id NOT IN (
+                SELECT id FROM share_request_error_snapshots
+                 WHERE share_id = ?1
+                 ORDER BY captured_at DESC, id DESC
+                 LIMIT ?2
+            )",
+        params![
+            snapshot.share_id,
+            SHARE_REQUEST_ERROR_SNAPSHOT_RETAIN_PER_SHARE as i64
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "trim share request error snapshots failed: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn recent_model_health_check_fingerprint(check: &ShareModelHealthCheckEntry) -> String {
@@ -53960,6 +54050,172 @@ mod tests {
                 .expect("count leftover snapshots");
             assert_eq!(remaining, 0);
         }
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn failed_model_health_probe_writes_recent_error_snapshot() {
+        let (store, config) = setup_store("share-model-probe-error-snapshot").await;
+        insert_installation(&store, "health-installation").await;
+        insert_share(
+            &store,
+            "health-installation",
+            "health-share",
+            "health-sub",
+            "active",
+        )
+        .await;
+        let slot_start = (Utc::now().timestamp() / 1_800) * 1_800;
+        let epoch_id = store
+            .sync_share_model_probe_epoch(
+                "health-share",
+                slot_start,
+                Some(&model_probe_epoch_input(
+                    "pool-health-share",
+                    &"a".repeat(64),
+                )),
+            )
+            .await
+            .expect("sync probe snapshot epoch")
+            .expect("probe snapshot epoch");
+        let success_claim = store
+            .claim_share_model_health_slot(
+                "health-share",
+                slot_start,
+                &epoch_id,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-test",
+                slot_start,
+            )
+            .await
+            .expect("claim success slot")
+            .expect("success claim");
+        assert!(
+            store
+                .finish_share_model_health_slot(
+                    "health-share",
+                    slot_start,
+                    &success_claim,
+                    model_health_slot_result(
+                        "success",
+                        slot_start + 10,
+                        "health-installation",
+                        "health-share",
+                    ),
+                )
+                .await
+                .expect("finish success probe")
+        );
+        assert!(
+            store
+                .list_share_request_error_snapshots("health-share")
+                .await
+                .expect("list after success")
+                .is_empty()
+        );
+
+        let failed_slot = slot_start + 1_800;
+        let failed_claim = store
+            .claim_share_model_health_slot(
+                "health-share",
+                failed_slot,
+                &epoch_id,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-test-fail",
+                failed_slot,
+            )
+            .await
+            .expect("claim failed slot")
+            .expect("failed claim");
+        let mut failed = model_health_slot_result(
+            "quota_blocked",
+            failed_slot + 5,
+            "health-installation",
+            "health-share",
+        );
+        failed.status_code = Some(429);
+        failed.latency_ms = 0;
+        failed.outcome = "failure".into();
+        failed.failure_domain = Some("quota".into());
+        failed.reason_code = Some("quota_blocked".into());
+        failed.error_category = Some("quotaBlocked".into());
+        failed.error_message = Some(
+            "quota blocked: upstream rate limit is active until 2026-09-17T10:00:00+00:00".into(),
+        );
+        failed.source = "cc-switch-router-cycle:utc-test-fail".into();
+        assert!(
+            store
+                .finish_share_model_health_slot(
+                    "health-share",
+                    failed_slot,
+                    &failed_claim,
+                    failed,
+                )
+                .await
+                .expect("finish quota probe")
+        );
+        let listed = store
+            .list_share_request_error_snapshots("health-share")
+            .await
+            .expect("list probe snapshots");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status_code, 429);
+        assert_eq!(listed[0].method.as_deref(), Some("PROBE"));
+        assert_eq!(
+            listed[0].path.as_deref(),
+            Some("/_share-router/model-health/codex/server-test-model@low")
+        );
+        assert_eq!(listed[0].body_capture_reason, "router_local");
+        assert!(listed[0].body_text.contains("quota_blocked"));
+        assert!(listed[0].body_text.contains("cc-switch-router-cycle:utc-test-fail"));
+        assert!(listed[0].body_text.contains("upstream rate limit is active"));
+
+        let gap_slot = failed_slot + 1_800;
+        let gap_claim = store
+            .claim_share_model_health_slot(
+                "health-share",
+                gap_slot,
+                &epoch_id,
+                "codex",
+                "openai",
+                "server-test-model@low",
+                "cc-switch-router-cycle:utc-test-gap",
+                gap_slot,
+            )
+            .await
+            .expect("claim gap slot")
+            .expect("gap claim");
+        let mut gap = model_health_slot_result(
+            "failed",
+            gap_slot + 5,
+            "health-installation",
+            "health-share",
+        );
+        gap.observation_id = None;
+        gap.outcome = "unobserved".into();
+        gap.status_code = None;
+        gap.failure_domain = Some("control_transport".into());
+        gap.reason_code = Some("control_transport_failed".into());
+        gap.evidence_scope = "share_projection".into();
+        assert!(
+            store
+                .finish_share_model_health_slot("health-share", gap_slot, &gap_claim, gap)
+                .await
+                .expect("finish unobserved gap")
+        );
+        assert_eq!(
+            store
+                .list_share_request_error_snapshots("health-share")
+                .await
+                .expect("list after unobserved gap")
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_file(config.database.path);
     }
