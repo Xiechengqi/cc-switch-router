@@ -239,9 +239,9 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_TELEGRAM_BIND_TOKEN_TTL_SECS` | `900` | 绑定深链 token 有效期(秒) |
 | `CC_SWITCH_ROUTER_TELEGRAM_RECIPIENT_HOURLY_LIMIT` | `10` | 单用户每小时 Telegram 通知硬上限;与邮件额度互不占用 |
 | `CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT` | `50` | Router 全局每小时 Telegram 通知硬上限 |
-| `CC_SWITCH_ROUTER_BARK_ENABLED` | `false` | 用户 Bark 通知总开关；要求 Server URL 与凭据主密钥 |
+| `CC_SWITCH_ROUTER_BARK_ENABLED` | `false` | 用户 Bark 通知总开关；首次启用时 Router 自动创建凭据主密钥 |
 | `CC_SWITCH_ROUTER_BARK_SERVER_URL` | `https://api.day.app` | 用户 Push URL 必须属于此 Bark Server；远端只允许 HTTPS |
-| `CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY` | 空 | 加密用户 Device Key 的独立 32 字节 hex/base64 密钥；修改后需重启且 API 永不回传 |
+| `CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY` | 首次启用时自动生成 | 加密用户 Device Key 的独立 32 字节 hex/base64 密钥；由 Router 管理，修改后需重启且 API 永不回传 |
 | `CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION` | `1` | Bark 密文密钥版本；修改后需重启并要求用户重新绑定 |
 | `CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT` | `10` | 单用户每小时 Bark 通知硬上限 |
 | `CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT` | `50` | Router 全局每小时 Bark 通知硬上限 |

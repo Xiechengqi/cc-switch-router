@@ -90,6 +90,13 @@ type ClientServerReleaseCheck = {
   result?: ClientServerReleaseValidation;
 };
 
+const ROUTER_MANAGED_BARK_FIELDS = new Set([
+  "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
+  "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION",
+  "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT",
+  "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT",
+]);
+
 const CLIENT_SERVER_RELEASE_KEY = "CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE";
 
 const PANEL_SUBSECTION_IDS: Record<SettingsPanel, string> = {
@@ -287,9 +294,10 @@ export function SettingsPage() {
   }
 
   const schema = snapshot?.schema;
+  const settingsFields = (schema?.fields || []).filter((field) => !ROUTER_MANAGED_BARK_FIELDS.has(field.key));
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const activeCategory = activeSection === "overview" ? undefined : activeSection;
-  const categoryFields = (schema?.fields || []).filter((field) => field.category === activeCategory);
+  const categoryFields = settingsFields.filter((field) => field.category === activeCategory);
   const subsections = activeCategory
     ? buildSettingsSubsections(activeCategory, categoryFields, values, dirty, mapDirty, t)
     : [];
@@ -300,7 +308,7 @@ export function SettingsPage() {
     : undefined;
   const activeSubsection = subsections.find((item) => item.id === requestedSubsection) || subsections[0];
   const activeSubsectionIndex = Math.max(0, subsections.findIndex((item) => item.id === activeSubsection?.id));
-  const matchingFields = (schema?.fields || []).filter((field) => {
+  const matchingFields = settingsFields.filter((field) => {
     if (!normalizedQuery) {
       return !!activeSubsection?.groups?.includes(field.group) && field.category === activeCategory;
     }
@@ -374,7 +382,7 @@ export function SettingsPage() {
                 active={activeSection === category.id && !normalizedQuery}
                 label={settingsCategoryLabel(t, category)}
                 count={(
-                  categoryDirtyCount(category.id, schema?.fields || [], dirty)
+                  categoryDirtyCount(category.id, settingsFields, dirty)
                   + (category.id === "general_display" && mapDirty ? 1 : 0)
                 ) || undefined}
                 icon={CATEGORY_ICONS[category.id]}
@@ -727,7 +735,10 @@ function SettingsOverview({
   return (
     <div className="grid gap-7">
       <section className="grid rounded-md bg-muted/35 sm:grid-cols-2">
-        <OverviewStat label={t("settings.configuredFields")} value={snapshot.schema.fields.length} />
+        <OverviewStat
+          label={t("settings.configuredFields")}
+          value={snapshot.schema.fields.filter((field) => !ROUTER_MANAGED_BARK_FIELDS.has(field.key)).length}
+        />
         <OverviewStat label={t("settings.pendingRestartLabel")} value={snapshot.pendingRestartKeys.length} tone={snapshot.pendingRestartKeys.length ? "warning" : "default"} />
       </section>
 

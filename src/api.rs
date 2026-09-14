@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
 use futures_util::StreamExt;
+use rand::RngCore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
@@ -3432,6 +3433,66 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn bark_credential_is_generated_only_when_enabling_without_one() {
+        const ENABLED: &str = "CC_SWITCH_ROUTER_BARK_ENABLED";
+        const MASTER_KEY: &str = "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY";
+
+        let mut updates = BTreeMap::from([(ENABLED.into(), Some("true".into()))]);
+        provision_bark_credential_if_needed(
+            &mut updates,
+            &HashMap::new(),
+            &crate::config::BarkSettings::default(),
+        );
+        let generated = updates
+            .get(MASTER_KEY)
+            .and_then(|value| value.as_deref())
+            .expect("enabling Bark should provision a credential");
+        assert_eq!(generated.len(), 64);
+        assert!(generated.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let mut disabled = BTreeMap::from([(ENABLED.into(), Some("false".into()))]);
+        provision_bark_credential_if_needed(
+            &mut disabled,
+            &HashMap::new(),
+            &crate::config::BarkSettings::default(),
+        );
+        assert!(!disabled.contains_key(MASTER_KEY));
+    }
+
+    #[test]
+    fn bark_credential_provisioning_preserves_existing_sources_and_explicit_updates() {
+        const ENABLED: &str = "CC_SWITCH_ROUTER_BARK_ENABLED";
+        const MASTER_KEY: &str = "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY";
+        let enabling = || BTreeMap::from([(ENABLED.into(), Some("true".into()))]);
+
+        let mut persisted = enabling();
+        provision_bark_credential_if_needed(
+            &mut persisted,
+            &HashMap::from([(MASTER_KEY.into(), "persisted-key".into())]),
+            &crate::config::BarkSettings::default(),
+        );
+        assert!(!persisted.contains_key(MASTER_KEY));
+
+        let mut bark = crate::config::BarkSettings::default();
+        bark.credential_master_key = Some("external-key".into());
+        let mut external = enabling();
+        provision_bark_credential_if_needed(&mut external, &HashMap::new(), &bark);
+        assert!(!external.contains_key(MASTER_KEY));
+
+        let mut explicit = enabling();
+        explicit.insert(MASTER_KEY.into(), Some("operator-key".into()));
+        provision_bark_credential_if_needed(
+            &mut explicit,
+            &HashMap::new(),
+            &crate::config::BarkSettings::default(),
+        );
+        assert_eq!(
+            explicit.get(MASTER_KEY).and_then(|value| value.as_deref()),
+            Some("operator-key")
+        );
+    }
+
     #[tokio::test]
     async fn regions_endpoint_preserves_file_order_with_free_first() {
         let Json(regions) = regions().await.expect("embedded regions should be valid");
@@ -6032,11 +6093,12 @@ async fn admin_client_notification_deliveries(
 async fn admin_settings_validate(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<SettingsUpdateRequest>,
+    Json(mut input): Json<SettingsUpdateRequest>,
 ) -> Result<Json<SettingsValidationResponse>, AppError> {
     require_admin_session(&state, &headers).await?;
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
+    provision_bark_credential_if_needed(&mut input.updates, &existing, &state.config.bark);
     let mut validation =
         validation_response_with_runtime(&existing, &input.updates, &state.settings_runtime);
     if !validation.valid {
@@ -6085,7 +6147,7 @@ async fn admin_settings_apply(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(input): Json<SettingsUpdateRequest>,
+    Json(mut input): Json<SettingsUpdateRequest>,
 ) -> Result<Json<SettingsUpdateResponse>, AppError> {
     let session = require_admin_session(&state, &headers).await?;
     if input.updates.is_empty() {
@@ -6097,6 +6159,7 @@ async fn admin_settings_apply(
     // stall unrelated dynamic-settings readers.
     let existing = read_env_file(&state.env_path)?;
     ensure_settings_revision(&existing, &input.expected_revision)?;
+    provision_bark_credential_if_needed(&mut input.updates, &existing, &state.config.bark);
     let outcome =
         validate_and_diff_with_runtime(&existing, &input.updates, &state.settings_runtime)
             .map_err(|error| {
@@ -6286,6 +6349,38 @@ async fn admin_settings_apply(
                 .collect(),
         ),
     }))
+}
+
+fn provision_bark_credential_if_needed(
+    updates: &mut BTreeMap<String, Option<String>>,
+    existing: &HashMap<String, String>,
+    bark: &crate::config::BarkSettings,
+) {
+    const ENABLED: &str = "CC_SWITCH_ROUTER_BARK_ENABLED";
+    const MASTER_KEY: &str = "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY";
+    let enabling = updates
+        .get(ENABLED)
+        .and_then(|value| value.as_deref())
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+    let already_available = match existing.get(MASTER_KEY) {
+        Some(value) => !value.trim().is_empty(),
+        None => bark
+            .credential_master_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+    };
+    if !enabling || already_available || updates.contains_key(MASTER_KEY) {
+        return;
+    }
+    let mut key = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    updates.insert(MASTER_KEY.into(), Some(hex::encode(key)));
+    key.fill(0);
 }
 
 fn changed_client_server_release(outcome: &ApplyOutcome) -> Option<String> {
