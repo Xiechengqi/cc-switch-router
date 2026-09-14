@@ -769,12 +769,10 @@ function SettingsOverview({
                   </span>
                   <span className="break-all font-mono text-xs text-muted-foreground">{field.key}</span>
                   <span className="text-xs text-muted-foreground">
-                    {entry?.isSecret
-                      ? t("settings.pendingRestartSecretChanged")
-                      : t("settings.pendingRestartValues", {
-                        saved: formatOverviewSettingValue(entry?.value, t),
-                        runtime: formatOverviewSettingValue(entry?.effectiveValue, t),
-                      })}
+                    {t("settings.pendingRestartValues", {
+                      saved: formatOverviewSettingValue(entry?.value, t),
+                      runtime: formatOverviewSettingValue(entry?.effectiveValue, t),
+                    })}
                   </span>
                 </button>
               );
@@ -964,8 +962,7 @@ function SettingsFieldRow({
   t: ReturnType<typeof useLocaleText>["t"];
   onChange: (value: DirtyValue) => void;
 }) {
-  const secretClearing = field.fieldType === "secret" && value === null;
-  const inputValue = secretClearing ? "" : String(value ?? "");
+  const inputValue = String(value ?? "");
   const rowState = errors.length
     ? "bg-danger/5 hover:bg-danger/10"
     : dirty
@@ -992,14 +989,9 @@ function SettingsFieldRow({
           <span>{t("settings.runtimeSource", { source: settingsValueSource(t, entry?.effectiveSource) })}</span>
           {entry?.pendingRestart ? <span className="text-amber-700">· {t("settings.pendingRestartShort")}</span> : null}
         </div>
-        {entry?.pendingRestart && !entry?.isSecret ? (
+        {entry?.pendingRestart ? (
           <p className="mt-2 text-xs text-muted-foreground">
             {t("settings.effectiveValue", { value: entry.effectiveValue || t("common.unset") })}
-          </p>
-        ) : null}
-        {entry?.pendingRestart && entry?.isSecret ? (
-          <p className="mt-2 text-xs text-muted-foreground">
-            {entry.effectiveHasValue ? t("settings.effectiveSecretSet") : t("settings.effectiveSecretUnset")}
           </p>
         ) : null}
       </div>
@@ -1042,38 +1034,19 @@ function SettingsFieldRow({
         ) : (
           <Input
             id={field.key}
-            type={field.fieldType === "secret" ? "password" : field.fieldType === "int" || field.fieldType === "decimal" ? "number" : field.fieldType === "url" ? "url" : field.fieldType === "email" ? "email" : "text"}
+            type={field.fieldType === "int" || field.fieldType === "decimal" ? "number" : field.fieldType === "url" ? "url" : field.fieldType === "email" ? "email" : "text"}
             min={field.constraints.min}
             max={field.constraints.max}
             step={field.constraints.step}
             value={inputValue}
             onChange={(event) => onChange(event.target.value)}
-            placeholder={field.fieldType === "secret" && entry?.hasValue
-              ? t("settings.secretKeepPlaceholder")
-              : settingsFieldPlaceholder(t, field)}
+            placeholder={settingsFieldPlaceholder(t, field)}
           />
         )}
 
         {field.unit ? <span className="text-right text-xs text-muted-foreground">{field.unit}</span> : null}
         {clientServerReleaseCheck && clientServerReleaseCheck.phase !== "idle" ? (
           <ClientServerReleaseFeedback check={clientServerReleaseCheck} />
-        ) : null}
-        {field.fieldType === "secret" ? (
-          <div className="flex min-h-8 items-center justify-between gap-3">
-            <span className={`text-xs ${secretClearing ? "text-red-600" : "text-muted-foreground"}`}>
-              {secretClearing
-                ? t("settings.secretWillClear")
-                : entry?.hasValue
-                  ? t("settings.currentlySet")
-                  : t("common.unset")}
-            </span>
-            {entry?.hasValue || secretClearing ? (
-              <Button size="sm" variant="ghost" onClick={() => onChange(secretClearing ? "" : null)}>
-                {secretClearing ? <RotateCcw className="h-3.5 w-3.5" /> : <AlertTriangle className="h-3.5 w-3.5" />}
-                {secretClearing ? t("common.cancel") : t("settings.clearSecret")}
-              </Button>
-            ) : null}
-          </div>
         ) : null}
         {errors.map((error) => <p key={error} className="text-xs text-red-600">{error}</p>)}
       </div>
@@ -1316,7 +1289,6 @@ function baseValue(field: SettingsField, entry?: SettingValueEntry): DirtyValue 
     const raw = configured || field.default || "";
     return raw === "true" || raw === "1" || raw === "yes" || raw === "on";
   }
-  if (field.fieldType === "secret") return "";
   return configured ?? field.default ?? "";
 }
 
@@ -1327,7 +1299,6 @@ function dirtyValue(field: SettingsField, entry: SettingValueEntry | undefined, 
 
 function sameDirtyValue(field: SettingsField, left: DirtyValue, right: DirtyValue) {
   if (field.fieldType === "bool") return Boolean(left) === Boolean(right);
-  if (field.fieldType === "secret") return left === "" && right === "";
   return String(left ?? "").trim() === String(right ?? "").trim();
 }
 
@@ -1338,9 +1309,6 @@ function buildUpdates(fields: SettingsField[], dirty: Record<string, DirtyValue>
     if (!field) continue;
     if (field.fieldType === "bool") {
       updates[key] = Boolean(value) ? "true" : "false";
-    } else if (field.fieldType === "secret") {
-      if (value === null) updates[key] = null;
-      else if (String(value).trim()) updates[key] = String(value).trim();
     } else {
       const trimmed = String(value ?? "").trim();
       updates[key] = trimmed === "" ? null : trimmed;
@@ -1356,10 +1324,6 @@ function reconcileDirty(snapshot: SettingsSnapshot, current: Record<string, Dirt
     const field = snapshot.schema.fields.find((candidate) => candidate.key === key);
     const entry = entries[key];
     if (!field) continue;
-    if (field.fieldType === "secret") {
-      if (value === null ? entry?.hasValue : String(value).trim()) next[key] = value;
-      continue;
-    }
     if (!sameDirtyValue(field, value, baseValue(field, entry))) next[key] = value;
   }
   return next;

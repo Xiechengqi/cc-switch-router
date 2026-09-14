@@ -1413,7 +1413,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: true,
         default: None,
-        description: "Dedicated 32-byte key, encoded as 64 hexadecimal characters or base64, used to encrypt merchant API credentials and retained transaction evidence. Stored only in protected Settings env files and never returned by the API; changing it requires every merchant to rebind.",
+        description: "Dedicated 32-byte key, encoded as 64 hexadecimal characters or base64, used to encrypt merchant API credentials and retained transaction evidence. Changing it requires every merchant to rebind.",
         placeholder: Some("64 hex characters or base64"),
         dynamic_group: None,
     },
@@ -1731,7 +1731,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: false,
         default: None,
-        description: "Bot token issued by @BotFather. It is never returned by the Settings API or written to logs.",
+        description: "Bot token issued by @BotFather. It is displayed to administrators in Settings and is not written to logs.",
         placeholder: Some("123456:ABC..."),
         dynamic_group: Some(DynamicGroup::Alerting),
     },
@@ -1894,7 +1894,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: true,
         default: None,
-        description: "Dedicated 32-byte key encoded as 64 hexadecimal characters or base64. Encrypts user Bark device keys and is never returned by the API.",
+        description: "Dedicated 32-byte key encoded as 64 hexadecimal characters or base64. Encrypts user Bark device keys.",
         placeholder: Some("64 hexadecimal characters"),
         dynamic_group: None,
     },
@@ -2401,9 +2401,9 @@ pub fn read_env_file(path: &Path) -> Result<HashMap<String, String>, AppError> {
     Ok(out)
 }
 
-/// Read current values and produce the API response. Secrets surface only
-/// `hasValue=true` plus a redacted display so admins can confirm presence
-/// without leaking the secret over the wire.
+/// Read current values and produce the API response. Settings is an
+/// administrator-only surface, so credential fields use the same explicit
+/// read/edit/clear contract as every other field.
 #[cfg(test)]
 pub fn values_response(env_path: &Path) -> Result<SettingsValuesResponse, AppError> {
     let file_kv = read_env_file(env_path)?;
@@ -2505,11 +2505,11 @@ fn value_entries(
                 values_differ && (field.restart_required || field.dynamic_group.is_some());
             Ok(SettingValueEntry {
                 key: field.key.to_string(),
-                value: (!is_secret).then_some(configured).flatten(),
+                value: configured,
                 has_value,
                 is_secret,
                 source,
-                effective_value: (!is_secret).then_some(effective).flatten(),
+                effective_value: effective,
                 effective_has_value,
                 effective_source,
                 pending_restart,
@@ -4961,7 +4961,7 @@ mod tests {
     }
 
     #[test]
-    fn alert_channel_secrets_are_never_returned_by_settings_values_api() {
+    fn alert_channel_credentials_are_returned_by_admin_settings_api() {
         let path = std::env::temp_dir().join(format!(
             "cc-switch-router-alert-settings-secret-{}.env",
             uuid::Uuid::new_v4()
@@ -4980,7 +4980,7 @@ mod tests {
             .expect("alert secret entry");
         assert!(entry.is_secret);
         assert!(entry.has_value);
-        assert!(entry.value.is_none());
+        assert_eq!(entry.value.as_deref(), Some("telegram-secret"));
         for key in [
             "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY",
             "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
@@ -4992,8 +4992,12 @@ mod tests {
                 .expect("Bark secret entry");
             assert!(entry.is_secret);
             assert!(entry.has_value);
-            assert!(entry.value.is_none());
-            assert!(entry.effective_value.is_none());
+            let expected = if key == "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY" {
+                "bark-device-secret"
+            } else {
+                "1111111111111111111111111111111111111111111111111111111111111111"
+            };
+            assert_eq!(entry.value.as_deref(), Some(expected));
         }
         let _ = std::fs::remove_file(path);
     }
@@ -5159,7 +5163,7 @@ mod tests {
     }
 
     #[test]
-    fn turso_token_is_never_returned_by_settings_values_api() {
+    fn turso_token_is_returned_by_admin_settings_api() {
         let path = std::env::temp_dir().join(format!(
             "cc-switch-router-settings-secret-{}.env",
             uuid::Uuid::new_v4()
@@ -5178,7 +5182,7 @@ mod tests {
             .expect("Turso token entry");
         assert!(token.is_secret);
         assert!(token.has_value);
-        assert!(token.value.is_none());
+        assert_eq!(token.value.as_deref(), Some("do-not-return-this-token"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -5821,8 +5825,11 @@ mod tests {
         assert!(master_key.has_value);
         assert!(master_key.effective_has_value);
         assert!(!master_key.pending_restart);
-        assert!(master_key.value.is_none());
-        assert!(master_key.effective_value.is_none());
+        assert_eq!(master_key.value.as_deref(), Some(&*"11".repeat(32)));
+        assert_eq!(
+            master_key.effective_value.as_deref(),
+            Some(&*"11".repeat(32))
+        );
 
         let version = snapshot
             .values
@@ -5853,7 +5860,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_snapshot_redacts_dynamic_telegram_secret() {
+    fn settings_snapshot_returns_dynamic_telegram_secret() {
         let path = std::env::temp_dir().join(format!(
             "cc-switch-router-settings-dynamic-secret-{}.env",
             uuid::Uuid::new_v4()
@@ -5878,14 +5885,14 @@ mod tests {
         assert!(token.is_secret);
         assert!(token.has_value);
         assert!(token.effective_has_value);
-        assert!(token.value.is_none());
-        assert!(token.effective_value.is_none());
+        assert_eq!(token.value.as_deref(), Some("telegram-secret"));
+        assert_eq!(token.effective_value.as_deref(), Some("telegram-secret"));
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn settings_values_never_return_binance_master_key() {
+    fn settings_values_return_binance_master_key() {
         let path = std::env::temp_dir().join(format!(
             "cc-switch-router-settings-binance-secret-{}.env",
             uuid::Uuid::new_v4()
@@ -5897,7 +5904,7 @@ mod tests {
         )
         .expect("write Binance Settings fixture");
 
-        let response = values_response(&path).expect("read redacted Settings values");
+        let response = values_response(&path).expect("read Settings values");
         let master_key = response
             .values
             .iter()
@@ -5905,8 +5912,7 @@ mod tests {
             .expect("Binance master key entry");
         assert!(master_key.is_secret);
         assert!(master_key.has_value);
-        assert!(master_key.value.is_none());
-        assert!(!format!("{response:?}").contains(&secret));
+        assert_eq!(master_key.value.as_deref(), Some(secret.as_str()));
 
         let _ = std::fs::remove_file(path);
     }

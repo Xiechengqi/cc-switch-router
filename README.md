@@ -180,13 +180,13 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS` | `21600` | 未确认 critical 事故的首次提醒间隔；后续指数退避至最长 24 小时，范围 60 秒至 7 天。warning 只记录首次与恢复，不周期提醒 |
 | `CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS` | `90` | 已恢复事故、流转、投递尝试、渠道测试和已完成 Client 信号的保留天数 |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED` | `false` | 启用 Telegram Bot 告警；同时要求 Bot Token 和 Chat ID |
-| `CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN` | 空 | `@BotFather` 签发的 Token；Settings API 不回传明文 |
+| `CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN` | 空 | `@BotFather` 签发的 Token；管理员可在 Settings 中查看明文 |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_CHAT_ID` | 空 | Telegram 私聊、群组、超级群组或频道 ID |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_TOPIC_ID` | 空 | 论坛模式超级群组的可选 `message_thread_id` |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY` | `warning` | Telegram 最低投递级别：`info`、`warning` 或 `critical` |
 | `CC_SWITCH_ROUTER_ALERT_BARK_ENABLED` | `false` | 启用独立的运维 Bark 告警渠道；要求 Server URL 与 Device Key |
 | `CC_SWITCH_ROUTER_ALERT_BARK_SERVER_URL` | `https://api.day.app` | 运维告警使用的 Bark Server；远端只允许 HTTPS |
-| `CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY` | 空 | 运维 Bark 设备的 Device Key；Settings API 不回传明文 |
+| `CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY` | 空 | 运维 Bark 设备的 Device Key；管理员可在 Settings 中查看明文 |
 | `CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY` | `warning` | Bark 最低投递级别：`info`、`warning` 或 `critical` |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔(秒) |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `86400` | 过期 lease 保留时长(秒) |
@@ -241,7 +241,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_TELEGRAM_GLOBAL_HOURLY_LIMIT` | `50` | Router 全局每小时 Telegram 通知硬上限 |
 | `CC_SWITCH_ROUTER_BARK_ENABLED` | `false` | 用户 Bark 通知总开关；首次启用时 Router 自动创建凭据主密钥 |
 | `CC_SWITCH_ROUTER_BARK_SERVER_URL` | `https://api.day.app` | 用户 Push URL 必须属于此 Bark Server；远端只允许 HTTPS |
-| `CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY` | 首次启用时自动生成 | 加密用户 Device Key 的独立 32 字节 hex/base64 密钥；由 Router 管理，修改后需重启且 API 永不回传 |
+| `CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY` | 首次启用时自动生成 | 加密用户 Device Key 的独立 32 字节 hex/base64 密钥；由 Router 管理，修改后需重启 |
 | `CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION` | `1` | Bark 密文密钥版本；修改后需重启并要求用户重新绑定 |
 | `CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT` | `10` | 单用户每小时 Bark 通知硬上限 |
 | `CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT` | `50` | Router 全局每小时 Bark 通知硬上限 |
