@@ -620,14 +620,14 @@ export function AccountNotificationsPanel() {
           <label className="grid gap-1 text-sm">
             <span className="text-muted-foreground">{t("account.notifications.barkPushUrl")}</span>
             <Input
-              type="password"
+              type="text"
               inputMode="url"
               autoComplete="off"
               autoCapitalize="none"
               autoCorrect="off"
               spellCheck={false}
               aria-label={t("account.notifications.barkPushUrl")}
-              placeholder="https://api.day.app/••••••••"
+              placeholder="https://api.day.app/YOUR_DEVICE_KEY"
               value={barkPushUrl}
               onChange={(event) => setBarkPushUrl(event.target.value)}
               disabled={!barkAvailable || busy}

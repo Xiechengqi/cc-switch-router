@@ -697,7 +697,7 @@ export function AccountPaymentsPanel() {
             <label className="grid gap-1.5 text-sm">
               <span className="text-muted-foreground">{t("account.binanceAuto.apiKey")}</span>
               <input
-                type="password"
+                type="text"
                 value={binanceApiKey}
                 onChange={(event) => setBinanceApiKey(event.target.value)}
                 autoComplete="off"
@@ -708,10 +708,10 @@ export function AccountPaymentsPanel() {
             <label className="grid gap-1.5 text-sm">
               <span className="text-muted-foreground">{t("account.binanceAuto.apiSecret")}</span>
               <input
-                type="password"
+                type="text"
                 value={binanceApiSecret}
                 onChange={(event) => setBinanceApiSecret(event.target.value)}
-                autoComplete="new-password"
+                autoComplete="off"
                 spellCheck={false}
                 className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
               />
