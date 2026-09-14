@@ -5630,7 +5630,7 @@ impl AppStore {
                 AppError::Internal(format!("prepare notification deliveries failed: {error}"))
             })?;
         let rows = statement
-            .query_map(params![limit.clamp(1, 100) as i64], |row| {
+            .query_map(params![limit.clamp(1, 10_000) as i64], |row| {
                 let recipient = row.get::<_, String>(4)?;
                 let channel = row.get::<_, String>(5)?;
                 let channel_target = row.get::<_, Option<String>>(6)?;

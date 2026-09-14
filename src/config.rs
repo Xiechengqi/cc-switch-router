@@ -485,7 +485,7 @@ impl Default for AlertingSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            repeat_interval_secs: 30 * 60,
+            repeat_interval_secs: 6 * 60 * 60,
             history_retention_days: 90,
             telegram_enabled: false,
             telegram_bot_token: None,
@@ -1074,7 +1074,7 @@ impl Config {
                     enabled: env_bool("CC_SWITCH_ROUTER_ALERTING_ENABLED", true),
                     repeat_interval_secs: env_i64(
                         "CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS",
-                        30 * 60,
+                        6 * 60 * 60,
                     ),
                     history_retention_days: env_var(
                         "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS",
@@ -1532,7 +1532,7 @@ CC_SWITCH_ROUTER_CLOCK_PROBE_INTERVAL_SECS=60
 CC_SWITCH_ROUTER_CLOCK_PROBE_TIMEOUT_SECS=4
 CC_SWITCH_ROUTER_CLOCK_SOURCES=https://www.cloudflare.com/cdn-cgi/trace,https://www.apple.com/library/test/success.html,https://checkip.amazonaws.com/
 CC_SWITCH_ROUTER_ALERTING_ENABLED=true
-CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS=1800
+CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS=21600
 CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS=90
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED=false
 CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN=

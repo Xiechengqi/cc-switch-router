@@ -6022,7 +6022,10 @@ async fn admin_client_notification_deliveries(
     headers: HeaderMap,
 ) -> Result<Json<ClientNotificationDeliveriesResponse>, AppError> {
     require_admin_session(&state, &headers).await?;
-    let deliveries = state.store.list_client_notification_deliveries(100).await?;
+    let deliveries = state
+        .store
+        .list_client_notification_deliveries(10_000)
+        .await?;
     Ok(Json(ClientNotificationDeliveriesResponse { deliveries }))
 }
 
@@ -7071,7 +7074,7 @@ async fn admin_alerting_overview(
     Ok(Json(
         state
             .alerting
-            .overview(query.limit.unwrap_or(100).clamp(1, 500))
+            .overview(query.limit.unwrap_or(100).clamp(1, 10_000))
             .await?,
     ))
 }

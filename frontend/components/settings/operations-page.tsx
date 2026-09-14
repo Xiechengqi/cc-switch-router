@@ -23,6 +23,11 @@ export function OperationsPage() {
   const { t } = useLocaleText();
   const [active, setActive] = React.useState<OperationsSection>("service");
 
+  React.useEffect(() => {
+    const requested = new URLSearchParams(window.location.search).get("section");
+    if (ITEMS.some((item) => item.id === requested)) setActive(requested as OperationsSection);
+  }, []);
+
   if (loading) {
     return <main className="settings-surface mx-auto w-[calc(100%-2rem)] max-w-7xl py-12 text-muted-foreground">{t("common.loadingSession")}</main>;
   }

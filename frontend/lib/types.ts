@@ -1421,6 +1421,11 @@ export type AlertDelivery = {
   incidentId: string;
   transitionId: string;
   channel: string;
+  title: string;
+  eventKind: string;
+  transition: string;
+  severity: string;
+  bodyPreview: string;
   status: string;
   attempts: number;
   providerMessageId?: string | null;

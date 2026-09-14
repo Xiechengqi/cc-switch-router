@@ -1,16 +1,22 @@
 "use client";
 
-import { Alert, Button, Card, Chip } from "@heroui/react";
+import { Alert, Button, Card, Chip, Input } from "@heroui/react";
 import { Loader2, RefreshCw, RotateCcw } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getClientChatDeliveries, getClientNotificationDeliveries, requeueClientChatDelivery } from "@/lib/api";
+import { getAlertingOverview, getClientChatDeliveries, getClientNotificationDeliveries, requeueClientChatDelivery } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
-import type { ClientChatDelivery, ClientNotificationDelivery } from "@/lib/types";
+import type { AlertingOverview, ClientChatDelivery, ClientNotificationDelivery } from "@/lib/types";
 
 export function ClientNotificationDeliveriesPanel() {
   const { locale, t } = useLocaleText();
   const [deliveries, setDeliveries] = React.useState<ClientNotificationDelivery[]>([]);
+  const [alerts, setAlerts] = React.useState<AlertingOverview | null>(null);
+  const [source, setSource] = React.useState("all");
+  const [channel, setChannel] = React.useState("all");
+  const [status, setStatus] = React.useState("all");
+  const [query, setQuery] = React.useState("");
+  const [page, setPage] = React.useState(0);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
 
@@ -18,8 +24,16 @@ export function ClientNotificationDeliveriesPanel() {
     setLoading(true);
     setError("");
     try {
-      const response = await getClientNotificationDeliveries();
-      setDeliveries(response.deliveries || []);
+      const [response, alerting] = await Promise.allSettled([
+        getClientNotificationDeliveries(),
+        getAlertingOverview(10_000),
+      ]);
+      setDeliveries(response.status === "fulfilled" ? response.value.deliveries || [] : []);
+      setAlerts(alerting.status === "fulfilled" ? alerting.value : null);
+      const failures = [response, alerting]
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason));
+      setError(failures.join(" · "));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -30,6 +44,44 @@ export function ClientNotificationDeliveriesPanel() {
   React.useEffect(() => {
     load().catch(console.error);
   }, [load]);
+
+  React.useEffect(() => setPage(0), [source, channel, status, query]);
+
+  const records = [
+    ...deliveries.map((delivery) => ({
+      id: `user:${delivery.id}`, source: "user", channel: delivery.channel,
+      status: delivery.status, attempts: delivery.attempts,
+      createdAt: delivery.createdAt, resultAt: deliveryResultTime(delivery),
+      event: deliveryLabel(delivery.deliveryKind, delivery.eventKind, delivery.status, t),
+      detail: delivery.eventKind, target: delivery.targetMasked,
+      body: "", providerMessageId: "",
+      error: delivery.errorMessage || delivery.failureKind || delivery.blockedReasonCode || "",
+    })),
+    ...(alerts?.deliveries || []).map((delivery) => {
+      return {
+        id: `operator:${delivery.id}`, source: "operator", channel: delivery.channel,
+        status: delivery.status, attempts: delivery.attempts,
+        createdAt: new Date(delivery.createdAt * 1000).toISOString(),
+        resultAt: delivery.sentAt ? new Date(delivery.sentAt * 1000).toISOString() : null,
+        event: delivery.title || t("notifications.operatorAlerts"), detail: `${delivery.eventKind} · ${delivery.transition} · ${delivery.severity}`,
+        target: t("notifications.operatorTarget"), body: delivery.bodyPreview,
+        providerMessageId: delivery.providerMessageId || "", error: delivery.lastError || "",
+      };
+    }),
+  ].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = records.filter((record) =>
+    (source === "all" || record.source === source)
+    && (channel === "all" || record.channel === channel)
+    && (status === "all" || (status === "failed"
+      ? ["retry", "dead_letter", "blocked_config"].includes(record.status)
+      : status === "suppressed" ? record.status.startsWith("suppressed") || record.status.startsWith("cancelled") || record.status === "superseded" : record.status === status))
+    && (!normalizedQuery || `${record.event} ${record.detail} ${record.target} ${record.error}`.toLowerCase().includes(normalizedQuery))
+  );
+  const pageSize = 50;
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const visible = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
 
   return (
     <div className="grid gap-6">
@@ -46,6 +98,19 @@ export function ClientNotificationDeliveriesPanel() {
       </Card.Header>
       <Card.Content className="grid gap-4">
         {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
+        <div className="grid gap-2 md:grid-cols-[minmax(220px,1fr)_160px_140px_140px]">
+          <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("notifications.search")} aria-label={t("notifications.search")} />
+          <HistorySelect value={source} onChange={setSource} label={t("notifications.event")} options={[['all',t('notifications.allSources')],['operator',t('notifications.operatorAlerts')],['user',t('notifications.userNotifications')]]} />
+          <HistorySelect value={channel} onChange={setChannel} label={t("notifications.channel")} options={[['all',t('notifications.allChannels')],['bark','Bark'],['telegram','Telegram'],['email','Email']]} />
+          <HistorySelect value={status} onChange={setStatus} label={t("notifications.status")} options={[['all',t('notifications.allStatuses')],['sent',t('notifications.status.sent')],['failed',t('notifications.failedRetrying')],['suppressed',t('notifications.suppressed')]]} />
+        </div>
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <span>{t("notifications.pageSummary", { count: filtered.length, page: safePage + 1, pages: pageCount })}</span>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setPage(Math.max(0, safePage - 1))} isDisabled={safePage === 0}>‹</Button>
+            <Button size="sm" variant="outline" onClick={() => setPage(Math.min(pageCount - 1, safePage + 1))} isDisabled={safePage + 1 >= pageCount}>›</Button>
+          </div>
+        </div>
         <div className="overflow-x-auto rounded-lg border">
           <table className="w-full min-w-[960px] text-left text-sm">
             <thead className="bg-muted/50 text-xs text-muted-foreground">
@@ -60,36 +125,30 @@ export function ClientNotificationDeliveriesPanel() {
               </tr>
             </thead>
             <tbody className="divide-y">
-              {deliveries.map((delivery) => (
+              {visible.map((delivery) => (
                 <tr key={delivery.id} className="align-top">
                   <td className="px-4 py-3 font-medium">
                     <div className="flex items-center gap-1">
-                      <span>{deliveryLabel(delivery.deliveryKind, delivery.eventKind, delivery.status, t)}</span>
-                      {delivery.eventCount > 1 ? <span className="text-muted-foreground">x{delivery.eventCount}</span> : null}
+                      <span>{delivery.event}</span>
                     </div>
-                    {delivery.deliveryKind === "incident" ? (
-                      <div className="mt-1 text-xs font-normal text-muted-foreground">{eventLabel(delivery.eventKind, t)}</div>
-                    ) : null}
+                    <div className="mt-1 text-xs font-normal text-muted-foreground">{delivery.source === "operator" ? t("notifications.operatorAlerts") : t("notifications.userNotifications")}{delivery.detail ? ` · ${delivery.detail}` : ""}</div>
+                    {delivery.body ? <details className="mt-2 max-w-[420px] text-xs font-normal text-muted-foreground"><summary className="cursor-pointer">{t("notifications.messagePreview")}</summary><pre className="mt-1 whitespace-pre-wrap font-sans">{delivery.body}</pre></details> : null}
                   </td>
                   <td className="px-4 py-3"><Chip size="sm" variant="soft">{channelLabel(delivery.channel, t)}</Chip></td>
-                  <td className="px-4 py-3 font-mono text-xs">{delivery.targetMasked}</td>
+                  <td className="px-4 py-3 font-mono text-xs">{delivery.target}</td>
                   <td className="px-4 py-3"><DeliveryStatus status={delivery.status} /></td>
                   <td className="px-4 py-3 tabular-nums">{delivery.attempts}</td>
                   <td className="px-4 py-3 whitespace-nowrap">{formatTime(delivery.createdAt, locale)}</td>
                   <td className="max-w-[300px] px-4 py-3">
-                    <div className="whitespace-nowrap">{formatTime(deliveryResultTime(delivery), locale)}</div>
-                    {delivery.failureKind || delivery.blockedReasonCode ? (
-                      <div className="mt-1 break-words font-mono text-[10px] text-muted-foreground">
-                        {[delivery.failureKind, delivery.blockedReasonCode].filter(Boolean).join(" / ")}
-                      </div>
-                    ) : null}
-                    {delivery.errorMessage ? <div className="mt-1 break-words text-xs text-danger" title={delivery.errorMessage}>{delivery.errorMessage}</div> : null}
+                    <div className="whitespace-nowrap">{formatTime(delivery.resultAt, locale)}</div>
+                    {delivery.error ? <div className="mt-1 break-words text-xs text-danger" title={delivery.error}>{delivery.error}</div> : null}
+                    {delivery.providerMessageId ? <div className="mt-1 break-all font-mono text-[10px] text-muted-foreground">{delivery.providerMessageId}</div> : null}
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {!loading && deliveries.length === 0 ? (
+          {!loading && visible.length === 0 ? (
             <div className="px-4 py-12 text-center text-sm text-muted-foreground">{t("notifications.empty")}</div>
           ) : null}
           {loading && deliveries.length === 0 ? (
@@ -104,6 +163,12 @@ export function ClientNotificationDeliveriesPanel() {
     <ClientChatDeliveriesCard />
     </div>
   );
+}
+
+function HistorySelect({ value, onChange, label, options }: { value: string; onChange: (value: string) => void; label: string; options: [string, string][] }) {
+  return <select className="min-h-10 rounded-md border bg-background px-3 text-sm" value={value} onChange={(event) => onChange(event.target.value)} aria-label={label}>
+    {options.map(([optionValue, optionLabel]) => <option key={optionValue} value={optionValue}>{optionLabel}</option>)}
+  </select>;
 }
 
 function ClientChatDeliveriesCard() {

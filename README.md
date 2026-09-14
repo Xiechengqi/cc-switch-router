@@ -177,7 +177,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_CLOCK_PROBE_TIMEOUT_SECS` | `4` | 每个 HTTPS 时间源的完整请求超时,范围 1-15 秒 |
 | `CC_SWITCH_ROUTER_CLOCK_SOURCES` | Cloudflare、Apple、AWS 三路 HTTPS URL | 逗号分隔的 3-5 个不同 HTTPS host；至少两路相符才形成可信偏差样本 |
 | `CC_SWITCH_ROUTER_ALERTING_ENABLED` | `true` | 是否为新事故流转创建 IM 投递；事故本身始终持久化，可在 Settings 热更新 |
-| `CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS` | `1800` | 未确认活跃事故的提醒间隔，范围 60 秒至 7 天 |
+| `CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS` | `21600` | 未确认 critical 事故的首次提醒间隔；后续指数退避至最长 24 小时，范围 60 秒至 7 天。warning 只记录首次与恢复，不周期提醒 |
 | `CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS` | `90` | 已恢复事故、流转、投递尝试、渠道测试和已完成 Client 信号的保留天数 |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_ENABLED` | `false` | 启用 Telegram Bot 告警；同时要求 Bot Token 和 Chat ID |
 | `CC_SWITCH_ROUTER_ALERT_TELEGRAM_BOT_TOKEN` | 空 | `@BotFather` 签发的 Token；Settings API 不回传明文 |

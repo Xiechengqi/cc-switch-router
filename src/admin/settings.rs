@@ -1694,9 +1694,9 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         field_type: FieldType::Int,
         required: false,
         restart_required: false,
-        default: Some("1800"),
-        description: "Minimum seconds between reminders for an unacknowledged incident that remains active.",
-        placeholder: Some("1800"),
+        default: Some("21600"),
+        description: "Initial reminder interval for an unacknowledged critical incident; later reminders use exponential backoff.",
+        placeholder: Some("21600"),
         dynamic_group: Some(DynamicGroup::Alerting),
     },
     SettingsField {
@@ -4380,7 +4380,7 @@ pub fn apply_updates_to_dynamic(
             "CC_SWITCH_ROUTER_ALERT_REPEAT_INTERVAL_SECS" => {
                 current.alerting.repeat_interval_secs = value
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(30 * 60);
+                    .unwrap_or(6 * 60 * 60);
             }
             "CC_SWITCH_ROUTER_ALERT_HISTORY_RETENTION_DAYS" => {
                 current.alerting.history_retention_days =

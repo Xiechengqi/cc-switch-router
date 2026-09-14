@@ -14,6 +14,14 @@ use super::models::{
     AlertOverviewCounts, AlertTransition, OperatorAlertSignal, severity_rank,
 };
 
+/// A condition must stay absent for this long before an incident is resolved.
+/// Metrics are intentionally sampled much more frequently; the grace period
+/// absorbs threshold jitter without hiding a sustained recovery.
+const CONDITION_RECOVERY_GRACE_SECS: i64 = 60;
+const CONDITION_FIRING_GRACE_SECS: i64 = 30;
+const CONDITION_CANDIDATE_MAX_GAP_SECS: i64 = 120;
+const MAX_REMINDER_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
 #[derive(Debug, Clone, Default)]
 pub struct AlertChannelActivity {
     pub last_attempt_at: Option<i64>,
@@ -167,9 +175,21 @@ impl AlertStore {
                 }
             }
 
+            tx.execute(
+                "DELETE FROM alert_condition_candidates
+                 WHERE scope = ?1 AND last_seen_at < ?2",
+                params![scope, now],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prune stale alert candidates failed: {error}"))
+            })?;
+
             let unresolved = load_active_incidents_for_scope_tx(&tx, &scope)?;
             for incident in unresolved {
                 if observed.contains(&incident.fingerprint) {
+                    continue;
+                }
+                if now.saturating_sub(incident.last_seen_at) < CONDITION_RECOVERY_GRACE_SECS {
                     continue;
                 }
                 if let Some(transition) = resolve_incident_tx(
@@ -327,7 +347,7 @@ impl AlertStore {
         let store = self.clone();
         spawn_blocking(move || {
             let conn = store.open()?;
-            load_incidents(&conn, limit.clamp(1, 500), active_only)
+            load_incidents(&conn, limit.clamp(1, 10_000), active_only)
         })
         .await
         .map_err(|error| AppError::Internal(format!("list alert incidents task failed: {error}")))?
@@ -337,7 +357,7 @@ impl AlertStore {
         let store = self.clone();
         spawn_blocking(move || {
             let conn = store.open()?;
-            load_deliveries(&conn, limit.clamp(1, 500))
+            load_deliveries(&conn, limit.clamp(1, 10_000))
         })
         .await
         .map_err(|error| {
@@ -1104,6 +1124,15 @@ fn init_alert_db(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_alert_incidents_status_seen
             ON alert_incidents(status, last_seen_at DESC);
 
+        CREATE TABLE IF NOT EXISTS alert_condition_candidates (
+            fingerprint TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alert_condition_candidates_scope_seen
+            ON alert_condition_candidates(scope, last_seen_at);
+
         CREATE TABLE IF NOT EXISTS alert_transitions (
             id TEXT PRIMARY KEY,
             incident_id TEXT NOT NULL,
@@ -1265,6 +1294,46 @@ fn observe_condition_tx(
 ) -> Result<Option<AlertTransition>, AppError> {
     let Some(mut incident) = load_active_incident_by_fingerprint_tx(tx, &condition.fingerprint)?
     else {
+        if condition.severity != "critical" {
+            tx.execute(
+                "INSERT INTO alert_condition_candidates (
+                    fingerprint, scope, first_seen_at, last_seen_at
+                 ) VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(fingerprint) DO UPDATE SET
+                    first_seen_at = CASE
+                        WHEN excluded.last_seen_at - alert_condition_candidates.last_seen_at > ?4
+                        THEN excluded.last_seen_at
+                        ELSE alert_condition_candidates.first_seen_at
+                    END,
+                    last_seen_at = excluded.last_seen_at",
+                params![
+                    condition.fingerprint,
+                    condition.scope,
+                    now,
+                    CONDITION_CANDIDATE_MAX_GAP_SECS
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("observe alert candidate failed: {error}"))
+            })?;
+            let first_seen_at = tx
+                .query_row(
+                    "SELECT first_seen_at FROM alert_condition_candidates WHERE fingerprint = ?1",
+                    params![condition.fingerprint],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("read alert candidate failed: {error}"))
+                })?;
+            if now.saturating_sub(first_seen_at) < CONDITION_FIRING_GRACE_SECS {
+                return Ok(None);
+            }
+        }
+        tx.execute(
+            "DELETE FROM alert_condition_candidates WHERE fingerprint = ?1",
+            params![condition.fingerprint],
+        )
+        .map_err(|error| AppError::Internal(format!("promote alert candidate failed: {error}")))?;
         return create_incident_tx(tx, condition, None, now, policy).map(Some);
     };
 
@@ -1318,8 +1387,9 @@ fn observe_condition_tx(
     } else if silence_expired {
         Some("unsilenced")
     } else if next_status == "firing"
+        && incident.severity == "critical"
         && now.saturating_sub(latest_notification_transition_at_tx(tx, &incident.id)?)
-            >= repeat_interval_secs.max(60)
+            >= reminder_interval_secs_tx(tx, &incident.id, repeat_interval_secs)?
     {
         Some("reminder")
     } else {
@@ -1347,6 +1417,26 @@ fn observe_condition_tx(
         policy,
     )
     .map(Some)
+}
+
+fn reminder_interval_secs_tx(
+    tx: &Transaction<'_>,
+    incident_id: &str,
+    base_interval_secs: i64,
+) -> Result<i64, AppError> {
+    let reminders = tx
+        .query_row(
+            "SELECT COUNT(*) FROM alert_transitions
+             WHERE incident_id = ?1 AND transition = 'reminder'",
+            params![incident_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| AppError::Internal(format!("count alert reminders failed: {error}")))?;
+    let multiplier = 1_i64 << reminders.clamp(0, 10);
+    Ok(base_interval_secs
+        .max(60)
+        .saturating_mul(multiplier)
+        .min(MAX_REMINDER_INTERVAL_SECS))
 }
 
 fn observe_signal_tx(
@@ -1797,11 +1887,16 @@ fn load_incidents(
 fn load_deliveries(conn: &Connection, limit: usize) -> Result<Vec<AlertDelivery>, AppError> {
     let mut statement = conn
         .prepare(
-            "SELECT id, incident_id, transition_id, channel, status, attempts,
-                    provider_message_id, next_attempt_at, last_error,
-                    created_at, updated_at, sent_at
-             FROM alert_deliveries
-             ORDER BY updated_at DESC, created_at DESC LIMIT ?1",
+            "SELECT d.id, d.incident_id, d.transition_id, d.channel,
+                    i.title, i.kind, t.transition, t.severity,
+                    substr(d.payload_text, 1, 500),
+                    d.status, d.attempts, d.provider_message_id,
+                    d.next_attempt_at, d.last_error,
+                    d.created_at, d.updated_at, d.sent_at
+             FROM alert_deliveries d
+             INNER JOIN alert_incidents i ON i.id = d.incident_id
+             INNER JOIN alert_transitions t ON t.id = d.transition_id
+             ORDER BY d.updated_at DESC, d.created_at DESC LIMIT ?1",
         )
         .map_err(|error| AppError::Internal(format!("prepare alert deliveries failed: {error}")))?;
     let rows = statement
@@ -1811,14 +1906,19 @@ fn load_deliveries(conn: &Connection, limit: usize) -> Result<Vec<AlertDelivery>
                 incident_id: row.get(1)?,
                 transition_id: row.get(2)?,
                 channel: row.get(3)?,
-                status: row.get(4)?,
-                attempts: row.get::<_, i64>(5)?.max(0) as u32,
-                provider_message_id: row.get(6)?,
-                next_attempt_at: row.get(7)?,
-                last_error: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                sent_at: row.get(11)?,
+                title: row.get(4)?,
+                event_kind: row.get(5)?,
+                transition: row.get(6)?,
+                severity: row.get(7)?,
+                body_preview: row.get(8)?,
+                status: row.get(9)?,
+                attempts: row.get::<_, i64>(10)?.max(0) as u32,
+                provider_message_id: row.get(11)?,
+                next_attempt_at: row.get(12)?,
+                last_error: row.get(13)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
+                sent_at: row.get(16)?,
             })
         })
         .map_err(|error| AppError::Internal(format!("query alert deliveries failed: {error}")))?;
@@ -1944,11 +2044,67 @@ mod tests {
             kind: "fd_pressure".into(),
             entity_kind: "router".into(),
             entity_id: Some("router".into()),
-            severity: "warning".into(),
+            severity: "critical".into(),
             title: "FD pressure".into(),
             message: "FD usage is elevated".into(),
             details: serde_json::json!({ "percent": 75 }),
         }
+    }
+
+    #[tokio::test]
+    async fn warning_condition_requires_a_stable_firing_window() {
+        let store = test_store("warning-firing-grace");
+        let mut warning = condition();
+        warning.severity = "warning".into();
+        store
+            .reconcile_conditions(
+                "metrics".into(),
+                vec![warning.clone()],
+                100,
+                300,
+                no_delivery(),
+            )
+            .await
+            .unwrap();
+        assert!(store.list_incidents(10, true).await.unwrap().is_empty());
+        store
+            .reconcile_conditions("metrics".into(), vec![warning], 130, 300, no_delivery())
+            .await
+            .unwrap();
+        assert_eq!(store.list_incidents(10, true).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn warning_candidate_does_not_age_through_a_monitoring_gap() {
+        let store = test_store("warning-candidate-gap");
+        let mut warning = condition();
+        warning.severity = "warning".into();
+        store
+            .reconcile_conditions(
+                "metrics".into(),
+                vec![warning.clone()],
+                100,
+                300,
+                no_delivery(),
+            )
+            .await
+            .unwrap();
+        store
+            .reconcile_conditions(
+                "metrics".into(),
+                vec![warning.clone()],
+                500,
+                300,
+                no_delivery(),
+            )
+            .await
+            .unwrap();
+        assert!(store.list_incidents(10, true).await.unwrap().is_empty());
+        store
+            .reconcile_conditions("metrics".into(), vec![warning], 530, 300, no_delivery())
+            .await
+            .unwrap();
+        assert_eq!(store.list_incidents(10, true).await.unwrap().len(), 1);
     }
 
     fn no_delivery() -> AlertDeliveryPolicy {
@@ -1969,6 +2125,11 @@ mod tests {
         store
             .reconcile_conditions("metrics".into(), Vec::new(), 110, 300, no_delivery())
             .await
+            .expect("retain incident during recovery grace");
+        assert_eq!(store.list_incidents(10, true).await.unwrap().len(), 1);
+        store
+            .reconcile_conditions("metrics".into(), Vec::new(), 160, 300, no_delivery())
+            .await
             .expect("resolve incident");
         let incidents = store
             .list_incidents(10, false)
@@ -1976,7 +2137,56 @@ mod tests {
             .expect("list incidents");
         assert_eq!(incidents.len(), 1);
         assert_eq!(incidents[0].status, "resolved");
-        assert_eq!(incidents[0].resolved_at, Some(110));
+        assert_eq!(incidents[0].resolved_at, Some(160));
+    }
+
+    #[tokio::test]
+    async fn critical_reminders_back_off_and_warning_reminders_stay_quiet() {
+        let store = test_store("reminder-backoff");
+        store
+            .reconcile_conditions("metrics".into(), vec![condition()], 100, 300, no_delivery())
+            .await
+            .unwrap();
+        for now in [400, 699, 1_000] {
+            store
+                .reconcile_conditions("metrics".into(), vec![condition()], now, 300, no_delivery())
+                .await
+                .unwrap();
+        }
+        let conn = store.open().unwrap();
+        let reminders = conn
+            .query_row(
+                "SELECT COUNT(*) FROM alert_transitions WHERE transition = 'reminder'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(reminders, 2);
+
+        let warning_store = test_store("warning-no-reminders");
+        let mut warning = condition();
+        warning.severity = "warning".into();
+        for now in [2_000, 2_030, 10_000] {
+            warning_store
+                .reconcile_conditions(
+                    "metrics".into(),
+                    vec![warning.clone()],
+                    now,
+                    300,
+                    no_delivery(),
+                )
+                .await
+                .unwrap();
+        }
+        let warning_conn = warning_store.open().unwrap();
+        let warning_reminders = warning_conn
+            .query_row(
+                "SELECT COUNT(*) FROM alert_transitions WHERE transition = 'reminder'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(warning_reminders, 0);
     }
 
     #[tokio::test]
@@ -2213,7 +2423,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .reconcile_conditions("metrics".into(), Vec::new(), 120, 300, policy)
+            .reconcile_conditions("metrics".into(), Vec::new(), 170, 300, policy)
             .await
             .unwrap();
 
@@ -2223,9 +2433,9 @@ mod tests {
             .iter()
             .find(|delivery| delivery.status == "superseded")
             .expect("stale firing delivery must be superseded");
-        assert!(store.retry_delivery(stale.id.clone(), 121).await.is_err());
+        assert!(store.retry_delivery(stale.id.clone(), 171).await.is_err());
         let recovery = store
-            .claim_delivery("worker".into(), 120, 30)
+            .claim_delivery("worker".into(), 170, 30)
             .await
             .unwrap()
             .expect("recovery delivery must retain the previously targeted channel");

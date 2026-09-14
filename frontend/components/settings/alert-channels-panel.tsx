@@ -85,6 +85,9 @@ export function AlertChannelsPanel({
           {busy === "load" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
           {t("common.reload")}
         </Button>
+        <Link href="/operations/?section=deliveries" className="text-sm font-medium underline underline-offset-4">
+          {t("notifications.title")}
+        </Link>
       </div>
 
       {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}

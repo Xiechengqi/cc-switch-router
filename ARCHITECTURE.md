@@ -366,7 +366,7 @@ Bark 绑定链路：`POST /v1/me/notifications/bark` 只接受管理员指定 Se
 
 `src/alerting/` 使用 metrics SQLite 保存 `alert_incidents`、`alert_transitions`、`alert_deliveries`、`alert_delivery_attempts`、`alert_channel_checks` 和 `alert_source_events`。Fingerprint 保证同一条件同时只有一个活跃事故；Metrics 条件按完整观测集 reconcile，Client presence 则通过业务库 `operator_alert_signal_outbox` 跨库传递，source event ID 同时在两侧去重。
 
-事故状态为 `firing`、`acknowledged`、`silenced`、`resolved`。确认与静默不伪造恢复；严重级别升级会重新唤醒已确认事故，静默到期仍异常时自动回到 firing，真实恢复始终产生 recovery transition。每次可通知 transition 在同一 metrics SQLite 事务内冻结渠道 payload 并创建 delivery；同一事故尚未发送的旧 delivery 会先进入不可重试的 `superseded`，且曾接收高等级 firing 的当前启用渠道不会因事故降级而漏掉 recovery。worker 使用 60 秒 claim lease、带稳定 jitter 的指数退避和 12 次自动尝试；attempt number 防止过期 worker 覆盖已被重新认领的投递。
+事故状态为 `firing`、`acknowledged`、`silenced`、`resolved`。warning/info 条件先在 `alert_condition_candidates` 持续观测 30 秒才升级为事故，已有条件需连续消失 60 秒才恢复，以吸收指标阈值抖动；critical 仍立即触发。确认与静默不伪造恢复；严重级别升级会重新唤醒已确认事故，静默到期仍异常时自动回到 firing，真实恢复始终产生 recovery transition。warning 不产生周期提醒；未确认 critical 的提醒以配置间隔为起点指数退避，最长 24 小时。每次可通知 transition 在同一 metrics SQLite 事务内冻结渠道 payload 并创建 delivery；同一事故尚未发送的旧 delivery 会先进入不可重试的 `superseded`，且曾接收高等级 firing 的当前启用渠道不会因事故降级而漏掉 recovery。worker 使用 60 秒 claim lease、带稳定 jitter 的指数退避和 12 次自动尝试；attempt number 防止过期 worker 覆盖已被重新认领的投递。
 
 渠道适配器通过稳定的字符串 ID 注册，投递 policy、outbox、渠道状态和管理 API 均不依赖具体供应商。当前注册 Telegram adapter（Bot `sendMessage`）与独立的运维 Bark adapter（`POST /push`）；未来渠道可在不改动事故状态机和存储模型的前提下加入。所有渠道错误在持久化和 API 返回前截断并清除换行或 Token/Device Key，Secret Settings 只返回 `hasValue`。
 
@@ -380,7 +380,7 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 - i18n 覆盖 `en` / `zh-CN`
 - **Settings 控制面**(`/settings/`):受管环境变量按 7 个稳定配置域组织。后端 schema 是字段类型、约束、依赖、风险和重启边界的唯一来源，前端 i18n catalog 只覆盖文案。`GET /v1/admin/settings` 在一个快照中返回 schema、持久化值、进程有效值、来源和 SHA-256 revision；validate/PATCH 都要求 `expectedRevision`。进程启动前已有的环境变量被标记为只读 override，Secret 只暴露 `hasValue`。静态字段以启动快照计算 durable pending-restart，动态字段保存后直接更新 `DynamicSettings`；快照从当前 `DynamicSettings` 反向生成热更新字段的运行值，因此手工修改 `.env` 也不会被误报为已经生效。Client 分发设置额外通过 `POST /v1/admin/client-server-release/validate` 检查 GitHub Release 的 tag、目标 Commit 和 AMD64/ARM64 binary/checksum；相同 selector single-flight，并使用短期正/负缓存，404 与限流/超时不会混淆
 - **持久化边界**:`PATCH /v1/admin/settings` 先在锁外完成 schema 与必要的外部 Release 验证，再获取 `DynamicSettings` 写锁并重新确认 revision，随后完成 `.env.new` 写入与 fsync、旧文件备份、原子 rename、目录 fsync，再发布动态快照。通知 lifecycle 同步失败会回写旧 `.env`。地图和公告使用独立 revision，前端在 409 时加载最新版本并保留用户草稿供复核
-- **Operations 控制面**(`/operations/`):版本/服务操作、Router 日志、通知投递历史和 admin audit 从 Settings 中独立出来，避免配置编辑与即时运维动作混在同一导航和保存状态机中
+- **Operations 控制面**(`/operations/`):版本/服务操作、Router 日志、统一通知中心和 admin audit 从 Settings 中独立出来。通知中心按时间合并 metrics SQLite 的运维告警投递与业务 SQLite 的用户通知投递，支持来源、渠道、状态和文本筛选，并保持目标脱敏
 - **模型中枢**(`/clients/?tab=mine`):作为 Clients「我的」分页内的可选能力展示区域统一入口、用户 API Key 和 revision 化模型映射；同页 Share 卡片继续显示直连 URL，并只在该上下文附加映射摘要和快捷新增入口。它不是独立一级导航，不改变首页地图或 Share 侧边栏的信息层级
 - **配置契约审计**:`cargo test admin::settings` 覆盖后端 schema、来源、关系和文件权限；`npm run audit:settings-i18n` 保证所有字段与分组都有中英文文案；`npm run audit:settings-contract` 保证 Rust schema、默认 `.env` 和前端字段 catalog 精确一致，且旧 Settings API 不会回流
 - **账户 → 通知设置**(`/account/notifications`)：邮件、Telegram、Bark 三选一，邮件始终可选；第三方渠道未绑定或 Provider 未就绪时不可选，已选渠道临时不可用时明确显示 Email 回落。Telegram 绑定按钮在 `await` 前先 `window.open("about:blank")` 保留用户手势，失败则回落为可复制深链与 `/start <token>`；页面以 3 秒间隔轮询 `GET /v1/me/notifications`，并以 `verifiedAt` 变化识别重新绑定，5 分钟后停止。Bark 表单使用密码输入接收完整 Push URL，验证成功后只显示 Server 与设备掩码，解绑与重新绑定均受后端 revision fence 保护
