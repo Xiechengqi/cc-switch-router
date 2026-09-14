@@ -13,7 +13,7 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -36,7 +36,14 @@ use self::store::{
 };
 
 const MAX_POLL_ACCOUNTS_PER_CYCLE: usize = 8;
-const MAX_TRANSACTION_PAGES: usize = 10;
+const MAX_TRANSACTION_QUERIES_PER_POLL: usize = 32;
+// GET /sapi/v1/pay/transactions costs 3000 UID weight against a documented
+// 180000/minute UID budget. Spacing query starts also leaves headroom for
+// credential verification and other operators using the same Binance UID.
+const MIN_TRANSACTION_QUERY_SPACING: StdDuration = StdDuration::from_millis(1_250);
+const TRANSACTION_PAGE_LIMIT: usize = 100;
+const POLL_OVERLAP_MS: i64 = 10 * 60 * 1_000;
+const MAX_POLL_SCAN_WINDOW_MS: i64 = 60 * 60 * 1_000;
 const PERMISSION_REVERIFY_HOURS: i64 = 24;
 const VERIFICATION_ATTEMPT_COOLDOWN_SECS: u64 = 30;
 const MAX_VERIFICATION_ATTEMPT_SCOPES: usize = 10_000;
@@ -51,6 +58,13 @@ const OFFICIAL_BINANCE_API_HOSTS: &[&str] = &[
     "api3.binance.com",
     "api4.binance.com",
 ];
+
+#[derive(Debug, Clone)]
+struct PollScanCheckpoint {
+    completed_cursor_at: Option<String>,
+    scan_cursor_at: Option<String>,
+    scan_target_at: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalMode {
@@ -616,7 +630,10 @@ async fn resolve_admin_reconciliation(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
+pub async fn run_service(
+    state: ServerState,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     if state.binance_settlement.mode() == GlobalMode::Disabled {
         state
             .store
@@ -624,46 +641,82 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
             .await?;
         return Ok(());
     }
+    if *shutdown.borrow() {
+        state
+            .store
+            .binance_release_poll_leases(&state.binance_settlement.worker_id)
+            .await?;
+        return Ok(());
+    }
     let mut interval = tokio::time::interval(StdDuration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        if let Err(error) = state.store.binance_expire_due_intents().await {
-            tracing::warn!(error = %error, "expire Binance payment intents failed");
-        }
-        let mut claimed = Vec::new();
-        for _ in 0..MAX_POLL_ACCOUNTS_PER_CYCLE {
-            match state
-                .store
-                .binance_claim_poll_account(
-                    state.binance_settlement.payment_home_region(),
-                    &state.binance_settlement.worker_id,
-                )
-                .await
-            {
-                Ok(Some(account)) => claimed.push(account),
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(error = %error, "claim Binance poll account failed");
-                    break;
+    let mut last_health_reconciliation = Instant::now()
+        .checked_sub(StdDuration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    'service: loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break 'service;
+                }
+            }
+            _ = interval.tick() => {
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break 'service;
+                        }
+                    }
+                    _ = run_poll_cycle(&state, &mut last_health_reconciliation) => {}
                 }
             }
         }
-        let results = stream::iter(claimed)
-            .map(|account| {
-                let state = state.clone();
-                async move { poll_one_account(&state, account).await }
-            })
-            .buffer_unordered(MAX_POLL_ACCOUNTS_PER_CYCLE)
-            .collect::<Vec<_>>()
-            .await;
-        for result in results {
-            match result {
-                Ok(actions) => crate::market_billing::dispatch_actions(&state, actions).await,
-                Err(error) => tracing::warn!(error = %error, "Binance settlement poll failed"),
+    }
+    state
+        .store
+        .binance_release_poll_leases(&state.binance_settlement.worker_id)
+        .await?;
+    Ok(())
+}
+
+async fn run_poll_cycle(state: &ServerState, last_health_reconciliation: &mut Instant) {
+    if let Err(error) = state.store.binance_expire_due_intents().await {
+        tracing::warn!(error = %error, "expire Binance payment intents failed");
+    }
+    if last_health_reconciliation.elapsed() >= StdDuration::from_secs(60) {
+        if let Err(error) = state.store.binance_reconcile_poll_health_alerts().await {
+            tracing::warn!(error = %error, "reconcile Binance poll health alerts failed");
+        }
+        *last_health_reconciliation = Instant::now();
+    }
+    let mut claimed = Vec::new();
+    for _ in 0..MAX_POLL_ACCOUNTS_PER_CYCLE {
+        match state
+            .store
+            .binance_claim_poll_account(
+                state.binance_settlement.payment_home_region(),
+                &state.binance_settlement.worker_id,
+            )
+            .await
+        {
+            Ok(Some(account)) => claimed.push(account),
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(error = %error, "claim Binance poll account failed");
+                break;
             }
         }
     }
+    stream::iter(claimed)
+        .for_each_concurrent(MAX_POLL_ACCOUNTS_PER_CYCLE, |account| async move {
+            match poll_one_account(state, account).await {
+                Ok(actions) => crate::market_billing::dispatch_actions(state, actions).await,
+                Err(error) => tracing::warn!(error = %error, "Binance settlement poll failed"),
+            }
+        })
+        .await;
 }
 
 async fn poll_one_account(
@@ -679,6 +732,7 @@ async fn poll_one_account(
                 .binance_record_poll_failure(
                     &account.id,
                     &state.binance_settlement.worker_id,
+                    account.credential_revision,
                     "CREDENTIAL_DECRYPT_FAILED",
                     None,
                 )
@@ -707,6 +761,7 @@ async fn poll_one_account(
                     .binance_record_poll_failure(
                         &account.id,
                         &state.binance_settlement.worker_id,
+                        account.credential_revision,
                         &error.code,
                         error.retry_after_secs,
                     )
@@ -731,6 +786,7 @@ async fn poll_one_account(
                 .binance_record_poll_failure(
                     &account.id,
                     &state.binance_settlement.worker_id,
+                    account.credential_revision,
                     "BINANCE_PERMISSION_VERIFICATION_STALE",
                     None,
                 )
@@ -739,25 +795,14 @@ async fn poll_one_account(
         }
     }
     let now_ms = Utc::now().timestamp_millis();
-    let stored_cursor_ms = account
-        .poll_cursor_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.timestamp_millis());
-    let active_intent_started_ms = account
-        .active_intent_started_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.timestamp_millis());
-    let cursor_ms = select_poll_cursor_ms(stored_cursor_ms, active_intent_started_ms, now_ms);
-    let start_ms = cursor_ms
-        .saturating_sub(10 * 60 * 1_000)
-        .max(now_ms.saturating_sub(90 * 24 * 60 * 60 * 1_000));
+    let (start_ms, target_ms) = select_poll_scan_window(&account, now_ms);
     let transactions = match fetch_transaction_window(
+        state,
+        &account,
         &state.binance_settlement.client,
         &envelope.credentials,
         start_ms,
-        now_ms,
+        target_ms,
     )
     .await
     {
@@ -773,6 +818,7 @@ async fn poll_one_account(
                 .binance_record_poll_failure(
                     &account.id,
                     &state.binance_settlement.worker_id,
+                    account.credential_revision,
                     &error.code,
                     error.retry_after_secs,
                 )
@@ -780,15 +826,31 @@ async fn poll_one_account(
             return Ok(Vec::new());
         }
     };
+    let checkpoint = if transactions.complete {
+        PollScanCheckpoint {
+            completed_cursor_at: Some(timestamp_text(target_ms)?),
+            scan_cursor_at: None,
+            scan_target_at: None,
+        }
+    } else {
+        PollScanCheckpoint {
+            completed_cursor_at: None,
+            scan_cursor_at: Some(timestamp_text(
+                transactions.covered_through_ms.saturating_add(1),
+            )?),
+            scan_target_at: Some(timestamp_text(target_ms)?),
+        }
+    };
     let result = state
         .store
-        .binance_process_poll_success(
+        .binance_process_poll_batch(
             &account,
             &state.binance_settlement.worker_id,
-            &transactions,
+            &transactions.transactions,
             cipher,
             state.binance_settlement.mode() == GlobalMode::Enabled,
             state.binance_settlement.poll_interval_secs,
+            &checkpoint,
         )
         .await;
     match result {
@@ -799,6 +861,7 @@ async fn poll_one_account(
                 .binance_record_poll_failure(
                     &account.id,
                     &state.binance_settlement.worker_id,
+                    account.credential_revision,
                     "BINANCE_POLL_PROCESSING_FAILED",
                     None,
                 )
@@ -809,48 +872,217 @@ async fn poll_one_account(
 }
 
 async fn fetch_transaction_window(
+    state: &ServerState,
+    account: &StoredPaymentAccount,
     client: &BinanceClient,
     credentials: &BinanceCredentials,
     start_ms: i64,
     end_ms: i64,
-) -> Result<Vec<BinancePayTransaction>, BinanceApiError> {
-    let mut all = Vec::new();
-    let mut seen = HashSet::new();
-    let mut page_end = end_ms;
-    for _ in 0..MAX_TRANSACTION_PAGES {
-        let page = client
-            .pay_transactions(credentials, start_ms, page_end, 100)
-            .await?;
-        let mut minimum_time = None::<i64>;
-        for transaction in &page {
-            minimum_time = Some(
-                minimum_time
-                    .map(|current| current.min(transaction.transaction_time))
-                    .unwrap_or(transaction.transaction_time),
-            );
-            if !transaction.transaction_id.trim().is_empty()
-                && seen.insert(transaction.transaction_id.clone())
-            {
-                all.push(transaction.clone());
-            }
-        }
-        if page.len() < 100 {
-            all.sort_by_key(|transaction| transaction.transaction_time);
-            return Ok(all);
-        }
-        let Some(minimum_time) = minimum_time else {
+) -> Result<FetchedTransactionWindow, BinanceApiError> {
+    let mut collector = AdaptiveWindowCollector::new(start_ms, end_ms)?;
+    let mut previous_query_started_at: Option<Instant> = None;
+    for _ in 0..MAX_TRANSACTION_QUERIES_PER_POLL {
+        let Some(window) = collector.next_window() else {
             break;
         };
-        page_end = minimum_time.saturating_sub(1);
-        if page_end <= start_ms {
-            all.sort_by_key(|transaction| transaction.transaction_time);
-            return Ok(all);
+        if let Some(previous_query_started_at) = previous_query_started_at {
+            let remaining =
+                MIN_TRANSACTION_QUERY_SPACING.saturating_sub(previous_query_started_at.elapsed());
+            tokio::time::sleep(remaining).await;
         }
+        if let Err(error) = state
+            .store
+            .binance_renew_poll_lease(
+                &account.id,
+                &state.binance_settlement.worker_id,
+                account.credential_revision,
+            )
+            .await
+        {
+            let error_code = if matches!(error, AppError::Conflict(_)) {
+                "BINANCE_POLL_LEASE_LOST"
+            } else {
+                "BINANCE_POLL_LEASE_RENEW_FAILED"
+            };
+            tracing::warn!(
+                account_id = %account.id,
+                %error,
+                error_code,
+                "renew Binance poll lease before transaction query failed"
+            );
+            return Err(binance_api_error(error_code, Some(4)));
+        }
+        previous_query_started_at = Some(Instant::now());
+        let page = client
+            .pay_transactions(
+                credentials,
+                window.start_ms,
+                window.end_ms,
+                TRANSACTION_PAGE_LIMIT,
+            )
+            .await?;
+        collector.accept_page(window, page)?;
     }
-    Err(BinanceApiError {
-        code: "BINANCE_PAGINATION_LIMIT_REACHED".into(),
-        retry_after_secs: Some(60),
-    })
+    collector.finish()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimeWindow {
+    start_ms: i64,
+    end_ms: i64,
+}
+
+#[derive(Debug)]
+struct FetchedTransactionWindow {
+    transactions: Vec<BinancePayTransaction>,
+    covered_through_ms: i64,
+    complete: bool,
+}
+
+struct AdaptiveWindowCollector {
+    start_ms: i64,
+    end_ms: i64,
+    pending: Vec<TimeWindow>,
+    transactions: Vec<BinancePayTransaction>,
+    seen_transaction_ids: HashSet<String>,
+    covered_through_ms: Option<i64>,
+}
+
+impl AdaptiveWindowCollector {
+    fn new(start_ms: i64, end_ms: i64) -> Result<Self, BinanceApiError> {
+        if start_ms > end_ms {
+            return Err(binance_api_error("BINANCE_POLL_WINDOW_INVALID", None));
+        }
+        Ok(Self {
+            start_ms,
+            end_ms,
+            pending: vec![TimeWindow { start_ms, end_ms }],
+            transactions: Vec::new(),
+            seen_transaction_ids: HashSet::new(),
+            covered_through_ms: None,
+        })
+    }
+
+    fn next_window(&mut self) -> Option<TimeWindow> {
+        self.pending.pop()
+    }
+
+    fn accept_page(
+        &mut self,
+        window: TimeWindow,
+        page: Vec<BinancePayTransaction>,
+    ) -> Result<(), BinanceApiError> {
+        if page.iter().any(|transaction| {
+            transaction.transaction_id.trim().is_empty()
+                || transaction.transaction_time < window.start_ms
+                || transaction.transaction_time > window.end_ms
+        }) {
+            return Err(binance_api_error("BINANCE_RESPONSE_INVALID", None));
+        }
+        if page.len() >= TRANSACTION_PAGE_LIMIT {
+            if window.start_ms == window.end_ms {
+                return Err(binance_api_error(
+                    "BINANCE_TIMESTAMP_SATURATED",
+                    Some(60 * 60),
+                ));
+            }
+            let midpoint = i64::try_from(
+                i128::from(window.start_ms)
+                    + (i128::from(window.end_ms) - i128::from(window.start_ms)) / 2,
+            )
+            .map_err(|_| binance_api_error("BINANCE_POLL_WINDOW_INVALID", None))?;
+            self.pending.push(TimeWindow {
+                start_ms: midpoint.saturating_add(1),
+                end_ms: window.end_ms,
+            });
+            self.pending.push(TimeWindow {
+                start_ms: window.start_ms,
+                end_ms: midpoint,
+            });
+            return Ok(());
+        }
+        let expected_start = self
+            .covered_through_ms
+            .map(|value| value.saturating_add(1))
+            .unwrap_or(self.start_ms);
+        if window.start_ms != expected_start {
+            return Err(binance_api_error("BINANCE_POLL_WINDOW_INVALID", None));
+        }
+        for transaction in page {
+            if self
+                .seen_transaction_ids
+                .insert(transaction.transaction_id.clone())
+            {
+                self.transactions.push(transaction);
+            }
+        }
+        self.covered_through_ms = Some(window.end_ms);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<FetchedTransactionWindow, BinanceApiError> {
+        let complete = self.pending.is_empty();
+        let covered_through_ms = self
+            .covered_through_ms
+            .ok_or_else(|| binance_api_error("BINANCE_PAGINATION_BUDGET_REACHED", Some(15)))?;
+        if complete && covered_through_ms != self.end_ms {
+            return Err(binance_api_error("BINANCE_POLL_WINDOW_INVALID", None));
+        }
+        self.transactions.sort_by(|left, right| {
+            left.transaction_time
+                .cmp(&right.transaction_time)
+                .then_with(|| left.transaction_id.cmp(&right.transaction_id))
+        });
+        Ok(FetchedTransactionWindow {
+            transactions: self.transactions,
+            covered_through_ms,
+            complete,
+        })
+    }
+}
+
+fn binance_api_error(code: &str, retry_after_secs: Option<u64>) -> BinanceApiError {
+    BinanceApiError {
+        code: code.into(),
+        retry_after_secs,
+    }
+}
+
+fn timestamp_ms(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+}
+
+fn timestamp_text(value: i64) -> Result<String, AppError> {
+    Utc.timestamp_millis_opt(value)
+        .single()
+        .map(|value| value.to_rfc3339())
+        .ok_or_else(|| AppError::Internal("Binance poll checkpoint is invalid".into()))
+}
+
+fn select_poll_scan_window(account: &StoredPaymentAccount, now_ms: i64) -> (i64, i64) {
+    if let (Some(scan_cursor_ms), Some(scan_target_ms)) = (
+        timestamp_ms(account.poll_scan_cursor_at.as_deref()),
+        timestamp_ms(account.poll_scan_target_at.as_deref()),
+    ) && scan_cursor_ms <= scan_target_ms
+        && scan_target_ms <= now_ms
+    {
+        return (scan_cursor_ms, scan_target_ms);
+    }
+    let cursor_ms = select_poll_cursor_ms(
+        timestamp_ms(account.poll_cursor_at.as_deref()),
+        timestamp_ms(account.active_intent_started_at.as_deref()),
+        now_ms,
+    );
+    let start_ms = cursor_ms
+        .saturating_sub(POLL_OVERLAP_MS)
+        .max(now_ms.saturating_sub(90 * 24 * 60 * 60 * 1_000));
+    let target_ms = start_ms
+        .saturating_add(MAX_POLL_SCAN_WINDOW_MS)
+        .min(now_ms)
+        .max(start_ms);
+    (start_ms, target_ms)
 }
 
 fn select_poll_cursor_ms(
@@ -868,6 +1100,7 @@ fn map_verification_error(error: BinanceApiError) -> AppError {
     match error.code.as_str() {
         "READ_PERMISSION_REQUIRED"
         | "DANGEROUS_PERMISSION_ENABLED"
+        | "ACCOUNT_UID_MISMATCH"
         | "RECEIVER_UID_MISMATCH"
         | "BINANCE_CREDENTIALS_REJECTED" => AppError::UnprocessableEntity(format!(
             "Binance credential verification failed: {}",
@@ -898,7 +1131,7 @@ fn require_initial_uid_confirmation(
 ) -> Result<(), AppError> {
     if !verification.uid_confirmed {
         return Err(AppError::UnprocessableEntity(
-            "Binance credential verification failed: RECEIVER_UID_UNCONFIRMED; receive a small Binance Pay transfer, then bind again"
+            "Binance credential verification failed: ACCOUNT_UID_UNCONFIRMED; receive a small Binance Pay transfer, then bind again"
                 .into(),
         ));
     }
@@ -1001,6 +1234,45 @@ pub(crate) fn validate_api_base(url: &Url) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn synthetic_transaction(index: usize, transaction_time: i64) -> BinancePayTransaction {
+        BinancePayTransaction {
+            order_id: format!("order-{index}"),
+            note: String::new(),
+            order_type: "C2C".into(),
+            transaction_id: format!("transaction-{index}"),
+            transaction_time,
+            amount: "1.0001".into(),
+            currency: "USDT".into(),
+            counterparty_id: serde_json::json!(index + 10_000),
+            payer_info: super::client::PartyInfo::default(),
+            receiver_info: super::client::PartyInfo::default(),
+        }
+    }
+
+    fn collect_synthetic_window(
+        transactions: &[BinancePayTransaction],
+        start_ms: i64,
+        end_ms: i64,
+        query_budget: usize,
+    ) -> Result<FetchedTransactionWindow, BinanceApiError> {
+        let mut collector = AdaptiveWindowCollector::new(start_ms, end_ms)?;
+        for _ in 0..query_budget {
+            let Some(window) = collector.next_window() else {
+                break;
+            };
+            let page = transactions
+                .iter()
+                .filter(|transaction| {
+                    (window.start_ms..=window.end_ms).contains(&transaction.transaction_time)
+                })
+                .take(TRANSACTION_PAGE_LIMIT)
+                .cloned()
+                .collect();
+            collector.accept_page(window, page)?;
+        }
+        collector.finish()
+    }
+
     #[test]
     fn master_key_accepts_hex_and_rejects_short_values() {
         assert_eq!(*parse_master_key(&"ab".repeat(32)).unwrap(), [0xab; 32]);
@@ -1027,6 +1299,73 @@ mod tests {
         assert_eq!(select_poll_cursor_ms(Some(250), Some(200), 300), 250);
         assert_eq!(select_poll_cursor_ms(Some(400), Some(200), 300), 300);
         assert_eq!(select_poll_cursor_ms(None, None, 2_000_000), 200_000);
+    }
+
+    #[test]
+    fn adaptive_windows_cover_full_page_boundaries_without_skipping() {
+        for count in [100_usize, 101, 1_000, 1_001] {
+            let transactions = (0..count)
+                .map(|index| synthetic_transaction(index, index as i64))
+                .collect::<Vec<_>>();
+            let result =
+                collect_synthetic_window(&transactions, 0, i64::try_from(count).unwrap(), 128)
+                    .expect("adaptive window should enumerate every transaction");
+            assert!(result.complete, "count={count}");
+            assert_eq!(result.covered_through_ms, count as i64);
+            assert_eq!(result.transactions.len(), count, "count={count}");
+            assert_eq!(
+                result
+                    .transactions
+                    .iter()
+                    .map(|transaction| transaction.transaction_id.as_str())
+                    .collect::<HashSet<_>>()
+                    .len(),
+                count,
+                "count={count}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_busy_window_resumes_from_the_last_complete_time_partition() {
+        let transactions = (0..1_001)
+            .map(|index| synthetic_transaction(index, index as i64))
+            .collect::<Vec<_>>();
+        let mut next_start = 0_i64;
+        let mut observed = HashSet::new();
+        for _ in 0..32 {
+            let result = collect_synthetic_window(&transactions, next_start, 1_001, 6)
+                .expect("each bounded pass should complete a contiguous prefix");
+            for transaction in result.transactions {
+                assert!(observed.insert(transaction.transaction_id));
+            }
+            if result.complete {
+                next_start = 1_002;
+                break;
+            }
+            let resumed = result.covered_through_ms.saturating_add(1);
+            assert!(resumed > next_start);
+            next_start = resumed;
+        }
+        assert_eq!(next_start, 1_002);
+        assert_eq!(observed.len(), transactions.len());
+    }
+
+    #[test]
+    fn duplicate_rows_are_deduplicated_but_a_saturated_millisecond_fails_closed() {
+        let mut duplicate = synthetic_transaction(1, 10);
+        duplicate.transaction_time = 11;
+        let result = collect_synthetic_window(&[synthetic_transaction(1, 10), duplicate], 0, 20, 2)
+            .expect("a non-saturated duplicate page is complete");
+        assert_eq!(result.transactions.len(), 1);
+
+        let saturated = (0..TRANSACTION_PAGE_LIMIT)
+            .map(|index| synthetic_transaction(index, 10))
+            .collect::<Vec<_>>();
+        let error = collect_synthetic_window(&saturated, 10, 10, 1)
+            .expect_err("a full one-millisecond window cannot prove completeness");
+        assert_eq!(error.code, "BINANCE_TIMESTAMP_SATURATED");
+        assert_eq!(error.retry_after_secs, Some(60 * 60));
     }
 
     #[test]
@@ -1068,6 +1407,7 @@ mod tests {
                 reading_enabled: true,
                 dangerous_permissions_disabled: true,
                 uid_confirmed: false,
+                uid_confirmation_source: None,
             })
             .is_err()
         );
@@ -1076,6 +1416,9 @@ mod tests {
                 reading_enabled: true,
                 dangerous_permissions_disabled: true,
                 uid_confirmed: true,
+                uid_confirmation_source: Some(
+                    self::client::UidConfirmationSource::ReceiverHistory,
+                ),
             })
             .is_ok()
         );

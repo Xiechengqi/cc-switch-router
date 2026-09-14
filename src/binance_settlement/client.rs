@@ -72,13 +72,16 @@ impl PartyInfo {
 }
 
 pub fn value_as_identifier(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(value) if !value.trim().is_empty() => {
-            Some(value.trim().to_string())
-        }
-        serde_json::Value::Number(value) => Some(value.to_string()),
-        _ => None,
+    let value = match value {
+        serde_json::Value::String(value) => value.trim().to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
+    if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
+    let value = value.trim_start_matches('0');
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +90,23 @@ pub struct VerificationResult {
     pub reading_enabled: bool,
     pub dangerous_permissions_disabled: bool,
     pub uid_confirmed: bool,
+    pub uid_confirmation_source: Option<UidConfirmationSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UidConfirmationSource {
+    ReceiverHistory,
+    PayerHistory,
+}
+
+impl UidConfirmationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReceiverHistory => "receiver_history",
+            Self::PayerHistory => "payer_history",
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -185,22 +205,35 @@ impl BinanceClient {
                 parse_decimal_units(&transaction.amount, 10_000)
                     .ok()
                     .and_then(|amount| match amount.cmp(&0) {
-                        std::cmp::Ordering::Greater => transaction.receiver_info.uid(),
-                        std::cmp::Ordering::Less => transaction.payer_info.uid(),
+                        std::cmp::Ordering::Greater => transaction
+                            .receiver_info
+                            .uid()
+                            .map(|uid| (uid, UidConfirmationSource::ReceiverHistory)),
+                        std::cmp::Ordering::Less => transaction
+                            .payer_info
+                            .uid()
+                            .map(|uid| (uid, UidConfirmationSource::PayerHistory)),
                         std::cmp::Ordering::Equal => None,
                     })
             })
             .collect::<Vec<_>>();
         if observed_account_uids
             .iter()
-            .any(|observed_uid| observed_uid != expected_uid)
+            .any(|(observed_uid, _)| observed_uid != expected_uid)
         {
-            return Err(BinanceApiError::new("RECEIVER_UID_MISMATCH"));
+            return Err(BinanceApiError::new("ACCOUNT_UID_MISMATCH"));
         }
+        let uid_confirmation_source = observed_account_uids
+            .iter()
+            .find_map(|(_, source)| {
+                (*source == UidConfirmationSource::ReceiverHistory).then_some(*source)
+            })
+            .or_else(|| observed_account_uids.first().map(|(_, source)| *source));
         Ok(VerificationResult {
             reading_enabled: true,
             dangerous_permissions_disabled: true,
-            uid_confirmed: !observed_account_uids.is_empty(),
+            uid_confirmed: uid_confirmation_source.is_some(),
+            uid_confirmation_source,
         })
     }
 
@@ -446,6 +479,28 @@ mod tests {
     }
 
     #[test]
+    fn upstream_identifiers_must_be_positive_canonical_decimal_values() {
+        assert_eq!(
+            value_as_identifier(&serde_json::json!(123456789_i64)).as_deref(),
+            Some("123456789")
+        );
+        assert_eq!(
+            value_as_identifier(&serde_json::json!(" 00123456789 ")).as_deref(),
+            Some("123456789")
+        );
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("0"),
+            serde_json::json!("123.4"),
+            serde_json::json!("not-an-id"),
+        ] {
+            assert!(value_as_identifier(&invalid).is_none(), "value={invalid}");
+        }
+    }
+
+    #[test]
     fn api_restrictions_require_every_security_relevant_field() {
         let valid = serde_json::json!({
             "enableReading": true,
@@ -683,6 +738,10 @@ mod tests {
             .await
             .expect("explicit payer UID proves the signed account");
         assert!(verification.uid_confirmed);
+        assert_eq!(
+            verification.uid_confirmation_source,
+            Some(UidConfirmationSource::PayerHistory)
+        );
         assert_eq!(requests.await.expect("captured requests").len(), 2);
     }
 }

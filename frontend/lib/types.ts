@@ -2112,7 +2112,7 @@ export type BinanceAutoSettlementAccount = {
   paymentHomeRegion: string;
   permissionsVerifiedAt?: string;
   uidConfirmed: boolean;
-  uidConfirmationSource?: "receiver_history" | "payment_observation" | string;
+  uidConfirmationSource?: "receiver_history" | "payer_history" | "payment_observation" | string;
   lastPollSuccessAt?: string;
   lastPollErrorCode?: string;
   consecutiveFailures: number;
@@ -2150,6 +2150,9 @@ export type BinanceReconciliationCase = {
   paymentIntentId?: string;
   paymentAccountId: string;
   transactionId: string;
+  orderId?: string;
+  counterpartyReference?: string;
+  payerBinanceIdReference?: string;
   caseKind: string;
   status: string;
   detail: Record<string, unknown>;
@@ -2163,8 +2166,27 @@ export type BinanceReconciliationCase = {
   resolvedAt?: string;
 };
 
+export type BinanceDegradedAccount = {
+  paymentAccountId: string;
+  supplierUserId: string;
+  binanceUid: string;
+  paymentHomeRegion: string;
+  automationMode: string;
+  lastPollSuccessAt?: string;
+  lastPollErrorCode?: string;
+  consecutiveFailures: number;
+  degradedSince?: string;
+  nextPollAt?: string;
+  leaseUntil?: string;
+  pollScanCursorAt?: string;
+  pollScanTargetAt?: string;
+  updatedAt: string;
+};
+
 export type BinanceSettlementAdmin = {
   cases: BinanceReconciliationCase[];
+  /** Optional while an older Router API is still serving during a rolling upgrade. */
+  degradedAccounts?: BinanceDegradedAccount[];
   openCaseCount: number;
   pendingIntentCount: number;
   degradedAccountCount: number;

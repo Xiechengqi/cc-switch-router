@@ -77,6 +77,9 @@ pub struct BinanceReconciliationCaseView {
     pub payment_intent_id: Option<String>,
     pub payment_account_id: String,
     pub transaction_id: String,
+    pub order_id: Option<String>,
+    pub counterparty_reference: Option<String>,
+    pub payer_binance_id_reference: Option<String>,
     pub case_kind: String,
     pub status: String,
     pub detail: serde_json::Value,
@@ -92,8 +95,28 @@ pub struct BinanceReconciliationCaseView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BinanceDegradedAccountView {
+    pub payment_account_id: String,
+    pub supplier_user_id: String,
+    pub binance_uid: String,
+    pub payment_home_region: String,
+    pub automation_mode: String,
+    pub last_poll_success_at: Option<String>,
+    pub last_poll_error_code: Option<String>,
+    pub consecutive_failures: i64,
+    pub degraded_since: Option<String>,
+    pub next_poll_at: Option<String>,
+    pub lease_until: Option<String>,
+    pub poll_scan_cursor_at: Option<String>,
+    pub poll_scan_target_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BinanceSettlementAdminView {
     pub cases: Vec<BinanceReconciliationCaseView>,
+    pub degraded_accounts: Vec<BinanceDegradedAccountView>,
     pub open_case_count: i64,
     pub pending_intent_count: i64,
     pub degraded_account_count: i64,
@@ -112,6 +135,8 @@ pub struct StoredPaymentAccount {
     pub automation_mode: String,
     pub permissions_verified_at: Option<String>,
     pub poll_cursor_at: Option<String>,
+    pub poll_scan_cursor_at: Option<String>,
+    pub poll_scan_target_at: Option<String>,
     pub active_intent_started_at: Option<String>,
 }
 
@@ -131,7 +156,8 @@ impl AppStore {
         conn.query_row(
             "SELECT id, supplier_user_id, binance_uid, credentials_ciphertext,
                     credential_nonce, encryption_key_version, credential_revision,
-                    automation_mode, permissions_verified_at, poll_cursor_at, NULL
+                    automation_mode, permissions_verified_at, poll_cursor_at,
+                    poll_scan_cursor_at, poll_scan_target_at, NULL
              FROM binance_payment_accounts
              WHERE supplier_user_id = ?1 AND payment_home_region = ?2
                AND status != 'disabled' AND credentials_ciphertext != ''",
@@ -148,7 +174,9 @@ impl AppStore {
                     automation_mode: row.get(7)?,
                     permissions_verified_at: row.get(8)?,
                     poll_cursor_at: row.get(9)?,
-                    active_intent_started_at: row.get(10)?,
+                    poll_scan_cursor_at: row.get(10)?,
+                    poll_scan_target_at: row.get(11)?,
+                    active_intent_started_at: row.get(12)?,
                 })
             },
         )
@@ -253,6 +281,9 @@ impl AppStore {
         let cooldown_until = (now_dt + Duration::hours(AMOUNT_COOLDOWN_HOURS)).to_rfc3339();
         let permissions_json = serde_json::to_string(verification)
             .map_err(|_| AppError::Internal("encode Binance permissions failed".into()))?;
+        let uid_confirmation_source = verification
+            .uid_confirmation_source
+            .map(|source| source.as_str());
         let masked = mask_api_key(api_key);
         let fingerprint = format!("{:x}", Sha256::digest(api_key.as_bytes()));
         let conn = self.conn.lock().await;
@@ -280,10 +311,22 @@ impl AppStore {
         }
         let existing = tx
             .query_row(
-                "SELECT id, credential_revision FROM binance_payment_accounts
+                "SELECT id, credential_revision, binance_uid, status,
+                        consecutive_failures, last_poll_error_code, last_poll_success_at
+                 FROM binance_payment_accounts
                  WHERE supplier_user_id = ?1 AND payment_home_region = ?2",
                 params![supplier_user_id, region],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_db("lock Binance account binding"))?;
@@ -319,7 +362,7 @@ impl AppStore {
                             region,
                             permissions_json,
                             i64::from(verification.uid_confirmed),
-                            verification.uid_confirmed.then_some("receiver_history"),
+                            uid_confirmation_source,
                             now,
                         ],
                     )
@@ -330,7 +373,15 @@ impl AppStore {
                     ));
                 }
             }
-            Some((current_id, current_revision)) => {
+            Some((
+                current_id,
+                current_revision,
+                current_uid,
+                current_status,
+                current_failures,
+                current_error,
+                current_last_success,
+            )) => {
                 if current_id != account_id
                     || current_revision.checked_add(1) != Some(credential_revision)
                 {
@@ -338,13 +389,16 @@ impl AppStore {
                         "Binance account binding changed during verification; retry".into(),
                     ));
                 }
-                cancel_payment_account_intents_tx(
-                    &tx,
-                    account_id,
-                    "payment_account_rebound",
-                    &now,
-                    &cooldown_until,
-                )?;
+                let uid_changed = current_uid != binance_uid;
+                if uid_changed {
+                    cancel_payment_account_intents_tx(
+                        &tx,
+                        account_id,
+                        "payment_account_rebound",
+                        &now,
+                        &cooldown_until,
+                    )?;
+                }
                 let updated = tx
                     .execute(
                         "UPDATE binance_payment_accounts
@@ -354,9 +408,18 @@ impl AppStore {
                              credential_revision = ?11, status = 'verified',
                              automation_mode = ?12, permissions_json = ?13,
                              permissions_verified_at = ?16, uid_confirmed = ?14,
-                             uid_confirmation_source = ?15, last_poll_success_at = NULL,
+                             uid_confirmation_source = ?15,
+                             last_poll_success_at = CASE WHEN ?17 = 0
+                                 THEN last_poll_success_at ELSE NULL END,
                              last_poll_error_code = NULL, consecutive_failures = 0,
-                             poll_cursor_at = NULL, lease_owner = NULL, lease_until = NULL,
+                             degraded_since = NULL,
+                             poll_cursor_at = CASE WHEN ?17 = 0
+                                 THEN poll_cursor_at ELSE NULL END,
+                             poll_scan_cursor_at = CASE WHEN ?17 = 0
+                                 THEN poll_scan_cursor_at ELSE NULL END,
+                             poll_scan_target_at = CASE WHEN ?17 = 0
+                                 THEN poll_scan_target_at ELSE NULL END,
+                             lease_owner = NULL, lease_until = NULL,
                              next_poll_at = ?16, updated_at = ?16
                          WHERE id = ?1 AND supplier_user_id = ?2
                            AND payment_home_region = ?3 AND credential_revision = ?4",
@@ -375,8 +438,9 @@ impl AppStore {
                             automation_mode,
                             permissions_json,
                             i64::from(verification.uid_confirmed),
-                            verification.uid_confirmed.then_some("receiver_history"),
+                            uid_confirmation_source,
                             now,
+                            i64::from(uid_changed),
                         ],
                     )
                     .map_err(map_db("rotate Binance payment account"))?;
@@ -384,6 +448,22 @@ impl AppStore {
                     return Err(AppError::Conflict(
                         "Binance account binding changed during verification; retry".into(),
                     ));
+                }
+                if current_status == "degraded" || current_failures > 0 || current_error.is_some() {
+                    enqueue_binance_poll_alert_tx(
+                        &tx,
+                        account_id,
+                        supplier_user_id,
+                        region,
+                        "resolved",
+                        current_error.as_deref().unwrap_or("CREDENTIALS_REBOUND"),
+                        current_failures,
+                        current_last_success.as_deref(),
+                        None,
+                        false,
+                        &format!("rebind:{}", now_dt.timestamp_millis()),
+                        now_dt,
+                    )?;
                 }
             }
         }
@@ -405,20 +485,67 @@ impl AppStore {
         verification: &VerificationResult,
     ) -> Result<(), AppError> {
         ensure_safe_verification(verification, false)?;
-        let now = Utc::now().to_rfc3339();
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
         let permissions_json = serde_json::to_string(verification)
             .map_err(|_| AppError::Internal("encode Binance permissions failed".into()))?;
+        let uid_confirmation_source = verification
+            .uid_confirmation_source
+            .map(|source| source.as_str());
+        let manual_verification = expected_lease_owner.is_none();
         let conn = self.conn.lock().await;
-        let updated = conn
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Binance verification success"))?;
+        let previous = tx
+            .query_row(
+                "SELECT status, consecutive_failures, last_poll_error_code,
+                        last_poll_success_at
+                 FROM binance_payment_accounts
+                 WHERE supplier_user_id = ?1 AND payment_home_region = ?2
+                   AND id = ?3 AND credential_revision = ?4
+                   AND status != 'disabled' AND credentials_ciphertext != ''
+                   AND (?5 IS NULL OR lease_owner = ?5)",
+                params![
+                    supplier_user_id,
+                    region,
+                    account_id,
+                    credential_revision,
+                    expected_lease_owner,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read Binance verification success state"))?
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "Binance payment account changed while credentials were verified; retry".into(),
+                )
+            })?;
+        let updated = tx
             .execute(
                 "UPDATE binance_payment_accounts
-                 SET status = 'verified', permissions_json = ?6,
-                     permissions_verified_at = ?8,
+                 SET status = CASE WHEN ?10 = 1 THEN 'verified' ELSE status END,
+                     permissions_json = ?6,
+                     permissions_verified_at = ?9,
                      uid_confirmed = MAX(uid_confirmed, ?7),
                      uid_confirmation_source = CASE WHEN ?7 = 1
-                         THEN 'receiver_history' ELSE uid_confirmation_source END,
-                     last_poll_error_code = NULL, consecutive_failures = 0,
-                     next_poll_at = ?8, updated_at = ?8
+                         THEN ?8 ELSE uid_confirmation_source END,
+                     last_poll_error_code = CASE WHEN ?10 = 1
+                         THEN NULL ELSE last_poll_error_code END,
+                     consecutive_failures = CASE WHEN ?10 = 1
+                         THEN 0 ELSE consecutive_failures END,
+                     degraded_since = CASE WHEN ?10 = 1
+                         THEN NULL ELSE degraded_since END,
+                     next_poll_at = CASE WHEN ?10 = 1 THEN ?9 ELSE next_poll_at END,
+                     updated_at = ?9
                  WHERE supplier_user_id = ?1 AND payment_home_region = ?2
                    AND id = ?3 AND credential_revision = ?4
                    AND status != 'disabled' AND credentials_ciphertext != ''
@@ -431,7 +558,9 @@ impl AppStore {
                     expected_lease_owner,
                     permissions_json,
                     i64::from(verification.uid_confirmed),
-                    now
+                    uid_confirmation_source,
+                    now,
+                    i64::from(manual_verification),
                 ],
             )
             .map_err(map_db("mark Binance account verified"))?;
@@ -440,7 +569,26 @@ impl AppStore {
                 "Binance payment account changed while credentials were verified; retry".into(),
             ));
         }
-        Ok(())
+        if manual_verification
+            && (previous.0 == "degraded" || previous.1 > 0 || previous.2.is_some())
+        {
+            enqueue_binance_poll_alert_tx(
+                &tx,
+                account_id,
+                supplier_user_id,
+                region,
+                "resolved",
+                previous.2.as_deref().unwrap_or("CREDENTIALS_REVERIFIED"),
+                previous.1,
+                previous.3.as_deref(),
+                None,
+                false,
+                &format!("verification-recovered:{}", now_dt.timestamp_millis()),
+                now_dt,
+            )?;
+        }
+        tx.commit()
+            .map_err(map_db("commit Binance verification success"))
     }
 
     pub async fn binance_mark_account_verification_failed(
@@ -464,6 +612,7 @@ impl AppStore {
                  SET status = 'degraded', permissions_verified_at = NULL,
                      last_poll_error_code = ?5,
                      consecutive_failures = MIN(consecutive_failures + 1, 1000000),
+                     degraded_since = COALESCE(degraded_since, ?6),
                      lease_owner = NULL, lease_until = NULL,
                      next_poll_at = ?6, updated_at = ?6
                  WHERE supplier_user_id = ?1 AND payment_home_region = ?2
@@ -491,6 +640,28 @@ impl AppStore {
             &now,
             &cooldown_until,
         )?;
+        let (failures, last_success_at) = tx
+            .query_row(
+                "SELECT consecutive_failures, last_poll_success_at
+                 FROM binance_payment_accounts WHERE id = ?1",
+                params![account_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(map_db("read failed Binance verification state"))?;
+        enqueue_binance_poll_alert_tx(
+            &tx,
+            account_id,
+            supplier_user_id,
+            region,
+            "firing",
+            error_code,
+            failures,
+            last_success_at.as_deref(),
+            Some(&now),
+            true,
+            &format!("verification:{}", now_dt.timestamp_millis()),
+            now_dt,
+        )?;
         tx.commit()
             .map_err(map_db("commit Binance verification failure"))
     }
@@ -508,19 +679,29 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Binance account disable"))?;
-        let account_id = tx
+        let account = tx
             .query_row(
-                "SELECT id FROM binance_payment_accounts
+                "SELECT id, status, consecutive_failures, last_poll_error_code,
+                        last_poll_success_at
+                 FROM binance_payment_accounts
                  WHERE supplier_user_id = ?1 AND payment_home_region = ?2",
                 params![supplier_user_id, region],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_db("find Binance account to disable"))?
             .ok_or_else(|| AppError::NotFound("Binance payment account not found".into()))?;
         cancel_payment_account_intents_tx(
             &tx,
-            &account_id,
+            &account.0,
             "payment_account_disabled",
             &now,
             &cooldown_until,
@@ -532,21 +713,41 @@ impl AppStore {
                      masked_api_key = '', credential_fingerprint = '',
                      credentials_ciphertext = '', credential_nonce = '',
                      permissions_verified_at = NULL,
-                     last_poll_error_code = 'CREDENTIALS_DELETED', lease_owner = NULL,
-                     lease_until = NULL, next_poll_at = NULL, updated_at = ?2
+                     last_poll_error_code = 'CREDENTIALS_DELETED', degraded_since = NULL,
+                     lease_owner = NULL,
+                     lease_until = NULL, poll_scan_cursor_at = NULL,
+                     poll_scan_target_at = NULL, next_poll_at = NULL, updated_at = ?2
                  WHERE id = ?1",
-                params![account_id, now],
+                params![account.0, now],
             )
             .map_err(map_db("purge Binance payment credentials"))?;
         } else {
             tx.execute(
                 "UPDATE binance_payment_accounts
                  SET status = 'disabled', credential_revision = credential_revision + 1,
-                     permissions_verified_at = NULL, lease_owner = NULL, lease_until = NULL,
+                     permissions_verified_at = NULL, degraded_since = NULL,
+                     lease_owner = NULL, lease_until = NULL,
+                     poll_scan_cursor_at = NULL, poll_scan_target_at = NULL,
                      next_poll_at = NULL, updated_at = ?2 WHERE id = ?1",
-                params![account_id, now],
+                params![account.0, now],
             )
             .map_err(map_db("disable Binance payment account"))?;
+        }
+        if account.1 == "degraded" || account.2 > 0 || account.3.is_some() {
+            enqueue_binance_poll_alert_tx(
+                &tx,
+                &account.0,
+                supplier_user_id,
+                region,
+                "resolved",
+                account.3.as_deref().unwrap_or("ACCOUNT_DISABLED"),
+                account.2,
+                account.4.as_deref(),
+                None,
+                false,
+                &format!("disabled:{}", now_dt.timestamp_millis()),
+                now_dt,
+            )?;
         }
         tx.commit()
             .map_err(map_db("commit Binance account disable"))
@@ -695,6 +896,7 @@ impl AppStore {
                          SET status = 'degraded', permissions_verified_at = NULL,
                              last_poll_error_code = 'CREDENTIAL_DECRYPT_FAILED',
                              consecutive_failures = MIN(consecutive_failures + 1, 1000000),
+                             degraded_since = COALESCE(degraded_since, ?3),
                              lease_owner = NULL, lease_until = NULL, next_poll_at = NULL,
                              updated_at = ?3
                          WHERE id = ?1 AND credential_revision = ?2
@@ -714,6 +916,27 @@ impl AppStore {
                     "payment_account_degraded",
                     &now,
                     &cooldown_until,
+                )?;
+                let failures = tx
+                    .query_row(
+                        "SELECT consecutive_failures FROM binance_payment_accounts WHERE id = ?1",
+                        params![payment_account.0],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(map_db("read undecryptable Binance account state"))?;
+                enqueue_binance_poll_alert_tx(
+                    &tx,
+                    &payment_account.0,
+                    &invoice.supplier_user_id,
+                    region,
+                    "firing",
+                    "CREDENTIAL_DECRYPT_FAILED",
+                    failures,
+                    None,
+                    None,
+                    true,
+                    &format!("decrypt:{}", now_dt.timestamp_millis()),
+                    now_dt,
                 )?;
                 tx.commit()
                     .map_err(map_db("commit undecryptable Binance account degradation"))?;
@@ -888,6 +1111,152 @@ impl AppStore {
         tx.commit().map_err(map_db("commit Binance intent expiry"))
     }
 
+    pub async fn binance_reconcile_poll_health_alerts(&self) -> Result<(), AppError> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let stale_cutoff = (now - Duration::minutes(5)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Binance poll health reconciliation"))?;
+        let accounts = tx
+            .prepare(
+                "SELECT account.id, account.supplier_user_id,
+                        account.payment_home_region, account.status,
+                        account.last_poll_error_code, account.consecutive_failures,
+                        account.last_poll_success_at, account.next_poll_at,
+                        account.degraded_since,
+                        (SELECT MIN(intent.created_at)
+                           FROM market_payment_intents intent
+                          WHERE intent.payment_account_id = account.id
+                            AND (
+                                intent.status = 'pending' OR
+                                (intent.status = 'expired' AND intent.late_grace_until >= ?1) OR
+                                (intent.status = 'cancelled'
+                                 AND intent.late_grace_until >= ?1
+                                 AND COALESCE(intent.cancellation_reason, '') NOT IN (
+                                     'payment_account_rebound', 'payment_account_disabled'
+                                 ))
+                            )) AS active_intent_started_at
+                 FROM binance_payment_accounts account
+                 WHERE account.status IN ('verified', 'degraded')
+                   AND account.credentials_ciphertext != ''",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![now_text], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                            row.get::<_, Option<String>>(9)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read Binance poll health"))?;
+        for account in accounts {
+            let degraded_too_long = account.3 == "degraded"
+                && account
+                    .8
+                    .as_deref()
+                    .is_some_and(|degraded_since| degraded_since <= stale_cutoff.as_str());
+            // An idle account is intentionally not polled. Only an account with
+            // a payable or late-protection intent can be stale because it has
+            // not recorded a recent successful poll.
+            let activity_anchor = account.9.as_deref().map(|intent_started| {
+                account.6.as_deref().map_or(intent_started, |last_success| {
+                    last_success.max(intent_started)
+                })
+            });
+            let polling_stale =
+                activity_anchor.is_some_and(|anchor| anchor <= stale_cutoff.as_str());
+            if !degraded_too_long && !polling_stale {
+                continue;
+            }
+            let error_code = if degraded_too_long {
+                account.4.as_deref().unwrap_or("BINANCE_ACCOUNT_DEGRADED")
+            } else {
+                account.4.as_deref().unwrap_or("BINANCE_POLL_STALE")
+            };
+            let source_anchor = account
+                .8
+                .as_deref()
+                .filter(|_| degraded_too_long)
+                .or(activity_anchor)
+                .unwrap_or("unknown");
+            enqueue_binance_poll_alert_tx(
+                &tx,
+                &account.0,
+                &account.1,
+                &account.2,
+                "firing",
+                error_code,
+                account.5,
+                account.6.as_deref(),
+                account.7.as_deref(),
+                degraded_too_long,
+                &format!("health:{source_anchor}"),
+                now,
+            )?;
+        }
+        tx.commit()
+            .map_err(map_db("commit Binance poll health reconciliation"))
+    }
+
+    pub async fn binance_release_poll_leases(&self, lease_owner: &str) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE binance_payment_accounts
+             SET lease_owner = NULL, lease_until = NULL, updated_at = ?2
+             WHERE lease_owner = ?1",
+            params![lease_owner, now],
+        )
+        .map_err(map_db("release Binance poll leases"))?;
+        Ok(())
+    }
+
+    pub async fn binance_renew_poll_lease(
+        &self,
+        account_id: &str,
+        lease_owner: &str,
+        credential_revision: i64,
+    ) -> Result<(), AppError> {
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_until = (now_dt + Duration::seconds(POLL_LEASE_SECONDS)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let updated = conn
+            .execute(
+                "UPDATE binance_payment_accounts
+                 SET lease_until = ?4, updated_at = ?3
+                 WHERE id = ?1 AND lease_owner = ?2 AND credential_revision = ?5
+                   AND status IN ('verified', 'degraded')
+                   AND credentials_ciphertext != ''",
+                params![
+                    account_id,
+                    lease_owner,
+                    now,
+                    lease_until,
+                    credential_revision,
+                ],
+            )
+            .map_err(map_db("renew Binance poll lease"))?;
+        if updated != 1 {
+            return Err(AppError::Conflict(
+                "Binance account poll lease is no longer current".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn binance_cancel_live_intents_for_global_disable(&self) -> Result<(), AppError> {
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
@@ -951,7 +1320,8 @@ impl AppStore {
                         account.credentials_ciphertext, account.credential_nonce,
                         account.encryption_key_version, account.credential_revision,
                         account.automation_mode, account.permissions_verified_at,
-                        account.poll_cursor_at,
+                        account.poll_cursor_at, account.poll_scan_cursor_at,
+                        account.poll_scan_target_at,
                         (SELECT MIN(intent.created_at)
                            FROM market_payment_intents intent
                           WHERE intent.payment_account_id = account.id
@@ -998,7 +1368,9 @@ impl AppStore {
                         automation_mode: row.get(7)?,
                         permissions_verified_at: row.get(8)?,
                         poll_cursor_at: row.get(9)?,
-                        active_intent_started_at: row.get(10)?,
+                        poll_scan_cursor_at: row.get(10)?,
+                        poll_scan_target_at: row.get(11)?,
+                        active_intent_started_at: row.get(12)?,
                     })
                 },
             )
@@ -1025,6 +1397,7 @@ impl AppStore {
         &self,
         account_id: &str,
         lease_owner: &str,
+        credential_revision: i64,
         error_code: &str,
         retry_after_secs: Option<u64>,
     ) -> Result<(), AppError> {
@@ -1035,25 +1408,42 @@ impl AppStore {
             error_code,
             "CREDENTIAL_DECRYPT_FAILED"
                 | "BINANCE_CREDENTIALS_REJECTED"
+                | "BINANCE_IP_BANNED"
+                | "BINANCE_TIMESTAMP_SATURATED"
                 | "READ_PERMISSION_REQUIRED"
                 | "DANGEROUS_PERMISSION_ENABLED"
+                | "ACCOUNT_UID_MISMATCH"
                 | "RECEIVER_UID_MISMATCH"
         );
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Binance poll failure"))?;
-        let failures = tx
+        let previous = tx
             .query_row(
-                "SELECT consecutive_failures FROM binance_payment_accounts
-                 WHERE id = ?1 AND lease_owner = ?2",
-                params![account_id, lease_owner],
-                |row| row.get::<_, i64>(0),
+                "SELECT consecutive_failures, status, supplier_user_id,
+                        payment_home_region, last_poll_success_at
+                 FROM binance_payment_accounts
+                 WHERE id = ?1 AND lease_owner = ?2 AND credential_revision = ?3",
+                params![account_id, lease_owner, credential_revision],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
             )
             .optional()
-            .map_err(map_db("read Binance poll failure count"))?
-            .unwrap_or(0)
-            .saturating_add(1);
+            .map_err(map_db("read Binance poll failure state"))?;
+        let Some(previous) = previous else {
+            tx.commit()
+                .map_err(map_db("commit stale Binance poll failure"))?;
+            return Ok(());
+        };
+        let failures = previous.0.saturating_add(1);
         let exponential = 4_i64.saturating_mul(1_i64 << failures.min(6));
         let default_delay = match error_code {
             "BINANCE_IP_BANNED" => IP_BAN_DEFAULT_BACKOFF_SECONDS,
@@ -1064,6 +1454,7 @@ impl AppStore {
             .map(|value| i64::try_from(value).unwrap_or(MAX_POLL_BACKOFF_SECONDS))
             .unwrap_or(default_delay)
             .clamp(4, MAX_POLL_BACKOFF_SECONDS);
+        let next_poll_at = (now + Duration::seconds(delay)).to_rfc3339();
         let updated = tx
             .execute(
                 "UPDATE binance_payment_accounts
@@ -1071,17 +1462,20 @@ impl AppStore {
                  permissions_verified_at = CASE WHEN ?7 = 1
                      THEN NULL ELSE permissions_verified_at END,
                  last_poll_error_code = ?4, consecutive_failures = ?3,
+                 degraded_since = CASE WHEN ?7 = 1 OR ?3 >= 3
+                     THEN COALESCE(degraded_since, ?6) ELSE degraded_since END,
                  next_poll_at = ?5, lease_owner = NULL, lease_until = NULL,
                  updated_at = ?6
-             WHERE id = ?1 AND lease_owner = ?2",
+             WHERE id = ?1 AND lease_owner = ?2 AND credential_revision = ?8",
                 params![
                     account_id,
                     lease_owner,
                     failures,
                     sanitize_code(error_code),
-                    (now + Duration::seconds(delay)).to_rfc3339(),
+                    next_poll_at,
                     now_text,
                     i64::from(force_degraded),
+                    credential_revision,
                 ],
             )
             .map_err(map_db("record Binance poll failure"))?;
@@ -1094,9 +1488,30 @@ impl AppStore {
                 &cooldown_until,
             )?;
         }
+        let became_degraded = force_degraded || failures >= 3;
+        if updated == 1
+            && (noteworthy_binance_poll_error(error_code)
+                || (became_degraded && previous.1 != "degraded"))
+        {
+            enqueue_binance_poll_alert_tx(
+                &tx,
+                account_id,
+                &previous.2,
+                &previous.3,
+                "firing",
+                error_code,
+                failures,
+                previous.4.as_deref(),
+                Some(&next_poll_at),
+                became_degraded,
+                &now.timestamp_millis().to_string(),
+                now,
+            )?;
+        }
         tx.commit().map_err(map_db("commit Binance poll failure"))
     }
 
+    #[cfg(test)]
     pub async fn binance_process_poll_success(
         &self,
         account: &StoredPaymentAccount,
@@ -1106,6 +1521,52 @@ impl AppStore {
         globally_enabled: bool,
         poll_interval_secs: i64,
     ) -> Result<Vec<BillingAction>, AppError> {
+        self.binance_process_poll_success_inner(
+            account,
+            lease_owner,
+            transactions,
+            cipher,
+            globally_enabled,
+            poll_interval_secs,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn binance_process_poll_batch(
+        &self,
+        account: &StoredPaymentAccount,
+        lease_owner: &str,
+        transactions: &[BinancePayTransaction],
+        cipher: &CredentialCipher,
+        globally_enabled: bool,
+        poll_interval_secs: i64,
+        checkpoint: &super::PollScanCheckpoint,
+    ) -> Result<Vec<BillingAction>, AppError> {
+        self.binance_process_poll_success_inner(
+            account,
+            lease_owner,
+            transactions,
+            cipher,
+            globally_enabled,
+            poll_interval_secs,
+            Some(checkpoint),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn binance_process_poll_success_inner(
+        &self,
+        account: &StoredPaymentAccount,
+        lease_owner: &str,
+        transactions: &[BinancePayTransaction],
+        cipher: &CredentialCipher,
+        globally_enabled: bool,
+        poll_interval_secs: i64,
+        checkpoint: Option<&super::PollScanCheckpoint>,
+    ) -> Result<Vec<BillingAction>, AppError> {
         let prepared = prepare_transactions(account, transactions, cipher)?;
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
@@ -1114,24 +1575,34 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Binance transaction ingestion"))?;
-        let lease_is_current = tx
+        let previous_poll_state = tx
             .query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM binance_payment_accounts
-                     WHERE id = ?1 AND lease_owner = ?2
-                       AND credential_revision = ?3
-                       AND status IN ('verified', 'degraded')
-                       AND credentials_ciphertext != ''
-                 )",
+                "SELECT status, consecutive_failures, last_poll_error_code,
+                        last_poll_success_at, supplier_user_id, payment_home_region
+                 FROM binance_payment_accounts
+                 WHERE id = ?1 AND lease_owner = ?2
+                   AND credential_revision = ?3
+                   AND status IN ('verified', 'degraded')
+                   AND credentials_ciphertext != ''",
                 params![account.id, lease_owner, account.credential_revision],
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
             )
+            .optional()
             .map_err(map_db("fence Binance account poll lease"))?;
-        if lease_is_current == 0 {
+        let Some(previous_poll_state) = previous_poll_state else {
             return Err(AppError::Conflict(
                 "Binance account poll lease is no longer current".into(),
             ));
-        }
+        };
         expire_due_intents_tx(&tx, &now, &cooldown_until)?;
         let mut actions = Vec::new();
         let mut max_transaction_time = account.poll_cursor_at.clone();
@@ -1153,10 +1624,12 @@ impl AppStore {
                         account_binance_uid, encryption_key_version, transaction_id,
                         order_id, order_type, transaction_time, direction, currency,
                         amount_units, amount_scale, receiver_uid, counterparty_fingerprint,
+                        payer_binance_id_fingerprint, counterparty_fingerprint_source,
                         raw_payload_ciphertext, raw_payload_nonce, ingestion_status,
                         match_status, match_reason, observed_at
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                               ?12, 10000, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                               ?12, 10000, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                               ?20, ?21, ?22)",
                     params![
                         prepared.id,
                         account.id,
@@ -1172,6 +1645,8 @@ impl AppStore {
                         prepared.amount_units,
                         prepared.receiver_uid,
                         prepared.counterparty_fingerprint,
+                        prepared.payer_binance_id_fingerprint,
+                        prepared.counterparty_fingerprint_source,
                         prepared.raw_payload_ciphertext,
                         prepared.raw_payload_nonce,
                         prepared.ingestion_status,
@@ -1212,19 +1687,33 @@ impl AppStore {
                 &mut actions,
             )?;
         }
+        let (completed_cursor_at, scan_cursor_at, scan_target_at) = checkpoint
+            .map(|checkpoint| {
+                (
+                    checkpoint.completed_cursor_at.as_deref(),
+                    checkpoint.scan_cursor_at.as_deref(),
+                    checkpoint.scan_target_at.as_deref(),
+                )
+            })
+            .unwrap_or((max_transaction_time.as_deref(), None, None));
         let completed = tx
             .execute(
                 "UPDATE binance_payment_accounts
              SET status = 'verified', last_poll_success_at = ?3,
                  last_poll_error_code = NULL, consecutive_failures = 0,
-                 poll_cursor_at = COALESCE(?4, poll_cursor_at), next_poll_at = ?5,
+                 degraded_since = NULL,
+                 poll_cursor_at = COALESCE(?4, poll_cursor_at),
+                 poll_scan_cursor_at = ?5, poll_scan_target_at = ?6,
+                 next_poll_at = ?7,
                  lease_owner = NULL, lease_until = NULL, updated_at = ?3
-             WHERE id = ?1 AND lease_owner = ?2 AND credential_revision = ?6",
+             WHERE id = ?1 AND lease_owner = ?2 AND credential_revision = ?8",
                 params![
                     account.id,
                     lease_owner,
                     now,
-                    max_transaction_time,
+                    completed_cursor_at,
+                    scan_cursor_at,
+                    scan_target_at,
                     (now_dt + Duration::seconds(poll_interval_secs.max(1))).to_rfc3339(),
                     account.credential_revision,
                 ],
@@ -1234,6 +1723,38 @@ impl AppStore {
             return Err(AppError::Conflict(
                 "Binance account poll lease changed before completion".into(),
             ));
+        }
+        let stale_cutoff = now_dt - Duration::minutes(5);
+        let previously_stale = previous_poll_state
+            .3
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value.with_timezone(&Utc) <= stale_cutoff)
+            || (previous_poll_state.3.is_none()
+                && account
+                    .active_intent_started_at
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .is_some_and(|value| value.with_timezone(&Utc) <= stale_cutoff));
+        if previous_poll_state.0 == "degraded"
+            || previous_poll_state.1 > 0
+            || previous_poll_state.2.is_some()
+            || previously_stale
+        {
+            enqueue_binance_poll_alert_tx(
+                &tx,
+                &account.id,
+                &previous_poll_state.4,
+                &previous_poll_state.5,
+                "resolved",
+                previous_poll_state.2.as_deref().unwrap_or("POLL_RECOVERED"),
+                previous_poll_state.1,
+                previous_poll_state.3.as_deref(),
+                None,
+                false,
+                &now_dt.timestamp_millis().to_string(),
+                now_dt,
+            )?;
         }
         tx.commit()
             .map_err(map_db("commit Binance transaction ingestion"))?;
@@ -1253,7 +1774,10 @@ impl AppStore {
                         reconciliation.status, reconciliation.detail_json,
                         account.supplier_user_id, payment.account_binance_uid,
                         payment.transaction_time, payment.currency,
-                        payment.amount_units, invoice.status,
+                        payment.amount_units, payment.order_id,
+                        payment.counterparty_fingerprint,
+                        payment.counterparty_fingerprint_source,
+                        payment.payer_binance_id_fingerprint, invoice.status,
                         reconciliation.created_at, reconciliation.resolved_at
                  FROM market_payment_reconciliation_cases reconciliation
                  JOIN binance_payment_accounts account
@@ -1270,12 +1794,23 @@ impl AppStore {
                 statement
                     .query_map([], |row| {
                         let detail_json = row.get::<_, String>(7)?;
+                        let counterparty_source = row.get::<_, Option<String>>(15)?;
                         Ok(BinanceReconciliationCaseView {
                             id: row.get(0)?,
                             invoice_id: row.get(1)?,
                             payment_intent_id: row.get(2)?,
                             payment_account_id: row.get(3)?,
                             transaction_id: row.get(4)?,
+                            order_id: row.get(13)?,
+                            counterparty_reference: (counterparty_source.as_deref()
+                                == Some("counterparty_id"))
+                            .then(|| row.get::<_, Option<String>>(14))
+                            .transpose()?
+                            .flatten()
+                            .map(|fingerprint| anonymous_fingerprint("cp", &fingerprint)),
+                            payer_binance_id_reference: row
+                                .get::<_, Option<String>>(16)?
+                                .map(|fingerprint| anonymous_fingerprint("payer", &fingerprint)),
                             case_kind: row.get(5)?,
                             status: row.get(6)?,
                             detail: serde_json::from_str(&detail_json)
@@ -1285,14 +1820,48 @@ impl AppStore {
                             transaction_time: row.get(10)?,
                             asset: row.get(11)?,
                             amount: format_amount(row.get(12)?),
-                            invoice_status: row.get(13)?,
-                            created_at: row.get(14)?,
-                            resolved_at: row.get(15)?,
+                            invoice_status: row.get(17)?,
+                            created_at: row.get(18)?,
+                            resolved_at: row.get(19)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("read Binance reconciliation cases"))?;
+        let degraded_accounts = conn
+            .prepare(
+                "SELECT id, supplier_user_id, binance_uid, payment_home_region,
+                        automation_mode, last_poll_success_at, last_poll_error_code,
+                        consecutive_failures, degraded_since, next_poll_at, lease_until,
+                        poll_scan_cursor_at, poll_scan_target_at, updated_at
+                 FROM binance_payment_accounts
+                 WHERE status = 'degraded'
+                 ORDER BY COALESCE(degraded_since, updated_at), id
+                 LIMIT 200",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok(BinanceDegradedAccountView {
+                            payment_account_id: row.get(0)?,
+                            supplier_user_id: row.get(1)?,
+                            binance_uid: row.get(2)?,
+                            payment_home_region: row.get(3)?,
+                            automation_mode: row.get(4)?,
+                            last_poll_success_at: row.get(5)?,
+                            last_poll_error_code: row.get(6)?,
+                            consecutive_failures: row.get(7)?,
+                            degraded_since: row.get(8)?,
+                            next_poll_at: row.get(9)?,
+                            lease_until: row.get(10)?,
+                            poll_scan_cursor_at: row.get(11)?,
+                            poll_scan_target_at: row.get(12)?,
+                            updated_at: row.get(13)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read degraded Binance payment accounts"))?;
         let (open_case_count, pending_intent_count, degraded_account_count, oldest_open_case_at) =
             conn.query_row(
                 "SELECT
@@ -1313,6 +1882,7 @@ impl AppStore {
             .map_err(map_db("read Binance settlement operational summary"))?;
         Ok(BinanceSettlementAdminView {
             cases,
+            degraded_accounts,
             open_case_count,
             pending_intent_count,
             degraded_account_count,
@@ -1558,6 +2128,9 @@ struct PreparedTransaction {
     amount_units: i64,
     receiver_uid: Option<String>,
     counterparty_fingerprint: Option<String>,
+    payer_binance_id_fingerprint: Option<String>,
+    counterparty_fingerprint_source: Option<&'static str>,
+    identity_review_reason: Option<&'static str>,
     raw_payload_ciphertext: String,
     raw_payload_nonce: String,
     ingestion_status: String,
@@ -1591,11 +2164,15 @@ fn prepare_transactions(
             };
             let receiver_uid = transaction.receiver_info.uid();
             let payer_uid = transaction.payer_info.uid();
-            let counterparty =
-                value_as_identifier(&transaction.counterparty_id).or_else(|| payer_uid.clone());
+            let counterparty = value_as_identifier(&transaction.counterparty_id);
             let fingerprint_context = format!("binance-counterparty:{}", account.id);
             let counterparty_fingerprint = counterparty
+                .as_ref()
                 .map(|value| cipher.fingerprint(fingerprint_context.as_bytes(), value.as_bytes()));
+            let payer_fingerprint_context = format!("binance-payer-binance-id:{}", account.id);
+            let payer_binance_id_fingerprint = payer_uid.as_ref().map(|value| {
+                cipher.fingerprint(payer_fingerprint_context.as_bytes(), value.as_bytes())
+            });
             let transaction_time = Utc
                 .timestamp_millis_opt(transaction.transaction_time)
                 .single()
@@ -1649,6 +2226,11 @@ fn prepare_transactions(
                 amount_units,
                 receiver_uid,
                 counterparty_fingerprint,
+                payer_binance_id_fingerprint,
+                counterparty_fingerprint_source: counterparty
+                    .is_some()
+                    .then_some("counterparty_id"),
+                identity_review_reason: counterparty.is_none().then_some("counterparty_id_missing"),
                 raw_payload_ciphertext,
                 raw_payload_nonce,
                 ingestion_status: ingestion_status.into(),
@@ -1748,6 +2330,8 @@ fn match_transaction_tx(
                 "UPDATE binance_pay_transactions
                  SET match_status = 'ignored', match_reason = 'unrelated_incoming',
                      order_id = NULL, counterparty_fingerprint = NULL,
+                     payer_binance_id_fingerprint = NULL,
+                     counterparty_fingerprint_source = NULL,
                      raw_payload_ciphertext = '', raw_payload_nonce = ''
                  WHERE payment_account_id = ?1 AND transaction_id = ?2",
                 params![account.id, transaction.transaction_id],
@@ -1775,6 +2359,41 @@ fn match_transaction_tx(
             params![account.id, transaction.transaction_id, intent_id],
         )
         .map_err(map_db("mark non-payable Binance match for review"))?;
+        return Ok(());
+    }
+    if let Some(reason) = transaction.identity_review_reason {
+        create_reconciliation_case_tx(
+            tx,
+            account,
+            transaction,
+            reason,
+            now,
+            Some(invoice_id),
+            Some(intent_id),
+        )?;
+        tx.execute(
+            "UPDATE binance_pay_transactions
+             SET ingestion_status = 'review_required', match_status = 'review_required',
+                 match_reason = ?3, payment_intent_id = ?4
+             WHERE payment_account_id = ?1 AND transaction_id = ?2",
+            params![account.id, transaction.transaction_id, reason, intent_id],
+        )
+        .map_err(map_db("mark Binance identity schema drift for review"))?;
+        let intent_updated = tx
+            .execute(
+                "UPDATE market_payment_intents
+                 SET status = 'review_required', matched_transaction_id = ?2,
+                     updated_at = ?3
+                 WHERE id = ?1 AND status IN ('pending', 'expired')",
+                params![intent_id, transaction.transaction_id, now],
+            )
+            .map_err(map_db("mark Binance identity-drift intent for review"))?;
+        if intent_updated != 1 {
+            return Err(AppError::Conflict(
+                "Binance payment intent changed during identity review".into(),
+            ));
+        }
+        cool_intent_amount_tx(tx, intent_id, cooldown_until)?;
         return Ok(());
     }
     tx.execute(
@@ -2247,10 +2866,10 @@ fn cancel_payment_account_intents_tx(
         cancel_intent_tx(tx, &intent_id, reason, now, cooldown_until)?;
     }
     // Buyer-cancelled/refreshed intents normally remain visible to the poller
-    // until their late-payment window closes. A credential rebind or account
+    // until their late-payment window closes. A Binance UID change or account
     // disable is a stronger identity boundary: relabel every still-live
-    // cancelled intent so it cannot resume polling under a future credential
-    // revision (which may belong to a different Binance UID).
+    // cancelled intent so it cannot resume polling in a different payment
+    // account domain.
     tx.execute(
         "UPDATE market_payment_intents
          SET cancellation_reason = ?2, updated_at = ?3
@@ -2409,6 +3028,7 @@ fn ensure_safe_verification(
     if !verification.reading_enabled
         || !verification.dangerous_permissions_disabled
         || (require_uid_confirmation && !verification.uid_confirmed)
+        || verification.uid_confirmed != verification.uid_confirmation_source.is_some()
     {
         return Err(AppError::Internal(
             "unsafe Binance verification result reached credential storage".into(),
@@ -2464,6 +3084,96 @@ fn clean_optional(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.chars().take(200).collect())
 }
 
+fn anonymous_fingerprint(namespace: &str, fingerprint: &str) -> String {
+    format!(
+        "{namespace}:{}",
+        fingerprint.chars().take(12).collect::<String>()
+    )
+}
+
+fn noteworthy_binance_poll_error(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        "BINANCE_IP_BANNED"
+            | "BINANCE_RATE_LIMITED"
+            | "BINANCE_UPSTREAM_ERROR"
+            | "BINANCE_PAGINATION_LIMIT_REACHED"
+            | "BINANCE_PAGINATION_BUDGET_REACHED"
+            | "BINANCE_TIMESTAMP_SATURATED"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_binance_poll_alert_tx(
+    conn: &Connection,
+    account_id: &str,
+    supplier_user_id: &str,
+    payment_home_region: &str,
+    transition: &str,
+    error_code: &str,
+    consecutive_failures: i64,
+    last_poll_success_at: Option<&str>,
+    next_poll_at: Option<&str>,
+    degraded: bool,
+    source_event_suffix: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let resolved = transition == "resolved";
+    let severity = if resolved {
+        "warning"
+    } else if degraded
+        || matches!(
+            error_code,
+            "BINANCE_IP_BANNED"
+                | "BINANCE_PAGINATION_LIMIT_REACHED"
+                | "BINANCE_PAGINATION_BUDGET_REACHED"
+                | "BINANCE_TIMESTAMP_SATURATED"
+        )
+    {
+        "critical"
+    } else {
+        "warning"
+    };
+    let safe_error_code = sanitize_code(error_code);
+    let title = if resolved {
+        "Binance settlement polling recovered"
+    } else if degraded {
+        "Binance settlement account degraded"
+    } else {
+        "Binance settlement polling impaired"
+    };
+    let message = if resolved {
+        format!("Binance settlement polling recovered for payment account {account_id}.")
+    } else {
+        format!(
+            "Binance settlement polling failed for payment account {account_id}: {safe_error_code}."
+        )
+    };
+    crate::store::enqueue_operator_alert_signal_tx(
+        conn,
+        &format!("binance-settlement:{transition}:{account_id}:{source_event_suffix}"),
+        &format!("binance_settlement_poll:binance_payment_account:{account_id}"),
+        transition,
+        "binance_settlement_poll",
+        "binance_payment_account",
+        Some(account_id),
+        severity,
+        title,
+        &message,
+        serde_json::json!({
+            "paymentAccountId": account_id,
+            "supplierUserId": supplier_user_id,
+            "paymentHomeRegion": payment_home_region,
+            "errorCode": safe_error_code,
+            "consecutiveFailures": consecutive_failures,
+            "lastPollSuccessAt": last_poll_success_at,
+            "nextPollAt": next_poll_at,
+            "degraded": degraded,
+        }),
+        occurred_at,
+    )
+}
+
 fn sanitize_code(value: &str) -> String {
     value
         .chars()
@@ -2511,6 +3221,9 @@ mod tests {
             reading_enabled: true,
             dangerous_permissions_disabled: true,
             uid_confirmed: true,
+            uid_confirmation_source: Some(
+                super::super::client::UidConfirmationSource::ReceiverHistory,
+            ),
         }
     }
 
@@ -2790,7 +3503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credential_rotation_is_cas_fenced_and_cancels_live_intents() {
+    async fn same_uid_credential_rotation_is_cas_fenced_and_preserves_live_intents() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let fixture = settlement_fixture(&store, "credential-cas").await;
         let previously_cancelled_intent = store
@@ -2889,15 +3602,20 @@ mod tests {
             .expect("rotated account exists");
         assert_eq!(stored.id, fixture.payment_account_id);
         assert_eq!(stored.credential_revision, first_revision);
-        assert!(stored.poll_cursor_at.is_none());
+        assert!(stored.poll_cursor_at.is_some());
         let decoded =
             decode_account_credentials(stored, &fixture.cipher).expect("decrypt winning rotation");
         assert_eq!(decoded.credentials.api_key, first_credentials.api_key);
         let conn = store.conn.lock().await;
-        let (status, reason, cooldown_until, late_grace_until): (String, String, String, String) =
-            conn.query_row(
+        let (status, reason, reservation_status, cooldown_until): (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
                 "SELECT intent.status, intent.cancellation_reason,
-                        reservation.cooldown_until, intent.late_grace_until
+                        reservation.status, reservation.cooldown_until
                    FROM market_payment_intents intent
                    JOIN market_payment_amount_reservations reservation
                      ON reservation.intent_id = intent.id
@@ -2906,9 +3624,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("read intent cancelled by rotation");
-        assert_eq!(status, "cancelled");
-        assert_eq!(reason, "payment_account_rebound");
-        assert!(cooldown_until >= late_grace_until);
+        assert_eq!(status, "expired");
+        assert_eq!(reason, None);
+        assert_eq!(reservation_status, "reserved");
+        assert_eq!(cooldown_until, None);
         let old_cancellation_reason: String = conn
             .query_row(
                 "SELECT cancellation_reason FROM market_payment_intents WHERE id = ?1",
@@ -2916,13 +3635,96 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read pre-cancelled intent fenced by rotation");
-        assert_eq!(old_cancellation_reason, "payment_account_rebound");
+        assert_eq!(old_cancellation_reason, "buyer_cancelled");
         drop(conn);
         assert!(
             store
                 .binance_claim_poll_account("test", "post-rotation-worker")
                 .await
                 .expect("check polling after credential rotation")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_uid_rebind_cancels_and_fences_the_old_payment_domain() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "changed-uid-rebind").await;
+        let intent = store
+            .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
+            .await
+            .expect("create old-UID intent");
+        let new_uid = "987654321";
+        let methods = serde_json::to_string(&[PaymentMethod {
+            kind: "binance".into(),
+            account: Some(new_uid.into()),
+            qr_image_url: None,
+            asset_url: None,
+            token: None,
+            chain: None,
+            address: None,
+            instructions: None,
+            settlement_asset: Some(PAYMENT_ASSET.into()),
+        }])
+        .expect("serialize replacement Binance method");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE account_payment_profiles SET methods_json = ?2 WHERE user_id = ?1",
+                params![fixture.supplier.user_id, methods],
+            )
+            .expect("publish replacement UID");
+        }
+        let (account_id, revision) = store
+            .binance_prepare_account_binding(&fixture.supplier.user_id, "test", new_uid)
+            .await
+            .expect("prepare changed-UID rebind");
+        let credentials = BinanceCredentials {
+            api_key: "changed-uid-key-0123456789".into(),
+            api_secret: "changed-uid-secret-0123456789".into(),
+        };
+        let aad = credential_aad(&account_id, &fixture.supplier.user_id, revision);
+        let (ciphertext, nonce) = fixture
+            .cipher
+            .seal_json(&credentials, aad.as_bytes())
+            .expect("encrypt changed-UID credentials");
+        store
+            .binance_save_verified_account(
+                &fixture.supplier.user_id,
+                &account_id,
+                "test",
+                new_uid,
+                &credentials.api_key,
+                &ciphertext,
+                &nonce,
+                fixture.cipher.version(),
+                revision,
+                "enabled",
+                &verified_permissions(),
+            )
+            .await
+            .expect("save changed-UID rebind");
+
+        let conn = store.conn.lock().await;
+        let (status, reason, bound_uid): (String, String, String) = conn
+            .query_row(
+                "SELECT intent.status, intent.cancellation_reason, account.binance_uid
+                 FROM market_payment_intents intent
+                 JOIN binance_payment_accounts account ON account.id = intent.payment_account_id
+                 WHERE intent.id = ?1",
+                params![intent.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read changed-UID boundary");
+        assert_eq!(status, "cancelled");
+        assert_eq!(reason, "payment_account_rebound");
+        assert_eq!(bound_uid, new_uid);
+        drop(conn);
+        assert!(
+            store
+                .binance_claim_poll_account("test", "changed-uid-worker")
+                .await
+                .expect("check changed-UID polling boundary")
                 .is_none()
         );
     }
@@ -3004,6 +3806,93 @@ mod tests {
                 .await,
             Err(AppError::ServiceUnavailable(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn same_uid_rebind_keeps_global_disable_boundary_payment_reconcilable() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "global-disable-rebind").await;
+        let intent = store
+            .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
+            .await
+            .expect("create intent before global disable");
+        store
+            .binance_cancel_live_intents_for_global_disable()
+            .await
+            .expect("apply global disable");
+
+        let (account_id, revision) = store
+            .binance_prepare_account_binding(&fixture.supplier.user_id, "test", "123456789")
+            .await
+            .expect("prepare same-UID rebind");
+        let rebound_credentials = BinanceCredentials {
+            api_key: "same-uid-rebound-key-0123456789".into(),
+            api_secret: "same-uid-rebound-secret-0123456789".into(),
+        };
+        let aad = credential_aad(&account_id, &fixture.supplier.user_id, revision);
+        let (ciphertext, nonce) = fixture
+            .cipher
+            .seal_json(&rebound_credentials, aad.as_bytes())
+            .expect("encrypt rebound credentials");
+        store
+            .binance_save_verified_account(
+                &fixture.supplier.user_id,
+                &account_id,
+                "test",
+                "123456789",
+                &rebound_credentials.api_key,
+                &ciphertext,
+                &nonce,
+                fixture.cipher.version(),
+                revision,
+                "enabled",
+                &verified_permissions(),
+            )
+            .await
+            .expect("save same-UID rebind");
+
+        let account = claim_account(&store).await;
+        store
+            .binance_process_poll_success(
+                &account,
+                "test-worker",
+                &[transaction(
+                    "tx-global-disable-boundary",
+                    &intent.pay_amount,
+                    "USDT",
+                    "C2C",
+                    Some("123456789"),
+                )],
+                &fixture.cipher,
+                true,
+                4,
+            )
+            .await
+            .expect("ingest boundary payment after rebind");
+
+        let overview = store
+            .binance_admin_reconciliation()
+            .await
+            .expect("load boundary reconciliation");
+        assert_eq!(overview.open_case_count, 1);
+        assert_eq!(
+            overview.cases[0].invoice_id.as_deref(),
+            Some(fixture.invoice_id.as_str())
+        );
+        assert_eq!(
+            overview.cases[0].payment_intent_id.as_deref(),
+            Some(intent.id.as_str())
+        );
+        let conn = store.conn.lock().await;
+        let (status, reason): (String, String) = conn
+            .query_row(
+                "SELECT status, cancellation_reason FROM market_payment_intents WHERE id = ?1",
+                params![intent.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read preserved boundary intent");
+        assert_eq!(status, "cancelled");
+        assert_eq!(reason, "global_settlement_disabled");
     }
 
     #[tokio::test]
@@ -3212,17 +4101,22 @@ mod tests {
             .binance_record_poll_failure(
                 &account.id,
                 "test-worker",
+                account.credential_revision,
                 "BINANCE_CREDENTIALS_REJECTED",
                 None,
             )
             .await
             .expect("record fatal poll failure");
         let conn = store.conn.lock().await;
-        let state: (String, Option<String>, String, i64, String) = conn
+        let state: (String, Option<String>, String, i64, String, Option<String>, i64) = conn
             .query_row(
                 "SELECT status, permissions_verified_at, last_poll_error_code,
                         consecutive_failures,
-                        (SELECT status FROM market_payment_intents WHERE id = ?2)
+                        (SELECT status FROM market_payment_intents WHERE id = ?2),
+                        degraded_since,
+                        (SELECT COUNT(*) FROM operator_alert_signal_outbox
+                          WHERE fingerprint = 'binance_settlement_poll:binance_payment_account:' || ?1
+                            AND transition = 'firing')
                    FROM binance_payment_accounts WHERE id = ?1",
                 params![fixture.payment_account_id, intent.id],
                 |row| {
@@ -3232,6 +4126,8 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -3241,6 +4137,281 @@ mod tests {
         assert_eq!(state.2, "BINANCE_CREDENTIALS_REJECTED");
         assert_eq!(state.3, 1);
         assert_eq!(state.4, "cancelled");
+        assert!(state.5.is_some());
+        assert_eq!(state.6, 1);
+    }
+
+    #[tokio::test]
+    async fn ip_bans_and_saturated_timestamps_fail_closed_on_the_first_error() {
+        for (fixture_suffix, error_code, retry_after_secs) in [
+            ("ip-ban", "BINANCE_IP_BANNED", None),
+            (
+                "timestamp-saturated",
+                "BINANCE_TIMESTAMP_SATURATED",
+                Some(60 * 60),
+            ),
+        ] {
+            let store = AppStore::new_in_memory_for_tests().expect("test store");
+            let fixture = settlement_fixture(&store, fixture_suffix).await;
+            let intent = store
+                .binance_create_or_refresh_intent(
+                    &fixture.buyer,
+                    &fixture.invoice_id,
+                    "test",
+                    false,
+                )
+                .await
+                .expect("create intent before hard polling failure");
+            let account = claim_account(&store).await;
+            let before_failure = Utc::now();
+            store
+                .binance_record_poll_failure(
+                    &account.id,
+                    "test-worker",
+                    account.credential_revision,
+                    error_code,
+                    retry_after_secs,
+                )
+                .await
+                .expect("record hard polling failure");
+            let conn = store.conn.lock().await;
+            let state: (String, String, String, String) = conn
+                .query_row(
+                    "SELECT status, last_poll_error_code, next_poll_at,
+                            (SELECT status FROM market_payment_intents WHERE id = ?2)
+                     FROM binance_payment_accounts WHERE id = ?1",
+                    params![fixture.payment_account_id, intent.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read hard polling failure state");
+            assert_eq!(state.0, "degraded", "error={error_code}");
+            assert_eq!(state.1, error_code);
+            assert_eq!(state.3, "cancelled", "error={error_code}");
+            let next_poll_at = DateTime::parse_from_rfc3339(&state.2)
+                .expect("valid next poll timestamp")
+                .with_timezone(&Utc);
+            assert!(
+                next_poll_at >= before_failure + Duration::minutes(59),
+                "hard failure must not hammer Binance: error={error_code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_and_stale_poll_health_emit_deduplicated_operator_alerts() {
+        let rate_store = AppStore::new_in_memory_for_tests().expect("test store");
+        let rate_fixture = settlement_fixture(&rate_store, "rate-limit-alert").await;
+        rate_store
+            .binance_create_or_refresh_intent(
+                &rate_fixture.buyer,
+                &rate_fixture.invoice_id,
+                "test",
+                false,
+            )
+            .await
+            .expect("create rate-limit intent");
+        let account = claim_account(&rate_store).await;
+        rate_store
+            .binance_record_poll_failure(
+                &account.id,
+                "test-worker",
+                account.credential_revision,
+                "BINANCE_RATE_LIMITED",
+                Some(60),
+            )
+            .await
+            .expect("record rate limit");
+        {
+            let conn = rate_store.conn.lock().await;
+            let (status, alerts): (String, i64) = conn
+                .query_row(
+                    "SELECT status,
+                            (SELECT COUNT(*) FROM operator_alert_signal_outbox
+                              WHERE fingerprint = 'binance_settlement_poll:binance_payment_account:' || ?1
+                                AND transition = 'firing')
+                     FROM binance_payment_accounts WHERE id = ?1",
+                    params![rate_fixture.payment_account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read rate-limit alert state");
+            assert_eq!(status, "verified");
+            assert_eq!(alerts, 1);
+            conn.execute(
+                "UPDATE binance_payment_accounts SET next_poll_at = ?2 WHERE id = ?1",
+                params![rate_fixture.payment_account_id, Utc::now().to_rfc3339()],
+            )
+            .expect("make rate-limited account retryable");
+        }
+        let recovered = rate_store
+            .binance_claim_poll_account("test", "recovery-worker")
+            .await
+            .expect("claim rate-limit recovery")
+            .expect("rate-limited account is retryable");
+        rate_store
+            .binance_mark_account_verified(
+                &recovered.supplier_user_id,
+                "test",
+                &recovered.id,
+                recovered.credential_revision,
+                Some("recovery-worker"),
+                &verified_permissions(),
+            )
+            .await
+            .expect("periodic permission verification succeeds");
+        {
+            let conn = rate_store.conn.lock().await;
+            let state: (String, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT status, consecutive_failures, last_poll_error_code
+                     FROM binance_payment_accounts WHERE id = ?1",
+                    params![rate_fixture.payment_account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read state retained until transaction polling succeeds");
+            assert_eq!(state.0, "verified");
+            assert_eq!(state.1, 1);
+            assert_eq!(state.2.as_deref(), Some("BINANCE_RATE_LIMITED"));
+        }
+        rate_store
+            .binance_process_poll_success(
+                &recovered,
+                "recovery-worker",
+                &[],
+                &rate_fixture.cipher,
+                true,
+                4,
+            )
+            .await
+            .expect("record polling recovery");
+        {
+            let conn = rate_store.conn.lock().await;
+            let resolved: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                     WHERE fingerprint = 'binance_settlement_poll:binance_payment_account:' || ?1
+                       AND transition = 'resolved'",
+                    params![rate_fixture.payment_account_id],
+                    |row| row.get(0),
+                )
+                .expect("count poll recovery alerts");
+            assert_eq!(resolved, 1);
+        }
+
+        let stale_store = AppStore::new_in_memory_for_tests().expect("test store");
+        let stale_fixture = settlement_fixture(&stale_store, "stale-poll-alert").await;
+        let intent = stale_store
+            .binance_create_or_refresh_intent(
+                &stale_fixture.buyer,
+                &stale_fixture.invoice_id,
+                "test",
+                false,
+            )
+            .await
+            .expect("create stale polling intent");
+        {
+            let conn = stale_store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_payment_intents SET created_at = ?2 WHERE id = ?1",
+                params![intent.id, (Utc::now() - Duration::minutes(6)).to_rfc3339()],
+            )
+            .expect("age stale polling intent");
+        }
+        stale_store
+            .binance_reconcile_poll_health_alerts()
+            .await
+            .expect("emit stale polling alert");
+        stale_store
+            .binance_reconcile_poll_health_alerts()
+            .await
+            .expect("repeat stale polling reconciliation");
+        let conn = stale_store.conn.lock().await;
+        let alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE fingerprint = 'binance_settlement_poll:binance_payment_account:' || ?1
+                   AND transition = 'firing'",
+                params![stale_fixture.payment_account_id],
+                |row| row.get(0),
+            )
+            .expect("count deduplicated stale polling alerts");
+        assert_eq!(alerts, 1);
+        drop(conn);
+
+        let idle_store = AppStore::new_in_memory_for_tests().expect("idle test store");
+        let idle_fixture = settlement_fixture(&idle_store, "idle-poll-health").await;
+        {
+            let conn = idle_store.conn.lock().await;
+            conn.execute(
+                "UPDATE binance_payment_accounts SET last_poll_success_at = ?2 WHERE id = ?1",
+                params![
+                    idle_fixture.payment_account_id,
+                    (Utc::now() - Duration::minutes(30)).to_rfc3339(),
+                ],
+            )
+            .expect("age idle account's last successful poll");
+        }
+        idle_store
+            .binance_reconcile_poll_health_alerts()
+            .await
+            .expect("reconcile idle account health");
+        let conn = idle_store.conn.lock().await;
+        let idle_alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE fingerprint = 'binance_settlement_poll:binance_payment_account:' || ?1",
+                params![idle_fixture.payment_account_id],
+                |row| row.get(0),
+            )
+            .expect("count idle account alerts");
+        assert_eq!(idle_alerts, 0, "idle accounts are intentionally not polled");
+    }
+
+    #[tokio::test]
+    async fn manual_reverification_resolves_an_impaired_poll_incident() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "manual-poll-recovery").await;
+        store
+            .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
+            .await
+            .expect("create payment intent");
+        let account = claim_account(&store).await;
+        store
+            .binance_record_poll_failure(
+                &account.id,
+                "test-worker",
+                account.credential_revision,
+                "BINANCE_RATE_LIMITED",
+                Some(60),
+            )
+            .await
+            .expect("record impaired polling");
+        store
+            .binance_mark_account_verified(
+                &account.supplier_user_id,
+                "test",
+                &account.id,
+                account.credential_revision,
+                None,
+                &verified_permissions(),
+            )
+            .await
+            .expect("manually reverify account");
+        let conn = store.conn.lock().await;
+        let state: (String, i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT status, consecutive_failures, last_poll_error_code,
+                        (SELECT COUNT(*) FROM operator_alert_signal_outbox
+                          WHERE fingerprint = 'binance_settlement_poll:binance_payment_account:' || ?1
+                            AND transition = 'resolved')
+                 FROM binance_payment_accounts WHERE id = ?1",
+                params![fixture.payment_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read manual recovery state");
+        assert_eq!(state.0, "verified");
+        assert_eq!(state.1, 0);
+        assert!(state.2.is_none());
+        assert_eq!(state.3, 1);
     }
 
     #[tokio::test]
@@ -3503,7 +4674,8 @@ mod tests {
             .await
             .expect("create intent");
         let account = claim_account(&store).await;
-        let payment = transaction("tx-exact", &intent.pay_amount, "USDT", "C2C", None);
+        let mut payment = transaction("tx-exact", &intent.pay_amount, "USDT", "C2C", None);
+        payment.payer_info.binance_id = serde_json::json!("555666777");
         let actions = store
             .binance_process_poll_success(
                 &account,
@@ -3547,20 +4719,117 @@ mod tests {
         assert_eq!(transaction_count, 1);
         assert_eq!(receipt_count, 1);
         assert_eq!(uid_confirmed, 1);
-        let transaction_account_snapshot: (String, i64, i64) = conn
+        let transaction_account_snapshot: (String, i64, i64, String, String, String) = conn
             .query_row(
                 "SELECT account_binance_uid, account_credential_revision,
-                        encryption_key_version
+                        encryption_key_version, counterparty_fingerprint,
+                        payer_binance_id_fingerprint, counterparty_fingerprint_source
                    FROM binance_pay_transactions
                   WHERE payment_account_id = ?1 AND transaction_id = 'tx-exact'",
                 params![fixture.payment_account_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .expect("read transaction account snapshot");
-        assert_eq!(
-            transaction_account_snapshot,
-            ("123456789".into(), 1, fixture.cipher.version())
+        assert_eq!(transaction_account_snapshot.0, "123456789");
+        assert_eq!(transaction_account_snapshot.1, 1);
+        assert_eq!(transaction_account_snapshot.2, fixture.cipher.version());
+        assert!(!transaction_account_snapshot.3.is_empty());
+        assert!(!transaction_account_snapshot.4.is_empty());
+        assert_ne!(
+            transaction_account_snapshot.3,
+            transaction_account_snapshot.4
         );
+        assert_eq!(transaction_account_snapshot.5, "counterparty_id");
+    }
+
+    #[tokio::test]
+    async fn missing_stable_counterparty_id_routes_an_exact_payment_to_review() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "counterparty-schema-drift").await;
+        let intent = store
+            .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
+            .await
+            .expect("create intent");
+        let account = claim_account(&store).await;
+        let mut payment = transaction(
+            "tx-counterparty-missing",
+            &intent.pay_amount,
+            "USDT",
+            "C2C",
+            Some("123456789"),
+        );
+        payment.counterparty_id = serde_json::Value::Null;
+        payment.payer_info.binance_id = serde_json::json!("555666777");
+        store
+            .binance_process_poll_success(
+                &account,
+                "test-worker",
+                &[payment],
+                &fixture.cipher,
+                true,
+                4,
+            )
+            .await
+            .expect("ingest schema-drift payment");
+
+        let conn = store.conn.lock().await;
+        let state: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT
+                    (SELECT status FROM market_invoices WHERE id = ?1),
+                    (SELECT status FROM market_payment_intents WHERE id = ?2),
+                    payment.ingestion_status, payment.match_status,
+                    payment.counterparty_fingerprint,
+                    payment.counterparty_fingerprint_source,
+                    payment.payer_binance_id_fingerprint,
+                    reconciliation.case_kind
+                 FROM binance_pay_transactions payment
+                 JOIN market_payment_reconciliation_cases reconciliation
+                   ON reconciliation.payment_account_id = payment.payment_account_id
+                  AND reconciliation.transaction_id = payment.transaction_id
+                 WHERE payment.payment_account_id = ?3
+                   AND payment.transaction_id = 'tx-counterparty-missing'",
+                params![fixture.invoice_id, intent.id, fixture.payment_account_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("read schema-drift review state");
+        assert_eq!(state.0, "open");
+        assert_eq!(state.1, "review_required");
+        assert_eq!(state.2, "review_required");
+        assert_eq!(state.3, "review_required");
+        assert!(state.4.is_none());
+        assert!(state.5.is_none());
+        assert!(!state.6.is_empty());
+        assert_eq!(state.7, "counterparty_id_missing");
     }
 
     #[tokio::test]
@@ -3690,6 +4959,160 @@ mod tests {
             account.active_intent_started_at.as_deref(),
             Some(started_at.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn partial_poll_checkpoint_is_persisted_and_completed_without_advancing_early() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "poll-checkpoint").await;
+        store
+            .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
+            .await
+            .expect("create intent");
+        let account = claim_account(&store).await;
+        let scan_cursor = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+        let scan_target = Utc::now().to_rfc3339();
+        let partial = super::super::PollScanCheckpoint {
+            completed_cursor_at: None,
+            scan_cursor_at: Some(scan_cursor.clone()),
+            scan_target_at: Some(scan_target.clone()),
+        };
+        store
+            .binance_process_poll_batch(
+                &account,
+                "test-worker",
+                &[],
+                &fixture.cipher,
+                true,
+                1,
+                &partial,
+            )
+            .await
+            .expect("persist partial polling progress");
+        {
+            let conn = store.conn.lock().await;
+            let state: (Option<String>, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT poll_cursor_at, poll_scan_cursor_at, poll_scan_target_at
+                     FROM binance_payment_accounts WHERE id = ?1",
+                    params![fixture.payment_account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read partial polling progress");
+            assert!(state.0.is_none());
+            assert_eq!(state.1.as_deref(), Some(scan_cursor.as_str()));
+            assert_eq!(state.2.as_deref(), Some(scan_target.as_str()));
+            conn.execute(
+                "UPDATE binance_payment_accounts SET next_poll_at = ?2 WHERE id = ?1",
+                params![fixture.payment_account_id, Utc::now().to_rfc3339()],
+            )
+            .expect("make partial scan claimable");
+        }
+
+        let resumed = store
+            .binance_claim_poll_account("test", "resumed-worker")
+            .await
+            .expect("claim partial scan")
+            .expect("partial scan remains claimable");
+        assert_eq!(
+            resumed.poll_scan_cursor_at.as_deref(),
+            Some(scan_cursor.as_str())
+        );
+        assert_eq!(
+            resumed.poll_scan_target_at.as_deref(),
+            Some(scan_target.as_str())
+        );
+        let complete = super::super::PollScanCheckpoint {
+            completed_cursor_at: Some(scan_target.clone()),
+            scan_cursor_at: None,
+            scan_target_at: None,
+        };
+        store
+            .binance_process_poll_batch(
+                &resumed,
+                "resumed-worker",
+                &[],
+                &fixture.cipher,
+                true,
+                1,
+                &complete,
+            )
+            .await
+            .expect("complete resumed polling scan");
+        let conn = store.conn.lock().await;
+        let state: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT poll_cursor_at, poll_scan_cursor_at, poll_scan_target_at
+                 FROM binance_payment_accounts WHERE id = ?1",
+                params![fixture.payment_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read completed polling progress");
+        assert_eq!(state.0.as_deref(), Some(scan_target.as_str()));
+        assert!(state.1.is_none() && state.2.is_none());
+    }
+
+    #[tokio::test]
+    async fn graceful_worker_release_only_clears_its_own_poll_leases() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "lease-release").await;
+        store
+            .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
+            .await
+            .expect("create intent");
+        let account = claim_account(&store).await;
+        store
+            .binance_renew_poll_lease(&account.id, "test-worker", account.credential_revision)
+            .await
+            .expect("renew current poll lease");
+        assert!(matches!(
+            store
+                .binance_renew_poll_lease(
+                    &account.id,
+                    "test-worker",
+                    account.credential_revision + 1,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        store
+            .binance_record_poll_failure(
+                &account.id,
+                "test-worker",
+                account.credential_revision + 1,
+                "BINANCE_UPSTREAM_ERROR",
+                None,
+            )
+            .await
+            .expect("ignore stale-revision poll failure");
+        store
+            .binance_release_poll_leases("another-worker")
+            .await
+            .expect("ignore another worker's lease");
+        {
+            let conn = store.conn.lock().await;
+            let owner: String = conn
+                .query_row(
+                    "SELECT lease_owner FROM binance_payment_accounts WHERE id = ?1",
+                    params![fixture.payment_account_id],
+                    |row| row.get(0),
+                )
+                .expect("read retained lease");
+            assert_eq!(owner, "test-worker");
+        }
+        store
+            .binance_release_poll_leases("test-worker")
+            .await
+            .expect("release owned lease");
+        let conn = store.conn.lock().await;
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT lease_owner FROM binance_payment_accounts WHERE id = ?1",
+                params![fixture.payment_account_id],
+                |row| row.get(0),
+            )
+            .expect("read released lease");
+        assert!(owner.is_none());
     }
 
     #[tokio::test]

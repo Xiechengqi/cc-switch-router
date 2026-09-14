@@ -146,6 +146,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         40,
         include_str!("../schema/0040_share_request_error_snapshots.sql"),
     ),
+    (
+        41,
+        include_str!("../schema/0041_binance_settlement_hardening.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -760,6 +764,7 @@ mod tests {
         assert_eq!(versions[37], (38, migration_checksum(MIGRATIONS[36].1)));
         assert_eq!(versions[38], (39, migration_checksum(MIGRATIONS[37].1)));
         assert_eq!(versions[39], (40, migration_checksum(MIGRATIONS[38].1)));
+        assert_eq!(versions[40], (41, migration_checksum(MIGRATIONS[39].1)));
     }
 
     /// The history assertion above is easy to forget when adding a migration
@@ -1114,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_39_upgrade_a_version_26_database() {
+    fn migrations_27_through_41_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1243,8 +1248,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 40);
-        check_compatibility(&conn).expect("upgraded version 40 is compatible");
+        assert_eq!(latest_version, 41);
+        check_compatibility(&conn).expect("upgraded version 41 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1274,6 +1279,102 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(pk_columns, vec!["pattern", "match_kind"]);
+    }
+
+    #[test]
+    fn migration_41_preserves_binance_poll_state_and_separates_identity_sources() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 40);
+        conn.execute_batch(
+            "INSERT INTO binance_payment_accounts (
+                id, supplier_user_id, binance_uid, masked_api_key,
+                credential_fingerprint, credentials_ciphertext, credential_nonce,
+                encryption_key_version, credential_revision, status, automation_mode,
+                payment_home_region, uid_confirmed, uid_confirmation_source,
+                consecutive_failures, poll_cursor_at, next_poll_at, created_at, updated_at
+             ) VALUES (
+                'binance-account-v40', 'supplier-v40', '100200300', 'key-***',
+                'credential-fingerprint-v40', 'ciphertext-v40', 'nonce-v40',
+                1, 2, 'degraded', 'enabled', 'global', 1, 'receiver_history',
+                3, '2026-08-01T00:00:00Z', '2026-08-01T00:01:00Z',
+                '2026-07-01T00:00:00Z', '2026-08-01T00:00:30Z'
+             );
+             INSERT INTO binance_pay_transactions (
+                id, payment_account_id, account_credential_revision,
+                account_binance_uid, encryption_key_version, transaction_id,
+                transaction_time, direction, currency, amount_units, amount_scale,
+                counterparty_fingerprint, raw_payload_ciphertext, raw_payload_nonce,
+                ingestion_status, match_status, observed_at
+             ) VALUES (
+                'binance-transaction-v40', 'binance-account-v40', 2,
+                '100200300', 1, 'transaction-v40', '2026-08-01T00:00:10Z',
+                'incoming', 'USDT', 10001, 10000, 'legacy-fingerprint-v40',
+                'payload-v40', 'payload-nonce-v40', 'accepted', 'unmatched',
+                '2026-08-01T00:00:20Z'
+             );",
+        )
+        .expect("seed version 40 Binance settlement state");
+
+        apply(&conn).expect("upgrade version 40 through Binance settlement hardening");
+
+        let account = conn
+            .query_row(
+                "SELECT degraded_since, updated_at, poll_cursor_at,
+                        poll_scan_cursor_at, poll_scan_target_at
+                   FROM binance_payment_accounts
+                  WHERE id = 'binance-account-v40'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .expect("read migrated Binance payment account");
+        assert_eq!(account.0.as_deref(), Some(account.1.as_str()));
+        assert_eq!(account.2.as_deref(), Some("2026-08-01T00:00:00Z"));
+        assert_eq!(account.3, None);
+        assert_eq!(account.4, None);
+
+        let transaction_identity = conn
+            .query_row(
+                "SELECT payer_binance_id_fingerprint, counterparty_fingerprint_source
+                   FROM binance_pay_transactions
+                  WHERE id = 'binance-transaction-v40'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .expect("read migrated Binance transaction identity");
+        assert_eq!(transaction_identity.0, None);
+        assert_eq!(transaction_identity.1.as_deref(), Some("legacy_mixed"));
+
+        conn.execute(
+            "UPDATE binance_payment_accounts
+                SET uid_confirmation_source = 'payer_history'
+              WHERE id = 'binance-account-v40'",
+            [],
+        )
+        .expect("admit outgoing payer-history UID proof");
+
+        let unpaired_scan_cursor = conn.execute(
+            "UPDATE binance_payment_accounts
+                SET poll_scan_cursor_at = '2026-08-01T00:00:01Z'
+              WHERE id = 'binance-account-v40'",
+            [],
+        );
+        assert!(
+            unpaired_scan_cursor.is_err(),
+            "a resumable scan cursor must always carry its target watermark"
+        );
     }
 
     #[test]
@@ -1335,7 +1436,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 40);
+        assert_eq!(latest_version, 41);
     }
 
     #[test]
@@ -1359,7 +1460,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 40);
+        assert_eq!(latest_version, 41);
     }
 
     #[test]
@@ -1539,7 +1640,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 40);
+        assert_eq!(latest_version, 41);
     }
 
     #[test]

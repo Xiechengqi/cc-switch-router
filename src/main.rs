@@ -796,17 +796,17 @@ async fn main() -> Result<()> {
             result
         },
     );
-    let binance_settlement_task = spawn_background_task(
-        "Binance auto-settlement",
-        background_shutdown_rx,
-        async move {
-            let result = crate::binance_settlement::run_service(binance_settlement_state).await;
-            if let Err(error) = &result {
-                tracing::error!(error = %error, "Binance auto-settlement service stopped");
-            }
-            result
-        },
-    );
+    let binance_settlement_task = tokio::spawn(async move {
+        let result = crate::binance_settlement::run_service(
+            binance_settlement_state,
+            background_shutdown_rx,
+        )
+        .await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "Binance auto-settlement service stopped");
+        }
+        result.context("Binance auto-settlement background service stopped")
+    });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
     let mut ssh_task = tokio::spawn(async move {

@@ -781,6 +781,7 @@ export function AccountBillingPage() {
   const binanceIntentMutationRef = React.useRef(false);
   const binanceIntentPollInFlightRef = React.useRef(false);
   const autoPayInvoiceId = action?.kind === "auto-pay" ? action.invoice.id : null;
+  const binanceDegradedAccounts = binanceAdmin?.degradedAccounts ?? [];
   actorKeyRef.current = actorKey;
 
   React.useEffect(() => {
@@ -1388,12 +1389,51 @@ export function AccountBillingPage() {
                   </Chip>
                 </div>
               </div>
+              {binanceDegradedAccounts.length ? (
+                <div className="grid gap-2 rounded-md border border-rose-200 bg-rose-50/70 p-3">
+                  <h5 className="text-xs font-semibold text-rose-900">{t("marketBilling.binance.admin.degradedDetails")}</h5>
+                  {binanceDegradedAccounts.map((account) => (
+                    <div key={account.paymentAccountId} className="grid gap-2 rounded-md border border-rose-100 bg-white p-3 text-xs">
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <strong className="break-all text-rose-900">{account.lastPollErrorCode || t("marketBilling.binance.admin.unknownError")}</strong>
+                        <span className="text-muted-foreground">{t("marketBilling.binance.admin.failureCount", { count: account.consecutiveFailures })}</span>
+                      </div>
+                      <div className="grid gap-1 text-muted-foreground sm:grid-cols-2">
+                        <span>{t("marketBilling.binance.admin.uid", { uid: account.binanceUid })}</span>
+                        <span className="break-all">{t("marketBilling.binance.admin.account", { account: account.paymentAccountId })}</span>
+                        <span className="break-all">{t("marketBilling.binance.admin.supplier", { supplier: account.supplierUserId })}</span>
+                        <span>{t("marketBilling.binance.admin.region", { region: account.paymentHomeRegion })}</span>
+                        <span>{t("marketBilling.binance.admin.degradedSince", { date: account.degradedSince ? formatDate(account.degradedSince, locale) : "—" })}</span>
+                        <span>{t("marketBilling.binance.admin.lastSuccess", { date: account.lastPollSuccessAt ? formatDate(account.lastPollSuccessAt, locale) : "—" })}</span>
+                        <span>{t("marketBilling.binance.admin.nextPoll", { date: account.nextPollAt ? formatDate(account.nextPollAt, locale) : "—" })}</span>
+                        <span>{t("marketBilling.binance.admin.leaseUntil", { date: account.leaseUntil ? formatDate(account.leaseUntil, locale) : "—" })}</span>
+                      </div>
+                      {account.pollScanCursorAt && account.pollScanTargetAt ? (
+                        <p className="break-all text-muted-foreground">
+                          {t("marketBilling.binance.admin.scanProgress", {
+                            cursor: formatDate(account.pollScanCursorAt, locale),
+                            target: formatDate(account.pollScanTargetAt, locale),
+                          })}
+                        </p>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               {binanceAdmin.cases.length ? binanceAdmin.cases.map((item) => (
                 <div key={item.id} className="grid gap-3 rounded-md border border-border bg-white p-3">
                   <div className="flex flex-wrap items-start justify-between gap-3 text-xs">
                     <div>
                       <strong className="text-sm">{item.amount} {item.asset}</strong>
                       <p className="mt-1 break-all text-muted-foreground">{item.caseKind} · {item.transactionId}</p>
+                      {item.orderId ? <p className="mt-1 break-all text-muted-foreground">{t("marketBilling.binance.admin.order", { order: item.orderId })}</p> : null}
+                      {item.counterpartyReference || item.payerBinanceIdReference ? (
+                        <p className="mt-1 break-all text-muted-foreground">
+                          {item.counterpartyReference ? t("marketBilling.binance.admin.counterparty", { reference: item.counterpartyReference }) : ""}
+                          {item.counterpartyReference && item.payerBinanceIdReference ? " · " : ""}
+                          {item.payerBinanceIdReference ? t("marketBilling.binance.admin.payerBinance", { reference: item.payerBinanceIdReference }) : ""}
+                        </p>
+                      ) : null}
                     </div>
                     <span className="text-muted-foreground">{formatDate(item.transactionTime, locale)}</span>
                   </div>
