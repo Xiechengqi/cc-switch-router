@@ -33,7 +33,8 @@ use crate::proxy_stream::{
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{
     AppStore, IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE, NewImageGenerationRequestLog,
-    ShareForTest, UserApiTokenPrincipal, UserModelRouteResolution, image_result_path,
+    NewShareRequestErrorSnapshot, ShareForTest, UserApiTokenPrincipal, UserModelRouteResolution,
+    image_result_path, truncate_error_snapshot_body,
 };
 
 const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -46,6 +47,8 @@ const SHARE_USER_COUNTRY_ISO3_HEADER: &str = "X-CC-Switch-User-Country-Iso3";
 const SHARE_DATA_SOURCE_HEADER: &str = "X-CC-Switch-Data-Source";
 const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
 const MAX_PROXY_ERROR_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES: usize =
+    crate::store::SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES;
 const ROUTE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const ROUTE_RECONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const ROUTE_RECONNECT_MAX_WAITERS: usize = 128;
@@ -922,6 +925,36 @@ struct ShareLlmProxyMetricsGuard {
     started: Instant,
 }
 
+#[derive(Clone)]
+struct ShareErrorSnapshotContext {
+    store: AppStore,
+    share_id: String,
+    request_id: Option<String>,
+    method: String,
+    path: String,
+    content_type: Option<String>,
+    caller_email: Option<String>,
+    status_code: u16,
+    is_event_stream: bool,
+}
+
+impl std::fmt::Debug for ShareErrorSnapshotContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareErrorSnapshotContext")
+            .field("share_id", &self.share_id)
+            .field("request_id", &self.request_id)
+            .field("status_code", &self.status_code)
+            .field("is_event_stream", &self.is_event_stream)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShareErrorSnapshotContext {
+    fn should_capture(&self) -> bool {
+        !(200..300).contains(&self.status_code)
+    }
+}
+
 #[derive(Debug, Default)]
 struct ProxyResponseLifecycle {
     _route: Option<RouteInflightGuard>,
@@ -931,6 +964,7 @@ struct ProxyResponseLifecycle {
     _recent_traffic: Option<RecentTrafficGuard>,
     _share_llm_metrics: Option<ShareLlmProxyMetricsGuard>,
     _metrics: Option<MetricsPermit>,
+    error_snapshot: Option<ShareErrorSnapshotContext>,
 }
 
 impl ProxyResponseLifecycle {
@@ -2057,10 +2091,20 @@ pub async fn gateway_proxy_handler(
         _ => return simple_response(StatusCode::NOT_FOUND, "missing-share-id"),
     };
     let path_and_query = format!("{forwarded_path}{query}");
+    let admission_request_id = Uuid::new_v4().to_string();
+    let error_capture = ShareErrorCapture {
+        store: state.store.clone(),
+        share_id: Some(share_id.clone()),
+        skip: false,
+        method: method.as_str().to_string(),
+        path: path_and_query.clone(),
+        request_id: Some(admission_request_id.clone()),
+        caller_email: None,
+    };
+    let simple_response = |status: StatusCode, reason: &str| error_capture.simple(status, reason);
     let Some(request_app) = infer_share_request_app(&path_and_query) else {
         return simple_response(StatusCode::BAD_REQUEST, "unsupported-share-api-path");
     };
-    let admission_request_id = Uuid::new_v4().to_string();
 
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
     let inflight_by_share = state.proxy.inflight_by_share().await;
@@ -2137,6 +2181,7 @@ pub async fn gateway_proxy_handler(
                     "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                     exceeded.current, exceeded.limit
                 ),
+                Some(&error_capture),
             );
         }
     };
@@ -2168,6 +2213,7 @@ pub async fn gateway_proxy_handler(
                         "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                         exceeded.current, exceeded.limit
                     ),
+                    Some(&error_capture),
                 );
             }
         }
@@ -2212,6 +2258,7 @@ pub async fn gateway_proxy_handler(
             client_metadata.country_code.clone(),
             &method,
             &body_bytes,
+            Some(&error_capture),
         ),
     )
     .await
@@ -2292,7 +2339,14 @@ pub async fn gateway_proxy_handler(
     recent_traffic_guard.set_status(status);
     let response_headers = upstream.headers().clone();
     if let Some(response) =
-        ingress_rejection_response(&state, status, &response_headers, &route, &path_and_query)
+        ingress_rejection_response(
+            &state,
+            status,
+            &response_headers,
+            &route,
+            &path_and_query,
+            Some(&error_capture),
+        )
     {
         state.metrics.record_proxy_status(response.status());
         return response;
@@ -2323,6 +2377,18 @@ pub async fn gateway_proxy_handler(
             _free_share_ip: free_share_ip_permit,
             _recent_traffic: Some(recent_traffic_guard),
             _metrics: Some(metrics_permit),
+            error_snapshot: share_error_snapshot_context(
+                &state,
+                Some(share_id.as_str()),
+                false,
+                method.as_str(),
+                &path_and_query,
+                Some(live_request_id.as_str()),
+                None,
+                status,
+                &response_headers,
+                is_event_stream,
+            ),
             ..Default::default()
         },
     );
@@ -3188,7 +3254,7 @@ pub async fn proxy_handler(
             ban_remaining_secs = remaining.as_secs(),
             "proxy request rejected: client temporarily banned"
         );
-        return client_banned_response(remaining, "router");
+        return client_banned_response(remaining, "router", None);
     }
     let is_internal_share_router_path = is_internal_share_router_path(&path);
     let is_share_router_probe = parts
@@ -3198,6 +3264,27 @@ pub async fn proxy_handler(
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
         && path == "/_share-router/health";
+    let error_capture = StdMutex::new(ShareErrorCapture {
+        store: state.store.clone(),
+        share_id: None,
+        skip: is_share_router_probe || is_dashboard_connection_test,
+        method: method.as_str().to_string(),
+        path: path_and_query.clone(),
+        request_id: None,
+        caller_email: None,
+    });
+    let simple_response = |status: StatusCode, reason: &str| {
+        error_capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .simple(status, reason)
+    };
+    let json_error_response = |status: StatusCode, message: &str| {
+        error_capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .json_message(status, message)
+    };
     if !host_matches_tunnel_domain(&host, &state.config.tunnel_domain) {
         tracing::debug!(
             method = %method,
@@ -3270,7 +3357,11 @@ pub async fn proxy_handler(
                             wait_timeout_ms = ROUTE_RECONNECT_WAIT_TIMEOUT.as_millis(),
                             "proxy request deferred: registered tunnel is reconnecting"
                         );
-                        return reconnecting_response();
+                        let capture = error_capture
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        return reconnecting_response(Some(&capture));
                     }
                 }
             } else {
@@ -3291,6 +3382,10 @@ pub async fn proxy_handler(
             return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
         }
     };
+    error_capture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .share_id = route.share_id.clone();
     if is_internal_share_router_path
         && method == axum::http::Method::GET
         && !authorize_internal_share_router_get(&state, &route, &parts.headers, &path_and_query)
@@ -3500,6 +3595,10 @@ pub async fn proxy_handler(
             {
                 Ok(true) => {
                     api_user_email = Some(principal.email.clone());
+                    error_capture
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .caller_email = api_user_email.clone();
                 }
                 Ok(false) => {
                     return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-user");
@@ -3535,7 +3634,11 @@ pub async fn proxy_handler(
             ban_remaining_secs = remaining.as_secs(),
             "proxy request rejected: client banned from Share"
         );
-        return client_banned_response(remaining, "share");
+        let capture = error_capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        return client_banned_response(remaining, "share", Some(&capture));
     }
     if route.is_share()
         && method == axum::http::Method::POST
@@ -3727,6 +3830,10 @@ pub async fn proxy_handler(
                     .expect("Share admission requests always have a request id");
                 let app = request_app.as_deref().unwrap_or("codex");
                 record_llm_admission_rejection(&state, &route, request_id, app, "direct", None);
+                let capture = error_capture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 return llm_concurrency_response(
                     app,
                     "cc_switch_share_concurrency_limit_exceeded",
@@ -3738,6 +3845,7 @@ pub async fn proxy_handler(
                         "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                         exceeded.current, exceeded.limit
                     ),
+                    Some(&capture),
                 );
             }
         }
@@ -3772,6 +3880,10 @@ pub async fn proxy_handler(
                     .expect("Share admission requests always have a request id");
                 let app = infer_share_request_app(&path).unwrap_or_else(|| "codex".to_string());
                 record_llm_admission_rejection(&state, &route, request_id, &app, "direct", None);
+                let capture = error_capture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 return llm_concurrency_response(
                     &app,
                     "cc_switch_free_share_ip_concurrency_limit_exceeded",
@@ -3783,6 +3895,7 @@ pub async fn proxy_handler(
                         "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                         exceeded.current, exceeded.limit
                     ),
+                    Some(&capture),
                 );
             }
         }
@@ -3810,6 +3923,10 @@ pub async fn proxy_handler(
     } else {
         None
     };
+    error_capture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .request_id = live_request_id.clone();
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
@@ -4065,6 +4182,12 @@ pub async fn proxy_handler(
         &response_headers,
         &route,
         &path_and_query,
+        Some(&{
+            error_capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }),
     );
     let status = ingress_rejection
         .as_ref()
@@ -4168,6 +4291,18 @@ pub async fn proxy_handler(
             _recent_traffic: recent_traffic_guard,
             _share_llm_metrics: share_llm_metrics_guard,
             _metrics: Some(metrics_permit),
+            error_snapshot: share_error_snapshot_context(
+                &state,
+                route.share_id.as_deref(),
+                is_share_router_probe || is_health_check_request,
+                method.as_str(),
+                &path_and_query,
+                live_request_id.as_deref(),
+                api_user_email.as_deref(),
+                status,
+                &response_headers,
+                is_event_stream,
+            ),
             ..Default::default()
         },
     );
@@ -4391,6 +4526,19 @@ async fn handle_image_generation_stream_submit(
     let Some(share_id) = route.share_id.as_deref() else {
         return json_error_response(StatusCode::NOT_FOUND, "share-not-found");
     };
+    let error_capture = ShareErrorCapture {
+        store: state.store.clone(),
+        share_id: Some(share_id.to_string()),
+        skip: false,
+        method: "POST".into(),
+        path: "/v1/images/generations".into(),
+        request_id: None,
+        caller_email: api_user_email.clone(),
+    };
+    let json_error_response = {
+        let error_capture = error_capture.clone();
+        move |status: StatusCode, message: &str| error_capture.json_message(status, message)
+    };
     let share = match state.store.get_share_for_test(share_id).await {
         Ok(Some(share)) => share,
         Ok(None) => return json_error_response(StatusCode::NOT_FOUND, "share-not-found"),
@@ -4406,6 +4554,12 @@ async fn handle_image_generation_stream_submit(
         );
     };
     let admission_request_id = Uuid::new_v4().to_string();
+    let mut error_capture = error_capture;
+    error_capture.request_id = Some(admission_request_id.clone());
+    let json_error_response = {
+        let error_capture = error_capture.clone();
+        move |status: StatusCode, message: &str| error_capture.json_message(status, message)
+    };
     let share_permit = match state
         .proxy
         .try_acquire_share_permit(
@@ -4438,6 +4592,7 @@ async fn handle_image_generation_stream_submit(
                     "Share concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                     exceeded.current, exceeded.limit
                 ),
+                Some(&error_capture),
             );
         }
     };
@@ -4469,6 +4624,7 @@ async fn handle_image_generation_stream_submit(
                         "Free Share IP concurrency limit has been reached ({}/{}). Wait for an in-flight request to finish.",
                         exceeded.current, exceeded.limit
                     ),
+                    Some(&error_capture),
                 );
             }
         }
@@ -4504,6 +4660,7 @@ async fn handle_image_generation_stream_submit(
                     "Image generation concurrency limit has been reached ({}/{}). Wait for the active image request to finish.",
                     exceeded.current, exceeded.limit
                 ),
+                Some(&error_capture),
             );
         }
     };
@@ -4622,6 +4779,7 @@ async fn handle_image_generation_stream_submit(
             Some(user_country.clone()),
             &axum::http::Method::POST,
             &upstream_body,
+            Some(&error_capture),
         ),
     )
     .await
@@ -4758,6 +4916,7 @@ async fn handle_image_generation_stream_submit(
         &response_headers,
         route,
         "/v1/images/generations",
+        Some(&error_capture),
     ) {
         let mapped_status = response.status();
         state.metrics.record_proxy_status(mapped_status);
@@ -4823,6 +4982,35 @@ async fn handle_image_generation_stream_submit(
                 format!("failed to read upstream error response: {error}"),
             ),
         };
+        let snapshot_reason = match &response_body {
+            Some(body) if body.is_empty() => "empty_body",
+            Some(_) => "buffered",
+            None => "read_failed",
+        };
+        let (snapshot_text, snapshot_truncated) = match &response_body {
+            Some(body) if !body.is_empty() => truncate_error_snapshot_body(body),
+            _ => (String::new(), false),
+        };
+        spawn_share_error_snapshot(
+            state.store.clone(),
+            NewShareRequestErrorSnapshot {
+                share_id: log_meta.share_id.clone(),
+                request_id: Some(log_meta.request_id.clone()),
+                status_code: status_code.as_u16(),
+                method: Some("POST".into()),
+                path: Some("/v1/images/generations".into()),
+                content_type: response_headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                caller_email: api_user_email.clone(),
+                body_text: snapshot_text,
+                body_truncated: snapshot_truncated,
+                body_capture_reason: snapshot_reason.into(),
+            },
+        );
         if let Err(err) = record_image_stream_log(
             &state.store,
             &state.config,
@@ -4845,7 +5033,11 @@ async fn handle_image_generation_stream_submit(
         }
         return match response_body {
             Some(body) => buffered_upstream_response(status_code, &response_headers, body),
-            None => json_error_response(StatusCode::BAD_GATEWAY, &error_message),
+            None => {
+                let mut capture = error_capture.clone();
+                capture.skip = true;
+                capture.json_message(StatusCode::BAD_GATEWAY, &error_message)
+            }
         };
     }
 
@@ -5802,6 +5994,202 @@ fn json_error_response(status: StatusCode, message: &str) -> Response {
     response
 }
 
+fn capture_router_local_error_snapshot(
+    store: &AppStore,
+    share_id: Option<&str>,
+    skip: bool,
+    status: StatusCode,
+    method: &str,
+    path: &str,
+    request_id: Option<&str>,
+    caller_email: Option<&str>,
+    body: &[u8],
+    content_type: Option<&str>,
+) {
+    let Some(share_id) = share_id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if skip || (200..300).contains(&status.as_u16()) {
+        return;
+    }
+    let (body_text, body_truncated) = if body.is_empty() {
+        (String::new(), false)
+    } else {
+        truncate_error_snapshot_body(body)
+    };
+    spawn_share_error_snapshot(
+        store.clone(),
+        NewShareRequestErrorSnapshot {
+            share_id: share_id.to_string(),
+            request_id: request_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            status_code: status.as_u16(),
+            method: Some(method.to_string()),
+            path: Some(path.to_string()),
+            content_type: content_type.map(str::to_string),
+            caller_email: caller_email
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            body_text,
+            body_truncated,
+            body_capture_reason: if body.is_empty() {
+                "empty_body".into()
+            } else {
+                "router_local".into()
+            },
+        },
+    );
+}
+
+fn spawn_share_error_snapshot(store: AppStore, snapshot: NewShareRequestErrorSnapshot) {
+    tokio::spawn(async move {
+        if let Err(error) = store.insert_share_request_error_snapshot(snapshot).await {
+            warn!(error = %error, "persist share request error snapshot failed");
+        }
+    });
+}
+
+#[derive(Clone)]
+struct ShareErrorCapture {
+    store: AppStore,
+    share_id: Option<String>,
+    skip: bool,
+    method: String,
+    path: String,
+    request_id: Option<String>,
+    caller_email: Option<String>,
+}
+
+impl ShareErrorCapture {
+    fn simple(&self, status: StatusCode, reason: &str) -> Response {
+        capture_router_local_error_snapshot(
+            &self.store,
+            self.share_id.as_deref(),
+            self.skip,
+            status,
+            &self.method,
+            &self.path,
+            self.request_id.as_deref(),
+            self.caller_email.as_deref(),
+            reason.as_bytes(),
+            Some("text/plain"),
+        );
+        simple_response(status, reason)
+    }
+
+    fn json_message(&self, status: StatusCode, message: &str) -> Response {
+        let body = serde_json::to_vec(&serde_json::json!({ "message": message }))
+            .unwrap_or_else(|_| b"{}".to_vec());
+        capture_router_local_error_snapshot(
+            &self.store,
+            self.share_id.as_deref(),
+            self.skip,
+            status,
+            &self.method,
+            &self.path,
+            self.request_id.as_deref(),
+            self.caller_email.as_deref(),
+            &body,
+            Some("application/json"),
+        );
+        json_error_response(status, message)
+    }
+
+    fn record_body(&self, status: StatusCode, body: &[u8], content_type: Option<&str>) {
+        capture_router_local_error_snapshot(
+            &self.store,
+            self.share_id.as_deref(),
+            self.skip,
+            status,
+            &self.method,
+            &self.path,
+            self.request_id.as_deref(),
+            self.caller_email.as_deref(),
+            body,
+            content_type,
+        );
+    }
+}
+
+fn persist_stream_error_snapshot(
+    ctx: ShareErrorSnapshotContext,
+    captured: &[u8],
+    capture_failed: bool,
+) {
+    if !ctx.should_capture() {
+        return;
+    }
+    let (body_text, body_truncated, body_capture_reason) = if ctx.is_event_stream {
+        (String::new(), false, "sse_not_buffered")
+    } else if capture_failed {
+        let (text, truncated) = truncate_error_snapshot_body(captured);
+        (text, truncated, "read_failed")
+    } else if captured.is_empty() {
+        (String::new(), false, "empty_body")
+    } else {
+        let (text, truncated) = truncate_error_snapshot_body(captured);
+        (text, truncated, "buffered")
+    };
+    spawn_share_error_snapshot(
+        ctx.store,
+        NewShareRequestErrorSnapshot {
+            share_id: ctx.share_id,
+            request_id: ctx.request_id,
+            status_code: ctx.status_code,
+            method: Some(ctx.method),
+            path: Some(ctx.path),
+            content_type: ctx.content_type,
+            caller_email: ctx.caller_email,
+            body_text,
+            body_truncated,
+            body_capture_reason: body_capture_reason.into(),
+        },
+    );
+}
+
+fn share_error_snapshot_context(
+    state: &ServerState,
+    share_id: Option<&str>,
+    skip: bool,
+    method: &str,
+    path: &str,
+    request_id: Option<&str>,
+    caller_email: Option<&str>,
+    status: StatusCode,
+    headers: &HeaderMap,
+    is_event_stream: bool,
+) -> Option<ShareErrorSnapshotContext> {
+    if skip || (200..300).contains(&status.as_u16()) {
+        return None;
+    }
+    let share_id = share_id.filter(|value| !value.is_empty())?;
+    Some(ShareErrorSnapshotContext {
+        store: state.store.clone(),
+        share_id: share_id.to_string(),
+        request_id: request_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        method: method.to_string(),
+        path: path.to_string(),
+        content_type: headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        caller_email: caller_email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        status_code: status.as_u16(),
+        is_event_stream,
+    })
+}
+
 fn infer_share_request_app(path: &str) -> Option<String> {
     let path = path
         .split('?')
@@ -5851,6 +6239,7 @@ fn llm_concurrency_response(
     limit: usize,
     request_id: &str,
     message: String,
+    capture: Option<&ShareErrorCapture>,
 ) -> Response {
     let surface = InferenceSurface::from_app(app);
     let body = match surface {
@@ -5905,6 +6294,14 @@ fn llm_concurrency_response(
             }
         }),
     };
+    if let Some(capture) = capture {
+        let encoded = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+        capture.record_body(
+            StatusCode::CONFLICT,
+            &encoded,
+            Some("application/json"),
+        );
+    }
     let mut response = json_response(StatusCode::CONFLICT, body);
     response
         .headers_mut()
@@ -5986,7 +6383,18 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
     response
 }
 
-fn client_banned_response(remaining: Duration, scope: &'static str) -> Response {
+fn client_banned_response(
+    remaining: Duration,
+    scope: &'static str,
+    capture: Option<&ShareErrorCapture>,
+) -> Response {
+    if let Some(capture) = capture {
+        capture.record_body(
+            StatusCode::FORBIDDEN,
+            b"client-banned",
+            Some("text/plain"),
+        );
+    }
     let mut response = simple_response(StatusCode::FORBIDDEN, "client-banned");
     let code = if scope == "share" {
         "cc_switch_share_client_banned"
@@ -6011,6 +6419,7 @@ fn ingress_rejection_response(
     upstream_headers: &HeaderMap,
     route: &RouteEntry,
     path: &str,
+    capture: Option<&ShareErrorCapture>,
 ) -> Option<Response> {
     if upstream_status != StatusCode::UNAUTHORIZED {
         return None;
@@ -6051,6 +6460,9 @@ fn ingress_rejection_response(
     } else {
         (StatusCode::BAD_GATEWAY, "ingress-contract-rejected")
     };
+    if let Some(capture) = capture {
+        capture.record_body(status, public_reason.as_bytes(), Some("text/plain"));
+    }
     let mut response = simple_response(status, public_reason);
     if is_freshness {
         response
@@ -6091,7 +6503,14 @@ fn buffered_upstream_response(status: StatusCode, headers: &HeaderMap, body: Byt
     response
 }
 
-fn reconnecting_response() -> Response {
+fn reconnecting_response(capture: Option<&ShareErrorCapture>) -> Response {
+    if let Some(capture) = capture {
+        capture.record_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            b"tunnel-reconnecting",
+            Some("text/plain"),
+        );
+    }
     let mut response = simple_response(StatusCode::SERVICE_UNAVAILABLE, "tunnel-reconnecting");
     response
         .headers_mut()
@@ -6125,6 +6544,7 @@ async fn with_signed_ingress_context(
     user_country: Option<String>,
     method: &axum::http::Method,
     body: &[u8],
+    capture: Option<&ShareErrorCapture>,
 ) -> Result<reqwest::RequestBuilder, Response> {
     let installation_id = route.installation_id().unwrap_or_default();
     let control_secret = match state
@@ -6134,6 +6554,12 @@ async fn with_signed_ingress_context(
     {
         Ok(Some(secret)) if !secret.trim().is_empty() => secret,
         Ok(_) => {
+            if let Some(capture) = capture {
+                return Err(capture.simple(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-control-secret-missing",
+                ));
+            }
             return Err(simple_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ingress-control-secret-missing",
@@ -6145,6 +6571,12 @@ async fn with_signed_ingress_context(
                 error = %error,
                 "proxy ingress context secret lookup failed"
             );
+            if let Some(capture) = capture {
+                return Err(capture.simple(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-control-secret-lookup-failed",
+                ));
+            }
             return Err(simple_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ingress-control-secret-lookup-failed",
@@ -6157,10 +6589,17 @@ async fn with_signed_ingress_context(
         .unwrap_or_else(|| format!("client:{installation_id}"));
     let path_and_query = outbound_request_path_and_query(&builder).map_err(|error| {
         warn!(%error, "proxy ingress outbound request binding failed");
-        simple_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ingress-context-signing-failed",
-        )
+        if let Some(capture) = capture {
+            capture.simple(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ingress-context-signing-failed",
+            )
+        } else {
+            simple_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ingress-context-signing-failed",
+            )
+        }
     })?;
     let ingress_body_limit = proxy_request_body_limit(&path_and_query, &state.config.proxy_stream);
     let signed = crate::ingress_context::sign(
@@ -6191,10 +6630,17 @@ async fn with_signed_ingress_context(
     )
     .map_err(|error| {
         warn!(error, "proxy ingress context signing failed");
-        simple_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ingress-context-signing-failed",
-        )
+        if let Some(capture) = capture {
+            capture.simple(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ingress-context-signing-failed",
+            )
+        } else {
+            simple_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ingress-context-signing-failed",
+            )
+        }
     })?;
     Ok(builder
         .header(
@@ -6771,12 +7217,27 @@ where
         let mut detector = protocol.map(ProxyStreamDetector::new);
         let mut progress_deadline = tokio::time::Instant::now() + timeouts.first_event;
         let mut meaningful_progress_seen = false;
+        let mut captured_error_body = Vec::new();
+        let mut capture_failed = false;
+        let mut snapshot_ctx = lifecycle
+            .as_mut()
+            .and_then(|lifecycle| lifecycle.error_snapshot.take())
+            .filter(ShareErrorSnapshotContext::should_capture);
+        let capture_sse = snapshot_ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_event_stream);
 
         loop {
             let next = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => break,
-                _ = sender.closed() => break,
+                _ = cancellation.cancelled() => {
+                    capture_failed = true;
+                    break;
+                }
+                _ = sender.closed() => {
+                    capture_failed = true;
+                    break;
+                }
                 _ = tokio::time::sleep_until(hard_deadline) => {
                     let owns_share_release =
                         finish_proxy_response_lifecycle(&mut lifecycle);
@@ -6797,6 +7258,7 @@ where
                             "proxy request hard lifetime exceeded",
                         ),
                     );
+                    capture_failed = true;
                     break;
                 }
                 _ = tokio::time::sleep_until(progress_deadline) => {
@@ -6836,6 +7298,7 @@ where
                         failure,
                         std::io::Error::new(std::io::ErrorKind::TimedOut, message),
                     );
+                    capture_failed = true;
                     break;
                 }
                 next = upstream_stream.next() => next,
@@ -6867,6 +7330,7 @@ where
                                         "proxy stream protocol event exceeded parser capacity",
                                     ),
                                 );
+                                capture_failed = true;
                                 break;
                             }
                         }
@@ -6885,6 +7349,14 @@ where
                     let output = terminal_end
                         .map(|end| bytes.slice(..end.min(bytes.len())))
                         .unwrap_or(bytes);
+                    if snapshot_ctx.is_some() && !capture_sse && !capture_failed {
+                        let remaining = SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES
+                            .saturating_sub(captured_error_body.len());
+                        if remaining > 0 {
+                            let take = remaining.min(output.len());
+                            captured_error_body.extend_from_slice(&output[..take]);
+                        }
+                    }
                     if terminal_end.is_some() {
                         metrics.record_proxy_stream_semantic_terminal();
                         drop(lifecycle.take());
@@ -6907,6 +7379,7 @@ where
                             timeouts.max_lifetime,
                             owns_share_release,
                         );
+                        capture_failed = true;
                         break;
                     }
                     if terminal_end.is_some() {
@@ -6920,6 +7393,7 @@ where
                         error_frame = is_event_stream,
                         "proxy upstream response stream failed"
                     );
+                    capture_failed = true;
                     drop(lifecycle.take());
                     // Unlike the timeout paths this one still awaits the send: the
                     // pump has upstream bytes behind it, so the frame has to queue
@@ -6952,6 +7426,9 @@ where
                 }
                 None => break,
             }
+        }
+        if let Some(ctx) = snapshot_ctx.take() {
+            persist_stream_error_snapshot(ctx, &captured_error_body, capture_failed);
         }
     });
 
@@ -7318,6 +7795,7 @@ mod tests {
             Some("JP".into()),
             &axum::http::Method::POST,
             br#"{"model":"claude-sonnet-4-6"}"#,
+            None,
         )
         .await
         .unwrap()
@@ -7634,6 +8112,7 @@ mod tests {
             &headers,
             &route,
             "/web-api/auth/methods",
+            None,
         )
         .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -7659,6 +8138,7 @@ mod tests {
             &headers,
             &route,
             "/web-api/auth/methods",
+            None,
         )
         .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -7678,6 +8158,7 @@ mod tests {
                 &HeaderMap::new(),
                 &route,
                 "/web-api/auth/methods",
+                None,
             )
             .is_none()
         );
@@ -8287,6 +8768,7 @@ mod tests {
                 4,
                 "request-123",
                 "Share concurrency limit has been reached (4/4).".to_string(),
+                None,
             );
             assert_eq!(response.status(), StatusCode::CONFLICT);
             assert_eq!(
@@ -8902,7 +9384,7 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
                 .await,
             RouteLookup::Unknown
         ));
-        let response = reconnecting_response();
+        let response = reconnecting_response(None);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
@@ -9810,6 +10292,148 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
                 .proxy_request_hard_timeout_total,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn non_sse_error_stream_persists_verbatim_body_snapshot() {
+        let config = proxy_test_config("error-snapshot-buffered");
+        let proxy = Arc::new(ProxyRegistry::default());
+        let state = proxy_test_state(&config, proxy);
+        state
+            .store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO shares (
+                    share_id, capacity_pool_id, installation_id, share_name,
+                    app_type, token_limit, parallel_limit, tokens_used,
+                    requests_count, share_status, created_at, expires_at,
+                    updated_at
+                 ) VALUES (
+                    'share-snap', 'pool-snap', 'installation-snap', 'Snap Share',
+                    'codex', -1, -1, 0, 0, 'active',
+                    '2026-01-01T00:00:00Z', '2099-12-31T23:59:59Z',
+                    '2026-01-01T00:00:00Z'
+                 )",
+                [],
+            )
+            .expect("insert snapshot share");
+        let body_bytes = Bytes::from_static(br#"{"error":{"code":"cc_switch_rate_limited"}}"#);
+        let stream = proxy_response_body_stream(
+            futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) }),
+            None,
+            false,
+            ProxyResponseTimeouts {
+                first_event: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_secs(1),
+                max_lifetime: Duration::from_secs(5),
+            },
+            state.metrics.clone(),
+            ProxyResponseLifecycle {
+                error_snapshot: Some(ShareErrorSnapshotContext {
+                    store: state.store.clone(),
+                    share_id: "share-snap".into(),
+                    request_id: Some("req-snap".into()),
+                    method: "POST".into(),
+                    path: "/v1/responses".into(),
+                    content_type: Some("application/json".into()),
+                    caller_email: Some("alice@example.com".into()),
+                    status_code: 429,
+                    is_event_stream: false,
+                }),
+                ..Default::default()
+            },
+        );
+        let chunks = stream.collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].as_ref().unwrap().as_ref(),
+            br#"{"error":{"code":"cc_switch_rate_limited"}}"#
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let listed = state
+            .store
+            .list_share_request_error_snapshots("share-snap")
+            .await
+            .expect("list snapshots");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status_code, 429);
+        assert_eq!(
+            listed[0].body_text,
+            r#"{"error":{"code":"cc_switch_rate_limited"}}"#
+        );
+        assert_eq!(listed[0].body_capture_reason, "buffered");
+        assert_eq!(listed[0].caller_email.as_deref(), Some("alice@example.com"));
+        let _ = std::fs::remove_file(&config.database.path);
+        let _ = std::fs::remove_file(&config.metrics.db_path);
+    }
+
+    #[tokio::test]
+    async fn sse_error_stream_does_not_buffer_body() {
+        let config = proxy_test_config("error-snapshot-sse");
+        let proxy = Arc::new(ProxyRegistry::default());
+        let state = proxy_test_state(&config, proxy);
+        state
+            .store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO shares (
+                    share_id, capacity_pool_id, installation_id, share_name,
+                    app_type, token_limit, parallel_limit, tokens_used,
+                    requests_count, share_status, created_at, expires_at,
+                    updated_at
+                 ) VALUES (
+                    'share-sse', 'pool-sse', 'installation-sse', 'SSE Share',
+                    'codex', -1, -1, 0, 0, 'active',
+                    '2026-01-01T00:00:00Z', '2099-12-31T23:59:59Z',
+                    '2026-01-01T00:00:00Z'
+                 )",
+                [],
+            )
+            .expect("insert sse share");
+        let body_bytes = Bytes::from_static(b"data: nope\n\n");
+        let stream = proxy_response_body_stream(
+            futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) }),
+            None,
+            true,
+            ProxyResponseTimeouts {
+                first_event: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+                downstream_stall: Duration::from_secs(1),
+                max_lifetime: Duration::from_secs(5),
+            },
+            state.metrics.clone(),
+            ProxyResponseLifecycle {
+                error_snapshot: Some(ShareErrorSnapshotContext {
+                    store: state.store.clone(),
+                    share_id: "share-sse".into(),
+                    request_id: Some("req-sse".into()),
+                    method: "POST".into(),
+                    path: "/v1/responses".into(),
+                    content_type: Some("text/event-stream".into()),
+                    caller_email: None,
+                    status_code: 429,
+                    is_event_stream: true,
+                }),
+                ..Default::default()
+            },
+        );
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let listed = state
+            .store
+            .list_share_request_error_snapshots("share-sse")
+            .await
+            .expect("list sse snapshots");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].body_capture_reason, "sse_not_buffered");
+        assert_eq!(listed[0].body_text, "");
+        let _ = std::fs::remove_file(&config.database.path);
+        let _ = std::fs::remove_file(&config.metrics.db_path);
     }
 
     #[tokio::test]

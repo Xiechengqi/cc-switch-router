@@ -115,6 +115,7 @@ import type {
   ServerLogMeta,
   ServerLogScope,
   ShareRequestLogsPage,
+  ShareRecentErrorsResponse,
   ShareControlDeadLetterPage,
 } from "@/lib/types";
 
@@ -987,6 +988,18 @@ export async function getShareImageGenerationRequestLogs(
     }),
   );
   return data.logs || [];
+}
+
+export async function getShareRecentErrors(
+  shareId: string,
+  signal?: AbortSignal,
+): Promise<ShareRecentErrorsResponse> {
+  return parseJson<ShareRecentErrorsResponse>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/recent-errors`, {
+      cache: "no-store",
+      signal,
+    }),
+  );
 }
 
 export async function getShareRequestLogs(

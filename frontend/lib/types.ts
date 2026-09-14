@@ -774,6 +774,31 @@ export type ShareRequestLogsPage = {
   hasMore: boolean;
 };
 
+export type ShareRecentError = {
+  id: string;
+  shareId: string;
+  requestId?: string;
+  capturedAt: string;
+  statusCode: number;
+  method?: string;
+  path?: string;
+  contentType?: string;
+  callerEmail?: string;
+  bodyText: string;
+  bodyTruncated: boolean;
+  bodyCaptureReason:
+    | "buffered"
+    | "sse_not_buffered"
+    | "empty_body"
+    | "read_failed"
+    | "router_local"
+    | string;
+};
+
+export type ShareRecentErrorsResponse = {
+  errors: ShareRecentError[];
+};
+
 export type ImageGenerationRequestLog = {
   requestId: string;
   shareId: string;

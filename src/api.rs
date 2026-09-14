@@ -481,6 +481,10 @@ pub fn router(state: ServerState) -> Router {
             get(list_share_image_generation_request_logs),
         )
         .route(
+            "/v1/shares/:share_id/recent-errors",
+            get(list_share_recent_errors),
+        )
+        .route(
             "/v1/shares/:share_id/image-jobs",
             get(list_share_image_generation_jobs_compat),
         )
@@ -3375,6 +3379,38 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn recent_error_emails_are_masked_for_anonymous_viewers() {
+        let mut errors = vec![crate::store::ShareRequestErrorSnapshot {
+            id: "snap-1".into(),
+            share_id: "share-1".into(),
+            request_id: Some("req-1".into()),
+            captured_at: "2026-09-14T00:00:00Z".into(),
+            status_code: 429,
+            method: Some("POST".into()),
+            path: Some("/v1/responses".into()),
+            content_type: Some("application/json".into()),
+            caller_email: Some("alice@example.com".into()),
+            body_text: r#"{"error":{"code":"cc_switch_rate_limited"}}"#.into(),
+            body_truncated: false,
+            body_capture_reason: "buffered".into(),
+        }];
+        apply_recent_error_email_visibility(&mut errors, false);
+        assert_eq!(
+            errors[0].caller_email.as_deref(),
+            Some("a***e@example.com")
+        );
+        assert_eq!(
+            errors[0].body_text,
+            r#"{"error":{"code":"cc_switch_rate_limited"}}"#
+        );
+        apply_recent_error_email_visibility(&mut errors, true);
+        assert_eq!(errors[0].caller_email.as_deref(), Some("a***e@example.com"));
+        errors[0].caller_email = Some("alice@example.com".into());
+        apply_recent_error_email_visibility(&mut errors, true);
+        assert_eq!(errors[0].caller_email.as_deref(), Some("alice@example.com"));
+    }
 
     #[test]
     fn bark_binding_errors_have_stable_user_facing_codes() {
@@ -7379,6 +7415,12 @@ struct ShareRequestLogsResponse {
     has_more: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRecentErrorsResponse {
+    errors: Vec<crate::store::ShareRequestErrorSnapshot>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ImageGenerationResultQuery {
     token: Option<String>,
@@ -8022,6 +8064,49 @@ async fn list_share_request_logs(
         next_cursor: page.next_cursor,
         has_more: page.has_more,
     }))
+}
+
+async fn list_share_recent_errors(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<ShareRecentErrorsResponse>, AppError> {
+    let share = state
+        .store
+        .get_share_for_test(&share_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+    let viewer_email = extract_session_email(&state, &headers).await?;
+    let is_admin = {
+        let dynamic = state.dynamic.read().await;
+        viewer_email
+            .as_deref()
+            .is_some_and(|email| dynamic.is_admin(email))
+    };
+    let is_owner = viewer_email
+        .as_deref()
+        .is_some_and(|email| share.owner_email.eq_ignore_ascii_case(email));
+    let reveal_email = is_admin || is_owner;
+    let mut errors = state
+        .store
+        .list_share_request_error_snapshots(&share_id)
+        .await?;
+    apply_recent_error_email_visibility(&mut errors, reveal_email);
+    Ok(Json(ShareRecentErrorsResponse { errors }))
+}
+
+fn apply_recent_error_email_visibility(
+    errors: &mut [crate::store::ShareRequestErrorSnapshot],
+    reveal_email: bool,
+) {
+    if reveal_email {
+        return;
+    }
+    for error in errors {
+        if let Some(email) = error.caller_email.as_deref() {
+            error.caller_email = Some(crate::store::mask_email(email));
+        }
+    }
 }
 
 async fn list_share_image_generation_jobs_compat(

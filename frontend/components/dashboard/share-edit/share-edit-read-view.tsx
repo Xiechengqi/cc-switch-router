@@ -31,6 +31,7 @@ import {
   ReadOnlyField,
   ShareEditSection,
 } from "./share-edit-section";
+import { ShareRecentErrorsPanel } from "./share-recent-errors-panel";
 
 function activeUserLimitGrants(share: ShareView): ShareUserGrant[] {
   return Object.values(share.userGrants || {})
@@ -219,6 +220,7 @@ export function ShareEditReadView({
       ) : (
         <EmptyBlock>{t("dashboard.shareEditNoAppType")}</EmptyBlock>
       )}
+      <ShareRecentErrorsPanel shareId={share.shareId} t={t} />
     </div>
   );
 }

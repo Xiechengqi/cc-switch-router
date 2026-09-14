@@ -479,6 +479,7 @@ Server 通过签名接口 `POST /v1/share-request-logs/batch-sync` 上送同一 
 - `share_request_logs` upsert 只接受 `excluded.usage_revision >= share_request_logs.usage_revision`，因此迟到或重放的低 revision pending 不能覆盖更高 revision 终态。
 - 旧 Server 未发送这些字段时，Router 按 `usageState=observed`、`usageRevision=0` 兼容；新 Server 必须发送明确状态。
 - `not_applicable` 不代表 token 为零；Image/Video 卡片不得渲染 token grid。`GET /v1/shares/:id/request-logs?requestKind=text|image|video` 在分页前过滤，并排除 `isHealthCheck=true` 记录。Dashboard 侧边栏以三个 Tab 读取同一接口；Image Tab 可用同一个 canonical `requestId` 关联旧图片结果表中的受控预览 URL。
+- `GET /v1/shares/:id/recent-errors` 是公开只读接口，返回该 Share 最近 3 条已提交 HTTP 状态的非 2xx 快照（文本/图片共用槽位）。响应体按原样保存，截断仅发生在 8192 字节并追加 `...`。Owner/admin 看到完整 caller email；匿名与非 owner 看到 `mask_email` 后的邮箱。本接口不返回请求体、Authorization 或 IP，也不改写 `share_request_logs`。
 
 **该命名空间对公网封闭**:`/_share-router/*` 的入站 GET 必须携带合法控制签名,否则返回 404(`src/proxy.rs:4032-4043`)。`/_ctl/*` 在所有公网入口点一律 404,不经路由(`src/proxy.rs:1459, 1845, 2165`)。
 

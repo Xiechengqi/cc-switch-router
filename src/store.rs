@@ -115,6 +115,8 @@ pub(crate) mod client_chat;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
+pub const SHARE_REQUEST_ERROR_SNAPSHOT_RETAIN_PER_SHARE: usize = 3;
+pub const SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES: usize = 8192;
 const SHARE_MODEL_HEALTH_CHECK_LIMIT: usize = 10;
 const SHARE_REQUEST_LOG_RECOVERY_PAGE_LIMIT: usize = 100;
 const SHARE_REQUEST_LOG_RECOVERY_MAX_PAGES: usize = 10;
@@ -915,6 +917,42 @@ pub struct ShareRequestLogPage {
     pub logs: Vec<ShareRequestLogEntry>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRequestErrorSnapshot {
+    pub id: String,
+    pub share_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub captured_at: String,
+    pub status_code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_email: Option<String>,
+    pub body_text: String,
+    pub body_truncated: bool,
+    pub body_capture_reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewShareRequestErrorSnapshot {
+    pub share_id: String,
+    pub request_id: Option<String>,
+    pub status_code: u16,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub content_type: Option<String>,
+    pub caller_email: Option<String>,
+    pub body_text: String,
+    pub body_truncated: bool,
+    pub body_capture_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -8074,6 +8112,110 @@ impl AppStore {
             next_cursor,
             has_more,
         })
+    }
+
+    pub async fn insert_share_request_error_snapshot(
+        &self,
+        snapshot: NewShareRequestErrorSnapshot,
+    ) -> Result<(), AppError> {
+        if snapshot.share_id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "share request error snapshot requires share_id".into(),
+            ));
+        }
+        let captured_at = Utc::now().to_rfc3339();
+        let id = Uuid::new_v4().to_string();
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction().map_err(|error| {
+            AppError::Internal(format!(
+                "begin share request error snapshot tx failed: {error}"
+            ))
+        })?;
+        tx.execute(
+            "INSERT INTO share_request_error_snapshots (
+                id, share_id, request_id, captured_at, status_code, method, path,
+                content_type, caller_email, body_text, body_truncated, body_capture_reason
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id,
+                snapshot.share_id,
+                snapshot.request_id,
+                captured_at,
+                snapshot.status_code as i64,
+                snapshot.method,
+                snapshot.path,
+                snapshot.content_type,
+                snapshot.caller_email,
+                snapshot.body_text,
+                if snapshot.body_truncated { 1 } else { 0 },
+                snapshot.body_capture_reason,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "insert share request error snapshot failed: {error}"
+            ))
+        })?;
+        tx.execute(
+            "DELETE FROM share_request_error_snapshots
+              WHERE share_id = ?1
+                AND id NOT IN (
+                    SELECT id FROM share_request_error_snapshots
+                     WHERE share_id = ?1
+                     ORDER BY captured_at DESC, id DESC
+                     LIMIT ?2
+                )",
+            params![
+                snapshot.share_id,
+                SHARE_REQUEST_ERROR_SNAPSHOT_RETAIN_PER_SHARE as i64
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "trim share request error snapshots failed: {error}"
+            ))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit share request error snapshot failed: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    pub async fn list_share_request_error_snapshots(
+        &self,
+        share_id: &str,
+    ) -> Result<Vec<ShareRequestErrorSnapshot>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, share_id, request_id, captured_at, status_code, method, path,
+                        content_type, caller_email, body_text, body_truncated, body_capture_reason
+                   FROM share_request_error_snapshots
+                  WHERE share_id = ?1
+                  ORDER BY captured_at DESC, id DESC
+                  LIMIT ?2",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare share request error snapshots failed: {error}"
+                ))
+            })?;
+        let rows = stmt
+            .query_map(
+                params![
+                    share_id,
+                    SHARE_REQUEST_ERROR_SNAPSHOT_RETAIN_PER_SHARE as i64
+                ],
+                map_share_request_error_snapshot_row,
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query share request error snapshots failed: {error}"
+                ))
+            })?;
+        collect_rows(rows)
     }
 
     pub async fn get_image_generation_result_for_access(
@@ -15927,6 +16069,15 @@ fn delete_share_auxiliary_rows_tx(conn: &Connection, share_id: &str) -> Result<(
     )
     .map_err(|e| AppError::Internal(format!("delete share request logs failed: {e}")))?;
     conn.execute(
+        "DELETE FROM share_request_error_snapshots WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "delete share request error snapshots failed: {e}"
+        ))
+    })?;
+    conn.execute(
         "DELETE FROM share_health_checks WHERE share_id = ?1",
         params![share_id],
     )
@@ -22989,6 +23140,25 @@ fn map_image_generation_request_log_row(
     })
 }
 
+fn map_share_request_error_snapshot_row(
+    row: &Row<'_>,
+) -> Result<ShareRequestErrorSnapshot, crate::db::Error> {
+    Ok(ShareRequestErrorSnapshot {
+        id: row.get(0)?,
+        share_id: row.get(1)?,
+        request_id: row.get(2)?,
+        captured_at: row.get(3)?,
+        status_code: row.get::<_, i64>(4)?.max(0) as u16,
+        method: row.get(5)?,
+        path: row.get(6)?,
+        content_type: row.get(7)?,
+        caller_email: row.get(8)?,
+        body_text: row.get(9)?,
+        body_truncated: row.get::<_, i64>(10)? != 0,
+        body_capture_reason: row.get(11)?,
+    })
+}
+
 fn list_recent_share_model_health_checks(
     conn: &Connection,
     per_share_limit: usize,
@@ -26050,7 +26220,7 @@ fn normalize_email(value: &str) -> Result<String, AppError> {
     Ok(email)
 }
 
-fn mask_email(email: &str) -> String {
+pub(crate) fn mask_email(email: &str) -> String {
     let Some((local, domain)) = email.split_once('@') else {
         return "***".into();
     };
@@ -26064,6 +26234,20 @@ fn hash_token(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+pub fn truncate_error_snapshot_body(bytes: &[u8]) -> (String, bool) {
+    let truncated = bytes.len() > SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES;
+    let slice = if truncated {
+        &bytes[..SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES]
+    } else {
+        bytes
+    };
+    let mut text = String::from_utf8_lossy(slice).into_owned();
+    if truncated {
+        text.push_str("...");
+    }
+    (text, truncated)
 }
 
 fn truncate_error(value: &str, max_chars: usize) -> String {
@@ -53647,5 +53831,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_request_error_snapshots_keep_last_three_and_delete_with_share() {
+        let (store, config) = setup_store("share-request-error-snapshots").await;
+        insert_installation(&store, "snap-installation").await;
+        insert_share(
+            &store,
+            "snap-installation",
+            "share-snap",
+            &test_share_host("share-snap"),
+            "active",
+        )
+        .await;
+
+        for index in 0..4 {
+            store
+                .insert_share_request_error_snapshot(NewShareRequestErrorSnapshot {
+                    share_id: "share-snap".into(),
+                    request_id: Some(format!("req-{index}")),
+                    status_code: 429,
+                    method: Some("POST".into()),
+                    path: Some("/v1/responses".into()),
+                    content_type: Some("application/json".into()),
+                    caller_email: Some("caller@example.com".into()),
+                    body_text: format!(r#"{{"error":"rate limited {index}"}}"#),
+                    body_truncated: false,
+                    body_capture_reason: "buffered".into(),
+                })
+                .await
+                .expect("insert error snapshot");
+        }
+
+        let listed = store
+            .list_share_request_error_snapshots("share-snap")
+            .await
+            .expect("list error snapshots");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| row.request_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("req-3"), Some("req-2"), Some("req-1")]
+        );
+        assert_eq!(listed[0].caller_email.as_deref(), Some("caller@example.com"));
+        assert_eq!(listed[0].body_text, r#"{"error":"rate limited 3"}"#);
+        assert_eq!(listed[0].body_capture_reason, "buffered");
+
+        let oversized = vec![b'x'; SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES + 16];
+        let (truncated_text, truncated) = truncate_error_snapshot_body(&oversized);
+        assert!(truncated);
+        assert!(truncated_text.ends_with("..."));
+        assert_eq!(
+            truncated_text.len(),
+            SHARE_REQUEST_ERROR_SNAPSHOT_BODY_LIMIT_BYTES + 3
+        );
+
+        {
+            let conn = store.conn.lock().await;
+            delete_share_auxiliary_rows_tx(&conn, "share-snap").expect("delete auxiliary rows");
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM share_request_error_snapshots WHERE share_id = ?1",
+                    params!["share-snap"],
+                    |row| row.get(0),
+                )
+                .expect("count leftover snapshots");
+            assert_eq!(remaining, 0);
+        }
+
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[test]
+    fn mask_email_keeps_first_and_last_local_chars() {
+        assert_eq!(mask_email("alice@example.com"), "a***e@example.com");
+        assert_eq!(mask_email("ab@example.com"), "a***b@example.com");
+        assert_eq!(mask_email("invalid"), "***");
     }
 }

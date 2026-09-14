@@ -677,6 +677,20 @@ location.reload();
 | S-56 | 承上，活跃用户 ≥ 3 | 同上 | 渲染四类占比条与免责文案；条上不含绝对 token 数 |
 | S-57 | 非 `publicly_listed` 的 listing | 直接访问 `/pricing` | 404（非 403，不泄露存在性） |
 
+### 11.6 Share 最近错误(S-59~S-65)
+
+覆盖 owner 编辑弹窗与只读查看弹窗中的最近 3 条非 2xx 快照。市场卡片不变。
+
+| ID | 前置 | 步骤 | 预期 |
+|---|---|---|---|
+| S-59 | Share 最近有非 2xx | 打开编辑弹窗 | 「最近错误」表格显示最多 3 行，按时间倒序 |
+| S-60 | 承上，匿名/非 owner 打开查看弹窗 | 观察 caller | 邮箱被 mask（`a***e@domain`）；owner/admin 看到完整邮箱 |
+| S-61 | 承上，上游返回 JSON 429 | 观察正文 | `<pre>` 显示原始 HTTP 错误体，不是短码 paraphrase |
+| S-62 | SSE 非 2xx | 观察原因 | 显示「流式响应，未缓存正文」，正文为空 |
+| S-63 | 正文 > 8 KiB | 观察正文 | 截到 8192 字节并带 `...`，并有截断说明 |
+| S-64 | 无快照 | 打开弹窗 | 空状态，不报错 |
+| S-65 | 市场目录 | 打开 listing 卡片 | 不出现最近错误表 |
+
 ---
 
 ## 12. 聊天(CH)
@@ -890,7 +904,7 @@ location.reload();
 | `dashboard/create-client-dialog.tsx` | C-19, H-40, 见 §17 |
 | `dashboard/web-terminal/*` | T-01~T-19 |
 | `dashboard/client-console/*` | C-15, T-30~T-36 |
-| `dashboard/share-edit-dialog.tsx`, `share-edit/*` | S-08~S-25, S-47~S-53, S-58 |
+| `dashboard/share-edit-dialog.tsx`, `share-edit/*` | S-08~S-25, S-47~S-53, S-58, S-59~S-65 |
 | `dashboard/share-connect-dialog.tsx` | S-01~S-07 |
 | `dashboard/account-page.tsx` | AC-01~AC-18 |
 | `dashboard/account-notifications-panel.tsx` | X-40~X-43 |
@@ -938,7 +952,7 @@ location.reload();
 | 统一市场账务 | `getMarketBillingDashboard`、`settleMarketBillingAccount`、`requestMarketBillingSettlement`、`declareMarketBillingPayment`、`confirmMarketBillingPayment`、争议/作废端点 | MB-01~MB-19 |
 | 聊天 | `getClientChat*`、`postClientChatMessage` | CH-01~CH-19 |
 | 指标 | `getMetrics*`、`getLlmMetrics*` | N-02~N-14 |
-| Shares | `updateShareSettings`、`getShareUsageByEmail`、`refreshShareUsage`、`getShareUserUsageBreakdown` | S-05, S-06, S-08~S-25, S-34, S-35, S-47~S-53, S-58 |
+| Shares | `updateShareSettings`、`getShareUsageByEmail`、`refreshShareUsage`、`getShareUserUsageBreakdown`、`getShareRecentErrors` | S-05, S-06, S-08~S-25, S-34, S-35, S-47~S-53, S-58, S-59~S-65 |
 | 账户收款资料 | `getAccountPaymentProfile`、`updateAccountPaymentProfile` | AC-03~AC-16, MB-03, MB-17 |
 | Dashboard | `getDashboard`、`getMapDisplay` | C-01, C-22 |
 | Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
@@ -994,3 +1008,4 @@ location.reload();
 | 2026-07-31 | 可信买家管理改为可搜索表格和统一草稿保存；新增全局重置/保存门控以及多买家批量编辑回归用例 MA-14~MA-15。 |
 | 2026-08-10 | Share 下拉补充 subdomain、owner 与支持应用；Token 不限额时隐藏并归一周期；免费/付费统一独立服务期限并从租用成功起算，补齐到期状态机、聊天室事件和 SM/AS 回归用例。 |
 | 2026-08-25 | 新增区域统一模型入口与 Clients「我的」中的模型中枢；补齐精确路由、直连兼容、ACL 重检、无 fallback、CORS、日志归因和 URL 深链 MH-01~MH-20，总数 406。 |
+| 2026-09-14 | Share 编辑/查看弹窗新增最近 3 条非 2xx 快照表（S-59~S-65）；公开 `GET /v1/shares/:id/recent-errors`，匿名 mask 邮箱、正文原样截到 8 KiB。 |

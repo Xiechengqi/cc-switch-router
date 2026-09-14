@@ -7,6 +7,7 @@ import { ShareEditReadView } from "@/components/dashboard/share-edit/share-edit-
 import { ShareEditFormBody, useShareEditForm } from "@/components/dashboard/share-edit/share-edit-form";
 import { ShareEditStatusBanner } from "@/components/dashboard/share-edit/share-edit-section";
 import { ShareClientBansPanel } from "@/components/dashboard/share-edit/share-client-bans-panel";
+import { ShareRecentErrorsPanel } from "@/components/dashboard/share-edit/share-recent-errors-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { ShareView } from "@/lib/types";
 
@@ -72,6 +73,7 @@ export function ShareEditDialog({
                       </Alert>
                     ) : null}
                     <ShareEditFormBody share={liveShare} t={t} form={form} />
+                    <ShareRecentErrorsPanel shareId={liveShare.shareId} t={t} />
                     <ShareClientBansPanel
                       shareId={liveShare.shareId}
                       shareName={liveShare.subdomain || liveShare.shareName}
