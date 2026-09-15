@@ -28,6 +28,7 @@ import type {
   UserModelRoutingTestResponse,
   ReplaceUserModelRoutingRequest,
   NotificationSettings,
+  UserNotificationHistoryResponse,
   TelegramBindLink,
   AccountUsagePeriod,
   AccountUsageResponse,
@@ -459,6 +460,23 @@ export async function testUserModelRouting(input: UserModelRoutingTestRequest) {
 export async function getMyNotificationSettings() {
   return parseJson<NotificationSettings>(
     await authFetch("/v1/me/notifications", { cache: "no-store" }),
+  );
+}
+
+export async function getMyNotificationHistory(params: {
+  cursor?: string;
+  limit?: number;
+  channel?: string;
+  status?: string;
+} = {}) {
+  const query = new URLSearchParams();
+  if (params.cursor) query.set("cursor", params.cursor);
+  if (params.limit) query.set("limit", String(params.limit));
+  if (params.channel && params.channel !== "all") query.set("channel", params.channel);
+  if (params.status && params.status !== "all") query.set("status", params.status);
+  const suffix = query.size ? `?${query}` : "";
+  return parseJson<UserNotificationHistoryResponse>(
+    await authFetch(`/v1/me/notifications/history${suffix}`, { cache: "no-store" }),
   );
 }
 

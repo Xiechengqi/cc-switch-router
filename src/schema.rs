@@ -150,6 +150,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         41,
         include_str!("../schema/0041_binance_settlement_hardening.sql"),
     ),
+    (
+        42,
+        include_str!("../schema/0042_user_notification_history.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1119,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_41_upgrade_a_version_26_database() {
+    fn migrations_27_through_42_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1248,8 +1252,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 41);
-        check_compatibility(&conn).expect("upgraded version 41 is compatible");
+        assert_eq!(latest_version, 42);
+        check_compatibility(&conn).expect("upgraded version 42 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1436,7 +1440,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 41);
+        assert_eq!(latest_version, 42);
     }
 
     #[test]
@@ -1460,7 +1464,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 41);
+        assert_eq!(latest_version, 42);
     }
 
     #[test]
@@ -1640,7 +1644,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 41);
+        assert_eq!(latest_version, 42);
     }
 
     #[test]

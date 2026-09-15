@@ -134,6 +134,23 @@ const NONCE_RETENTION_SECS: i64 = 10 * 60;
 const CLIENT_NOTIFICATION_AUDIT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS: i64 = 60 * 60;
 
+fn user_notification_history_status(status: &str) -> &'static str {
+    match status {
+        "sent" => "sent",
+        "pending" | "claimed" | "retry" | "sending" => "pending",
+        "dead_letter" | "blocked_config" => "failed",
+        value
+            if value == "cancelled"
+                || value.starts_with("suppressed_")
+                || value.starts_with("cancelled_") =>
+        {
+            "suppressed"
+        }
+        "superseded" => "suppressed",
+        _ => "pending",
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CapacityScope<'a> {
     // `router_gateways.owner_email` is self-reported audit metadata and must
@@ -5665,6 +5682,101 @@ impl AppStore {
         })
     }
 
+    pub async fn list_user_notification_history(
+        &self,
+        email: &str,
+        channel: Option<&str>,
+        status: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<crate::notifications::UserNotificationHistoryItem>, bool), AppError> {
+        let email = normalize_email(email)?;
+        let (cursor_created_at, cursor_id) = cursor.unzip();
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT b.id, b.channel, b.delivery_kind,
+                    COALESCE(GROUP_CONCAT(DISTINCT e.kind), ''),
+                    COALESCE(SUM(CASE WHEN e.id IS NULL THEN 0 ELSE 1 END), 0),
+                    b.subject, b.text_body, b.recipient, b.channel_target,
+                    b.status, b.attempts, b.created_at, b.sent_at,
+                    b.next_attempt_at, b.failure_kind, b.blocked_reason_code
+             FROM notification_deliveries b
+             LEFT JOIN notification_delivery_items bi ON bi.batch_id = b.id
+             LEFT JOIN client_notification_events e ON e.id = bi.event_id
+             WHERE (
+                 b.recipient_user_id = (
+                     SELECT id FROM users WHERE email_normalized = ?1 LIMIT 1
+                 )
+                 OR (b.recipient_user_id IS NULL AND LOWER(b.recipient) = ?1)
+             )
+               AND (?2 IS NULL OR b.channel = ?2)
+               AND (?3 IS NULL OR
+                    (?3 = 'sent' AND b.status = 'sent') OR
+                    (?3 = 'pending' AND b.status IN ('pending', 'claimed', 'retry', 'sending')) OR
+                    (?3 = 'failed' AND b.status IN ('dead_letter', 'blocked_config')) OR
+                    (?3 = 'suppressed' AND (
+                        b.status = 'cancelled' OR b.status LIKE 'suppressed_%' OR b.status LIKE 'cancelled_%'
+                        OR b.status = 'superseded'
+                    )))
+               AND (?4 IS NULL OR b.created_at < ?4 OR (b.created_at = ?4 AND b.id < ?5))
+             GROUP BY b.id
+             ORDER BY b.created_at DESC, b.id DESC
+             LIMIT ?6",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare user notification history failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    email,
+                    channel,
+                    status,
+                    cursor_created_at,
+                    cursor_id,
+                    limit.clamp(1, 100) as i64 + 1,
+                ],
+                |row| {
+                    let channel: String = row.get(1)?;
+                    let recipient: String = row.get(7)?;
+                    let channel_target: Option<String> = row.get(8)?;
+                    let raw_status: String = row.get(9)?;
+                    Ok(crate::notifications::UserNotificationHistoryItem {
+                        id: row.get(0)?,
+                        channel: channel.clone(),
+                        delivery_kind: row.get(2)?,
+                        event_kind: row.get(3)?,
+                        event_count: row.get::<_, i64>(4)?.max(0) as u64,
+                        title: row.get(5)?,
+                        body: row.get::<_, String>(6)?.chars().take(20_000).collect(),
+                        target_label: mask_notification_target(
+                            &channel,
+                            &recipient,
+                            channel_target.as_deref(),
+                        ),
+                        status: user_notification_history_status(&raw_status).into(),
+                        attempts: row.get::<_, i64>(10)?.max(0) as u32,
+                        created_at: row.get(11)?,
+                        sent_at: row.get(12)?,
+                        next_attempt_at: row.get(13)?,
+                        failure_code: row.get::<_, Option<String>>(15)?.or(row.get(14)?),
+                    })
+                },
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("query user notification history failed: {error}"))
+            })?;
+        let mut items = rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read user notification history failed: {error}"))
+        })?;
+        let has_more = items.len() > limit.clamp(1, 100);
+        if has_more {
+            items.pop();
+        }
+        Ok((items, has_more))
+    }
+
     pub async fn prepare_installation_upgrade(
         &self,
         config: &Config,
@@ -8133,7 +8245,6 @@ impl AppStore {
         Ok(())
     }
 
-
     pub async fn list_share_request_error_snapshots(
         &self,
         share_id: &str,
@@ -8835,9 +8946,7 @@ impl AppStore {
                   WHERE created_at >= ?1
                     AND is_health_check = 0",
             )
-            .map_err(|e| {
-                AppError::Internal(format!("prepare rollup model keys failed: {e}"))
-            })?;
+            .map_err(|e| AppError::Internal(format!("prepare rollup model keys failed: {e}")))?;
         let observed_models: Vec<String> = observed_stmt
             .query_map(params![horizon], |row| row.get::<_, String>(0))
             .map_err(|e| AppError::Internal(format!("query rollup model keys failed: {e}")))?
@@ -8854,11 +8963,7 @@ impl AppStore {
             if let Some((_, price)) = catalog.lookup(&model_key, now_unix)
                 && let Some(threshold) = price.long_context_threshold
             {
-                thresholds.push((
-                    model_key,
-                    threshold as i64,
-                    price.long_context_inclusive,
-                ));
+                thresholds.push((model_key, threshold as i64, price.long_context_inclusive));
             }
         }
 
@@ -9317,8 +9422,7 @@ impl AppStore {
                 rebase_applied,
                 observed_totals: totals,
                 equivalent_usd_micros: any_priced.then(|| equivalent.to_string()),
-                equivalent_usd_micros_upper_bound: any_priced
-                    .then(|| equivalent_upper.to_string()),
+                equivalent_usd_micros_upper_bound: any_priced.then(|| equivalent_upper.to_string()),
                 priced_coverage_percent,
                 estimated_request_percent,
                 by_model,
@@ -16024,11 +16128,7 @@ fn delete_share_auxiliary_rows_tx(conn: &Connection, share_id: &str) -> Result<(
         "DELETE FROM share_request_error_snapshots WHERE share_id = ?1",
         params![share_id],
     )
-    .map_err(|e| {
-        AppError::Internal(format!(
-            "delete share request error snapshots failed: {e}"
-        ))
-    })?;
+    .map_err(|e| AppError::Internal(format!("delete share request error snapshots failed: {e}")))?;
     conn.execute(
         "DELETE FROM share_health_checks WHERE share_id = ?1",
         params![share_id],
@@ -20368,9 +20468,7 @@ fn share_user_usage_rebase_applied(
     {
         return true;
     }
-    grant
-        .usage_quota
-        .is_some_and(|quota| quota.rebase_applies)
+    grant.usage_quota.is_some_and(|quota| quota.rebase_applies)
 }
 
 /// Renders the `targets` VALUES list, appending its bound values.
@@ -33906,7 +34004,11 @@ mod tests {
         let _ = std::fs::remove_file(&config.database.path);
     }
 
-    fn set_share_grants(conn: &Connection, share_id: &str, grants: BTreeMap<String, ShareUserGrant>) {
+    fn set_share_grants(
+        conn: &Connection,
+        share_id: &str,
+        grants: BTreeMap<String, ShareUserGrant>,
+    ) {
         conn.execute(
             "UPDATE shares SET user_grants_json = ?2 WHERE share_id = ?1",
             params![
@@ -34055,7 +34157,12 @@ mod tests {
         assert_eq!(row.by_model[0].unattributed, 80);
         assert!(row.by_model[0].equivalent_usd_micros.is_none());
         assert!(row.equivalent_usd_micros.is_none());
-        assert!(!row.by_model[0].notes.iter().any(|note| note == "priceKeyNotFound"));
+        assert!(
+            !row.by_model[0]
+                .notes
+                .iter()
+                .any(|note| note == "priceKeyNotFound")
+        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -34290,10 +34397,7 @@ mod tests {
         let now = Utc::now().timestamp();
         {
             let conn = store.conn.lock().await;
-            for (request_id, email) in [
-                ("mix-a", "a@example.com"),
-                ("mix-b", "b@example.com"),
-            ] {
+            for (request_id, email) in [("mix-a", "a@example.com"), ("mix-b", "b@example.com")] {
                 let mut log = test_share_request_log_entry(request_id, "share-public", now);
                 log.user_email = Some(email.into());
                 log.input_tokens = 10;
@@ -34366,8 +34470,20 @@ mod tests {
         assert!(mix.composition.input > 0.0);
         assert!(mix.composition.output > 0.0);
         let encoded = serde_json::to_value(&pricing).expect("encode pricing");
-        assert!(encoded.get("usageMix").unwrap().get("distinctUsers").is_none());
-        assert!(encoded.get("usageMix").unwrap().get("requestCount").is_none());
+        assert!(
+            encoded
+                .get("usageMix")
+                .unwrap()
+                .get("distinctUsers")
+                .is_none()
+        );
+        assert!(
+            encoded
+                .get("usageMix")
+                .unwrap()
+                .get("requestCount")
+                .is_none()
+        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -34426,7 +34542,10 @@ mod tests {
             aliased.output_tokens = 1;
             upsert_share_request_log_tx(&conn, "inst-1", aliased).expect("insert aliased long");
         }
-        store.reload_pricing_catalog().await.expect("reload catalog");
+        store
+            .reload_pricing_catalog()
+            .await
+            .expect("reload catalog");
         store
             .rebuild_share_listing_usage_rollup(31)
             .await
@@ -34548,7 +34667,9 @@ mod tests {
             "read_share_listing_usage_mix must prepare LISTING_USAGE_MIX_SQL, otherwise a later live-scan string would slip past the constant pin"
         );
         assert!(
-            !mix_fn_body.to_ascii_lowercase().contains("share_request_logs"),
+            !mix_fn_body
+                .to_ascii_lowercase()
+                .contains("share_request_logs"),
             "read_share_listing_usage_mix must not mention share_request_logs: {mix_fn_body}"
         );
         let pricing_fn_start = mix_fn_src
@@ -43267,6 +43388,119 @@ mod tests {
             .await
             .expect("list overflow delivery summary");
         assert!(deliveries.is_empty());
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn user_notification_history_is_account_scoped_filtered_and_paginated() {
+        let config = enabled_notification_config("user-notification-history");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            for (id, email) in [("user-a", "a@example.com"), ("user-b", "b@example.com")] {
+                conn.execute(
+                    "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+                     VALUES (?1, ?2, ?3, ?3)",
+                    params![id, email, now],
+                )
+                .expect("insert history user");
+            }
+            for (id, user_id, recipient, channel, status, created) in [
+                (
+                    "history-a-2",
+                    Some("user-a"),
+                    "a@example.com",
+                    "bark",
+                    "sent",
+                    "2026-09-14T02:00:00Z",
+                ),
+                (
+                    "history-a-1",
+                    Some("user-a"),
+                    "a@example.com",
+                    "email",
+                    "dead_letter",
+                    "2026-09-14T01:00:00Z",
+                ),
+                (
+                    "history-legacy-a",
+                    None,
+                    "A@example.com",
+                    "telegram",
+                    "suppressed_disabled",
+                    "2026-09-14T00:00:00Z",
+                ),
+                (
+                    "history-b",
+                    Some("user-b"),
+                    "b@example.com",
+                    "email",
+                    "sent",
+                    "2026-09-14T03:00:00Z",
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO notification_deliveries (
+                        id, notification_lane, recipient, recipient_user_id, channel,
+                        from_address, subject, html_body, text_body, idempotency_key,
+                        status, attempts, not_before, template_fingerprint,
+                        delivery_kind, created_at, updated_at
+                     ) VALUES (?1, 'offline', ?2, ?3, ?4, '', ?1, '', 'visible body',
+                               ?1 || '-key', ?5, 1, ?6, 'test', 'lifecycle', ?6, ?6)",
+                    params![id, recipient, user_id, channel, status, created],
+                )
+                .expect("insert history delivery");
+            }
+        }
+
+        let (first, more) = store
+            .list_user_notification_history("A@example.com", None, None, None, 2)
+            .await
+            .expect("first history page");
+        assert_eq!(
+            first
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["history-a-2", "history-a-1"]
+        );
+        assert!(more);
+        assert!(first.iter().all(|item| !item.id.contains("history-b")));
+
+        let last = first.last().expect("page cursor");
+        let (second, more) = store
+            .list_user_notification_history(
+                "a@example.com",
+                None,
+                None,
+                Some((&last.created_at, &last.id)),
+                2,
+            )
+            .await
+            .expect("second history page");
+        assert_eq!(
+            second
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["history-legacy-a"]
+        );
+        assert!(!more);
+
+        let (failed, _) = store
+            .list_user_notification_history(
+                "a@example.com",
+                Some("email"),
+                Some("failed"),
+                None,
+                30,
+            )
+            .await
+            .expect("filtered history");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, "failed");
+        assert_eq!(failed[0].body, "visible body");
         let _ = std::fs::remove_file(&config.database.path);
     }
 

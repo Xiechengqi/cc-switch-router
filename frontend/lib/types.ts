@@ -644,6 +644,28 @@ export type NotificationSettings = {
   telegramBotLastFailureAt?: string;
 };
 
+export type UserNotificationHistoryItem = {
+  id: string;
+  channel: string;
+  deliveryKind: string;
+  eventKind: string;
+  eventCount: number;
+  title: string;
+  body: string;
+  targetLabel: string;
+  status: "sent" | "pending" | "failed" | "suppressed" | string;
+  attempts: number;
+  createdAt: string;
+  sentAt?: string | null;
+  nextAttemptAt?: string | null;
+  failureCode?: string | null;
+};
+
+export type UserNotificationHistoryResponse = {
+  items: UserNotificationHistoryItem[];
+  nextCursor?: string | null;
+};
+
 /** POST /v1/me/notifications/telegram/bind-link — single use, short lived. */
 export type TelegramBindLink = {
   url: string;

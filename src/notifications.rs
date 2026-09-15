@@ -381,6 +381,32 @@ pub struct ClientNotificationDeliveriesResponse {
     pub deliveries: Vec<ClientNotificationDeliveryView>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserNotificationHistoryItem {
+    pub id: String,
+    pub channel: String,
+    pub delivery_kind: String,
+    pub event_kind: String,
+    pub event_count: u64,
+    pub title: String,
+    pub body: String,
+    pub target_label: String,
+    pub status: String,
+    pub attempts: u32,
+    pub created_at: String,
+    pub sent_at: Option<String>,
+    pub next_attempt_at: Option<String>,
+    pub failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserNotificationHistoryResponse {
+    pub items: Vec<UserNotificationHistoryItem>,
+    pub next_cursor: Option<String>,
+}
+
 #[async_trait]
 pub trait ClientNotificationStore: Clone + Send + Sync + 'static {
     async fn reconcile_client_notification_events(

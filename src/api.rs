@@ -403,6 +403,10 @@ pub fn router(state: ServerState) -> Router {
             get(get_my_notification_settings).patch(update_my_notification_settings),
         )
         .route(
+            "/v1/me/notifications/history",
+            get(get_my_notification_history),
+        )
+        .route(
             "/v1/me/notifications/telegram/bind-link",
             post(create_my_telegram_bind_link),
         )
@@ -2508,6 +2512,94 @@ async fn get_my_notification_settings(
     Ok(Json(response))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserNotificationHistoryQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+    channel: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UserNotificationHistoryCursor {
+    created_at: String,
+    id: String,
+}
+
+async fn get_my_notification_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<UserNotificationHistoryQuery>,
+) -> Result<(HeaderMap, Json<crate::notifications::UserNotificationHistoryResponse>), AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let limit = query.limit.unwrap_or(30).clamp(1, 100);
+    let channel = query.channel.as_deref().filter(|value| *value != "all");
+    if channel.is_some_and(|value| !matches!(value, "email" | "telegram" | "bark")) {
+        return Err(AppError::BadRequest("invalid notification channel".into()));
+    }
+    let status = query.status.as_deref().filter(|value| *value != "all");
+    if status.is_some_and(|value| !matches!(value, "sent" | "pending" | "failed" | "suppressed")) {
+        return Err(AppError::BadRequest("invalid notification status".into()));
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_notification_history_cursor)
+        .transpose()?;
+    let (items, has_more) = state
+        .store
+        .list_user_notification_history(
+            &email,
+            channel,
+            status,
+            cursor
+                .as_ref()
+                .map(|value| (value.created_at.as_str(), value.id.as_str())),
+            limit,
+        )
+        .await?;
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(encode_notification_history_cursor)
+            .transpose()?
+    } else {
+        None
+    };
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((
+        response_headers,
+        Json(crate::notifications::UserNotificationHistoryResponse { items, next_cursor }),
+    ))
+}
+
+fn decode_notification_history_cursor(
+    value: &str,
+) -> Result<UserNotificationHistoryCursor, AppError> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| AppError::BadRequest("invalid notification history cursor".into()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadRequest("invalid notification history cursor".into()))
+}
+
+fn encode_notification_history_cursor(
+    item: &crate::notifications::UserNotificationHistoryItem,
+) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(&UserNotificationHistoryCursor {
+        created_at: item.created_at.clone(),
+        id: item.id.clone(),
+    })
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "encode notification history cursor failed: {error}"
+        ))
+    })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
 async fn update_my_notification_settings(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -3491,6 +3583,31 @@ mod tests {
             explicit.get(MASTER_KEY).and_then(|value| value.as_deref()),
             Some("operator-key")
         );
+    }
+
+    #[test]
+    fn notification_history_cursor_round_trips_and_rejects_invalid_input() {
+        let item = crate::notifications::UserNotificationHistoryItem {
+            id: "delivery-1".into(),
+            channel: "email".into(),
+            delivery_kind: "lifecycle".into(),
+            event_kind: "client_offline".into(),
+            event_count: 1,
+            title: "title".into(),
+            body: "body".into(),
+            target_label: "a***e@example.com".into(),
+            status: "sent".into(),
+            attempts: 1,
+            created_at: "2026-09-14T00:00:00Z".into(),
+            sent_at: None,
+            next_attempt_at: None,
+            failure_code: None,
+        };
+        let encoded = encode_notification_history_cursor(&item).expect("encode cursor");
+        let decoded = decode_notification_history_cursor(&encoded).expect("decode cursor");
+        assert_eq!(decoded.created_at, item.created_at);
+        assert_eq!(decoded.id, item.id);
+        assert!(decode_notification_history_cursor("not-a-cursor").is_err());
     }
 
     #[tokio::test]

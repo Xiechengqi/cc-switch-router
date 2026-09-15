@@ -120,7 +120,7 @@ const NOTIFICATION_SUBSECTION_GROUPS = {
   system: ["Alerting"],
   business: ["Client notifications"],
   email: ["Email (Resend)"],
-  telegram: ["Telegram alerts", "Telegram bot"],
+  telegram: ["Telegram bot", "Telegram alerts"],
   bark: ["Bark alerts", "Bark channel"],
 } as const;
 
@@ -320,7 +320,7 @@ export function SettingsPage() {
     ].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
   });
   const visibleFields = matchingFields.filter((field) => dependenciesSatisfied(field, schema?.fields || [], values, dirty));
-  const groupedFields = groupFields(visibleFields);
+  const groupedFields = groupFields(visibleFields, activeSubsection?.groups);
   const keepGeneralPanelsMounted = activeSection === "general_display";
   const keepProvisionKeyMounted = activeSection === "marketplace";
   const keepChannelHealthMounted = activeSection === "notifications";
@@ -1120,10 +1120,15 @@ function ProvisionKeyPanel({ value, error }: { value: ProvisionSshKey | null; er
   );
 }
 
-function groupFields(fields: SettingsField[]) {
+function groupFields(fields: SettingsField[], preferredOrder?: readonly string[]) {
   const groups = new Map<string, SettingsField[]>();
   for (const field of fields) groups.set(field.group, [...(groups.get(field.group) || []), field]);
-  return [...groups.entries()];
+  const entries = [...groups.entries()];
+  if (!preferredOrder) return entries;
+  const order = new Map(preferredOrder.map((group, index) => [group, index]));
+  return entries.sort(([left], [right]) => (
+    (order.get(left) ?? Number.MAX_SAFE_INTEGER) - (order.get(right) ?? Number.MAX_SAFE_INTEGER)
+  ));
 }
 
 function groupSubsectionId(group: string) {

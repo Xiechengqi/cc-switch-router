@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Input } from "@heroui/react";
-import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, Send, Smartphone, Unlink } from "lucide-react";
+import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, RefreshCw, Send, Smartphone, Unlink } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -10,12 +10,13 @@ import {
   ApiError,
   bindMyBark,
   createTelegramBindLink,
+  getMyNotificationHistory,
   getMyNotificationSettings,
   unbindMyTelegramChat,
   unbindMyBark,
   updateMyNotificationSettings,
 } from "@/lib/api";
-import type { NotificationChannelSettings, NotificationSettings, TelegramBindLink } from "@/lib/types";
+import type { NotificationChannelSettings, NotificationSettings, TelegramBindLink, UserNotificationHistoryItem } from "@/lib/types";
 import { cn, formatDateTime } from "@/lib/utils";
 
 /** How long to keep watching for the `/start` handshake after opening the tab. */
@@ -662,6 +663,8 @@ export function AccountNotificationsPanel() {
         ) : null}
       </section>
 
+      <AccountNotificationHistory accountKey={session?.user?.email || ""} />
+
       <ConfirmAlertDialog
         open={unbindOpen}
         title={t("account.notifications.unbindConfirmTitle")}
@@ -686,6 +689,111 @@ export function AccountNotificationsPanel() {
       />
     </div>
   );
+}
+
+function AccountNotificationHistory({ accountKey }: { accountKey: string }) {
+  const { locale, t } = useLocaleText();
+  const [items, setItems] = React.useState<UserNotificationHistoryItem[]>([]);
+  const [cursor, setCursor] = React.useState<string | null>(null);
+  const [channel, setChannel] = React.useState("all");
+  const [status, setStatus] = React.useState("all");
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const requestGeneration = React.useRef(0);
+
+  const load = React.useCallback(async (append = false, generation = requestGeneration.current) => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await getMyNotificationHistory({
+        cursor: append ? cursor || undefined : undefined,
+        limit: 30,
+        channel,
+        status,
+      });
+      if (generation !== requestGeneration.current) return;
+      setItems((current) => append ? [...current, ...response.items] : response.items);
+      setCursor(response.nextCursor || null);
+    } catch (cause) {
+      if (generation !== requestGeneration.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (generation === requestGeneration.current) setLoading(false);
+    }
+  }, [channel, cursor, status]);
+
+  React.useEffect(() => {
+    requestGeneration.current += 1;
+    setItems([]);
+    setCursor(null);
+    void load(false, requestGeneration.current);
+    // `load` includes the cursor written by this request; filters and account
+    // identity are the actual reset boundaries.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountKey, channel, status]);
+
+  return (
+    <section className="grid gap-3 border-t pt-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">{t("account.notifications.historyTitle")}</h3>
+          <p className="mt-0.5 text-sm text-muted-foreground">{t("account.notifications.historyHint")}</p>
+        </div>
+        <Button size="sm" variant="outline" isDisabled={loading} onClick={() => void load(false)}>
+          {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          {t("common.reload")}
+        </Button>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <select className="h-10 rounded-md border bg-background px-3 text-sm" value={channel} onChange={(event) => setChannel(event.target.value)} aria-label={t("account.notifications.historyChannel")}>
+          <option value="all">{t("account.notifications.historyAllChannels")}</option>
+          <option value="email">Email</option><option value="telegram">Telegram</option><option value="bark">Bark</option>
+        </select>
+        <select className="h-10 rounded-md border bg-background px-3 text-sm" value={status} onChange={(event) => setStatus(event.target.value)} aria-label={t("account.notifications.historyStatus")}>
+          <option value="all">{t("account.notifications.historyAllStatuses")}</option>
+          <option value="sent">{t("account.notifications.historySent")}</option>
+          <option value="pending">{t("account.notifications.historyPending")}</option>
+          <option value="failed">{t("account.notifications.historyFailed")}</option>
+          <option value="suppressed">{t("account.notifications.historySuppressed")}</option>
+        </select>
+      </div>
+      {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
+      <div className="divide-y rounded-md border">
+        {items.map((item) => (
+          <details key={item.id} className="group px-3 py-3">
+            <summary className="cursor-pointer list-none">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="font-medium text-foreground">{item.title || item.eventKind}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">{item.channel.toUpperCase()} · {item.targetLabel} · {formatDateTime(item.createdAt, locale)}</div>
+                </div>
+                <span className={cn("rounded-full px-2 py-1 text-xs font-medium", historyStatusClass(item.status))}>{historyStatusLabel(item.status, t)}</span>
+              </div>
+            </summary>
+            <div className="mt-3 grid gap-2 border-t pt-3 text-sm">
+              <pre className="whitespace-pre-wrap break-words font-sans text-muted-foreground">{item.body || t("account.notifications.historyNoBody")}</pre>
+              <div className="text-xs text-muted-foreground">{t("account.notifications.historyAttempts", { count: item.attempts })}{item.sentAt ? ` · ${t("account.notifications.historySentAt", { time: formatDateTime(item.sentAt, locale) })}` : ""}</div>
+              {item.failureCode ? <div className="text-xs text-red-700">{t("account.notifications.historyFailure", { code: item.failureCode })}</div> : null}
+            </div>
+          </details>
+        ))}
+        {!loading && items.length === 0 ? <div className="px-3 py-10 text-center text-sm text-muted-foreground">{t("account.notifications.historyEmpty")}</div> : null}
+      </div>
+      {cursor ? <Button variant="outline" isDisabled={loading} onClick={() => void load(true)}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("account.notifications.historyLoadMore")}</Button> : null}
+    </section>
+  );
+}
+
+function historyStatusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  const key = status === "sent" ? "historySent" : status === "failed" ? "historyFailed" : status === "suppressed" ? "historySuppressed" : "historyPending";
+  return t(`account.notifications.${key}`);
+}
+
+function historyStatusClass(status: string) {
+  if (status === "sent") return "bg-emerald-50 text-emerald-700";
+  if (status === "failed") return "bg-red-50 text-red-700";
+  if (status === "suppressed") return "bg-slate-100 text-slate-600";
+  return "bg-amber-50 text-amber-700";
 }
 
 function channelSettings(
