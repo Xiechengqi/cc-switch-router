@@ -821,6 +821,13 @@ export type ShareRecentErrorsResponse = {
   errors: ShareRecentError[];
 };
 
+export type ShareRequestedModelBlocks = {
+  shareId: string;
+  revision: number;
+  blockedModelsByApp: Partial<Record<"claude" | "codex" | "gemini", string[]>>;
+  updatedAt?: string;
+};
+
 export type ImageGenerationRequestLog = {
   requestId: string;
   shareId: string;
@@ -966,6 +973,49 @@ export type ShareUserUsageBreakdownResponse = {
   pricingRevision: string;
   pricedAt: number;
   rows: ShareUserUsageBreakdownRow[];
+};
+
+export type AdminModelPriceResult = {
+  modelKey: string;
+  displayName: string;
+  effectiveFrom: number;
+  pricingRevision: string;
+};
+
+export type AdminModelPriceRates = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite5m: number;
+  cacheWrite1h?: number;
+};
+
+export type AdminModelPriceListItem = {
+  modelKey: string;
+  displayName: string;
+  priced: boolean;
+  source?: "derived" | "admin";
+  discoveredFrom: Array<"catalog" | "share" | "usage" | "admin">;
+  effectiveFrom?: number;
+  ratesMicrosPer1m?: AdminModelPriceRates;
+};
+
+export type AdminModelPriceList = {
+  pricingRevision: string;
+  total: number;
+  priced: number;
+  unpriced: number;
+  adminOverrides: number;
+  models: AdminModelPriceListItem[];
+};
+
+export type AdminModelPriceHistoryItem = {
+  effectiveFrom: number;
+  effectiveTo?: number;
+  displayName: string;
+  source: "derived" | "admin";
+  current: boolean;
+  ratesMicrosPer1m: AdminModelPriceRates;
 };
 
 /** email (lowercased) -> breakdown row. */

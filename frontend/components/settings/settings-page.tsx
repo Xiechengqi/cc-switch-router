@@ -2,6 +2,7 @@
 
 import {
   AlertTriangle,
+  BadgeDollarSign,
   CheckCircle2,
   CircleGauge,
   Database,
@@ -26,6 +27,7 @@ import { AlertChannelsPanel } from "@/components/settings/alert-channels-panel";
 import { EmailChannelPanel } from "@/components/settings/email-channel-panel";
 import { AnnouncementPanel } from "@/components/settings/announcement-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
+import { ModelPricesPanel } from "@/components/settings/model-prices-panel";
 import {
   settingsCategoryDescription,
   settingsCategoryLabel,
@@ -63,7 +65,7 @@ import type {
 } from "@/lib/types";
 
 type DirtyValue = string | boolean | null;
-type ActiveSection = "overview" | SettingsCategoryId;
+type ActiveSection = "overview" | "model_prices" | SettingsCategoryId;
 type Banner = { kind: "default" | "success" | "destructive" | "warning"; text: string };
 type SettingsPanel = "map" | "announcement" | "channel_health" | "provision_key";
 type SettingsSubsection = {
@@ -296,7 +298,9 @@ export function SettingsPage() {
   const schema = snapshot?.schema;
   const settingsFields = (schema?.fields || []).filter((field) => !ROUTER_MANAGED_BARK_FIELDS.has(field.key));
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const activeCategory = activeSection === "overview" ? undefined : activeSection;
+  const activeCategory = activeSection === "overview" || activeSection === "model_prices"
+    ? undefined
+    : activeSection;
   const categoryFields = settingsFields.filter((field) => field.category === activeCategory);
   const subsections = activeCategory
     ? buildSettingsSubsections(activeCategory, categoryFields, values, dirty, mapDirty, t)
@@ -332,7 +336,7 @@ export function SettingsPage() {
           <h1 className="font-display text-3xl">{t("settings.title")}</h1>
           <p className="mt-2 max-w-3xl text-sm text-muted-foreground">{t("settings.workspaceDescription")}</p>
         </div>
-        <div className="flex flex-wrap justify-end gap-2">
+        <div className={`flex flex-wrap justify-end gap-2 ${activeSection === "model_prices" ? "hidden" : ""}`}>
           <Button variant="outline" onClick={resetDraft} isDisabled={!!busy || dirtyCount === 0}>
             <RotateCcw className="h-4 w-4" />
             {t("common.reset")}
@@ -389,11 +393,17 @@ export function SettingsPage() {
                 onClick={() => selectCategory(category.id)}
               />
             ))}
+            <SettingsNavButton
+              active={activeSection === "model_prices"}
+              label={t("settings.modelPrices.nav")}
+              icon={BadgeDollarSign}
+              onClick={() => { setActiveSection("model_prices"); setQuery(""); }}
+            />
           </nav>
         </aside>
 
         <div className="min-w-0">
-          <div className="relative mb-5">
+          <div className={`relative mb-5 ${activeSection === "model_prices" ? "hidden" : ""}`}>
             <Search className="pointer-events-none absolute left-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("settings.search")}
@@ -404,7 +414,9 @@ export function SettingsPage() {
             />
           </div>
 
-          {!snapshot && busy === "load" ? (
+          {activeSection === "model_prices" ? (
+            <ModelPricesPanel />
+          ) : !snapshot && busy === "load" ? (
             <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
               {t("settings.loading")}

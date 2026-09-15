@@ -919,6 +919,135 @@ pub struct AppStore {
     /// Snapshot of the model price catalog (§5.4). Instance-scoped rather than
     /// process-global so it always matches this store's database.
     pricing_catalog: Arc<StdRwLock<Arc<crate::model_price_catalog::PricingCatalog>>>,
+    requested_model_blocks: Arc<StdRwLock<Arc<RequestedModelBlockSnapshot>>>,
+}
+
+type RequestedModelBlockSnapshot = HashMap<String, HashMap<String, HashSet<String>>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRequestedModelBlocks {
+    pub share_id: String,
+    pub revision: u64,
+    pub blocked_models_by_app: BTreeMap<String, Vec<String>>,
+    pub updated_at: Option<String>,
+}
+
+fn normalize_requested_model_blocks(
+    input: BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, Vec<String>>, AppError> {
+    let mut output = BTreeMap::new();
+    let mut total = 0usize;
+    for (raw_app, raw_models) in input {
+        let app = raw_app.trim().to_ascii_lowercase();
+        if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
+            return Err(AppError::BadRequest(format!(
+                "unsupported app type: {raw_app}"
+            )));
+        }
+        let mut models = BTreeSet::new();
+        for raw_model in raw_models {
+            let model = raw_model.trim().to_string();
+            if model.is_empty()
+                || model.len() > 200
+                || model.contains('*')
+                || model.chars().any(char::is_control)
+            {
+                return Err(AppError::BadRequest("invalid exact requested model".into()));
+            }
+            models.insert(model);
+        }
+        if models.len() > 100 {
+            return Err(AppError::BadRequest(
+                "at most 100 blocked models are allowed per app".into(),
+            ));
+        }
+        total += models.len();
+        if !models.is_empty() {
+            output.insert(app, models.into_iter().collect());
+        }
+    }
+    if total > 200 {
+        return Err(AppError::BadRequest(
+            "at most 200 blocked models are allowed per Share".into(),
+        ));
+    }
+    Ok(output)
+}
+
+fn load_requested_model_block_snapshot(
+    conn: &Connection,
+) -> Result<RequestedModelBlockSnapshot, AppError> {
+    let mut statement = conn
+        .prepare("SELECT share_id, app_type, requested_model FROM share_requested_model_blocks")
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "prepare requested model block snapshot failed: {e}"
+            ))
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| {
+            AppError::Internal(format!("query requested model block snapshot failed: {e}"))
+        })?;
+    let mut snapshot = HashMap::new();
+    for row in rows {
+        let (share_id, app, model) =
+            row.map_err(|e| AppError::Internal(format!("read requested model block failed: {e}")))?;
+        snapshot
+            .entry(share_id)
+            .or_insert_with(HashMap::new)
+            .entry(app)
+            .or_insert_with(HashSet::new)
+            .insert(model);
+    }
+    Ok(snapshot)
+}
+
+fn share_requested_model_blocks_from_conn(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<ShareRequestedModelBlocks, AppError> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM shares WHERE share_id = ?1)",
+            params![share_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| AppError::Internal(format!("query Share failed: {e}")))?;
+    if exists == 0 {
+        return Err(AppError::NotFound("Share not found".into()));
+    }
+    let policy = conn.query_row(
+        "SELECT revision, updated_at FROM share_requested_model_block_policies WHERE share_id = ?1",
+        params![share_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    ).optional().map_err(|e| AppError::Internal(format!("query requested model block policy failed: {e}")))?;
+    let mut statement = conn.prepare(
+        "SELECT app_type, requested_model FROM share_requested_model_blocks WHERE share_id = ?1 ORDER BY app_type, requested_model",
+    ).map_err(|e| AppError::Internal(format!("prepare requested model blocks failed: {e}")))?;
+    let rows = statement
+        .query_map(params![share_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| AppError::Internal(format!("query requested model blocks failed: {e}")))?;
+    let mut by_app: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        let (app, model) =
+            row.map_err(|e| AppError::Internal(format!("read requested model block failed: {e}")))?;
+        by_app.entry(app).or_default().push(model);
+    }
+    Ok(ShareRequestedModelBlocks {
+        share_id: share_id.to_string(),
+        revision: policy.as_ref().map_or(0, |value| value.0.max(0) as u64),
+        blocked_models_by_app: by_app,
+        updated_at: policy.map(|value| value.1),
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1573,6 +1702,7 @@ impl AppStore {
         // Fail-closed, like the baseline checksum: a half-loaded price catalog
         // would render plausible numbers that are wrong (§5.4).
         let pricing_catalog = crate::model_price_catalog::load(&conn, Utc::now().timestamp())?;
+        let requested_model_blocks = load_requested_model_block_snapshot(&conn)?;
         let (boot_notification_policy, _) =
             ClientNotificationPolicy::for_runtime(&config.client_notifications, config);
         let boot_notification_template = NotificationTemplateContext::from_config(config);
@@ -1594,6 +1724,7 @@ impl AppStore {
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
             market_usd_cny_rate_micros: Arc::new(AtomicI64::new(config.market_usd_cny_rate_micros)),
             pricing_catalog: Arc::new(StdRwLock::new(pricing_catalog)),
+            requested_model_blocks: Arc::new(StdRwLock::new(Arc::new(requested_model_blocks))),
         })
     }
 
@@ -1858,7 +1989,129 @@ impl AppStore {
             pricing_catalog: Arc::new(StdRwLock::new(Arc::new(
                 crate::model_price_catalog::PricingCatalog::default(),
             ))),
+            requested_model_blocks: Arc::new(StdRwLock::new(Arc::new(HashMap::new()))),
         })
+    }
+
+    pub fn is_requested_model_blocked(&self, share_id: &str, app_type: &str, model: &str) -> bool {
+        let snapshot = match self.requested_model_blocks.read() {
+            Ok(value) => value,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        snapshot
+            .get(share_id)
+            .and_then(|apps| apps.get(app_type))
+            .is_some_and(|models| models.contains(model))
+    }
+
+    pub fn share_has_requested_model_blocks(&self, share_id: &str) -> bool {
+        let snapshot = match self.requested_model_blocks.read() {
+            Ok(value) => value,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        snapshot.get(share_id).is_some_and(|apps| !apps.is_empty())
+    }
+
+    pub async fn get_share_requested_model_blocks(
+        &self,
+        share_id: &str,
+    ) -> Result<ShareRequestedModelBlocks, AppError> {
+        let conn = self.conn.lock().await;
+        share_requested_model_blocks_from_conn(&conn, share_id)
+    }
+
+    pub async fn replace_share_requested_model_blocks(
+        &self,
+        share_id: &str,
+        actor_email: &str,
+        expected_revision: u64,
+        blocked_models_by_app: BTreeMap<String, Vec<String>>,
+    ) -> Result<ShareRequestedModelBlocks, AppError> {
+        let normalized = normalize_requested_model_blocks(blocked_models_by_app)?;
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| {
+                AppError::Internal(format!("begin requested model block update failed: {e}"))
+            })?;
+        let exists: i64 = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM shares WHERE share_id = ?1)",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("query Share failed: {e}")))?;
+        if exists == 0 {
+            return Err(AppError::NotFound("Share not found".into()));
+        }
+        let revision: i64 = tx.query_row(
+            "SELECT COALESCE((SELECT revision FROM share_requested_model_block_policies WHERE share_id = ?1), 0)",
+            params![share_id], |row| row.get(0),
+        ).map_err(|e| AppError::Internal(format!("query requested model block revision failed: {e}")))?;
+        if revision.max(0) as u64 != expected_revision {
+            return Err(AppError::Conflict(
+                "requested model blocks changed after this editor was opened; reload and try again"
+                    .into(),
+            ));
+        }
+        let current = share_requested_model_blocks_from_conn(&tx, share_id)?;
+        let expands_policy = normalized.iter().any(|(app, models)| {
+            let old = current.blocked_models_by_app.get(app);
+            models
+                .iter()
+                .any(|model| !old.is_some_and(|values| values.contains(model)))
+        });
+        if expands_policy {
+            let active_rentals: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM share_market_subscriptions
+                 WHERE share_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+                    params![share_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("query active Share rentals failed: {e}"))
+                })?;
+            if active_rentals > 0 {
+                return Err(AppError::coded_conflict(
+                    "share_market_contract_settings_protected",
+                    "requested model blocks cannot be expanded while the Share has an active rental contract",
+                    serde_json::json!({ "field": "requestedModelBlocks", "reason": "active_rental" }),
+                ));
+            }
+        }
+        let next_revision = revision + 1;
+        tx.execute(
+            "INSERT INTO share_requested_model_block_policies (share_id, revision, updated_by, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(share_id) DO UPDATE SET revision = excluded.revision, updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+            params![share_id, next_revision, actor_email, now],
+        ).map_err(|e| AppError::Internal(format!("write requested model block policy failed: {e}")))?;
+        tx.execute(
+            "DELETE FROM share_requested_model_blocks WHERE share_id = ?1",
+            params![share_id],
+        )
+        .map_err(|e| AppError::Internal(format!("replace requested model blocks failed: {e}")))?;
+        for (app, models) in &normalized {
+            for model in models {
+                tx.execute(
+                    "INSERT INTO share_requested_model_blocks (share_id, app_type, requested_model, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![share_id, app, model, now],
+                ).map_err(|e| AppError::Internal(format!("insert requested model block failed: {e}")))?;
+            }
+        }
+        tx.commit().map_err(|e| {
+            AppError::Internal(format!("commit requested model blocks failed: {e}"))
+        })?;
+        let result = share_requested_model_blocks_from_conn(&conn, share_id)?;
+        let snapshot = load_requested_model_block_snapshot(&conn)?;
+        drop(conn);
+        match self.requested_model_blocks.write() {
+            Ok(mut value) => *value = Arc::new(snapshot),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(snapshot),
+        }
+        Ok(result)
     }
 
     /// The price catalog in force for this store.
@@ -1884,6 +2137,62 @@ impl AppStore {
             Err(poisoned) => *poisoned.into_inner() = Arc::clone(&catalog),
         }
         Ok(catalog)
+    }
+
+    pub(crate) async fn upsert_admin_model_price(
+        &self,
+        input: crate::model_price_catalog::AdminModelPriceInput,
+    ) -> Result<crate::model_price_catalog::AdminModelPriceResult, AppError> {
+        let effective_from = {
+            let conn = self.conn.lock().await;
+            crate::model_price_catalog::upsert_admin_price(&conn, &input, Utc::now().timestamp())?
+        };
+        let catalog = self.reload_pricing_catalog().await?;
+        Ok(crate::model_price_catalog::AdminModelPriceResult {
+            model_key: input.price_key,
+            display_name: input.display_name,
+            effective_from,
+            pricing_revision: crate::model_price_catalog::qualified_revision(catalog.revision()),
+        })
+    }
+
+    pub(crate) async fn list_admin_model_prices(
+        &self,
+    ) -> Result<crate::model_price_catalog::AdminModelPriceList, AppError> {
+        let catalog = self.pricing_catalog();
+        let conn = self.conn.lock().await;
+        crate::model_price_catalog::list_admin_prices(&conn, &catalog, Utc::now().timestamp())
+    }
+
+    pub(crate) async fn admin_model_price_history(
+        &self,
+        price_key: &str,
+    ) -> Result<Vec<crate::model_price_catalog::AdminModelPriceHistoryItem>, AppError> {
+        let conn = self.conn.lock().await;
+        crate::model_price_catalog::admin_price_history(&conn, price_key, Utc::now().timestamp())
+    }
+
+    pub(crate) async fn close_admin_model_price_override(
+        &self,
+        price_key: &str,
+        expected_effective_from: i64,
+    ) -> Result<crate::model_price_catalog::AdminModelPriceListItem, AppError> {
+        {
+            let conn = self.conn.lock().await;
+            crate::model_price_catalog::close_admin_override(
+                &conn,
+                price_key,
+                expected_effective_from,
+                Utc::now().timestamp(),
+            )?;
+        }
+        let catalog = self.reload_pricing_catalog().await?;
+        let conn = self.conn.lock().await;
+        crate::model_price_catalog::list_admin_prices(&conn, &catalog, Utc::now().timestamp())?
+            .models
+            .into_iter()
+            .find(|item| item.model_key == price_key)
+            .ok_or_else(|| AppError::NotFound("model price was not found".into()))
     }
 
     pub(crate) fn market_usd_cny_rate_micros(&self) -> i64 {
@@ -9281,14 +9590,19 @@ impl AppStore {
                     cache_write: group.cache_write,
                 };
                 let group_total = split.total().saturating_add(group.unattributed);
+                request_count = request_count.saturating_add(group.request_count);
+                estimated_count = estimated_count.saturating_add(group.estimated_count);
+                if group.model_key.is_empty() {
+                    totals.unattributed = totals.unattributed.saturating_add(group_total);
+                    totals.total = totals.total.saturating_add(group_total);
+                    continue;
+                }
                 totals.input = totals.input.saturating_add(split.input);
                 totals.output = totals.output.saturating_add(split.output);
                 totals.cache_read = totals.cache_read.saturating_add(split.cache_read);
                 totals.cache_write = totals.cache_write.saturating_add(split.cache_write);
                 totals.unattributed = totals.unattributed.saturating_add(group.unattributed);
                 totals.total = totals.total.saturating_add(group_total);
-                request_count = request_count.saturating_add(group.request_count);
-                estimated_count = estimated_count.saturating_add(group.estimated_count);
 
                 let mut notes = Vec::new();
                 let (tier, tier_known) = match ServiceTier::parse(&group.tier_raw) {
@@ -34139,6 +34453,8 @@ mod tests {
             );
             let mut log = test_share_request_log_entry("unattr-only", "share-unattr", now);
             log.user_email = Some("user@example.com".into());
+            log.model.clear();
+            log.actual_model.clear();
             log.input_tokens = 0;
             log.output_tokens = 0;
             log.cache_read_tokens = 0;
@@ -34154,15 +34470,8 @@ mod tests {
         let row = &breakdown.rows[0];
         assert_eq!(row.observed_totals.unattributed, 80);
         assert_eq!(row.observed_totals.total, 80);
-        assert_eq!(row.by_model[0].unattributed, 80);
-        assert!(row.by_model[0].equivalent_usd_micros.is_none());
+        assert!(row.by_model.is_empty());
         assert!(row.equivalent_usd_micros.is_none());
-        assert!(
-            !row.by_model[0]
-                .notes
-                .iter()
-                .any(|note| note == "priceKeyNotFound")
-        );
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -54465,5 +54774,60 @@ mod tests {
         assert_eq!(mask_email("alice@example.com"), "a***e@example.com");
         assert_eq!(mask_email("ab@example.com"), "a***b@example.com");
         assert_eq!(mask_email("invalid"), "***");
+    }
+
+    #[test]
+    fn requested_model_blocks_are_exact_trimmed_and_deduplicated() {
+        let normalized = normalize_requested_model_blocks(BTreeMap::from([
+            (
+                "Claude".to_string(),
+                vec![
+                    " claude-opus-4-6 ".to_string(),
+                    "claude-opus-4-6".to_string(),
+                    "Claude-Opus-4-6".to_string(),
+                ],
+            ),
+            ("codex".to_string(), Vec::new()),
+        ]))
+        .expect("normalize policy");
+        assert_eq!(
+            normalized.get("claude"),
+            Some(&vec![
+                "Claude-Opus-4-6".to_string(),
+                "claude-opus-4-6".to_string()
+            ])
+        );
+        assert!(!normalized.contains_key("codex"));
+    }
+
+    #[test]
+    fn requested_model_blocks_reject_patterns_and_control_characters() {
+        for model in ["claude-*", "bad\nmodel", " "] {
+            let result = normalize_requested_model_blocks(BTreeMap::from([(
+                "claude".to_string(),
+                vec![model.to_string()],
+            )]));
+            assert!(result.is_err(), "{model:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn requested_model_block_snapshot_uses_exact_case_sensitive_matches() {
+        let mut snapshot = RequestedModelBlockSnapshot::new();
+        snapshot.insert(
+            "share-1".to_string(),
+            HashMap::from([(
+                "claude".to_string(),
+                HashSet::from(["claude-opus-4-6".to_string()]),
+            )]),
+        );
+        let store = AppStore::new_in_memory_for_tests().expect("store");
+        match store.requested_model_blocks.write() {
+            Ok(mut value) => *value = Arc::new(snapshot),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(snapshot),
+        }
+        assert!(store.is_requested_model_blocked("share-1", "claude", "claude-opus-4-6"));
+        assert!(!store.is_requested_model_blocked("share-1", "claude", "Claude-Opus-4-6"));
+        assert!(!store.is_requested_model_blocked("share-1", "codex", "claude-opus-4-6"));
     }
 }

@@ -1,8 +1,9 @@
 "use client";
 
 import { ChevronDown, ChevronRight, Eye, Link2, Maximize2, Pencil } from "lucide-react";
-import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
+import { Button, Card, Chip, Input, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
+import { useAuth } from "@/components/auth/auth-provider";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import {
   ShareProviderLogo,
@@ -15,6 +16,7 @@ import {
   getShareRequestLogs,
   getShareUsageByEmail,
   getShareUserLimitStatus,
+  upsertAdminModelPrice,
 } from "@/lib/api";
 import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
 import type { AppLocale } from "@/lib/i18n";
@@ -41,7 +43,7 @@ import {
   formatNumber,
   formatRelativeTime,
 } from "@/lib/utils";
-import { formatTokenMillions } from "@/lib/token-units";
+import { formatTokenMillions, formatTokenMillionsFixed } from "@/lib/token-units";
 import {
   formatPercent as formatCoveragePercent,
   formatUsdMicros,
@@ -819,6 +821,7 @@ export function ShareEmailUsagePanel({
     breakdown,
     breakdownRevision,
     onExpand,
+    refresh: refreshBreakdown,
     errors: breakdownErrors,
     loaded: breakdownLoaded,
   } = useShareUserUsageBreakdown(share.shareId);
@@ -942,6 +945,7 @@ export function ShareEmailUsagePanel({
           breakdownErrors={breakdownErrors}
           breakdownLoaded={breakdownLoaded}
           onExpand={onExpand}
+          onPriceSaved={refreshBreakdown}
         />
       ) : null}
       {showLimits && !(limitRows?.length || limitGrants.length) && loading ? (
@@ -1082,7 +1086,7 @@ function usageNoteMessageKey(note: ShareUsagePricingNote) {
 const NO_AMOUNT = "—";
 
 function formatUsageTokens(value: number, locale: AppLocale) {
-  return value === 0 ? NO_AMOUNT : formatTokenMillions(value, locale);
+  return value === 0 ? NO_AMOUNT : formatTokenMillionsFixed(value, locale);
 }
 
 function ShareUserUsageNoteList({
@@ -1112,13 +1116,20 @@ function ShareUserUsageBreakdownPanel({
   locale,
   revision,
   t,
+  onPriceSaved,
 }: {
   row: ShareUserUsageBreakdownRow;
   locale: AppLocale;
   revision: string;
   t: TFn;
+  onPriceSaved?: (email: string) => void;
 }) {
+  const { session } = useAuth();
   const [openLines, setOpenLines] = React.useState<string | null>(null);
+  const [priceModel, setPriceModel] = React.useState<ShareUserUsageBreakdownRow["byModel"][number] | null>(null);
+  const [priceDraft, setPriceDraft] = React.useState({ input: "", output: "", cacheRead: "", cacheWrite5m: "", cacheWrite1h: "" });
+  const [priceError, setPriceError] = React.useState("");
+  const [priceBusy, setPriceBusy] = React.useState(false);
   const unattributed = row.observedTotals.unattributed;
 
   if (!row.byModel.length && !unattributed) {
@@ -1202,6 +1213,11 @@ function ShareUserUsageBreakdownPanel({
                         <Chip size="sm" variant="tertiary" className="shrink-0 text-amber-800">
                           {t("dashboard.userLimit.byModel.unpriced")}
                         </Chip>
+                      ) : null}
+                      {session?.isAdmin && !model.priced && model.modelKey ? (
+                        <Button size="sm" variant="ghost" className="h-6 min-w-0 px-1.5 text-[10px]" onClick={() => { setPriceModel(model); setPriceError(""); setPriceDraft({ input: "", output: "", cacheRead: "", cacheWrite5m: "", cacheWrite1h: "" }); }}>
+                          {t("dashboard.userLimit.price.configure")}
+                        </Button>
                       ) : null}
                       {model.notes
                         .filter((note) => USAGE_NOTE_KIND[note] !== "info")
@@ -1322,7 +1338,42 @@ function ShareUserUsageBreakdownPanel({
           revision,
         })}
       </div>
+      <details className="text-[10px] text-muted-foreground">
+        <summary className="cursor-pointer">{t("dashboard.userLimit.price.calculationDetails")}</summary>
+        <div className="mt-1 break-all font-mono">{revision}</div>
+      </details>
       <ShareUserUsageNoteList notes={row.notes} t={t} />
+      <Modal.Backdrop isOpen={!!priceModel} onOpenChange={(open) => !open && !priceBusy && setPriceModel(null)}>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] !bg-white !text-slate-900">
+            <Modal.CloseTrigger />
+            <Modal.Header><Modal.Heading>{t("dashboard.userLimit.price.title")}</Modal.Heading></Modal.Header>
+            <Modal.Body className="grid gap-3">
+              <p className="text-xs text-amber-700">{t("dashboard.userLimit.price.globalHint")}</p>
+              <Input value={priceModel?.modelKey || ""} disabled aria-label={t("dashboard.userLimit.byModel.model")} />
+              {(["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"] as const).map((field) => (
+                <label key={field} className="grid gap-1 text-xs">
+                  <span>{t(`dashboard.userLimit.price.${field}`)}</span>
+                  <Input inputMode="decimal" value={priceDraft[field]} placeholder="0" onChange={(event) => setPriceDraft((current) => ({ ...current, [field]: event.target.value }))} />
+                </label>
+              ))}
+              {priceError ? <p className="text-xs text-red-600">{priceError}</p> : null}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="outline" isDisabled={priceBusy} onClick={() => setPriceModel(null)}>{t("common.cancel")}</Button>
+              <Button variant="primary" isDisabled={priceBusy || !priceDraft.input || !priceDraft.output || !priceDraft.cacheRead || !priceDraft.cacheWrite5m} onClick={async () => {
+                if (!priceModel) return;
+                setPriceBusy(true); setPriceError("");
+                try {
+                  await upsertAdminModelPrice(priceModel.modelKey, { displayName: priceModel.displayName || priceModel.modelKey, expectUnpriced: true, rates: { inputUsdPer1m: priceDraft.input, outputUsdPer1m: priceDraft.output, cacheReadUsdPer1m: priceDraft.cacheRead, cacheWrite5mUsdPer1m: priceDraft.cacheWrite5m, ...(priceDraft.cacheWrite1h.trim() ? { cacheWrite1hUsdPer1m: priceDraft.cacheWrite1h } : {}) } });
+                  setPriceModel(null); onPriceSaved?.(row.email);
+                } catch (error) { setPriceError(error instanceof Error ? error.message : String(error)); }
+                finally { setPriceBusy(false); }
+              }}>{t("common.save")}</Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
     </div>
   );
 }
@@ -1339,6 +1390,7 @@ export function ShareUserLimitsTable({
   breakdownErrors,
   breakdownLoaded,
   onExpand,
+  onPriceSaved,
 }: {
   rows?: ShareUserLimitStatusRow[];
   grants?: ShareUserGrant[];
@@ -1366,6 +1418,7 @@ export function ShareUserLimitsTable({
   breakdownLoaded?: Record<string, true>;
   /** Lazy load: fired on first expand only, never on mount. */
   onExpand?: (email: string) => void;
+  onPriceSaved?: (email: string) => void;
 }) {
   const unlimited = t("common.unlimited");
   const permanent = t("dashboard.userLimit.permanent");
@@ -1594,6 +1647,7 @@ export function ShareUserLimitsTable({
                         locale={locale}
                         revision={breakdownRevision || "-"}
                         t={t}
+                        onPriceSaved={onPriceSaved}
                       />
                     ) : breakdownErrors?.[emailKey] ? (
                       <div className="flex flex-wrap items-center gap-2 px-2 py-2 text-[11px] text-danger">

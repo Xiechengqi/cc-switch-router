@@ -227,6 +227,7 @@ export function ShareUserGrantsEditor({
     breakdown,
     breakdownRevision,
     onExpand,
+    refresh: refreshBreakdown,
     errors: breakdownErrors,
     loaded: breakdownLoaded,
   } = useShareUserUsageBreakdown(shareId);
@@ -734,6 +735,7 @@ export function ShareUserGrantsEditor({
           breakdownErrors={shareId ? breakdownErrors : undefined}
           breakdownLoaded={shareId ? breakdownLoaded : undefined}
           onExpand={shareId ? onExpand : undefined}
+          onPriceSaved={shareId ? refreshBreakdown : undefined}
           leading={selecting ? {
             header: (
               <Checkbox

@@ -8,6 +8,7 @@ import type {
   ClientServerReleaseValidation,
   ShareSettingsPatch,
   ShareEditView,
+  ShareRequestedModelBlocks,
   ShareClientBanPage,
   ShareClientUnbanResponse,
   ShareAccountRateLimitRecovery,
@@ -360,6 +361,26 @@ export async function updateShareSettings(
   );
 }
 
+export async function getShareRequestedModelBlocks(shareId: string) {
+  return parseJson<ShareRequestedModelBlocks>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/requested-model-blocks`),
+  );
+}
+
+export async function replaceShareRequestedModelBlocks(
+  shareId: string,
+  expectedRevision: number,
+  blockedModelsByApp: ShareRequestedModelBlocks["blockedModelsByApp"],
+) {
+  return parseJson<ShareRequestedModelBlocks>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/requested-model-blocks`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision, blockedModelsByApp }),
+    }),
+  );
+}
+
 export async function getShareClientBans(
   shareId: string,
   cursor?: string,
@@ -411,6 +432,49 @@ export async function getShareUserUsageBreakdown(shareId: string, email?: string
       `/v1/shares/${encodeURIComponent(shareId)}/user-usage-breakdown${query}`,
       { cache: "no-store" },
     ),
+  );
+}
+
+export async function upsertAdminModelPrice(modelKey: string, input: {
+  displayName: string;
+  expectedEffectiveFrom?: number;
+  expectUnpriced?: boolean;
+  rates: {
+    inputUsdPer1m: string;
+    outputUsdPer1m: string;
+    cacheReadUsdPer1m: string;
+    cacheWrite5mUsdPer1m: string;
+    cacheWrite1hUsdPer1m?: string;
+  };
+}) {
+  return parseJson<import("@/lib/types").AdminModelPriceResult>(
+    await authFetch(`/v1/admin/model-prices/${encodeURIComponent(modelKey)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function getAdminModelPrices() {
+  return parseJson<import("@/lib/types").AdminModelPriceList>(
+    await authFetch("/v1/admin/model-prices", { cache: "no-store" }),
+  );
+}
+
+export async function getAdminModelPriceHistory(modelKey: string) {
+  return parseJson<import("@/lib/types").AdminModelPriceHistoryItem[]>(
+    await authFetch(`/v1/admin/model-prices/${encodeURIComponent(modelKey)}/history`, { cache: "no-store" }),
+  );
+}
+
+export async function restoreAdminModelPrice(modelKey: string, expectedEffectiveFrom: number) {
+  return parseJson<import("@/lib/types").AdminModelPriceListItem>(
+    await authFetch(`/v1/admin/model-prices/${encodeURIComponent(modelKey)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedEffectiveFrom }),
+    }),
   );
 }
 

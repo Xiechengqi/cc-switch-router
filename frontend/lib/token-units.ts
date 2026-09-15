@@ -58,3 +58,19 @@ export function formatTokenMillions(value: number, locale?: string) {
   }
   return formatExactScaledTokens(value, TOKENS_PER_MILLION, " M", locale);
 }
+
+export function formatTokenMillionsFixed(value: number, locale?: string, fractionDigits = 1) {
+  if (!Number.isSafeInteger(value) || value < 0 || !Number.isInteger(fractionDigits) || fractionDigits < 0) {
+    return "-";
+  }
+  const [scale, unit] = isChineseLocale(locale)
+    ? value >= TOKENS_PER_YI
+      ? [TOKENS_PER_YI, "亿"] as const
+      : [TOKENS_PER_WAN, "万"] as const
+    : [TOKENS_PER_MILLION, " M"] as const;
+  const formatted = new Intl.NumberFormat(locale, {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  }).format(value / scale);
+  return `${formatted}${unit}`;
+}

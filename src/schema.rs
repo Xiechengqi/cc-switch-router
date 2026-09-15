@@ -154,6 +154,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         42,
         include_str!("../schema/0042_user_notification_history.sql"),
     ),
+    (
+        43,
+        include_str!("../schema/0043_share_requested_model_blocks.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -681,7 +685,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 142);
+        assert_eq!(table_count, 144);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1123,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_42_upgrade_a_version_26_database() {
+    fn migrations_27_through_43_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1252,8 +1256,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 42);
-        check_compatibility(&conn).expect("upgraded version 42 is compatible");
+        assert_eq!(latest_version, 43);
+        check_compatibility(&conn).expect("upgraded version 43 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1440,7 +1444,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 42);
+        assert_eq!(latest_version, 43);
     }
 
     #[test]
@@ -1464,7 +1468,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 42);
+        assert_eq!(latest_version, 43);
     }
 
     #[test]
@@ -1644,7 +1648,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 42);
+        assert_eq!(latest_version, 43);
     }
 
     #[test]

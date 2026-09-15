@@ -444,6 +444,10 @@ pub fn router(state: ServerState) -> Router {
             patch(update_share_settings),
         )
         .route(
+            "/v1/shares/:share_id/requested-model-blocks",
+            get(get_share_requested_model_blocks).put(replace_share_requested_model_blocks),
+        )
+        .route(
             "/v1/shares/:share_id/client-bans",
             get(list_share_client_bans),
         )
@@ -462,6 +466,17 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/user-usage-breakdown",
             get(share_user_usage_breakdown),
+        )
+        .route("/v1/admin/model-prices", get(admin_list_model_prices))
+        .route(
+            "/v1/admin/model-prices/:model_key",
+            get(admin_model_price_detail)
+                .put(admin_upsert_model_price)
+                .delete(admin_close_model_price_override),
+        )
+        .route(
+            "/v1/admin/model-prices/:model_key/history",
+            get(admin_model_price_history),
         )
         .route(
             "/v1/shares/:share_id/test-connection",
@@ -3498,6 +3513,18 @@ mod tests {
     }
 
     #[test]
+    fn admin_model_price_decimal_parser_is_exact_and_bounded() {
+        assert_eq!(parse_usd_per1m_micros("input", "15").unwrap(), 15_000_000);
+        assert_eq!(
+            parse_usd_per1m_micros("input", "1.234567").unwrap(),
+            1_234_567
+        );
+        assert!(parse_usd_per1m_micros("input", "-1").is_err());
+        assert!(parse_usd_per1m_micros("input", "1.0000001").is_err());
+        assert!(parse_usd_per1m_micros("input", "").is_err());
+    }
+
+    #[test]
     fn recent_error_emails_are_masked_for_anonymous_viewers() {
         let mut errors = vec![crate::store::ShareRequestErrorSnapshot {
             id: "snap-1".into(),
@@ -5128,6 +5155,63 @@ async fn update_share_settings(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ReplaceShareRequestedModelBlocksRequest {
+    expected_revision: u64,
+    #[serde(default)]
+    blocked_models_by_app: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+async fn get_share_requested_model_blocks(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<crate::store::ShareRequestedModelBlocks>, AppError> {
+    require_share_owner(&state, &headers, &share_id).await?;
+    Ok(Json(
+        state
+            .store
+            .get_share_requested_model_blocks(&share_id)
+            .await?,
+    ))
+}
+
+async fn replace_share_requested_model_blocks(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(share_id): Path<String>,
+    Json(input): Json<ReplaceShareRequestedModelBlocksRequest>,
+) -> Result<Json<crate::store::ShareRequestedModelBlocks>, AppError> {
+    let actor = require_share_owner(&state, &headers, &share_id).await?;
+    let before = state
+        .store
+        .get_share_requested_model_blocks(&share_id)
+        .await?;
+    let after = state
+        .store
+        .replace_share_requested_model_blocks(
+            &share_id,
+            &actor,
+            input.expected_revision,
+            input.blocked_models_by_app,
+        )
+        .await?;
+    let audit = serde_json::json!({ "shareId": share_id, "before": before, "after": after });
+    let metadata = extract_client_metadata(&headers, addr);
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&actor),
+            "share.requested_model_blocks.replace",
+            Some(&audit),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(after))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ShareClientBanListQuery {
     #[serde(default = "default_share_client_ban_limit")]
     limit: usize,
@@ -5288,6 +5372,240 @@ async fn share_user_usage_breakdown(
             .share_user_usage_breakdown(&share_id, query.email.as_deref())
             .await?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminModelPriceRatesRequest {
+    input_usd_per1m: String,
+    output_usd_per1m: String,
+    cache_read_usd_per1m: String,
+    cache_write5m_usd_per1m: String,
+    cache_write1h_usd_per1m: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminModelPriceRequest {
+    display_name: String,
+    rates: AdminModelPriceRatesRequest,
+    expected_effective_from: Option<i64>,
+    #[serde(default)]
+    expect_unpriced: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminModelPriceRestoreRequest {
+    expected_effective_from: i64,
+}
+
+fn parse_usd_per1m_micros(field: &str, raw: &str) -> Result<i64, AppError> {
+    let value = raw.trim();
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 6
+    {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be a non-negative USD amount with at most 6 decimal places"
+        )));
+    }
+    let whole = whole
+        .parse::<i64>()
+        .map_err(|_| AppError::BadRequest(format!("{field} is too large")))?;
+    let fraction = format!("{fraction:0<6}")
+        .parse::<i64>()
+        .map_err(|_| AppError::BadRequest(format!("{field} is invalid")))?;
+    whole
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(fraction))
+        .ok_or_else(|| AppError::BadRequest(format!("{field} is too large")))
+}
+
+async fn admin_upsert_model_price(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(model_key): Path<String>,
+    Json(input): Json<AdminModelPriceRequest>,
+) -> Result<Json<crate::model_price_catalog::AdminModelPriceResult>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let model_key = validate_admin_model_key(&model_key)?;
+    let display_name = input.display_name.trim().to_string();
+    if display_name.is_empty()
+        || display_name.len() > 200
+        || display_name.chars().any(char::is_control)
+    {
+        return Err(AppError::BadRequest("invalid model display name".into()));
+    }
+    let cache_write_5m =
+        parse_usd_per1m_micros("cacheWrite5mUsdPer1m", &input.rates.cache_write5m_usd_per1m)?;
+    let cache_write_1h = input
+        .rates
+        .cache_write1h_usd_per1m
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_usd_per1m_micros("cacheWrite1hUsdPer1m", value))
+        .transpose()?;
+    if cache_write_1h.is_some_and(|value| value < cache_write_5m) {
+        return Err(AppError::BadRequest(
+            "cacheWrite1hUsdPer1m must be at least cacheWrite5mUsdPer1m".into(),
+        ));
+    }
+    let input_rate = parse_usd_per1m_micros("inputUsdPer1m", &input.rates.input_usd_per1m)?;
+    let output_rate = parse_usd_per1m_micros("outputUsdPer1m", &input.rates.output_usd_per1m)?;
+    let cache_read_rate =
+        parse_usd_per1m_micros("cacheReadUsdPer1m", &input.rates.cache_read_usd_per1m)?;
+    let before_pricing_revision = state
+        .store
+        .list_admin_model_prices()
+        .await?
+        .pricing_revision;
+    let before = state
+        .store
+        .admin_model_price_history(&model_key)
+        .await?
+        .into_iter()
+        .find(|item| item.current);
+    let result = state
+        .store
+        .upsert_admin_model_price(crate::model_price_catalog::AdminModelPriceInput {
+            price_key: model_key.clone(),
+            display_name,
+            input: input_rate,
+            output: output_rate,
+            cache_read: cache_read_rate,
+            cache_write_5m,
+            cache_write_1h,
+            expected_effective_from: input.expected_effective_from,
+            expect_unpriced: input.expect_unpriced,
+        })
+        .await?;
+    let audit = serde_json::json!({
+        "modelKey": result.model_key,
+        "displayName": result.display_name,
+        "effectiveFrom": result.effective_from,
+        "pricingRevision": result.pricing_revision,
+        "beforePricingRevision": before_pricing_revision,
+        "before": before,
+        "ratesMicrosPer1m": {
+            "input": input_rate,
+            "output": output_rate,
+            "cacheRead": cache_read_rate,
+            "cacheWrite5m": cache_write_5m,
+            "cacheWrite1h": cache_write_1h,
+        },
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "model_price.admin.upsert",
+            Some(&audit),
+            None,
+        )
+        .await;
+    Ok(Json(result))
+}
+
+async fn admin_list_model_prices(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::model_price_catalog::AdminModelPriceList>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(state.store.list_admin_model_prices().await?))
+}
+
+async fn admin_model_price_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(model_key): Path<String>,
+) -> Result<Json<Vec<crate::model_price_catalog::AdminModelPriceHistoryItem>>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let model_key = validate_admin_model_key(&model_key)?;
+    Ok(Json(
+        state.store.admin_model_price_history(&model_key).await?,
+    ))
+}
+
+async fn admin_model_price_detail(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(model_key): Path<String>,
+) -> Result<Json<crate::model_price_catalog::AdminModelPriceListItem>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let model_key = validate_admin_model_key(&model_key)?;
+    let item = state
+        .store
+        .list_admin_model_prices()
+        .await?
+        .models
+        .into_iter()
+        .find(|item| item.model_key == model_key)
+        .ok_or_else(|| AppError::NotFound("model price was not found".into()))?;
+    Ok(Json(item))
+}
+
+async fn admin_close_model_price_override(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(model_key): Path<String>,
+    Json(input): Json<AdminModelPriceRestoreRequest>,
+) -> Result<Json<crate::model_price_catalog::AdminModelPriceListItem>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let model_key = validate_admin_model_key(&model_key)?;
+    let before_pricing_revision = state
+        .store
+        .list_admin_model_prices()
+        .await?
+        .pricing_revision;
+    let before = state
+        .store
+        .admin_model_price_history(&model_key)
+        .await?
+        .into_iter()
+        .find(|item| item.current && item.source == "admin");
+    let result = state
+        .store
+        .close_admin_model_price_override(&model_key, input.expected_effective_from)
+        .await?;
+    let pricing_revision = state
+        .store
+        .list_admin_model_prices()
+        .await?
+        .pricing_revision;
+    let audit = serde_json::json!({
+        "modelKey": model_key,
+        "expectedEffectiveFrom": input.expected_effective_from,
+        "before": before,
+        "after": result,
+        "beforePricingRevision": before_pricing_revision,
+        "pricingRevision": pricing_revision,
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "model_price.admin.restore_derived",
+            Some(&audit),
+            None,
+        )
+        .await;
+    Ok(Json(result))
+}
+
+fn validate_admin_model_key(raw: &str) -> Result<String, AppError> {
+    let model_key = raw.trim().to_ascii_lowercase();
+    if model_key.is_empty()
+        || model_key.len() > 200
+        || model_key.chars().any(char::is_control)
+        || model_key.contains('*')
+    {
+        return Err(AppError::BadRequest("invalid exact model key".into()));
+    }
+    Ok(model_key)
 }
 
 async fn update_share_settings_with_email(
@@ -8758,6 +9076,26 @@ async fn test_share_connection(
             _ => unreachable!("operation was validated"),
         }
     };
+    let requested_model = if operation == "image_edit" {
+        Some("grok-imagine".to_string())
+    } else {
+        crate::proxy::extract_user_model_request_model(
+            &app,
+            &prepared.path,
+            prepared.echo_body.as_bytes(),
+        )
+    };
+    if let Some(requested_model) = requested_model
+        && state
+            .store
+            .is_requested_model_blocked(&share_id, &app, &requested_model)
+    {
+        return Err(AppError::coded_forbidden(
+            "share_requested_model_blocked",
+            "the requested model is disabled for this Share",
+            serde_json::json!({ "appType": app, "requestedModel": requested_model }),
+        ));
+    }
     let response_mode = prepared.response_mode;
     let subdomain = share.subdomain.clone();
 

@@ -30,6 +30,7 @@ import {
 import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
+import { ShareRequestedModelBlocksPanel } from "./share-requested-model-blocks-panel";
 
 function shareUserGrantsFingerprint(share: ShareView | null) {
   if (!share) return "";
@@ -359,6 +360,13 @@ export function ShareEditFormBody({
           draft={draft}
           disabled={fieldsDisabled}
           onDraftChange={form.onDraftChange}
+        />
+
+        <ShareRequestedModelBlocksPanel
+          shareId={displayShare.shareId}
+          apps={activeShareApps}
+          editable={displayShare.canEditSettings !== false}
+          t={t}
         />
 
         <ShareUserGrantsEditor

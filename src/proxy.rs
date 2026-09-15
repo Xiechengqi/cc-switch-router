@@ -2129,6 +2129,15 @@ pub async fn gateway_proxy_handler(
         return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-gateway");
     }
 
+    if let Some(requested_model) =
+        extract_user_model_request_model(&request_app, &forwarded_path, &body_bytes)
+        && state
+            .store
+            .is_requested_model_blocked(&share_id, &request_app, &requested_model)
+    {
+        return requested_model_blocked_response(&request_app, &requested_model);
+    }
+
     let Some((route, route_inflight_guard)) = state.proxy.route_for_share_request(&share_id).await
     else {
         return simple_response(StatusCode::NOT_FOUND, "share-offline");
@@ -2636,6 +2645,14 @@ async fn user_model_proxy_handler_inner(
         Err(error) => return error.into_response(),
     };
 
+    if state.store.is_requested_model_blocked(
+        &resolution.target_share_id,
+        &app_type,
+        &requested_model,
+    ) {
+        return requested_model_blocked_response(&app_type, &requested_model);
+    }
+
     let target_active = state
         .proxy
         .route_by_share_id(&resolution.target_share_id)
@@ -2737,7 +2754,11 @@ async fn authenticate_user_model_request(
     }
 }
 
-fn extract_user_model_request_model(app_type: &str, path: &str, body: &[u8]) -> Option<String> {
+pub(crate) fn extract_user_model_request_model(
+    app_type: &str,
+    path: &str,
+    body: &[u8],
+) -> Option<String> {
     if app_type == "gemini" {
         let encoded_model = path
             .split('?')
@@ -3640,6 +3661,42 @@ pub async fn proxy_handler(
         return client_banned_response(remaining, "share", Some(&capture));
     }
     if route.is_share()
+        && !is_health_check_request
+        && method == axum::http::Method::POST
+        && let Some(share_id) = route.share_id.as_deref()
+        && state.store.share_has_requested_model_blocks(share_id)
+        && let Some(app_type) = infer_share_request_app(&path)
+    {
+        let body_bytes = match read_proxy_request_body(
+            body,
+            proxy_request_body_limit(&path, &state.config.proxy_stream),
+            Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(ProxyRequestBodyReadError::Timeout) => {
+                state.metrics.record_proxy_request_body_timeout();
+                return json_error_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
+            }
+            Err(ProxyRequestBodyReadError::Rejected(_)) => {
+                return json_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request-body-too-large",
+                );
+            }
+        };
+        if let Some(requested_model) =
+            extract_user_model_request_model(&app_type, &path, &body_bytes)
+            && state
+                .store
+                .is_requested_model_blocked(share_id, &app_type, &requested_model)
+        {
+            return requested_model_blocked_response(&app_type, &requested_model);
+        }
+        body = Body::from(body_bytes);
+    }
+    if route.is_share()
         && method == axum::http::Method::POST
         && is_image_generation_submit_path(&path)
     {
@@ -4342,6 +4399,23 @@ pub async fn proxy_handler(
             "proxy request completed"
         );
     }
+    response
+}
+
+fn requested_model_blocked_response(app_type: &str, requested_model: &str) -> Response {
+    let mut response = unified_api_error_response(
+        StatusCode::FORBIDDEN,
+        "share_requested_model_blocked",
+        "the requested model is disabled for this Share",
+        serde_json::json!({ "appType": app_type, "requestedModel": requested_model }),
+    );
+    response.headers_mut().insert(
+        "x-cc-switch-error-code",
+        HeaderValue::from_static("share_requested_model_blocked"),
+    );
+    response
+        .headers_mut()
+        .insert("x-cc-switch-error-scope", HeaderValue::from_static("share"));
     response
 }
 

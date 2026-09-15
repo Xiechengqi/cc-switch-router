@@ -32,6 +32,7 @@ import {
   ShareEditSection,
 } from "./share-edit-section";
 import { ShareRecentErrorsPanel } from "./share-recent-errors-panel";
+import { ShareRequestedModelBlocksPanel } from "./share-requested-model-blocks-panel";
 
 function activeUserLimitGrants(share: ShareView): ShareUserGrant[] {
   return Object.values(share.userGrants || {})
@@ -77,6 +78,7 @@ export function ShareEditReadView({
     breakdown,
     breakdownRevision,
     onExpand,
+    refresh: refreshBreakdown,
     errors: breakdownErrors,
     loaded: breakdownLoaded,
   } = useShareUserUsageBreakdown(share.shareId);
@@ -184,6 +186,14 @@ export function ShareEditReadView({
                 value={t("dashboard.freeAccessEnabled")}
               />
             ) : null}
+            {share.canManage ? (
+              <ShareRequestedModelBlocksPanel
+                shareId={share.shareId}
+                apps={boundApps}
+                editable={false}
+                t={t}
+              />
+            ) : null}
             <div className="grid gap-2">
               <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
               {limitRows?.length || limitGrants.length ? (
@@ -196,6 +206,7 @@ export function ShareEditReadView({
                   breakdownErrors={breakdownErrors}
                   breakdownLoaded={breakdownLoaded}
                   onExpand={onExpand}
+                  onPriceSaved={refreshBreakdown}
                 />
               ) : limitLoading ? (
                 <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock>

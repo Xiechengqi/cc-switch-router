@@ -31,12 +31,13 @@ export function useShareUserUsageBreakdown(shareId?: string) {
     loadedKeys.current.clear();
   }, [shareId]);
 
-  const onExpand = React.useCallback(
-    (email: string) => {
+  const load = React.useCallback(
+    (email: string, force = false) => {
       if (!shareId) return;
       const key = email.trim().toLowerCase();
       if (!key) return;
-      if (loadedKeys.current.has(key) || inflight.current.has(key)) return;
+      if ((!force && loadedKeys.current.has(key)) || inflight.current.has(key)) return;
+      if (force) loadedKeys.current.delete(key);
       inflight.current.add(key);
       setErrors((current) => {
         if (!(key in current)) return current;
@@ -77,5 +78,8 @@ export function useShareUserUsageBreakdown(shareId?: string) {
     [shareId],
   );
 
-  return { breakdown, breakdownRevision, onExpand, errors, loaded };
+  const onExpand = React.useCallback((email: string) => load(email), [load]);
+  const refresh = React.useCallback((email: string) => load(email, true), [load]);
+
+  return { breakdown, breakdownRevision, onExpand, refresh, errors, loaded };
 }

@@ -15,10 +15,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::db::{Connection, TransactionBehavior, params};
+use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::AppError;
 use crate::model_pricing::{ContextTier, MicrosPer1M, ModelPrice, RateSet, ServiceTier};
 
@@ -31,6 +31,72 @@ const EMBEDDED_CATALOG: &str = include_str!("../pricing/model-prices.json");
 const DERIVED_EFFECTIVE_FROM: i64 = 0;
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct AdminModelPriceInput {
+    pub price_key: String,
+    pub display_name: String,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write_5m: i64,
+    pub cache_write_1h: Option<i64>,
+    pub expected_effective_from: Option<i64>,
+    pub expect_unpriced: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminModelPriceResult {
+    pub model_key: String,
+    pub display_name: String,
+    pub effective_from: i64,
+    pub pricing_revision: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminModelPriceRates {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write_5m: i64,
+    pub cache_write_1h: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminModelPriceListItem {
+    pub model_key: String,
+    pub display_name: String,
+    pub priced: bool,
+    pub source: Option<String>,
+    pub discovered_from: Vec<String>,
+    pub effective_from: Option<i64>,
+    pub rates_micros_per_1m: Option<AdminModelPriceRates>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminModelPriceList {
+    pub pricing_revision: String,
+    pub total: usize,
+    pub priced: usize,
+    pub unpriced: usize,
+    pub admin_overrides: usize,
+    pub models: Vec<AdminModelPriceListItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminModelPriceHistoryItem {
+    pub effective_from: i64,
+    pub effective_to: Option<i64>,
+    pub display_name: String,
+    pub source: String,
+    pub current: bool,
+    pub rates_micros_per_1m: AdminModelPriceRates,
+}
 
 // ---------------------------------------------------------------------------
 // Embedded document
@@ -390,6 +456,333 @@ fn write_derived_rows(
 
     tx.commit()
         .map_err(|error| AppError::Internal(format!("commit price catalog load failed: {error}")))
+}
+
+pub fn upsert_admin_price(
+    conn: &Connection,
+    input: &AdminModelPriceInput,
+    requested_at: i64,
+) -> Result<i64, AppError> {
+    if input.expected_effective_from.is_some() || input.expect_unpriced {
+        let current: Option<i64> = conn
+            .query_row(
+                "SELECT effective_from FROM model_price_catalog
+                 WHERE price_key = ?1 AND effective_from <= ?2
+                   AND (effective_to IS NULL OR effective_to > ?2)
+                 ORDER BY CASE source WHEN 'admin' THEN 0 ELSE 1 END, effective_from DESC
+                 LIMIT 1",
+                params![input.price_key, requested_at],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read current model price failed: {error}"))
+            })?;
+        let matches_expectation = input
+            .expected_effective_from
+            .map_or(current.is_none(), |expected| current == Some(expected));
+        if !matches_expectation {
+            return Err(AppError::Conflict(
+                "model price changed; reload the latest generation and retry".into(),
+            ));
+        }
+    }
+    let latest: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(effective_from) FROM model_price_catalog WHERE price_key = ?1 AND source = 'admin'",
+            params![input.price_key],
+            |row| row.get(0),
+        )
+        .map_err(|error| AppError::Internal(format!("read admin model price generation failed: {error}")))?;
+    let effective_from = latest.map_or(requested_at, |value| {
+        requested_at.max(value.saturating_add(1))
+    });
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            AppError::Internal(format!("begin admin model price update failed: {error}"))
+        })?;
+    tx.execute(
+        "UPDATE model_price_catalog SET effective_to = ?2, updated_at = ?2
+         WHERE price_key = ?1 AND source = 'admin' AND effective_to IS NULL",
+        params![input.price_key, effective_from],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "close admin model price generation failed: {error}"
+        ))
+    })?;
+    tx.execute(
+        "INSERT INTO model_price_catalog (
+             price_key, effective_from, effective_to, display_name, currency,
+             long_context_threshold, long_context_inclusive, supports_cache_breakdown,
+             source, source_note, updated_at
+         ) VALUES (?1, ?2, NULL, ?3, 'USD', NULL, 0, 1, 'admin', 'Router administrator override', ?2)",
+        params![input.price_key, effective_from, input.display_name],
+    )
+    .map_err(|error| AppError::Internal(format!("insert admin model price failed: {error}")))?;
+    tx.execute(
+        "INSERT INTO model_price_rates (
+             price_key, effective_from, service_tier, context_tier,
+             input_micros_per_1m, output_micros_per_1m, cache_read_micros_per_1m,
+             cache_write_5m_micros_per_1m, cache_write_1h_micros_per_1m
+         ) VALUES (?1, ?2, 'standard', 'base', ?3, ?4, ?5, ?6, ?7)",
+        params![
+            input.price_key,
+            effective_from,
+            input.input,
+            input.output,
+            input.cache_read,
+            input.cache_write_5m,
+            input.cache_write_1h
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("insert admin model price rates failed: {error}"))
+    })?;
+    tx.commit().map_err(|error| {
+        AppError::Internal(format!("commit admin model price update failed: {error}"))
+    })?;
+    Ok(effective_from)
+}
+
+pub fn close_admin_override(
+    conn: &Connection,
+    price_key: &str,
+    expected_effective_from: i64,
+    requested_at: i64,
+) -> Result<i64, AppError> {
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT effective_from FROM model_price_catalog
+             WHERE price_key = ?1 AND source = 'admin' AND effective_to IS NULL
+             ORDER BY effective_from DESC LIMIT 1",
+            params![price_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read admin model price override failed: {error}"))
+        })?;
+    if current != Some(expected_effective_from) {
+        return Err(AppError::Conflict(
+            "model price override changed; reload and retry".into(),
+        ));
+    }
+    let effective_to = requested_at.max(expected_effective_from.saturating_add(1));
+    let changed = conn
+        .execute(
+            "UPDATE model_price_catalog SET effective_to = ?3, updated_at = ?3
+             WHERE price_key = ?1 AND source = 'admin' AND effective_from = ?2 AND effective_to IS NULL",
+            params![price_key, expected_effective_from, effective_to],
+        )
+        .map_err(|error| AppError::Internal(format!("close admin model price override failed: {error}")))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "model price override changed; reload and retry".into(),
+        ));
+    }
+    Ok(effective_to)
+}
+
+pub fn list_admin_prices(
+    conn: &Connection,
+    catalog: &PricingCatalog,
+    now_unix: i64,
+) -> Result<AdminModelPriceList, AppError> {
+    let mut discovered: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for (sql, source) in [
+        (
+            "SELECT DISTINCT price_key FROM model_price_catalog WHERE price_key != ''",
+            "catalog",
+        ),
+        (
+            "SELECT DISTINCT lower(trim(model_key)) FROM share_listing_usage_rollup",
+            "usage",
+        ),
+        (
+            "SELECT DISTINCT lower(COALESCE(NULLIF(trim(actual_model), ''), NULLIF(trim(requested_model), ''), '')) FROM share_model_health_state",
+            "share",
+        ),
+    ] {
+        let mut statement = conn.prepare(sql).map_err(|error| {
+            AppError::Internal(format!("prepare model price discovery failed: {error}"))
+        })?;
+        let rows = statement
+            .query_map(params![], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                AppError::Internal(format!("read model price discovery failed: {error}"))
+            })?;
+        for row in rows {
+            let key = row.map_err(|error| {
+                AppError::Internal(format!("read discovered model failed: {error}"))
+            })?;
+            if !key.is_empty() {
+                discovered.entry(key).or_default().insert(source.into());
+            }
+        }
+    }
+
+    let mut models = Vec::with_capacity(discovered.len());
+    for (observed_key, sources) in discovered {
+        let resolved_key = catalog
+            .resolve_price_key(&observed_key)
+            .unwrap_or(&observed_key)
+            .to_string();
+        if models
+            .iter()
+            .any(|item: &AdminModelPriceListItem| item.model_key == resolved_key)
+        {
+            if let Some(item) = models
+                .iter_mut()
+                .find(|item| item.model_key == resolved_key)
+            {
+                for source in sources {
+                    if !item.discovered_from.contains(&source) {
+                        item.discovered_from.push(source);
+                    }
+                }
+                item.discovered_from.sort();
+            }
+            continue;
+        }
+        let current = query_generation(conn, &resolved_key, now_unix)?;
+        let mut discovered_from: Vec<_> = sources.into_iter().collect();
+        if current.as_ref().is_some_and(|item| item.source == "admin") {
+            discovered_from.push("admin".into());
+        }
+        discovered_from.sort();
+        discovered_from.dedup();
+        models.push(AdminModelPriceListItem {
+            model_key: resolved_key.clone(),
+            display_name: current
+                .as_ref()
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| observed_key.clone()),
+            priced: current.is_some(),
+            source: current.as_ref().map(|item| item.source.clone()),
+            discovered_from,
+            effective_from: current.as_ref().map(|item| item.effective_from),
+            rates_micros_per_1m: current.map(|item| item.rates_micros_per_1m),
+        });
+    }
+    models.sort_by(|left, right| {
+        left.priced
+            .cmp(&right.priced)
+            .then_with(|| {
+                right
+                    .source
+                    .as_deref()
+                    .eq(&Some("admin"))
+                    .cmp(&left.source.as_deref().eq(&Some("admin")))
+            })
+            .then_with(|| left.model_key.cmp(&right.model_key))
+    });
+    let priced = models.iter().filter(|item| item.priced).count();
+    let admin_overrides = models
+        .iter()
+        .filter(|item| item.source.as_deref() == Some("admin"))
+        .count();
+    Ok(AdminModelPriceList {
+        pricing_revision: qualified_revision(catalog.revision()),
+        total: models.len(),
+        priced,
+        unpriced: models.len().saturating_sub(priced),
+        admin_overrides,
+        models,
+    })
+}
+
+fn query_generation(
+    conn: &Connection,
+    price_key: &str,
+    at: i64,
+) -> Result<Option<AdminModelPriceHistoryItem>, AppError> {
+    conn.query_row(
+        "SELECT c.effective_from, c.effective_to, c.display_name, c.source,
+                r.input_micros_per_1m, r.output_micros_per_1m, r.cache_read_micros_per_1m,
+                r.cache_write_5m_micros_per_1m, r.cache_write_1h_micros_per_1m
+         FROM model_price_catalog c JOIN model_price_rates r
+           ON r.price_key = c.price_key AND r.effective_from = c.effective_from
+          AND r.service_tier = 'standard' AND r.context_tier = 'base'
+         WHERE c.price_key = ?1 AND c.effective_from <= ?2
+           AND (c.effective_to IS NULL OR c.effective_to > ?2)
+         ORDER BY CASE c.source WHEN 'admin' THEN 0 ELSE 1 END, c.effective_from DESC LIMIT 1",
+        params![price_key, at],
+        |row| {
+            Ok(AdminModelPriceHistoryItem {
+                effective_from: row.get(0)?,
+                effective_to: row.get(1)?,
+                display_name: row.get(2)?,
+                source: row.get(3)?,
+                current: true,
+                rates_micros_per_1m: AdminModelPriceRates {
+                    input: row.get(4)?,
+                    output: row.get(5)?,
+                    cache_read: row.get(6)?,
+                    cache_write_5m: row.get(7)?,
+                    cache_write_1h: row.get(8)?,
+                },
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "read current model price generation failed: {error}"
+        ))
+    })
+}
+
+pub fn admin_price_history(
+    conn: &Connection,
+    price_key: &str,
+    now_unix: i64,
+) -> Result<Vec<AdminModelPriceHistoryItem>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT c.effective_from, c.effective_to, c.display_name, c.source,
+                r.input_micros_per_1m, r.output_micros_per_1m, r.cache_read_micros_per_1m,
+                r.cache_write_5m_micros_per_1m, r.cache_write_1h_micros_per_1m
+         FROM model_price_catalog c JOIN model_price_rates r
+           ON r.price_key = c.price_key AND r.effective_from = c.effective_from
+          AND r.service_tier = 'standard' AND r.context_tier = 'base'
+         WHERE c.price_key = ?1 ORDER BY c.effective_from DESC",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare model price history failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map(params![price_key], |row| {
+            let effective_from: i64 = row.get(0)?;
+            let effective_to: Option<i64> = row.get(1)?;
+            Ok(AdminModelPriceHistoryItem {
+                effective_from,
+                effective_to,
+                display_name: row.get(2)?,
+                source: row.get(3)?,
+                current: false,
+                rates_micros_per_1m: AdminModelPriceRates {
+                    input: row.get(4)?,
+                    output: row.get(5)?,
+                    cache_read: row.get(6)?,
+                    cache_write_5m: row.get(7)?,
+                    cache_write_1h: row.get(8)?,
+                },
+            })
+        })
+        .map_err(|error| AppError::Internal(format!("read model price history failed: {error}")))?;
+    let mut history = rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+        AppError::Internal(format!("decode model price history failed: {error}"))
+    })?;
+    if let Some(current) = query_generation(conn, price_key, now_unix)? {
+        if let Some(item) = history.iter_mut().find(|item| {
+            item.effective_from == current.effective_from && item.source == current.source
+        }) {
+            item.current = true;
+        }
+    }
+    Ok(history)
 }
 
 /// Rebuilds the in-process snapshot from the database, so admin overrides
@@ -1129,5 +1522,72 @@ mod tests {
             "source":{"name":"n","url":"u","sha256":"s","license":"MIT"},
             "models":[],"aliases":[]}"#;
         assert!(parse_document(raw).is_err());
+    }
+
+    #[test]
+    fn admin_price_updates_are_generation_safe_and_survive_derived_reload() {
+        let conn = fixture_conn();
+        load(&conn, 100).expect("load derived catalog");
+        let input = AdminModelPriceInput {
+            price_key: "claude-opus-5".into(),
+            display_name: "Claude Opus 5".into(),
+            input: 15_000_000,
+            output: 75_000_000,
+            cache_read: 1_500_000,
+            cache_write_5m: 18_750_000,
+            cache_write_1h: Some(30_000_000),
+            expected_effective_from: None,
+            expect_unpriced: false,
+        };
+        assert_eq!(upsert_admin_price(&conn, &input, 200).unwrap(), 200);
+        assert_eq!(upsert_admin_price(&conn, &input, 200).unwrap(), 201);
+        let catalog = load(&conn, 300).expect("reload with derived rows");
+        let (_, price) = catalog.lookup("claude-opus-5", 300).expect("admin price");
+        assert_eq!(
+            price.rates[&(ServiceTier::Standard, ContextTier::Base)].output_micros_per_1m,
+            75_000_000
+        );
+        let generations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM model_price_catalog WHERE price_key = 'claude-opus-5' AND source = 'admin'",
+            params![], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(generations, 2);
+        let list = list_admin_prices(&conn, &catalog, 300).expect("list admin prices");
+        let item = list
+            .models
+            .iter()
+            .find(|item| item.model_key == "claude-opus-5")
+            .unwrap();
+        assert_eq!(item.source.as_deref(), Some("admin"));
+        assert_eq!(item.effective_from, Some(201));
+        assert_eq!(list.admin_overrides, 1);
+
+        let mut stale = input.clone();
+        stale.expected_effective_from = Some(200);
+        assert!(matches!(
+            upsert_admin_price(&conn, &stale, 301),
+            Err(AppError::Conflict(_))
+        ));
+        stale.expected_effective_from = None;
+        stale.expect_unpriced = true;
+        assert!(matches!(
+            upsert_admin_price(&conn, &stale, 301),
+            Err(AppError::Conflict(_))
+        ));
+
+        assert_eq!(
+            close_admin_override(&conn, "claude-opus-5", 201, 301).unwrap(),
+            301
+        );
+        let history = admin_price_history(&conn, "claude-opus-5", 301).unwrap();
+        assert_eq!(
+            history.iter().filter(|item| item.source == "admin").count(),
+            2
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|item| item.current && item.source == "admin")
+        );
     }
 }

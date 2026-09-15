@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   formatTokenMillions,
+  formatTokenMillionsFixed,
   millionsInputToTokens,
   tokensToMillionsInput,
   validTokenMillionsInput,
@@ -14,6 +15,12 @@ test("formats raw token counts as exact editable million values", () => {
   assert.equal(tokensToMillionsInput(1_250_000), "1.25");
   assert.equal(tokensToMillionsInput(12_000_001), "12.000001");
   assert.equal(tokensToMillionsInput(-1), "");
+});
+
+test("formatTokenMillionsFixed keeps a stable display precision", () => {
+  assert.equal(formatTokenMillionsFixed(1_250_000, "en"), "1.3 M");
+  assert.equal(formatTokenMillionsFixed(12_500, "zh-CN"), "1.3万");
+  assert.equal(formatTokenMillionsFixed(150_000_000, "zh-CN"), "1.5亿");
 });
 
 test("parses million inputs without floating point rounding", () => {
