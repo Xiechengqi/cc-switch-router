@@ -3238,7 +3238,6 @@ pub async fn proxy_handler(
     let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
     let user_asn = trusted_asn_header(&parts.headers, peer);
     let user_agent = header_str(&parts.headers, "user-agent");
-    let is_dashboard_connection_test = is_trusted_dashboard_connection_test(peer, &parts.headers);
     if let Some(remaining) = state.abuse.ban_remaining(&user_ip).await {
         warn!(
             method = %method,
@@ -3391,7 +3390,10 @@ pub async fn proxy_handler(
         return simple_response(StatusCode::NOT_FOUND, "not-found");
     }
     let backend = route.backend.clone();
-    let is_health_check_request = is_share_router_probe || is_dashboard_connection_test;
+    // Automated route probes are operational health checks and stay outside
+    // business usage. A user-triggered Share connection test is a real model
+    // invocation, so it must be recorded and billed like any other request.
+    let is_health_check_request = classify_share_request_as_health_check(is_share_router_probe);
     let is_direct_share_web_request = route.is_share() && is_allowed_direct_share_web_path(&path);
     let skips_share_edge_auth =
         share_route_skips_edge_auth(is_internal_share_router_path, is_direct_share_web_request);
@@ -6659,13 +6661,8 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .unwrap_or("-")
 }
 
-fn is_trusted_dashboard_connection_test(peer: SocketAddr, headers: &HeaderMap) -> bool {
-    peer.ip().is_loopback()
-        && header_str(headers, "user-agent") == "cc-switch-router/0.1 test-connection"
-        && headers
-            .get("x-cc-switch-dashboard-test")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == "1")
+fn classify_share_request_as_health_check(is_share_router_probe: bool) -> bool {
+    is_share_router_probe
 }
 
 fn is_internal_share_context_header(name: &str) -> bool {
@@ -9801,30 +9798,9 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
     }
 
     #[test]
-    fn dashboard_health_marker_requires_loopback_and_exact_internal_identity() {
-        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
-        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 12345);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "user-agent",
-            HeaderValue::from_static("cc-switch-router/0.1 test-connection"),
-        );
-        headers.insert("x-cc-switch-dashboard-test", HeaderValue::from_static("1"));
-
-        assert!(is_trusted_dashboard_connection_test(loopback, &headers));
-        assert!(!is_trusted_dashboard_connection_test(remote, &headers));
-
-        headers.insert("user-agent", HeaderValue::from_static("curl/8.0"));
-        assert!(!is_trusted_dashboard_connection_test(loopback, &headers));
-        headers.insert(
-            "user-agent",
-            HeaderValue::from_static("cc-switch-router/0.1 test-connection"),
-        );
-        headers.insert(
-            "x-cc-switch-dashboard-test",
-            HeaderValue::from_static("true"),
-        );
-        assert!(!is_trusted_dashboard_connection_test(loopback, &headers));
+    fn only_automated_share_probes_are_excluded_from_business_usage() {
+        assert!(classify_share_request_as_health_check(true));
+        assert!(!classify_share_request_as_health_check(false));
     }
 
     #[test]

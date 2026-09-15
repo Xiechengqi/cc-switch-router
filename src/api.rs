@@ -8822,8 +8822,7 @@ async fn test_share_connection(
     let request = client
         .post(&local_url)
         .header("Host", &public_host)
-        .bearer_auth(&api_token)
-        .header("x-cc-switch-dashboard-test", "1");
+        .bearer_auth(&api_token);
     let mut request = match prepared.body {
         ConnectionTestBody::Json(body) => request
             .header("Content-Type", "application/json")
