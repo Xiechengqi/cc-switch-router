@@ -1,7 +1,8 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { ArrowDownUp, CircleDot, Search, X } from "lucide-react";
+import { CircleDot, Search, X } from "lucide-react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { ShareMarketListing, ShareMarketProviderFamily } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -124,19 +125,16 @@ export function MarketListingFilters({
         </button>
       ) : null}
       {showSort ? (
-        <label className="flex h-9 shrink-0 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
-          <ArrowDownUp className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-          <select
-            aria-label={t("shareMarket.catalog.sort")}
-            value={sort}
-            onChange={(event) => onSortChange(event.target.value as MarketCatalogSort)}
-            className="min-w-0 bg-transparent text-xs outline-none"
-          >
-            {MARKET_CATALOG_SORTS.map((value) => (
-              <option key={value} value={value}>{t(`shareMarket.catalog.sort.${value}`)}</option>
-            ))}
-          </select>
-        </label>
+        <CompactSelect
+          value={sort}
+          onChange={(value) => onSortChange(value as MarketCatalogSort)}
+          ariaLabel={t("shareMarket.catalog.sort")}
+          className="shrink-0"
+          options={MARKET_CATALOG_SORTS.map((value) => ({
+            value,
+            label: t(`shareMarket.catalog.sort.${value}`),
+          }))}
+        />
       ) : null}
       <label className="flex h-9 w-44 shrink-0 grow items-center gap-1.5 sm:grow-0 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
         <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" />

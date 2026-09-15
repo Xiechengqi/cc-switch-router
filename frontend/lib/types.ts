@@ -1892,12 +1892,31 @@ export type ShareConnectionTestResponse = {
   } | null;
   durationMs: number;
   error: string | null;
+  failure?: {
+    code: string;
+    scope?: string | null;
+    retryable: boolean;
+    providerId?: string | null;
+    retryAt?: string | null;
+    source: "client";
+  } | null;
   terminalEvent?: string | null;
   schedulingRecovery?: {
     shareModelHealthDeleted: number;
     gatewayModelFailuresDeleted: number;
     gatewayRuntimeStatesDeleted: number;
   };
+};
+
+export type ShareAccountRateLimitRecovery = {
+  ok: boolean;
+  outcome: "not_blocked" | "recovered" | "still_rate_limited" | "provider_changed" | "state_changed" | "upstream_failed";
+  providerId: string;
+  previousUntil: number | null;
+  currentUntil: number | null;
+  upstreamStatus: number | null;
+  message: string;
+  testedAt: number;
 };
 
 export type ShareModelHealthCalendarDay = {

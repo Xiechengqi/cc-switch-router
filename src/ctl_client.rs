@@ -26,6 +26,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
 const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
+const VERIFY_SHARE_ACCOUNT_RECOVERY_PATH: &str = "/_ctl/verify_share_account_recovery";
 const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/prepare";
 const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
 const ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/abort";
@@ -68,6 +69,29 @@ struct ControlErrorDetails {
 struct RefreshShareUsageBody<'a> {
     share_id: &'a str,
     app: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyShareAccountRecoveryBody<'a> {
+    share_id: &'a str,
+    app: &'a str,
+    expected_provider_id: &'a str,
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyShareAccountRecoveryReply {
+    #[serde(default)]
+    pub ok: bool,
+    pub outcome: String,
+    pub provider_id: String,
+    pub previous_until: Option<i64>,
+    pub current_until: Option<i64>,
+    pub upstream_status: Option<u16>,
+    pub message: String,
+    pub tested_at: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -324,12 +348,31 @@ async fn post_control<T: serde::de::DeserializeOwned>(
     path: &str,
     body: String,
 ) -> Result<T, CtlError> {
+    post_control_with_timeout(
+        backend,
+        installation_id,
+        control_secret,
+        path,
+        body,
+        CTL_TIMEOUT,
+    )
+    .await
+}
+
+async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    path: &str,
+    body: String,
+    timeout: Duration,
+) -> Result<T, CtlError> {
     let timestamp_ms = chrono::Utc::now().timestamp_millis();
     let nonce = uuid::Uuid::new_v4().to_string();
     let sig = signature(path, control_secret, &body, timestamp_ms, &nonce);
 
     let client = reqwest::Client::builder()
-        .timeout(CTL_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|e| CtlError::Unreachable(format!("build http client failed: {e}")))?;
 
@@ -378,6 +421,33 @@ async fn post_control<T: serde::de::DeserializeOwned>(
     resp.json()
         .await
         .map_err(|e| CtlError::Malformed(e.to_string()))
+}
+
+pub async fn verify_share_account_recovery(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    share_id: &str,
+    app: &str,
+    expected_provider_id: &str,
+) -> Result<VerifyShareAccountRecoveryReply, CtlError> {
+    let timeout_ms = 30_000;
+    let body = serde_json::to_string(&VerifyShareAccountRecoveryBody {
+        share_id,
+        app,
+        expected_provider_id,
+        timeout_ms,
+    })
+    .map_err(|error| CtlError::Malformed(format!("serialize control body failed: {error}")))?;
+    post_control_with_timeout(
+        backend,
+        installation_id,
+        control_secret,
+        VERIFY_SHARE_ACCOUNT_RECOVERY_PATH,
+        body,
+        Duration::from_secs(35),
+    )
+    .await
 }
 
 /// Synchronously ask the installation behind `backend` (a `host:port` tunnel

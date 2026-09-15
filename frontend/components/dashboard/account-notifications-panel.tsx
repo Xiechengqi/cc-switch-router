@@ -5,6 +5,7 @@ import { Button, Input } from "@heroui/react";
 import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, RefreshCw, Send, Smartphone, Unlink } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   ApiError,
@@ -745,17 +746,17 @@ function AccountNotificationHistory({ accountKey }: { accountKey: string }) {
         </Button>
       </div>
       <div className="grid gap-2 sm:grid-cols-2">
-        <select className="h-10 rounded-md border bg-background px-3 text-sm" value={channel} onChange={(event) => setChannel(event.target.value)} aria-label={t("account.notifications.historyChannel")}>
-          <option value="all">{t("account.notifications.historyAllChannels")}</option>
-          <option value="email">Email</option><option value="telegram">Telegram</option><option value="bark">Bark</option>
-        </select>
-        <select className="h-10 rounded-md border bg-background px-3 text-sm" value={status} onChange={(event) => setStatus(event.target.value)} aria-label={t("account.notifications.historyStatus")}>
-          <option value="all">{t("account.notifications.historyAllStatuses")}</option>
-          <option value="sent">{t("account.notifications.historySent")}</option>
-          <option value="pending">{t("account.notifications.historyPending")}</option>
-          <option value="failed">{t("account.notifications.historyFailed")}</option>
-          <option value="suppressed">{t("account.notifications.historySuppressed")}</option>
-        </select>
+        <CompactSelect value={channel} onChange={setChannel} ariaLabel={t("account.notifications.historyChannel")} triggerClassName="h-10 min-h-10 text-sm" options={[
+          { value: "all", label: t("account.notifications.historyAllChannels") },
+          { value: "email", label: "Email" }, { value: "telegram", label: "Telegram" }, { value: "bark", label: "Bark" },
+        ]} />
+        <CompactSelect value={status} onChange={setStatus} ariaLabel={t("account.notifications.historyStatus")} triggerClassName="h-10 min-h-10 text-sm" options={[
+          { value: "all", label: t("account.notifications.historyAllStatuses") },
+          { value: "sent", label: t("account.notifications.historySent") },
+          { value: "pending", label: t("account.notifications.historyPending") },
+          { value: "failed", label: t("account.notifications.historyFailed") },
+          { value: "suppressed", label: t("account.notifications.historySuppressed") },
+        ]} />
       </div>
       {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
       <div className="divide-y rounded-md border">

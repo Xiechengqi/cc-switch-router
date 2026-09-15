@@ -2906,6 +2906,13 @@ export const messages = {
     "dashboard.connectDialog.test.bodyTruncated":
       "(truncated — run curl for full body)",
     "dashboard.connectDialog.test.networkError": "Network error: {message}",
+    "dashboard.connectDialog.test.accountRateLimited":
+      "The remote Client paused Provider {provider} until {until}. Verify the upstream once to recover a stale cooldown.",
+    "dashboard.connectDialog.test.recoveryButton": "Verify and recover",
+    "dashboard.connectDialog.test.recoveryRunning": "Verifying…",
+    "dashboard.connectDialog.test.recoveryDone": "Recovered; the Share test was run again.",
+    "dashboard.connectDialog.test.recoveryStillLimited": "The upstream is still rate limited; the cooldown was kept.",
+    "dashboard.connectDialog.test.recoveryUnknownUntil": "an unknown time",
     "dashboard.healthCalendar.title": "Upstream model availability",
     "dashboard.healthCalendar.schedule": "{count} half-hour slots/full day · {timezone}",
     "dashboard.healthCalendar.currentProbe": "Primary probe: {app} · test model {model}",
@@ -6211,6 +6218,13 @@ export const messages = {
     "dashboard.connectDialog.test.bodyTruncated":
       "（已截断，完整内容请 curl 自跑）",
     "dashboard.connectDialog.test.networkError": "网络错误：{message}",
+    "dashboard.connectDialog.test.accountRateLimited":
+      "远端 Client 已暂停供应商 {provider}，预计解除时间为 {until}。可真实验证一次上游以恢复失真的冷却状态。",
+    "dashboard.connectDialog.test.recoveryButton": "验证并恢复",
+    "dashboard.connectDialog.test.recoveryRunning": "正在验证…",
+    "dashboard.connectDialog.test.recoveryDone": "已恢复，并已重新执行 Share 测试。",
+    "dashboard.connectDialog.test.recoveryStillLimited": "上游仍在限流，已保留冷却状态。",
+    "dashboard.connectDialog.test.recoveryUnknownUntil": "未知时间",
     "dashboard.healthCalendar.title": "上游模型可用性",
     "dashboard.healthCalendar.schedule": "完整监测日 {count} 个半小时槽 · {timezone}",
     "dashboard.healthCalendar.currentProbe": "主探针：{app} · 测试模型 {model}",

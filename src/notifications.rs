@@ -2065,7 +2065,10 @@ fn strip_header_controls(value: &str) -> String {
 }
 
 pub(crate) fn notification_sender(config: &Config) -> Option<String> {
-    email_sender(config.resend_from.as_deref(), config.resend_from_name.as_deref())
+    email_sender(
+        config.resend_from.as_deref(),
+        config.resend_from_name.as_deref(),
+    )
 }
 
 pub(crate) fn email_sender(from: Option<&str>, from_name: Option<&str>) -> Option<String> {

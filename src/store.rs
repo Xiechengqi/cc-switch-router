@@ -54259,7 +54259,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("req-3"), Some("req-2"), Some("req-1")]
         );
-        assert_eq!(listed[0].caller_email.as_deref(), Some("caller@example.com"));
+        assert_eq!(
+            listed[0].caller_email.as_deref(),
+            Some("caller@example.com")
+        );
         assert_eq!(listed[0].body_text, r#"{"error":"rate limited 3"}"#);
         assert_eq!(listed[0].body_capture_reason, "buffered");
 
@@ -54384,12 +54387,7 @@ mod tests {
         failed.source = "cc-switch-router-cycle:utc-test-fail".into();
         assert!(
             store
-                .finish_share_model_health_slot(
-                    "health-share",
-                    failed_slot,
-                    &failed_claim,
-                    failed,
-                )
+                .finish_share_model_health_slot("health-share", failed_slot, &failed_claim, failed,)
                 .await
                 .expect("finish quota probe")
         );
@@ -54406,8 +54404,16 @@ mod tests {
         );
         assert_eq!(listed[0].body_capture_reason, "router_local");
         assert!(listed[0].body_text.contains("quota_blocked"));
-        assert!(listed[0].body_text.contains("cc-switch-router-cycle:utc-test-fail"));
-        assert!(listed[0].body_text.contains("upstream rate limit is active"));
+        assert!(
+            listed[0]
+                .body_text
+                .contains("cc-switch-router-cycle:utc-test-fail")
+        );
+        assert!(
+            listed[0]
+                .body_text
+                .contains("upstream rate limit is active")
+        );
 
         let gap_slot = failed_slot + 1_800;
         let gap_claim = store

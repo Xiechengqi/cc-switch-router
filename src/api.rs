@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
+use std::sync::{Mutex as StdMutex, OnceLock};
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
@@ -464,6 +466,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/test-connection",
             post(test_share_connection),
+        )
+        .route(
+            "/v1/shares/:share_id/recover-account-rate-limit",
+            post(recover_share_account_rate_limit),
         )
         .route(
             "/v1/shares/:share_id/model-health-calendar",
@@ -2531,7 +2537,13 @@ async fn get_my_notification_history(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<UserNotificationHistoryQuery>,
-) -> Result<(HeaderMap, Json<crate::notifications::UserNotificationHistoryResponse>), AppError> {
+) -> Result<
+    (
+        HeaderMap,
+        Json<crate::notifications::UserNotificationHistoryResponse>,
+    ),
+    AppError,
+> {
     let email = require_session_email(&state, &headers).await?;
     let limit = query.limit.unwrap_or(30).clamp(1, 100);
     let channel = query.channel.as_deref().filter(|value| *value != "all");
@@ -3474,6 +3486,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn share_connection_failure_parses_client_account_cooldown() {
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"provider provider-1 account is rate_limited (account_rate_limit): upstream rate limit is active, retry in 60s (until 2026-09-17T10:00:00Z)","code":"cc_switch_rate_limited","details":{"retryable":true}}}"#;
+        let failure = parse_share_connection_failure(429, body).expect("structured failure");
+        assert_eq!(failure.code, "cc_switch_rate_limited");
+        assert_eq!(failure.scope.as_deref(), Some("account_rate_limit"));
+        assert_eq!(failure.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(failure.retry_at.as_deref(), Some("2026-09-17T10:00:00Z"));
+        assert!(failure.retryable);
+        assert!(parse_share_connection_failure(500, body).is_none());
+    }
+
+    #[test]
     fn recent_error_emails_are_masked_for_anonymous_viewers() {
         let mut errors = vec![crate::store::ShareRequestErrorSnapshot {
             id: "snap-1".into(),
@@ -3490,10 +3514,7 @@ mod tests {
             body_capture_reason: "buffered".into(),
         }];
         apply_recent_error_email_visibility(&mut errors, false);
-        assert_eq!(
-            errors[0].caller_email.as_deref(),
-            Some("a***e@example.com")
-        );
+        assert_eq!(errors[0].caller_email.as_deref(), Some("a***e@example.com"));
         assert_eq!(
             errors[0].body_text,
             r#"{"error":{"code":"cc_switch_rate_limited"}}"#
@@ -7571,9 +7592,78 @@ struct ShareConnectionTestResponse {
     duration_ms: u64,
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<ShareConnectionFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terminal_event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduling_recovery: Option<crate::store::ShareSchedulingRecovery>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareConnectionFailure {
+    code: String,
+    scope: Option<String>,
+    retryable: bool,
+    provider_id: Option<String>,
+    retry_at: Option<String>,
+    source: String,
+}
+
+fn parse_share_connection_failure(status: u16, body: &str) -> Option<ShareConnectionFailure> {
+    if status != 429 {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let error = value.get("error")?;
+    let code = error.get("code")?.as_str()?.to_string();
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let details = error.get("details");
+    let scope = details
+        .and_then(|details| details.get("scope"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            message
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(scope, _)| scope.to_string())
+        });
+    let provider_id = details
+        .and_then(|details| details.get("providerId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            message
+                .strip_prefix("provider ")
+                .and_then(|rest| rest.split_once(" account is "))
+                .map(|(provider, _)| provider.to_string())
+        });
+    let retry_at = details
+        .and_then(|details| details.get("retryAt"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            message
+                .split_once("(until ")
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(until, _)| until.to_string())
+        });
+    Some(ShareConnectionFailure {
+        code,
+        scope,
+        retryable: error
+            .get("details")
+            .and_then(|details| details.get("retryable"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        provider_id,
+        retry_at,
+        source: "client".into(),
+    })
 }
 
 enum ConnectionTestBody {
@@ -8774,6 +8864,7 @@ async fn test_share_connection(
                 response: None,
                 duration_ms,
                 error: Some(err.to_string()),
+                failure: None,
                 terminal_event: None,
                 scheduling_recovery: None,
             }))
@@ -8797,6 +8888,7 @@ async fn test_share_connection(
             let body_truncated = body.total_bytes > body.preview.len();
             let body_text = String::from_utf8_lossy(&body.preview).into_owned();
             let success = (200..300).contains(&status_code) && body.error.is_none();
+            let failure = parse_share_connection_failure(status_code, &body_text);
 
             tracing::info!(
                 tag = "test-connection",
@@ -8843,9 +8935,122 @@ async fn test_share_connection(
                 }),
                 duration_ms,
                 error: body.error,
+                failure,
                 terminal_event: body.terminal_event,
                 scheduling_recovery,
             }))
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoverShareAccountRateLimitRequest {
+    app: String,
+}
+
+static SHARE_RATE_LIMIT_RECOVERY_ATTEMPTS: OnceLock<StdMutex<HashMap<String, Instant>>> =
+    OnceLock::new();
+
+async fn recover_share_account_rate_limit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<RecoverShareAccountRateLimitRequest>,
+) -> Result<Json<crate::ctl_client::VerifyShareAccountRecoveryReply>, AppError> {
+    let actor_email = require_user_email(&state, &headers, "share:write").await?;
+    let share = state
+        .store
+        .get_share_for_test(&share_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+    let is_admin = state.dynamic.read().await.is_admin(&actor_email);
+    if !is_admin && !share.owner_email.eq_ignore_ascii_case(&actor_email) {
+        return Err(AppError::Forbidden(
+            "only the Share owner or admins can recover its Provider account".into(),
+        ));
+    }
+    let app = input.app.trim().to_ascii_lowercase();
+    if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
+        return Err(AppError::BadRequest("unsupported Share App".into()));
+    }
+    let provider_id = share
+        .bindings
+        .get(&app)
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest(format!("share does not have a {app} binding")))?;
+    let limiter_key = format!("{share_id}:{app}");
+    {
+        let mut attempts = SHARE_RATE_LIMIT_RECOVERY_ATTEMPTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        attempts
+            .retain(|_, attempted_at| now.duration_since(*attempted_at) < Duration::from_secs(60));
+        if attempts.contains_key(&limiter_key) {
+            return Err(AppError::RateLimited {
+                message: "Share account recovery can be attempted once per minute".into(),
+                retry_after_secs: 60,
+            });
+        }
+        attempts.insert(limiter_key, now);
+    }
+    let route = state
+        .proxy
+        .route_by_share_id(&share_id)
+        .await
+        .ok_or_else(|| AppError::UnprocessableEntity("share client is offline".into()))?;
+    let installation_id = route
+        .installation_id()
+        .ok_or_else(|| AppError::UnprocessableEntity("share installation is unavailable".into()))?;
+    let control_secret = state
+        .store
+        .installation_control_secret(installation_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::UnprocessableEntity("share control secret is unavailable".into())
+        })?;
+    let reply = crate::ctl_client::verify_share_account_recovery(
+        route.route_target(),
+        installation_id,
+        &control_secret,
+        &share_id,
+        &app,
+        &provider_id,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::ctl_client::CtlError::Rejected { status: 404, .. } => AppError::Conflict(
+            "remote cc-switch-server does not support account recovery; upgrade it first".into(),
+        ),
+        crate::ctl_client::CtlError::Timeout => {
+            AppError::ServiceUnavailable("account recovery verification timed out".into())
+        }
+        crate::ctl_client::CtlError::Unreachable(_) => {
+            AppError::ServiceUnavailable("share client is unreachable".into())
+        }
+        other => AppError::UnprocessableEntity(other.to_string()),
+    })?;
+    let audit = serde_json::json!({
+        "shareId": share_id,
+        "installationId": installation_id,
+        "app": app,
+        "providerId": provider_id,
+        "outcome": reply.outcome,
+        "previousUntil": reply.previous_until,
+        "currentUntil": reply.current_until,
+        "upstreamStatus": reply.upstream_status,
+        "testedAt": reply.tested_at,
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&actor_email),
+            "share.account_rate_limit.recover",
+            Some(&audit),
+            None,
+        )
+        .await;
+    Ok(Json(reply))
 }

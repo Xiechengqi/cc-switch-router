@@ -3,9 +3,10 @@
 import * as React from "react";
 import { Button } from "@heroui/react";
 import { Check, ChevronDown, Copy, Loader2, RefreshCw } from "lucide-react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { refreshShareUsage, testShareConnection } from "@/lib/api";
+import { recoverShareAccountRateLimit, refreshShareUsage, testShareConnection } from "@/lib/api";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import { buildShareProbeCurl } from "@/lib/share-model-probe";
 import type {
@@ -103,6 +104,8 @@ export function ShareConnectionTestRow({
   const [refreshState, setRefreshState] = React.useState<TestState>("idle");
   const [refreshMsg, setRefreshMsg] = React.useState("");
   const [operation, setOperation] = React.useState<TestOperation>("text");
+  const [recoveryState, setRecoveryState] = React.useState<TestState>("idle");
+  const [recoveryMsg, setRecoveryMsg] = React.useState("");
 
   const isBound = !!(share.bindings?.[app]);
   const runtime = runtimeForApp(share, app);
@@ -163,6 +166,30 @@ export function ShareConnectionTestRow({
     }
   }, [canExecute, isBound, refreshState, share.shareId, app, t]);
 
+  const runRecovery = React.useCallback(async () => {
+    if (!share.canManage || recoveryState === "running") return;
+    setRecoveryState("running");
+    setRecoveryMsg("");
+    try {
+      const recovery = await recoverShareAccountRateLimit(share.shareId, app);
+      if (recovery.outcome === "recovered" || recovery.outcome === "not_blocked") {
+        setRecoveryState("done");
+        setRecoveryMsg(t("dashboard.connectDialog.test.recoveryDone"));
+        const response = await testShareConnection(share.shareId, { app, operation, timeoutMs: 30000 });
+        setResult(response);
+        setTestState(response.success ? "done" : "error");
+      } else {
+        setRecoveryState("error");
+        setRecoveryMsg(recovery.outcome === "still_rate_limited"
+          ? t("dashboard.connectDialog.test.recoveryStillLimited")
+          : recovery.message);
+      }
+    } catch (err) {
+      setRecoveryState("error");
+      setRecoveryMsg(err instanceof Error ? err.message : String(err));
+    }
+  }, [app, operation, recoveryState, share.canManage, share.shareId, t]);
+
   const running = testState === "running";
   const refreshing = refreshState === "running";
   const canRefreshUsage = share.canManage;
@@ -205,23 +232,19 @@ export function ShareConnectionTestRow({
         ) : (
           <div className="flex shrink-0 items-center gap-1.5">
             {app === "codex" ? (
-              <select
+              <CompactSelect
                 value={operation}
-                onChange={(event) => setOperation(event.target.value as TestOperation)}
+                onChange={(value) => setOperation(value as TestOperation)}
                 disabled={running}
-                className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700"
-              >
-                <option value="text">{t("dashboard.connectDialog.test.operationText")}</option>
-                {share.grokMediaPolicy?.imageGenerationEnabled ? (
-                  <option value="image_generation">{t("dashboard.connectDialog.test.operationImageGeneration")}</option>
-                ) : null}
-                {share.grokMediaPolicy?.imageEditEnabled ? (
-                  <option value="image_edit">{t("dashboard.connectDialog.test.operationImageEdit")}</option>
-                ) : null}
-                {share.grokMediaPolicy?.videoGenerationEnabled ? (
-                  <option value="video_generation">{t("dashboard.connectDialog.test.operationVideoGeneration")}</option>
-                ) : null}
-              </select>
+                ariaLabel={t("dashboard.connectDialog.test.operationText")}
+                triggerClassName="h-8 min-h-8"
+                options={[
+                  { value: "text", label: t("dashboard.connectDialog.test.operationText") },
+                  ...(share.grokMediaPolicy?.imageGenerationEnabled ? [{ value: "image_generation", label: t("dashboard.connectDialog.test.operationImageGeneration") }] : []),
+                  ...(share.grokMediaPolicy?.imageEditEnabled ? [{ value: "image_edit", label: t("dashboard.connectDialog.test.operationImageEdit") }] : []),
+                  ...(share.grokMediaPolicy?.videoGenerationEnabled ? [{ value: "video_generation", label: t("dashboard.connectDialog.test.operationVideoGeneration") }] : []),
+                ]}
+              />
             ) : null}
             {canRefreshUsage ? (
               <Button
@@ -336,6 +359,35 @@ export function ShareConnectionTestRow({
 
           {result.error ? (
             <p className="text-xs text-red-600">{result.error}</p>
+          ) : null}
+
+          {result.failure?.code === "cc_switch_rate_limited"
+            && result.failure.scope === "account_rate_limit" ? (
+            <div className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+              <p>
+                {t("dashboard.connectDialog.test.accountRateLimited", {
+                  provider: result.failure.providerId || t("dashboard.connectDialog.test.providerUnknown"),
+                  until: result.failure.retryAt
+                    ? new Date(result.failure.retryAt).toLocaleString()
+                    : t("dashboard.connectDialog.test.recoveryUnknownUntil"),
+                })}
+              </p>
+              {share.canManage ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="justify-self-start"
+                  isDisabled={recoveryState === "running"}
+                  onClick={recoveryState === "running" ? undefined : runRecovery}
+                >
+                  {recoveryState === "running" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  {recoveryState === "running"
+                    ? t("dashboard.connectDialog.test.recoveryRunning")
+                    : t("dashboard.connectDialog.test.recoveryButton")}
+                </Button>
+              ) : null}
+              {recoveryMsg ? <p className={recoveryState === "error" ? "text-red-700" : "text-emerald-700"}>{recoveryMsg}</p> : null}
+            </div>
           ) : null}
 
           {result.response ? (

@@ -1366,7 +1366,10 @@ mod tests {
         )
         .await
         .expect_err("missing API key");
-        assert_eq!(error.code(), Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED"));
+        assert_eq!(
+            error.code(),
+            Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED")
+        );
 
         let error = test_email_channel(
             &reqwest::Client::new(),
@@ -1382,7 +1385,10 @@ mod tests {
         )
         .await
         .expect_err("missing sender");
-        assert_eq!(error.code(), Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED"));
+        assert_eq!(
+            error.code(),
+            Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED")
+        );
     }
 
     #[tokio::test]
@@ -1401,7 +1407,10 @@ mod tests {
         )
         .await
         .expect_err("invalid administrator email");
-        assert_eq!(error.code(), Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED"));
+        assert_eq!(
+            error.code(),
+            Some("USER_NOTIFICATION_CHANNEL_MISCONFIGURED")
+        );
     }
 
     #[tokio::test]

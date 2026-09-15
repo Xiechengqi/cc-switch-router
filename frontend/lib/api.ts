@@ -10,6 +10,7 @@ import type {
   ShareEditView,
   ShareClientBanPage,
   ShareClientUnbanResponse,
+  ShareAccountRateLimitRecovery,
   ShareConnectionTestRequest,
   ShareConnectionTestResponse,
   ClientOnlineCalendar,
@@ -950,6 +951,16 @@ export async function testShareConnection(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
+    }),
+  );
+}
+
+export async function recoverShareAccountRateLimit(shareId: string, app: string) {
+  return parseJson<ShareAccountRateLimitRecovery>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/recover-account-rate-limit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ app }),
     }),
   );
 }

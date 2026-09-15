@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CompactSelect } from "@/components/common/compact-select";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -250,23 +251,24 @@ function CounterpartyCreditCell({
 
   return (
     <div className="grid min-w-0 gap-2">
-      <select
+      <CompactSelect
         value={draft.kind}
         disabled={disabled}
-        aria-label={`${currency} ${t("marketAccess.creditType")}`}
-        onChange={(event) =>
+        ariaLabel={`${currency} ${t("marketAccess.creditType")}`}
+        onChange={(value) =>
           onChange({
             ...draft,
-            kind: event.target.value as MarketCreditKind,
+            kind: value as MarketCreditKind,
             unlimitedAcknowledged: false,
           })
         }
-        className="h-9 w-full rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
-      >
-        {allowNone ? <option value="none">{t("marketAccess.credit.none")}</option> : null}
-        <option value="limited">{t("marketAccess.credit.limited")}</option>
-        <option value="unlimited">{t("marketAccess.credit.unlimited")}</option>
-      </select>
+        className="w-full"
+        options={[
+          ...(allowNone ? [{ value: "none", label: t("marketAccess.credit.none") }] : []),
+          { value: "limited", label: t("marketAccess.credit.limited") },
+          { value: "unlimited", label: t("marketAccess.credit.unlimited") },
+        ]}
+      />
       {draft.kind === "limited" ? (
         <input
           value={draft.limit}
@@ -1256,20 +1258,21 @@ export function AccountMarketAccessPage() {
                             const key = scopeKey(productKind, pricingKind);
                             const label = pricingKind === "free" ? t("marketAccess.pricing.free") : t("marketAccess.pricing.paid");
                             return (
-                              <label key={pricingKind} className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-[5rem_minmax(0,1fr)] sm:items-center">
+                              <div key={pricingKind} className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-[5rem_minmax(0,1fr)] sm:items-center">
                                 <span>{label}</span>
-                                <select
+                                <CompactSelect
                                   value={draft.decisions[key]}
                                   disabled={editorDisabled}
-                                  aria-label={`${productKind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")} · ${label}`}
-                                  onChange={(event) => updateCounterpartyDraft(counterparty.id, (current) => ({ ...current, decisions: { ...current.decisions, [key]: event.target.value as MarketAccessDecision } }))}
-                                  className="h-9 min-w-0 rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
-                                >
-                                  <option value="inherit">{t("marketAccess.decision.inherit")}</option>
-                                  <option value="allow">{t("marketAccess.decision.allow")}</option>
-                                  <option value="deny">{t("marketAccess.decision.deny")}</option>
-                                </select>
-                              </label>
+                                  ariaLabel={`${productKind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")} · ${label}`}
+                                  onChange={(value) => updateCounterpartyDraft(counterparty.id, (current) => ({ ...current, decisions: { ...current.decisions, [key]: value as MarketAccessDecision } }))}
+                                  className="min-w-0"
+                                  options={[
+                                    { value: "inherit", label: t("marketAccess.decision.inherit") },
+                                    { value: "allow", label: t("marketAccess.decision.allow") },
+                                    { value: "deny", label: t("marketAccess.decision.deny") },
+                                  ]}
+                                />
+                              </div>
                             );
                           })}
                         </section>

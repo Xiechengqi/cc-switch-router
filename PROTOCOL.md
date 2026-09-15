@@ -252,6 +252,7 @@ Router 复用已建立的反向隧道**同步调用** Server 本地 API,避免�
 
 - `POST /_ctl/apply_share_settings` —— 下发 share 配置补丁
 - `POST /_ctl/refresh_share_usage` —— 触发用量刷新
+- `POST /_ctl/verify_share_account_recovery` —— 对 Share 当前绑定 Provider 执行一次真实恢复探针；仅在账号身份与冷却快照均未变化且探针成功时清除 `account_rate_limit`
 
 **HMAC 规范串**(`src/ctl_client.rs:110-154`):
 

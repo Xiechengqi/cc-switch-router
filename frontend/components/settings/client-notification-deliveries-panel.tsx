@@ -3,6 +3,7 @@
 import { Alert, Button, Card, Chip, Input } from "@heroui/react";
 import { Loader2, RefreshCw, RotateCcw } from "lucide-react";
 import * as React from "react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAlertingOverview, getClientChatDeliveries, getClientNotificationDeliveries, requeueClientChatDelivery } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
@@ -166,9 +167,13 @@ export function ClientNotificationDeliveriesPanel() {
 }
 
 function HistorySelect({ value, onChange, label, options }: { value: string; onChange: (value: string) => void; label: string; options: [string, string][] }) {
-  return <select className="min-h-10 rounded-md border bg-background px-3 text-sm" value={value} onChange={(event) => onChange(event.target.value)} aria-label={label}>
-    {options.map(([optionValue, optionLabel]) => <option key={optionValue} value={optionValue}>{optionLabel}</option>)}
-  </select>;
+  return <CompactSelect
+    value={value}
+    onChange={onChange}
+    ariaLabel={label}
+    triggerClassName="h-10 min-h-10 text-sm"
+    options={options.map(([optionValue, optionLabel]) => ({ value: optionValue, label: optionLabel }))}
+  />;
 }
 
 function ClientChatDeliveriesCard() {

@@ -24,6 +24,7 @@ import {
   Users,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CompactSelect } from "@/components/common/compact-select";
 import {
   ProviderContactsList,
   ProviderPaymentMethodsList,
@@ -1662,13 +1663,20 @@ export function AccountBillingPage() {
                   <p className="text-xs text-muted-foreground">
                     {t("marketBilling.paymentSnapshot", { date: formatDate(action.invoice.paymentProfileUpdatedAt, locale) })}
                   </p>
-                  <label className="grid gap-1 text-sm">
+                  <div className="grid gap-1 text-sm">
                     <span className="text-muted-foreground">{t("marketBilling.declare.method")}</span>
-                    <select value={paymentKind} onChange={(event) => setPaymentKind(event.target.value)} className="h-10 rounded-md border border-border bg-white px-3">
-                      <option value="">{t("marketBilling.declare.methodOther")}</option>
-                      {action.invoice.paymentMethods.map((method, index) => <option key={`${method.kind}:${index}`} value={method.kind}>{method.kind}</option>)}
-                    </select>
-                  </label>
+                    <CompactSelect
+                      value={paymentKind}
+                      onChange={setPaymentKind}
+                      ariaLabel={t("marketBilling.declare.method")}
+                      triggerClassName="h-10 min-h-10 text-sm"
+                      options={[
+                        { value: "", label: t("marketBilling.declare.methodOther") },
+                        ...Array.from(new Set(action.invoice.paymentMethods.map((method) => method.kind)))
+                          .map((kind) => ({ value: kind, label: kind })),
+                      ]}
+                    />
+                  </div>
                   <label className="grid gap-1 text-sm">
                     <span className="text-muted-foreground">{t("marketBilling.declare.reference")}</span>
                     <input value={reference} onChange={(event) => setReference(event.target.value)} maxLength={200} className="h-10 rounded-md border border-border px-3" />

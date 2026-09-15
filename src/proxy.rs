@@ -2338,16 +2338,14 @@ pub async fn gateway_proxy_handler(
     let status = upstream.status();
     recent_traffic_guard.set_status(status);
     let response_headers = upstream.headers().clone();
-    if let Some(response) =
-        ingress_rejection_response(
-            &state,
-            status,
-            &response_headers,
-            &route,
-            &path_and_query,
-            Some(&error_capture),
-        )
-    {
+    if let Some(response) = ingress_rejection_response(
+        &state,
+        status,
+        &response_headers,
+        &route,
+        &path_and_query,
+        Some(&error_capture),
+    ) {
         state.metrics.record_proxy_status(response.status());
         return response;
     }
@@ -6293,11 +6291,7 @@ fn llm_concurrency_response(
     };
     if let Some(capture) = capture {
         let encoded = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
-        capture.record_body(
-            StatusCode::CONFLICT,
-            &encoded,
-            Some("application/json"),
-        );
+        capture.record_body(StatusCode::CONFLICT, &encoded, Some("application/json"));
     }
     let mut response = json_response(StatusCode::CONFLICT, body);
     response
@@ -6386,11 +6380,7 @@ fn client_banned_response(
     capture: Option<&ShareErrorCapture>,
 ) -> Response {
     if let Some(capture) = capture {
-        capture.record_body(
-            StatusCode::FORBIDDEN,
-            b"client-banned",
-            Some("text/plain"),
-        );
+        capture.record_body(StatusCode::FORBIDDEN, b"client-banned", Some("text/plain"));
     }
     let mut response = simple_response(StatusCode::FORBIDDEN, "client-banned");
     let code = if scope == "share" {
@@ -7220,9 +7210,7 @@ where
             .as_mut()
             .and_then(|lifecycle| lifecycle.error_snapshot.take())
             .filter(ShareErrorSnapshotContext::should_capture);
-        let capture_sse = snapshot_ctx
-            .as_ref()
-            .is_some_and(|ctx| ctx.is_event_stream);
+        let capture_sse = snapshot_ctx.as_ref().is_some_and(|ctx| ctx.is_event_stream);
 
         loop {
             let next = tokio::select! {

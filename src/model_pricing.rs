@@ -428,7 +428,8 @@ mod tests {
 
     #[test]
     fn prices_each_category_independently() {
-        let priced = price_usage(&sonnet(), ServiceTier::Standard, &one_million_each(), 100).unwrap();
+        let priced =
+            price_usage(&sonnet(), ServiceTier::Standard, &one_million_each(), 100).unwrap();
         assert_eq!(priced.lines.len(), 4);
         // $3 + $15 + $0.30 + $3.75 = $22.05
         assert_eq!(priced.total_micros, 22_050_000);
@@ -497,8 +498,13 @@ mod tests {
 
     #[test]
     fn long_context_switches_every_category_not_just_input() {
-        let priced =
-            price_usage(&sonnet(), ServiceTier::Standard, &one_million_each(), 250_000).unwrap();
+        let priced = price_usage(
+            &sonnet(),
+            ServiceTier::Standard,
+            &one_million_each(),
+            250_000,
+        )
+        .unwrap();
         assert_eq!(priced.context_tier, ContextTier::Long);
         // $6 + $22.50 + $0.60 + $7.50 = $36.60 — cache_read moved too.
         assert_eq!(priced.total_micros, 36_600_000);
@@ -534,12 +540,18 @@ mod tests {
         price
             .rates
             .insert((ServiceTier::Standard, ContextTier::Long), base);
-        let priced = price_usage(&price, ServiceTier::Standard, &one_million_each(), 250_000).unwrap();
+        let priced =
+            price_usage(&price, ServiceTier::Standard, &one_million_each(), 250_000).unwrap();
         assert_eq!(priced.context_tier, ContextTier::Long);
         assert!(!priced.notes.contains(&PricingNote::LongContextApplied));
 
-        let priced =
-            price_usage(&sonnet(), ServiceTier::Standard, &one_million_each(), 250_000).unwrap();
+        let priced = price_usage(
+            &sonnet(),
+            ServiceTier::Standard,
+            &one_million_each(),
+            250_000,
+        )
+        .unwrap();
         assert!(priced.notes.contains(&PricingNote::LongContextApplied));
     }
 
@@ -647,7 +659,10 @@ mod tests {
         // from summed per-request amounts by at most 1 micro per request per
         // category. Assert that bound rather than exact equality.
         let drift = bucketed - per_request;
-        assert!((0..=(requests.len() as i128) * 2).contains(&drift), "drift {drift}");
+        assert!(
+            (0..=(requests.len() as i128) * 2).contains(&drift),
+            "drift {drift}"
+        );
     }
 
     #[test]
