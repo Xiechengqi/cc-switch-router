@@ -8315,7 +8315,9 @@ impl AppStore {
         let share_model_health_deleted = conn
             .execute(
                 "DELETE FROM share_model_health_state
-                 WHERE share_id = ?1 AND lower(app_type) = lower(?2)",
+                 WHERE share_id = ?1
+                   AND lower(app_type) = lower(?2)
+                   AND last_status = 'failed'",
                 params![share_id, app],
             )
             .map_err(|e| AppError::Internal(format!("delete share model health failed: {e}")))?;

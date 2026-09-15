@@ -336,7 +336,7 @@ export function ShareConnectionTestRow({
               <span className="text-slate-500">
                 {t("dashboard.connectDialog.test.durationMs", { ms: String(result.durationMs) })}
               </span>
-              {result.terminalEvent ? (
+              {!result.success && result.terminalEvent ? (
                 <>
                   <span className="text-slate-400">·</span>
                   <span className="text-slate-500">
