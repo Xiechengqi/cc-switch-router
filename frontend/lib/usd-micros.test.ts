@@ -5,7 +5,6 @@ import {
   formatPercent,
   formatUsdMicros,
   formatUsdMicrosPerMillion,
-  formatUsdMicrosRange,
   parseUsdMicros,
 } from "./usd-micros";
 
@@ -44,18 +43,6 @@ test("rounds half away from zero at the display scale only", () => {
   assert.equal(formatUsdMicros("1005000", "en-US"), "$1.01");
   assert.equal(formatUsdMicros("1004999", "en-US"), "$1.00");
   assert.equal(formatUsdMicros("999995000", "en-US"), "$1,000.00");
-});
-
-test("collapses a degenerate interval to a single value", () => {
-  assert.equal(formatUsdMicrosRange("12400000", "12400000", "en-US"), "$12.40");
-  assert.equal(formatUsdMicrosRange("12400000", null, "en-US"), "$12.40");
-  // An upper bound below the point estimate is nonsense; never render it.
-  assert.equal(formatUsdMicrosRange("12400000", "12000000", "en-US"), "$12.40");
-  assert.equal(
-    formatUsdMicrosRange("12400000", "13280000", "en-US"),
-    "$12.40 ~ $13.28",
-  );
-  assert.equal(formatUsdMicrosRange(null, "13280000", "en-US"), null);
 });
 
 test("formats per-1M rates through the same rounding as amounts", () => {

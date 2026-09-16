@@ -939,7 +939,6 @@ export type ShareUserUsageModelRow = {
   requestCount: number;
   priced: boolean;
   equivalentUsdMicros?: string;
-  equivalentUsdMicrosUpperBound?: string;
   lines: ShareUserUsagePriceLine[];
   notes: ShareUsagePricingNote[];
 };
@@ -961,7 +960,6 @@ export type ShareUserUsageBreakdownRow = {
   rebaseApplied: boolean;
   observedTotals: ShareUserUsageTotals;
   equivalentUsdMicros?: string;
-  equivalentUsdMicrosUpperBound?: string;
   pricedCoveragePercent: number;
   estimatedRequestPercent: number;
   byModel: ShareUserUsageModelRow[];

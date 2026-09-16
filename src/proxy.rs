@@ -2096,7 +2096,7 @@ pub async fn gateway_proxy_handler(
     let error_capture = ShareErrorCapture {
         store: state.store.clone(),
         share_id: Some(share_id.clone()),
-        skip: false,
+        skip: true,
         method: method.as_str().to_string(),
         path: path_and_query.clone(),
         request_id: Some(admission_request_id.clone()),
@@ -2386,18 +2386,7 @@ pub async fn gateway_proxy_handler(
             _free_share_ip: free_share_ip_permit,
             _recent_traffic: Some(recent_traffic_guard),
             _metrics: Some(metrics_permit),
-            error_snapshot: share_error_snapshot_context(
-                &state,
-                Some(share_id.as_str()),
-                method.as_str(),
-                &path_and_query,
-                Some(live_request_id.as_str()),
-                None,
-                status,
-                &response_headers,
-                is_event_stream,
-                "gateway",
-            ),
+            error_snapshot: None,
             ..Default::default()
         },
     );
@@ -3302,7 +3291,7 @@ pub async fn proxy_handler(
     let error_capture = StdMutex::new(ShareErrorCapture {
         store: state.store.clone(),
         share_id: None,
-        skip: is_internal_share_router_path && path == "/_share-router/request-logs",
+        skip: true,
         method: method.as_str().to_string(),
         path: path_and_query.clone(),
         request_id: None,
@@ -3627,6 +3616,12 @@ pub async fn proxy_handler(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .caller_email = Some(principal.email.clone());
+            if is_llm_inference_request(&method, &path) {
+                error_capture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .skip = false;
+            }
             match state
                 .store
                 .user_can_invoke_share(
@@ -4367,18 +4362,23 @@ pub async fn proxy_handler(
             _recent_traffic: recent_traffic_guard,
             _share_llm_metrics: share_llm_metrics_guard,
             _metrics: Some(metrics_permit),
-            error_snapshot: share_error_snapshot_context(
-                &state,
-                route.share_id.as_deref(),
-                method.as_str(),
-                &path_and_query,
-                live_request_id.as_deref(),
-                api_user_email.as_deref(),
-                status,
-                &response_headers,
-                is_event_stream,
-                request_source,
-            ),
+            error_snapshot: if api_user_email.is_some() && is_llm_inference_request(&method, &path)
+            {
+                share_error_snapshot_context(
+                    &state,
+                    route.share_id.as_deref(),
+                    method.as_str(),
+                    &path_and_query,
+                    live_request_id.as_deref(),
+                    api_user_email.as_deref(),
+                    status,
+                    &response_headers,
+                    is_event_stream,
+                    request_source,
+                )
+            } else {
+                None
+            },
             ..Default::default()
         },
     );
@@ -6338,6 +6338,10 @@ fn infer_share_request_app(path: &str) -> Option<String> {
 fn infer_share_request_app_with_headers(path: &str, headers: &HeaderMap) -> Option<String> {
     infer_share_request_app(path)
         .or_else(|| unified_model_list_app(path, headers).map(str::to_string))
+}
+
+fn is_llm_inference_request(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::POST && infer_share_request_app(path).is_some()
 }
 
 fn llm_concurrency_response(
@@ -8661,6 +8665,22 @@ mod tests {
             infer_share_request_app_with_headers("/v1beta/models", &HeaderMap::new()).as_deref(),
             Some("gemini")
         );
+        assert!(is_llm_inference_request(
+            &axum::http::Method::POST,
+            "/v1/messages"
+        ));
+        assert!(is_llm_inference_request(
+            &axum::http::Method::POST,
+            "/v1beta/models/gemini-2.5-pro:generateContent"
+        ));
+        assert!(!is_llm_inference_request(
+            &axum::http::Method::GET,
+            "/v1/models"
+        ));
+        assert!(!is_llm_inference_request(
+            &axum::http::Method::POST,
+            "/_share-router/request-logs"
+        ));
     }
 
     #[tokio::test]

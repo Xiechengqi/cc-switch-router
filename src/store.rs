@@ -9584,7 +9584,6 @@ impl AppStore {
             let mut request_count: u64 = 0;
             let mut estimated_count: u64 = 0;
             let mut equivalent: i128 = 0;
-            let mut equivalent_upper: i128 = 0;
             let mut any_priced = false;
 
             for group in by_email.remove(&email).unwrap_or_default() {
@@ -9646,16 +9645,14 @@ impl AppStore {
                     None => (None, group.model_key.clone()),
                 };
 
-                let (amount, upper, lines) = match &priced {
+                let (amount, lines) = match &priced {
                     Some(usage) => {
                         any_priced = true;
                         priced_tokens = priced_tokens.saturating_add(split.total());
                         equivalent += usage.total_micros;
-                        equivalent_upper += usage.upper_bound_micros;
                         notes.extend(usage.notes.iter().copied());
                         (
                             Some(usage.total_micros.to_string()),
-                            Some(usage.upper_bound_micros.to_string()),
                             usage
                                 .lines
                                 .iter()
@@ -9674,7 +9671,7 @@ impl AppStore {
                         if resolved.is_none() {
                             notes.push(PricingNote::PriceKeyNotFound);
                         }
-                        (None, None, Vec::new())
+                        (None, Vec::new())
                     }
                 };
 
@@ -9696,7 +9693,6 @@ impl AppStore {
                     request_count: group.request_count,
                     priced: resolved.is_some(),
                     equivalent_usd_micros: amount,
-                    equivalent_usd_micros_upper_bound: upper,
                     lines,
                     notes: notes.iter().map(|note| note.as_str().to_string()).collect(),
                 });
@@ -9741,7 +9737,6 @@ impl AppStore {
                 rebase_applied,
                 observed_totals: totals,
                 equivalent_usd_micros: any_priced.then(|| equivalent.to_string()),
-                equivalent_usd_micros_upper_bound: any_priced.then(|| equivalent_upper.to_string()),
                 priced_coverage_percent,
                 estimated_request_percent,
                 by_model,
@@ -14565,7 +14560,6 @@ impl AppStore {
                 },
             )?;
         }
-        insert_share_model_probe_error_snapshot_tx(&tx, share_id, &result)?;
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit Share model health slot failed: {error}"))
         })?;
@@ -22355,87 +22349,6 @@ fn share_model_health_check_request_id(
     checked_at: i64,
 ) -> String {
     format!("share-model-health:{share_id}:{app_type}:{requested_model}:{checked_at}")
-}
-
-fn insert_share_model_probe_error_snapshot_tx(
-    conn: &Connection,
-    share_id: &str,
-    result: &ShareModelHealthSlotResult,
-) -> Result<(), AppError> {
-    let Some(snapshot) = share_model_probe_error_snapshot(share_id, result) else {
-        return Ok(());
-    };
-    insert_share_request_error_snapshot_tx(conn, &snapshot)
-}
-
-fn share_model_probe_error_snapshot(
-    share_id: &str,
-    result: &ShareModelHealthSlotResult,
-) -> Option<NewShareRequestErrorSnapshot> {
-    if share_id.trim().is_empty() {
-        return None;
-    }
-    if matches!(result.status.as_str(), "success" | "degraded") || result.outcome != "failure" {
-        return None;
-    }
-    let status_code = result
-        .status_code
-        .filter(|code| !(200..300).contains(code))
-        .unwrap_or(599);
-    let body = share_model_probe_error_snapshot_body(result);
-    let (body_text, body_truncated) = truncate_error_snapshot_body(body.as_bytes());
-    Some(NewShareRequestErrorSnapshot {
-        share_id: share_id.to_string(),
-        request_id: result.observation_id.clone().or_else(|| {
-            Some(share_model_health_check_request_id(
-                share_id,
-                &result.app_type,
-                if result.requested_model.trim().is_empty() {
-                    &result.app_type
-                } else {
-                    &result.requested_model
-                },
-                result.checked_at,
-            ))
-        }),
-        status_code,
-        method: Some("PROBE".into()),
-        path: Some(format!(
-            "/_share-router/model-health/{}{}",
-            result.app_type,
-            if result.requested_model.trim().is_empty() {
-                String::new()
-            } else {
-                format!("/{}", result.requested_model)
-            }
-        )),
-        content_type: Some("application/json".into()),
-        caller_email: None,
-        body_text,
-        body_truncated,
-        body_capture_reason: "router_local".into(),
-        request_source: "health_probe".into(),
-    })
-}
-
-fn share_model_probe_error_snapshot_body(result: &ShareModelHealthSlotResult) -> String {
-    serde_json::json!({
-        "source": result.source,
-        "status": result.status,
-        "statusCode": result.status_code,
-        "latencyMs": result.latency_ms,
-        "appType": result.app_type,
-        "requestedModel": result.requested_model,
-        "actualModel": result.actual_model,
-        "providerId": result.provider_id,
-        "providerName": result.provider_name,
-        "outcome": result.outcome,
-        "failureDomain": result.failure_domain,
-        "reasonCode": result.reason_code,
-        "errorCategory": result.error_category,
-        "errorMessage": result.error_message,
-    })
-    .to_string()
 }
 
 fn insert_share_request_error_snapshot_tx(
@@ -54612,7 +54525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_model_health_probe_writes_recent_error_snapshot() {
+    async fn failed_model_health_probe_stays_out_of_recent_api_errors() {
         let (store, config) = setup_store("share-model-probe-error-snapshot").await;
         insert_installation(&store, "health-installation").await;
         insert_share(
@@ -54715,25 +54628,7 @@ mod tests {
             .list_share_request_error_snapshots("health-share")
             .await
             .expect("list probe snapshots");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status_code, 429);
-        assert_eq!(listed[0].method.as_deref(), Some("PROBE"));
-        assert_eq!(
-            listed[0].path.as_deref(),
-            Some("/_share-router/model-health/codex/server-test-model@low")
-        );
-        assert_eq!(listed[0].body_capture_reason, "router_local");
-        assert!(listed[0].body_text.contains("quota_blocked"));
-        assert!(
-            listed[0]
-                .body_text
-                .contains("cc-switch-router-cycle:utc-test-fail")
-        );
-        assert!(
-            listed[0]
-                .body_text
-                .contains("upstream rate limit is active")
-        );
+        assert!(listed.is_empty());
 
         let gap_slot = failed_slot + 1_800;
         let gap_claim = store
@@ -54774,7 +54669,7 @@ mod tests {
                 .await
                 .expect("list after unobserved gap")
                 .len(),
-            1
+            0
         );
 
         let _ = std::fs::remove_file(config.database.path);

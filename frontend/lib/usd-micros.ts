@@ -82,28 +82,6 @@ export function formatUsdMicros(
 }
 
 /**
- * Formats the §7.5 estimate interval.
- *
- * Collapses to a single value when the bounds are equal — which is the common
- * case (no cache writes, or a model with no separate 1h price). Showing
- * "$1.20 ~ $1.20" would imply an uncertainty that is not there.
- */
-export function formatUsdMicrosRange(
-  lower: string | null | undefined,
-  upper: string | null | undefined,
-  locale?: string,
-): string | null {
-  const low = parseUsdMicros(lower);
-  if (low == null) return null;
-  const high = parseUsdMicros(upper);
-  const lowText = formatUsdMicros(low, locale);
-  if (lowText == null) return null;
-  if (high == null || high <= low) return lowText;
-  const highText = formatUsdMicros(high, locale);
-  return highText == null ? lowText : `${lowText} ~ ${highText}`;
-}
-
-/**
  * Formats a per-1M-token rate. Rates are plain integers on the wire (they fit
  * comfortably in a JS number) but they share the micro-USD unit, so they share
  * the formatter to keep rounding identical between a rate and an amount.

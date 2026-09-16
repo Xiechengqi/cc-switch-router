@@ -47,7 +47,6 @@ import { formatTokenMillions, formatTokenMillionsFixed } from "@/lib/token-units
 import {
   formatUsdMicros,
   formatUsdMicrosPerMillion,
-  formatUsdMicrosRange,
 } from "@/lib/usd-micros";
 import {
   resolveShareCoreApp,
@@ -1186,11 +1185,7 @@ function ShareUserUsageBreakdownPanel({
             // collapses them.
             const key = `${model.modelKey}:${model.serviceTier}:${model.contextTier}:${model.appType}:${index}`;
             const amount = model.priced
-              ? formatUsdMicrosRange(
-                  model.equivalentUsdMicros,
-                  model.equivalentUsdMicrosUpperBound,
-                  locale,
-                )
+              ? formatUsdMicros(model.equivalentUsdMicros, locale)
               : null;
             const linesOpen = openLines === key;
             return (
@@ -1255,11 +1250,7 @@ function ShareUserUsageBreakdownPanel({
                         type="button"
                         className="rounded underline decoration-dotted underline-offset-2 hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
                         aria-expanded={linesOpen}
-                        title={
-                          amount.includes("~")
-                            ? t("dashboard.userLimit.equivalent.range")
-                            : t("dashboard.userLimit.equivalent.hint")
-                        }
+                        title={t("dashboard.userLimit.equivalent.hint")}
                         onClick={() => setOpenLines(linesOpen ? null : key)}
                       >
                         {amount}
@@ -1517,11 +1508,7 @@ export function ShareUserLimitsTable({
             const isExpanded = expanded.has(emailKey);
             const breakdownRow = breakdown?.[emailKey];
             const equivalent = breakdownRow
-              ? formatUsdMicrosRange(
-                  breakdownRow.equivalentUsdMicros,
-                  breakdownRow.equivalentUsdMicrosUpperBound,
-                  locale,
-                )
+              ? formatUsdMicros(breakdownRow.equivalentUsdMicros, locale)
               : null;
             return (
               <React.Fragment key={`${row.role}:${row.email}`}>
@@ -1583,11 +1570,7 @@ export function ShareUserLimitsTable({
                   {equivalent ? (
                     <div
                       className="mt-0.5 font-mono text-[10px] leading-4 text-muted-foreground"
-                      title={
-                        equivalent.includes("~")
-                          ? `${t("dashboard.userLimit.equivalent.hint")} ${t("dashboard.userLimit.equivalent.range")}`
-                          : t("dashboard.userLimit.equivalent.hint")
-                      }
+                      title={t("dashboard.userLimit.equivalent.hint")}
                     >
                       ≈ {equivalent}
                     </div>

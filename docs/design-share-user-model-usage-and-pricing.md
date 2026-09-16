@@ -302,12 +302,10 @@ CREATE INDEX idx_model_price_aliases_priority
     ON model_price_aliases(priority DESC, match_kind, pattern);
 ```
 
-`cache_write_1h_micros_per_1m` 当前**不参与主计算**（token 侧无 5m/1h 拆分，见 §11.1），保留它有两个用途：
+`cache_write_1h_micros_per_1m` 当前**不参与计算**（token 侧无 5m/1h 拆分，见 §11.1），仅为前向兼容保留：
 
-1. 前向兼容——若将来走通 v7 携带拆分，目录已就绪，无需再迁移
-2. **计算等价金额的上界**（§7.5）：把全部 cache write 按 1h 计价得到 `upperBound`，
-   与按 5m 计价的主值一起返回，让 UI 能显示「$9.80 ~ $11.30」这样的区间，
-   把估算不确定性**量化并可见**，而不是藏在一条脚注里
+若将来走通 v7 携带拆分，目录已就绪，无需再迁移。当前连续 Agent 场景按 5m 单价计算单值，
+并通过 `cacheWriteAssumed5m` 明确披露假设。
 
 ### 5.2 费率解析的回退链
 
@@ -533,8 +531,6 @@ pub struct PriceLine {
 pub struct PricedUsage {
     pub lines: Vec<PriceLine>,
     pub total_micros: i128,
-    /// 全部 cache write 按 1h 计价的上界；无 1h 价时等于 total_micros
-    pub upper_bound_micros: i128,
     pub service_tier: ServiceTier,
     pub context_tier: ContextTier,
     pub notes: Vec<PricingNote>,
@@ -592,19 +588,10 @@ let applied = long.total_micros > base.total_micros;
 `representative_input_tokens` 指**单条请求的 input**。§8.2 的分档预聚合保证同一组内所有请求的档位判定一致，
 故组内先求和再按该组档位定价与逐请求定价结果等价。
 
-### 7.5 估算上界
+### 7.5 缓存写入估算
 
-`cache_write_5m` 与 `cache_write_1h` 的 token 无法拆分（§11.1），主值按 5m 计。同时计算上界：
-
-```
-upper_bound_micros = total_micros
-                   - cache_write_tokens * rate_5m / 1_000_000
-                   + cache_write_tokens * rate_1h / 1_000_000
-```
-
-无 1h 价时 `upper_bound_micros == total_micros`。以 Sonnet 4.5 为例
-（5m = 3.75e-6、1h = 6e-6 USD/token）1h 为 5m 的 **1.6 倍**，故上界仅在 cache write 一项上浮 60%，
-落到总额通常是个位数百分比。UI 据此显示区间而非单点，把不确定性量化。
+`cache_write_5m` 与 `cache_write_1h` 的 token 无法拆分（§11.1）。正常连续 Agent 会话绝大部分采用
+5m TTL，因此统一按 5m 单价计算单值；只要存在 cache write，就附加 `cacheWriteAssumed5m` note。
 
 ### 7.6 明细与配额列的口径对账
 
@@ -767,8 +754,7 @@ GET /v1/shares/:share_id/user-usage-breakdown[?email=<addr>]
       "unattributed": 1200000,                   // ← §7.6，计入 total 不计入金额
       "total": 115400000
     },
-    "equivalentUsdMicros": "12400000",           // 主值：cache write 按 5m
-    "equivalentUsdMicrosUpperBound": "13120000", // 上界：cache write 全按 1h（§7.5）
+    "equivalentUsdMicros": "12400000",           // cache write 按 5m
     "pricedCoveragePercent": 97.3,
     "estimatedRequestPercent": 1.2,
     "byModel": [{
@@ -784,7 +770,6 @@ GET /v1/shares/:share_id/user-usage-breakdown[?email=<addr>]
       "requestCount": 4821,
       "priced": true,
       "equivalentUsdMicros": "9800000",
-      "equivalentUsdMicrosUpperBound": "10520000",
       "lines": [
         { "kind": "input",     "tokens": 2100000,  "rateMicrosPer1M": 3000000, "amountMicros": "6300000" },
         { "kind": "cacheRead", "tokens": 98200000, "rateMicrosPer1M": 300000,  "amountMicros": "29460000" }
@@ -802,7 +787,6 @@ GET /v1/shares/:share_id/user-usage-breakdown[?email=<addr>]
       "requestCount": 133,
       "priced": true,
       "equivalentUsdMicros": "4260000",
-      "equivalentUsdMicrosUpperBound": "4260000",
       "lines": [ /* ... */ ],
       "notes": []
     }, {
@@ -817,7 +801,6 @@ GET /v1/shares/:share_id/user-usage-breakdown[?email=<addr>]
       "requestCount": 12,
       "priced": false,
       "equivalentUsdMicros": null,
-      "equivalentUsdMicrosUpperBound": null,
       "lines": [],
       "notes": ["priceKeyNotFound"]
     }]
@@ -972,11 +955,11 @@ Some("1h") => { object.remove("ttl"); seen_five_minute = true; }  // 其后降�
 | 从 provider 配置反推 | ❌ 混合 TTL 合法存在 + Router 读不到配置 |
 | Server 补解析嵌套对象 → v7 携带 2 字段 → 加 2 列 | ✅ 唯一正确路径 |
 
-**本设计的处理：按 5m 计价，并给出上界。** 含 cache write 的模型行附 `cacheWriteAssumed5m` note，
-同时返回 `equivalentUsdMicrosUpperBound`（全部按 1h 计价，§7.5），UI 以区间展示。
+**本设计的处理：按 5m 计价并显示单值。** 含 cache write 的模型行附 `cacheWriteAssumed5m` note，
+UI 通过提示说明实际 TTL 未被记录。
 
 目录已备好 `cache_write_1h_micros_per_1m`（§5.1），因此：
-- 今天用它算上界，把估算不确定性量化为可见区间
+- 今天统一采用 5m 估值
 - 将来若走通 v7 携带 token 拆分，目录无需再迁移，只需改计算入口
 
 > 参考 TokenHub 的 `Rates` 已区分 `cache_write_5m` / `cache_write_1h`（`internal/metering/pricing.go:11-18`）。
@@ -1046,8 +1029,7 @@ Some("1h") => { object.remove("ttl"); seen_five_minute = true; }  // 其后降�
 1. **同一模型可能出现多行。** §8.2 按 `(model, serviceTier, contextTier)` 三维分组，因此
    「Claude Sonnet 4.5」标准档与长上下文档是两行。非 `standard` / 非 `base` 的行**必须**带
    Chip 区分，否则用户会以为是重复数据。
-2. **等价金额是区间。** `equivalentUsdMicros ~ equivalentUsdMicrosUpperBound`（§7.5）。
-   两者相等时（无 cache write，或该模型无 1h 价）退化为单值，不显示 `~`。
+2. **等价金额是单值估算。** cache write 统一按 5m 单价计算，并用 note 披露 TTL 假设（§7.5）。
 3. **`unattributed` 单独成行。** 它有 token 数但按定义无金额（§7.6），四个分拆列均为 `—`。
    这一行的存在就是「明细之和 = 配额列」的解释，不能省略。
 
@@ -1064,7 +1046,7 @@ onExpand?: (email: string) => void;       // 懒加载回调
 
 ### 12.4 展示细则
 
-- 等价金额 `font-mono`，`≈` 前缀强调估算性质；区间用 `~` 连接，两端同宽对齐
+- 等价金额 `font-mono`，`≈` 前缀强调估算性质
 - `ⓘ` tooltip 展开 `lines` 逐项（token 数 × 单价 = 金额），并列出该行命中的所有 `notes`
 - 未定价模型：金额列 `—` + 警示 Chip，**不显示 `$0`**
 - Chip 语义分三类，视觉上必须可区分：
@@ -1184,7 +1166,7 @@ Server 必须知道美元——而它按定义算不出来。三条出路：
 
 ### 14.2 前端
 
-- `frontend/lib/usd-micros.test.ts`：字符串微美元格式化、大数不失精度、区间两端相等时退化为单值
+- `frontend/lib/usd-micros.test.ts`：字符串微美元格式化、大数不失精度
 - 扩展 `audit:web-token-units`：断言等价金额路径**不出现** `Number(` / `parseFloat(` 算术
 - `audit-model-prices.mjs` 顺带断言 §9 的 `notes` 枚举与 `frontend/lib/i18n.ts` 的
   `dashboard.userLimit.note.*` 键集合完全相等，且每个键 `en` / `zh-CN` 双份齐备

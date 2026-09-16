@@ -79,7 +79,6 @@ for (const marker of [
   "MICROS_PER_USD = 1_000_000n",
   "export function parseUsdMicros",
   "export function formatUsdMicros",
-  "export function formatUsdMicrosRange",
   "export function formatUsdMicrosPerMillion",
   "BigInt(trimmed)",
 ]) {

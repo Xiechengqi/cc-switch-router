@@ -3237,7 +3237,7 @@ export const messages = {
     "dashboard.shareClientBans.reason.share_policy_abuse": "Share policy abuse",
     "dashboard.shareRecentErrors.title": "Recent errors",
     "dashboard.shareRecentErrors.description":
-      "Last 3 non-success responses, including tests and probes. Bodies are kept as returned and truncated after 8 KiB.",
+      "Last 3 non-success LLM API responses after successful caller authentication. Other API and authentication failures are excluded.",
     "dashboard.shareRecentErrors.loading": "Loading recent errors…",
     "dashboard.shareRecentErrors.empty": "No recent non-success responses for this Share.",
     "dashboard.shareRecentErrors.refresh": "Refresh recent errors",
@@ -3357,8 +3357,6 @@ export const messages = {
     "dashboard.userLimit.equivalent.label": "Equivalent",
     "dashboard.userLimit.equivalent.hint":
       "Official list price for the tokens actually consumed. Not a bill, and not what the seat costs.",
-    "dashboard.userLimit.equivalent.range":
-      "A range because the cache-write duration is not recorded; the two ends are the 5m and 1h prices.",
     "dashboard.userLimit.equivalent.rebaseNotice":
       "This user's quota was rebased. The quota bar includes the offset; the figures below are observed usage only.",
     "dashboard.userLimit.equivalent.catalogRevision": "Price catalog {revision}",
@@ -6587,7 +6585,7 @@ export const messages = {
     "dashboard.shareClientBans.reason.share_policy_abuse": "Share 策略违规",
     "dashboard.shareRecentErrors.title": "最近错误",
     "dashboard.shareRecentErrors.description":
-      "最近 3 条非成功响应，含测试连接和探针；正文原样保存，超过 8 KiB 截断。",
+      "最近 3 条调用方认证成功后的 LLM API 非成功响应；不包含其他 API 和认证失败。",
     "dashboard.shareRecentErrors.loading": "正在加载最近错误…",
     "dashboard.shareRecentErrors.empty": "此 Share 暂无最近的非成功响应。",
     "dashboard.shareRecentErrors.refresh": "刷新最近错误",
@@ -6704,8 +6702,6 @@ export const messages = {
     "dashboard.userLimit.equivalent.label": "等价",
     "dashboard.userLimit.equivalent.hint":
       "按实际消耗 Token 折算的官方标价。不是账单，也不等于这个席位的价格。",
-    "dashboard.userLimit.equivalent.range":
-      "区间是因为缓存写入的时长未被记录，两端分别按 5m 与 1h 价格计算。",
     "dashboard.userLimit.equivalent.rebaseNotice":
       "该用户配额已重基线。配额进度条含偏移量，下方为实测用量。",
     "dashboard.userLimit.equivalent.catalogRevision": "价目目录 {revision}",

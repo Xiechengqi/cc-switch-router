@@ -2145,9 +2145,6 @@ pub struct ShareUserUsageBreakdownRow {
     /// Point estimate; cache writes priced at the 5m rate (§11.1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equivalent_usd_micros: Option<String>,
-    /// Upper bound; all cache writes repriced at the 1h rate (§7.5).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub equivalent_usd_micros_upper_bound: Option<String>,
     /// Priced tokens / total tokens, 0-100. Makes §6.4 measurable.
     pub priced_coverage_percent: f64,
     pub estimated_request_percent: f64,
@@ -2193,8 +2190,6 @@ pub struct ShareUserUsageModelRow {
     /// `null` when `priced` is false — never `"0"`, which would read as free.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equivalent_usd_micros: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub equivalent_usd_micros_upper_bound: Option<String>,
     pub lines: Vec<ShareUserUsagePriceLine>,
     pub notes: Vec<String>,
 }

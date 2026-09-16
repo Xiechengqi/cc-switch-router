@@ -212,9 +212,6 @@ pub struct PriceLine {
 pub struct PricedUsage {
     pub lines: Vec<PriceLine>,
     pub total_micros: Micros,
-    /// All cache-write tokens repriced at the 1h rate (§7.5). Always
-    /// `>= total_micros`; equal when there is no cache write or no 1h price.
-    pub upper_bound_micros: Micros,
     pub service_tier: ServiceTier,
     pub context_tier: ContextTier,
     pub notes: Vec<PricingNote>,
@@ -357,15 +354,6 @@ pub fn price_usage_in_tier(
         }
     }
 
-    // §7.5 upper bound: identical except cache writes go at the 1h rate.
-    let upper_bound = match rates.cache_write_1h_micros_per_1m {
-        Some(rate_1h) if split.cache_write > 0 => {
-            total - price_tokens(split.cache_write, rates.cache_write_5m_micros_per_1m)
-                + price_tokens(split.cache_write, rate_1h)
-        }
-        _ => total,
-    };
-
     if split.cache_write > 0 {
         notes.push(PricingNote::CacheWriteAssumed5m);
     }
@@ -376,7 +364,6 @@ pub fn price_usage_in_tier(
     Some(PricedUsage {
         lines,
         total_micros: total,
-        upper_bound_micros: upper_bound.max(total),
         service_tier: tier,
         context_tier: requested_ctx,
         notes,
@@ -459,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn upper_bound_reprices_only_cache_writes_at_1h() {
+    fn cache_writes_use_the_5m_rate_and_disclose_the_assumption() {
         let split = TokenSplit {
             input: 1_000_000,
             cache_write: 1_000_000,
@@ -467,13 +454,11 @@ mod tests {
         };
         let priced = price_usage(&sonnet(), ServiceTier::Standard, &split, 0).unwrap();
         assert_eq!(priced.total_micros, 3_000_000 + 3_750_000);
-        // 1h is 1.6x the 5m rate, not 2x.
-        assert_eq!(priced.upper_bound_micros, 3_000_000 + 6_000_000);
         assert!(priced.notes.contains(&PricingNote::CacheWriteAssumed5m));
     }
 
     #[test]
-    fn upper_bound_equals_total_without_1h_price_or_cache_writes() {
+    fn cache_write_note_depends_on_usage_not_the_presence_of_a_1h_rate() {
         let mut price = sonnet();
         price
             .rates
@@ -485,14 +470,13 @@ mod tests {
             ..TokenSplit::default()
         };
         let priced = price_usage(&price, ServiceTier::Standard, &split, 0).unwrap();
-        assert_eq!(priced.upper_bound_micros, priced.total_micros);
+        assert!(priced.notes.contains(&PricingNote::CacheWriteAssumed5m));
 
         let no_writes = TokenSplit {
             input: 1_000_000,
             ..TokenSplit::default()
         };
         let priced = price_usage(&sonnet(), ServiceTier::Standard, &no_writes, 0).unwrap();
-        assert_eq!(priced.upper_bound_micros, priced.total_micros);
         assert!(!priced.notes.contains(&PricingNote::CacheWriteAssumed5m));
     }
 
