@@ -1085,6 +1085,7 @@ pub struct ShareRequestErrorSnapshot {
     pub body_text: String,
     pub body_truncated: bool,
     pub body_capture_reason: String,
+    pub request_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1099,6 +1100,7 @@ pub struct NewShareRequestErrorSnapshot {
     pub body_text: String,
     pub body_truncated: bool,
     pub body_capture_reason: String,
+    pub request_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -8564,7 +8566,8 @@ impl AppStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, share_id, request_id, captured_at, status_code, method, path,
-                        content_type, caller_email, body_text, body_truncated, body_capture_reason
+                        content_type, caller_email, body_text, body_truncated, body_capture_reason,
+                        request_source
                    FROM share_request_error_snapshots
                   WHERE share_id = ?1
                   ORDER BY captured_at DESC, id DESC
@@ -22411,6 +22414,7 @@ fn share_model_probe_error_snapshot(
         body_text,
         body_truncated,
         body_capture_reason: "router_local".into(),
+        request_source: "health_probe".into(),
     })
 }
 
@@ -22448,8 +22452,9 @@ fn insert_share_request_error_snapshot_tx(
     conn.execute(
         "INSERT INTO share_request_error_snapshots (
             id, share_id, request_id, captured_at, status_code, method, path,
-            content_type, caller_email, body_text, body_truncated, body_capture_reason
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            content_type, caller_email, body_text, body_truncated, body_capture_reason,
+            request_source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             snapshot.share_id,
@@ -22463,6 +22468,7 @@ fn insert_share_request_error_snapshot_tx(
             snapshot.body_text,
             if snapshot.body_truncated { 1 } else { 0 },
             snapshot.body_capture_reason,
+            snapshot.request_source,
         ],
     )
     .map_err(|error| {
@@ -23660,6 +23666,7 @@ fn map_share_request_error_snapshot_row(
         body_text: row.get(9)?,
         body_truncated: row.get::<_, i64>(10)? != 0,
         body_capture_reason: row.get(11)?,
+        request_source: row.get(12)?,
     })
 }
 
@@ -54553,6 +54560,7 @@ mod tests {
                     body_text: format!(r#"{{"error":"rate limited {index}"}}"#),
                     body_truncated: false,
                     body_capture_reason: "buffered".into(),
+                    request_source: "user".into(),
                 })
                 .await
                 .expect("insert error snapshot");
@@ -54563,6 +54571,7 @@ mod tests {
             .await
             .expect("list error snapshots");
         assert_eq!(listed.len(), 3);
+        assert!(listed.iter().all(|row| row.request_source == "user"));
         assert_eq!(
             listed
                 .iter()

@@ -936,6 +936,7 @@ struct ShareErrorSnapshotContext {
     caller_email: Option<String>,
     status_code: u16,
     is_event_stream: bool,
+    request_source: String,
 }
 
 impl std::fmt::Debug for ShareErrorSnapshotContext {
@@ -2100,6 +2101,7 @@ pub async fn gateway_proxy_handler(
         path: path_and_query.clone(),
         request_id: Some(admission_request_id.clone()),
         caller_email: None,
+        request_source: "gateway".into(),
     };
     let simple_response = |status: StatusCode, reason: &str| error_capture.simple(status, reason);
     let Some(request_app) = infer_share_request_app(&path_and_query) else {
@@ -2394,6 +2396,7 @@ pub async fn gateway_proxy_handler(
                 status,
                 &response_headers,
                 is_event_stream,
+                "gateway",
             ),
             ..Default::default()
         },
@@ -3281,14 +3284,30 @@ pub async fn proxy_handler(
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
         && path == "/_share-router/health";
+    let is_dashboard_test = peer.ip().is_loopback()
+        && parts
+            .headers
+            .get("x-cc-switch-dashboard-test")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let request_source = if is_dashboard_test {
+        "dashboard_test"
+    } else if is_share_router_probe {
+        "health_probe"
+    } else if is_internal_share_router_path {
+        "internal"
+    } else {
+        "user"
+    };
     let error_capture = StdMutex::new(ShareErrorCapture {
         store: state.store.clone(),
         share_id: None,
-        skip: false,
+        skip: is_internal_share_router_path && path == "/_share-router/request-logs",
         method: method.as_str().to_string(),
         path: path_and_query.clone(),
         request_id: None,
         caller_email: None,
+        request_source: request_source.into(),
     });
     let simple_response = |status: StatusCode, reason: &str| {
         error_capture
@@ -3604,21 +3623,21 @@ pub async fn proxy_handler(
                     );
                 }
             };
+            error_capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .caller_email = Some(principal.email.clone());
             match state
                 .store
                 .user_can_invoke_share(
                     &principal.email,
                     share_id,
-                    infer_share_request_app(&path).as_deref(),
+                    infer_share_request_app_with_headers(&path, &parts.headers).as_deref(),
                 )
                 .await
             {
                 Ok(true) => {
                     api_user_email = Some(principal.email.clone());
-                    error_capture
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .caller_email = api_user_email.clone();
                 }
                 Ok(false) => {
                     return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-user");
@@ -3741,6 +3760,7 @@ pub async fn proxy_handler(
                 api_user_email,
                 user_ip,
                 user_country.to_string(),
+                request_source,
             )
             .await;
         }
@@ -4357,6 +4377,7 @@ pub async fn proxy_handler(
                 status,
                 &response_headers,
                 is_event_stream,
+                request_source,
             ),
             ..Default::default()
         },
@@ -4594,6 +4615,7 @@ async fn handle_image_generation_stream_submit(
     api_user_email: Option<String>,
     user_ip: String,
     user_country: String,
+    request_source: &str,
 ) -> Response {
     let Some(share_id) = route.share_id.as_deref() else {
         return json_error_response(StatusCode::NOT_FOUND, "share-not-found");
@@ -4606,6 +4628,7 @@ async fn handle_image_generation_stream_submit(
         path: "/v1/images/generations".into(),
         request_id: None,
         caller_email: api_user_email.clone(),
+        request_source: request_source.to_string(),
     };
     let json_error_response = {
         let error_capture = error_capture.clone();
@@ -5081,6 +5104,7 @@ async fn handle_image_generation_stream_submit(
                 body_text: snapshot_text,
                 body_truncated: snapshot_truncated,
                 body_capture_reason: snapshot_reason.into(),
+                request_source: request_source.to_string(),
             },
         );
         if let Err(err) = record_image_stream_log(
@@ -6077,6 +6101,7 @@ fn capture_router_local_error_snapshot(
     caller_email: Option<&str>,
     body: &[u8],
     content_type: Option<&str>,
+    request_source: &str,
 ) {
     let Some(share_id) = share_id.filter(|value| !value.is_empty()) else {
         return;
@@ -6112,6 +6137,7 @@ fn capture_router_local_error_snapshot(
             } else {
                 "router_local".into()
             },
+            request_source: request_source.to_string(),
         },
     );
 }
@@ -6133,6 +6159,7 @@ struct ShareErrorCapture {
     path: String,
     request_id: Option<String>,
     caller_email: Option<String>,
+    request_source: String,
 }
 
 impl ShareErrorCapture {
@@ -6148,6 +6175,7 @@ impl ShareErrorCapture {
             self.caller_email.as_deref(),
             reason.as_bytes(),
             Some("text/plain"),
+            &self.request_source,
         );
         simple_response(status, reason)
     }
@@ -6166,6 +6194,7 @@ impl ShareErrorCapture {
             self.caller_email.as_deref(),
             &body,
             Some("application/json"),
+            &self.request_source,
         );
         json_error_response(status, message)
     }
@@ -6182,6 +6211,7 @@ impl ShareErrorCapture {
             self.caller_email.as_deref(),
             body,
             content_type,
+            &self.request_source,
         );
     }
 }
@@ -6218,6 +6248,7 @@ fn persist_stream_error_snapshot(
             body_text,
             body_truncated,
             body_capture_reason: body_capture_reason.into(),
+            request_source: ctx.request_source,
         },
     );
 }
@@ -6232,6 +6263,7 @@ fn share_error_snapshot_context(
     status: StatusCode,
     headers: &HeaderMap,
     is_event_stream: bool,
+    request_source: &str,
 ) -> Option<ShareErrorSnapshotContext> {
     if (200..300).contains(&status.as_u16()) {
         return None;
@@ -6258,6 +6290,7 @@ fn share_error_snapshot_context(
             .map(str::to_string),
         status_code: status.as_u16(),
         is_event_stream,
+        request_source: request_source.to_string(),
     })
 }
 
@@ -6300,6 +6333,11 @@ fn infer_share_request_app(path: &str) -> Option<String> {
         return Some("codex".to_string());
     }
     None
+}
+
+fn infer_share_request_app_with_headers(path: &str, headers: &HeaderMap) -> Option<String> {
+    infer_share_request_app(path)
+        .or_else(|| unified_model_list_app(path, headers).map(str::to_string))
 }
 
 fn llm_concurrency_response(
@@ -8611,6 +8649,18 @@ mod tests {
             unified_model_list_app("/v1/me/model-routing", &HeaderMap::new()),
             None
         );
+        assert_eq!(
+            infer_share_request_app_with_headers("/v1/models", &anthropic).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            infer_share_request_app_with_headers("/v1/models", &HeaderMap::new()).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            infer_share_request_app_with_headers("/v1beta/models", &HeaderMap::new()).as_deref(),
+            Some("gemini")
+        );
     }
 
     #[tokio::test]
@@ -10377,6 +10427,7 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
                     caller_email: Some("alice@example.com".into()),
                     status_code: 429,
                     is_event_stream: false,
+                    request_source: "user".into(),
                 }),
                 ..Default::default()
             },
@@ -10422,11 +10473,13 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
             StatusCode::SERVICE_UNAVAILABLE,
             &headers,
             false,
+            "health_probe",
         )
         .expect("health probe failure should snapshot");
         assert_eq!(snapshot.share_id, "share-probe");
         assert_eq!(snapshot.path, "/_share-router/health");
         assert_eq!(snapshot.status_code, 503);
+        assert_eq!(snapshot.request_source, "health_probe");
 
         let snapshot = share_error_snapshot_context(
             &state,
@@ -10438,10 +10491,12 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
             StatusCode::TOO_MANY_REQUESTS,
             &headers,
             false,
+            "dashboard_test",
         )
         .expect("dashboard test-connection failure should snapshot");
         assert_eq!(snapshot.path, "/v1/messages");
         assert_eq!(snapshot.status_code, 429);
+        assert_eq!(snapshot.request_source, "dashboard_test");
         assert!(
             share_error_snapshot_context(
                 &state,
@@ -10453,6 +10508,7 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
                 StatusCode::NO_CONTENT,
                 &headers,
                 false,
+                "health_probe",
             )
             .is_none()
         );
@@ -10509,6 +10565,7 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
                     caller_email: None,
                     status_code: 429,
                     is_event_stream: true,
+                    request_source: "user".into(),
                 }),
                 ..Default::default()
             },

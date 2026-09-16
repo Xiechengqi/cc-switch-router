@@ -158,6 +158,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         43,
         include_str!("../schema/0043_share_requested_model_blocks.sql"),
     ),
+    (
+        44,
+        include_str!("../schema/0044_share_request_error_source.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1127,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_43_upgrade_a_version_26_database() {
+    fn migrations_27_through_44_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1256,8 +1260,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 43);
-        check_compatibility(&conn).expect("upgraded version 43 is compatible");
+        assert_eq!(latest_version, 44);
+        check_compatibility(&conn).expect("upgraded version 44 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1287,6 +1291,44 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(pk_columns, vec!["pattern", "match_kind"]);
+    }
+
+    #[test]
+    fn migration_44_classifies_existing_snapshots_and_removes_log_recovery_noise() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 43);
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO share_request_error_snapshots
+                (id, share_id, captured_at, status_code, method, path, body_text,
+                 body_truncated, body_capture_reason)
+             VALUES
+                ('user', 'share-test', 'now', 429, 'POST', '/v1/messages', '', 0, 'empty_body'),
+                ('probe', 'share-test', 'now', 503, 'PROBE', '/_share-router/model-health/claude', '', 0, 'empty_body'),
+                ('internal', 'share-test', 'now', 503, 'GET', '/_share-router/other', '', 0, 'empty_body'),
+                ('logs', 'share-test', 'now', 503, 'GET', '/_share-router/request-logs?afterSequence=1', '', 0, 'empty_body');",
+        )
+        .expect("seed pre-migration request error snapshots");
+
+        apply(&conn).expect("apply request source migration");
+
+        let rows = conn
+            .prepare("SELECT id, request_source FROM share_request_error_snapshots ORDER BY id")
+            .expect("prepare migrated snapshots")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query migrated snapshots")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect migrated snapshots");
+        assert_eq!(
+            rows,
+            vec![
+                ("internal".into(), "internal".into()),
+                ("probe".into(), "health_probe".into()),
+                ("user".into(), "user".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1444,7 +1486,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 43);
+        assert_eq!(latest_version, 44);
     }
 
     #[test]
@@ -1468,7 +1510,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 43);
+        assert_eq!(latest_version, 44);
     }
 
     #[test]
@@ -1648,7 +1690,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 43);
+        assert_eq!(latest_version, 44);
     }
 
     #[test]

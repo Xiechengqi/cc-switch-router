@@ -3539,6 +3539,7 @@ mod tests {
             body_text: r#"{"error":{"code":"cc_switch_rate_limited"}}"#.into(),
             body_truncated: false,
             body_capture_reason: "buffered".into(),
+            request_source: "user".into(),
         }];
         apply_recent_error_email_visibility(&mut errors, false);
         assert_eq!(errors[0].caller_email.as_deref(), Some("a***e@example.com"));
@@ -9160,6 +9161,7 @@ async fn test_share_connection(
     let request = client
         .post(&local_url)
         .header("Host", &public_host)
+        .header("x-cc-switch-dashboard-test", "1")
         .bearer_auth(&api_token);
     let mut request = match prepared.body {
         ConnectionTestBody::Json(body) => request
