@@ -95,11 +95,10 @@ export function ShareClientBansPanel({
   };
 
   return (
-    <ShareEditSection title={t("dashboard.shareClientBans.title")}>
-      <div className="flex items-start justify-between gap-3">
-        <p className="text-xs leading-5 text-slate-500">
-          {t("dashboard.shareClientBans.description")}
-        </p>
+    <ShareEditSection
+      title={t("dashboard.shareClientBans.title")}
+      hint={t("dashboard.shareClientBans.description")}
+      actions={
         <Button
           size="sm"
           variant="ghost"
@@ -110,8 +109,8 @@ export function ShareClientBansPanel({
         >
           <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
         </Button>
-      </div>
-
+      }
+    >
       {error ? <Alert status="danger">{error}</Alert> : null}
 
       {loading && items.length === 0 ? (

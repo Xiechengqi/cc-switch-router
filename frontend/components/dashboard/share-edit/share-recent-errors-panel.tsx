@@ -64,11 +64,10 @@ export function ShareRecentErrorsPanel({
   }, [load]);
 
   return (
-    <ShareEditSection title={t("dashboard.shareRecentErrors.title")}>
-      <div className="flex items-start justify-between gap-3">
-        <p className="text-xs leading-5 text-slate-500">
-          {t("dashboard.shareRecentErrors.description")}
-        </p>
+    <ShareEditSection
+      title={t("dashboard.shareRecentErrors.title")}
+      hint={t("dashboard.shareRecentErrors.description")}
+      actions={
         <Button
           size="sm"
           variant="ghost"
@@ -79,8 +78,8 @@ export function ShareRecentErrorsPanel({
         >
           <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
         </Button>
-      </div>
-
+      }
+    >
       {error ? <Alert status="danger">{error}</Alert> : null}
 
       {loading && items.length === 0 ? (
@@ -93,36 +92,47 @@ export function ShareRecentErrorsPanel({
       ) : items.length === 0 ? (
         <EmptyBlock>{t("dashboard.shareRecentErrors.empty")}</EmptyBlock>
       ) : (
-        <div className="grid gap-2">
-          {items.map((item) => (
-            <div key={item.id} className="rounded-xl border border-rose-100 bg-rose-50/40 px-3 py-3">
-              <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="font-mono text-sm font-semibold text-rose-800">
-                    {t("dashboard.shareRecentErrors.status", { code: item.statusCode })}
-                  </div>
-                  <div className="mt-1 break-all font-mono text-[11px] text-slate-600">
-                    {[item.method, item.path].filter(Boolean).join(" ") || "—"}
-                  </div>
-                </div>
-                <div className="shrink-0 text-right text-[11px] leading-5 text-slate-500">
-                  <div>{formatDateTime(item.capturedAt)}</div>
-                  <div className="break-all font-mono text-slate-600">
+        <div className="overflow-x-auto rounded-xl border border-slate-200">
+          <table className="w-full min-w-[36rem] border-collapse text-left text-xs">
+            <thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-3 py-2 font-medium">{t("dashboard.shareRecentErrors.request")}</th>
+                <th className="px-3 py-2 font-medium">{t("dashboard.shareRecentErrors.caller")}</th>
+                <th className="px-3 py-2 font-medium">{t("dashboard.shareRecentErrors.time")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => (
+                <tr key={item.id} className="border-t border-slate-200 align-top">
+                  <td className="px-3 py-3">
+                    <div className="font-mono text-sm font-semibold text-rose-800">
+                      {t("dashboard.shareRecentErrors.status", { code: item.statusCode })}
+                    </div>
+                    <div className="mt-1 break-all font-mono text-[11px] text-slate-500">
+                      {[item.method, item.path].filter(Boolean).join(" ") || "—"}
+                    </div>
+                    <div className="mt-1 text-[11px] text-slate-500">
+                      {captureReasonLabel(item.bodyCaptureReason, t)}
+                      {item.bodyTruncated
+                        ? ` · ${t("dashboard.shareRecentErrors.truncated")}`
+                        : ""}
+                    </div>
+                    {item.bodyText.trim() ? (
+                      <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-800">
+                        {item.bodyText}
+                      </pre>
+                    ) : null}
+                  </td>
+                  <td className="px-3 py-3 font-mono text-slate-700">
                     {item.callerEmail || t("dashboard.shareRecentErrors.anonymous")}
-                  </div>
-                </div>
-              </div>
-              <div className="mt-2 text-[11px] leading-5 text-slate-500">
-                {captureReasonLabel(item.bodyCaptureReason, t)}
-                {item.bodyTruncated ? ` · ${t("dashboard.shareRecentErrors.truncated")}` : ""}
-              </div>
-              {item.bodyText.trim() ? (
-                <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-slate-200 bg-white px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-800">
-                  {item.bodyText}
-                </pre>
-              ) : null}
-            </div>
-          ))}
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap text-slate-500">
+                    {formatDateTime(item.capturedAt)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </ShareEditSection>

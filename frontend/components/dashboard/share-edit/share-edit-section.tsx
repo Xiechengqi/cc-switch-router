@@ -1,7 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { Alert } from "@heroui/react";
+import { Alert, Button, Tooltip } from "@heroui/react";
+import { Info } from "lucide-react";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import type { ShareEditView, ShareView } from "@/lib/types";
 
@@ -20,16 +21,45 @@ export function ReadOnlyField({
   );
 }
 
+export function ShareEditHint({ label }: { label: string }) {
+  return (
+    <Tooltip>
+      <Tooltip.Trigger>
+        <Button
+          isIconOnly
+          size="sm"
+          variant="ghost"
+          className="h-5 w-5 min-w-5 text-slate-400"
+          aria-label={label}
+        >
+          <Info className="h-3.5 w-3.5" />
+        </Button>
+      </Tooltip.Trigger>
+      <Tooltip.Content className="max-w-xs text-xs leading-5">{label}</Tooltip.Content>
+    </Tooltip>
+  );
+}
+
 export function ShareEditSection({
   title,
+  hint,
+  actions,
   children,
 }: {
   title: string;
+  hint?: string;
+  actions?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
     <section className="grid gap-3 rounded-2xl border border-slate-200/80 bg-white p-4">
-      <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{title}</h3>
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <h3 className="flex min-w-0 items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">
+          <span className="truncate">{title}</span>
+          {hint ? <ShareEditHint label={hint} /> : null}
+        </h3>
+        {actions}
+      </div>
       {children}
     </section>
   );

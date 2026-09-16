@@ -1,13 +1,13 @@
 "use client";
 
-import { Button, Input, Tooltip } from "@heroui/react";
-import { Info } from "lucide-react";
+import { Button, Input } from "@heroui/react";
 import * as React from "react";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { getShareRequestedModelBlocks, replaceShareRequestedModelBlocks } from "@/lib/api";
 import { SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import type { ShareRequestedModelBlocks } from "@/lib/types";
+import { ShareEditHint } from "./share-edit-section";
 
 const APPS = ["claude", "codex", "gemini"] as const satisfies readonly CoreShareApp[];
 type App = (typeof APPS)[number];
@@ -126,25 +126,10 @@ export const ShareRequestedModelBlocksPanel = React.forwardRef<
 
   return (
     <div className="grid gap-3">
-      <div className="flex min-w-0 items-center gap-1">
-        <div className="text-sm font-semibold text-slate-900">{t("dashboard.requestedModelBlocks.title")}</div>
-        <Tooltip>
-          <Tooltip.Trigger>
-            <Button
-              isIconOnly
-              size="sm"
-              variant="ghost"
-              className="h-6 w-6 min-w-6 text-muted-foreground"
-              aria-label={t("dashboard.requestedModelBlocks.hint")}
-            >
-              <Info className="h-3.5 w-3.5" />
-            </Button>
-          </Tooltip.Trigger>
-          <Tooltip.Content className="max-w-xs text-xs leading-5">
-            {t("dashboard.requestedModelBlocks.hint")}
-          </Tooltip.Content>
-        </Tooltip>
-      </div>
+      <h3 className="flex min-w-0 items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">
+        <span className="truncate">{t("dashboard.requestedModelBlocks.title")}</span>
+        <ShareEditHint label={t("dashboard.requestedModelBlocks.hint")} />
+      </h3>
       {error ? <div className="text-xs text-danger">{error}</div> : null}
       {!policy && !error ? <div className="text-xs text-slate-500">{t("common.loading")}</div> : null}
       {policy ? (
@@ -209,7 +194,7 @@ export const ShareRequestedModelBlocksPanel = React.forwardRef<
                     {canEditApp ? (
                       <div className="mt-2 flex min-w-0 items-center gap-2">
                         <Input
-                          className="min-w-0 flex-1"
+                          className="min-w-0 flex-1 placeholder:text-slate-400"
                           value={inputs[app] || ""}
                           maxLength={200}
                           placeholder={t("dashboard.requestedModelBlocks.placeholder")}

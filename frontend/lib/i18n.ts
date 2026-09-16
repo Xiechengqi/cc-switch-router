@@ -3207,7 +3207,7 @@ export const messages = {
     "dashboard.requestedModelBlocks.title": "Requested model blacklist",
     "dashboard.requestedModelBlocks.hint": "Router rejects exact requested model names. Aliases and resolved upstream models are not checked.",
     "dashboard.requestedModelBlocks.empty": "No blocked models",
-    "dashboard.requestedModelBlocks.placeholder": "Exact model name",
+    "dashboard.requestedModelBlocks.placeholder": "Model name",
     "dashboard.requestedModelBlocks.appDisabled": "Enable this app API to edit its model blacklist.",
     "dashboard.requestedModelBlocks.appDisabledReadonly": "This app API is off; existing blocks still apply if it is turned back on.",
     "dashboard.requestedModelBlocks.count": "{count} blocked",
@@ -3219,7 +3219,7 @@ export const messages = {
       "No app binding is configured for this share.",
     "dashboard.shareClientBans.title": "Banned client IPs",
     "dashboard.shareClientBans.description":
-      "Only active bans scoped to this Share are shown. Router-wide authentication bans are managed separately.",
+      "Only this Share's active bans. Router-wide auth bans are managed elsewhere.",
     "dashboard.shareClientBans.loading": "Loading banned client IPs…",
     "dashboard.shareClientBans.empty": "No client IP is currently banned from this Share.",
     "dashboard.shareClientBans.refresh": "Refresh banned client IPs",
@@ -3237,7 +3237,7 @@ export const messages = {
     "dashboard.shareClientBans.reason.share_policy_abuse": "Share policy abuse",
     "dashboard.shareRecentErrors.title": "Recent errors",
     "dashboard.shareRecentErrors.description":
-      "The last 3 non-success responses for this Share, including connection tests and model-health probes. The body is stored as returned, truncated only after 8 KiB.",
+      "Last 3 non-success responses, including tests and probes. Bodies are kept as returned and truncated after 8 KiB.",
     "dashboard.shareRecentErrors.loading": "Loading recent errors…",
     "dashboard.shareRecentErrors.empty": "No recent non-success responses for this Share.",
     "dashboard.shareRecentErrors.refresh": "Refresh recent errors",
@@ -6559,7 +6559,7 @@ export const messages = {
     "dashboard.requestedModelBlocks.title": "请求模型黑名单",
     "dashboard.requestedModelBlocks.hint": "按请求模型名精确拦截，不检查别名和实际上游模型。",
     "dashboard.requestedModelBlocks.empty": "未禁用任何模型",
-    "dashboard.requestedModelBlocks.placeholder": "输入精确模型名",
+    "dashboard.requestedModelBlocks.placeholder": "模型名",
     "dashboard.requestedModelBlocks.appDisabled": "启用该应用接口后才能修改其模型黑名单。",
     "dashboard.requestedModelBlocks.appDisabledReadonly": "该应用接口未启用；已有黑名单在重新启用后仍会生效。",
     "dashboard.requestedModelBlocks.count": "已禁用 {count} 个",
@@ -6570,7 +6570,7 @@ export const messages = {
     "dashboard.shareEditNoAppType": "此 share 未配置 app 绑定。",
     "dashboard.shareClientBans.title": "被封禁的客户端 IP",
     "dashboard.shareClientBans.description":
-      "这里只显示当前 Share 范围内的有效封禁；Router 全局认证封禁不在此处管理。",
+      "仅显示此 Share 的有效封禁，不含 Router 全局认证封禁。",
     "dashboard.shareClientBans.loading": "正在加载被封禁的客户端 IP…",
     "dashboard.shareClientBans.empty": "当前没有被此 Share 封禁的客户端 IP。",
     "dashboard.shareClientBans.refresh": "刷新被封禁的客户端 IP",
@@ -6587,7 +6587,7 @@ export const messages = {
     "dashboard.shareClientBans.reason.share_policy_abuse": "Share 策略违规",
     "dashboard.shareRecentErrors.title": "最近错误",
     "dashboard.shareRecentErrors.description":
-      "此 Share 最近 3 条非成功响应，包含测试连接和模型健康探针。正文按原样保存，仅在超过 8 KiB 时截断。",
+      "最近 3 条非成功响应，含测试连接和探针；正文原样保存，超过 8 KiB 截断。",
     "dashboard.shareRecentErrors.loading": "正在加载最近错误…",
     "dashboard.shareRecentErrors.empty": "此 Share 暂无最近的非成功响应。",
     "dashboard.shareRecentErrors.refresh": "刷新最近错误",
