@@ -5,6 +5,7 @@ import {
   buildOrdinaryUserGrantsPatch,
   buildShareSettingsPatch,
   draftFromShare,
+  isPermanentUserPolicyExpiry,
   isRevokedRouterShareMarketGrant,
   isRouterShareMarketManagedGrant,
   ordinaryShareUserGrant,
@@ -37,6 +38,12 @@ test("revoked Share Market tombstones are not treated as managed users", () => {
     entitlementId: "entitlement-revoked",
   });
   assert.equal(isRouterShareMarketManagedGrant(tombstone), false);
+});
+
+test("legacy permanent owner expiry sentinel is treated as unlimited", () => {
+  assert.equal(isPermanentUserPolicyExpiry(Date.parse("2099-12-31T23:59:59Z")), true);
+  assert.equal(isPermanentUserPolicyExpiry(Date.parse("2027-01-01T00:00:00Z")), false);
+  assert.equal(isPermanentUserPolicyExpiry(undefined), false);
 });
 
 test("routerShareMarketManagedEmails excludes inactive tombstones", () => {

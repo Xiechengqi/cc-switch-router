@@ -133,6 +133,7 @@ const SHARE_PRUNE_MAX_ID_BYTES: usize = 512;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
 const CLIENT_NOTIFICATION_AUDIT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS: i64 = 60 * 60;
+const PERMANENT_SHARE_EXPIRY_SENTINEL_MS: i64 = 4_102_444_799_000;
 
 fn user_notification_history_status(status: &str) -> &'static str {
     match status {
@@ -21554,6 +21555,14 @@ fn normalize_share_user_grants_preserving(
         } else {
             "shareto".to_string()
         };
+        if grant.role == "owner"
+            && grant
+                .policy
+                .expires_at
+                .is_some_and(|value| value >= PERMANENT_SHARE_EXPIRY_SENTINEL_MS)
+        {
+            grant.policy.expires_at = None;
+        }
         grant.active = true;
         // Client patches are untrusted for counters; keep server-owned usage when present.
         grant.usage = existing
@@ -21948,13 +21957,25 @@ fn parse_share_user_grants(
     if value.trim().is_empty() {
         return Ok(BTreeMap::new());
     }
-    serde_json::from_str(&value).map_err(|err| {
-        crate::db::Error::FromSqlConversionFailure(
-            0,
-            crate::db::types::Type::Text,
-            Box::new(CanonicalShareUserGrantsDecodeError(err)),
-        )
-    })
+    let mut grants =
+        serde_json::from_str::<BTreeMap<String, ShareUserGrant>>(&value).map_err(|err| {
+            crate::db::Error::FromSqlConversionFailure(
+                0,
+                crate::db::types::Type::Text,
+                Box::new(CanonicalShareUserGrantsDecodeError(err)),
+            )
+        })?;
+    for grant in grants.values_mut() {
+        if grant.role.eq_ignore_ascii_case("owner")
+            && grant
+                .policy
+                .expires_at
+                .is_some_and(|value| value >= PERMANENT_SHARE_EXPIRY_SENTINEL_MS)
+        {
+            grant.policy.expires_at = None;
+        }
+    }
+    Ok(grants)
 }
 
 fn parse_app_providers(value: Option<String>) -> Result<ShareAppProviders, crate::db::Error> {
@@ -31691,6 +31712,40 @@ mod tests {
         assert_eq!(buyer_visible.shares.len(), 1);
 
         let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[test]
+    fn canonical_grant_parser_normalizes_legacy_owner_permanent_expiry() {
+        let grants = parse_share_user_grants(Some(
+            serde_json::json!({
+                "owner@example.com": {
+                    "email": "owner@example.com",
+                    "role": "owner",
+                    "active": true,
+                    "policy": {
+                        "tokenPeriod": "lifetime",
+                        "expiresAt": 4_102_444_799_000_i64
+                    }
+                },
+                "user@example.com": {
+                    "email": "user@example.com",
+                    "role": "shareto",
+                    "active": true,
+                    "policy": {
+                        "tokenPeriod": "lifetime",
+                        "expiresAt": 1_800_000_000_000_i64
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .expect("parse canonical grants");
+
+        assert_eq!(grants["owner@example.com"].policy.expires_at, None);
+        assert_eq!(
+            grants["user@example.com"].policy.expires_at,
+            Some(1_800_000_000_000)
+        );
     }
 
     #[tokio::test]

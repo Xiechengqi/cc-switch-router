@@ -9,6 +9,7 @@ import type {
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
 export const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
+export const PERMANENT_EXPIRES_AT_MS = Date.parse(PERMANENT_EXPIRES_AT_ISO);
 export const DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES = 60;
 export const MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES = 10;
 export const MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES = 7 * 24 * 60;
@@ -114,6 +115,10 @@ export function isPermanentExpiry(value?: string | null) {
   if (!value) return false;
   const date = new Date(value);
   return !Number.isNaN(date.getTime()) && date.getUTCFullYear() >= 2099;
+}
+
+export function isPermanentUserPolicyExpiry(value?: number | null) {
+  return value != null && Number.isFinite(value) && value >= PERMANENT_EXPIRES_AT_MS;
 }
 
 export function toDateTimeLocal(value?: string | null) {

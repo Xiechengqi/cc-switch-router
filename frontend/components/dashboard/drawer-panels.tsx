@@ -44,6 +44,7 @@ import {
   formatRelativeTime,
 } from "@/lib/utils";
 import { formatTokenMillions, formatTokenMillionsFixed } from "@/lib/token-units";
+import { isPermanentUserPolicyExpiry } from "@/lib/share-settings";
 import {
   formatUsdMicros,
   formatUsdMicrosPerMillion,
@@ -979,7 +980,9 @@ function displayUserLimitValue(value: number | undefined, unlimited: string) {
 }
 
 function displayUserLimitExpiry(value: number | undefined, permanent: string) {
-  return value == null ? permanent : formatDateTime(value);
+  return value == null || isPermanentUserPolicyExpiry(value)
+    ? permanent
+    : formatDateTime(value);
 }
 
 function formatResetCountdown(
@@ -1592,7 +1595,7 @@ export function ShareUserLimitsTable({
                       {t("dashboard.userLimit.nearLimit")}
                     </div>
                   ) : null}
-                  {row.expiresAt != null ? (
+                  {row.expiresAt != null && !isPermanentUserPolicyExpiry(row.expiresAt) ? (
                     <div className="mt-0.5 text-[10px] text-muted-foreground">
                       {t("dashboard.userLimit.expiry")}:{" "}
                       {displayUserLimitExpiry(row.expiresAt, permanent)}

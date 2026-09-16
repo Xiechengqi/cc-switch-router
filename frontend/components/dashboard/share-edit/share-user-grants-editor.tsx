@@ -18,6 +18,7 @@ import type {
 } from "@/lib/types";
 import {
   isRevokedRouterShareMarketGrant,
+  isPermanentUserPolicyExpiry,
   ordinaryShareUserGrant,
   routerShareMarketManagedEmails,
 } from "@/lib/share-settings";
@@ -49,7 +50,7 @@ type BatchGrantDraft = Omit<GrantDraft, "email"> & {
 const ANCHORED_PERIODS: ReadonlySet<ShareTokenPeriod> = new Set(["sevenDays", "thirtyDays"]);
 
 function toLocalDateTime(value?: number) {
-  if (!value) return "";
+  if (!value || isPermanentUserPolicyExpiry(value)) return "";
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return "";
   const pad = (part: number) => String(part).padStart(2, "0");
