@@ -45,7 +45,6 @@ import {
 } from "@/lib/utils";
 import { formatTokenMillions, formatTokenMillionsFixed } from "@/lib/token-units";
 import {
-  formatPercent as formatCoveragePercent,
   formatUsdMicros,
   formatUsdMicrosPerMillion,
   formatUsdMicrosRange,
@@ -1089,6 +1088,10 @@ function formatUsageTokens(value: number, locale: AppLocale) {
   return value === 0 ? NO_AMOUNT : formatTokenMillionsFixed(value, locale);
 }
 
+function visibleUsageNotes(notes: ShareUsagePricingNote[]) {
+  return notes.filter((note) => note !== "usageStateNotFullyObserved");
+}
+
 function ShareUserUsageNoteList({
   notes,
   t,
@@ -1096,10 +1099,11 @@ function ShareUserUsageNoteList({
   notes: ShareUsagePricingNote[];
   t: TFn;
 }) {
-  if (!notes.length) return null;
+  const visible = visibleUsageNotes(notes);
+  if (!visible.length) return null;
   return (
     <ul className="mt-1 space-y-0.5 text-[10px] leading-4 text-muted-foreground">
-      {notes.map((note) => (
+      {visible.map((note) => (
         <li key={note} className="flex gap-1.5">
           <span aria-hidden className="text-muted-foreground/60">
             ·
@@ -1114,13 +1118,11 @@ function ShareUserUsageNoteList({
 function ShareUserUsageBreakdownPanel({
   row,
   locale,
-  revision,
   t,
   onPriceSaved,
 }: {
   row: ShareUserUsageBreakdownRow;
   locale: AppLocale;
-  revision: string;
   t: TFn;
   onPriceSaved?: (email: string) => void;
 }) {
@@ -1331,17 +1333,6 @@ function ShareUserUsageBreakdownPanel({
         </tbody>
       </table>
 
-      <div className="text-[10px] leading-4 text-muted-foreground">
-        {t("dashboard.userLimit.byModel.coverage", {
-          coverage: formatCoveragePercent(row.pricedCoveragePercent, locale),
-          estimated: formatCoveragePercent(row.estimatedRequestPercent, locale),
-          revision,
-        })}
-      </div>
-      <details className="text-[10px] text-muted-foreground">
-        <summary className="cursor-pointer">{t("dashboard.userLimit.price.calculationDetails")}</summary>
-        <div className="mt-1 break-all font-mono">{revision}</div>
-      </details>
       <ShareUserUsageNoteList notes={row.notes} t={t} />
       <Modal.Backdrop isOpen={!!priceModel} onOpenChange={(open) => !open && !priceBusy && setPriceModel(null)}>
         <Modal.Container placement="center">
@@ -1573,18 +1564,6 @@ export function ShareUserLimitsTable({
                     </Chip>
                     {renderEmailMeta?.(row)}
                   </div>
-                  {equivalent ? (
-                    <div
-                      className="mt-0.5 font-mono text-[10px] leading-4 text-muted-foreground"
-                      title={
-                        equivalent.includes("~")
-                          ? `${t("dashboard.userLimit.equivalent.hint")} ${t("dashboard.userLimit.equivalent.range")}`
-                          : t("dashboard.userLimit.equivalent.hint")
-                      }
-                    >
-                      ≈ {equivalent}
-                    </div>
-                  ) : null}
                 </td>
                 <td className="overflow-hidden px-1.5 py-2 font-mono">
                   {displayUserLimitValue(row.parallelLimit, unlimited)}
@@ -1601,6 +1580,18 @@ export function ShareUserLimitsTable({
                       {periodLabels[period] || period}
                     </span>
                   </div>
+                  {equivalent ? (
+                    <div
+                      className="mt-0.5 font-mono text-[10px] leading-4 text-muted-foreground"
+                      title={
+                        equivalent.includes("~")
+                          ? `${t("dashboard.userLimit.equivalent.hint")} ${t("dashboard.userLimit.equivalent.range")}`
+                          : t("dashboard.userLimit.equivalent.hint")
+                      }
+                    >
+                      ≈ {equivalent}
+                    </div>
+                  ) : null}
                   {limited ? (
                     <UsageBar
                       used={used}
@@ -1645,7 +1636,6 @@ export function ShareUserLimitsTable({
                       <ShareUserUsageBreakdownPanel
                         row={breakdownRow}
                         locale={locale}
-                        revision={breakdownRevision || "-"}
                         t={t}
                         onPriceSaved={onPriceSaved}
                       />

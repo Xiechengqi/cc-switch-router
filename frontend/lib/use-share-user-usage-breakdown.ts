@@ -6,11 +6,12 @@ import { getShareUserUsageBreakdown } from "@/lib/api";
 import type { ShareUserUsageBreakdownMap } from "@/lib/types";
 
 /**
- * Lazy-loads per-email usage breakdowns for a Share.
+ * Loads per-email usage equivalents for a Share as soon as the table is shown,
+ * so the TOKEN column can render USD without waiting for a row expand.
  *
- * The parent never fetches on mount: `onExpand` fires from the table's first
- * expand of that email, and subsequent expands reuse the cached row. A failed
- * fetch is not cached: `errors[email]` is set so the row can retry.
+ * `onExpand` still exists for retrying a failed email after the nested panel
+ * is opened. A failed fetch is not cached: `errors[email]` is set so the row
+ * can retry.
  */
 export function useShareUserUsageBreakdown(shareId?: string) {
   const [breakdown, setBreakdown] = React.useState<ShareUserUsageBreakdownMap>(
@@ -21,6 +22,7 @@ export function useShareUserUsageBreakdown(shareId?: string) {
   const [loaded, setLoaded] = React.useState<Record<string, true>>({});
   const inflight = React.useRef(new Set<string>());
   const loadedKeys = React.useRef(new Set<string>());
+  const shareRequestId = React.useRef(0);
 
   React.useEffect(() => {
     setBreakdown({});
@@ -29,6 +31,37 @@ export function useShareUserUsageBreakdown(shareId?: string) {
     setLoaded({});
     inflight.current.clear();
     loadedKeys.current.clear();
+    if (!shareId) return;
+    const requestId = ++shareRequestId.current;
+    inflight.current.add("*");
+    void getShareUserUsageBreakdown(shareId)
+      .then((response) => {
+        if (shareRequestId.current !== requestId) return;
+        const next: ShareUserUsageBreakdownMap = {};
+        const nextLoaded: Record<string, true> = {};
+        for (const row of response.rows || []) {
+          const key = row.email.trim().toLowerCase();
+          if (!key) continue;
+          next[key] = row;
+          nextLoaded[key] = true;
+          loadedKeys.current.add(key);
+        }
+        setBreakdown(next);
+        setLoaded(nextLoaded);
+        setErrors({});
+        if (response.pricingRevision) {
+          setBreakdownRevision(response.pricingRevision);
+        }
+      })
+      .catch(() => {
+        if (shareRequestId.current !== requestId) return;
+        loadedKeys.current.clear();
+        setBreakdown({});
+        setLoaded({});
+      })
+      .finally(() => {
+        inflight.current.delete("*");
+      });
   }, [shareId]);
 
   const load = React.useCallback(
