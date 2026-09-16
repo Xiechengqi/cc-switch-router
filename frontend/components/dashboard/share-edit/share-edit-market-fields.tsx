@@ -11,7 +11,10 @@ import {
 } from "./share-edit-draft";
 import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
-import { ShareRequestedModelBlocksPanel } from "./share-requested-model-blocks-panel";
+import {
+  ShareRequestedModelBlocksPanel,
+  type ShareRequestedModelBlocksHandle,
+} from "./share-requested-model-blocks-panel";
 
 function looksLikeEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
@@ -83,6 +86,8 @@ export type ShareEditMarketFieldsProps = {
   appApiInvalid: boolean;
   disabled?: boolean;
   blocksEditable?: boolean;
+  blocksRef?: React.Ref<ShareRequestedModelBlocksHandle>;
+  onBlocksStateChange?: (state: { dirty: boolean }) => void;
   onDescriptionChange: (value: string) => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
 };
@@ -96,6 +101,8 @@ export function ShareEditMarketFields({
   appApiInvalid,
   disabled,
   blocksEditable,
+  blocksRef,
+  onBlocksStateChange,
   onDescriptionChange,
   onDraftChange,
 }: ShareEditMarketFieldsProps) {
@@ -175,11 +182,13 @@ export function ShareEditMarketFields({
         </div>
         <div className="border-t border-slate-200/80 pt-3">
           <ShareRequestedModelBlocksPanel
+            ref={blocksRef}
             shareId={share.shareId}
             apps={activeShareApps}
             enabledApps={draft.enabledApps}
             editable={Boolean(blocksEditable) && !disabled}
             t={t}
+            onStateChange={onBlocksStateChange}
           />
         </div>
       </ShareEditSection>

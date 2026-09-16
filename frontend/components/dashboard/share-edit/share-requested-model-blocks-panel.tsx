@@ -1,6 +1,7 @@
 "use client";
 
-import { Button, Input } from "@heroui/react";
+import { Button, Input, Tooltip } from "@heroui/react";
+import { Info } from "lucide-react";
 import * as React from "react";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
@@ -10,28 +11,60 @@ import type { ShareRequestedModelBlocks } from "@/lib/types";
 
 const APPS = ["claude", "codex", "gemini"] as const satisfies readonly CoreShareApp[];
 type App = (typeof APPS)[number];
+type BlockedModelsByApp = ShareRequestedModelBlocks["blockedModelsByApp"];
 
-export function ShareRequestedModelBlocksPanel({
-  shareId,
-  apps,
-  enabledApps,
-  editable,
-  t,
-}: {
-  shareId: string;
-  apps: string[];
-  enabledApps?: Partial<Record<App, boolean>>;
-  editable: boolean;
-  t: TFn;
-}) {
+function blockedModelsFingerprint(value: BlockedModelsByApp) {
+  return JSON.stringify(value || {});
+}
+
+function freezeDisabledAppBlocks(
+  draft: BlockedModelsByApp,
+  enabledApps: Partial<Record<App, boolean>> | undefined,
+  saved: BlockedModelsByApp | undefined,
+): BlockedModelsByApp {
+  const next: BlockedModelsByApp = { ...draft };
+  for (const app of APPS) {
+    if (enabledApps?.[app] !== false) continue;
+    const kept = saved?.[app] || [];
+    if (kept.length) next[app] = kept;
+    else delete next[app];
+  }
+  return next;
+}
+
+export type ShareRequestedModelBlocksHandle = {
+  dirty: boolean;
+  reset: () => void;
+  save: () => Promise<void>;
+};
+
+export const ShareRequestedModelBlocksPanel = React.forwardRef<
+  ShareRequestedModelBlocksHandle,
+  {
+    shareId: string;
+    apps: string[];
+    enabledApps?: Partial<Record<App, boolean>>;
+    editable: boolean;
+    t: TFn;
+    onStateChange?: (state: { dirty: boolean }) => void;
+  }
+>(function ShareRequestedModelBlocksPanel(
+  { shareId, apps, enabledApps, editable, t, onStateChange },
+  ref,
+) {
   const [policy, setPolicy] = React.useState<ShareRequestedModelBlocks | null>(null);
-  const [draft, setDraft] = React.useState<ShareRequestedModelBlocks["blockedModelsByApp"]>({});
+  const [draft, setDraft] = React.useState<BlockedModelsByApp>({});
   const [inputs, setInputs] = React.useState<Partial<Record<App, string>>>({});
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const visibleApps = APPS.filter(
     (app) => apps.includes(app) || Boolean(policy?.blockedModelsByApp[app]?.length),
   );
+  const payload = React.useMemo(
+    () => freezeDisabledAppBlocks(draft, enabledApps, policy?.blockedModelsByApp),
+    [draft, enabledApps, policy],
+  );
+  const dirty = policy != null && blockedModelsFingerprint(payload) !== blockedModelsFingerprint(policy.blockedModelsByApp || {});
 
   React.useEffect(() => {
     let cancelled = false;
@@ -49,6 +82,10 @@ export function ShareRequestedModelBlocksPanel({
     };
   }, [shareId]);
 
+  React.useEffect(() => {
+    onStateChange?.({ dirty });
+  }, [dirty, onStateChange]);
+
   const add = (app: App) => {
     const model = (inputs[app] || "").trim();
     if (!model || model.length > 200 || model.includes("*")) return;
@@ -63,18 +100,13 @@ export function ShareRequestedModelBlocksPanel({
       ...current,
       [app]: (current[app] || []).filter((item) => item !== model),
     }));
-  const payload = React.useMemo(() => {
-    const next: ShareRequestedModelBlocks["blockedModelsByApp"] = { ...draft };
-    for (const app of APPS) {
-      if (enabledApps?.[app] !== false) continue;
-      const saved = policy?.blockedModelsByApp[app] || [];
-      if (saved.length) next[app] = saved;
-      else delete next[app];
-    }
-    return next;
-  }, [draft, enabledApps, policy]);
-  const dirty = policy != null && JSON.stringify(payload) !== JSON.stringify(policy.blockedModelsByApp || {});
-  const save = async () => {
+  const reset = React.useCallback(() => {
+    if (!policy) return;
+    setDraft(policy.blockedModelsByApp || {});
+    setInputs({});
+    setError("");
+  }, [policy]);
+  const save = React.useCallback(async () => {
     if (!policy || !dirty) return;
     setBusy(true);
     setError("");
@@ -84,33 +116,43 @@ export function ShareRequestedModelBlocksPanel({
       setDraft(next.blockedModelsByApp || {});
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+      throw reason;
     } finally {
       setBusy(false);
     }
-  };
-  const canSave = editable && dirty && policy != null;
+  }, [dirty, payload, policy, shareId]);
+
+  React.useImperativeHandle(ref, () => ({ dirty, reset, save }), [dirty, reset, save]);
 
   return (
     <div className="grid gap-3">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-slate-900">{t("dashboard.requestedModelBlocks.title")}</div>
-          <p className="mt-1 text-xs leading-5 text-slate-500">{t("dashboard.requestedModelBlocks.hint")}</p>
-        </div>
-        {canSave ? (
-          <Button size="sm" variant="primary" isPending={busy} onPress={() => void save()}>
-            {t("common.save")}
-          </Button>
-        ) : null}
+      <div className="flex min-w-0 items-center gap-1">
+        <div className="text-sm font-semibold text-slate-900">{t("dashboard.requestedModelBlocks.title")}</div>
+        <Tooltip>
+          <Tooltip.Trigger>
+            <Button
+              isIconOnly
+              size="sm"
+              variant="ghost"
+              className="h-6 w-6 min-w-6 text-muted-foreground"
+              aria-label={t("dashboard.requestedModelBlocks.hint")}
+            >
+              <Info className="h-3.5 w-3.5" />
+            </Button>
+          </Tooltip.Trigger>
+          <Tooltip.Content className="max-w-xs text-xs leading-5">
+            {t("dashboard.requestedModelBlocks.hint")}
+          </Tooltip.Content>
+        </Tooltip>
       </div>
       {error ? <div className="text-xs text-danger">{error}</div> : null}
       {!policy && !error ? <div className="text-xs text-slate-500">{t("common.loading")}</div> : null}
       {policy ? (
-        <div className="grid gap-2">
+        <div className="grid grid-cols-3 gap-2">
           {visibleApps.map((app) => {
             const models = draft[app] || [];
             const appEnabled = enabledApps?.[app] !== false;
-            const canEditApp = editable && appEnabled;
+            const canEditApp = editable && appEnabled && !busy;
             return (
               <div
                 key={app}
@@ -118,7 +160,7 @@ export function ShareRequestedModelBlocksPanel({
                   appEnabled ? "bg-emerald-50/70" : "bg-slate-50 text-slate-500"
                 }`}
               >
-                <div className="flex min-w-0 items-start gap-2.5">
+                <div className="flex min-w-0 items-start gap-2">
                   <ShareAppLogo app={app} size={16} className={`mt-0.5 ${appEnabled ? "" : "opacity-60"}`} />
                   <div className="min-w-0 flex-1">
                     <div className="flex min-w-0 items-center justify-between gap-2">
@@ -195,4 +237,4 @@ export function ShareRequestedModelBlocksPanel({
       ) : null}
     </div>
   );
-}
+});

@@ -30,6 +30,7 @@ import {
 import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
+import type { ShareRequestedModelBlocksHandle } from "./share-requested-model-blocks-panel";
 
 function shareUserGrantsFingerprint(share: ShareView | null) {
   if (!share) return "";
@@ -65,6 +66,8 @@ export type ShareEditFormApi = {
   expiryInvalid: boolean;
   appApiInvalid: boolean;
   formInvalid: boolean;
+  settingsDirty: boolean;
+  blocksDirty: boolean;
   isDirty: boolean;
   setError: (value: string) => void;
   setNotice: (value: string) => void;
@@ -72,6 +75,8 @@ export type ShareEditFormApi = {
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
   handleTokenUnlimited: (checked: boolean) => void;
   handleParallelUnlimited: (checked: boolean) => void;
+  onBlocksStateChange: (state: { dirty: boolean }) => void;
+  blocksRef: React.RefObject<ShareRequestedModelBlocksHandle | null>;
   resetDraft: () => void;
   save: () => Promise<void>;
 };
@@ -94,9 +99,14 @@ export function useShareEditForm({
   const [error, setError] = React.useState("");
   const [notice, setNotice] = React.useState("");
   const [remoteRefreshPending, setRemoteRefreshPending] = React.useState(false);
+  const [blocksDirty, setBlocksDirty] = React.useState(false);
   const draftRef = React.useRef<ShareEditDraft | null>(null);
   const baseDraftRef = React.useRef<ShareEditDraft | null>(null);
   const baseShareRef = React.useRef<ShareView | null>(null);
+  const blocksRef = React.useRef<ShareRequestedModelBlocksHandle | null>(null);
+  const onBlocksStateChange = React.useCallback((state: { dirty: boolean }) => {
+    setBlocksDirty(state.dirty);
+  }, []);
 
   const liveShare = share || baseShare;
   const activeShareApps = React.useMemo(() => shareProviderSupportedApps(liveShare), [liveShare]);
@@ -115,6 +125,7 @@ export function useShareEditForm({
       setRemoteRefreshPending(false);
       setError("");
       setNotice("");
+      setBlocksDirty(false);
       return;
     }
     const incoming = buildShareEditDraft(share);
@@ -235,7 +246,8 @@ export function useShareEditForm({
 
   const currentPatch = buildShareEditPatch(draft, liveShare, activeShareApps);
   const basePatch = buildShareEditPatch(baseDraft, liveShare, activeShareApps);
-  const isDirty = shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
+  const settingsDirty = shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
+  const isDirty = settingsDirty || blocksDirty;
 
   const resetDraft = () => {
     if (!baseDraft || busy) return;
@@ -246,6 +258,7 @@ export function useShareEditForm({
     setRemoteRefreshPending(false);
     setError("");
     setNotice("");
+    blocksRef.current?.reset();
   };
 
   const save = async () => {
@@ -254,19 +267,24 @@ export function useShareEditForm({
     setError("");
     setNotice("");
     try {
-      const res = await updateShareSettings(
-        liveShare.shareId,
-        currentPatch,
-        liveShare.configRevision,
-      );
-      await onSaved({ appliedSynchronously: res.appliedSynchronously });
-      if (res.appliedSynchronously) {
-        onClose();
-      } else {
-        setBaseDraft(draft);
-        setBaseShare(liveShare);
-        setRemoteRefreshPending(false);
-        setNotice(t("dashboard.shareEditQueued"));
+      if (blocksDirty) {
+        await blocksRef.current?.save();
+      }
+      if (settingsDirty) {
+        const res = await updateShareSettings(
+          liveShare.shareId,
+          currentPatch,
+          liveShare.configRevision,
+        );
+        await onSaved({ appliedSynchronously: res.appliedSynchronously });
+        if (res.appliedSynchronously) {
+          onClose();
+        } else {
+          setBaseDraft(draft);
+          setBaseShare(liveShare);
+          setRemoteRefreshPending(false);
+          setNotice(t("dashboard.shareEditQueued"));
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -292,6 +310,8 @@ export function useShareEditForm({
     expiryInvalid,
     appApiInvalid,
     formInvalid,
+    settingsDirty,
+    blocksDirty,
     isDirty,
     setError,
     setNotice,
@@ -301,6 +321,8 @@ export function useShareEditForm({
     save,
     handleTokenUnlimited,
     handleParallelUnlimited,
+    onBlocksStateChange,
+    blocksRef,
   };
 }
 
@@ -350,6 +372,8 @@ export function ShareEditFormBody({
         appApiInvalid={form.appApiInvalid}
         disabled={fieldsDisabled}
         blocksEditable={displayShare.canEditSettings !== false}
+        blocksRef={form.blocksRef}
+        onBlocksStateChange={form.onBlocksStateChange}
         onDescriptionChange={form.onDescriptionChange}
         onDraftChange={form.onDraftChange}
       />
