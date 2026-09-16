@@ -5166,7 +5166,7 @@ async fn get_share_requested_model_blocks(
     headers: HeaderMap,
     Path(share_id): Path<String>,
 ) -> Result<Json<crate::store::ShareRequestedModelBlocks>, AppError> {
-    require_share_owner(&state, &headers, &share_id).await?;
+    let _ = extract_session_email(&state, &headers).await?;
     Ok(Json(
         state
             .store

@@ -175,6 +175,19 @@ export function ShareEditReadView({
             );
           })}
         </div>
+        <div className="border-t border-slate-200/80 pt-3">
+          <ShareRequestedModelBlocksPanel
+            shareId={share.shareId}
+            apps={boundApps}
+            enabledApps={{
+              claude: !(share.support && share.support.claude === false),
+              codex: !(share.support && share.support.codex === false),
+              gemini: !(share.support && share.support.gemini === false),
+            }}
+            editable={false}
+            t={t}
+          />
+        </div>
       </ShareEditSection>
 
       {shareApp ? (
@@ -184,14 +197,6 @@ export function ShareEditReadView({
               <ReadOnlyField
                 label={t("dashboard.field.freeAccess")}
                 value={t("dashboard.freeAccessEnabled")}
-              />
-            ) : null}
-            {share.canManage ? (
-              <ShareRequestedModelBlocksPanel
-                shareId={share.shareId}
-                apps={boundApps}
-                editable={false}
-                t={t}
               />
             ) : null}
             <div className="grid gap-2">

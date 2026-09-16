@@ -11,6 +11,7 @@ import {
 } from "./share-edit-draft";
 import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
+import { ShareRequestedModelBlocksPanel } from "./share-requested-model-blocks-panel";
 
 function looksLikeEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
@@ -81,6 +82,7 @@ export type ShareEditMarketFieldsProps = {
   descriptionInvalid: boolean;
   appApiInvalid: boolean;
   disabled?: boolean;
+  blocksEditable?: boolean;
   onDescriptionChange: (value: string) => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
 };
@@ -93,6 +95,7 @@ export function ShareEditMarketFields({
   descriptionInvalid,
   appApiInvalid,
   disabled,
+  blocksEditable,
   onDescriptionChange,
   onDraftChange,
 }: ShareEditMarketFieldsProps) {
@@ -169,6 +172,15 @@ export function ShareEditMarketFields({
           {appApiInvalid ? (
             <span className="col-span-3 text-xs text-red-600">{t("dashboard.shareEdit.appApiRequired")}</span>
           ) : null}
+        </div>
+        <div className="border-t border-slate-200/80 pt-3">
+          <ShareRequestedModelBlocksPanel
+            shareId={share.shareId}
+            apps={activeShareApps}
+            enabledApps={draft.enabledApps}
+            editable={Boolean(blocksEditable) && !disabled}
+            t={t}
+          />
         </div>
       </ShareEditSection>
     </>
