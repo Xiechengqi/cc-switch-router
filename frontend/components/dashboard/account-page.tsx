@@ -4,7 +4,6 @@ import * as React from "react";
 import { Button, Chip, ListBox, Select, toast } from "@heroui/react";
 import {
   BookOpen,
-  KeyRound,
   Loader2,
   Plus,
   Power,
@@ -299,7 +298,7 @@ export function AccountPaymentsPanel() {
     }
   };
 
-  const discoverBinanceCredentials = async (force = false) => {
+  const discoverBinanceCredentials = React.useCallback(async () => {
     if (
       binanceBusy
       || binanceDiscoveryInFlightRef.current
@@ -308,7 +307,7 @@ export function AccountPaymentsPanel() {
       || binanceApiSecret.trim().length < 16
     ) return;
     const attemptKey = `${actorKey}\u0000${binanceApiKey.trim()}\u0000${binanceApiSecret.trim()}`;
-    if (!force && binanceDiscoveryAttemptRef.current === attemptKey) return;
+    if (binanceDiscoveryAttemptRef.current === attemptKey) return;
     binanceDiscoveryAttemptRef.current = attemptKey;
     binanceDiscoveryInFlightRef.current = true;
     const requestedActorKey = actorKey;
@@ -335,7 +334,7 @@ export function AccountPaymentsPanel() {
       binanceDiscoveryInFlightRef.current = false;
       if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
     }
-  };
+  }, [actorKey, binanceApiKey, binanceApiSecret, binanceBusy, binanceUiState]);
 
   const confirmBinanceCredentials = async () => {
     if (binanceBusy || !binanceDiscovery) return;
@@ -418,6 +417,27 @@ export function AccountPaymentsPanel() {
       if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
     }
   };
+
+  React.useEffect(() => {
+    if (
+      !authed
+      || binanceBusy
+      || binanceUiState === "unavailable"
+      || binanceApiKey.trim().length < 16
+      || binanceApiSecret.trim().length < 16
+    ) return;
+    const timeoutId = window.setTimeout(() => {
+      void discoverBinanceCredentials();
+    }, 1_000);
+    return () => window.clearTimeout(timeoutId);
+  }, [
+    authed,
+    binanceApiKey,
+    binanceApiSecret,
+    binanceBusy,
+    binanceUiState,
+    discoverBinanceCredentials,
+  ]);
 
   if (authLoading || loading) {
     return (
@@ -586,16 +606,11 @@ export function AccountPaymentsPanel() {
           )}
         </div>
 
-        <div className="grid gap-4 rounded-lg border border-border p-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="flex min-w-0 items-start gap-2">
-              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-              <div>
-                <h3 className="text-sm font-semibold">{t("account.binanceAuto.title")}</h3>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  {t("account.binanceAuto.description")}
-                </p>
-              </div>
+        <div className="grid gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <PaymentMethodIcons kinds={["binance"]} />
+              <h3 className="text-sm font-semibold">{t("account.binanceAuto.title")}</h3>
             </div>
             <div className="flex flex-wrap gap-2">
               <Button size="sm" variant="outline" onClick={() => setBinanceReceiptsOpen(true)}>
@@ -712,7 +727,6 @@ export function AccountPaymentsPanel() {
                 type="text"
                 value={binanceApiKey}
                 onChange={(event) => setBinanceApiKey(event.target.value)}
-                onBlur={() => void discoverBinanceCredentials()}
                 autoComplete="off"
                 spellCheck={false}
                 className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
@@ -724,13 +738,18 @@ export function AccountPaymentsPanel() {
                 type="text"
                 value={binanceApiSecret}
                 onChange={(event) => setBinanceApiSecret(event.target.value)}
-                onBlur={() => void discoverBinanceCredentials()}
                 autoComplete="off"
                 spellCheck={false}
                 className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
               />
             </label>
           </div>
+          {binanceBusy === "discover" ? (
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+              {t("account.binanceAuto.loadingAccount")}
+            </p>
+          ) : null}
           <p className="text-xs leading-5 text-muted-foreground">{t("account.binanceAuto.readOnlyWarning")}</p>
           {binanceDiscovery ? (
             <div className="grid gap-3 rounded-md border border-emerald-200 bg-emerald-50/60 p-3 text-xs">
@@ -792,22 +811,6 @@ export function AccountPaymentsPanel() {
             </div>
           ) : null}
           <div className="flex flex-wrap gap-2">
-            <Button
-              size="sm"
-              variant={binanceDiscovery ? "outline" : "primary"}
-              isDisabled={
-                !!binanceBusy
-                || binanceUiState === "unavailable"
-                || binanceApiKey.trim().length < 16
-                || binanceApiSecret.trim().length < 16
-              }
-              onClick={() => void discoverBinanceCredentials(true)}
-            >
-              {binanceBusy === "discover" ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-              {binanceDiscovery
-                ? t("account.binanceAuto.reload")
-                : t("account.binanceAuto.load")}
-            </Button>
             {binanceStatus?.account?.maskedApiKey ? (
               <>
                 <Button
