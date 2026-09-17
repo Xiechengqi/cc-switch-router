@@ -14610,58 +14610,19 @@ impl AppStore {
     pub async fn can_view_share_model_health_calendar(
         &self,
         share_id: &str,
-        viewer_email: Option<&str>,
-        is_admin: bool,
     ) -> Result<bool, AppError> {
         let conn = self.conn.lock().await;
-        let row = conn
+        let exists = conn
             .query_row(
-                "SELECT COALESCE(owner_email, ''), COALESCE(user_grants_json, '{}'),
-                        EXISTS(
-                            SELECT 1 FROM share_market_listings listing
-                            WHERE listing.share_id = shares.share_id
-                              AND listing.status = 'active'
-                              AND listing.deleted_at IS NULL
-                              AND shares.share_status = 'active'
-                              AND lower(listing.owner_email) = lower(shares.owner_email)
-                        )
-                 FROM shares WHERE share_id = ?1",
+                "SELECT 1 FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        parse_share_user_grants(row.get(1)?)?,
-                        row.get::<_, i64>(2)? != 0,
-                    ))
-                },
+                |_| Ok(()),
             )
             .optional()
             .map_err(|error| {
                 AppError::Internal(format!("read Share model health access failed: {error}"))
             })?;
-        let Some((owner_email, grants, publicly_listed)) = row else {
-            return Ok(false);
-        };
-        if is_admin || publicly_listed {
-            return Ok(true);
-        }
-        let Some(viewer_email) = viewer_email else {
-            return Ok(false);
-        };
-        if owner_email.eq_ignore_ascii_case(viewer_email.trim()) {
-            return Ok(true);
-        }
-        let now_ms = Utc::now().timestamp_millis();
-        Ok(grants.iter().any(|(email, grant)| {
-            grant.active
-                && grant.role == "shareto"
-                && grant
-                    .policy
-                    .expires_at
-                    .is_none_or(|expires_at| expires_at > now_ms)
-                && (email.eq_ignore_ascii_case(viewer_email)
-                    || grant.email.eq_ignore_ascii_case(viewer_email))
-        }))
+        Ok(exists.is_some())
     }
 
     pub async fn share_model_health_calendar(
@@ -32724,7 +32685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_model_health_calendar_visibility_matches_market_and_share_acl() {
+    async fn share_model_health_calendar_is_public_for_every_existing_share() {
         let (store, config) = setup_store("share-model-health-calendar-access").await;
         insert_installation(&store, "health-access-installation").await;
         insert_share(
@@ -32735,80 +32696,15 @@ mod tests {
             "active",
         )
         .await;
-        set_shareto_users(&store, "health-access-share", &["buyer@example.com"]).await;
-
         assert!(
             store
-                .can_view_share_model_health_calendar(
-                    "health-access-share",
-                    Some("owner@example.com"),
-                    false,
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .can_view_share_model_health_calendar(
-                    "health-access-share",
-                    Some("buyer@example.com"),
-                    false,
-                )
-                .await
-                .unwrap()
-        );
-        expire_shareto_user(&store, "health-access-share", "buyer@example.com").await;
-        assert!(
-            !store
-                .can_view_share_model_health_calendar(
-                    "health-access-share",
-                    Some("buyer@example.com"),
-                    false,
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .can_view_share_model_health_calendar("health-access-share", None, true)
+                .can_view_share_model_health_calendar("health-access-share")
                 .await
                 .unwrap()
         );
         assert!(
             !store
-                .can_view_share_model_health_calendar(
-                    "health-access-share",
-                    Some("other@example.com"),
-                    false,
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .can_view_share_model_health_calendar("health-access-share", None, false)
-                .await
-                .unwrap()
-        );
-        {
-            let conn = store.conn.lock().await;
-            let now = Utc::now().to_rfc3339();
-            conn.execute(
-                "INSERT INTO share_market_listings (
-                    id, share_id, installation_id, owner_user_id, owner_email,
-                    status, created_at, updated_at
-                 ) VALUES (
-                    'health-access-listing', 'health-access-share',
-                    'health-access-installation', 'owner-user', 'owner@example.com',
-                    'active', ?1, ?1
-                 )",
-                params![now],
-            )
-            .expect("publish Share Market listing");
-        }
-        assert!(
-            store
-                .can_view_share_model_health_calendar("health-access-share", None, false)
+                .can_view_share_model_health_calendar("missing-share")
                 .await
                 .unwrap()
         );

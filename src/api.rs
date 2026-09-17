@@ -5307,9 +5307,9 @@ async fn unban_share_client(
 // holding the Share id, the same way the listing itself is. Do not "fix" this
 // by adding `require_user_email` — that removes a surface the market is built
 // on. The neighbours in this same router that *do* authenticate
-// (`test_share_connection`, `get_share_model_health_calendar`) either act on
-// the Share or expose its operational history, which is a different thing
-// from publishing its ledger.
+// (`test_share_connection`) acts on the Share. The model-health calendar
+// matches the dashboard Share drawer: anyone who can open that drawer can
+// read the calendar for an existing `share_id`.
 //
 // Two consequences, recorded so they are decided rather than rediscovered:
 //   * `share_id` is the only thing gating this. It is 64 bits of randomness,
@@ -8865,20 +8865,12 @@ async fn get_image_generation_result(
 
 async fn get_share_model_health_calendar(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Path(share_id): Path<String>,
     Query(query): Query<ShareModelHealthCalendarQuery>,
 ) -> Result<Json<ShareModelHealthCalendarResponse>, AppError> {
-    let viewer_email = extract_session_email(&state, &headers).await?;
-    let is_admin = {
-        let dynamic = state.dynamic.read().await;
-        viewer_email
-            .as_deref()
-            .is_some_and(|email| dynamic.is_admin(email))
-    };
     if !state
         .store
-        .can_view_share_model_health_calendar(&share_id, viewer_email.as_deref(), is_admin)
+        .can_view_share_model_health_calendar(&share_id)
         .await?
     {
         return Err(AppError::NotFound(
