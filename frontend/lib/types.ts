@@ -2221,6 +2221,44 @@ export type BinanceAutoSettlementStatus = {
   account?: BinanceAutoSettlementAccount;
 };
 
+export type BinanceReceiptMarketLine = {
+  productKind: string;
+  serviceLabel: string;
+  serviceStartedAt: string;
+  serviceEndedAt: string;
+  amountUsdMinor: number;
+  amountCnyMinor: number;
+};
+
+export type BinanceReceiptHistoryEntry = {
+  receiptId: string;
+  paymentIntentId: string;
+  transactionId: string;
+  orderId?: string;
+  transactionAt: string;
+  confirmedAt: string;
+  source: "binance_auto" | "admin_reconciliation" | string;
+  matchedBy: string;
+  asset: string;
+  expectedAmount: string;
+  actualAmount: string;
+  invoice: {
+    id: string;
+    sequence: number;
+    status: string;
+    paidAt?: string;
+    buyerEmail: string;
+    amountUsdMinor: number;
+    amountCnyMinor: number;
+    lines: BinanceReceiptMarketLine[];
+  };
+};
+
+export type BinanceReceiptHistoryResponse = {
+  items: BinanceReceiptHistoryEntry[];
+  nextCursor?: string;
+};
+
 export type BinancePaymentIntent = {
   id: string;
   invoiceId: string;
@@ -2386,6 +2424,15 @@ export type MarketBillingInvoice = {
   declaration?: MarketBillingPaymentDeclaration;
   dispute?: MarketBillingDispute;
   creditNotes: MarketBillingCreditNote[];
+  externalPaymentReceipt?: {
+    kind: "binance" | string;
+    source: string;
+    matchedBy: string;
+    asset: string;
+    expectedAmount: string;
+    actualAmount: string;
+    confirmedAt: string;
+  };
 };
 
 export type MarketBillingInvoiceHistory = {

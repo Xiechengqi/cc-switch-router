@@ -187,6 +187,19 @@ pub struct BillingInvoiceView {
     pub declaration: Option<PaymentDeclarationView>,
     pub dispute: Option<BillingDisputeView>,
     pub credit_notes: Vec<CreditNoteView>,
+    pub external_payment_receipt: Option<ExternalPaymentReceiptView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPaymentReceiptView {
+    pub kind: String,
+    pub source: String,
+    pub matched_by: String,
+    pub asset: String,
+    pub expected_amount: String,
+    pub actual_amount: String,
+    pub confirmed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3933,8 +3946,35 @@ fn invoice_view(
         declaration: declaration_view_for_invoice(conn, invoice_id)?,
         dispute: dispute_view_for_invoice(conn, invoice_id)?,
         credit_notes: credit_notes_for_invoice(conn, invoice_id)?,
+        external_payment_receipt: external_payment_receipt_for_invoice(conn, invoice_id)?,
         lines,
     }))
+}
+
+#[cfg(test)]
+fn external_payment_receipt_for_invoice(
+    conn: &Connection,
+    invoice_id: &str,
+) -> Result<Option<ExternalPaymentReceiptView>, AppError> {
+    conn.query_row(
+        "SELECT source, matched_by, asset, expected_amount_units,
+                actual_amount_units, confirmed_at
+         FROM market_external_payment_receipts WHERE invoice_id = ?1",
+        params![invoice_id],
+        |row| {
+            Ok(ExternalPaymentReceiptView {
+                kind: "binance".into(),
+                source: row.get(0)?,
+                matched_by: row.get(1)?,
+                asset: row.get(2)?,
+                expected_amount: crate::binance_settlement::format_amount(row.get(3)?),
+                actual_amount: crate::binance_settlement::format_amount(row.get(4)?),
+                confirmed_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_db("read external payment receipt"))
 }
 
 fn invoice_views(
@@ -4014,8 +4054,45 @@ fn invoice_views(
                     declaration: None,
                     dispute: None,
                     credit_notes: Vec::new(),
+                    external_payment_receipt: None,
                 },
             );
+        }
+
+        let receipts_sql = format!(
+            "SELECT invoice_id, source, matched_by, asset, expected_amount_units,
+                    actual_amount_units, confirmed_at
+             FROM market_external_payment_receipts WHERE invoice_id IN ({placeholders})"
+        );
+        let receipts = conn
+            .prepare(&receipts_sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params_from_iter(chunk.iter().cloned()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            ExternalPaymentReceiptView {
+                                kind: "binance".into(),
+                                source: row.get(1)?,
+                                matched_by: row.get(2)?,
+                                asset: row.get(3)?,
+                                expected_amount: crate::binance_settlement::format_amount(
+                                    row.get(4)?,
+                                ),
+                                actual_amount: crate::binance_settlement::format_amount(
+                                    row.get(5)?,
+                                ),
+                                confirmed_at: row.get(6)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read external payment receipts batch"))?;
+        for (invoice_id, receipt) in receipts {
+            if let Some(invoice) = views.get_mut(&invoice_id) {
+                invoice.external_payment_receipt = Some(receipt);
+            }
         }
 
         let lines_sql = format!(

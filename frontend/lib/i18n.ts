@@ -886,17 +886,37 @@ export const messages = {
     "account.binanceRecommend": "Recommended — anonymous and efficient. ",
     "account.binanceRegister": "Register",
     "account.binanceAuto.title": "Automatic Binance receipt confirmation",
+    "account.binanceAuto.receipts.open": "Receipt history",
+    "account.binanceAuto.receipts.title": "Binance receipt history",
+    "account.binanceAuto.receipts.scope": "Only Binance Pay receipts confirmed by Router and matched to a Market invoice are shown. This is not your complete Binance transaction history.",
+    "account.binanceAuto.receipts.empty": "No confirmed Market receipts yet.",
+    "account.binanceAuto.receipts.sourceAuto": "Automatic exact match",
+    "account.binanceAuto.receipts.sourceAdmin": "Admin review",
+    "account.binanceAuto.receipts.confirmedAt": "Confirmed",
+    "account.binanceAuto.receipts.invoiceStatus": "Invoice status",
+    "account.binanceAuto.receipts.expected": "Expected",
+    "account.binanceAuto.receipts.transactionId": "Transaction ID",
+    "account.binanceAuto.receipts.orderId": "Binance order ID",
+    "account.binanceAuto.receipts.loadMore": "Load more",
     "account.binanceAuto.description":
-      "Bind a read-only API key after receiving one small Pay transfer that proves the UID. Buyers still transfer in Binance; the Router only observes incoming transactions and settles exact matches.",
-    "account.binanceAuto.globalMode": "Router: {mode}",
-    "account.binanceAuto.accountStatus": "Account: {status}",
-    "account.binanceAuto.accountMode": "Automation: {mode}",
-    "account.binanceAuto.activateByRebind":
-      "This account stayed in shadow mode during rollout. Rebind and verify the credentials after the Router is enabled to activate automatic settlement for this account.",
-    "account.binanceAuto.storageUnavailable":
-      "Encrypted credential storage is not configured on this Router. Ask an administrator to enable it.",
-    "account.binanceAuto.routerDisabled":
-      "The Router kill switch is off. Binding and verification stay unavailable until an administrator selects shadow or enabled mode.",
+      "Use a read-only API key to confirm Binance Pay receipts automatically. The Router never trades, transfers, or withdraws funds.",
+    "account.binanceAuto.state.unavailable": "Not enabled",
+    "account.binanceAuto.state.trial": "Trial mode",
+    "account.binanceAuto.state.ready": "Ready to bind",
+    "account.binanceAuto.state.actionRequired": "Rebind required",
+    "account.binanceAuto.state.active": "Enabled",
+    "account.binanceAuto.state.degraded": "Needs attention",
+    "account.binanceAuto.state.accountDisabled": "Disabled",
+    "account.binanceAuto.notice.unavailable":
+      "Automatic confirmation is not enabled on this Router. Contact the administrator to enable it.",
+    "account.binanceAuto.notice.trial":
+      "Trial mode only observes incoming payments and does not settle invoices automatically.",
+    "account.binanceAuto.notice.actionRequired":
+      "Rebind and verify this account to enable automatic settlement.",
+    "account.binanceAuto.notice.degraded":
+      "Automatic confirmation is unavailable for this account. Check the latest error, then fix the credentials or verify again.",
+    "account.binanceAuto.notice.accountDisabled":
+      "Automatic confirmation is disabled for this account. Bind the credentials again to resume it.",
     "account.binanceAuto.statusUnavailable":
       "Automatic confirmation status is temporarily unavailable; manual payment details remain usable.",
     "account.binanceAuto.saveUidFirst":
@@ -915,7 +935,50 @@ export const messages = {
     "account.binanceAuto.apiKey": "Read-only Binance API key",
     "account.binanceAuto.apiSecret": "API secret",
     "account.binanceAuto.readOnlyWarning":
-      "Only a key with reading enabled and every trading, withdrawal, and transfer permission disabled is accepted. The secret is encrypted and is never shown again.",
+      "Enable reading only. Trading, withdrawal, and every transfer permission must stay off.",
+    "account.binanceAuto.guide.open": "How to create a read-only API key",
+    "account.binanceAuto.guide.title": "Create a read-only Binance API key",
+    "account.binanceAuto.guide.safetyTitle": "Read-only access only",
+    "account.binanceAuto.guide.safetyBody":
+      "The Router reads Binance Pay history only. Never enable trading, withdrawal, transfer, futures, margin, options, or any other fund-moving permission.",
+    "account.binanceAuto.guide.uid.title": "Confirm and save the receiving UID",
+    "account.binanceAuto.guide.uid.body":
+      "Find the numeric UID in the receiving Binance account profile and save the exact same value in the Binance user ID field above. Do not use the payer UID, email address, phone number, or an obsolete Pay ID.",
+    "account.binanceAuto.guide.proof.title": "Create one UID proof receipt",
+    "account.binanceAuto.guide.proof.body":
+      "Use another Binance account to send a controlled small Binance Pay transfer to this UID. Wait until it appears in the receiving account's Pay history. The Router checks the last 30 days of history to prove that the API key and public receiving UID belong to the same account.",
+    "account.binanceAuto.guide.create.title": "Create a system-generated API key",
+    "account.binanceAuto.guide.create.body":
+      "Sign in to the Binance website, open API Management from the account settings, and create a system-generated API key. Complete Binance's security checks and use a recognizable label such as cc-switch-router.",
+    "account.binanceAuto.guide.permissions.title": "Apply strict permissions",
+    "account.binanceAuto.guide.permissions.body":
+      "Review every permission before saving. The Router rejects the key if any known or newly introduced fund-moving permission is enabled.",
+    "account.binanceAuto.guide.permissions.read":
+      "Turn on Enable Reading / Read Only.",
+    "account.binanceAuto.guide.permissions.block":
+      "Keep spot and margin trading, withdrawals, internal and universal transfers, futures, portfolio margin, options, FIX trading, and all other trading permissions off.",
+    "account.binanceAuto.guide.permissions.ip":
+      "Recommended: restrict the key to the Router server's fixed public egress IP, not your current computer or phone IP. Ask the Router administrator if you do not know it.",
+    "account.binanceAuto.guide.copy.title": "Copy the key and secret once",
+    "account.binanceAuto.guide.copy.body":
+      "Binance normally shows the API Secret only once. Paste both values into the Router immediately. The Router encrypts the secret, never returns it, and clears both browser fields after a successful bind. Never place credentials in chats, tickets, screenshots, or logs.",
+    "account.binanceAuto.guide.verify.title": "Bind and verify",
+    "account.binanceAuto.guide.verify.body":
+      "Click Bind and verify. The Router checks the key, strict read-only permissions, recent Pay history, and UID ownership. If this Router is not enabled yet, keep the key private and contact the administrator instead of repeatedly creating new keys.",
+    "account.binanceAuto.guide.errors.title": "Common verification errors",
+    "account.binanceAuto.guide.error.read": "Enable reading permission, then try again.",
+    "account.binanceAuto.guide.error.dangerous":
+      "Turn off every trading, withdrawal, and transfer permission, then try again.",
+    "account.binanceAuto.guide.error.unconfirmed":
+      "Receive a small Binance Pay transfer, wait for it to appear in Pay history, then try again.",
+    "account.binanceAuto.guide.error.mismatch":
+      "The saved UID and API key belong to different accounts. Correct the UID or use a key from the receiving account.",
+    "account.binanceAuto.guide.error.credentials":
+      "Check the key, secret, and IP allowlist. Create a new read-only key if the secret is no longer available.",
+    "account.binanceAuto.guide.uiNotice":
+      "Binance menu names and locations can vary by region, account type, and app version. Use the official API Management page if your interface differs.",
+    "account.binanceAuto.guide.openApiManagement": "Open Binance API Management",
+    "account.binanceAuto.guide.openApiDocs": "Open Pay API documentation",
     "account.binanceAuto.bind": "Bind and verify",
     "account.binanceAuto.rotate": "Rotate credentials",
     "account.binanceAuto.rotateConfirm":
@@ -1769,6 +1832,8 @@ export const messages = {
     "marketBilling.binance.action.open": "Pay with Binance",
     "marketBilling.binance.action.other": "Other payment method",
     "marketBilling.binance.paid": "Binance payment confirmed.",
+    "marketBilling.binance.receipt.auto": "Binance automatic receipt",
+    "marketBilling.binance.receipt.admin": "Binance admin-reviewed receipt",
     "marketBilling.binance.creating": "Preparing a unique payment amount…",
     "marketBilling.binance.unavailable": "Automatic Binance confirmation is unavailable",
     "marketBilling.binance.exactAmount": "Exact amount to transfer",
@@ -4325,17 +4390,33 @@ export const messages = {
     "account.binanceRecommend": "推荐使用，匿名且高效，",
     "account.binanceRegister": "去注册",
     "account.binanceAuto.title": "币安自动到账确认",
+    "account.binanceAuto.receipts.open": "到账记录",
+    "account.binanceAuto.receipts.title": "币安到账记录",
+    "account.binanceAuto.receipts.scope": "仅展示 Router 已确认并匹配到 Market 账单的币安 Pay 到账，不代表币安账户的全部交易流水。",
+    "account.binanceAuto.receipts.empty": "暂无已确认的 Market 到账记录。",
+    "account.binanceAuto.receipts.sourceAuto": "自动精确匹配",
+    "account.binanceAuto.receipts.sourceAdmin": "管理员复核",
+    "account.binanceAuto.receipts.confirmedAt": "确认时间",
+    "account.binanceAuto.receipts.invoiceStatus": "账单状态",
+    "account.binanceAuto.receipts.expected": "应付金额",
+    "account.binanceAuto.receipts.transactionId": "交易 ID",
+    "account.binanceAuto.receipts.orderId": "币安订单 ID",
+    "account.binanceAuto.receipts.loadMore": "加载更多",
     "account.binanceAuto.description":
-      "先接收一笔用于证明 UID 的小额 Pay 转账，再绑定只读 API Key。买家仍在币安内主动转账；Router 只读取入账流水，并对精确匹配的账单自动结算。",
-    "account.binanceAuto.globalMode": "Router：{mode}",
-    "account.binanceAuto.accountStatus": "账户：{status}",
-    "account.binanceAuto.accountMode": "自动结算：{mode}",
-    "account.binanceAuto.activateByRebind":
-      "此账户在灰度阶段保持 shadow。Router 启用后，请重新绑定并验证凭据，才会为该账户逐户开启自动结算。",
-    "account.binanceAuto.storageUnavailable":
-      "当前 Router 未配置加密凭据存储，请联系管理员启用。",
-    "account.binanceAuto.routerDisabled":
-      "Router 总开关当前关闭；管理员切换到 shadow 或 enabled 前，绑定与复验保持禁用。",
+      "使用只读 API 自动核对 Binance Pay 入账；Router 不会交易、转账或提现。",
+    "account.binanceAuto.state.unavailable": "未启用",
+    "account.binanceAuto.state.trial": "试运行",
+    "account.binanceAuto.state.ready": "可以绑定",
+    "account.binanceAuto.state.actionRequired": "需要重新绑定",
+    "account.binanceAuto.state.active": "已启用",
+    "account.binanceAuto.state.degraded": "需要处理",
+    "account.binanceAuto.state.accountDisabled": "已停用",
+    "account.binanceAuto.notice.unavailable": "当前 Router 尚未启用自动到账确认，请联系管理员。",
+    "account.binanceAuto.notice.trial": "当前为试运行模式：只观察到账，不会自动结算账单。",
+    "account.binanceAuto.notice.actionRequired": "请重新绑定并验证该账户，以启用自动结算。",
+    "account.binanceAuto.notice.degraded":
+      "该账户暂时无法自动确认到账。请查看最近错误，修复凭据后重新验证。",
+    "account.binanceAuto.notice.accountDisabled": "该账户已停用；重新绑定凭据后可恢复使用。",
     "account.binanceAuto.statusUnavailable": "自动到账状态暂时不可用；人工收款资料仍可正常使用。",
     "account.binanceAuto.saveUidFirst":
       "绑定凭据前，请先保存公开的币安 UID；收款码仅供人工付款，可选填。",
@@ -4353,7 +4434,48 @@ export const messages = {
     "account.binanceAuto.apiKey": "币安只读 API Key",
     "account.binanceAuto.apiSecret": "API Secret",
     "account.binanceAuto.readOnlyWarning":
-      "系统只接受开启读取、且关闭全部交易、提现和转账权限的 Key。Secret 会加密保存，之后不会再次显示。",
+      "仅开启读取权限；交易、提现和全部转账权限必须保持关闭。",
+    "account.binanceAuto.guide.open": "如何创建只读 API Key",
+    "account.binanceAuto.guide.title": "创建币安只读 API Key",
+    "account.binanceAuto.guide.safetyTitle": "只能授予读取权限",
+    "account.binanceAuto.guide.safetyBody":
+      "Router 只读取 Binance Pay 流水。不要开启交易、提现、转账、合约、杠杆、期权或任何其他资金操作权限。",
+    "account.binanceAuto.guide.uid.title": "确认并保存收款 UID",
+    "account.binanceAuto.guide.uid.body":
+      "在收款币安账户的资料页找到数字 UID，并把完全相同的值保存到上方“币安用户 ID”。不要填写付款方 UID、邮箱、手机号或已经停用的 Pay ID。",
+    "account.binanceAuto.guide.proof.title": "生成一笔 UID 证明流水",
+    "account.binanceAuto.guide.proof.body":
+      "使用另一个币安账户，向该 UID 发起一笔可控的小额 Binance Pay 转账，等待它出现在收款账户的 Pay 历史中。Router 会检查最近 30 天流水，证明 API Key 与公开收款 UID 属于同一个账户。",
+    "account.binanceAuto.guide.create.title": "创建系统生成的 API Key",
+    "account.binanceAuto.guide.create.body":
+      "登录币安网页版，从账户设置进入 API 管理，选择创建系统生成的 API Key。完成币安要求的安全验证，并使用容易识别的名称，例如 cc-switch-router。",
+    "account.binanceAuto.guide.permissions.title": "严格设置权限",
+    "account.binanceAuto.guide.permissions.body":
+      "保存前逐项检查权限。只要开启任何已知或币安以后新增的资金操作权限，Router 都会拒绝该 Key。",
+    "account.binanceAuto.guide.permissions.read": "开启 Enable Reading / 允许读取。",
+    "account.binanceAuto.guide.permissions.block":
+      "关闭现货与杠杆交易、提现、内部转账、通用转账、合约、Portfolio Margin、期权、FIX 交易及其他全部交易权限。",
+    "account.binanceAuto.guide.permissions.ip":
+      "推荐把 Key 限制为 Router 服务器的固定公网出口 IP，不要填写当前电脑或手机的 IP；不知道时请联系 Router 管理员。",
+    "account.binanceAuto.guide.copy.title": "一次性复制 Key 和 Secret",
+    "account.binanceAuto.guide.copy.body":
+      "币安通常只显示一次 API Secret，请立即把 Key 和 Secret 粘贴到 Router。Router 会加密保存 Secret、永不回显，并在绑定成功后清空浏览器中的两个输入框。不要把凭据发送到聊天、工单、截图或日志中。",
+    "account.binanceAuto.guide.verify.title": "绑定并验证",
+    "account.binanceAuto.guide.verify.body":
+      "点击“绑定并验证”。Router 会检查 Key、严格只读权限、近期 Pay 流水和 UID 所有权。如果当前 Router 尚未启用，请妥善保管 Key 并联系管理员，不要反复创建新 Key。",
+    "account.binanceAuto.guide.errors.title": "常见验证错误",
+    "account.binanceAuto.guide.error.read": "开启读取权限后重试。",
+    "account.binanceAuto.guide.error.dangerous": "关闭所有交易、提现和转账权限后重试。",
+    "account.binanceAuto.guide.error.unconfirmed":
+      "先接收一笔小额 Binance Pay 转账，等待流水出现后重试。",
+    "account.binanceAuto.guide.error.mismatch":
+      "保存的 UID 与 API Key 属于不同账户；请修正 UID，或使用收款账户创建的 Key。",
+    "account.binanceAuto.guide.error.credentials":
+      "检查 Key、Secret 和 IP 白名单；如果 Secret 已无法找回，请重新创建只读 Key。",
+    "account.binanceAuto.guide.uiNotice":
+      "币安菜单名称和位置可能随地区、账户类型及 App 版本变化；如果界面不同，请使用官方 API 管理页面。",
+    "account.binanceAuto.guide.openApiManagement": "打开币安 API 管理",
+    "account.binanceAuto.guide.openApiDocs": "查看 Pay API 文档",
     "account.binanceAuto.bind": "绑定并验证",
     "account.binanceAuto.rotate": "轮换凭据",
     "account.binanceAuto.rotateConfirm":
@@ -5173,6 +5295,8 @@ export const messages = {
     "marketBilling.binance.action.open": "币安自动付款",
     "marketBilling.binance.action.other": "其他付款方式",
     "marketBilling.binance.paid": "币安付款已确认。",
+    "marketBilling.binance.receipt.auto": "币安自动到账",
+    "marketBilling.binance.receipt.admin": "币安管理员复核到账",
     "marketBilling.binance.creating": "正在生成唯一付款金额…",
     "marketBilling.binance.unavailable": "币安自动确认暂不可用",
     "marketBilling.binance.exactAmount": "请精确转账",

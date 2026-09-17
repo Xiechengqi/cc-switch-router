@@ -76,6 +76,7 @@ import type {
   ClientTunnelSubdomainAvailability,
   AccountPaymentProfile,
   BinanceAutoSettlementStatus,
+  BinanceReceiptHistoryResponse,
   BinancePaymentIntent,
   BinanceSettlementAdmin,
   ClientMarketPaymentMethod,
@@ -1319,6 +1320,17 @@ export async function updateAccountPaymentProfile(
 export async function getBinanceAutoSettlementStatus() {
   return parseJson<BinanceAutoSettlementStatus>(
     await authFetch("/v1/account/binance-auto-settlement", { cache: "no-store" }),
+  );
+}
+
+export async function getBinanceReceiptHistory(cursor?: string, signal?: AbortSignal) {
+  const query = new URLSearchParams({ limit: "20" });
+  if (cursor) query.set("cursor", cursor);
+  return parseJson<BinanceReceiptHistoryResponse>(
+    await authFetch(`/v1/account/binance-auto-settlement/receipts?${query}`, {
+      cache: "no-store",
+      signal,
+    }),
   );
 }
 

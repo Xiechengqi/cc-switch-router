@@ -3,18 +3,22 @@
 import * as React from "react";
 import { Button, Chip, ListBox, Select, toast } from "@heroui/react";
 import {
+  BookOpen,
   ExternalLink,
   KeyRound,
   Loader2,
   Plus,
   Power,
   RefreshCw,
+  ReceiptText,
   Save,
   ShieldCheck,
   Trash2,
   WalletCards,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { BinanceApiKeyGuideDialog } from "@/components/dashboard/binance-api-key-guide-dialog";
+import { BinanceReceiptHistoryDialog } from "@/components/dashboard/binance-receipt-history-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -32,6 +36,7 @@ import {
   DEFAULT_USD_CNY_RATE_MICROS,
   formatUsdCnyRate,
 } from "@/lib/market-money";
+import { binanceAutoSettlementUiState } from "@/lib/binance-auto-settlement";
 import type {
   BinanceAutoSettlementStatus,
   ClientMarketPaymentMethod,
@@ -140,6 +145,8 @@ export function AccountPaymentsPanel() {
   }));
   const [binanceBusy, setBinanceBusy] = React.useState("");
   const [binanceStatusError, setBinanceStatusError] = React.useState("");
+  const [binanceGuideOpen, setBinanceGuideOpen] = React.useState(false);
+  const [binanceReceiptsOpen, setBinanceReceiptsOpen] = React.useState(false);
   const actorKeyRef = React.useRef(actorKey);
   actorKeyRef.current = actorKey;
   const binanceApiKey = binanceCredentialDraft.actorKey === actorKey
@@ -164,6 +171,14 @@ export function AccountPaymentsPanel() {
   }, [actorKey]);
 
   const dirty = serializePaymentDraft(draft) !== baseline;
+  const binanceUiState = binanceAutoSettlementUiState(binanceStatus);
+  const binanceUiStateClass = binanceUiState === "active"
+    ? "bg-emerald-100 text-emerald-700"
+    : binanceUiState === "degraded"
+      ? "bg-rose-100 text-rose-700"
+      : binanceUiState === "trial" || binanceUiState === "actionRequired"
+        ? "bg-amber-100 text-amber-800"
+        : "bg-slate-100 text-slate-600";
 
   const applyProfile = React.useCallback((methods: ClientMarketPaymentMethod[], contacts: PaymentContact[] = []) => {
     const alipay = methods.find((method) => method.kind === "alipay");
@@ -591,28 +606,18 @@ export function AccountPaymentsPanel() {
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Chip size="sm" variant="soft">
-                {t("account.binanceAuto.globalMode", {
-                  mode: binanceStatus?.globalMode || "disabled",
-                })}
-              </Chip>
-              {binanceStatus?.account ? (
-                <>
-                  <Chip
-                    size="sm"
-                    variant="soft"
-                    className={binanceStatus.account.status === "verified"
-                      ? "bg-emerald-100 text-emerald-700"
-                      : binanceStatus.account.status === "degraded"
-                        ? "bg-rose-100 text-rose-700"
-                        : "bg-slate-100 text-slate-600"}
-                  >
-                    {t("account.binanceAuto.accountStatus", { status: binanceStatus.account.status })}
-                  </Chip>
-                  <Chip size="sm" variant="soft">
-                    {t("account.binanceAuto.accountMode", { mode: binanceStatus.account.automationMode })}
-                  </Chip>
-                </>
+              <Button size="sm" variant="outline" onClick={() => setBinanceReceiptsOpen(true)}>
+                <ReceiptText className="h-4 w-4" aria-hidden />
+                {t("account.binanceAuto.receipts.open")}
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => setBinanceGuideOpen(true)}>
+                <BookOpen className="h-4 w-4" aria-hidden />
+                {t("account.binanceAuto.guide.open")}
+              </Button>
+              {binanceStatus ? (
+                <Chip size="sm" variant="soft" className={binanceUiStateClass}>
+                  {t(`account.binanceAuto.state.${binanceUiState}`)}
+                </Chip>
               ) : null}
             </div>
           </div>
@@ -622,22 +627,31 @@ export function AccountPaymentsPanel() {
               {t("account.binanceAuto.statusUnavailable")} {binanceStatusError}
             </p>
           ) : null}
-          {binanceStatus && !binanceStatus.credentialStorageConfigured ? (
-            <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
-              {t("account.binanceAuto.storageUnavailable")}
-            </p>
-          ) : null}
-          {binanceStatus?.globalMode === "disabled" ? (
+          {binanceStatus && binanceUiState === "unavailable" ? (
             <p className="rounded-md border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-700">
-              {t("account.binanceAuto.routerDisabled")}
+              {t("account.binanceAuto.notice.unavailable")}
             </p>
           ) : null}
-          {binanceStatus?.globalMode === "enabled"
-            && binanceStatus.account?.automationMode === "shadow" ? (
-              <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
-                {t("account.binanceAuto.activateByRebind")}
-              </p>
-            ) : null}
+          {binanceStatus && binanceUiState === "trial" ? (
+            <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
+              {t("account.binanceAuto.notice.trial")}
+            </p>
+          ) : null}
+          {binanceStatus && binanceUiState === "actionRequired" ? (
+            <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
+              {t("account.binanceAuto.notice.actionRequired")}
+            </p>
+          ) : null}
+          {binanceStatus && binanceUiState === "degraded" ? (
+            <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+              {t("account.binanceAuto.notice.degraded")}
+            </p>
+          ) : null}
+          {binanceStatus && binanceUiState === "accountDisabled" ? (
+            <p className="rounded-md border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-700">
+              {t("account.binanceAuto.notice.accountDisabled")}
+            </p>
+          ) : null}
           {dirty ? (
             <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
               {t("account.binanceAuto.saveUidFirst")}
@@ -725,8 +739,7 @@ export function AccountPaymentsPanel() {
               isDisabled={
                 !!binanceBusy
                 || dirty
-                || !binanceStatus?.credentialStorageConfigured
-                || binanceStatus.globalMode === "disabled"
+                || binanceUiState === "unavailable"
                 || !/^\d{6,20}$/.test(draft.binanceAccount.trim())
                 || binanceApiKey.trim().length < 16
                 || binanceApiSecret.trim().length < 16
@@ -740,7 +753,16 @@ export function AccountPaymentsPanel() {
             </Button>
             {binanceStatus?.account?.maskedApiKey ? (
               <>
-                <Button size="sm" variant="outline" isDisabled={!!binanceBusy || binanceStatus.globalMode === "disabled" || binanceStatus.account.status === "disabled"} onClick={() => void verifyBinanceCredentials()}>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  isDisabled={
+                    !!binanceBusy
+                    || binanceUiState === "unavailable"
+                    || binanceStatus.account.status === "disabled"
+                  }
+                  onClick={() => void verifyBinanceCredentials()}
+                >
                   {binanceBusy === "verify" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                   {t("account.binanceAuto.verify")}
                 </Button>
@@ -756,6 +778,13 @@ export function AccountPaymentsPanel() {
             ) : null}
           </div>
         </div>
+
+        <BinanceApiKeyGuideDialog open={binanceGuideOpen} onOpenChange={setBinanceGuideOpen} />
+        <BinanceReceiptHistoryDialog
+          open={binanceReceiptsOpen}
+          onOpenChange={setBinanceReceiptsOpen}
+          actorKey={actorKey}
+        />
 
         <div className="grid gap-4">
           <div className="flex items-center gap-2">

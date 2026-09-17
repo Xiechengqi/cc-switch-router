@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::client_market_trade::PaymentMethod;
-use crate::db::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use crate::db::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use crate::error::AppError;
 use crate::market_billing::BillingAction;
 use crate::models::AuthSession;
@@ -123,6 +125,52 @@ pub struct BinanceSettlementAdminView {
     pub oldest_open_case_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceReceiptMarketLineView {
+    pub product_kind: String,
+    pub service_label: String,
+    pub service_started_at: String,
+    pub service_ended_at: String,
+    pub amount_usd_minor: i64,
+    pub amount_cny_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceReceiptInvoiceView {
+    pub id: String,
+    pub sequence: i64,
+    pub status: String,
+    pub paid_at: Option<String>,
+    pub buyer_email: String,
+    pub amount_usd_minor: i64,
+    pub amount_cny_minor: i64,
+    pub lines: Vec<BinanceReceiptMarketLineView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceReceiptHistoryEntryView {
+    pub receipt_id: String,
+    pub payment_intent_id: String,
+    pub transaction_id: String,
+    pub order_id: Option<String>,
+    pub transaction_at: String,
+    pub confirmed_at: String,
+    pub source: String,
+    pub matched_by: String,
+    pub asset: String,
+    pub expected_amount: String,
+    pub actual_amount: String,
+    pub invoice: BinanceReceiptInvoiceView,
+}
+
+pub struct BinanceReceiptHistoryBatch {
+    pub items: Vec<BinanceReceiptHistoryEntryView>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredPaymentAccount {
     pub id: String,
@@ -147,6 +195,128 @@ pub struct AccountCredentialEnvelope {
 }
 
 impl AppStore {
+    pub async fn binance_receipt_history(
+        &self,
+        session: &AuthSession,
+        before: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<BinanceReceiptHistoryBatch, AppError> {
+        let conn = self.conn.lock().await;
+        let (before_at, before_id) = before
+            .map(|(at, id)| (Some(at), Some(id)))
+            .unwrap_or((None, None));
+        let rows = conn
+            .prepare(
+                "SELECT receipt.id, receipt.payment_intent_id, receipt.transaction_id,
+                        payment.order_id, payment.transaction_time, receipt.confirmed_at,
+                        receipt.source, receipt.matched_by, receipt.asset,
+                        receipt.expected_amount_units, receipt.actual_amount_units,
+                        invoice.id, invoice.sequence, invoice.status, invoice.paid_at,
+                        credit.buyer_email, invoice.amount_minor, invoice.amount_cny_minor
+                 FROM market_external_payment_receipts receipt
+                 JOIN binance_payment_accounts payment_account
+                   ON payment_account.id = receipt.payment_account_id
+                 JOIN binance_pay_transactions payment
+                   ON payment.payment_account_id = receipt.payment_account_id
+                  AND payment.transaction_id = receipt.transaction_id
+                 JOIN market_payment_intents intent
+                   ON intent.id = receipt.payment_intent_id
+                  AND intent.invoice_id = receipt.invoice_id
+                  AND intent.payment_account_id = receipt.payment_account_id
+                 JOIN market_invoices invoice ON invoice.id = receipt.invoice_id
+                 JOIN market_credit_accounts credit ON credit.id = invoice.account_id
+                 WHERE payment_account.supplier_user_id = ?1
+                   AND credit.supplier_user_id = ?1
+                   AND (?2 IS NULL OR receipt.confirmed_at < ?2
+                        OR (receipt.confirmed_at = ?2 AND receipt.id < ?3))
+                 ORDER BY receipt.confirmed_at DESC, receipt.id DESC
+                 LIMIT ?4",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(
+                        params![session.user_id, before_at, before_id, (limit + 1) as i64],
+                        |row| {
+                            Ok(BinanceReceiptHistoryEntryView {
+                                receipt_id: row.get(0)?,
+                                payment_intent_id: row.get(1)?,
+                                transaction_id: row.get(2)?,
+                                order_id: row.get(3)?,
+                                transaction_at: row.get(4)?,
+                                confirmed_at: row.get(5)?,
+                                source: row.get(6)?,
+                                matched_by: row.get(7)?,
+                                asset: row.get(8)?,
+                                expected_amount: format_amount(row.get(9)?),
+                                actual_amount: format_amount(row.get(10)?),
+                                invoice: BinanceReceiptInvoiceView {
+                                    id: row.get(11)?,
+                                    sequence: row.get(12)?,
+                                    status: row.get(13)?,
+                                    paid_at: row.get(14)?,
+                                    buyer_email: row.get(15)?,
+                                    amount_usd_minor: row.get(16)?,
+                                    amount_cny_minor: row.get(17)?,
+                                    lines: Vec::new(),
+                                },
+                            })
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("read Binance receipt history: {error}"))
+            })?;
+        let has_more = rows.len() > limit;
+        let mut items = rows.into_iter().take(limit).collect::<Vec<_>>();
+        let invoice_ids = items
+            .iter()
+            .map(|item| item.invoice.id.clone())
+            .collect::<Vec<_>>();
+        if !invoice_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", invoice_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT invoice_id, product_kind, service_label, service_started_at,
+                        service_ended_at, amount_minor, amount_cny_minor
+                 FROM market_invoice_lines WHERE invoice_id IN ({placeholders})
+                 ORDER BY invoice_id, service_started_at, id"
+            );
+            let lines = conn
+                .prepare(&sql)
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params_from_iter(invoice_ids.iter()), |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                BinanceReceiptMarketLineView {
+                                    product_kind: row.get(1)?,
+                                    service_label: row.get(2)?,
+                                    service_started_at: row.get(3)?,
+                                    service_ended_at: row.get(4)?,
+                                    amount_usd_minor: row.get(5)?,
+                                    amount_cny_minor: row.get(6)?,
+                                },
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("read Binance receipt lines: {error}"))
+                })?;
+            let mut by_invoice: std::collections::HashMap<String, Vec<_>> =
+                std::collections::HashMap::new();
+            for (invoice_id, line) in lines {
+                by_invoice.entry(invoice_id).or_default().push(line);
+            }
+            for item in &mut items {
+                item.invoice.lines = by_invoice.remove(&item.invoice.id).unwrap_or_default();
+            }
+        }
+        Ok(BinanceReceiptHistoryBatch { items, has_more })
+    }
+
     pub async fn binance_load_payment_account(
         &self,
         supplier_user_id: &str,
@@ -4749,6 +4919,14 @@ mod tests {
             transaction_account_snapshot.4
         );
         assert_eq!(transaction_account_snapshot.5, "counterparty_id");
+        drop(conn);
+        let history = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("load automatic receipt history");
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].source, "binance_auto");
+        assert_eq!(history.items[0].transaction_id, "tx-exact");
     }
 
     #[tokio::test]
@@ -5594,5 +5772,47 @@ mod tests {
         assert_eq!(invoice_status, "paid");
         assert_eq!(case_status, "settled");
         assert_eq!(source, "admin_reconciliation");
+        drop(conn);
+
+        let history = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("load supplier receipt history");
+        assert_eq!(history.items.len(), 1);
+        assert!(!history.has_more);
+        assert_eq!(history.items[0].source, "admin_reconciliation");
+        assert_eq!(history.items[0].invoice.id, fixture.invoice_id);
+        assert_eq!(history.items[0].invoice.buyer_email, fixture.buyer.email);
+
+        let unrelated = store
+            .binance_receipt_history(&session("unrelated"), None, 20)
+            .await
+            .expect("scope unrelated receipt history");
+        assert!(unrelated.items.is_empty());
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE binance_payment_accounts
+                 SET status = 'disabled', credentials_ciphertext = '', credential_nonce = ''
+                 WHERE id = ?1",
+                params![fixture.payment_account_id],
+            )
+            .expect("remove credentials after settlement");
+        }
+        let retained = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("retain receipt history after credential deletion");
+        assert_eq!(retained.items.len(), 1);
+        let serialized = serde_json::to_string(&retained.items).expect("serialize history");
+        for forbidden in [
+            "credentialsCiphertext",
+            "rawPayload",
+            "payerBinance",
+            "counterpartyFingerprint",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
     }
 }

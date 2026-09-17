@@ -166,6 +166,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         45,
         include_str!("../schema/0045_share_recent_errors_authenticated_llm_only.sql"),
     ),
+    (
+        46,
+        include_str!("../schema/0046_binance_receipt_history.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1135,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_45_upgrade_a_version_26_database() {
+    fn migrations_27_through_46_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1264,8 +1268,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 45);
-        check_compatibility(&conn).expect("upgraded version 45 is compatible");
+        assert_eq!(latest_version, 46);
+        check_compatibility(&conn).expect("upgraded version 46 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1486,7 +1490,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 45);
+        assert_eq!(latest_version, 46);
     }
 
     #[test]
@@ -1510,7 +1514,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 45);
+        assert_eq!(latest_version, 46);
     }
 
     #[test]
@@ -1690,7 +1694,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 45);
+        assert_eq!(latest_version, 46);
     }
 
     #[test]

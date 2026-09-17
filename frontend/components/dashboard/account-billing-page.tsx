@@ -393,6 +393,22 @@ function CreditNoteDetails({ invoice, locale }: { invoice: MarketBillingInvoice;
   );
 }
 
+function ExternalReceiptDetails({ invoice, locale }: { invoice: MarketBillingInvoice; locale: string }) {
+  const { t } = useLocaleText();
+  const receipt = invoice.externalPaymentReceipt;
+  if (!receipt) return null;
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-emerald-200 bg-emerald-50/70 px-4 py-3 text-xs sm:px-5">
+      <strong className="text-emerald-900">
+        {receipt.source === "admin_reconciliation"
+          ? t("marketBilling.binance.receipt.admin")
+          : t("marketBilling.binance.receipt.auto")}
+      </strong>
+      <span className="text-emerald-800">{receipt.actualAmount} {receipt.asset} · {formatDate(receipt.confirmedAt, locale)}</span>
+    </div>
+  );
+}
+
 function CreditAccountPanel({
   account,
   perspective,
@@ -623,6 +639,7 @@ function CreditAccountPanel({
             </div>
           </div>
           <InvoiceLines invoice={invoice} locale={locale} />
+          <ExternalReceiptDetails invoice={invoice} locale={locale} />
           {invoice.declaration ? (
             <div className="border-t border-border px-4 py-3 sm:px-5">
               <PaymentDeclarationDetails declaration={invoice.declaration} locale={locale} />
@@ -680,6 +697,7 @@ function CreditAccountPanel({
                       </span>
                     </summary>
                     <InvoiceLines invoice={item} locale={locale} />
+                    <ExternalReceiptDetails invoice={item} locale={locale} />
                     {item.declaration ? (
                       <div className="border-t border-border px-4 py-3 sm:px-5">
                         <PaymentDeclarationDetails declaration={item.declaration} locale={locale} />

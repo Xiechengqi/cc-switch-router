@@ -8,7 +8,7 @@ use std::time::Duration as StdDuration;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,14 +26,15 @@ use crate::models::AuthSession;
 
 use self::client::{BinanceApiError, BinanceClient, BinancePayTransaction};
 use self::crypto::{BinanceCredentials, CredentialCipher, credential_aad};
-pub(crate) use self::store::cancel_invoice_intents_tx;
 pub use self::store::{
-    BinancePaymentAccountView, BinancePaymentIntentView, BinanceSettlementAdminView,
+    BinancePaymentAccountView, BinancePaymentIntentView, BinanceReceiptHistoryEntryView,
+    BinanceSettlementAdminView,
 };
 use self::store::{
     StoredPaymentAccount, decode_account_credentials, validate_automation_mode,
     validate_credentials, validate_uid,
 };
+pub(crate) use self::store::{cancel_invoice_intents_tx, format_amount};
 
 const MAX_POLL_ACCOUNTS_PER_CYCLE: usize = 8;
 const MAX_TRANSACTION_QUERIES_PER_POLL: usize = 32;
@@ -278,6 +279,28 @@ struct ResolveReconciliationRequest {
     note: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReceiptHistoryQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReceiptHistoryCursor {
+    v: u8,
+    confirmed_at: String,
+    receipt_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReceiptHistoryResponse {
+    items: Vec<BinanceReceiptHistoryEntryView>,
+    next_cursor: Option<String>,
+}
+
 fn default_account_mode() -> String {
     "enabled".into()
 }
@@ -307,6 +330,10 @@ pub fn router() -> Router<ServerState> {
             post(disable_account),
         )
         .route(
+            "/v1/account/binance-auto-settlement/receipts",
+            get(get_receipt_history),
+        )
+        .route(
             "/v1/market-billing/invoices/:invoice_id/binance-intent",
             get(get_payment_intent)
                 .post(create_payment_intent)
@@ -324,6 +351,64 @@ pub fn router() -> Router<ServerState> {
             "/v1/admin/market-billing/binance-reconciliation/:case_id/resolve",
             post(resolve_admin_reconciliation),
         )
+}
+
+fn decode_receipt_cursor(value: &str) -> Result<ReceiptHistoryCursor, AppError> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| AppError::BadRequest("invalid receipt history cursor".into()))?;
+    let cursor: ReceiptHistoryCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadRequest("invalid receipt history cursor".into()))?;
+    if cursor.v != 1
+        || cursor.receipt_id.is_empty()
+        || cursor.receipt_id.len() > 128
+        || chrono::DateTime::parse_from_rfc3339(&cursor.confirmed_at).is_err()
+    {
+        return Err(AppError::BadRequest(
+            "invalid receipt history cursor".into(),
+        ));
+    }
+    Ok(cursor)
+}
+
+fn encode_receipt_cursor(item: &BinanceReceiptHistoryEntryView) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(&ReceiptHistoryCursor {
+        v: 1,
+        confirmed_at: item.confirmed_at.clone(),
+        receipt_id: item.receipt_id.clone(),
+    })
+    .map_err(|error| AppError::Internal(format!("encode receipt history cursor: {error}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+async fn get_receipt_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ReceiptHistoryQuery>,
+) -> Result<Json<ReceiptHistoryResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_receipt_cursor)
+        .transpose()?;
+    let before = cursor
+        .as_ref()
+        .map(|cursor| (cursor.confirmed_at.as_str(), cursor.receipt_id.as_str()));
+    let batch = state
+        .store
+        .binance_receipt_history(&session, before, limit)
+        .await?;
+    let next_cursor = if batch.has_more {
+        batch.items.last().map(encode_receipt_cursor).transpose()?
+    } else {
+        None
+    };
+    Ok(Json(ReceiptHistoryResponse {
+        items: batch.items,
+        next_cursor,
+    }))
 }
 
 async fn require_session(
