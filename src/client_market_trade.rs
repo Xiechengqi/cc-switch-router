@@ -806,16 +806,9 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
             method.settlement_asset = None;
         }
         "binance" => {
-            if method.account.is_some() {
-                return Err(AppError::BadRequest(
-                    "Binance UID is managed by verified API credentials".into(),
-                ));
-            }
-            method.token = None;
-            method.chain = None;
-            method.address = None;
-            method.instructions = None;
-            method.settlement_asset = None;
+            return Err(AppError::BadRequest(
+                "Binance payment method is managed by verified API credentials".into(),
+            ));
         }
         "crypto" => {
             let token = method.token.as_deref().unwrap_or_default();
@@ -1878,21 +1871,12 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("read API-managed Binance UID failed: {error}"))
             })?;
-        let mut methods = methods.to_vec();
-        let mut found_binance = false;
-        methods.retain_mut(|method| {
-            if method.kind != "binance" {
-                return true;
-            }
-            if found_binance {
-                return false;
-            }
-            found_binance = true;
-            method.account = canonical_binance_uid.clone();
-            method.settlement_asset = canonical_binance_uid.as_ref().map(|_| "USDT".into());
-            method.account.is_some() || method.qr_image_url.is_some()
-        });
-        if canonical_binance_uid.is_some() && !found_binance {
+        let mut methods = methods
+            .iter()
+            .filter(|method| method.kind != "binance")
+            .cloned()
+            .collect::<Vec<_>>();
+        if canonical_binance_uid.is_some() {
             methods.push(PaymentMethod {
                 kind: "binance".into(),
                 account: canonical_binance_uid,
@@ -5463,25 +5447,39 @@ mod tests {
     }
 
     #[test]
-    fn public_payment_profile_rejects_a_browser_supplied_binance_uid() {
-        let error = normalize_payment_method(PaymentMethod {
-            kind: " Binance ".into(),
-            account: Some("123456789".into()),
-            qr_image_url: Some("https://example.com/binance-qr.png".into()),
-            asset_url: None,
-            token: None,
-            chain: None,
-            address: None,
-            instructions: None,
-            settlement_asset: Some("USDT".into()),
-        })
-        .expect_err("Binance UID must only come from verified API credentials");
-
-        assert!(matches!(
-            error,
-            AppError::BadRequest(message)
-                if message == "Binance UID is managed by verified API credentials"
-        ));
+    fn public_payment_profile_rejects_browser_supplied_binance_methods() {
+        for method in [
+            PaymentMethod {
+                kind: " Binance ".into(),
+                account: Some("123456789".into()),
+                qr_image_url: None,
+                asset_url: None,
+                token: None,
+                chain: None,
+                address: None,
+                instructions: None,
+                settlement_asset: Some("USDT".into()),
+            },
+            PaymentMethod {
+                kind: "binance".into(),
+                account: None,
+                qr_image_url: Some("https://example.com/binance-qr.png".into()),
+                asset_url: None,
+                token: None,
+                chain: None,
+                address: None,
+                instructions: None,
+                settlement_asset: None,
+            },
+        ] {
+            let error = normalize_payment_method(method)
+                .expect_err("Binance methods must only come from verified API credentials");
+            assert!(matches!(
+                error,
+                AppError::BadRequest(message)
+                    if message == "Binance payment method is managed by verified API credentials"
+            ));
+        }
     }
 
     #[tokio::test]

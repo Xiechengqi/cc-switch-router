@@ -882,8 +882,6 @@ export const messages = {
     "account.qrPreviewAlt": "{method} preview",
     "account.phoneOrAccount": "Phone or account",
     "account.qrImageUrl": "QR image URL",
-    "account.binanceRecommend": "Recommended — anonymous and efficient. ",
-    "account.binanceRegister": "Register",
     "account.binanceAuto.title": "Automatic Binance receipt confirmation",
     "account.binanceAuto.receipts.open": "Receipt history",
     "account.binanceAuto.receipts.title": "Binance receipt history",
@@ -900,7 +898,7 @@ export const messages = {
     "account.binanceAuto.description":
       "Enter a read-only API key. Router detects its UID from Pay history before you confirm the binding.",
     "account.binanceAuto.state.unavailable": "Not enabled",
-    "account.binanceAuto.state.trial": "Trial mode",
+    "account.binanceAuto.state.trial": "Observe only",
     "account.binanceAuto.state.ready": "Ready to bind",
     "account.binanceAuto.state.actionRequired": "Rebind required",
     "account.binanceAuto.state.active": "Enabled",
@@ -909,7 +907,7 @@ export const messages = {
     "account.binanceAuto.notice.unavailable":
       "Automatic confirmation is not enabled on this Router. Contact the administrator to enable it.",
     "account.binanceAuto.notice.trial":
-      "Trial mode only observes incoming payments and does not settle invoices automatically.",
+      "Deposits are currently observed without settling invoices automatically.",
     "account.binanceAuto.notice.actionRequired":
       "Rebind and verify this account to enable automatic settlement.",
     "account.binanceAuto.notice.degraded":
@@ -4396,8 +4394,6 @@ export const messages = {
     "account.qrPreviewAlt": "{method}预览",
     "account.phoneOrAccount": "手机号或账号",
     "account.qrImageUrl": "收款码图片 URL",
-    "account.binanceRecommend": "推荐使用，匿名且高效，",
-    "account.binanceRegister": "去注册",
     "account.binanceAuto.title": "币安自动到账确认",
     "account.binanceAuto.receipts.open": "到账记录",
     "account.binanceAuto.receipts.title": "币安到账记录",
@@ -4414,14 +4410,14 @@ export const messages = {
     "account.binanceAuto.description":
       "填写只读 API Key，Router 会从 Pay 流水识别 UID，确认无误后再绑定。",
     "account.binanceAuto.state.unavailable": "未启用",
-    "account.binanceAuto.state.trial": "试运行",
+    "account.binanceAuto.state.trial": "仅观察",
     "account.binanceAuto.state.ready": "可以绑定",
     "account.binanceAuto.state.actionRequired": "需要重新绑定",
     "account.binanceAuto.state.active": "已启用",
     "account.binanceAuto.state.degraded": "需要处理",
     "account.binanceAuto.state.accountDisabled": "已停用",
     "account.binanceAuto.notice.unavailable": "当前 Router 尚未启用自动到账确认，请联系管理员。",
-    "account.binanceAuto.notice.trial": "当前为试运行模式：只观察到账，不会自动结算账单。",
+    "account.binanceAuto.notice.trial": "当前只观察到账，不会自动结算账单。",
     "account.binanceAuto.notice.actionRequired": "请重新绑定并验证该账户，以启用自动结算。",
     "account.binanceAuto.notice.degraded":
       "该账户暂时无法自动确认到账。请查看最近错误，修复凭据后重新验证。",

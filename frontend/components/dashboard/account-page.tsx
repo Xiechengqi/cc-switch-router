@@ -4,7 +4,6 @@ import * as React from "react";
 import { Button, Chip, ListBox, Select, toast } from "@heroui/react";
 import {
   BookOpen,
-  ExternalLink,
   KeyRound,
   Loader2,
   Plus,
@@ -52,7 +51,6 @@ type PaymentDraft = {
   alipayAccount: string;
   alipayQr: string;
   wechatQr: string;
-  binanceQr: string;
   crypto: CryptoDraft[];
   custom: string;
   contacts: ContactDraft[];
@@ -78,7 +76,6 @@ const emptyPaymentDraft = (): PaymentDraft => ({
   alipayAccount: "",
   alipayQr: "",
   wechatQr: "",
-  binanceQr: "",
   crypto: [emptyCrypto()],
   custom: "",
   contacts: [],
@@ -109,7 +106,6 @@ function serializePaymentDraft(draft: PaymentDraft) {
     alipayAccount: draft.alipayAccount.trim(),
     alipayQr: draft.alipayQr.trim(),
     wechatQr: draft.wechatQr.trim(),
-    binanceQr: draft.binanceQr.trim(),
     crypto: normalizeCrypto(draft.crypto),
     custom: draft.custom.trim(),
     contacts: normalizeContacts(draft.contacts),
@@ -182,14 +178,13 @@ export function AccountPaymentsPanel() {
     ? "bg-emerald-100 text-emerald-700"
     : binanceUiState === "degraded"
       ? "bg-rose-100 text-rose-700"
-      : binanceUiState === "trial" || binanceUiState === "actionRequired"
+      : binanceUiState === "actionRequired"
         ? "bg-amber-100 text-amber-800"
         : "bg-slate-100 text-slate-600";
 
   const applyProfile = React.useCallback((methods: ClientMarketPaymentMethod[], contacts: PaymentContact[] = []) => {
     const alipay = methods.find((method) => method.kind === "alipay");
     const wechat = methods.find((method) => method.kind === "wechat");
-    const binance = methods.find((method) => method.kind === "binance");
     const customMethod = methods.find((method) => method.kind === "custom");
     const cryptoMethods = methods
       .filter((method) => method.kind === "crypto")
@@ -204,7 +199,6 @@ export function AccountPaymentsPanel() {
       alipayAccount: alipay?.account || "",
       alipayQr: alipay?.qrImageUrl || "",
       wechatQr: wechat?.qrImageUrl || "",
-      binanceQr: binance?.qrImageUrl || "",
       crypto: cryptoMethods.length ? cryptoMethods : [emptyCrypto()],
       custom: customMethod?.instructions || "",
       contacts: contacts
@@ -281,12 +275,6 @@ export function AccountPaymentsPanel() {
       });
     }
     if (draft.wechatQr.trim()) methods.push({ kind: "wechat", qrImageUrl: draft.wechatQr.trim() });
-    if (draft.binanceQr.trim()) {
-      methods.push({
-        kind: "binance",
-        qrImageUrl: draft.binanceQr.trim() || undefined,
-      });
-    }
     for (const method of draft.crypto) {
       if (method.address.trim()) {
         methods.push({
@@ -598,34 +586,10 @@ export function AccountPaymentsPanel() {
           )}
         </div>
 
-        <div className="grid gap-4">
-          <div className="grid gap-1">
-            <div className="flex items-center gap-2">
-              <PaymentMethodIcons kinds={["binance"]} />
-              <h3 className="text-sm font-semibold">{t("billing.payment.binance")}</h3>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {t("account.binanceRecommend")}
-              <a
-                href="https://www.bsmkweb.cc/register?ref=310371521"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-0.5 font-medium text-primary hover:underline"
-              >
-                {t("account.binanceRegister")}
-                <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
-              </a>
-            </p>
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            {qrField("binance", draft.binanceQr, (value) => patchDraft({ binanceQr: value }), t("account.qrImageUrl"))}
-          </div>
-        </div>
-
-        <div className="grid gap-4 rounded-lg border border-amber-200 bg-amber-50/50 p-4">
+        <div className="grid gap-4 rounded-lg border border-border p-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex min-w-0 items-start gap-2">
-              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
               <div>
                 <h3 className="text-sm font-semibold">{t("account.binanceAuto.title")}</h3>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
@@ -642,7 +606,7 @@ export function AccountPaymentsPanel() {
                 <BookOpen className="h-4 w-4" aria-hidden />
                 {t("account.binanceAuto.guide.open")}
               </Button>
-              {binanceStatus ? (
+              {binanceStatus && binanceUiState !== "trial" ? (
                 <Chip size="sm" variant="soft" className={binanceUiStateClass}>
                   {t(`account.binanceAuto.state.${binanceUiState}`)}
                 </Chip>
@@ -661,7 +625,7 @@ export function AccountPaymentsPanel() {
             </p>
           ) : null}
           {binanceStatus && binanceUiState === "trial" ? (
-            <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
+            <p className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-700">
               {t("account.binanceAuto.notice.trial")}
             </p>
           ) : null}

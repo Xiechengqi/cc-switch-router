@@ -2884,20 +2884,8 @@ fn sync_public_binance_uid_tx(
     let email = normalize_payment_owner_email(owner_email.unwrap_or(&stored_email))?;
     let mut methods: Vec<PaymentMethod> = serde_json::from_str(&methods_json)
         .map_err(|_| AppError::Internal("stored payment methods are invalid".into()))?;
-    let mut found_binance = false;
-    methods.retain_mut(|method| {
-        if method.kind != "binance" {
-            return true;
-        }
-        if found_binance {
-            return false;
-        }
-        found_binance = true;
-        method.account = canonical_uid.map(str::to_string);
-        method.settlement_asset = canonical_uid.map(|_| PAYMENT_ASSET.to_string());
-        method.account.is_some() || method.qr_image_url.is_some()
-    });
-    if canonical_uid.is_some() && !found_binance {
+    methods.retain(|method| method.kind != "binance");
+    if canonical_uid.is_some() {
         methods.push(PaymentMethod {
             kind: "binance".into(),
             account: canonical_uid.map(str::to_string),
@@ -5974,7 +5962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_managed_uid_survives_qr_edits_and_is_removed_with_credentials() {
+    async fn api_managed_uid_rejects_qr_edits_and_is_removed_with_credentials() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let fixture = settlement_fixture(&store, "api-managed-public-uid").await;
         let qr_url = "https://example.com/binance-qr.png";
@@ -5996,14 +5984,14 @@ mod tests {
                 None,
             )
             .await
-            .expect("save an independent Binance QR URL");
+            .expect("ignore an independent Binance QR URL");
         let method = profile
             .methods
             .iter()
             .find(|method| method.kind == "binance")
             .expect("canonical Binance method");
         assert_eq!(method.account.as_deref(), Some("123456789"));
-        assert_eq!(method.qr_image_url.as_deref(), Some(qr_url));
+        assert_eq!(method.qr_image_url, None);
         assert_eq!(method.settlement_asset.as_deref(), Some(PAYMENT_ASSET));
 
         store
@@ -6021,30 +6009,25 @@ mod tests {
         let profile = store
             .client_market_payment_profile(&fixture.supplier.user_id, &fixture.supplier.email)
             .await
-            .expect("read QR-only payment profile");
-        let method = profile
-            .methods
-            .iter()
-            .find(|method| method.kind == "binance")
-            .expect("QR-only Binance method is retained");
-        assert_eq!(method.account, None);
-        assert_eq!(method.qr_image_url.as_deref(), Some(qr_url));
-        assert_eq!(method.settlement_asset, None);
+            .expect("read payment profile after credential deletion");
+        assert!(
+            profile
+                .methods
+                .iter()
+                .all(|method| method.kind != "binance")
+        );
 
-        let normalized: String = store
+        let normalized_count: i64 = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT method_json FROM account_payment_methods
+                "SELECT COUNT(*) FROM account_payment_methods
                  WHERE profile_user_id = ?1 AND kind = 'binance'",
                 params![fixture.supplier.user_id],
                 |row| row.get(0),
             )
-            .expect("read normalized QR-only Binance method");
-        assert_eq!(
-            serde_json::from_str::<PaymentMethod>(&normalized).expect("decode normalized method"),
-            method.clone()
-        );
+            .expect("count normalized Binance methods");
+        assert_eq!(normalized_count, 0);
     }
 }
