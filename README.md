@@ -256,11 +256,11 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `free_access = 1` 的公开免费 Share 共用的单真实用户 IP 并发上限；v1 `forSale=Free` 只在 migration 20 的持久化迁移边界识别，不属于 active contract；设为 `0` 可关闭 |
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE` | `disabled` | 币安自动到账总开关：`disabled`、`shadow` 或 `enabled`；修改后需重启。`disabled` 还会持久化把全部绑定降为账户级 shadow，`shadow` 读取和匹配但不改账，并强制该阶段的新绑定保持账户级 shadow |
-| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY` | 空 | 32 字节凭据加密主密钥，使用 64 位 hex 或 base64；`shadow`/`enabled` 必填，禁止与数据库一起存放；密钥本身变化后所有商家凭据也必须重新绑定 |
-| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION` | `1` | 当前主密钥版本（1-1000000）；版本变化后，使用旧版本加密的商家凭据必须重新绑定 |
-| `CC_SWITCH_ROUTER_BINANCE_API_BASE` | `https://api.binance.com` | Binance API base；生产仅接受 Binance 官方 `api`/`api-gcp`/`api1`–`api4.binance.com` 的标准 HTTPS 端口，loopback 地址仅用于测试 |
-| `CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION` | Router tunnel domain（为空时 `local`） | 唯一负责轮询和结算币安付款的 Region；首期必须保证同一付款账户只有一个 home Region |
-| `CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS` | `4` | 存在待付款或迟到保护账单时的轮询间隔，范围 2-60 秒 |
+| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY` | 自动托管 | 高级部署覆盖项。默认在 Router 数据目录自动生成权限为 `0600` 的 `binance-master-key`，无需在 Settings 配置；变更密钥后已有商家必须重新绑定 |
+| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION` | `1` | 隐藏的高级部署覆盖项；普通部署保持默认值 |
+| `CC_SWITCH_ROUTER_BINANCE_API_BASE` | `https://api.binance.com` | 隐藏的测试/高级部署覆盖项；普通部署固定使用 Binance 官方 API |
+| `CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION` | Router tunnel domain（为空时 `local`） | 隐藏的多 Region 部署覆盖项；普通部署自动使用稳定的 Router tunnel domain |
+| `CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS` | `4` | 隐藏的高级部署覆盖项；普通部署使用安全默认值 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
 ### 统一入口 DNS 与 TLS

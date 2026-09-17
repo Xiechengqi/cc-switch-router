@@ -226,8 +226,11 @@ async fn main() -> Result<()> {
         &config,
     )?;
     let binance_settlement = Arc::new(
-        crate::binance_settlement::BinanceSettlementRuntime::from_env(&config.tunnel_domain)
-            .context("configure Binance auto-settlement failed")?,
+        crate::binance_settlement::BinanceSettlementRuntime::from_env(
+            &config.tunnel_domain,
+            &config.data_dir,
+        )
+        .context("configure Binance auto-settlement failed")?,
     );
     let store = AppStore::new(&config)?;
     let share_abuse = Arc::new(ShareAbuseTracker::new(

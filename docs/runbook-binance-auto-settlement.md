@@ -17,7 +17,7 @@
 - 凭据与原始流水使用 XChaCha20-Poly1305 加密。凭据 AAD 绑定付款账户、商家用户和 credential revision；流水 AAD 绑定付款账户和 transaction ID，流水同时冻结当时的 UID、credential revision 与 key version，避免轮换后审计串账。`counterpartyId` 与 `payerInfo.binanceId` 属于不同身份命名空间，分别保存为带不同 context 的主密钥 HMAC 指纹；旧版混合指纹只标记为 `legacy_mixed`，不会冒充稳定 counterparty 指纹。缺少稳定 `counterpartyId` 的可匹配入账必须进入人工复核，不能自动结算。
 - 首次绑定必须在最近 30 天历史中至少找到一笔能明确证明相同账户 UID 的 Binance Pay 流水（正向流水的收款 UID，或负向流水的付款 UID）；证明来源会分别记录为 `receiver_history` / `payer_history`。空历史或相关 UID 缺失时拒绝绑定，商家需先接收一笔受控小额转账再重试。这避免未证明账户所有权的用户抢占他人公开 UID。绑定完成后，个别流水缺少收款方 UID 时才可依赖已经确认的账户作用域、唯一金额和时间窗；明确返回不同 UID 的流水始终拒绝。
 - 自动付款 UI 只使用账单冻结且与 API 绑定一致的 UID，不展示商家上传的二维码；Router 无法验证二维码内容，二维码只保留在人工付款资料中供用户自行核对。
-- 同一 Binance UID 及同一 API Key 指纹在整个 Router 内只能绑定一次，避免同一笔账户流水在两个商家域中重复匹配。付款 home Region 是持久化账户身份的一部分；生产必须显式配置并保持稳定。
+- 同一 Binance UID 及同一 API Key 指纹在整个 Router 内只能绑定一次，避免同一笔账户流水在两个商家域中重复匹配。付款 home Region 是持久化账户身份的一部分；普通部署自动使用稳定的 tunnel domain，多 Region 部署可显式覆盖且之后必须保持稳定。
 - 自动匹配要求：正向金额、USDT、`C2C`、唯一精确金额、交易时间位于 intent 创建前 120 秒至迟到宽限期内、账单仍可支付。
 - 买家取消、改走人工付款、争议或作废后的金额仍轮询到迟到保护结束，到账只进入人工对账而不会自动改账。同一 UID 的只读 Key 轮换仍属于同一付款账户域，会保留活动及迟到保护 intent；只有绑定 UID 变化或账户停用才切断旧账户域。
 - `transactionId` 在付款账户内唯一，外部收据对账单、intent 和流水均有唯一约束。并发轮询、重试以及人工/自动竞争不能重复结算。
@@ -25,26 +25,19 @@
 
 ## 配置
 
-生成独立的 32 字节主密钥，不要复用数据库 Token 或其他应用密钥：
-
-```bash
-openssl rand -hex 32
-```
-
 生产示例：
 
 ```dotenv
 CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE=shadow
-CC_SWITCH_ROUTER_BINANCE_MASTER_KEY=<64-hex-characters>
-CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION=1
-CC_SWITCH_ROUTER_BINANCE_API_BASE=https://api.binance.com
-CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION=region-a
-CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS=4
 ```
+
+普通部署只需配置模式。Router 会在数据目录自动生成并以 `0600` 权限保存
+`binance-master-key`，API 地址、密钥版本、付款归属 Region 和轮询间隔均使用安全默认值。
+外部 Secret、多 Region 或本地测试部署仍可通过对应环境变量覆盖这些隐藏参数。
 
 生产 API base 只接受 `api.binance.com`、`api-gcp.binance.com` 和 `api1` 至 `api4.binance.com` 的标准 HTTPS 端口；任意第三方 HTTPS 主机都会在启动时被拒绝，防止配置错误把商家凭据发送到非 Binance 端点。HTTP/HTTPS loopback 仅用于本机测试。
 
-主密钥必须由进程密钥管理设施注入，并与业务数据库分开备份。当前只装载一个 key version；轮换版本后，让商家重新绑定凭据。版本不一致时系统会在生成付款 intent 前拒绝；即使运维误换主密钥却沿用了相同 version，创建或刷新 intent 前的密文自检也会原子降级账户并取消活动 intent。系统绝不会回退明文或尝试错误密钥。
+自动生成的主密钥必须与数据库一起纳入受保护备份，否则恢复数据库后无法解密商家凭据。使用外部 Secret 的高级部署可通过 `openssl rand -hex 32` 生成独立密钥，并应与数据库分开保管。当前只装载一个 key version；轮换版本后，让商家重新绑定凭据。版本不一致时系统会在生成付款 intent 前拒绝；即使运维误换主密钥却沿用了相同 version，创建或刷新 intent 前的密文自检也会原子降级账户并取消活动 intent。系统绝不会回退明文或尝试错误密钥。
 
 虽然流水接口是 Binance 的公开只读 API，把个人账户用于商业收款仍可能受账户所在地、KYC 类型和 Binance 条款限制。上线方必须自行确认授权与合规性；技术上的只读权限校验不等于 Binance 对商业用途的许可。
 

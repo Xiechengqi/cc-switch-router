@@ -3,6 +3,8 @@ mod crypto;
 mod store;
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
@@ -15,6 +17,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::{TimeZone, Utc};
 use futures_util::{StreamExt, stream};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
@@ -48,9 +51,12 @@ const MAX_POLL_SCAN_WINDOW_MS: i64 = 60 * 60 * 1_000;
 const PERMISSION_REVERIFY_HOURS: i64 = 24;
 const VERIFICATION_ATTEMPT_COOLDOWN_SECS: u64 = 30;
 const MAX_VERIFICATION_ATTEMPT_SCOPES: usize = 10_000;
-pub(crate) const MIN_POLL_INTERVAL_SECS: i64 = 2;
-pub(crate) const MAX_POLL_INTERVAL_SECS: i64 = 60;
-pub(crate) const MAX_MASTER_KEY_VERSION: i64 = 1_000_000;
+const DEFAULT_MASTER_KEY_VERSION: i64 = 1;
+const DEFAULT_POLL_INTERVAL_SECS: i64 = 4;
+const MASTER_KEY_FILE: &str = "binance-master-key";
+const MIN_POLL_INTERVAL_SECS: i64 = 2;
+const MAX_POLL_INTERVAL_SECS: i64 = 60;
+const MAX_MASTER_KEY_VERSION: i64 = 1_000_000;
 const OFFICIAL_BINANCE_API_HOSTS: &[&str] = &[
     "api.binance.com",
     "api-gcp.binance.com",
@@ -111,29 +117,18 @@ pub struct BinanceSettlementRuntime {
 }
 
 impl BinanceSettlementRuntime {
-    pub fn from_env(default_region: &str) -> anyhow::Result<Self> {
+    pub fn from_env(default_region: &str, data_dir: &FsPath) -> anyhow::Result<Self> {
         let mode = GlobalMode::parses(
             std::env::var("CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE").ok(),
         )?;
-        let key_text = std::env::var("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY")
-            .ok()
-            .map(Zeroizing::new);
-        let key = key_text
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| parse_master_key(value.as_str()))
-            .transpose()?;
-        if mode != GlobalMode::Disabled && key.is_none() {
-            bail!(
-                "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY is required when Binance auto-settlement is not disabled"
-            );
-        }
+        let key_override = std::env::var("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY").ok();
+        let key = load_or_create_master_key(data_dir, key_override.as_deref())?;
         let key_version = std::env::var("CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION")
             .ok()
             .map(|value| value.parse::<i64>())
             .transpose()
             .context("invalid CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION")?
-            .unwrap_or(1);
+            .unwrap_or(DEFAULT_MASTER_KEY_VERSION);
         if !(1..=MAX_MASTER_KEY_VERSION).contains(&key_version) {
             bail!(
                 "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION must be between 1 and {MAX_MASTER_KEY_VERSION}"
@@ -162,7 +157,7 @@ impl BinanceSettlementRuntime {
             .map(|value| value.parse::<i64>())
             .transpose()
             .context("invalid CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS")?
-            .unwrap_or(4);
+            .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
         if !(MIN_POLL_INTERVAL_SECS..=MAX_POLL_INTERVAL_SECS).contains(&poll_interval_secs) {
             bail!(
                 "CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS must be between {MIN_POLL_INTERVAL_SECS} and {MAX_POLL_INTERVAL_SECS}"
@@ -170,7 +165,7 @@ impl BinanceSettlementRuntime {
         }
         Ok(Self {
             mode,
-            cipher: key.map(|key| CredentialCipher::from_zeroizing(key, key_version)),
+            cipher: Some(CredentialCipher::from_zeroizing(key, key_version)),
             client: BinanceClient::new(base_url)?,
             payment_home_region: Arc::from(region),
             poll_interval_secs,
@@ -1253,9 +1248,31 @@ fn parse_master_key(value: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
     Ok(key)
 }
 
-pub(crate) fn validate_master_key(value: &str) -> anyhow::Result<()> {
-    let _ = parse_master_key(value)?;
-    Ok(())
+fn load_or_create_master_key(
+    data_dir: &FsPath,
+    configured: Option<&str>,
+) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    if let Some(value) = configured.filter(|value| !value.trim().is_empty()) {
+        return parse_master_key(&value)
+            .context("invalid CC_SWITCH_ROUTER_BINANCE_MASTER_KEY override");
+    }
+
+    let path = data_dir.join(MASTER_KEY_FILE);
+    if !path.exists() {
+        let mut generated = Zeroizing::new([0_u8; 32]);
+        rand::rngs::OsRng.fill_bytes(generated.as_mut());
+        let encoded = Zeroizing::new(format!("{}\n", hex::encode(generated.as_ref())));
+        crate::secure_file::atomic_create_file_mode(&path, encoded.as_bytes(), 0o600)
+            .with_context(|| format!("create Binance master key: {}", path.display()))?;
+    }
+    crate::secure_file::enforce_file_mode(&path, 0o600)
+        .with_context(|| format!("protect Binance master key: {}", path.display()))?;
+    let encoded = Zeroizing::new(
+        fs::read_to_string(&path)
+            .with_context(|| format!("read Binance master key: {}", path.display()))?,
+    );
+    parse_master_key(&encoded)
+        .with_context(|| format!("invalid Binance master key file: {}", path.display()))
 }
 
 pub(crate) fn normalize_payment_home_region(value: &str) -> anyhow::Result<String> {
@@ -1362,9 +1379,43 @@ mod tests {
     fn master_key_accepts_hex_and_rejects_short_values() {
         assert_eq!(*parse_master_key(&"ab".repeat(32)).unwrap(), [0xab; 32]);
         assert!(
-            validate_master_key(&base64::engine::general_purpose::STANDARD.encode([7; 32])).is_ok()
+            parse_master_key(&base64::engine::general_purpose::STANDARD.encode([7; 32])).is_ok()
         );
         assert!(parse_master_key("short").is_err());
+    }
+
+    #[test]
+    fn master_key_is_generated_once_with_private_permissions() {
+        let root = std::env::temp_dir().join(format!(
+            "cc-switch-router-binance-key-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first = load_or_create_master_key(&root, None).expect("generate managed key");
+        let second = load_or_create_master_key(&root, None).expect("reload managed key");
+        assert_eq!(*first, *second);
+        let path = root.join(MASTER_KEY_FILE);
+        assert_eq!(fs::read_to_string(&path).unwrap().trim().len(), 64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_master_key_override_does_not_create_a_file() {
+        let root = std::env::temp_dir().join(format!(
+            "cc-switch-router-binance-key-override-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let key = load_or_create_master_key(&root, Some(&"cd".repeat(32)))
+            .expect("load configured key override");
+        assert_eq!(*key, [0xcd; 32]);
+        assert!(!root.join(MASTER_KEY_FILE).exists());
     }
 
     #[test]

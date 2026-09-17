@@ -29,7 +29,7 @@ const frontendOccurrences = [...frontendBlock[1].matchAll(/"(CC_SWITCH_ROUTER_[A
 const frontendKeys = [...new Set(frontendOccurrences)].sort();
 
 const errors = [];
-if (schemaKeys.length !== 135) errors.push(`expected 135 Settings fields, found ${schemaKeys.length}`);
+if (schemaKeys.length !== 130) errors.push(`expected 130 Settings fields, found ${schemaKeys.length}`);
 for (const [label, occurrences, unique] of [
   ["Settings schema", schemaKeyOccurrences, schemaKeys],
   ["default env", defaultEnvOccurrences, defaultEnvKeys],
