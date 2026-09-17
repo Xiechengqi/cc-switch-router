@@ -84,7 +84,7 @@ pub fn value_as_identifier(value: &serde_json::Value) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerificationResult {
     pub reading_enabled: bool,
@@ -93,11 +93,19 @@ pub struct VerificationResult {
     pub uid_confirmation_source: Option<UidConfirmationSource>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UidConfirmationSource {
     ReceiverHistory,
     PayerHistory,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDiscovery {
+    pub binance_uid: String,
+    pub verification: VerificationResult,
+    pub evidence_count: usize,
 }
 
 impl UidConfirmationSource {
@@ -176,11 +184,10 @@ impl BinanceClient {
         Ok(Self { http, base_url })
     }
 
-    pub async fn verify_credentials(
+    pub async fn verify_permissions(
         &self,
         credentials: &BinanceCredentials,
-        expected_uid: &str,
-    ) -> Result<VerificationResult, BinanceApiError> {
+    ) -> Result<(), BinanceApiError> {
         let restrictions: ApiRestrictions = self
             .signed_get(
                 "/sapi/v1/account/apiRestrictions",
@@ -194,12 +201,20 @@ impl BinanceClient {
         if restrictions.has_dangerous_permissions() {
             return Err(BinanceApiError::new("DANGEROUS_PERMISSION_ENABLED"));
         }
+        Ok(())
+    }
+
+    async fn verified_uid_observations(
+        &self,
+        credentials: &BinanceCredentials,
+    ) -> Result<Vec<(String, UidConfirmationSource)>, BinanceApiError> {
+        self.verify_permissions(credentials).await?;
         let end_ms = Utc::now().timestamp_millis();
         let start_ms = end_ms.saturating_sub(30 * 24 * 60 * 60 * 1_000);
         let transactions = self
             .pay_transactions(credentials, start_ms, end_ms, 100)
             .await?;
-        let observed_account_uids = transactions
+        Ok(transactions
             .iter()
             .filter_map(|transaction| {
                 parse_decimal_units(&transaction.amount, 10_000)
@@ -216,7 +231,55 @@ impl BinanceClient {
                         std::cmp::Ordering::Equal => None,
                     })
             })
-            .collect::<Vec<_>>();
+            .collect())
+    }
+
+    pub async fn discover_account(
+        &self,
+        credentials: &BinanceCredentials,
+    ) -> Result<AccountDiscovery, BinanceApiError> {
+        let observations = self.verified_uid_observations(credentials).await?;
+        if observations.is_empty() {
+            return Err(BinanceApiError::new("ACCOUNT_UID_UNCONFIRMED"));
+        }
+        if observations
+            .iter()
+            .any(|(uid, _)| !(6..=20).contains(&uid.len()))
+        {
+            return Err(BinanceApiError::new("BINANCE_RESPONSE_INVALID"));
+        }
+        let unique_uids = observations
+            .iter()
+            .map(|(uid, _)| uid.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_uids.len() != 1 {
+            return Err(BinanceApiError::new("ACCOUNT_UID_AMBIGUOUS"));
+        }
+        let binance_uid = observations[0].0.clone();
+        let uid_confirmation_source = observations
+            .iter()
+            .find_map(|(_, source)| {
+                (*source == UidConfirmationSource::ReceiverHistory).then_some(*source)
+            })
+            .or_else(|| observations.first().map(|(_, source)| *source));
+        Ok(AccountDiscovery {
+            binance_uid,
+            verification: VerificationResult {
+                reading_enabled: true,
+                dangerous_permissions_disabled: true,
+                uid_confirmed: true,
+                uid_confirmation_source,
+            },
+            evidence_count: observations.len(),
+        })
+    }
+
+    pub async fn verify_credentials(
+        &self,
+        credentials: &BinanceCredentials,
+        expected_uid: &str,
+    ) -> Result<VerificationResult, BinanceApiError> {
+        let observed_account_uids = self.verified_uid_observations(credentials).await?;
         if observed_account_uids
             .iter()
             .any(|(observed_uid, _)| observed_uid != expected_uid)
@@ -416,6 +479,20 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     type MockResponse = (u16, Vec<(&'static str, &'static str)>, &'static str, u64);
+
+    const SAFE_RESTRICTIONS: &str = r#"{
+        "enableReading": true,
+        "enableWithdrawals": false,
+        "enableInternalTransfer": false,
+        "permitsUniversalTransfer": false,
+        "enableSpotAndMarginTrading": false,
+        "enableMargin": false,
+        "enableFutures": false,
+        "enablePortfolioMarginTrading": false,
+        "enableVanillaOptions": false,
+        "enableFixApiTrade": false,
+        "enableFixReadOnly": true
+    }"#;
 
     async fn mock_server(
         responses: Vec<MockResponse>,
@@ -743,5 +820,132 @@ mod tests {
             Some(UidConfirmationSource::PayerHistory)
         );
         assert_eq!(requests.await.expect("captured requests").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn account_discovery_uses_the_receiver_uid_for_incoming_history() {
+        let transactions = r#"{
+            "success": true,
+            "data": [{
+                "transactionId": "RECEIVER_ACCOUNT_PROOF",
+                "transactionTime": 1788325910559,
+                "amount": "0.10000000",
+                "currency": "USDT",
+                "receiverInfo": {"binanceId": "123456789"}
+            }]
+        }"#;
+        let (base_url, requests) = mock_server(vec![
+            (200, vec![], SAFE_RESTRICTIONS, 0),
+            (200, vec![], transactions, 0),
+        ])
+        .await;
+        let client = BinanceClient::new(base_url).expect("Binance client");
+
+        let discovery = client
+            .discover_account(&credentials())
+            .await
+            .expect("incoming receiver UID should identify the signed account");
+
+        assert_eq!(discovery.binance_uid, "123456789");
+        assert_eq!(discovery.evidence_count, 1);
+        assert_eq!(
+            discovery.verification.uid_confirmation_source,
+            Some(UidConfirmationSource::ReceiverHistory)
+        );
+        assert_eq!(requests.await.expect("captured requests").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn account_discovery_uses_the_payer_uid_for_outgoing_history() {
+        let transactions = r#"{
+            "success": true,
+            "data": [{
+                "transactionId": "PAYER_ACCOUNT_PROOF",
+                "transactionTime": 1788325910559,
+                "amount": "-0.10000000",
+                "currency": "USDT",
+                "payerInfo": {"binanceId": 987654321}
+            }]
+        }"#;
+        let (base_url, _) = mock_server(vec![
+            (200, vec![], SAFE_RESTRICTIONS, 0),
+            (200, vec![], transactions, 0),
+        ])
+        .await;
+        let client = BinanceClient::new(base_url).expect("Binance client");
+
+        let discovery = client
+            .discover_account(&credentials())
+            .await
+            .expect("outgoing payer UID should identify the signed account");
+
+        assert_eq!(discovery.binance_uid, "987654321");
+        assert_eq!(
+            discovery.verification.uid_confirmation_source,
+            Some(UidConfirmationSource::PayerHistory)
+        );
+    }
+
+    #[tokio::test]
+    async fn account_discovery_rejects_history_without_account_identity() {
+        let transactions = r#"{
+            "success": true,
+            "data": [{
+                "transactionId": "NO_ACCOUNT_PROOF",
+                "transactionTime": 1788325910559,
+                "amount": "0.10000000",
+                "currency": "USDT",
+                "receiverInfo": {}
+            }]
+        }"#;
+        let (base_url, _) = mock_server(vec![
+            (200, vec![], SAFE_RESTRICTIONS, 0),
+            (200, vec![], transactions, 0),
+        ])
+        .await;
+        let client = BinanceClient::new(base_url).expect("Binance client");
+
+        let error = client
+            .discover_account(&credentials())
+            .await
+            .expect_err("history without a signed-account UID must not create a binding");
+
+        assert_eq!(error.code, "ACCOUNT_UID_UNCONFIRMED");
+    }
+
+    #[tokio::test]
+    async fn account_discovery_fails_closed_on_conflicting_uids() {
+        let transactions = r#"{
+            "success": true,
+            "data": [
+                {
+                    "transactionId": "FIRST_ACCOUNT_PROOF",
+                    "transactionTime": 1788325910559,
+                    "amount": "0.10000000",
+                    "currency": "USDT",
+                    "receiverInfo": {"binanceId": "123456789"}
+                },
+                {
+                    "transactionId": "SECOND_ACCOUNT_PROOF",
+                    "transactionTime": 1788325910560,
+                    "amount": "-0.10000000",
+                    "currency": "USDT",
+                    "payerInfo": {"binanceId": "987654321"}
+                }
+            ]
+        }"#;
+        let (base_url, _) = mock_server(vec![
+            (200, vec![], SAFE_RESTRICTIONS, 0),
+            (200, vec![], transactions, 0),
+        ])
+        .await;
+        let client = BinanceClient::new(base_url).expect("Binance client");
+
+        let error = client
+            .discover_account(&credentials())
+            .await
+            .expect_err("conflicting account identities must fail closed");
+
+        assert_eq!(error.code, "ACCOUNT_UID_AMBIGUOUS");
     }
 }

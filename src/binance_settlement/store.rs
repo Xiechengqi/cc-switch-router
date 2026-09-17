@@ -49,6 +49,7 @@ pub struct BinancePaymentAccountView {
     pub last_poll_error_code: Option<String>,
     pub consecutive_failures: i64,
     pub credential_revision: i64,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -365,9 +366,10 @@ impl AppStore {
                     payment_home_region, permissions_verified_at, uid_confirmed,
                     uid_confirmation_source, last_poll_success_at,
                     last_poll_error_code, consecutive_failures,
-                    credential_revision, updated_at
+                    credential_revision, created_at, updated_at
              FROM binance_payment_accounts
-             WHERE supplier_user_id = ?1 AND payment_home_region = ?2",
+             WHERE supplier_user_id = ?1 AND payment_home_region = ?2
+               AND credentials_ciphertext != ''",
             params![supplier_user_id, region],
             |row| {
                 Ok(BinancePaymentAccountView {
@@ -383,7 +385,8 @@ impl AppStore {
                     last_poll_error_code: row.get(9)?,
                     consecutive_failures: row.get(10)?,
                     credential_revision: row.get(11)?,
-                    updated_at: row.get(12)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                 })
             },
         )
@@ -398,7 +401,6 @@ impl AppStore {
         binance_uid: &str,
     ) -> Result<(String, i64), AppError> {
         let conn = self.conn.lock().await;
-        ensure_public_binance_method(&conn, supplier_user_id, binance_uid)?;
         let uid_owner = conn
             .query_row(
                 "SELECT supplier_user_id, payment_home_region
@@ -430,10 +432,59 @@ impl AppStore {
             .unwrap_or_else(|| (Uuid::new_v4().to_string(), 1)))
     }
 
+    pub async fn binance_assert_account_binding_pending(
+        &self,
+        supplier_user_id: &str,
+        region: &str,
+        binance_uid: &str,
+        account_id: &str,
+        credential_revision: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let identity_conflict = conn
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM binance_payment_accounts
+                     WHERE id != ?1 AND binance_uid = ?2
+                 )",
+                params![account_id, binance_uid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("check pending Binance account identity"))?;
+        if identity_conflict != 0 {
+            return Err(AppError::Conflict(
+                "this Binance UID is already bound to another payment account".into(),
+            ));
+        }
+        let existing = conn
+            .query_row(
+                "SELECT id, credential_revision FROM binance_payment_accounts
+                 WHERE supplier_user_id = ?1 AND payment_home_region = ?2",
+                params![supplier_user_id, region],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(map_db("read pending Binance account binding"))?;
+        let pending = match existing {
+            Some((current_id, current_revision)) => {
+                current_id == account_id
+                    && current_revision.checked_add(1) == Some(credential_revision)
+            }
+            None => credential_revision == 1,
+        };
+        if !pending {
+            return Err(AppError::Conflict(
+                "Binance account binding changed during verification; retry".into(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn binance_save_verified_account(
         &self,
         supplier_user_id: &str,
+        owner_email: &str,
         account_id: &str,
         region: &str,
         binance_uid: &str,
@@ -460,7 +511,6 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Binance account binding"))?;
-        ensure_public_binance_method(&tx, supplier_user_id, binance_uid)?;
         let identity_conflict = tx
             .query_row(
                 "SELECT EXISTS (
@@ -637,6 +687,13 @@ impl AppStore {
                 }
             }
         }
+        sync_public_binance_uid_tx(
+            &tx,
+            supplier_user_id,
+            Some(owner_email),
+            Some(binance_uid),
+            &now,
+        )?;
         tx.commit()
             .map_err(map_db("commit Binance account binding"))?;
         drop(conn);
@@ -891,6 +948,7 @@ impl AppStore {
                 params![account.0, now],
             )
             .map_err(map_db("purge Binance payment credentials"))?;
+            sync_public_binance_uid_tx(&tx, supplier_user_id, None, None, &now)?;
         } else {
             tx.execute(
                 "UPDATE binance_payment_accounts
@@ -2779,33 +2837,123 @@ fn ensure_invoice_actor(
     Ok(())
 }
 
-fn ensure_public_binance_method(
+fn normalize_payment_owner_email(value: &str) -> Result<String, AppError> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 320
+        || value.chars().any(char::is_control)
+        || !value.contains('@')
+    {
+        return Err(AppError::BadRequest("invalid account email".into()));
+    }
+    Ok(value)
+}
+
+fn sync_public_binance_uid_tx(
     conn: &Connection,
     supplier_user_id: &str,
-    expected_uid: &str,
+    owner_email: Option<&str>,
+    canonical_uid: Option<&str>,
+    now: &str,
 ) -> Result<(), AppError> {
-    let methods_json = conn
+    let existing = conn
         .query_row(
-            "SELECT methods_json FROM account_payment_profiles WHERE user_id = ?1",
+            "SELECT owner_email, methods_json, COALESCE(contacts_json, '[]')
+               FROM account_payment_profiles WHERE user_id = ?1",
             params![supplier_user_id],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
-        .map_err(map_db("read public Binance payment method"))?
-        .ok_or_else(|| {
-            AppError::Conflict("save a public Binance UID before binding API credentials".into())
-        })?;
-    let methods: Vec<PaymentMethod> = serde_json::from_str(&methods_json)
-        .map_err(|_| AppError::Internal("stored payment methods are invalid".into()))?;
-    let valid = methods.iter().any(|method| {
-        method.kind == "binance"
-            && method.account.as_deref() == Some(expected_uid)
-            && method.settlement_asset.as_deref().unwrap_or(PAYMENT_ASSET) == PAYMENT_ASSET
+        .map_err(map_db("read public Binance payment profile"))?;
+    if existing.is_none() && canonical_uid.is_none() {
+        return Ok(());
+    }
+    let (stored_email, methods_json, contacts_json) = existing.unwrap_or_else(|| {
+        (
+            owner_email.unwrap_or_default().to_string(),
+            "[]".into(),
+            "[]".into(),
+        )
     });
-    if !valid {
-        return Err(AppError::Conflict(
-            "the bound Binance UID must match the public Binance payment method".into(),
-        ));
+    let email = normalize_payment_owner_email(owner_email.unwrap_or(&stored_email))?;
+    let mut methods: Vec<PaymentMethod> = serde_json::from_str(&methods_json)
+        .map_err(|_| AppError::Internal("stored payment methods are invalid".into()))?;
+    let mut found_binance = false;
+    methods.retain_mut(|method| {
+        if method.kind != "binance" {
+            return true;
+        }
+        if found_binance {
+            return false;
+        }
+        found_binance = true;
+        method.account = canonical_uid.map(str::to_string);
+        method.settlement_asset = canonical_uid.map(|_| PAYMENT_ASSET.to_string());
+        method.account.is_some() || method.qr_image_url.is_some()
+    });
+    if canonical_uid.is_some() && !found_binance {
+        methods.push(PaymentMethod {
+            kind: "binance".into(),
+            account: canonical_uid.map(str::to_string),
+            qr_image_url: None,
+            asset_url: None,
+            token: None,
+            chain: None,
+            address: None,
+            instructions: None,
+            settlement_asset: Some(PAYMENT_ASSET.into()),
+        });
+    }
+    let methods_json = serde_json::to_string(&methods)
+        .map_err(|_| AppError::Internal("encode public Binance payment method failed".into()))?;
+    conn.execute(
+        "INSERT INTO account_payment_profiles
+            (user_id, owner_email, methods_json, contacts_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(user_id) DO UPDATE SET
+            owner_email = excluded.owner_email,
+            methods_json = excluded.methods_json,
+            updated_at = excluded.updated_at",
+        params![supplier_user_id, email, methods_json, contacts_json, now],
+    )
+    .map_err(map_db("save public Binance payment profile"))?;
+    conn.execute(
+        "INSERT INTO host_provider_profiles (provider_id, owner_email, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(provider_id) DO UPDATE SET
+            owner_email = excluded.owner_email,
+            updated_at = excluded.updated_at",
+        params![supplier_user_id, email, now],
+    )
+    .map_err(map_db("sync Binance payment Provider profile"))?;
+    conn.execute(
+        "DELETE FROM account_payment_methods WHERE profile_user_id = ?1",
+        params![supplier_user_id],
+    )
+    .map_err(map_db("replace public Binance payment methods"))?;
+    for (position, method) in methods.iter().enumerate() {
+        let method_json = serde_json::to_string(method)
+            .map_err(|_| AppError::Internal("encode public payment method failed".into()))?;
+        conn.execute(
+            "INSERT INTO account_payment_methods (
+                id, profile_user_id, position, kind, method_json, enabled, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                supplier_user_id,
+                position as i64,
+                method.kind,
+                method_json,
+                now,
+            ],
+        )
+        .map_err(map_db("save public Binance payment method"))?;
     }
     Ok(())
 }
@@ -3166,16 +3314,6 @@ pub fn validate_uid(value: &str) -> Result<String, AppError> {
     Ok(value.to_string())
 }
 
-pub fn validate_automation_mode(value: &str) -> Result<&'static str, AppError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "enabled" => Ok("enabled"),
-        "shadow" => Ok("shadow"),
-        _ => Err(AppError::BadRequest(
-            "automationMode must be shadow or enabled".into(),
-        )),
-    }
-}
-
 pub fn validate_credentials(api_key: &str, api_secret: &str) -> Result<(), AppError> {
     let api_key = api_key.trim();
     let api_secret = api_secret.trim();
@@ -3232,7 +3370,7 @@ pub fn decode_account_credentials(
     })
 }
 
-fn mask_api_key(value: &str) -> String {
+pub(crate) fn mask_api_key(value: &str) -> String {
     let value = value.trim();
     if value.chars().count() <= 8 {
         return "••••••••".into();
@@ -3472,6 +3610,7 @@ mod tests {
         store
             .binance_save_verified_account(
                 &supplier.user_id,
+                &supplier.email,
                 &payment_account_id,
                 "test",
                 uid,
@@ -3656,6 +3795,7 @@ mod tests {
             store
                 .binance_save_verified_account(
                     &other.user_id,
+                    &other.email,
                     &account_id,
                     "test",
                     other_uid,
@@ -3734,6 +3874,7 @@ mod tests {
         store
             .binance_save_verified_account(
                 &fixture.supplier.user_id,
+                &fixture.supplier.email,
                 &first_id,
                 "test",
                 "123456789",
@@ -3749,8 +3890,21 @@ mod tests {
             .expect("commit first credential rotation");
         assert!(matches!(
             store
+                .binance_assert_account_binding_pending(
+                    &fixture.supplier.user_id,
+                    "test",
+                    "123456789",
+                    &stale_id,
+                    stale_revision,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            store
                 .binance_save_verified_account(
                     &fixture.supplier.user_id,
+                    &fixture.supplier.email,
                     &stale_id,
                     "test",
                     "123456789",
@@ -3861,6 +4015,7 @@ mod tests {
         store
             .binance_save_verified_account(
                 &fixture.supplier.user_id,
+                &fixture.supplier.email,
                 &account_id,
                 "test",
                 new_uid,
@@ -4007,6 +4162,7 @@ mod tests {
         store
             .binance_save_verified_account(
                 &fixture.supplier.user_id,
+                &fixture.supplier.email,
                 &account_id,
                 "test",
                 "123456789",
@@ -4127,6 +4283,7 @@ mod tests {
             store
                 .binance_save_verified_account(
                     &fixture.supplier.user_id,
+                    &fixture.supplier.email,
                     &stale_binding_id,
                     "test",
                     "123456789",
@@ -5814,5 +5971,80 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    #[tokio::test]
+    async fn api_managed_uid_survives_qr_edits_and_is_removed_with_credentials() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "api-managed-public-uid").await;
+        let qr_url = "https://example.com/binance-qr.png";
+
+        let profile = store
+            .client_market_update_payment_profile(
+                &fixture.supplier,
+                &[PaymentMethod {
+                    kind: "binance".into(),
+                    account: Some("999999999".into()),
+                    qr_image_url: Some(qr_url.into()),
+                    asset_url: None,
+                    token: None,
+                    chain: None,
+                    address: None,
+                    instructions: None,
+                    settlement_asset: Some(PAYMENT_ASSET.into()),
+                }],
+                None,
+            )
+            .await
+            .expect("save an independent Binance QR URL");
+        let method = profile
+            .methods
+            .iter()
+            .find(|method| method.kind == "binance")
+            .expect("canonical Binance method");
+        assert_eq!(method.account.as_deref(), Some("123456789"));
+        assert_eq!(method.qr_image_url.as_deref(), Some(qr_url));
+        assert_eq!(method.settlement_asset.as_deref(), Some(PAYMENT_ASSET));
+
+        store
+            .binance_disable_payment_account(&fixture.supplier.user_id, "test", true)
+            .await
+            .expect("delete Binance API credentials");
+
+        assert!(
+            store
+                .binance_payment_account_view(&fixture.supplier.user_id, "test")
+                .await
+                .expect("read deleted account status")
+                .is_none()
+        );
+        let profile = store
+            .client_market_payment_profile(&fixture.supplier.user_id, &fixture.supplier.email)
+            .await
+            .expect("read QR-only payment profile");
+        let method = profile
+            .methods
+            .iter()
+            .find(|method| method.kind == "binance")
+            .expect("QR-only Binance method is retained");
+        assert_eq!(method.account, None);
+        assert_eq!(method.qr_image_url.as_deref(), Some(qr_url));
+        assert_eq!(method.settlement_asset, None);
+
+        let normalized: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT method_json FROM account_payment_methods
+                 WHERE profile_user_id = ?1 AND kind = 'binance'",
+                params![fixture.supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("read normalized QR-only Binance method");
+        assert_eq!(
+            serde_json::from_str::<PaymentMethod>(&normalized).expect("decode normalized method"),
+            method.clone()
+        );
     }
 }

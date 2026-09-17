@@ -806,27 +806,16 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
             method.settlement_asset = None;
         }
         "binance" => {
-            if method.account.is_none() && method.qr_image_url.is_none() {
+            if method.account.is_some() {
                 return Err(AppError::BadRequest(
-                    "Binance requires a user ID or QR image URL".into(),
+                    "Binance UID is managed by verified API credentials".into(),
                 ));
             }
             method.token = None;
             method.chain = None;
             method.address = None;
             method.instructions = None;
-            if method.account.is_some() {
-                match method.settlement_asset.as_deref() {
-                    None | Some("USDT") => method.settlement_asset = Some("USDT".into()),
-                    Some(_) => {
-                        return Err(AppError::BadRequest(
-                            "Binance auto-settlement currently supports USDT only".into(),
-                        ));
-                    }
-                }
-            } else {
-                method.settlement_asset = None;
-            }
+            method.settlement_asset = None;
         }
         "crypto" => {
             let token = method.token.as_deref().unwrap_or_default();
@@ -1872,13 +1861,52 @@ impl AppStore {
         contacts: Option<&[PaymentContact]>,
     ) -> Result<PaymentProfileView, AppError> {
         let email = normalize_email(&session.email)?;
-        let methods_json = serde_json::to_string(methods).map_err(|error| {
-            AppError::Internal(format!("encode payment methods failed: {error}"))
-        })?;
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin payment profile update failed: {error}"))
+        })?;
+        let canonical_binance_uid = tx
+            .query_row(
+                "SELECT binance_uid FROM binance_payment_accounts
+                 WHERE supplier_user_id = ?1 AND credentials_ciphertext != ''
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![session.user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read API-managed Binance UID failed: {error}"))
+            })?;
+        let mut methods = methods.to_vec();
+        let mut found_binance = false;
+        methods.retain_mut(|method| {
+            if method.kind != "binance" {
+                return true;
+            }
+            if found_binance {
+                return false;
+            }
+            found_binance = true;
+            method.account = canonical_binance_uid.clone();
+            method.settlement_asset = canonical_binance_uid.as_ref().map(|_| "USDT".into());
+            method.account.is_some() || method.qr_image_url.is_some()
+        });
+        if canonical_binance_uid.is_some() && !found_binance {
+            methods.push(PaymentMethod {
+                kind: "binance".into(),
+                account: canonical_binance_uid,
+                qr_image_url: None,
+                asset_url: None,
+                token: None,
+                chain: None,
+                address: None,
+                instructions: None,
+                settlement_asset: Some("USDT".into()),
+            });
+        }
+        let methods_json = serde_json::to_string(&methods).map_err(|error| {
+            AppError::Internal(format!("encode payment methods failed: {error}"))
         })?;
         if methods.is_empty() {
             ensure_payment_profile_can_be_cleared(&tx, &session.user_id)?;
@@ -1990,7 +2018,7 @@ impl AppStore {
         Ok(PaymentProfileView {
             provider_id: session.user_id.clone(),
             owner_email: email,
-            methods: methods.to_vec(),
+            methods,
             contacts: serde_json::from_str(&contacts_json).unwrap_or_default(),
             updated_at: now,
         })
@@ -5432,6 +5460,28 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn public_payment_profile_rejects_a_browser_supplied_binance_uid() {
+        let error = normalize_payment_method(PaymentMethod {
+            kind: " Binance ".into(),
+            account: Some("123456789".into()),
+            qr_image_url: Some("https://example.com/binance-qr.png".into()),
+            asset_url: None,
+            token: None,
+            chain: None,
+            address: None,
+            instructions: None,
+            settlement_asset: Some("USDT".into()),
+        })
+        .expect_err("Binance UID must only come from verified API credentials");
+
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message == "Binance UID is managed by verified API credentials"
+        ));
     }
 
     #[tokio::test]

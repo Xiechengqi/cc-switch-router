@@ -45,6 +45,7 @@ const ERRORS: Array<{ code: string; message: MessageKey }> = [
   { code: "READ_PERMISSION_REQUIRED", message: "account.binanceAuto.guide.error.read" },
   { code: "DANGEROUS_PERMISSION_ENABLED", message: "account.binanceAuto.guide.error.dangerous" },
   { code: "ACCOUNT_UID_UNCONFIRMED", message: "account.binanceAuto.guide.error.unconfirmed" },
+  { code: "ACCOUNT_UID_AMBIGUOUS", message: "account.binanceAuto.guide.error.ambiguous" },
   { code: "ACCOUNT_UID_MISMATCH", message: "account.binanceAuto.guide.error.mismatch" },
   { code: "BINANCE_CREDENTIALS_REJECTED", message: "account.binanceAuto.guide.error.credentials" },
 ];

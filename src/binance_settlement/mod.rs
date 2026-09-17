@@ -34,8 +34,8 @@ pub use self::store::{
     BinanceSettlementAdminView,
 };
 use self::store::{
-    StoredPaymentAccount, decode_account_credentials, validate_automation_mode,
-    validate_credentials, validate_uid,
+    StoredPaymentAccount, decode_account_credentials, mask_api_key, validate_credentials,
+    validate_uid,
 };
 pub(crate) use self::store::{cancel_invoice_intents_tx, format_amount};
 
@@ -50,6 +50,8 @@ const POLL_OVERLAP_MS: i64 = 10 * 60 * 1_000;
 const MAX_POLL_SCAN_WINDOW_MS: i64 = 60 * 60 * 1_000;
 const PERMISSION_REVERIFY_HOURS: i64 = 24;
 const VERIFICATION_ATTEMPT_COOLDOWN_SECS: u64 = 30;
+const BINDING_CONFIRMATION_TTL_SECS: i64 = 10 * 60;
+const BINDING_CONFIRMATION_VERSION: u8 = 1;
 const MAX_VERIFICATION_ATTEMPT_SCOPES: usize = 10_000;
 const DEFAULT_MASTER_KEY_VERSION: i64 = 1;
 const DEFAULT_POLL_INTERVAL_SECS: i64 = 4;
@@ -258,12 +260,53 @@ pub struct BinanceAccountStatusResponse {
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BindBinanceAccountRequest {
-    binance_uid: String,
+struct DiscoverBinanceAccountRequest {
     api_key: String,
     api_secret: String,
-    #[serde(default = "default_account_mode")]
-    automation_mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmBinanceAccountRequest {
+    confirmation_token: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BindingConfirmationPayload {
+    version: u8,
+    user_id: String,
+    payment_home_region: String,
+    account_id: String,
+    credential_revision: i64,
+    binance_uid: String,
+    credentials: BinanceCredentials,
+    verification: self::client::VerificationResult,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveredBinanceAccountView {
+    binance_uid: String,
+    masked_api_key: String,
+    reading_enabled: bool,
+    dangerous_permissions_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid_confirmation_source: Option<self::client::UidConfirmationSource>,
+    evidence_count: usize,
+    detected_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_binance_uid: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoverBinanceAccountResponse {
+    account: DiscoveredBinanceAccountView,
+    confirmation_token: String,
+    expires_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,15 +339,10 @@ struct ReceiptHistoryResponse {
     next_cursor: Option<String>,
 }
 
-fn default_account_mode() -> String {
-    "enabled".into()
-}
-
-fn effective_binding_mode(global_mode: GlobalMode, requested_mode: &'static str) -> &'static str {
-    if global_mode == GlobalMode::Enabled {
-        requested_mode
-    } else {
-        "shadow"
+fn binding_mode(global_mode: GlobalMode) -> &'static str {
+    match global_mode {
+        GlobalMode::Enabled => "enabled",
+        GlobalMode::Disabled | GlobalMode::Shadow => "shadow",
     }
 }
 
@@ -319,6 +357,10 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/account/binance-auto-settlement/verify",
             post(verify_account),
+        )
+        .route(
+            "/v1/account/binance-auto-settlement/discover",
+            post(discover_account),
         )
         .route(
             "/v1/account/binance-auto-settlement/disable",
@@ -441,26 +483,74 @@ async fn get_account_status(
     Ok(Json(account_status(&state, &session).await?))
 }
 
-async fn bind_account(
+fn binding_confirmation_aad(user_id: &str, region: &str) -> String {
+    format!("binance-binding-confirmation:v1:{user_id}:{region}")
+}
+
+fn seal_binding_confirmation(
+    cipher: &CredentialCipher,
+    payload: &BindingConfirmationPayload,
+) -> Result<String, AppError> {
+    let aad = binding_confirmation_aad(&payload.user_id, &payload.payment_home_region);
+    let (ciphertext, nonce) = cipher.seal_json(payload, aad.as_bytes())?;
+    Ok(format!("v1.{nonce}.{ciphertext}"))
+}
+
+fn open_binding_confirmation(
+    cipher: &CredentialCipher,
+    token: &str,
+    session: &AuthSession,
+    region: &str,
+) -> Result<BindingConfirmationPayload, AppError> {
+    if token.len() > 16 * 1024 {
+        return Err(AppError::BadRequest(
+            "Binance binding confirmation is invalid".into(),
+        ));
+    }
+    let mut parts = token.split('.');
+    let (Some("v1"), Some(nonce), Some(ciphertext), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(AppError::BadRequest(
+            "Binance binding confirmation is invalid".into(),
+        ));
+    };
+    let aad = binding_confirmation_aad(&session.user_id, region);
+    let payload = cipher
+        .open_json::<BindingConfirmationPayload>(ciphertext, nonce, aad.as_bytes())
+        .map_err(|_| AppError::BadRequest("Binance binding confirmation is invalid".into()))?;
+    let now_ms = Utc::now().timestamp_millis();
+    if payload.version != BINDING_CONFIRMATION_VERSION
+        || payload.user_id != session.user_id
+        || payload.payment_home_region != region
+        || payload.credential_revision <= 0
+        || Uuid::parse_str(&payload.account_id).is_err()
+        || payload.issued_at_ms > now_ms.saturating_add(30_000)
+        || payload.expires_at_ms <= now_ms
+        || payload.expires_at_ms.saturating_sub(payload.issued_at_ms)
+            != BINDING_CONFIRMATION_TTL_SECS * 1_000
+    {
+        return Err(AppError::BadRequest(
+            "Binance binding confirmation is invalid or expired".into(),
+        ));
+    }
+    validate_uid(&payload.binance_uid)?;
+    validate_credentials(
+        &payload.credentials.api_key,
+        &payload.credentials.api_secret,
+    )?;
+    require_initial_uid_confirmation(&payload.verification)?;
+    Ok(payload)
+}
+
+async fn discover_account(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<BindBinanceAccountRequest>,
-) -> Result<Json<BinanceAccountStatusResponse>, AppError> {
+    Json(input): Json<DiscoverBinanceAccountRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
     let cipher = state.binance_settlement.require_binance_network_enabled()?;
-    let binance_uid = validate_uid(&input.binance_uid)?;
     validate_credentials(&input.api_key, &input.api_secret)?;
-    let requested_automation_mode = validate_automation_mode(&input.automation_mode)?;
-    let automation_mode =
-        effective_binding_mode(state.binance_settlement.mode(), requested_automation_mode);
-    let (account_id, revision) = state
-        .store
-        .binance_prepare_account_binding(
-            &session.user_id,
-            state.binance_settlement.payment_home_region(),
-            &binance_uid,
-        )
-        .await?;
     state
         .binance_settlement
         .consume_verification_attempt(&session.user_id)
@@ -469,29 +559,121 @@ async fn bind_account(
         api_key: input.api_key.trim().to_string(),
         api_secret: input.api_secret.trim().to_string(),
     };
-    let verification = state
+    let discovery = state
         .binance_settlement
         .client
-        .verify_credentials(&credentials, &binance_uid)
+        .discover_account(&credentials)
         .await
         .map_err(map_verification_error)?;
-    require_initial_uid_confirmation(&verification)?;
-    let aad = credential_aad(&account_id, &session.user_id, revision);
-    let (ciphertext, nonce) = cipher.seal_json(&credentials, aad.as_bytes())?;
+    let binance_uid = validate_uid(&discovery.binance_uid)?;
+    let previous_binance_uid = state
+        .store
+        .binance_payment_account_view(
+            &session.user_id,
+            state.binance_settlement.payment_home_region(),
+        )
+        .await?
+        .filter(|account| !account.masked_api_key.is_empty())
+        .map(|account| account.binance_uid)
+        .filter(|uid| uid != &binance_uid);
+    let (account_id, revision) = state
+        .store
+        .binance_prepare_account_binding(
+            &session.user_id,
+            state.binance_settlement.payment_home_region(),
+            &binance_uid,
+        )
+        .await?;
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::seconds(BINDING_CONFIRMATION_TTL_SECS);
+    let payload = BindingConfirmationPayload {
+        version: BINDING_CONFIRMATION_VERSION,
+        user_id: session.user_id.clone(),
+        payment_home_region: state.binance_settlement.payment_home_region().to_string(),
+        account_id,
+        credential_revision: revision,
+        binance_uid: binance_uid.clone(),
+        credentials,
+        verification: discovery.verification.clone(),
+        issued_at_ms: now.timestamp_millis(),
+        expires_at_ms: expires_at.timestamp_millis(),
+    };
+    let confirmation_token = seal_binding_confirmation(cipher, &payload)?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(DiscoverBinanceAccountResponse {
+            account: DiscoveredBinanceAccountView {
+                binance_uid,
+                masked_api_key: mask_api_key(&payload.credentials.api_key),
+                reading_enabled: discovery.verification.reading_enabled,
+                dangerous_permissions_disabled: discovery
+                    .verification
+                    .dangerous_permissions_disabled,
+                uid_confirmation_source: discovery.verification.uid_confirmation_source,
+                evidence_count: discovery.evidence_count,
+                detected_at: now.to_rfc3339(),
+                previous_binance_uid,
+            },
+            confirmation_token,
+            expires_at: expires_at.to_rfc3339(),
+        }),
+    ))
+}
+
+async fn bind_account(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ConfirmBinanceAccountRequest>,
+) -> Result<Json<BinanceAccountStatusResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let cipher = state.binance_settlement.require_binance_network_enabled()?;
+    let payload = open_binding_confirmation(
+        cipher,
+        input.confirmation_token.trim(),
+        &session,
+        state.binance_settlement.payment_home_region(),
+    )?;
+    state
+        .store
+        .binance_assert_account_binding_pending(
+            &session.user_id,
+            state.binance_settlement.payment_home_region(),
+            &payload.binance_uid,
+            &payload.account_id,
+            payload.credential_revision,
+        )
+        .await?;
+    state
+        .binance_settlement
+        .consume_verification_attempt(&format!("binding-confirm:{}", session.user_id))
+        .await?;
+    state
+        .binance_settlement
+        .client
+        .verify_permissions(&payload.credentials)
+        .await
+        .map_err(map_verification_error)?;
+    let aad = credential_aad(
+        &payload.account_id,
+        &session.user_id,
+        payload.credential_revision,
+    );
+    let (ciphertext, nonce) = cipher.seal_json(&payload.credentials, aad.as_bytes())?;
     state
         .store
         .binance_save_verified_account(
             &session.user_id,
-            &account_id,
+            &session.email,
+            &payload.account_id,
             state.binance_settlement.payment_home_region(),
-            &binance_uid,
-            &credentials.api_key,
+            &payload.binance_uid,
+            &payload.credentials.api_key,
             &ciphertext,
             &nonce,
             cipher.version(),
-            revision,
-            automation_mode,
-            &verification,
+            payload.credential_revision,
+            binding_mode(state.binance_settlement.mode()),
+            &payload.verification,
         )
         .await?;
     Ok(Json(account_status(&state, &session).await?))
@@ -1180,6 +1362,8 @@ fn map_verification_error(error: BinanceApiError) -> AppError {
     match error.code.as_str() {
         "READ_PERMISSION_REQUIRED"
         | "DANGEROUS_PERMISSION_ENABLED"
+        | "ACCOUNT_UID_UNCONFIRMED"
+        | "ACCOUNT_UID_AMBIGUOUS"
         | "ACCOUNT_UID_MISMATCH"
         | "RECEIVER_UID_MISMATCH"
         | "BINANCE_CREDENTIALS_REJECTED" => AppError::UnprocessableEntity(format!(
@@ -1336,6 +1520,50 @@ pub(crate) fn validate_api_base(url: &Url) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn test_session(user_id: &str) -> AuthSession {
+        let now = Utc::now();
+        AuthSession {
+            session_id: format!("session-{user_id}"),
+            user_id: user_id.into(),
+            email: format!("{user_id}@example.com"),
+            auth_source_kind: "auth_device".into(),
+            auth_source_id: format!("browser-{user_id}"),
+            access_token_hash: format!("access-{user_id}"),
+            refresh_token_hash: format!("refresh-{user_id}"),
+            access_expires_at: now + chrono::Duration::hours(1),
+            refresh_expires_at: now + chrono::Duration::days(30),
+            created_at: now,
+            last_used_at: now,
+        }
+    }
+
+    fn binding_confirmation_payload(
+        session: &AuthSession,
+        region: &str,
+        issued_at_ms: i64,
+    ) -> BindingConfirmationPayload {
+        BindingConfirmationPayload {
+            version: BINDING_CONFIRMATION_VERSION,
+            user_id: session.user_id.clone(),
+            payment_home_region: region.into(),
+            account_id: Uuid::new_v4().to_string(),
+            credential_revision: 1,
+            binance_uid: "123456789".into(),
+            credentials: BinanceCredentials {
+                api_key: "confirmation-api-key-0123456789".into(),
+                api_secret: "confirmation-api-secret-0123456789".into(),
+            },
+            verification: self::client::VerificationResult {
+                reading_enabled: true,
+                dangerous_permissions_disabled: true,
+                uid_confirmed: true,
+                uid_confirmation_source: Some(self::client::UidConfirmationSource::ReceiverHistory),
+            },
+            issued_at_ms,
+            expires_at_ms: issued_at_ms + BINDING_CONFIRMATION_TTL_SECS * 1_000,
+        }
+    }
+
     fn synthetic_transaction(index: usize, transaction_time: i64) -> BinancePayTransaction {
         BinancePayTransaction {
             order_id: format!("order-{index}"),
@@ -1382,6 +1610,69 @@ mod tests {
             parse_master_key(&base64::engine::general_purpose::STANDARD.encode([7; 32])).is_ok()
         );
         assert!(parse_master_key("short").is_err());
+    }
+
+    #[test]
+    fn binding_confirmation_round_trips_without_exposing_credentials() {
+        let cipher = CredentialCipher::new([17; 32], 1);
+        let session = test_session("binding-owner");
+        let payload = binding_confirmation_payload(&session, "test", Utc::now().timestamp_millis());
+
+        let token = seal_binding_confirmation(&cipher, &payload).expect("seal confirmation");
+        assert!(!token.contains(&payload.credentials.api_key));
+        assert!(!token.contains(&payload.credentials.api_secret));
+
+        let opened = open_binding_confirmation(&cipher, &token, &session, "test")
+            .expect("open confirmation");
+        assert_eq!(opened.user_id, session.user_id);
+        assert_eq!(opened.payment_home_region, "test");
+        assert_eq!(opened.binance_uid, "123456789");
+        assert_eq!(opened.credentials.api_key, payload.credentials.api_key);
+        assert_eq!(
+            opened.credentials.api_secret,
+            payload.credentials.api_secret
+        );
+    }
+
+    #[test]
+    fn binding_confirmation_rejects_tampering_and_scope_changes() {
+        let cipher = CredentialCipher::new([18; 32], 1);
+        let session = test_session("binding-owner");
+        let payload = binding_confirmation_payload(&session, "test", Utc::now().timestamp_millis());
+        let token = seal_binding_confirmation(&cipher, &payload).expect("seal confirmation");
+
+        let mut tampered = token.clone();
+        let replacement = if tampered.ends_with('A') { 'B' } else { 'A' };
+        tampered.pop();
+        tampered.push(replacement);
+        assert!(matches!(
+            open_binding_confirmation(&cipher, &tampered, &session, "test"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            open_binding_confirmation(&cipher, &token, &test_session("other-owner"), "test"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            open_binding_confirmation(&cipher, &token, &session, "other-region"),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn binding_confirmation_rejects_expired_evidence() {
+        let cipher = CredentialCipher::new([19; 32], 1);
+        let session = test_session("binding-owner");
+        let issued_at_ms = (Utc::now()
+            - chrono::Duration::seconds(BINDING_CONFIRMATION_TTL_SECS + 1))
+        .timestamp_millis();
+        let payload = binding_confirmation_payload(&session, "test", issued_at_ms);
+        let token = seal_binding_confirmation(&cipher, &payload).expect("seal confirmation");
+
+        assert!(matches!(
+            open_binding_confirmation(&cipher, &token, &session, "test"),
+            Err(AppError::BadRequest(message)) if message.contains("expired")
+        ));
     }
 
     #[test]
@@ -1506,18 +1797,9 @@ mod tests {
 
     #[test]
     fn api_base_is_fail_closed() {
-        assert_eq!(
-            effective_binding_mode(GlobalMode::Shadow, "enabled"),
-            "shadow"
-        );
-        assert_eq!(
-            effective_binding_mode(GlobalMode::Enabled, "enabled"),
-            "enabled"
-        );
-        assert_eq!(
-            effective_binding_mode(GlobalMode::Enabled, "shadow"),
-            "shadow"
-        );
+        assert_eq!(binding_mode(GlobalMode::Disabled), "shadow");
+        assert_eq!(binding_mode(GlobalMode::Shadow), "shadow");
+        assert_eq!(binding_mode(GlobalMode::Enabled), "enabled");
         assert!(validate_api_base(&Url::parse("https://api.binance.com").unwrap()).is_ok());
         assert!(validate_api_base(&Url::parse("https://api1.binance.com").unwrap()).is_ok());
         assert!(validate_api_base(&Url::parse("http://127.0.0.1:9000").unwrap()).is_ok());

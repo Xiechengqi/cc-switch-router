@@ -170,6 +170,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         46,
         include_str!("../schema/0046_binance_receipt_history.sql"),
     ),
+    (
+        47,
+        include_str!("../schema/0047_binance_api_managed_uid.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1139,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_46_upgrade_a_version_26_database() {
+    fn migrations_27_through_47_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1268,8 +1272,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 46);
-        check_compatibility(&conn).expect("upgraded version 46 is compatible");
+        assert_eq!(latest_version, 47);
+        check_compatibility(&conn).expect("upgraded version 47 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1432,6 +1436,118 @@ mod tests {
     }
 
     #[test]
+    fn migration_47_replaces_manual_binance_uids_and_rebuilds_normalized_methods() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 46);
+        conn.execute_batch(
+            r#"
+            INSERT INTO account_payment_profiles
+                (user_id, owner_email, methods_json, contacts_json, updated_at)
+            VALUES
+                ('bound-profile', 'bound@example.com',
+                 '[{"kind":"custom","instructions":"wire"},{"kind":"binance","account":"111111111","qrImageUrl":"https://example.com/bound.png","settlementAsset":"USDT"}]',
+                 '[]', '2026-09-01T00:00:00Z'),
+                ('qr-only-profile', 'qr@example.com',
+                 '[{"kind":"binance","account":"333333333","qrImageUrl":"https://example.com/qr.png","settlementAsset":"USDT"}]',
+                 '[]', '2026-09-01T00:00:00Z'),
+                ('uid-only-profile', 'uid@example.com',
+                 '[{"kind":"binance","account":"444444444","settlementAsset":"USDT"}]',
+                 '[]', '2026-09-01T00:00:00Z'),
+                ('missing-method-profile', 'missing@example.com',
+                 '[{"kind":"custom","instructions":"cash"}]',
+                 '[]', '2026-09-01T00:00:00Z');
+
+            INSERT INTO account_payment_methods
+                (id, profile_user_id, position, kind, method_json, enabled, created_at, updated_at)
+            VALUES
+                ('stale-bound', 'bound-profile', 0, 'binance',
+                 '{"kind":"binance","account":"111111111"}', 1, 'then', 'then'),
+                ('stale-qr', 'qr-only-profile', 0, 'binance',
+                 '{"kind":"binance","account":"333333333"}', 1, 'then', 'then'),
+                ('stale-uid', 'uid-only-profile', 0, 'binance',
+                 '{"kind":"binance","account":"444444444"}', 1, 'then', 'then');
+
+            INSERT INTO binance_payment_accounts (
+                id, supplier_user_id, binance_uid, masked_api_key,
+                credential_fingerprint, credentials_ciphertext, credential_nonce,
+                encryption_key_version, credential_revision, status, automation_mode,
+                payment_home_region, permissions_json, permissions_verified_at,
+                uid_confirmed, uid_confirmation_source, created_at, updated_at
+            ) VALUES
+                ('bound-account', 'bound-profile', '222222222', 'key-***',
+                 'fingerprint-bound', 'ciphertext-bound', 'nonce-bound', 1, 1,
+                 'verified', 'enabled', 'test', '{}', '2026-09-01T00:00:00Z',
+                 1, 'receiver_history', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z'),
+                ('missing-method-account', 'missing-method-profile', '555555555', 'key-***',
+                 'fingerprint-missing', 'ciphertext-missing', 'nonce-missing', 1, 1,
+                 'disabled', 'shadow', 'test', '{}', '2026-09-01T00:00:00Z',
+                 1, 'payer_history', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');
+            "#,
+        )
+        .expect("seed pre-migration Binance payment profiles");
+
+        apply(&conn).expect("apply API-managed Binance UID migration");
+
+        let read_methods = |user_id: &str| -> Vec<serde_json::Value> {
+            let value: String = conn
+                .query_row(
+                    "SELECT methods_json FROM account_payment_profiles WHERE user_id = ?1",
+                    params![user_id],
+                    |row| row.get(0),
+                )
+                .expect("read migrated payment methods");
+            serde_json::from_str(&value).expect("decode migrated payment methods")
+        };
+
+        let bound = read_methods("bound-profile");
+        let bound_binance = bound
+            .iter()
+            .find(|method| method["kind"] == "binance")
+            .expect("bound Binance method");
+        assert_eq!(bound_binance["account"], "222222222");
+        assert_eq!(bound_binance["qrImageUrl"], "https://example.com/bound.png");
+        assert_eq!(bound_binance["settlementAsset"], "USDT");
+
+        let qr_only = read_methods("qr-only-profile");
+        assert_eq!(qr_only.len(), 1);
+        assert!(qr_only[0].get("account").is_none());
+        assert!(qr_only[0].get("settlementAsset").is_none());
+        assert_eq!(qr_only[0]["qrImageUrl"], "https://example.com/qr.png");
+
+        assert!(read_methods("uid-only-profile").is_empty());
+
+        let missing = read_methods("missing-method-profile");
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[1]["kind"], "binance");
+        assert_eq!(missing[1]["account"], "555555555");
+        assert_eq!(missing[1]["settlementAsset"], "USDT");
+
+        for user_id in [
+            "bound-profile",
+            "qr-only-profile",
+            "uid-only-profile",
+            "missing-method-profile",
+        ] {
+            let normalized = conn
+                .prepare(
+                    "SELECT method_json FROM account_payment_methods
+                     WHERE profile_user_id = ?1 ORDER BY position",
+                )
+                .expect("prepare normalized payment method query")
+                .query_map(params![user_id], |row| row.get::<_, String>(0))
+                .expect("query normalized payment methods")
+                .map(|value| {
+                    serde_json::from_str::<serde_json::Value>(
+                        &value.expect("read normalized payment method"),
+                    )
+                    .expect("decode normalized payment method")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(normalized, read_methods(user_id), "user_id={user_id}");
+        }
+    }
+
+    #[test]
     fn migration_30_installs_user_model_routing_without_a_share_foreign_key() {
         let conn = memory_connection();
         install_schema_through(&conn, 29);
@@ -1490,7 +1606,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 46);
+        assert_eq!(latest_version, 47);
     }
 
     #[test]
@@ -1514,7 +1630,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 46);
+        assert_eq!(latest_version, 47);
     }
 
     #[test]
@@ -1694,7 +1810,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 46);
+        assert_eq!(latest_version, 47);
     }
 
     #[test]

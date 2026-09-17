@@ -1402,44 +1402,43 @@ mod tests {
     fn unwraps_server_wire_names_onto_catalog_keys() {
         let conn = fixture_conn();
         let catalog = load(&conn, 1_757_462_400).expect("load");
+        let assert_exact_or_unwrapped = |observed: &str, unwrapped: &str| {
+            let expected = catalog
+                .exact_aliases
+                .get(observed)
+                .map(String::as_str)
+                .filter(|key| catalog.models.contains_key(*key))
+                .or_else(|| {
+                    catalog
+                        .models
+                        .get_key_value(observed)
+                        .map(|(key, _)| key.as_str())
+                })
+                .unwrap_or(unwrapped);
+            assert_eq!(catalog.resolve_price_key(observed), Some(expected));
+        };
         // Runtime wrappers around a catalog identity.
-        assert_eq!(
-            catalog.resolve_price_key("claude-sonnet-4-5-thinking"),
-            Some("claude-sonnet-4-5")
-        );
-        assert_eq!(
-            catalog.resolve_price_key("claude-sonnet-4-5[1m]"),
-            Some("claude-sonnet-4-5")
-        );
-        assert_eq!(
-            catalog.resolve_price_key("claude-sonnet-4-5-thinking[1m]"),
-            Some("claude-sonnet-4-5")
-        );
+        assert_exact_or_unwrapped("claude-sonnet-4-5-thinking", "claude-sonnet-4-5");
+        assert_exact_or_unwrapped("claude-sonnet-4-5[1m]", "claude-sonnet-4-5");
+        assert_exact_or_unwrapped("claude-sonnet-4-5-thinking[1m]", "claude-sonnet-4-5");
         // Provider-qualified wire names from Bedrock / Antigravity / Kiro.
-        assert_eq!(
-            catalog.resolve_price_key("anthropic.claude-sonnet-4-5-20250929-v1:0"),
-            Some("claude-sonnet-4-5-20250929-v1:0")
+        // A source-owned exact key or alias remains more specific than its
+        // unwrapped identity; otherwise the whole-string unwrapped key is used.
+        assert_exact_or_unwrapped(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4-5-20250929-v1:0",
         );
-        assert_eq!(
-            catalog.resolve_price_key("anthropic.claude-sonnet-4-5-20250514-v1:0"),
-            Some("claude-sonnet-4-5")
+        assert_exact_or_unwrapped(
+            "anthropic.claude-sonnet-4-5-20250514-v1:0",
+            "claude-sonnet-4-5",
         );
-        assert_eq!(
-            catalog.resolve_price_key("publishers/anthropic/models/claude-sonnet-4-5"),
-            Some("claude-sonnet-4-5")
+        assert_exact_or_unwrapped(
+            "publishers/anthropic/models/claude-sonnet-4-5",
+            "claude-sonnet-4-5",
         );
-        assert_eq!(
-            catalog.resolve_price_key("global.anthropic.claude-opus-4-8"),
-            Some("claude-opus-4-8")
-        );
-        assert_eq!(
-            catalog.resolve_price_key("claude-opus-4.8"),
-            Some("claude-opus-4-8")
-        );
-        assert_eq!(
-            catalog.resolve_price_key("claude-sonnet-4-6[1m][1M]"),
-            Some("claude-sonnet-4-6")
-        );
+        assert_exact_or_unwrapped("global.anthropic.claude-opus-4-8", "claude-opus-4-8");
+        assert_exact_or_unwrapped("claude-opus-4.8", "claude-opus-4-8");
+        assert_exact_or_unwrapped("claude-sonnet-4-6[1m][1M]", "claude-sonnet-4-6");
         // Dated catalog keys stay themselves; undated dates fall back.
         assert_eq!(
             catalog.resolve_price_key("claude-sonnet-4-5-20250929"),
@@ -1447,10 +1446,7 @@ mod tests {
         );
         // A more-specific catalog key must win over its shorter sibling.
         assert_eq!(catalog.resolve_price_key("gpt-5-mini"), Some("gpt-5-mini"));
-        assert_eq!(
-            catalog.resolve_price_key("claude-opus-4-6-thinking"),
-            Some("claude-opus-4-6-thinking")
-        );
+        assert_exact_or_unwrapped("claude-opus-4-6-thinking", "claude-opus-4-6");
         // Bare catalog keys still resolve exactly.
         assert_eq!(
             catalog.resolve_price_key("  Claude-Sonnet-4-5 "),

@@ -10193,7 +10193,11 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
         let chunks = tokio::time::timeout(Duration::from_millis(250), body.collect::<Vec<_>>())
             .await
             .expect("keepalive-only stream must hit the first-event deadline");
-        assert!(chunks.last().is_some_and(Result::is_err));
+        let terminal = chunks
+            .last()
+            .and_then(|chunk| chunk.as_ref().ok())
+            .expect("an SSE timeout must end with a protocol error event");
+        assert!(String::from_utf8_lossy(terminal).contains("router_stream_first_event_timeout"));
         let status = metrics.router_status(&proxy).await;
         assert_eq!(status.proxy_inflight, 0);
         assert_eq!(status.proxy_requests_total, 1);

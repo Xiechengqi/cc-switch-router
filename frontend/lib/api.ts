@@ -76,6 +76,7 @@ import type {
   ClientTunnelSubdomainAvailability,
   AccountPaymentProfile,
   BinanceAutoSettlementStatus,
+  DiscoverBinanceAccountResponse,
   BinanceReceiptHistoryResponse,
   BinancePaymentIntent,
   BinanceSettlementAdmin,
@@ -1334,17 +1335,25 @@ export async function getBinanceReceiptHistory(cursor?: string, signal?: AbortSi
   );
 }
 
-export async function bindBinanceAutoSettlement(body: {
-  binanceUid: string;
+export async function discoverBinanceAutoSettlement(body: {
   apiKey: string;
   apiSecret: string;
-  automationMode?: "enabled" | "shadow";
 }) {
+  return parseJson<DiscoverBinanceAccountResponse>(
+    await authFetch("/v1/account/binance-auto-settlement/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function confirmBinanceAutoSettlement(confirmationToken: string) {
   return parseJson<BinanceAutoSettlementStatus>(
     await authFetch("/v1/account/binance-auto-settlement", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ confirmationToken }),
     }),
   );
 }

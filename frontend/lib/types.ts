@@ -2211,7 +2211,25 @@ export type BinanceAutoSettlementAccount = {
   lastPollErrorCode?: string;
   consecutiveFailures: number;
   credentialRevision: number;
+  createdAt: string;
   updatedAt: string;
+};
+
+export type DiscoveredBinanceAccount = {
+  binanceUid: string;
+  maskedApiKey: string;
+  readingEnabled: boolean;
+  dangerousPermissionsDisabled: boolean;
+  uidConfirmationSource?: "receiver_history" | "payer_history" | string;
+  evidenceCount: number;
+  detectedAt: string;
+  previousBinanceUid?: string;
+};
+
+export type DiscoverBinanceAccountResponse = {
+  account: DiscoveredBinanceAccount;
+  confirmationToken: string;
+  expiresAt: string;
 };
 
 export type BinanceAutoSettlementStatus = {

@@ -23,9 +23,10 @@ import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
-  bindBinanceAutoSettlement,
+  confirmBinanceAutoSettlement,
   deleteBinanceAutoSettlement,
   disableBinanceAutoSettlement,
+  discoverBinanceAutoSettlement,
   getAccountPaymentProfile,
   getBinanceAutoSettlementStatus,
   getMarketBillingConfig,
@@ -40,6 +41,7 @@ import { binanceAutoSettlementUiState } from "@/lib/binance-auto-settlement";
 import type {
   BinanceAutoSettlementStatus,
   ClientMarketPaymentMethod,
+  DiscoverBinanceAccountResponse,
   PaymentContact,
   PaymentContactChannel,
 } from "@/lib/types";
@@ -50,7 +52,6 @@ type PaymentDraft = {
   alipayAccount: string;
   alipayQr: string;
   wechatQr: string;
-  binanceAccount: string;
   binanceQr: string;
   crypto: CryptoDraft[];
   custom: string;
@@ -77,7 +78,6 @@ const emptyPaymentDraft = (): PaymentDraft => ({
   alipayAccount: "",
   alipayQr: "",
   wechatQr: "",
-  binanceAccount: "",
   binanceQr: "",
   crypto: [emptyCrypto()],
   custom: "",
@@ -109,7 +109,6 @@ function serializePaymentDraft(draft: PaymentDraft) {
     alipayAccount: draft.alipayAccount.trim(),
     alipayQr: draft.alipayQr.trim(),
     wechatQr: draft.wechatQr.trim(),
-    binanceAccount: draft.binanceAccount.trim(),
     binanceQr: draft.binanceQr.trim(),
     crypto: normalizeCrypto(draft.crypto),
     custom: draft.custom.trim(),
@@ -138,6 +137,7 @@ export function AccountPaymentsPanel() {
     DEFAULT_USD_CNY_RATE_MICROS,
   );
   const [binanceStatus, setBinanceStatus] = React.useState<BinanceAutoSettlementStatus | null>(null);
+  const [binanceDiscovery, setBinanceDiscovery] = React.useState<DiscoverBinanceAccountResponse | null>(null);
   const [binanceCredentialDraft, setBinanceCredentialDraft] = React.useState(() => ({
     actorKey,
     apiKey: "",
@@ -147,6 +147,8 @@ export function AccountPaymentsPanel() {
   const [binanceStatusError, setBinanceStatusError] = React.useState("");
   const [binanceGuideOpen, setBinanceGuideOpen] = React.useState(false);
   const [binanceReceiptsOpen, setBinanceReceiptsOpen] = React.useState(false);
+  const binanceDiscoveryAttemptRef = React.useRef("");
+  const binanceDiscoveryInFlightRef = React.useRef(false);
   const actorKeyRef = React.useRef(actorKey);
   actorKeyRef.current = actorKey;
   const binanceApiKey = binanceCredentialDraft.actorKey === actorKey
@@ -156,6 +158,8 @@ export function AccountPaymentsPanel() {
     ? binanceCredentialDraft.apiSecret
     : "";
   const setBinanceApiKey = React.useCallback((apiKey: string) => {
+    binanceDiscoveryAttemptRef.current = "";
+    setBinanceDiscovery(null);
     setBinanceCredentialDraft((current) => ({
       actorKey,
       apiKey,
@@ -163,6 +167,8 @@ export function AccountPaymentsPanel() {
     }));
   }, [actorKey]);
   const setBinanceApiSecret = React.useCallback((apiSecret: string) => {
+    binanceDiscoveryAttemptRef.current = "";
+    setBinanceDiscovery(null);
     setBinanceCredentialDraft((current) => ({
       actorKey,
       apiKey: current.actorKey === actorKey ? current.apiKey : "",
@@ -198,7 +204,6 @@ export function AccountPaymentsPanel() {
       alipayAccount: alipay?.account || "",
       alipayQr: alipay?.qrImageUrl || "",
       wechatQr: wechat?.qrImageUrl || "",
-      binanceAccount: binance?.account || "",
       binanceQr: binance?.qrImageUrl || "",
       crypto: cryptoMethods.length ? cryptoMethods : [emptyCrypto()],
       custom: customMethod?.instructions || "",
@@ -226,6 +231,8 @@ export function AccountPaymentsPanel() {
     let active = true;
     setBinanceApiKey("");
     setBinanceApiSecret("");
+    setBinanceDiscovery(null);
+    binanceDiscoveryAttemptRef.current = "";
     setBinanceStatus(null);
     setBinanceBusy("");
     setBinanceStatusError("");
@@ -274,12 +281,10 @@ export function AccountPaymentsPanel() {
       });
     }
     if (draft.wechatQr.trim()) methods.push({ kind: "wechat", qrImageUrl: draft.wechatQr.trim() });
-    if (draft.binanceAccount.trim() || draft.binanceQr.trim()) {
+    if (draft.binanceQr.trim()) {
       methods.push({
         kind: "binance",
-        account: draft.binanceAccount.trim() || undefined,
         qrImageUrl: draft.binanceQr.trim() || undefined,
-        settlementAsset: "USDT",
       });
     }
     for (const method of draft.crypto) {
@@ -306,26 +311,57 @@ export function AccountPaymentsPanel() {
     }
   };
 
-  const updateBinanceCredentials = async () => {
-    if (binanceBusy || dirty) return;
+  const discoverBinanceCredentials = async (force = false) => {
     if (
-      binanceStatus?.account?.maskedApiKey
-      && !window.confirm(t("account.binanceAuto.rotateConfirm"))
+      binanceBusy
+      || binanceDiscoveryInFlightRef.current
+      || binanceUiState === "unavailable"
+      || binanceApiKey.trim().length < 16
+      || binanceApiSecret.trim().length < 16
     ) return;
+    const attemptKey = `${actorKey}\u0000${binanceApiKey.trim()}\u0000${binanceApiSecret.trim()}`;
+    if (!force && binanceDiscoveryAttemptRef.current === attemptKey) return;
+    binanceDiscoveryAttemptRef.current = attemptKey;
+    binanceDiscoveryInFlightRef.current = true;
     const requestedActorKey = actorKey;
-    setBinanceBusy("bind");
+    setBinanceBusy("discover");
     try {
-      const next = await bindBinanceAutoSettlement({
-        binanceUid: draft.binanceAccount.trim(),
+      const next = await discoverBinanceAutoSettlement({
         apiKey: binanceApiKey.trim(),
         apiSecret: binanceApiSecret.trim(),
-        automationMode: "enabled",
       });
+      if (
+        actorKeyRef.current !== requestedActorKey
+        || binanceDiscoveryAttemptRef.current !== attemptKey
+      ) return;
+      setBinanceDiscovery(next);
+      setBinanceStatusError("");
+    } catch (error) {
+      if (
+        actorKeyRef.current === requestedActorKey
+        && binanceDiscoveryAttemptRef.current === attemptKey
+      ) {
+        toast.danger(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      binanceDiscoveryInFlightRef.current = false;
+      if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
+    }
+  };
+
+  const confirmBinanceCredentials = async () => {
+    if (binanceBusy || !binanceDiscovery) return;
+    const requestedActorKey = actorKey;
+    setBinanceBusy("confirm");
+    try {
+      const next = await confirmBinanceAutoSettlement(binanceDiscovery.confirmationToken);
       if (actorKeyRef.current !== requestedActorKey) return;
       setBinanceStatus(next);
       setBinanceStatusError("");
       setBinanceApiKey("");
       setBinanceApiSecret("");
+      setBinanceDiscovery(null);
+      binanceDiscoveryAttemptRef.current = "";
       toast.success(t("account.binanceAuto.saved"));
     } catch (error) {
       if (actorKeyRef.current === requestedActorKey) {
@@ -582,14 +618,6 @@ export function AccountPaymentsPanel() {
             </p>
           </div>
           <div className="grid gap-4 md:grid-cols-2">
-            <label className="grid gap-1.5 text-sm">
-              <span className="text-muted-foreground">{t("account.binanceUserId")}</span>
-              <input
-                value={draft.binanceAccount}
-                onChange={(event) => patchDraft({ binanceAccount: event.target.value })}
-                className="h-10 rounded-md border bg-white px-3 outline-none focus:ring-2 focus:ring-primary/20"
-              />
-            </label>
             {qrField("binance", draft.binanceQr, (value) => patchDraft({ binanceQr: value }), t("account.qrImageUrl"))}
           </div>
         </div>
@@ -652,12 +680,6 @@ export function AccountPaymentsPanel() {
               {t("account.binanceAuto.notice.accountDisabled")}
             </p>
           ) : null}
-          {dirty ? (
-            <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
-              {t("account.binanceAuto.saveUidFirst")}
-            </p>
-          ) : null}
-
           {binanceStatus?.account ? (
             <div className="grid gap-2 rounded-md border border-border bg-white p-3 text-xs sm:grid-cols-2">
               <div>
@@ -696,6 +718,18 @@ export function AccountPaymentsPanel() {
                 <span className="text-muted-foreground">{t("account.binanceAuto.region")}</span>
                 <strong className="mt-0.5 block">{binanceStatus.account.paymentHomeRegion}</strong>
               </div>
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.boundAt")}</span>
+                <strong className="mt-0.5 block">{new Date(binanceStatus.account.createdAt).toLocaleString()}</strong>
+              </div>
+              <div>
+                <span className="text-muted-foreground">{t("account.binanceAuto.lastVerified")}</span>
+                <strong className="mt-0.5 block">
+                  {binanceStatus.account.permissionsVerifiedAt
+                    ? new Date(binanceStatus.account.permissionsVerifiedAt).toLocaleString()
+                    : "—"}
+                </strong>
+              </div>
               {binanceStatus.account.lastPollErrorCode ? (
                 <p className="sm:col-span-2 text-rose-700">
                   {t("account.binanceAuto.lastError", {
@@ -714,6 +748,7 @@ export function AccountPaymentsPanel() {
                 type="text"
                 value={binanceApiKey}
                 onChange={(event) => setBinanceApiKey(event.target.value)}
+                onBlur={() => void discoverBinanceCredentials()}
                 autoComplete="off"
                 spellCheck={false}
                 className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
@@ -725,6 +760,7 @@ export function AccountPaymentsPanel() {
                 type="text"
                 value={binanceApiSecret}
                 onChange={(event) => setBinanceApiSecret(event.target.value)}
+                onBlur={() => void discoverBinanceCredentials()}
                 autoComplete="off"
                 spellCheck={false}
                 className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
@@ -732,24 +768,81 @@ export function AccountPaymentsPanel() {
             </label>
           </div>
           <p className="text-xs leading-5 text-muted-foreground">{t("account.binanceAuto.readOnlyWarning")}</p>
+          {binanceDiscovery ? (
+            <div className="grid gap-3 rounded-md border border-emerald-200 bg-emerald-50/60 p-3 text-xs">
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div>
+                  <span className="text-muted-foreground">{t("account.binanceAuto.preview.uid")}</span>
+                  <strong className="mt-0.5 block break-all text-sm">{binanceDiscovery.account.binanceUid}</strong>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">{t("account.binanceAuto.maskedKey")}</span>
+                  <strong className="mt-0.5 block break-all">{binanceDiscovery.account.maskedApiKey}</strong>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">{t("account.binanceAuto.permission")}</span>
+                  <strong className="mt-0.5 block">{t("account.binanceAuto.permissionVerified")}</strong>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">{t("account.binanceAuto.preview.source")}</span>
+                  <strong className="mt-0.5 block">
+                    {t(binanceDiscovery.account.uidConfirmationSource === "receiver_history"
+                      ? "account.binanceAuto.source.receiver_history"
+                      : binanceDiscovery.account.uidConfirmationSource === "payer_history"
+                        ? "account.binanceAuto.source.payer_history"
+                        : "account.binanceAuto.source.unknown")}
+                    {` · ${t("account.binanceAuto.preview.evidence", { count: binanceDiscovery.account.evidenceCount })}`}
+                  </strong>
+                </div>
+              </div>
+              {binanceDiscovery.account.previousBinanceUid ? (
+                <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-amber-900">
+                  {t("account.binanceAuto.preview.replace", {
+                    previous: binanceDiscovery.account.previousBinanceUid,
+                    next: binanceDiscovery.account.binanceUid,
+                  })}
+                </p>
+              ) : null}
+              <p className="text-muted-foreground">
+                {t("account.binanceAuto.preview.expires", {
+                  date: new Date(binanceDiscovery.expiresAt).toLocaleString(),
+                })}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="primary" isDisabled={!!binanceBusy} onClick={() => void confirmBinanceCredentials()}>
+                  {binanceBusy === "confirm" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                  {t("account.binanceAuto.confirm")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  isDisabled={!!binanceBusy}
+                  onClick={() => {
+                    binanceDiscoveryAttemptRef.current = "";
+                    setBinanceDiscovery(null);
+                  }}
+                >
+                  {t("common.cancel")}
+                </Button>
+              </div>
+            </div>
+          ) : null}
           <div className="flex flex-wrap gap-2">
             <Button
               size="sm"
-              variant="primary"
+              variant={binanceDiscovery ? "outline" : "primary"}
               isDisabled={
                 !!binanceBusy
-                || dirty
                 || binanceUiState === "unavailable"
-                || !/^\d{6,20}$/.test(draft.binanceAccount.trim())
                 || binanceApiKey.trim().length < 16
                 || binanceApiSecret.trim().length < 16
               }
-              onClick={() => void updateBinanceCredentials()}
+              onClick={() => void discoverBinanceCredentials(true)}
             >
-              {binanceBusy === "bind" ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-              {binanceStatus?.account?.maskedApiKey
-                ? t("account.binanceAuto.rotate")
-                : t("account.binanceAuto.bind")}
+              {binanceBusy === "discover" ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+              {binanceDiscovery
+                ? t("account.binanceAuto.reload")
+                : t("account.binanceAuto.load")}
             </Button>
             {binanceStatus?.account?.maskedApiKey ? (
               <>

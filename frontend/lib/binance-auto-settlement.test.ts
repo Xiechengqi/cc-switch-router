@@ -24,6 +24,7 @@ function account(overrides: Partial<NonNullable<BinanceAutoSettlementStatus["acc
     uidConfirmed: true,
     consecutiveFailures: 0,
     credentialRevision: 1,
+    createdAt: "2026-09-16T00:00:00Z",
     updatedAt: "2026-09-17T00:00:00Z",
     ...overrides,
   };
