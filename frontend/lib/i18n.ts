@@ -945,49 +945,27 @@ export const messages = {
     "account.binanceAuto.preview.expires": "Confirm before {date}.",
     "account.binanceAuto.guide.open": "How to create a read-only API key",
     "account.binanceAuto.guide.title": "Create a read-only Binance API key",
-    "account.binanceAuto.guide.safetyTitle": "Read-only access only",
-    "account.binanceAuto.guide.safetyBody":
-      "The Router reads Binance Pay history only. Never enable trading, withdrawal, transfer, futures, margin, options, or any other fund-moving permission.",
-    "account.binanceAuto.guide.uid.title": "Let Router detect the UID",
-    "account.binanceAuto.guide.uid.body":
-      "You never enter a UID in Router. After the API key and secret are supplied, Router derives the account UID from signed Binance Pay history and shows it read-only for confirmation.",
-    "account.binanceAuto.guide.proof.title": "Create one UID proof receipt",
-    "account.binanceAuto.guide.proof.body":
-      "If no UID can be detected, make one small Pay payment from this account or receive one into it, wait for the record to appear, then re-enter the key and secret for an automatic retry.",
-    "account.binanceAuto.guide.create.title": "Create a system-generated API key",
+    "account.binanceAuto.guide.create.title": "Create an API key",
     "account.binanceAuto.guide.create.body":
-      "Sign in to the Binance website, open API Management from the account settings, and create a system-generated API key. Complete Binance's security checks and use a recognizable label such as cc-switch-router.",
-    "account.binanceAuto.guide.permissions.title": "Apply strict permissions",
-    "account.binanceAuto.guide.permissions.body":
-      "Review every permission before saving. The Router rejects the key if any known or newly introduced fund-moving permission is enabled.",
+      "Open the Binance mobile app. If it is in Lite mode, switch to Pro, then go to Account Center → API Management → Create API. Choose System generated and complete the security checks.",
+    "account.binanceAuto.guide.permissions.title": "Set permissions",
+    "account.binanceAuto.guide.permissions.check": "Check these settings before saving:",
     "account.binanceAuto.guide.permissions.read":
-      "Turn on Enable Reading / Read Only.",
+      "Enable only Enable Reading / Read Only.",
     "account.binanceAuto.guide.permissions.block":
-      "Keep spot and margin trading, withdrawals, internal and universal transfers, futures, portfolio margin, options, FIX trading, and all other trading permissions off.",
+      "Turn off trading, withdrawals, transfers, futures, margin, options, FIX, and every other fund-moving permission.",
     "account.binanceAuto.guide.permissions.ip":
-      "Recommended: restrict the key to the Router server's fixed public egress IP, not your current computer or phone IP. Ask the Router administrator if you do not know it.",
-    "account.binanceAuto.guide.copy.title": "Copy the key and secret once",
+      "Optional: restrict access to the Router server's fixed public egress IP. Ask the administrator if you do not know it.",
+    "account.binanceAuto.guide.copy.title": "Paste the credentials into Router",
     "account.binanceAuto.guide.copy.body":
-      "Binance normally shows the API Secret only once. Paste both values into the Router immediately. The Router encrypts the secret, never returns it, and clears both browser fields after a successful bind. Never place credentials in chats, tickets, screenshots, or logs.",
-    "account.binanceAuto.guide.verify.title": "Bind and verify",
+      "Copy the API key and the secret shown once by Binance, then paste both into their Router fields.",
+    "account.binanceAuto.guide.verify.title": "Confirm the account",
     "account.binanceAuto.guide.verify.body":
-      "After both values are entered, Router loads the account automatically. Verify the read-only UID, then click Confirm binding. No UID supplied by the browser is accepted.",
-    "account.binanceAuto.guide.errors.title": "Common verification errors",
-    "account.binanceAuto.guide.error.read": "Enable reading permission, then try again.",
-    "account.binanceAuto.guide.error.dangerous":
-      "Turn off every trading, withdrawal, and transfer permission, then try again.",
-    "account.binanceAuto.guide.error.unconfirmed":
-      "Make or receive a small Binance Pay transfer, wait for it to appear in Pay history, then try again.",
-    "account.binanceAuto.guide.error.ambiguous":
-      "Recent Pay history exposed conflicting account UIDs. Do not bind this key until the account or Binance response is checked.",
-    "account.binanceAuto.guide.error.mismatch":
-      "New Pay evidence no longer matches the UID previously verified for this API key. Rebind and review the detected account.",
-    "account.binanceAuto.guide.error.credentials":
-      "Check the key, secret, and IP allowlist. Create a new read-only key if the secret is no longer available.",
-    "account.binanceAuto.guide.uiNotice":
-      "Binance menu names and locations can vary by region, account type, and app version. Use the official API Management page if your interface differs.",
-    "account.binanceAuto.guide.openApiManagement": "Open Binance API Management",
-    "account.binanceAuto.guide.openApiDocs": "Open Pay API documentation",
+      "Wait for Router to load the account, verify the read-only UID, then click Confirm binding.",
+    "account.binanceAuto.guide.note.title": "Notes",
+    "account.binanceAuto.guide.note.body":
+      "Router derives the UID from signed Binance Pay history; it cannot be entered manually. If no UID is found, make or receive one small Pay transfer, then enter the key and secret again. The secret is encrypted and never shown again. Binance app menu names can vary by region, account type, and app version.",
+    "account.binanceAuto.guide.openOfficialGuide": "View Binance's official guide",
     "account.binanceAuto.verify": "Verify again",
     "account.binanceAuto.disable": "Disable",
     "account.binanceAuto.disableConfirm":
@@ -4449,47 +4427,26 @@ export const messages = {
     "account.binanceAuto.preview.expires": "请在 {date} 前确认。",
     "account.binanceAuto.guide.open": "如何创建只读 API Key",
     "account.binanceAuto.guide.title": "创建币安只读 API Key",
-    "account.binanceAuto.guide.safetyTitle": "只能授予读取权限",
-    "account.binanceAuto.guide.safetyBody":
-      "Router 只读取 Binance Pay 流水。不要开启交易、提现、转账、合约、杠杆、期权或任何其他资金操作权限。",
-    "account.binanceAuto.guide.uid.title": "让 Router 自动识别 UID",
-    "account.binanceAuto.guide.uid.body":
-      "无需也不能在 Router 中填写 UID。输入 API Key 和 Secret 后，Router 会从签名的 Binance Pay 流水识别账户 UID，并以只读形式显示供确认。",
-    "account.binanceAuto.guide.proof.title": "生成一笔 UID 证明流水",
-    "account.binanceAuto.guide.proof.body":
-      "如果无法识别 UID，请先使用该账户支付或接收一笔小额 Binance Pay，等待流水出现后重新输入 Key 和 Secret，Router 会自动重试。",
-    "account.binanceAuto.guide.create.title": "创建系统生成的 API Key",
+    "account.binanceAuto.guide.create.title": "创建 API Key",
     "account.binanceAuto.guide.create.body":
-      "登录币安网页版，从账户设置进入 API 管理，选择创建系统生成的 API Key。完成币安要求的安全验证，并使用容易识别的名称，例如 cc-switch-router。",
-    "account.binanceAuto.guide.permissions.title": "严格设置权限",
-    "account.binanceAuto.guide.permissions.body":
-      "保存前逐项检查权限。只要开启任何已知或币安以后新增的资金操作权限，Router 都会拒绝该 Key。",
-    "account.binanceAuto.guide.permissions.read": "开启 Enable Reading / 允许读取。",
+      "打开币安手机 APP；如当前为简易版，先切换到专业版，再依次进入“账户中心 → API 管理 → 创建 API”，选择“系统生成”并完成安全验证。",
+    "account.binanceAuto.guide.permissions.title": "设置权限",
+    "account.binanceAuto.guide.permissions.check": "保存前逐项检查：",
+    "account.binanceAuto.guide.permissions.read": "只开启 Enable Reading / 允许读取。",
     "account.binanceAuto.guide.permissions.block":
-      "关闭现货与杠杆交易、提现、内部转账、通用转账、合约、Portfolio Margin、期权、FIX 交易及其他全部交易权限。",
+      "关闭交易、提现、转账、合约、杠杆、期权、FIX 及其他全部资金操作权限。",
     "account.binanceAuto.guide.permissions.ip":
-      "推荐把 Key 限制为 Router 服务器的固定公网出口 IP，不要填写当前电脑或手机的 IP；不知道时请联系 Router 管理员。",
-    "account.binanceAuto.guide.copy.title": "一次性复制 Key 和 Secret",
+      "可选：把访问限制为 Router 服务器的固定公网出口 IP；不知道时请联系管理员。",
+    "account.binanceAuto.guide.copy.title": "粘贴凭据到 Router",
     "account.binanceAuto.guide.copy.body":
-      "币安通常只显示一次 API Secret，请立即把 Key 和 Secret 粘贴到 Router。Router 会加密保存 Secret、永不回显，并在绑定成功后清空浏览器中的两个输入框。不要把凭据发送到聊天、工单、截图或日志中。",
-    "account.binanceAuto.guide.verify.title": "绑定并验证",
+      "复制 API Key 和币安仅显示一次的 Secret，分别粘贴到 Router 对应输入框。",
+    "account.binanceAuto.guide.verify.title": "确认账户",
     "account.binanceAuto.guide.verify.body":
-      "Key 和 Secret 均填写后，Router 会自动加载账户信息。核对只读显示的 UID 后点击“确认绑定”；后端不会接受浏览器提交的 UID。",
-    "account.binanceAuto.guide.errors.title": "常见验证错误",
-    "account.binanceAuto.guide.error.read": "开启读取权限后重试。",
-    "account.binanceAuto.guide.error.dangerous": "关闭所有交易、提现和转账权限后重试。",
-    "account.binanceAuto.guide.error.unconfirmed":
-      "先使用该账户支付或接收一笔小额 Binance Pay，等待流水出现后重试。",
-    "account.binanceAuto.guide.error.ambiguous":
-      "近期 Pay 流水出现多个冲突的账户 UID，请检查账户或 Binance 返回结果后再绑定。",
-    "account.binanceAuto.guide.error.mismatch":
-      "新的 Pay 证据与该 API Key 先前验证的 UID 不一致，请重新绑定并核对自动识别的账户。",
-    "account.binanceAuto.guide.error.credentials":
-      "检查 Key、Secret 和 IP 白名单；如果 Secret 已无法找回，请重新创建只读 Key。",
-    "account.binanceAuto.guide.uiNotice":
-      "币安菜单名称和位置可能随地区、账户类型及 App 版本变化；如果界面不同，请使用官方 API 管理页面。",
-    "account.binanceAuto.guide.openApiManagement": "打开币安 API 管理",
-    "account.binanceAuto.guide.openApiDocs": "查看 Pay API 文档",
+      "等待 Router 自动加载账户信息，核对只读 UID 后点击“确认绑定”。",
+    "account.binanceAuto.guide.note.title": "说明",
+    "account.binanceAuto.guide.note.body":
+      "UID 由 Router 从签名的 Binance Pay 流水自动识别，不能手填。若未识别，先使用该账户支付或接收一笔小额 Pay，再重新输入 Key 和 Secret。Secret 会加密保存且不回显。币安 APP 菜单名称可能因地区、账户类型和版本不同。",
+    "account.binanceAuto.guide.openOfficialGuide": "查看币安官方教程",
     "account.binanceAuto.verify": "重新验证",
     "account.binanceAuto.disable": "停用",
     "account.binanceAuto.disableConfirm": "停用自动到账确认，并取消全部待处理的自动付款金额？",

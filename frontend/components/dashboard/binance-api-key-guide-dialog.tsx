@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Modal } from "@heroui/react";
-import { ExternalLink, ShieldCheck, TriangleAlert } from "lucide-react";
+import { ExternalLink } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { MessageKey } from "@/lib/i18n";
 
@@ -11,20 +11,12 @@ const STEPS: Array<{
   bullets?: MessageKey[];
 }> = [
   {
-    title: "account.binanceAuto.guide.uid.title",
-    body: "account.binanceAuto.guide.uid.body",
-  },
-  {
-    title: "account.binanceAuto.guide.proof.title",
-    body: "account.binanceAuto.guide.proof.body",
-  },
-  {
     title: "account.binanceAuto.guide.create.title",
     body: "account.binanceAuto.guide.create.body",
   },
   {
     title: "account.binanceAuto.guide.permissions.title",
-    body: "account.binanceAuto.guide.permissions.body",
+    body: "account.binanceAuto.guide.permissions.check",
     bullets: [
       "account.binanceAuto.guide.permissions.read",
       "account.binanceAuto.guide.permissions.block",
@@ -39,15 +31,6 @@ const STEPS: Array<{
     title: "account.binanceAuto.guide.verify.title",
     body: "account.binanceAuto.guide.verify.body",
   },
-];
-
-const ERRORS: Array<{ code: string; message: MessageKey }> = [
-  { code: "READ_PERMISSION_REQUIRED", message: "account.binanceAuto.guide.error.read" },
-  { code: "DANGEROUS_PERMISSION_ENABLED", message: "account.binanceAuto.guide.error.dangerous" },
-  { code: "ACCOUNT_UID_UNCONFIRMED", message: "account.binanceAuto.guide.error.unconfirmed" },
-  { code: "ACCOUNT_UID_AMBIGUOUS", message: "account.binanceAuto.guide.error.ambiguous" },
-  { code: "ACCOUNT_UID_MISMATCH", message: "account.binanceAuto.guide.error.mismatch" },
-  { code: "BINANCE_CREDENTIALS_REJECTED", message: "account.binanceAuto.guide.error.credentials" },
 ];
 
 export function BinanceApiKeyGuideDialog({
@@ -71,16 +54,6 @@ export function BinanceApiKeyGuideDialog({
           </Modal.Header>
           <Modal.Body className="min-h-0 overflow-y-auto !text-slate-900">
             <div className="grid gap-5">
-              <div className="flex gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-950">
-                <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0" aria-hidden />
-                <div>
-                  <strong className="text-sm">{t("account.binanceAuto.guide.safetyTitle")}</strong>
-                  <p className="mt-1 text-xs leading-5">
-                    {t("account.binanceAuto.guide.safetyBody")}
-                  </p>
-                </div>
-              </div>
-
               <ol className="grid gap-4">
                 {STEPS.map((step, index) => (
                   <li key={step.title} className="flex gap-3">
@@ -100,24 +73,14 @@ export function BinanceApiKeyGuideDialog({
                 ))}
               </ol>
 
-              <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="flex items-center gap-2">
-                  <TriangleAlert className="h-4 w-4 text-amber-700" aria-hidden />
-                  <h3 className="text-sm font-semibold">{t("account.binanceAuto.guide.errors.title")}</h3>
-                </div>
-                <dl className="mt-3 grid gap-2">
-                  {ERRORS.map((error) => (
-                    <div key={error.code} className="grid gap-0.5 sm:grid-cols-[15rem_1fr] sm:gap-3">
-                      <dt className="break-all font-mono text-[11px] font-semibold text-slate-800">{error.code}</dt>
-                      <dd className="text-xs leading-5 text-muted-foreground">{t(error.message)}</dd>
-                    </div>
-                  ))}
-                </dl>
+              <section className="border-t border-slate-200 pt-4">
+                <h3 className="text-xs font-semibold text-slate-800">
+                  {t("account.binanceAuto.guide.note.title")}
+                </h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {t("account.binanceAuto.guide.note.body")}
+                </p>
               </section>
-
-              <p className="text-xs leading-5 text-muted-foreground">
-                {t("account.binanceAuto.guide.uiNotice")}
-              </p>
             </div>
           </Modal.Body>
           <Modal.Footer className="flex-wrap">
@@ -126,17 +89,10 @@ export function BinanceApiKeyGuideDialog({
             </Button>
             <Button
               variant="outline"
-              onClick={() => window.open("https://www.binance.com/en/my/settings/api-management", "_blank", "noopener,noreferrer")}
+              onClick={() => window.open("https://www.binance.com/en/support/faq/how-to-create-api-keys-on-binance-360002502072", "_blank", "noopener,noreferrer")}
             >
               <ExternalLink className="h-4 w-4" aria-hidden />
-              {t("account.binanceAuto.guide.openApiManagement")}
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => window.open("https://developers.binance.com/docs/pay/rest-api", "_blank", "noopener,noreferrer")}
-            >
-              <ExternalLink className="h-4 w-4" aria-hidden />
-              {t("account.binanceAuto.guide.openApiDocs")}
+              {t("account.binanceAuto.guide.openOfficialGuide")}
             </Button>
           </Modal.Footer>
         </Modal.Dialog>
