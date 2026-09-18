@@ -393,7 +393,7 @@ export function AccountMarketAccessPage() {
     "client_host:paid": false,
   });
   const [newBuyerCredit, setNewBuyerCredit] = React.useState<CreditDraft>({
-    kind: "limited",
+    kind: "none",
     limit: "",
     unlimitedAcknowledged: false,
   });
@@ -401,7 +401,7 @@ export function AccountMarketAccessPage() {
   const [riskAcknowledged, setRiskAcknowledged] = React.useState(false);
   const [requestAction, setRequestAction] = React.useState<RequestAction | null>(null);
   const [approvalCredit, setApprovalCredit] = React.useState<CreditDraft>({
-    kind: "limited",
+    kind: "none",
     limit: "",
     unlimitedAcknowledged: false,
   });
@@ -439,10 +439,6 @@ export function AccountMarketAccessPage() {
     dashboard?.policies.find(
       (item) => item.productKind === kind && item.pricingKind === pricingKind,
     );
-  const paidBlackMode =
-    dashboard?.policies.some(
-      (policy) => policy.pricingKind === "paid" && policy.mode === "blacklist",
-    ) || false;
   const publicCreditEnabled = dashboard?.publicCreditLines.some((line) => line.enabled) || false;
   const counterpartyChanges = React.useMemo(
     () =>
@@ -659,10 +655,6 @@ export function AccountMarketAccessPage() {
     const creditLimitMinor = newBuyerCredit.kind === "limited"
       ? parseLimitMinor(newBuyerCredit.limit)
       : undefined;
-    if (paidScopeSelected && newBuyerCredit.kind === "none") {
-      toast.danger(t("marketAccess.addCreditRequired"));
-      return;
-    }
     if (paidScopeSelected && newBuyerCredit.kind === "limited" && creditLimitMinor == null) {
       toast.danger(t("marketAccess.invalidLimit"));
       return;
@@ -695,7 +687,7 @@ export function AccountMarketAccessPage() {
         "client_host:free": false,
         "client_host:paid": false,
       });
-      setNewBuyerCredit({ kind: "limited", limit: "", unlimitedAcknowledged: false });
+      setNewBuyerCredit({ kind: "none", limit: "", unlimitedAcknowledged: false });
       setDashboard((current) =>
         current
           ? {
@@ -748,7 +740,7 @@ export function AccountMarketAccessPage() {
     const existingCredit = counterparty && counterpartyCreditLine(counterparty, MARKET_CURRENCY);
     const suggestedMinor = request.dailyRateMinor ? request.dailyRateMinor * 7 : 5_000;
     setApprovalCredit({
-      kind: existingCredit && existingCredit.kind !== "none" ? existingCredit.kind : "limited",
+      kind: existingCredit?.kind || "none",
       limit: existingCredit?.limitMinor != null
         ? (existingCredit.limitMinor / 100).toFixed(2)
         : (suggestedMinor / 100).toFixed(2),
@@ -782,7 +774,7 @@ export function AccountMarketAccessPage() {
     } | undefined;
     if (kind === "approve" && request.pricingKind === "paid") {
       const limitMinor = approvalCredit.kind === "limited" ? parseLimitMinor(approvalCredit.limit) : undefined;
-      if (approvalCredit.kind === "none" || (approvalCredit.kind === "limited" && limitMinor == null)) {
+      if (approvalCredit.kind === "limited" && limitMinor == null) {
         toast.danger(t("marketAccess.invalidLimit"));
         return;
       }
@@ -987,7 +979,7 @@ export function AccountMarketAccessPage() {
         </Button>
       </div>
 
-      {paidBlackMode || publicCreditEnabled ? (
+      {publicCreditEnabled ? (
         <section className="flex gap-3 border-y border-amber-300 bg-amber-50 px-4 py-3 text-amber-950">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
           <div>
@@ -1019,14 +1011,10 @@ export function AccountMarketAccessPage() {
                   : t("marketAccess.pricing.paid");
               const title = `${productLabel} · ${pricingLabel}`;
               const blacklisted = policy.mode === "blacklist";
-              const riskyOpenAccess = blacklisted && pricingKind === "paid";
               return (
                 <div
                   key={`${kind}:${pricingKind}`}
-                  className={cn(
-                    "grid gap-3 rounded-lg border bg-card p-3",
-                    riskyOpenAccess ? "border-amber-300 bg-amber-50/40" : "border-border",
-                  )}
+                  className="grid gap-3 rounded-lg border border-border bg-card p-3"
                 >
                   <strong className="text-sm text-foreground">{title}</strong>
                   <SegmentedControl
@@ -1050,7 +1038,7 @@ export function AccountMarketAccessPage() {
         </div>
       </section>
 
-      {paidBlackMode || publicCreditEnabled ? (
+      {publicCreditEnabled ? (
         <section className="grid gap-4 border-b border-border pb-5">
           <div>
             <h3 className="text-sm font-semibold">{t("marketAccess.publicCreditTitle")}</h3>
@@ -1120,7 +1108,7 @@ export function AccountMarketAccessPage() {
                   currency={MARKET_CURRENCY}
                   draft={newBuyerCredit}
                   disabled={!!busy}
-                  allowNone={false}
+                  allowNone
                   onChange={setNewBuyerCredit}
                 />
               </section>
@@ -1368,7 +1356,7 @@ export function AccountMarketAccessPage() {
                     line={requestCreditLine}
                     draft={approvalCredit}
                     disabled={!!busy}
-                    allowNone={false}
+                    allowNone
                     onChange={setApprovalCredit}
                   />
                 </section>

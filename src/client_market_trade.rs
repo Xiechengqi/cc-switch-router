@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration as StdDuration;
@@ -204,6 +205,7 @@ pub struct AllocationQuoteView {
     pub status: String,
     pub expires_at: String,
     pub items: Vec<QuoteItemView>,
+    pub funding: Vec<crate::market_billing::MarketFundingSummaryView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1265,12 +1267,17 @@ async fn create_quote(
     Json(input): Json<CreateQuoteRequest>,
 ) -> Result<Json<AllocationQuoteView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .client_market_create_quote(&session, input)
-            .await?,
-    ))
+    let mut quote = state
+        .store
+        .client_market_create_quote(&session, input)
+        .await?;
+    for funding in &mut quote.funding {
+        funding.topup_available = state
+            .binance_settlement
+            .supplier_funding_available(&state.store, &funding.supplier_user_id)
+            .await?;
+    }
+    Ok(Json(quote))
 }
 
 async fn commit_quote(
@@ -2772,6 +2779,39 @@ impl AppStore {
                 ));
             }
         }
+        let mut funding_rates = BTreeMap::<(String, String), (String, i64)>::new();
+        for candidate in &candidates {
+            if let Some(daily_rate_minor) = candidate.daily_rate_minor {
+                let currency = candidate.currency.as_deref().ok_or_else(|| {
+                    AppError::Internal("paid quoted Host currency is missing".into())
+                })?;
+                let key = (candidate.provider_id.clone(), currency.to_string());
+                let (_, rate) = funding_rates
+                    .entry(key)
+                    .or_insert_with(|| (candidate.host_owner_email.clone(), 0));
+                *rate = rate.checked_add(daily_rate_minor).ok_or_else(|| {
+                    AppError::Internal("quoted Host funding rate overflowed".into())
+                })?;
+            }
+        }
+        let funding = funding_rates
+            .into_iter()
+            .map(
+                |((provider_id, currency), (provider_email, daily_rate_minor))| {
+                    crate::market_billing::market_funding_summary_tx(
+                        &tx,
+                        &session.user_id,
+                        &session.email,
+                        &provider_id,
+                        &provider_email,
+                        crate::market_access::PRODUCT_CLIENT_HOST,
+                        &currency,
+                        daily_rate_minor,
+                        &now_rfc,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>, AppError>>()?;
         let quote_id = Uuid::new_v4().to_string();
         let expires_at = now + Duration::seconds(QUOTE_TTL_SECS);
         let client_owner_email = normalize_email(&session.email)?;
@@ -2861,6 +2901,7 @@ impl AppStore {
             status: "active".into(),
             expires_at: expires_at.to_rfc3339(),
             items,
+            funding,
         })
     }
 
@@ -3126,6 +3167,34 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("insert quoted provisioning job failed: {error}"))
             })?;
+            if let Some(daily_rate_minor) = item.4 {
+                let currency = item.5.as_deref().ok_or_else(|| {
+                    AppError::Internal("paid quote item currency is missing".into())
+                })?;
+                let reservation_expires_at = (now + Duration::minutes(30)).to_rfc3339();
+                let now_text = now.to_rfc3339();
+                crate::market_billing::reserve_client_market_funding_tx(
+                    &tx,
+                    &crate::market_billing::ActivateContractInput {
+                        product_kind: "client_host",
+                        product_ref: &job_id,
+                        service_ref: &item.0,
+                        service_label: subdomain,
+                        buyer_user_id: &session.user_id,
+                        buyer_email: &session.email,
+                        supplier_user_id: &item.1,
+                        supplier_email: &item.2,
+                        currency,
+                        daily_rate_minor,
+                        offer_revision: item.6,
+                        replacement_of: None,
+                        trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
+                    },
+                    &job_id,
+                    &reservation_expires_at,
+                    &now_text,
+                )?;
+            }
             tx.execute(
                 "INSERT INTO subdomain_reservations
                     (subdomain, job_id, host_id, client_owner_email, installation_id, expires_at_ms)
@@ -4712,6 +4781,70 @@ pub(crate) fn complete_provisioning_tx(
         let currency = currency
             .as_deref()
             .ok_or_else(|| AppError::Internal("paid Client Host currency is missing".into()))?;
+        let now_text = now.to_rfc3339();
+        let mut funding_captured = crate::market_billing::finish_market_funding_reservation_tx(
+            tx,
+            "client_host",
+            job_id,
+            true,
+            "service_activated",
+            &now_text,
+        )?;
+        if !funding_captured {
+            let reservation_status = tx
+                .query_row(
+                    "SELECT status FROM market_funding_reservations
+                     WHERE product_kind = 'client_host' AND product_ref = ?1",
+                    params![job_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "read completed Client funding reservation failed: {error}"
+                    ))
+                })?;
+            if reservation_status
+                .as_deref()
+                .is_none_or(|status| matches!(status, "released" | "expired"))
+            {
+                crate::market_billing::reserve_client_market_funding_tx(
+                    tx,
+                    &crate::market_billing::ActivateContractInput {
+                        product_kind: "client_host",
+                        product_ref: job_id,
+                        service_ref: installation_id,
+                        service_label: &label,
+                        buyer_user_id: &client_user_id,
+                        buyer_email: &client_email,
+                        supplier_user_id: &provider_id,
+                        supplier_email: &host_email,
+                        currency,
+                        daily_rate_minor,
+                        offer_revision: revision,
+                        replacement_of: None,
+                        trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
+                    },
+                    job_id,
+                    &(now + Duration::minutes(1)).to_rfc3339(),
+                    &now_text,
+                )?;
+                funding_captured = crate::market_billing::finish_market_funding_reservation_tx(
+                    tx,
+                    "client_host",
+                    job_id,
+                    true,
+                    "service_activated",
+                    &now_text,
+                )?;
+            }
+        }
+        if !funding_captured {
+            return Err(AppError::Conflict(
+                "the Client Market funding reservation expired before provisioning completed"
+                    .into(),
+            ));
+        }
         crate::market_billing::activate_contract_tx(
             tx,
             crate::market_billing::ActivateContractInput {

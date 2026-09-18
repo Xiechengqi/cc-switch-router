@@ -10,6 +10,10 @@ import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { marketEligibilityFromError } from "@/components/common/seller-approval-dialog";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
+import {
+  MarketFundingSummaryCard,
+  MarketFundingTopupDialog,
+} from "@/components/dashboard/market-funding-topup-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -20,12 +24,17 @@ import {
   getClientMarketBatch,
   getClientMarketProviderSupply,
 } from "@/lib/api";
+import {
+  applyMarketFundingConflict,
+  marketFundingConflictFromError,
+} from "@/lib/market-funding";
 import type {
   ClientMarketAllocationQuote,
   ClientMarketHost,
   ClientMarketProvider,
   CreateClientRegionsPersist,
   CreateClientSelectionPersist,
+  MarketFundingSummary,
   ProvisioningJob,
 } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
@@ -142,6 +151,7 @@ export function CreateClientDialog({
   );
   const [quantity, setQuantity] = React.useState(1);
   const [quote, setQuote] = React.useState<ClientMarketAllocationQuote | null>(null);
+  const [topupFunding, setTopupFunding] = React.useState<MarketFundingSummary>();
   const [drafts, setDrafts] = React.useState<Record<string, Draft>>({});
   /** Drafts rescued from an expired quote, keyed by hostId so they survive the new
    *  quote's fresh item ids. Losing a filled-in subdomain and password on a 120s
@@ -271,6 +281,7 @@ export function CreateClientDialog({
     setPhase("form");
     setMode("online");
     setQuote(null);
+    setTopupFunding(undefined);
     commitKeyRef.current = null;
     setDrafts({});
     setSubdomainChecks({});
@@ -489,6 +500,10 @@ export function CreateClientDialog({
 
   const commit = async () => {
     if (!quote) return;
+    if (quote.funding.some((funding) => funding.requiredTopupMinor > 0)) {
+      setError(t("marketFunding.blocked"));
+      return;
+    }
     const items = quote.items.map((item) => ({
       quoteItemId: item.id,
       offerRevision: item.offerRevision,
@@ -559,7 +574,17 @@ export function CreateClientDialog({
       void pollBatch(response.batchId, generation);
     } catch (reason) {
       if (!routeMarketEligibilityError(reason)) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        const fundingConflict = marketFundingConflictFromError(reason);
+        if (fundingConflict) {
+          setQuote((current) => current ? {
+            ...current,
+            funding: current.funding.map((funding) =>
+              applyMarketFundingConflict(funding, fundingConflict)),
+          } : current);
+          setError(t("marketFunding.blocked"));
+        } else {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
       }
     } finally {
       setLoading(false);
@@ -569,6 +594,7 @@ export function CreateClientDialog({
   const cancelQuote = async () => {
     if (quote) await cancelClientMarketQuote(quote.id).catch(() => undefined);
     setQuote(null);
+    setTopupFunding(undefined);
     setDrafts({});
     setSubdomainChecks({});
     subdomainCheckGeneration.current += 1;
@@ -579,6 +605,7 @@ export function CreateClientDialog({
     if (!nextOpen && phase === "running") return;
     if (!nextOpen && phase === "quote" && quote) void cancelClientMarketQuote(quote.id).catch(() => undefined);
     if (!nextOpen) subdomainCheckGeneration.current += 1;
+    if (!nextOpen) setTopupFunding(undefined);
     pollGeneration.current += 1;
     onOpenChange(nextOpen);
   };
@@ -599,6 +626,7 @@ export function CreateClientDialog({
       .filter((item) => item.dailyRateMinor != null)
       .map((item) => item.providerId) || [],
   ).size;
+  const hasFundingShortfall = quote?.funding.some((funding) => funding.requiredTopupMinor > 0) || false;
   const subdomainsCanCommit = !!quote && quote.items.every((item) => {
     const value = normalizeDraftSubdomain(drafts[item.id]?.subdomain || "");
     const check = subdomainChecks[item.id];
@@ -615,6 +643,7 @@ export function CreateClientDialog({
     capacity === 0;
 
   return (
+    <>
     <Modal.Backdrop isOpen={open} onOpenChange={close} isDismissable={phase !== "running"}>
       <Modal.Container placement="center">
         <Modal.Dialog className="light min-w-0 w-[min(720px,calc(100vw-2rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
@@ -740,6 +769,20 @@ export function CreateClientDialog({
                     </div>
                   </div>
                 ) : null}
+                {quote.funding.map((funding) => (
+                  <div key={`${funding.supplierUserId}:${funding.currency}`} className="grid gap-2">
+                    <MarketFundingSummaryCard funding={funding} />
+                    {funding.requiredTopupMinor > 0 ? (
+                      funding.topupAvailable ? (
+                        <Button size="sm" variant="outline" className="justify-self-start" onClick={() => setTopupFunding(funding)}>
+                          {t("marketFunding.topup.action")}
+                        </Button>
+                      ) : (
+                        <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t("marketFunding.topup.unavailable")}</p>
+                      )
+                    ) : null}
+                  </div>
+                ))}
                 {freeQuoteCount ? (
                   <div className="flex gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-950">
                     <ShieldCheck className="mt-1 h-4 w-4 shrink-0" />
@@ -764,10 +807,56 @@ export function CreateClientDialog({
             {phase === "quote" ? <Button variant="ghost" isDisabled={loading} onClick={() => void cancelQuote()}><RotateCcw className="h-4 w-4" />{t("clientMarket.back")}</Button> : <Button variant="ghost" isDisabled={phase === "running"} onClick={() => close(false)}>{t("common.close")}</Button>}
             {phase === "form" && mode === "manual" && !fixedHost ? <Button variant="outline" onClick={() => void navigator.clipboard.writeText(installCommand).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); })}>{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}{copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}</Button> : null}
             {phase === "form" && (mode === "online" || fixedHost) ? <Button variant="primary" isDisabled={loading || authLoading || (authed && capacity < quantity)} onClick={() => void requestQuote()}>{!authed ? <LogIn className="h-4 w-4" /> : loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{!authed ? t("createClient.login") : !fixedHost && safeProviders.mode === "official_default" && capacity === 0 ? t("createClient.officialNoCapacityButton") : t("createClient.selectHosts")}</Button> : null}
-            {phase === "quote" ? <Button variant="primary" isDisabled={loading || quoteSeconds <= 0 || !subdomainsCanCommit} onClick={() => void commit()}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("createClient.confirmCreate")}</Button> : null}
+            {phase === "quote" ? <Button variant="primary" isDisabled={loading || quoteSeconds <= 0 || !subdomainsCanCommit || hasFundingShortfall} onClick={() => void commit()}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("createClient.confirmCreate")}</Button> : null}
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
     </Modal.Backdrop>
+    <MarketFundingTopupDialog
+      open={!!topupFunding}
+      funding={topupFunding}
+      onClose={() => setTopupFunding(undefined)}
+      onCredited={async (creditedIntent) => {
+        setTopupFunding(undefined);
+        if (quote) {
+          const rescued: Record<string, Draft> = {};
+          for (const item of quote.items) {
+            const draft = drafts[item.id];
+            if (draft && (draft.subdomain || draft.password)) rescued[item.hostId] = draft;
+          }
+          preservedDrafts.current = rescued;
+          try {
+            await cancelClientMarketQuote(quote.id);
+          } catch {
+            if (secondsRemaining(quote.expiresAt) > 0) {
+              const creditedMinor = creditedIntent.creditedMinor
+                ?? topupFunding?.requiredTopupMinor
+                ?? 0;
+              setQuote((current) => current ? {
+                ...current,
+                funding: current.funding.map((funding) => {
+                  if (funding.supplierUserId !== creditedIntent.supplierUserId) return funding;
+                  return {
+                    ...funding,
+                    prepaidBalanceMinor: funding.prepaidBalanceMinor + creditedMinor,
+                    prepaidAvailableMinor: funding.prepaidAvailableMinor + creditedMinor,
+                    requiredTopupMinor: Math.max(0, funding.requiredTopupMinor - creditedMinor),
+                  };
+                }),
+              } : current);
+              setError(t("marketFunding.topup.quoteRefreshFallback"));
+              setPhase("quote");
+              return;
+            }
+          }
+          setQuote(null);
+          setDrafts({});
+          setSubdomainChecks({});
+        }
+        setPhase("form");
+        await requestQuote();
+      }}
+    />
+    </>
   );
 }

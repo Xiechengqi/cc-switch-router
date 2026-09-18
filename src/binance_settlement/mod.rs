@@ -30,8 +30,8 @@ use crate::models::AuthSession;
 use self::client::{BinanceApiError, BinanceClient, BinancePayTransaction};
 use self::crypto::{BinanceCredentials, CredentialCipher, credential_aad};
 pub use self::store::{
-    BinancePaymentAccountView, BinancePaymentIntentView, BinanceReceiptHistoryEntryView,
-    BinanceSettlementAdminView,
+    BinanceFundingIntentView, BinancePaymentAccountView, BinancePaymentIntentView,
+    BinanceReceiptHistoryEntryView, BinanceSettlementAdminView,
 };
 use self::store::{
     StoredPaymentAccount, decode_account_credentials, mask_api_key, validate_credentials,
@@ -335,6 +335,30 @@ impl BinanceSettlementRuntime {
         }
     }
 
+    pub(crate) async fn supplier_funding_available(
+        &self,
+        store: &crate::store::AppStore,
+        supplier_user_id: &str,
+    ) -> Result<bool, AppError> {
+        if self.mode != GlobalMode::Enabled {
+            return Ok(false);
+        }
+        let availability = self.service_availability(false).await;
+        if availability.status != BinanceServiceAvailability::Available {
+            return Ok(false);
+        }
+        let Some(cipher) = self.cipher.as_ref() else {
+            return Ok(false);
+        };
+        store
+            .binance_supplier_funding_available_for_cipher(
+                supplier_user_id,
+                self.payment_home_region(),
+                cipher,
+            )
+            .await
+    }
+
     pub(crate) async fn service_availability(
         &self,
         force: bool,
@@ -525,6 +549,14 @@ struct ResolveReconciliationRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateFundingIntentRequest {
+    supplier_user_id: String,
+    amount_minor: i64,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReceiptHistoryQuery {
     cursor: Option<String>,
     limit: Option<usize>,
@@ -585,6 +617,18 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/market-billing/invoices/:invoice_id/binance-intent/refresh",
             post(refresh_payment_intent),
+        )
+        .route(
+            "/v1/market-billing/funding-intents",
+            post(create_funding_intent),
+        )
+        .route(
+            "/v1/market-billing/funding-intents/:intent_id",
+            get(get_funding_intent).delete(cancel_funding_intent),
+        )
+        .route(
+            "/v1/market-billing/funding-intents/:intent_id/refresh",
+            post(refresh_funding_intent),
         )
         .route(
             "/v1/admin/market-billing/binance-reconciliation",
@@ -1068,6 +1112,91 @@ async fn cancel_payment_intent(
         state
             .store
             .binance_cancel_intent(&session, &invoice_id)
+            .await?,
+    ))
+}
+
+async fn create_funding_intent(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateFundingIntentRequest>,
+) -> Result<Json<BinanceFundingIntentView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let cipher = state.binance_settlement.require_payment_available().await?;
+    Ok(Json(
+        state
+            .store
+            .binance_create_funding_intent_for_cipher(
+                &session,
+                input.supplier_user_id.trim(),
+                input.amount_minor,
+                &input.idempotency_key,
+                state.binance_settlement.payment_home_region(),
+                cipher,
+            )
+            .await?,
+    ))
+}
+
+async fn get_funding_intent(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(intent_id): Path<String>,
+) -> Result<Json<BinanceFundingIntentView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let intent = state
+        .store
+        .binance_funding_intent(&session, &intent_id)
+        .await?;
+    if intent.status == "pending" {
+        let cipher = state.binance_settlement.require_payment_available().await?;
+        if !state
+            .store
+            .binance_supplier_funding_available_for_cipher(
+                &intent.supplier_user_id,
+                state.binance_settlement.payment_home_region(),
+                cipher,
+            )
+            .await?
+        {
+            return Err(AppError::ServiceUnavailable(
+                "the supplier Binance funding account is not currently available".into(),
+            ));
+        }
+    }
+    Ok(Json(intent))
+}
+
+async fn cancel_funding_intent(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(intent_id): Path<String>,
+) -> Result<Json<BinanceFundingIntentView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .binance_cancel_funding_intent(&session, &intent_id)
+            .await?,
+    ))
+}
+
+async fn refresh_funding_intent(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(intent_id): Path<String>,
+) -> Result<Json<BinanceFundingIntentView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let cipher = state.binance_settlement.require_payment_available().await?;
+    Ok(Json(
+        state
+            .store
+            .binance_refresh_funding_intent_for_cipher(
+                &session,
+                &intent_id,
+                state.binance_settlement.payment_home_region(),
+                cipher,
+            )
             .await?,
     ))
 }

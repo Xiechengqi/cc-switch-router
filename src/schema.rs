@@ -175,6 +175,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0047_binance_api_managed_uid.sql"),
     ),
     (48, include_str!("../schema/0048_binance_api_key_only.sql")),
+    (
+        49,
+        include_str!("../schema/0049_market_prepaid_funding.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -702,7 +706,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 144);
+        assert_eq!(table_count, 153);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1144,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_48_upgrade_a_version_26_database() {
+    fn migrations_27_through_49_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1273,8 +1277,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 48);
-        check_compatibility(&conn).expect("upgraded version 48 is compatible");
+        assert_eq!(latest_version, 49);
+        check_compatibility(&conn).expect("upgraded version 49 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1665,6 +1669,194 @@ mod tests {
     }
 
     #[test]
+    fn migration_49_adds_prepaid_funding_without_reinterpreting_historical_debt() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 48);
+        conn.execute_batch(
+            r#"
+            INSERT INTO market_credit_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, balance_units, open_invoice_id, credit_kind,
+                credit_limit_minor, credit_source, credit_revision, version,
+                created_at, updated_at
+            ) VALUES (
+                'migration-49-account', 'migration-49-buyer', 'buyer@example.com',
+                'migration-49-supplier', 'supplier@example.com', 'USD',
+                'settlement_due', 123456, 'migration-49-invoice', 'limited',
+                5000, 'counterparty', 7, 9,
+                '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z'
+            );
+            INSERT INTO market_invoices (
+                id, account_id, sequence, amount_minor, amount_cny_minor,
+                usd_cny_rate_micros, amount_units, currency, payment_methods_json,
+                payment_contacts_json, payment_profile_updated_at, status,
+                due_at, deadline_at, opened_at
+            ) VALUES (
+                'migration-49-invoice', 'migration-49-account', 3, 2, 14,
+                7000000, 123456, 'USD', '[]', '[]',
+                '2026-09-01T00:00:00Z', 'open',
+                '2026-09-03T00:00:00Z', '2026-09-04T00:00:00Z',
+                '2026-09-02T00:00:00Z'
+            );
+            INSERT INTO market_external_payment_receipts (
+                id, invoice_id, payment_intent_id, payment_account_id,
+                transaction_id, source, matched_by, asset,
+                expected_amount_units, actual_amount_units, confirmed_at
+            ) VALUES (
+                'migration-49-receipt', 'historical-paid-invoice',
+                'historical-payment-intent', 'historical-payment-account',
+                'historical-transaction', 'binance_auto', 'exact_amount', 'USDT',
+                100037, 100037, '2026-08-01T00:00:00Z'
+            );
+            INSERT INTO market_public_credit_policies (
+                supplier_user_id, supplier_email, currency, enabled, limit_minor,
+                revision, risk_acknowledged_at, created_at, updated_at
+            ) VALUES (
+                'migration-49-supplier', 'supplier@example.com', 'USD', 1, 5000,
+                4, '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z',
+                '2026-08-01T00:00:00Z'
+            );
+            "#,
+        )
+        .expect("seed version 48 billing history");
+        let account_before: (
+            String,
+            i64,
+            Option<String>,
+            String,
+            Option<i64>,
+            String,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT status, balance_units, open_invoice_id, credit_kind,
+                        credit_limit_minor, credit_source, credit_revision, version
+                 FROM market_credit_accounts WHERE id = 'migration-49-account'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("snapshot historical credit account");
+        let invoice_before: (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT amount_minor, amount_units, sequence, status
+                 FROM market_invoices WHERE id = 'migration-49-invoice'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("snapshot historical invoice");
+        let receipt_before: (String, String, i64, i64, String) = conn
+            .query_row(
+                "SELECT payment_account_id, transaction_id, expected_amount_units,
+                        actual_amount_units, confirmed_at
+                 FROM market_external_payment_receipts WHERE id = 'migration-49-receipt'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("snapshot historical receipt");
+
+        apply(&conn).expect("apply prepaid funding migration");
+
+        let account_after = conn
+            .query_row(
+                "SELECT status, balance_units, open_invoice_id, credit_kind,
+                        credit_limit_minor, credit_source, credit_revision, version
+                 FROM market_credit_accounts WHERE id = 'migration-49-account'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .expect("read migrated credit account");
+        let invoice_after = conn
+            .query_row(
+                "SELECT amount_minor, amount_units, sequence, status
+                 FROM market_invoices WHERE id = 'migration-49-invoice'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("read migrated invoice");
+        let receipt_after = conn
+            .query_row(
+                "SELECT payment_account_id, transaction_id, expected_amount_units,
+                        actual_amount_units, confirmed_at
+                 FROM market_external_payment_receipts WHERE id = 'migration-49-receipt'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .expect("read migrated receipt");
+        assert_eq!(account_after, account_before);
+        assert_eq!(invoice_after, invoice_before);
+        assert_eq!(receipt_after, receipt_before);
+        let prepaid_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
+                    'market_prepaid_accounts', 'market_prepaid_ledger_entries',
+                    'market_funding_intents', 'market_funding_amount_reservations',
+                    'market_funding_receipts', 'market_funding_reservations',
+                    'market_accrual_allocations', 'market_prepaid_refund_requests',
+                    'market_prepaid_adjustment_credits'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count prepaid funding tables");
+        assert_eq!(prepaid_tables, 9);
+        let legacy_only: i64 = conn
+            .query_row(
+                "SELECT legacy_only FROM market_public_credit_policies
+                 WHERE supplier_user_id = 'migration-49-supplier'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated public credit fence");
+        assert_eq!(legacy_only, 1);
+    }
+
+    #[test]
     fn migration_30_installs_user_model_routing_without_a_share_foreign_key() {
         let conn = memory_connection();
         install_schema_through(&conn, 29);
@@ -1723,7 +1915,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 48);
+        assert_eq!(latest_version, 49);
     }
 
     #[test]
@@ -1747,7 +1939,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 48);
+        assert_eq!(latest_version, 49);
     }
 
     #[test]
@@ -1927,7 +2119,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 48);
+        assert_eq!(latest_version, 49);
     }
 
     #[test]

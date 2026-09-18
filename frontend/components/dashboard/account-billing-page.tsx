@@ -22,6 +22,7 @@ import {
   Settings2,
   ShieldAlert,
   Users,
+  WalletCards,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactSelect } from "@/components/common/compact-select";
@@ -33,29 +34,37 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   cancelBinancePaymentIntent,
+  cancelBinanceFundingIntent,
   closeMarketBillingAccount,
   confirmMarketBillingPayment,
   createBinancePaymentIntent,
+  createBinanceFundingIntent,
   declareMarketBillingPayment,
   disputeMarketBillingInvoice,
   getAdminBinanceReconciliation,
   getAdminMarketBillingDisputes,
   getBinancePaymentIntent,
+  getBinanceFundingIntent,
   getMarketBillingConfig,
   getMarketBillingDashboard,
   getMarketBillingInvoiceHistory,
   refreshBinancePaymentIntent,
+  refreshBinanceFundingIntent,
   rejectMarketBillingPayment,
   recordMarketRefundObligation,
+  recordMarketPrepaidRefund,
+  requestMarketPrepaidRefund,
   requestMarketBillingSettlement,
   resolveAdminBinanceReconciliation,
   resolveAdminMarketBillingDispute,
+  resolveMarketPrepaidRefund,
   settleMarketBillingAccount,
   updateMarketBillingSupplierProfile,
   voidAdminMarketBillingInvoice,
 } from "@/lib/api";
 import type {
   AdminMarketBillingDispute,
+  BinanceFundingIntent,
   BinancePaymentIntent,
   BinanceReconciliationCase,
   BinanceSettlementAdmin,
@@ -64,6 +73,8 @@ import type {
   MarketBillingInvoice,
   MarketBillingPaymentDeclaration,
   MarketCreditAccount,
+  MarketPrepaidAccount,
+  MarketPrepaidRefundRequest,
   ShareMarketRefundObligation,
 } from "@/lib/types";
 import {
@@ -81,6 +92,8 @@ type ProfileDraft = { graceHours: string };
 type Action =
   | { kind: "settle" | "request-settlement" | "close"; account: MarketCreditAccount }
   | { kind: "auto-pay" | "declare" | "confirm" | "reject" | "dispute"; account: MarketCreditAccount; invoice: MarketBillingInvoice }
+  | { kind: "topup" | "request-prepaid-refund"; account: MarketPrepaidAccount }
+  | { kind: "approve-prepaid-refund" | "reject-prepaid-refund" | "record-prepaid-refund"; account: MarketPrepaidAccount; refund: MarketPrepaidRefundRequest }
   | { kind: "record-refund"; obligation: ShareMarketRefundObligation }
   | { kind: "admin-uphold" | "admin-void"; dispute: AdminMarketBillingDispute }
   | { kind: "admin-invoice-void"; dispute: AdminMarketBillingDispute };
@@ -139,6 +152,11 @@ function binanceIntentStatusLabel(status: string, t: ReturnType<typeof useLocale
   }
 }
 
+function fundingIntentStatusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  if (status === "credited") return t("marketBilling.prepaid.topup.status.credited");
+  return binanceIntentStatusLabel(status, t);
+}
+
 function serviceStatusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
   switch (status) {
     case "trial": return t("marketBilling.service.trial");
@@ -160,6 +178,11 @@ function actionSubmitLabel(action: Action, t: ReturnType<typeof useLocaleText>["
     case "reject": return t("marketBilling.action.reject");
     case "dispute": return t("marketBilling.action.dispute");
     case "record-refund": return t("marketBilling.refund.record");
+    case "topup": return t("marketBilling.prepaid.topup.create");
+    case "request-prepaid-refund": return t("marketBilling.prepaid.refund.request");
+    case "approve-prepaid-refund": return t("marketBilling.prepaid.refund.approve");
+    case "reject-prepaid-refund": return t("marketBilling.prepaid.refund.reject");
+    case "record-prepaid-refund": return t("marketBilling.prepaid.refund.record");
     case "admin-uphold": return t("marketBilling.admin.uphold");
     case "admin-void": return t("marketBilling.admin.voidDispute");
     case "admin-invoice-void": return t("marketBilling.admin.voidInvoice");
@@ -222,7 +245,7 @@ function RefundObligationPanel({
 }
 
 function actionIsDangerous(action: Action) {
-  return ["close", "reject", "dispute", "admin-void", "admin-invoice-void"].includes(action.kind);
+  return ["close", "reject", "dispute", "reject-prepaid-refund", "admin-void", "admin-invoice-void"].includes(action.kind);
 }
 
 function trialTime(seconds: number, t: ReturnType<typeof useLocaleText>["t"]) {
@@ -409,6 +432,164 @@ function ExternalReceiptDetails({ invoice, locale }: { invoice: MarketBillingInv
   );
 }
 
+function prepaidEntryLabel(kind: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  switch (kind) {
+    case "topup_credit": return t("marketBilling.prepaid.ledger.topup");
+    case "usage_debit": return t("marketBilling.prepaid.ledger.usage");
+    case "refund_debit": return t("marketBilling.prepaid.ledger.refund");
+    case "service_credit": return t("marketBilling.prepaid.ledger.serviceCredit");
+    default: return t("marketBilling.prepaid.ledger.adjustment");
+  }
+}
+
+function prepaidRefundStatusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  switch (status) {
+    case "requested": return t("marketBilling.prepaid.refund.status.requested");
+    case "approved": return t("marketBilling.prepaid.refund.status.approved");
+    case "rejected": return t("marketBilling.prepaid.refund.status.rejected");
+    case "recorded": return t("marketBilling.prepaid.refund.status.recorded");
+    case "cancelled": return t("marketBilling.prepaid.refund.status.cancelled");
+    default: return status.replaceAll("_", " ");
+  }
+}
+
+function PrepaidAccountPanel({
+  account,
+  perspective,
+  usdCnyRateMicros,
+  onAction,
+}: {
+  account: MarketPrepaidAccount;
+  perspective: "buyer" | "supplier";
+  usdCnyRateMicros: number;
+  onAction: (action: Action) => void;
+}) {
+  const { locale, t } = useLocaleText();
+  const [ledgerOpen, setLedgerOpen] = React.useState(false);
+  const counterparty = perspective === "buyer" ? account.supplierEmail : account.buyerEmail;
+  const activeRefund = account.refundRequests.find((item) => ["requested", "approved"].includes(item.status));
+  const money = (minor: number) => formatUsdCnyMoney(
+    minor,
+    locale,
+    usdMinorToCnyMinor(minor, usdCnyRateMicros),
+  );
+  return (
+    <section className="overflow-hidden rounded-lg border border-border bg-card">
+      <div className="grid gap-4 p-4 sm:p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <WalletCards className="h-4 w-4 shrink-0 text-muted-foreground" />
+              <strong className="break-all text-sm">{counterparty}</strong>
+              <Chip size="sm" variant="soft" className="bg-sky-100 text-sky-700">
+                {t("marketBilling.prepaid.badge")}
+              </Chip>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {perspective === "buyer" ? t("marketBilling.supplier") : t("marketBilling.buyer")} · {account.currency}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {perspective === "buyer" && account.topupAvailable ? (
+              <Button size="sm" variant="primary" onClick={() => onAction({ kind: "topup", account })}>
+                <CircleDollarSign className="h-4 w-4" />
+                {t("marketBilling.prepaid.topup.action")}
+              </Button>
+            ) : null}
+            {perspective === "buyer" && account.availableMinor > 0 && !activeRefund ? (
+              <Button size="sm" variant="outline" onClick={() => onAction({ kind: "request-prepaid-refund", account })}>
+                {t("marketBilling.prepaid.refund.request")}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div>
+            <span className="text-xs text-muted-foreground">{t("marketBilling.prepaid.balance")}</span>
+            <strong className="mt-0.5 block text-sm tabular-nums">{money(account.balanceMinor)}</strong>
+          </div>
+          <div>
+            <span className="text-xs text-muted-foreground">{t("marketBilling.prepaid.held")}</span>
+            <strong className="mt-0.5 block text-sm tabular-nums">{money(account.heldMinor)}</strong>
+          </div>
+          <div>
+            <span className="text-xs text-muted-foreground">{t("marketBilling.prepaid.available")}</span>
+            <strong className="mt-0.5 block text-sm tabular-nums text-emerald-700">{money(account.availableMinor)}</strong>
+          </div>
+        </div>
+
+        {perspective === "buyer" && !account.topupAvailable ? (
+          <p className="text-xs leading-5 text-muted-foreground">{t("marketBilling.prepaid.topup.unavailable")}</p>
+        ) : null}
+
+        {account.refundRequests.length ? (
+          <div className="grid gap-2 border-t border-border pt-3">
+            <strong className="text-xs uppercase text-muted-foreground">{t("marketBilling.prepaid.refund.title")}</strong>
+            {account.refundRequests.slice(0, 5).map((refund) => (
+              <div key={refund.id} className="grid gap-2 rounded-md border border-border p-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="flex items-center gap-2">
+                    <Chip size="sm" variant="soft" className={statusTone(refund.status)}>
+                      {prepaidRefundStatusLabel(refund.status, t)}
+                    </Chip>
+                    <span className="text-muted-foreground">{formatDate(refund.requestedAt, locale)}</span>
+                  </span>
+                  <strong className="tabular-nums">{money(refund.amountMinor)}</strong>
+                </div>
+                {refund.reason ? <p className="whitespace-pre-wrap text-muted-foreground">{refund.reason}</p> : null}
+                {refund.resolutionNote ? <p className="whitespace-pre-wrap text-muted-foreground">{refund.resolutionNote}</p> : null}
+                <div className="flex flex-wrap justify-end gap-2">
+                  {refund.canReview ? (
+                    <>
+                      <Button size="sm" variant="primary" onClick={() => onAction({ kind: "approve-prepaid-refund", account, refund })}>
+                        {t("marketBilling.prepaid.refund.approve")}
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => onAction({ kind: "reject-prepaid-refund", account, refund })}>
+                        {t("marketBilling.prepaid.refund.reject")}
+                      </Button>
+                    </>
+                  ) : null}
+                  {refund.canRecord ? (
+                    <Button size="sm" variant="primary" onClick={() => onAction({ kind: "record-prepaid-refund", account, refund })}>
+                      {t("marketBilling.prepaid.refund.record")}
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="border-t border-border pt-3">
+          <Button size="sm" variant="ghost" onClick={() => setLedgerOpen((current) => !current)}>
+            <ReceiptText className="h-4 w-4" />
+            {t("marketBilling.prepaid.ledger.title")}
+            <span className="tabular-nums text-muted-foreground">{account.ledger.length}</span>
+            <ChevronDown className={`h-4 w-4 transition-transform ${ledgerOpen ? "rotate-180" : ""}`} />
+          </Button>
+          {ledgerOpen ? (
+            <div className="mt-2 divide-y divide-border rounded-md border border-border">
+              {account.ledger.length ? account.ledger.map((entry) => (
+                <div key={entry.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 text-xs">
+                  <span>
+                    <strong>{prepaidEntryLabel(entry.entryKind, t)}</strong>
+                    <span className="ml-2 text-muted-foreground">{formatDate(entry.createdAt, locale)}</span>
+                  </span>
+                  <span className={`font-medium tabular-nums ${entry.direction === "credit" ? "text-emerald-700" : "text-foreground"}`}>
+                    {entry.direction === "credit" ? "+" : "-"}{money(entry.amountMinor)}
+                    <span className="ml-2 font-normal text-muted-foreground">{t("marketBilling.prepaid.ledger.after", { amount: money(entry.balanceAfterMinor) })}</span>
+                  </span>
+                </div>
+              )) : <p className="px-3 py-5 text-center text-xs text-muted-foreground">{t("marketBilling.prepaid.ledger.empty")}</p>}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function CreditAccountPanel({
   account,
   perspective,
@@ -430,6 +611,11 @@ function CreditAccountPanel({
   const utilization = account.utilizationBps == null
     ? null
     : Math.min(100, Math.max(0, account.utilizationBps / 100));
+  const creditAvailableMinor = account.creditKind === "unlimited"
+    ? null
+    : account.creditKind === "limited"
+      ? Math.max(0, (account.creditLimitMinor || 0) - account.balanceMinor)
+      : 0;
   const invoiceCanBePaid = perspective === "buyer" && invoice && ["open", "overdue"].includes(invoice.status);
   const invoiceSupportsBinance = binanceAutoSettlementEnabled
     && invoiceCanBePaid
@@ -496,24 +682,30 @@ function CreditAccountPanel({
                   )}
             </strong>
             <span className="text-xs text-muted-foreground">
-              {invoice ? t("marketBilling.invoice.total") : t("marketBilling.unbilledBalance")}
+              {invoice ? t("marketBilling.invoice.total") : t("marketBilling.creditOutstanding")}
             </span>
           </div> : null}
         </div>
 
-        {mode === "full" ? <><div className="grid gap-3 sm:grid-cols-3">
+        {mode === "full" ? <><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <div>
-            <span className="text-xs text-muted-foreground">{t("marketBilling.creditLimit")}</span>
+            <span className="text-xs text-muted-foreground">{t("marketBilling.prepaid.available")}</span>
+            <strong className="mt-0.5 block text-sm tabular-nums text-emerald-700">{formatUsdCnyMoney(
+              account.prepaidAvailableMinor,
+              locale,
+              usdMinorToCnyMinor(account.prepaidAvailableMinor, usdCnyRateMicros),
+            )}</strong>
+          </div>
+          <div>
+            <span className="text-xs text-muted-foreground">{t("marketBilling.creditAvailable")}</span>
             <strong className="mt-0.5 block text-sm tabular-nums">
-              {account.creditKind === "unlimited"
+              {creditAvailableMinor == null
                 ? t("marketBilling.creditUnlimited")
-                : account.creditLimitMinor != null
-                  ? formatUsdCnyMoney(
-                      account.creditLimitMinor,
-                      locale,
-                      usdMinorToCnyMinor(account.creditLimitMinor, usdCnyRateMicros),
-                    )
-                  : t("marketBilling.creditNone")}
+                : formatUsdCnyMoney(
+                    creditAvailableMinor,
+                    locale,
+                    usdMinorToCnyMinor(creditAvailableMinor, usdCnyRateMicros),
+                  )}
             </strong>
           </div>
           <div>
@@ -775,6 +967,9 @@ export function AccountBillingPage() {
   const [binanceIntent, setBinanceIntent] = React.useState<BinancePaymentIntent | null>(null);
   const [binanceIntentError, setBinanceIntentError] = React.useState("");
   const [binanceIntentBusy, setBinanceIntentBusy] = React.useState("");
+  const [fundingIntent, setFundingIntent] = React.useState<BinanceFundingIntent | null>(null);
+  const [fundingIntentError, setFundingIntentError] = React.useState("");
+  const [fundingIntentBusy, setFundingIntentBusy] = React.useState("");
   const [clockMs, setClockMs] = React.useState(() => Date.now());
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
@@ -786,6 +981,7 @@ export function AccountBillingPage() {
   const [note, setNote] = React.useState("");
   const [evidenceUrl, setEvidenceUrl] = React.useState("");
   const [paymentKind, setPaymentKind] = React.useState("");
+  const [amount, setAmount] = React.useState("");
   const [profiles, setProfiles] = React.useState<Record<Currency, ProfileDraft>>({
     USD: { ...EMPTY_PROFILE },
   });
@@ -799,7 +995,13 @@ export function AccountBillingPage() {
   const binanceIntentEpochRef = React.useRef(0);
   const binanceIntentMutationRef = React.useRef(false);
   const binanceIntentPollInFlightRef = React.useRef(false);
+  const creditedFundingIntentRef = React.useRef("");
+  const fundingIntentEpochRef = React.useRef(0);
+  const fundingIntentMutationRef = React.useRef(false);
+  const fundingIntentPollInFlightRef = React.useRef(false);
+  const fundingIdempotencyRef = React.useRef<{ supplierUserId: string; amountMinor: number; key: string } | null>(null);
   const autoPayInvoiceId = action?.kind === "auto-pay" ? action.invoice.id : null;
+  const topupSupplierId = action?.kind === "topup" ? action.account.supplierUserId : null;
   const binanceDegradedAccounts = binanceAdmin?.degradedAccounts ?? [];
   actorKeyRef.current = actorKey;
 
@@ -867,6 +1069,7 @@ export function AccountBillingPage() {
     setNote("");
     setEvidenceUrl("");
     setPaymentKind("");
+    setAmount("");
     setProfiles({ USD: { ...EMPTY_PROFILE } });
     setProfileDirty({ USD: false });
     setDashboard(null);
@@ -878,6 +1081,15 @@ export function AccountBillingPage() {
     setBinanceIntent(null);
     setBinanceIntentError("");
     setBinanceIntentBusy("");
+    binanceIntentEpochRef.current += 1;
+    binanceIntentMutationRef.current = false;
+    binanceIntentPollInFlightRef.current = false;
+    setFundingIntent(null);
+    setFundingIntentError("");
+    setFundingIntentBusy("");
+    fundingIntentEpochRef.current += 1;
+    fundingIntentMutationRef.current = false;
+    fundingIntentPollInFlightRef.current = false;
     if (!isAdmin) setTab((current) => current === "admin" ? "todo" : current);
     if (authLoading) return;
     if (!authed) {
@@ -976,15 +1188,81 @@ export function AccountBillingPage() {
     };
   }, [autoPayInvoiceId, load, t]);
 
+  React.useEffect(() => {
+    if (!topupSupplierId || !fundingIntent?.id || fundingIntent.status !== "pending") return;
+    let active = true;
+    const controller = new AbortController();
+    const intentId = fundingIntent.id;
+    const epoch = ++fundingIntentEpochRef.current;
+    fundingIntentPollInFlightRef.current = false;
+    const acceptIntent = (intent: BinanceFundingIntent) => {
+      if (!active || fundingIntentEpochRef.current !== epoch) return;
+      setFundingIntent(intent);
+      setFundingIntentError("");
+    };
+    const pollTimer = window.setInterval(() => {
+      if (fundingIntentMutationRef.current || fundingIntentPollInFlightRef.current) return;
+      fundingIntentPollInFlightRef.current = true;
+      void getBinanceFundingIntent(intentId, controller.signal)
+        .then(acceptIntent)
+        .catch((error) => {
+          if (!active || controller.signal.aborted || fundingIntentEpochRef.current !== epoch) return;
+          setFundingIntent((current) => current?.id === intentId
+            ? { ...current, accountStatus: "unavailable" }
+            : current);
+          setFundingIntentError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          if (active && fundingIntentEpochRef.current === epoch) {
+            fundingIntentPollInFlightRef.current = false;
+          }
+        });
+    }, 3_000);
+    const clockTimer = window.setInterval(() => setClockMs(Date.now()), 1_000);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearInterval(pollTimer);
+      window.clearInterval(clockTimer);
+      fundingIntentPollInFlightRef.current = false;
+    };
+  }, [fundingIntent?.id, fundingIntent?.status, load, t, topupSupplierId]);
+
+  React.useEffect(() => {
+    if (
+      !topupSupplierId
+      || fundingIntent?.status !== "credited"
+      || creditedFundingIntentRef.current === fundingIntent.id
+    ) return;
+    creditedFundingIntentRef.current = fundingIntent.id;
+    toast.success(t("marketBilling.prepaid.topup.credited"));
+    void load(true);
+  }, [fundingIntent?.id, fundingIntent?.status, load, t, topupSupplierId]);
+
   const openAction = (next: Action) => {
     setReason("");
     setReference("");
     setNote("");
     setEvidenceUrl("");
     setPaymentKind(next.kind === "declare" ? next.invoice.paymentMethods[0]?.kind || "" : "");
+    setAmount(
+      next.kind === "topup"
+        ? "10.00"
+        : next.kind === "request-prepaid-refund"
+          ? (next.account.availableMinor / 100).toFixed(2)
+          : "",
+    );
     setBinanceIntent(null);
     setBinanceIntentError("");
     setBinanceIntentBusy("");
+    fundingIntentEpochRef.current += 1;
+    fundingIntentMutationRef.current = false;
+    fundingIntentPollInFlightRef.current = false;
+    creditedFundingIntentRef.current = "";
+    fundingIdempotencyRef.current = null;
+    setFundingIntent(null);
+    setFundingIntentError("");
+    setFundingIntentBusy("");
     setAction(next);
   };
 
@@ -1034,6 +1312,105 @@ export function AccountBillingPage() {
     }
   };
 
+  const parsedAmountMinor = () => {
+    const normalized = amount.trim();
+    if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) return null;
+    const value = Number(normalized);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const minor = Math.round(value * 100);
+    return Number.isSafeInteger(minor) && minor > 0 ? minor : null;
+  };
+
+  const createTopupIntent = async () => {
+    if (action?.kind !== "topup" || fundingIntentBusy) return;
+    const amountMinor = parsedAmountMinor();
+    if (amountMinor == null) {
+      setFundingIntentError(t("marketBilling.prepaid.amountInvalid"));
+      return;
+    }
+    const identity = fundingIdempotencyRef.current;
+    if (!identity || identity.supplierUserId !== action.account.supplierUserId || identity.amountMinor !== amountMinor) {
+      fundingIdempotencyRef.current = {
+        supplierUserId: action.account.supplierUserId,
+        amountMinor,
+        key: `market-funding:${crypto.randomUUID()}`,
+      };
+    }
+    const idempotencyKey = fundingIdempotencyRef.current?.key;
+    if (!idempotencyKey) return;
+    const mutationEpoch = ++fundingIntentEpochRef.current;
+    fundingIntentMutationRef.current = true;
+    fundingIntentPollInFlightRef.current = false;
+    setFundingIntentBusy("create");
+    setFundingIntentError("");
+    try {
+      const intent = await createBinanceFundingIntent({
+        supplierUserId: action.account.supplierUserId,
+        amountMinor,
+        idempotencyKey,
+      });
+      if (fundingIntentEpochRef.current !== mutationEpoch) return;
+      setFundingIntent(intent);
+      setClockMs(Date.now());
+    } catch (error) {
+      if (fundingIntentEpochRef.current !== mutationEpoch) return;
+      setFundingIntentError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (fundingIntentEpochRef.current === mutationEpoch) {
+        fundingIntentMutationRef.current = false;
+        setFundingIntentBusy("");
+      }
+    }
+  };
+
+  const refreshTopupIntent = async () => {
+    if (!fundingIntent || fundingIntentBusy) return;
+    if (!window.confirm(t("marketBilling.binance.refreshConfirm"))) return;
+    const mutationEpoch = ++fundingIntentEpochRef.current;
+    fundingIntentMutationRef.current = true;
+    fundingIntentPollInFlightRef.current = false;
+    setFundingIntentBusy("refresh");
+    try {
+      const intent = await refreshBinanceFundingIntent(fundingIntent.id);
+      if (fundingIntentEpochRef.current !== mutationEpoch) return;
+      fundingIdempotencyRef.current = null;
+      setFundingIntent(intent);
+      setFundingIntentError("");
+      setClockMs(Date.now());
+    } catch (error) {
+      if (fundingIntentEpochRef.current !== mutationEpoch) return;
+      setFundingIntentError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (fundingIntentEpochRef.current === mutationEpoch) {
+        fundingIntentMutationRef.current = false;
+        setFundingIntentBusy("");
+      }
+    }
+  };
+
+  const cancelTopupIntent = async () => {
+    if (!fundingIntent || fundingIntentBusy) return;
+    if (!window.confirm(t("marketBilling.binance.cancelConfirm"))) return;
+    const mutationEpoch = ++fundingIntentEpochRef.current;
+    fundingIntentMutationRef.current = true;
+    fundingIntentPollInFlightRef.current = false;
+    setFundingIntentBusy("cancel");
+    try {
+      const intent = await cancelBinanceFundingIntent(fundingIntent.id);
+      if (fundingIntentEpochRef.current !== mutationEpoch) return;
+      setFundingIntent(intent);
+      setFundingIntentError("");
+    } catch (error) {
+      if (fundingIntentEpochRef.current !== mutationEpoch) return;
+      setFundingIntentError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (fundingIntentEpochRef.current === mutationEpoch) {
+        fundingIntentMutationRef.current = false;
+        setFundingIntentBusy("");
+      }
+    }
+  };
+
   const copyAutoPaymentValue = async (value: string) => {
     try {
       await navigator.clipboard.writeText(value);
@@ -1048,24 +1425,27 @@ export function AccountBillingPage() {
     resolution: "settle" | "ignore",
   ) => {
     if (busy) return;
+    const fundingCase = !!item.fundingIntentId;
     const invoiceId = (item.invoiceId ?? reconciliationInvoices[item.id] ?? "").trim();
-    if (resolution === "settle" && !invoiceId) {
+    if (resolution === "settle" && !fundingCase && !invoiceId) {
       toast.danger(t("marketBilling.binance.admin.invoiceRequired"));
       return;
     }
     if (
       resolution === "settle"
-      && !window.confirm(t("marketBilling.binance.admin.settleConfirm", {
-        amount: `${item.amount} ${item.asset}`,
-        invoice: invoiceId,
-      }))
+      && !window.confirm(fundingCase
+        ? t("marketBilling.binance.admin.settleFundingConfirm", { amount: `${item.amount} ${item.asset}` })
+        : t("marketBilling.binance.admin.settleConfirm", {
+            amount: `${item.amount} ${item.asset}`,
+            invoice: invoiceId,
+          }))
     ) return;
     if (resolution === "ignore" && !window.confirm(t("marketBilling.binance.admin.ignoreConfirm"))) return;
     setBusy(`binance-case:${item.id}`);
     try {
       await resolveAdminBinanceReconciliation(item.id, {
         resolution,
-        invoiceId: invoiceId || undefined,
+        invoiceId: fundingCase ? undefined : invoiceId || undefined,
       });
       toast.success(t("marketBilling.action.completed"));
       await load(true);
@@ -1139,6 +1519,28 @@ export function AccountBillingPage() {
           if (!reference.trim()) throw new Error(t("marketBilling.refund.referenceRequired"));
           await recordMarketRefundObligation(action.obligation.id, reference.trim());
           break;
+        case "request-prepaid-refund": {
+          const amountMinor = parsedAmountMinor();
+          if (amountMinor == null) throw new Error(t("marketBilling.prepaid.amountInvalid"));
+          nextDashboard = await requestMarketPrepaidRefund(
+            action.account.id,
+            amountMinor,
+            reason.trim() || undefined,
+          );
+          break;
+        }
+        case "approve-prepaid-refund":
+          nextDashboard = await resolveMarketPrepaidRefund(action.refund.id, "approve", note.trim() || undefined);
+          break;
+        case "reject-prepaid-refund":
+          nextDashboard = await resolveMarketPrepaidRefund(action.refund.id, "reject", note.trim() || undefined);
+          break;
+        case "record-prepaid-refund":
+          if (!reference.trim()) throw new Error(t("marketBilling.refund.referenceRequired"));
+          nextDashboard = await recordMarketPrepaidRefund(action.refund.id, reference.trim());
+          break;
+        case "topup":
+          return;
         case "admin-uphold":
           await resolveAdminMarketBillingDispute(action.dispute.dispute.id, "uphold", note || undefined);
           break;
@@ -1172,6 +1574,10 @@ export function AccountBillingPage() {
 
   const buyerAccounts = dashboard?.accounts.filter((account) => account.isBuyer) || [];
   const supplierAccounts = dashboard?.accounts.filter((account) => account.isSupplier) || [];
+  const buyerPrepaidAccounts = dashboard?.prepaidAccounts.filter((account) => account.isBuyer) || [];
+  const supplierPrepaidAccounts = dashboard?.prepaidAccounts.filter((account) => account.isSupplier) || [];
+  const prepaidTodoAccounts = supplierPrepaidAccounts.filter((account) =>
+    account.refundRequests.some((refund) => refund.canReview || refund.canRecord));
   const restrictions = dashboard?.restrictions || [];
   const refundObligations = dashboard?.refundObligations || [];
   const openRefundObligations = refundObligations.filter((item) => item.status !== "recorded");
@@ -1217,8 +1623,15 @@ export function AccountBillingPage() {
     && binanceIntent.accountStatus === "verified"
     && binanceRemainingSeconds > 0;
   const binanceCountdown = `${String(Math.floor(binanceRemainingSeconds / 60)).padStart(2, "0")}:${String(binanceRemainingSeconds % 60).padStart(2, "0")}`;
+  const fundingRemainingSeconds = fundingIntent
+    ? Math.max(0, Math.floor((new Date(fundingIntent.expiresAt).getTime() - clockMs) / 1_000))
+    : 0;
+  const fundingCanTransfer = fundingIntent?.status === "pending"
+    && fundingIntent.accountStatus === "verified"
+    && fundingRemainingSeconds > 0;
+  const fundingCountdown = `${String(Math.floor(fundingRemainingSeconds / 60)).padStart(2, "0")}:${String(fundingRemainingSeconds % 60).padStart(2, "0")}`;
   const needsReason = action && ["reject", "dispute", "admin-invoice-void"].includes(action.kind);
-  const needsAdminNote = action && ["admin-uphold", "admin-void"].includes(action.kind);
+  const needsAdminNote = action && ["approve-prepaid-refund", "reject-prepaid-refund", "admin-uphold", "admin-void"].includes(action.kind);
 
   return (
     <div className="grid min-w-0 gap-6">
@@ -1283,9 +1696,9 @@ export function AccountBillingPage() {
         ariaLabel={t("marketBilling.tabs.label")}
         size="md"
         items={[
-          { id: "todo", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.todo")}<span className="tabular-nums text-muted-foreground">{todoEntries.length + openRefundObligations.length}</span></span> },
-          { id: "payables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.payables")}<span className="tabular-nums text-muted-foreground">{buyerAccounts.length}</span></span> },
-          { id: "receivables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.receivables")}<span className="tabular-nums text-muted-foreground">{supplierAccounts.length}</span></span> },
+          { id: "todo", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.todo")}<span className="tabular-nums text-muted-foreground">{todoEntries.length + openRefundObligations.length + prepaidTodoAccounts.length}</span></span> },
+          { id: "payables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.payables")}<span className="tabular-nums text-muted-foreground">{Math.max(buyerAccounts.length, buyerPrepaidAccounts.length)}</span></span> },
+          { id: "receivables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.receivables")}<span className="tabular-nums text-muted-foreground">{Math.max(supplierAccounts.length, supplierPrepaidAccounts.length)}</span></span> },
           { id: "history", label: t("marketBilling.tabs.history") },
           ...(isAdmin ? [{ id: "admin" as const, label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.admin")}<span className="tabular-nums text-muted-foreground">{adminDisputes.length + (binanceAdmin?.openCaseCount || 0)}</span></span> }] : []),
         ]}
@@ -1339,10 +1752,13 @@ export function AccountBillingPage() {
         {openRefundObligations.map((obligation) => (
           <RefundObligationPanel key={obligation.id} obligation={obligation} locale={locale} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onRecord={(item) => openAction({ kind: "record-refund", obligation: item })} />
         ))}
+        {prepaidTodoAccounts.map((account) => (
+          <PrepaidAccountPanel key={`todo:prepaid:${account.id}`} account={account} perspective="supplier" usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onAction={openAction} />
+        ))}
         {todoEntries.map(({ account, perspective }) => (
           <CreditAccountPanel key={`todo:${perspective}:${account.id}`} account={account} perspective={perspective} onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
         ))}
-        {!todoEntries.length && !openRefundObligations.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.todo.empty")}</p> : null}
+        {!todoEntries.length && !openRefundObligations.length && !prepaidTodoAccounts.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.todo.empty")}</p> : null}
       </section> : null}
 
       {tab === "payables" ? <section className="grid gap-3">
@@ -1350,9 +1766,13 @@ export function AccountBillingPage() {
           <h3 className="text-base font-semibold">{t("marketBilling.payables.title")}</h3>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.payables.hint")}</p>
         </div>
-        {buyerAccounts.length ? buyerAccounts.map((account) => (
+        {buyerPrepaidAccounts.map((account) => (
+          <PrepaidAccountPanel key={`buyer:prepaid:${account.id}`} account={account} perspective="buyer" usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onAction={openAction} />
+        ))}
+        {buyerAccounts.map((account) => (
           <CreditAccountPanel key={`buyer:${account.id}`} account={account} perspective="buyer" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
-        )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.payables.empty")}</p>}
+        ))}
+        {!buyerAccounts.length && !buyerPrepaidAccounts.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.payables.empty")}</p> : null}
       </section> : null}
 
       {tab === "receivables" ? <section className="grid gap-3">
@@ -1360,9 +1780,13 @@ export function AccountBillingPage() {
           <h3 className="text-base font-semibold">{t("marketBilling.receivables.title")}</h3>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.receivables.hint")}</p>
         </div>
-        {supplierAccounts.length ? supplierAccounts.map((account) => (
+        {supplierPrepaidAccounts.map((account) => (
+          <PrepaidAccountPanel key={`supplier:prepaid:${account.id}`} account={account} perspective="supplier" usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onAction={openAction} />
+        ))}
+        {supplierAccounts.map((account) => (
           <CreditAccountPanel key={`supplier:${account.id}`} account={account} perspective="supplier" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
-        )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.receivables.empty")}</p>}
+        ))}
+        {!supplierAccounts.length && !supplierPrepaidAccounts.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.receivables.empty")}</p> : null}
       </section> : null}
 
       {tab === "history" ? <section className="grid gap-3">
@@ -1373,10 +1797,13 @@ export function AccountBillingPage() {
         {recordedRefundObligations.map((obligation) => (
           <RefundObligationPanel key={obligation.id} obligation={obligation} locale={locale} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onRecord={(item) => openAction({ kind: "record-refund", obligation: item })} />
         ))}
+        {[...buyerPrepaidAccounts.map((account) => ({ account, perspective: "buyer" as const })), ...supplierPrepaidAccounts.map((account) => ({ account, perspective: "supplier" as const }))].map(({ account, perspective }) => (
+          <PrepaidAccountPanel key={`history:prepaid:${perspective}:${account.id}`} account={account} perspective={perspective} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} onAction={openAction} />
+        ))}
         {historyEntries.map(({ account, perspective }) => (
           <CreditAccountPanel key={`history:${perspective}:${account.id}`} account={account} perspective={perspective} mode="history" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} binanceAutoSettlementEnabled={binanceAutoSettlementEnabled} />
         ))}
-        {!historyEntries.length && !recordedRefundObligations.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.history.empty")}</p> : null}
+        {!historyEntries.length && !recordedRefundObligations.length && !buyerPrepaidAccounts.length && !supplierPrepaidAccounts.length ? <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.history.empty")}</p> : null}
       </section> : null}
 
       {isAdmin && tab === "admin" ? (
@@ -1460,15 +1887,22 @@ export function AccountBillingPage() {
                     <span>{t("marketBilling.binance.admin.uid", { uid: item.binanceUid })}</span>
                     <span className="break-all">{t("marketBilling.binance.admin.account", { account: item.paymentAccountId })}</span>
                   </div>
-                  <label className="grid gap-1 text-xs text-muted-foreground">
-                    {t("marketBilling.binance.admin.invoiceId")}
-                    <input
-                      value={item.invoiceId ?? reconciliationInvoices[item.id] ?? ""}
-                      onChange={(event) => setReconciliationInvoices((current) => ({ ...current, [item.id]: event.target.value }))}
-                      readOnly={!!item.invoiceId}
-                      className="h-9 rounded-md border border-border bg-white px-3 font-mono text-xs text-foreground"
-                    />
-                  </label>
+                  {item.fundingIntentId ? (
+                    <div className="grid gap-1 rounded-md bg-sky-50 px-3 py-2 text-xs text-sky-900">
+                      <strong>{t("marketBilling.binance.admin.prepaidFunding")}</strong>
+                      <span className="break-all font-mono">{item.prepaidAccountId || item.fundingIntentId}</span>
+                    </div>
+                  ) : (
+                    <label className="grid gap-1 text-xs text-muted-foreground">
+                      {t("marketBilling.binance.admin.invoiceId")}
+                      <input
+                        value={item.invoiceId ?? reconciliationInvoices[item.id] ?? ""}
+                        onChange={(event) => setReconciliationInvoices((current) => ({ ...current, [item.id]: event.target.value }))}
+                        readOnly={!!item.invoiceId}
+                        className="h-9 rounded-md border border-border bg-white px-3 font-mono text-xs text-foreground"
+                      />
+                    </label>
+                  )}
                   <div className="flex flex-wrap gap-2">
                     <Button size="sm" variant="primary" isDisabled={!!busy} onClick={() => void resolveBinanceCase(item, "settle")}>
                       {busy === `binance-case:${item.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
@@ -1524,6 +1958,114 @@ export function AccountBillingPage() {
                   <span className="text-muted-foreground">{t("marketBilling.refund.amount")}</span>
                   <strong>{formatUsdCnyMoney(action.obligation.amountMinor, locale, usdMinorToCnyMinor(action.obligation.amountMinor, dashboard?.usdCnyRateMicros || 0))}</strong>
                   <span className="mt-1 text-xs text-muted-foreground">{t("marketBilling.refund.privateNotice")}</span>
+                </div>
+              ) : null}
+              {action?.kind === "topup" || action?.kind === "request-prepaid-refund" ? (
+                <div className="grid gap-3">
+                  <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-slate-50 p-3 text-sm">
+                    <span className="text-muted-foreground">{t("marketBilling.prepaid.available")}</span>
+                    <strong>{formatUsdCnyMoney(
+                      action.account.availableMinor,
+                      locale,
+                      usdMinorToCnyMinor(action.account.availableMinor, dashboard?.usdCnyRateMicros || 0),
+                    )}</strong>
+                  </div>
+                  {!fundingIntent ? (
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-muted-foreground">{t("marketBilling.prepaid.amountUsd")}</span>
+                      <input
+                        value={amount}
+                        onChange={(event) => {
+                          setAmount(event.target.value);
+                          fundingIdempotencyRef.current = null;
+                        }}
+                        inputMode="decimal"
+                        placeholder="10.00"
+                        className="h-10 rounded-md border border-border px-3 tabular-nums"
+                        autoFocus
+                      />
+                    </label>
+                  ) : null}
+                  {action.kind === "request-prepaid-refund" ? (
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-muted-foreground">{t("marketBilling.prepaid.refund.reason")}</span>
+                      <textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={2000} rows={3} className="rounded-md border border-border p-3" />
+                    </label>
+                  ) : null}
+                </div>
+              ) : null}
+              {action?.kind === "approve-prepaid-refund" || action?.kind === "reject-prepaid-refund" || action?.kind === "record-prepaid-refund" ? (
+                <div className="grid gap-1 rounded-md border border-border bg-slate-50 p-3 text-sm">
+                  <span className="text-muted-foreground">{t("marketBilling.prepaid.refund.amount")}</span>
+                  <strong>{formatUsdCnyMoney(
+                    action.refund.amountMinor,
+                    locale,
+                    usdMinorToCnyMinor(action.refund.amountMinor, dashboard?.usdCnyRateMicros || 0),
+                  )}</strong>
+                  {action.refund.reason ? <span className="mt-1 whitespace-pre-wrap text-xs text-muted-foreground">{action.refund.reason}</span> : null}
+                </div>
+              ) : null}
+              {action?.kind === "topup" ? (
+                <div className="grid gap-4">
+                  {fundingIntentError ? (
+                    <div className="flex gap-2 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                      <p className="break-words text-xs leading-5">{fundingIntentError}</p>
+                    </div>
+                  ) : null}
+                  {fundingIntent ? (
+                    <>
+                      <div className={`rounded-xl border p-4 text-center ${
+                        fundingIntent.status === "credited"
+                          ? "border-emerald-200 bg-emerald-50"
+                          : fundingIntent.status === "pending"
+                            ? "border-amber-200 bg-amber-50/70"
+                            : "border-slate-200 bg-slate-50"
+                      }`}>
+                        {fundingIntent.status === "credited" ? <CircleCheckBig className="mx-auto h-8 w-8 text-emerald-600" /> : null}
+                        <p className="mt-1 text-xs font-medium text-muted-foreground">
+                          {fundingCanTransfer ? t("marketBilling.binance.exactAmount") : fundingIntentStatusLabel(fundingIntent.status, t)}
+                        </p>
+                        <strong className="mt-1 block break-all text-3xl tabular-nums">
+                          {fundingIntent.payAmount}<span className="ml-2 text-base">{fundingIntent.asset}</span>
+                        </strong>
+                        {fundingCanTransfer ? (
+                          <Button size="sm" variant="outline" className="mt-3" onClick={() => void copyAutoPaymentValue(fundingIntent.payAmount)}>
+                            <Copy className="h-4 w-4" />{t("marketBilling.binance.copyAmount")}
+                          </Button>
+                        ) : null}
+                      </div>
+                      <div className="divide-y divide-dashed divide-border rounded-lg border border-border px-3 text-sm">
+                        {fundingCanTransfer ? (
+                          <>
+                            <div className="flex items-center justify-between gap-3 py-3">
+                              <span className="text-muted-foreground">{t("marketBilling.binance.receiverUid")}</span>
+                              <span className="flex min-w-0 items-center gap-2"><strong className="break-all text-right">{fundingIntent.receiverUid}</strong><Button isIconOnly size="sm" variant="ghost" aria-label={t("marketBilling.binance.copyUid")} onClick={() => void copyAutoPaymentValue(fundingIntent.receiverUid)}><Copy className="h-4 w-4" /></Button></span>
+                            </div>
+                            <div className="flex items-center justify-between gap-3 py-3">
+                              <span className="text-muted-foreground">{t("marketBilling.binance.noteCode")}</span>
+                              <span className="flex min-w-0 items-center gap-2"><strong className="break-all text-right">{fundingIntent.noteCode}</strong><Button isIconOnly size="sm" variant="ghost" aria-label={t("marketBilling.binance.copyNote")} onClick={() => void copyAutoPaymentValue(fundingIntent.noteCode)}><Copy className="h-4 w-4" /></Button></span>
+                            </div>
+                          </>
+                        ) : null}
+                        <div className="flex items-center justify-between gap-3 py-3"><span className="text-muted-foreground">{t("marketBilling.binance.remaining")}</span><strong className="tabular-nums">{fundingCountdown}</strong></div>
+                        <div className="flex items-center justify-between gap-3 py-3"><span className="text-muted-foreground">{t("marketBilling.binance.statusLabel")}</span><strong>{fundingIntentStatusLabel(fundingIntent.status, t)}</strong></div>
+                      </div>
+                      {fundingCanTransfer ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">{t("marketBilling.binance.path")}</p> : null}
+                      <div className="flex flex-wrap justify-center gap-2">
+                        {["pending", "expired", "cancelled"].includes(fundingIntent.status) ? (
+                          <Button size="sm" variant="outline" isDisabled={!!fundingIntentBusy || fundingIntent.accountStatus !== "verified"} onClick={() => void refreshTopupIntent()}>
+                            {fundingIntentBusy === "refresh" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("marketBilling.binance.refresh")}
+                          </Button>
+                        ) : null}
+                        {fundingIntent.status === "pending" ? (
+                          <Button size="sm" variant="outline" isDisabled={!!fundingIntentBusy} onClick={() => void cancelTopupIntent()}>
+                            {fundingIntentBusy === "cancel" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}{t("marketBilling.binance.cancel")}
+                          </Button>
+                        ) : null}
+                      </div>
+                    </>
+                  ) : null}
                 </div>
               ) : null}
               {actionInvoice ? (
@@ -1710,7 +2252,7 @@ export function AccountBillingPage() {
                   <p className="text-xs leading-5 text-muted-foreground">{t("marketBilling.declare.notice")}</p>
                 </>
               ) : null}
-              {action?.kind === "record-refund" ? (
+              {action?.kind === "record-refund" || action?.kind === "record-prepaid-refund" ? (
                 <label className="grid gap-1 text-sm">
                   <span className="text-muted-foreground">{t("marketBilling.refund.referenceLabel")}</span>
                   <input value={reference} onChange={(event) => setReference(event.target.value)} maxLength={200} className="h-10 rounded-md border border-border px-3" autoFocus />
@@ -1738,12 +2280,24 @@ export function AccountBillingPage() {
             <Modal.Footer>
               {action?.kind === "auto-pay" ? (
                 <Button variant="primary" onClick={() => setAction(null)}>{t("common.close")}</Button>
+              ) : action?.kind === "topup" ? (
+                fundingIntent ? (
+                  <Button variant="primary" isDisabled={!!fundingIntentBusy} onClick={() => setAction(null)}>{t("common.close")}</Button>
+                ) : (
+                  <>
+                    <Button variant="ghost" isDisabled={!!fundingIntentBusy} onClick={() => setAction(null)}>{t("common.cancel")}</Button>
+                    <Button variant="primary" isDisabled={!!fundingIntentBusy || parsedAmountMinor() == null} onClick={() => void createTopupIntent()}>
+                      {fundingIntentBusy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                      {t("marketBilling.prepaid.topup.create")}
+                    </Button>
+                  </>
+                )
               ) : (
                 <>
                   <Button variant="ghost" isDisabled={!!busy} onClick={() => setAction(null)}>{t("common.cancel")}</Button>
                   <Button
                     variant={action && actionIsDangerous(action) ? "danger" : "primary"}
-                    isDisabled={!!busy || !!(needsReason && !reason.trim()) || !!(action?.kind === "record-refund" && !reference.trim())}
+                    isDisabled={!!busy || !!(needsReason && !reason.trim()) || !!((action?.kind === "record-refund" || action?.kind === "record-prepaid-refund") && !reference.trim()) || !!(action?.kind === "request-prepaid-refund" && parsedAmountMinor() == null)}
                     onClick={() => void submitAction()}
                   >
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}

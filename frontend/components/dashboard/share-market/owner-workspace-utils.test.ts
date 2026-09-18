@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
+  MarketFundingSummary,
   ShareMarketListing,
   ShareMarketOwnedShare,
   ShareMarketSeat,
@@ -29,6 +30,10 @@ import {
 } from "./owner-workspace-utils";
 import { shareMarketMutationError } from "./market-utils";
 import { ApiError } from "@/lib/api";
+import {
+  applyMarketFundingConflict,
+  marketFundingConflictFromError,
+} from "@/lib/market-funding";
 
 function seat(
   id: string,
@@ -273,5 +278,73 @@ test("reopen API conflicts are localized by stable error code", () => {
       translate,
     ),
     "shareMarket.error.seatNotReopenable",
+  );
+});
+
+test("prepaid funding races are localized by stable error code", () => {
+  const translate = (key: string) => key;
+  assert.equal(
+    shareMarketMutationError(
+      new ApiError(409, "backend English", "MARKET_PREPAID_REQUIRED"),
+      translate,
+    ),
+    "marketFunding.blocked",
+  );
+});
+
+test("prepaid funding race details update only the affected supplier", () => {
+  const conflict = marketFundingConflictFromError(new ApiError(
+    409,
+    "funding changed",
+    "MARKET_PREPAID_REQUIRED",
+    {
+      supplierUserId: "supplier-a",
+      requiredTopupMinor: 275,
+      prepaidAvailableMinor: 25,
+      creditAvailableMinor: 0,
+    },
+  ));
+  assert.deepEqual(conflict, {
+    supplierUserId: "supplier-a",
+    requiredTopupMinor: 275,
+    prepaidAvailableMinor: 25,
+    creditAvailableMinor: 0,
+  });
+
+  const funding = {
+    supplierUserId: "supplier-a",
+    supplierEmail: "supplier@example.com",
+    currency: "USD",
+    fundingMode: "prepaid",
+    prepaidBalanceMinor: 25,
+    prepaidHeldMinor: 0,
+    prepaidAvailableMinor: 10,
+    creditKind: "none",
+    creditOutstandingMinor: 0,
+    requiredCoverageMinor: 300,
+    requiredTopupMinor: 0,
+    topupAvailable: true,
+  } satisfies MarketFundingSummary;
+  assert.deepEqual(applyMarketFundingConflict(funding, conflict!), {
+    ...funding,
+    prepaidAvailableMinor: 25,
+    creditAvailableMinor: 0,
+    requiredTopupMinor: 275,
+  });
+  assert.equal(
+    applyMarketFundingConflict(
+      { ...funding, supplierUserId: "supplier-b" },
+      conflict!,
+    ).requiredTopupMinor,
+    0,
+  );
+  assert.equal(
+    marketFundingConflictFromError(new ApiError(
+      409,
+      "unsafe incomplete details",
+      "MARKET_PREPAID_REQUIRED",
+      { requiredTopupMinor: 100 },
+    )),
+    null,
   );
 });

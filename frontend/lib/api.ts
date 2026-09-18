@@ -79,6 +79,7 @@ import type {
   DiscoverBinanceAccountResponse,
   BinanceReceiptHistoryResponse,
   BinancePaymentIntent,
+  BinanceFundingIntent,
   BinanceSettlementAdmin,
   ClientMarketPaymentMethod,
   PaymentContact,
@@ -1410,6 +1411,46 @@ export async function cancelBinancePaymentIntent(invoiceId: string) {
   );
 }
 
+export async function createBinanceFundingIntent(body: {
+  supplierUserId: string;
+  amountMinor: number;
+  idempotencyKey: string;
+}) {
+  return parseJson<BinanceFundingIntent>(
+    await authFetch("/v1/market-billing/funding-intents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function getBinanceFundingIntent(intentId: string, signal?: AbortSignal) {
+  return parseJson<BinanceFundingIntent>(
+    await authFetch(`/v1/market-billing/funding-intents/${encodeURIComponent(intentId)}`, {
+      cache: "no-store",
+      signal,
+    }),
+  );
+}
+
+export async function refreshBinanceFundingIntent(intentId: string) {
+  return parseJson<BinanceFundingIntent>(
+    await authFetch(
+      `/v1/market-billing/funding-intents/${encodeURIComponent(intentId)}/refresh`,
+      { method: "POST" },
+    ),
+  );
+}
+
+export async function cancelBinanceFundingIntent(intentId: string) {
+  return parseJson<BinanceFundingIntent>(
+    await authFetch(`/v1/market-billing/funding-intents/${encodeURIComponent(intentId)}`, {
+      method: "DELETE",
+    }),
+  );
+}
+
 export async function getAdminBinanceReconciliation(signal?: AbortSignal) {
   return parseJson<BinanceSettlementAdmin>(
     await authFetch("/v1/admin/market-billing/binance-reconciliation", {
@@ -1495,6 +1536,47 @@ export async function getMarketBillingInvoiceHistory(
       `/v1/market-billing/accounts/${encodeURIComponent(accountId)}/invoices?${query.toString()}`,
       { cache: "no-store" },
     ),
+  );
+}
+
+export async function requestMarketPrepaidRefund(
+  accountId: string,
+  amountMinor: number,
+  reason?: string,
+) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/prepaid-accounts/${encodeURIComponent(accountId)}/refunds`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amountMinor, reason }),
+    }),
+  );
+}
+
+export async function resolveMarketPrepaidRefund(
+  refundId: string,
+  resolution: "approve" | "reject",
+  note?: string,
+) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(
+      `/v1/market-billing/prepaid-refunds/${encodeURIComponent(refundId)}/${resolution}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note }),
+      },
+    ),
+  );
+}
+
+export async function recordMarketPrepaidRefund(refundId: string, externalReference: string) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/prepaid-refunds/${encodeURIComponent(refundId)}/record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ externalReference }),
+    }),
   );
 }
 

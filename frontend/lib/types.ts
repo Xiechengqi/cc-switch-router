@@ -2302,10 +2302,31 @@ export type BinancePaymentIntent = {
   lastCheckedAt?: string;
 };
 
+export type BinanceFundingIntent = {
+  id: string;
+  prepaidAccountId: string;
+  supplierUserId: string;
+  status: "pending" | "credited" | "expired" | "cancelled" | "review_required" | string;
+  asset: "USDT" | string;
+  baseAmount: string;
+  payAmount: string;
+  receiverUid: string;
+  noteCode: string;
+  expiresAt: string;
+  createdAt: string;
+  creditedAt?: string;
+  creditedMinor?: number;
+  cancellationReason?: string;
+  accountStatus: string;
+  lastCheckedAt?: string;
+};
+
 export type BinanceReconciliationCase = {
   id: string;
   invoiceId?: string;
   paymentIntentId?: string;
+  fundingIntentId?: string;
+  prepaidAccountId?: string;
   paymentAccountId: string;
   transactionId: string;
   orderId?: string;
@@ -2475,6 +2496,10 @@ export type MarketCreditAccount = {
   currency: "USD";
   status: string;
   balanceMinor: number;
+  prepaidAccountId?: string;
+  prepaidBalanceMinor: number;
+  prepaidHeldMinor: number;
+  prepaidAvailableMinor: number;
   creditKind: "none" | "limited" | "unlimited" | string;
   creditLimitMinor?: number;
   utilizationBps?: number;
@@ -2491,6 +2516,74 @@ export type MarketCreditAccount = {
   updatedAt: string;
 };
 
+export type MarketPrepaidLedgerEntry = {
+  id: string;
+  entryKind: string;
+  direction: "credit" | "debit" | string;
+  amountMinor: number;
+  balanceAfterMinor: number;
+  sourceKind: string;
+  sourceId: string;
+  detail: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type MarketPrepaidRefundRequest = {
+  id: string;
+  prepaidAccountId: string;
+  buyerUserId: string;
+  supplierUserId: string;
+  amountMinor: number;
+  currency: "USD";
+  status: string;
+  reason?: string;
+  resolutionNote?: string;
+  externalReference?: string;
+  requestedAt: string;
+  resolvedAt?: string;
+  recordedAt?: string;
+  canReview: boolean;
+  canRecord: boolean;
+};
+
+export type MarketPrepaidAccount = {
+  id: string;
+  buyerUserId: string;
+  buyerEmail: string;
+  supplierUserId: string;
+  supplierEmail: string;
+  currency: "USD";
+  status: string;
+  balanceMinor: number;
+  heldMinor: number;
+  availableMinor: number;
+  isBuyer: boolean;
+  isSupplier: boolean;
+  topupAvailable: boolean;
+  ledger: MarketPrepaidLedgerEntry[];
+  refundRequests: MarketPrepaidRefundRequest[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type MarketFundingSummary = {
+  supplierUserId: string;
+  supplierEmail: string;
+  currency: "USD";
+  fundingMode: "prepaid" | "prepaid_then_credit" | string;
+  prepaidAccountId?: string;
+  prepaidBalanceMinor: number;
+  prepaidHeldMinor: number;
+  prepaidAvailableMinor: number;
+  creditKind: MarketCreditKind;
+  creditOutstandingMinor: number;
+  creditAvailableMinor?: number;
+  requiredCoverageMinor: number;
+  requiredTopupMinor: number;
+  estimatedRunwaySeconds?: number;
+  topupAvailable: boolean;
+};
+
 export type MarketCreditRestriction = {
   id: string;
   invoiceId: string;
@@ -2500,6 +2593,7 @@ export type MarketCreditRestriction = {
 
 export type MarketBillingDashboard = {
   accounts: MarketCreditAccount[];
+  prepaidAccounts: MarketPrepaidAccount[];
   supplierProfiles: MarketBillingSupplierProfile[];
   restrictions: MarketCreditRestriction[];
   refundObligations: ShareMarketRefundObligation[];
@@ -2695,6 +2789,7 @@ export type ClientMarketAllocationQuote = {
   status: string;
   expiresAt: string;
   items: ClientMarketQuoteItem[];
+  funding: MarketFundingSummary[];
 };
 
 export type ClientMarketCommitQuoteResponse = {
@@ -2895,6 +2990,7 @@ export type ShareMarketTerminationAdjustmentSummary = {
   elapsedBps: number;
   refundBps: number;
   amountMinor: number;
+  prepaidCreditMinor: number;
   unbilledCreditMinor: number;
   invoiceCreditMinor: number;
   externalRefundMinor: number;
@@ -3080,6 +3176,7 @@ export type ShareMarketRentQuote = {
   status: "active" | "consumed" | "expired";
   expiresAt: string;
   trialSecondsRemaining: number;
+  funding?: MarketFundingSummary;
   offer: {
     seatId: string;
     listingId: string;

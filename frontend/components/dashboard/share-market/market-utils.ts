@@ -61,6 +61,7 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
   const coded: Partial<Record<string, MessageKey>> = {
     SHARE_MARKET_PAYMENT_PROFILE_REQUIRED: "shareMarket.error.paymentRequired",
     MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED: "shareMarket.error.settlementRequired",
+    MARKET_PREPAID_REQUIRED: "marketFunding.blocked",
     DATABASE_UNAVAILABLE: "shareMarket.error.temporarilyUnavailable",
     share_market_client_upgrade_required: "shareMarket.error.clientUpgradeRequired",
     share_market_share_tokens_exhausted: "shareMarket.error.shareTokensExhausted",

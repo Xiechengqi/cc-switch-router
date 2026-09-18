@@ -6904,25 +6904,49 @@ impl AppStore {
     }
 
     pub async fn client_market_fail_job(&self, job_id: &str, log: &str) -> Result<(), AppError> {
-        self.client_market_append_job_log(job_id, log).await?;
+        let chunk = sanitize_job_log_chunk(log);
+        let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE provisioning_jobs
-             SET status = ?2, phase = ?3, secret_ref = NULL, updated_at = ?4
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin fail provisioning job failed: {error}"))
+            })?;
+        let changed = tx
+            .execute(
+                "UPDATE provisioning_jobs
+             SET status = ?2, phase = ?3, secret_ref = NULL,
+                 log_blob = substr(COALESCE(log_blob, '') || ?4, -?5), updated_at = ?6
              WHERE id = ?1 AND status IN ('pending', 'running')",
-            params![
-                job_id,
-                JOB_STATUS_FAILED,
-                JOB_PHASE_COMPLETE,
-                Utc::now().to_rfc3339()
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("fail provisioning job failed: {e}")))?;
-        conn.execute(
+                params![
+                    job_id,
+                    JOB_STATUS_FAILED,
+                    JOB_PHASE_COMPLETE,
+                    chunk,
+                    JOB_LOG_LIMIT as i64,
+                    now,
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("fail provisioning job failed: {e}")))?;
+        if changed == 0 {
+            return Ok(());
+        }
+        tx.execute(
             "DELETE FROM subdomain_reservations WHERE job_id = ?1",
             params![job_id],
         )
         .map_err(|e| AppError::Internal(format!("release failed job reservation failed: {e}")))?;
+        crate::market_billing::finish_market_funding_reservation_tx(
+            &tx,
+            "client_host",
+            job_id,
+            false,
+            "provisioning_failed",
+            &now,
+        )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit failed provisioning job failed: {error}"))
+        })?;
         Ok(())
     }
 
@@ -8035,6 +8059,14 @@ impl AppStore {
             params![job_id],
         )
         .map_err(|e| AppError::Internal(format!("release failed reservation failed: {e}")))?;
+        crate::market_billing::finish_market_funding_reservation_tx(
+            &tx,
+            "client_host",
+            job_id,
+            false,
+            failure_code,
+            &now,
+        )?;
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit create failure transaction failed: {e}"))
         })?;
@@ -11270,6 +11302,304 @@ mod tests {
                 .status,
             HOST_STATUS_LOCKED
         );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn paid_quote_funding_is_captured_on_activation_and_released_on_failure() {
+        use crate::client_market_trade::CreateQuoteRequest;
+
+        let (store, _config, root) = test_store("paid-quote-funding-lifecycle");
+        let activated_host = add_provider_host(
+            &store,
+            "provider-funding",
+            "provider-funding@example.com",
+            "198.18.20.10",
+            "US",
+            Some(500),
+        )
+        .await;
+        let failed_host = add_provider_host(
+            &store,
+            "provider-funding",
+            "provider-funding@example.com",
+            "198.18.20.11",
+            "US",
+            Some(500),
+        )
+        .await;
+        let migrated_host = add_provider_host(
+            &store,
+            "provider-funding",
+            "provider-funding@example.com",
+            "198.18.20.12",
+            "US",
+            Some(500),
+        )
+        .await;
+        let expired_host = add_provider_host(
+            &store,
+            "provider-funding",
+            "provider-funding@example.com",
+            "198.18.20.13",
+            "US",
+            Some(500),
+        )
+        .await;
+        let client = market_session("client-funding", "client-funding@example.com");
+
+        let activation_quote = store
+            .client_market_create_quote(
+                &client,
+                CreateQuoteRequest {
+                    provider_ids: Vec::new(),
+                    country_codes: Vec::new(),
+                    count: 1,
+                    host_id: Some(activated_host.id.clone()),
+                },
+            )
+            .await
+            .expect("create paid activation quote");
+        let activation = store
+            .client_market_commit_quote(
+                &activation_quote.id,
+                &client,
+                &[(
+                    activation_quote.items[0].id.clone(),
+                    "funding-activated".into(),
+                    "secret".into(),
+                    activation_quote.items[0].offer_revision,
+                )],
+            )
+            .await
+            .expect("reserve paid activation funding");
+        let activation_job_id = &activation.job_ids[0];
+        {
+            let conn = store.conn.lock().await;
+            let tx = conn.transaction().expect("begin paid activation");
+            crate::client_market_trade::complete_provisioning_tx(
+                &tx,
+                activation_job_id,
+                &activated_host.id,
+                "funding-activated-installation",
+                "https://funding-activated.router.test",
+                Utc::now(),
+            )
+            .expect("activate paid Client Market subscription");
+            tx.commit().expect("commit paid activation");
+            let state: (String, i64, i64) = conn
+                .query_row(
+                    "SELECT reservation.status,
+                            (SELECT COUNT(*) FROM market_service_contracts
+                             WHERE product_kind = 'client_host' AND product_ref = ?2),
+                            (SELECT COUNT(*) FROM market_service_contracts
+                             WHERE product_kind = 'client_host'
+                               AND product_ref = 'funding-activated-installation')
+                     FROM market_funding_reservations reservation
+                     WHERE reservation.product_kind = 'client_host'
+                       AND reservation.product_ref = ?1",
+                    params![activation_job_id, activation_job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read captured Client Market funding");
+            assert_eq!(state, ("captured".into(), 0, 1));
+        }
+
+        let migrated_client = market_session(
+            "client-funding-migrated",
+            "client-funding-migrated@example.com",
+        );
+        let migrated_quote = store
+            .client_market_create_quote(
+                &migrated_client,
+                CreateQuoteRequest {
+                    provider_ids: Vec::new(),
+                    country_codes: Vec::new(),
+                    count: 1,
+                    host_id: Some(migrated_host.id.clone()),
+                },
+            )
+            .await
+            .expect("create migrated paid activation quote");
+        let migrated = store
+            .client_market_commit_quote(
+                &migrated_quote.id,
+                &migrated_client,
+                &[(
+                    migrated_quote.items[0].id.clone(),
+                    "funding-migrated".into(),
+                    "secret".into(),
+                    migrated_quote.items[0].offer_revision,
+                )],
+            )
+            .await
+            .expect("commit migrated paid activation quote");
+        let migrated_job_id = &migrated.job_ids[0];
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                conn.execute(
+                    "DELETE FROM market_funding_reservations
+                     WHERE product_kind = 'client_host' AND product_ref = ?1",
+                    params![migrated_job_id],
+                )
+                .expect("remove pre-migration Client funding reservation"),
+                1
+            );
+            let tx = conn.transaction().expect("begin migrated paid activation");
+            crate::client_market_trade::complete_provisioning_tx(
+                &tx,
+                migrated_job_id,
+                &migrated_host.id,
+                "funding-migrated-installation",
+                "https://funding-migrated.router.test",
+                Utc::now(),
+            )
+            .expect("activate pre-migration paid Client Market subscription");
+            tx.commit().expect("commit migrated paid activation");
+            let state: (String, i64) = conn
+                .query_row(
+                    "SELECT reservation.status,
+                            (SELECT COUNT(*) FROM market_service_contracts
+                             WHERE product_kind = 'client_host'
+                               AND product_ref = 'funding-migrated-installation')
+                     FROM market_funding_reservations reservation
+                     WHERE reservation.product_kind = 'client_host'
+                       AND reservation.product_ref = ?1",
+                    params![migrated_job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read reconstructed Client Market funding");
+            assert_eq!(state, ("captured".into(), 1));
+        }
+
+        let expired_client = market_session(
+            "client-funding-expired",
+            "client-funding-expired@example.com",
+        );
+        let expired_quote = store
+            .client_market_create_quote(
+                &expired_client,
+                CreateQuoteRequest {
+                    provider_ids: Vec::new(),
+                    country_codes: Vec::new(),
+                    count: 1,
+                    host_id: Some(expired_host.id.clone()),
+                },
+            )
+            .await
+            .expect("create expiring paid activation quote");
+        let expired = store
+            .client_market_commit_quote(
+                &expired_quote.id,
+                &expired_client,
+                &[(
+                    expired_quote.items[0].id.clone(),
+                    "funding-expired".into(),
+                    "secret".into(),
+                    expired_quote.items[0].offer_revision,
+                )],
+            )
+            .await
+            .expect("commit expiring paid activation quote");
+        let expired_job_id = &expired.job_ids[0];
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_funding_reservations
+                 SET expires_at = ?2
+                 WHERE product_kind = 'client_host' AND product_ref = ?1",
+                params![
+                    expired_job_id,
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .expect("expire Client funding reservation during provisioning");
+            let tx = conn.transaction().expect("begin expired paid activation");
+            crate::client_market_trade::complete_provisioning_tx(
+                &tx,
+                expired_job_id,
+                &expired_host.id,
+                "funding-expired-installation",
+                "https://funding-expired.router.test",
+                Utc::now(),
+            )
+            .expect("renew still-funded Client reservation at activation");
+            tx.commit().expect("commit renewed paid activation");
+            let state: (String, i64) = conn
+                .query_row(
+                    "SELECT reservation.status,
+                            (SELECT COUNT(*) FROM market_service_contracts
+                             WHERE product_kind = 'client_host'
+                               AND product_ref = 'funding-expired-installation')
+                     FROM market_funding_reservations reservation
+                     WHERE reservation.product_kind = 'client_host'
+                       AND reservation.product_ref = ?1",
+                    params![expired_job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read renewed Client Market funding");
+            assert_eq!(state, ("captured".into(), 1));
+        }
+
+        let failed_client = market_session(
+            "client-funding-failure",
+            "client-funding-failure@example.com",
+        );
+        let failure_quote = store
+            .client_market_create_quote(
+                &failed_client,
+                CreateQuoteRequest {
+                    provider_ids: Vec::new(),
+                    country_codes: Vec::new(),
+                    count: 1,
+                    host_id: Some(failed_host.id.clone()),
+                },
+            )
+            .await
+            .expect("create paid failure quote");
+        let failure = store
+            .client_market_commit_quote(
+                &failure_quote.id,
+                &failed_client,
+                &[(
+                    failure_quote.items[0].id.clone(),
+                    "funding-failed".into(),
+                    "secret".into(),
+                    failure_quote.items[0].offer_revision,
+                )],
+            )
+            .await
+            .expect("reserve paid failure funding");
+        let failure_job_id = &failure.job_ids[0];
+        store
+            .client_market_finalize_create_failure(
+                failure_job_id,
+                Some(&failed_host.id),
+                true,
+                "installer_failed",
+                "rollback complete",
+            )
+            .await
+            .expect("release failed paid provisioning funding");
+        let conn = store.conn.lock().await;
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT reservation.status,
+                        (SELECT COUNT(*) FROM market_service_contracts
+                         WHERE product_kind = 'client_host' AND product_ref = ?2),
+                        host.status
+                 FROM market_funding_reservations reservation
+                 JOIN router_ssh_hosts host ON host.id = ?3
+                 WHERE reservation.product_kind = 'client_host'
+                   AND reservation.product_ref = ?1",
+                params![failure_job_id, failure_job_id, failed_host.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read released Client Market funding");
+        assert_eq!(state, ("released".into(), 0, HOST_STATUS_IDLE.into()));
+        drop(conn);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -39,6 +39,7 @@ pub const ERROR_MARKET_BUYER_RESTRICTED: &str = "MARKET_BUYER_RESTRICTED";
 pub const ERROR_MARKET_SETTLEMENT_REQUIRED: &str = "MARKET_SETTLEMENT_REQUIRED";
 pub const ERROR_MARKET_CREDIT_LIMIT_REACHED: &str = "MARKET_CREDIT_LIMIT_REACHED";
 pub const ERROR_MARKET_RELATIONSHIP_CLOSED: &str = "MARKET_RELATIONSHIP_CLOSED";
+pub const ERROR_MARKET_PREPAID_REQUIRED: &str = "MARKET_PREPAID_REQUIRED";
 
 const MAX_CREDIT_LIMIT_MINOR: i64 = 100_000_000;
 const ACCESS_REQUEST_REAPPLY_COOLDOWN_HOURS: i64 = 24;
@@ -2375,19 +2376,25 @@ async fn update_public_credit_line(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin public credit update"))?;
-        let revision = tx
+        let current = tx
             .query_row(
-                "SELECT revision FROM market_public_credit_policies
+                "SELECT revision, enabled FROM market_public_credit_policies
              WHERE supplier_user_id = ?1 AND currency = ?2",
                 params![actor.user_id, currency],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
             )
             .optional()
             .map_err(map_db("read public credit revision"))?
-            .unwrap_or(0);
-        if input.expected_revision != revision {
+            .unwrap_or((0, false));
+        if input.expected_revision != current.0 {
             return Err(AppError::Conflict(
                 "public credit revision changed; reload before saving".into(),
+            ));
+        }
+        if input.enabled && !current.1 {
+            return Err(AppError::BadRequest(
+                "public paid credit is retired; allow prepaid access or grant credit to a specific buyer"
+                    .into(),
             ));
         }
         tx.execute(
@@ -2795,17 +2802,6 @@ pub(crate) fn effective_credit_grant_tx(
             .optional()
             .map_err(map_db("read counterparty credit grant"))?
         {
-            if kind == CREDIT_NONE {
-                return Err(AppError::coded_forbidden(
-                    ERROR_MARKET_CREDIT_REQUIRED,
-                    "seller has not granted paid market credit in this currency",
-                    serde_json::json!({
-                        "supplierUserId": supplier_user_id,
-                        "productKind": product_kind,
-                        "currency": currency,
-                    }),
-                ));
-            }
             return Ok(EffectiveCreditGrant {
                 kind,
                 limit_minor,
@@ -2814,11 +2810,40 @@ pub(crate) fn effective_credit_grant_tx(
             });
         }
     }
+    // Public credit is a legacy compatibility rail only.  Existing accounts
+    // retain their snapshotted grant, but a default-open paid market no longer
+    // grants debt capacity to a previously unknown buyer.
+    if let Some((kind, limit_minor, revision)) = conn
+        .query_row(
+            "SELECT credit_kind, credit_limit_minor, credit_revision
+             FROM market_credit_accounts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
+               AND credit_source = 'public' AND credit_kind != 'none'",
+            params![buyer_user_id, supplier_user_id, currency],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read legacy public credit account"))?
+    {
+        return Ok(EffectiveCreditGrant {
+            kind,
+            limit_minor,
+            source: "public".into(),
+            revision,
+        });
+    }
     if mode == MODE_BLACKLIST
         && let Some((limit_minor, revision)) = conn
             .query_row(
                 "SELECT limit_minor, revision FROM market_public_credit_policies
-                 WHERE supplier_user_id = ?1 AND currency = ?2 AND enabled = 1",
+                 WHERE supplier_user_id = ?1 AND currency = ?2 AND enabled = 1
+                   AND legacy_only = 0",
                 params![supplier_user_id, currency],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
@@ -2832,15 +2857,12 @@ pub(crate) fn effective_credit_grant_tx(
             revision,
         });
     }
-    Err(AppError::coded_forbidden(
-        ERROR_MARKET_CREDIT_REQUIRED,
-        "seller has not granted paid market credit in this currency",
-        serde_json::json!({
-            "supplierUserId": supplier_user_id,
-            "productKind": product_kind,
-            "currency": currency,
-        }),
-    ))
+    Ok(EffectiveCreditGrant {
+        kind: CREDIT_NONE.into(),
+        limit_minor: None,
+        source: "counterparty".into(),
+        revision: 0,
+    })
 }
 
 #[cfg(test)]
@@ -2874,10 +2896,10 @@ pub(crate) fn configure_open_test_policy(
     conn.execute(
         "INSERT INTO market_public_credit_policies (
             supplier_user_id, supplier_email, currency, enabled, limit_minor,
-            revision, risk_acknowledged_at, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, 1, ?4, 1, ?5, ?5, ?5)
+            revision, risk_acknowledged_at, created_at, updated_at, legacy_only
+         ) VALUES (?1, ?2, ?3, 1, ?4, 1, ?5, ?5, ?5, 0)
          ON CONFLICT(supplier_user_id, currency) DO UPDATE SET
-            enabled = 1, limit_minor = excluded.limit_minor",
+            enabled = 1, limit_minor = excluded.limit_minor, legacy_only = 0",
         params![supplier.user_id, supplier.email, currency, limit_minor, now],
     )
     .expect("configure public test credit");
@@ -3104,31 +3126,6 @@ mod tests {
         assert_eq!(before.status, "access_required");
         assert_eq!(before.request.expect("requested summary").id, request.id);
 
-        {
-            let tx = conn.transaction().expect("begin approval without credit");
-            let error = approve_access_request_for_actor_tx(
-                &tx,
-                &supplier,
-                &request.id,
-                request.revision,
-                None,
-                &(now + Duration::minutes(1)).to_rfc3339(),
-            )
-            .expect_err("reject paid approval without credit");
-            assert_eq!(error.code(), Some(ERROR_MARKET_CREDIT_REQUIRED));
-        }
-        assert!(
-            relationship_for_buyer_tx(&conn, &supplier.user_id, &buyer.user_id, &buyer.email)
-                .expect("read rolled back relationship")
-                .is_none()
-        );
-        assert_eq!(
-            access_request_view_tx(&conn, &request.id)
-                .expect("read pending request after rollback")
-                .status,
-            ACCESS_REQUEST_REQUESTED
-        );
-
         let stale_credit_line = ApprovalCreditLineInput {
             currency: "USD".into(),
             kind: CREDIT_LIMITED.into(),
@@ -3242,6 +3239,59 @@ mod tests {
         assert_eq!(after.status, "allowed");
         assert!(after.allowed);
         assert!(after.request.is_none());
+    }
+
+    #[test]
+    fn paid_approval_without_credit_creates_a_prepaid_only_relationship() {
+        let conn = access_request_connection();
+        insert_paid_share_target(&conn, "seat-prepaid-only");
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let supplier = test_actor("supplier", "supplier@example.com");
+        let now = test_request_time();
+        let request = create_access_request_tx(
+            &conn,
+            &buyer,
+            &share_request_input("seat-prepaid-only"),
+            now,
+        )
+        .expect("create prepaid-only approval request");
+
+        let tx = conn.transaction().expect("begin prepaid-only approval");
+        approve_access_request_for_actor_tx(
+            &tx,
+            &supplier,
+            &request.id,
+            request.revision,
+            None,
+            &(now + Duration::minutes(1)).to_rfc3339(),
+        )
+        .expect("approve paid access without credit");
+        tx.commit().expect("commit prepaid-only approval");
+
+        let grant = effective_credit_grant_tx(
+            &conn,
+            &supplier.user_id,
+            &buyer.user_id,
+            &buyer.email,
+            PRODUCT_SHARE,
+            "USD",
+        )
+        .expect("resolve prepaid-only funding");
+        assert_eq!(grant.kind, CREDIT_NONE);
+        assert_eq!(grant.limit_minor, None);
+        assert_eq!(grant.source, "counterparty");
+        let eligibility = market_eligibility_tx(
+            &conn,
+            &supplier.user_id,
+            &buyer.user_id,
+            &buyer.email,
+            PRODUCT_SHARE,
+            Some(1_000),
+            Some("USD"),
+        )
+        .expect("read prepaid-only eligibility");
+        assert!(eligibility.allowed);
+        assert_eq!(eligibility.status, "allowed");
     }
 
     #[test]
@@ -3706,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_and_public_credit_grants_are_resolved_without_public_unlimited_credit() {
+    fn explicit_credit_is_resolved_and_new_public_credit_is_ignored() {
         let conn = access_connection();
         let now = Utc::now().to_rfc3339();
         let relationship_id = set_product_access_decision_tx(
@@ -3780,10 +3830,10 @@ mod tests {
             PRODUCT_SHARE,
             "USD",
         )
-        .expect("resolve finite public credit");
-        assert_eq!(public_grant.kind, CREDIT_LIMITED);
-        assert_eq!(public_grant.limit_minor, Some(5_000));
-        assert_eq!(public_grant.source, "public");
+        .expect("resolve unknown buyer funding");
+        assert_eq!(public_grant.kind, CREDIT_NONE);
+        assert_eq!(public_grant.limit_minor, None);
+        assert_eq!(public_grant.source, "counterparty");
     }
 
     #[test]

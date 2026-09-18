@@ -27,7 +27,9 @@ pub(crate) const USD_CNY_RATE_SCALE: i64 = 1_000_000;
 pub(crate) const DEFAULT_USD_CNY_RATE_MICROS: i64 = 7 * USD_CNY_RATE_SCALE;
 const MIN_USD_CNY_RATE_MICROS: i64 = USD_CNY_RATE_SCALE / 100;
 const MAX_USD_CNY_RATE_MICROS: i64 = 100 * USD_CNY_RATE_SCALE;
-const MONEY_UNITS_PER_MINOR: i64 = 86_400;
+pub(crate) const MONEY_UNITS_PER_MINOR: i64 = 86_400;
+pub(crate) const PREPAID_COVERAGE_SECONDS: i64 = 86_400;
+const PREPAID_RESUME_SECONDS: i64 = 3_600;
 const NEAR_CREDIT_LIMIT_BPS: i64 = 8_000;
 const DEFAULT_SETTLEMENT_GRACE_HOURS: i64 = 24;
 const DISPUTE_RESPONSE_HOURS: i64 = 72;
@@ -257,6 +259,7 @@ pub struct SupplierTerminationAdjustment {
     pub id: String,
     pub status: String,
     pub calculation: SupplierTerminationCalculation,
+    pub prepaid_credit_minor: i64,
     pub unbilled_credit_minor: i64,
     pub invoice_credit_minor: i64,
     pub external_refund_minor: i64,
@@ -288,6 +291,10 @@ pub struct CreditAccountView {
     pub currency: String,
     pub status: String,
     pub balance_minor: i64,
+    pub prepaid_account_id: Option<String>,
+    pub prepaid_balance_minor: i64,
+    pub prepaid_held_minor: i64,
+    pub prepaid_available_minor: i64,
     pub credit_kind: String,
     pub credit_limit_minor: Option<i64>,
     pub utilization_bps: Option<i64>,
@@ -306,6 +313,82 @@ pub struct CreditAccountView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MarketFundingSummaryView {
+    pub supplier_user_id: String,
+    pub supplier_email: String,
+    pub currency: String,
+    pub funding_mode: String,
+    pub prepaid_account_id: Option<String>,
+    pub prepaid_balance_minor: i64,
+    pub prepaid_held_minor: i64,
+    pub prepaid_available_minor: i64,
+    pub credit_kind: String,
+    pub credit_outstanding_minor: i64,
+    pub credit_available_minor: Option<i64>,
+    pub required_coverage_minor: i64,
+    pub required_topup_minor: i64,
+    pub estimated_runway_seconds: Option<i64>,
+    pub topup_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepaidLedgerEntryView {
+    pub id: String,
+    pub entry_kind: String,
+    pub direction: String,
+    pub amount_minor: i64,
+    pub balance_after_minor: i64,
+    pub source_kind: String,
+    pub source_id: String,
+    pub detail: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepaidRefundRequestView {
+    pub id: String,
+    pub prepaid_account_id: String,
+    pub buyer_user_id: String,
+    pub supplier_user_id: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub resolution_note: Option<String>,
+    pub external_reference: Option<String>,
+    pub requested_at: String,
+    pub resolved_at: Option<String>,
+    pub recorded_at: Option<String>,
+    pub can_review: bool,
+    pub can_record: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepaidAccountView {
+    pub id: String,
+    pub buyer_user_id: String,
+    pub buyer_email: String,
+    pub supplier_user_id: String,
+    pub supplier_email: String,
+    pub currency: String,
+    pub status: String,
+    pub balance_minor: i64,
+    pub held_minor: i64,
+    pub available_minor: i64,
+    pub is_buyer: bool,
+    pub is_supplier: bool,
+    pub topup_available: bool,
+    pub ledger: Vec<PrepaidLedgerEntryView>,
+    pub refund_requests: Vec<PrepaidRefundRequestView>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreditRestrictionView {
     pub id: String,
     pub invoice_id: String,
@@ -317,6 +400,7 @@ pub struct CreditRestrictionView {
 #[serde(rename_all = "camelCase")]
 pub struct BillingDashboardView {
     pub accounts: Vec<CreditAccountView>,
+    pub prepaid_accounts: Vec<PrepaidAccountView>,
     pub supplier_profiles: Vec<SupplierBillingProfileView>,
     pub restrictions: Vec<CreditRestrictionView>,
     pub refund_obligations: Vec<RefundObligationView>,
@@ -401,6 +485,25 @@ struct RecordRefundRequest {
 struct InvoiceHistoryQuery {
     before_sequence: Option<i64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreatePrepaidRefundRequest {
+    amount_minor: i64,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolvePrepaidRefundRequest {
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordPrepaidRefundRequest {
+    external_reference: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -489,6 +592,22 @@ pub fn router() -> Router<ServerState> {
             get(invoice_history),
         )
         .route(
+            "/v1/market-billing/prepaid-accounts/:account_id/refunds",
+            post(create_prepaid_refund),
+        )
+        .route(
+            "/v1/market-billing/prepaid-refunds/:refund_id/approve",
+            post(approve_prepaid_refund),
+        )
+        .route(
+            "/v1/market-billing/prepaid-refunds/:refund_id/reject",
+            post(reject_prepaid_refund),
+        )
+        .route(
+            "/v1/market-billing/prepaid-refunds/:refund_id/record",
+            post(record_prepaid_refund),
+        )
+        .route(
             "/v1/market-billing/invoices/:invoice_id/declare-payment",
             post(declare_payment),
         )
@@ -553,12 +672,20 @@ pub(crate) fn ceil_minor_units(amount_units: i64) -> i64 {
     ceil_minor(amount_units)
 }
 
+pub(crate) fn floor_minor_units(amount_units: i64) -> i64 {
+    floor_minor(amount_units)
+}
+
 fn ceil_minor(amount_units: i64) -> i64 {
     if amount_units <= 0 {
         0
     } else {
         amount_units / MONEY_UNITS_PER_MINOR + i64::from(amount_units % MONEY_UNITS_PER_MINOR != 0)
     }
+}
+
+fn floor_minor(amount_units: i64) -> i64 {
+    amount_units.max(0) / MONEY_UNITS_PER_MINOR
 }
 
 pub(crate) fn parse_usd_cny_rate_micros(value: &str) -> Result<i64, String> {
@@ -655,12 +782,36 @@ async fn require_actor_user_id(
         .ok_or_else(|| AppError::Unauthorized("invalid user api token".into()))
 }
 
+async fn market_billing_dashboard_for_state(
+    state: &ServerState,
+    session: &AuthSession,
+) -> Result<BillingDashboardView, AppError> {
+    let mut dashboard = state.store.market_billing_dashboard(session).await?;
+    let mut availability = HashMap::<String, bool>::new();
+    for account in &mut dashboard.prepaid_accounts {
+        let available = if let Some(available) = availability.get(&account.supplier_user_id) {
+            *available
+        } else {
+            let available = state
+                .binance_settlement
+                .supplier_funding_available(&state.store, &account.supplier_user_id)
+                .await?;
+            availability.insert(account.supplier_user_id.clone(), available);
+            available
+        };
+        account.topup_available = available;
+    }
+    Ok(dashboard)
+}
+
 async fn get_dashboard(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<BillingDashboardView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn get_billing_config(State(state): State<ServerState>) -> Json<MarketBillingConfigView> {
@@ -688,7 +839,9 @@ async fn update_supplier_profile(
         .store
         .market_billing_update_supplier_profile(&session, &currency, input.settlement_grace_hours)
         .await?;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn settle_account(
@@ -702,7 +855,9 @@ async fn settle_account(
         .market_billing_open_account_invoice(&session.user_id, &account_id, false, false)
         .await?;
     dispatch_actions(&state, actions).await;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn request_supplier_settlement(
@@ -731,7 +886,9 @@ async fn close_account(
         .market_billing_open_account_invoice(&session.user_id, &account_id, true, false)
         .await?;
     dispatch_actions(&state, actions).await;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn invoice_history(
@@ -747,6 +904,75 @@ async fn invoice_history(
             .store
             .market_billing_invoice_history(&session, &account_id, query.before_sequence, limit)
             .await?,
+    ))
+}
+
+async fn create_prepaid_refund(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(account_id): Path<String>,
+    Json(input): Json<CreatePrepaidRefundRequest>,
+) -> Result<Json<BillingDashboardView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let reason = clean_optional(input.reason, 2_000, "reason")?;
+    state
+        .store
+        .market_prepaid_request_refund(&session, &account_id, input.amount_minor, reason.as_deref())
+        .await?;
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
+}
+
+async fn approve_prepaid_refund(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(refund_id): Path<String>,
+    Json(input): Json<ResolvePrepaidRefundRequest>,
+) -> Result<Json<BillingDashboardView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let note = clean_optional(input.note, 2_000, "note")?;
+    state
+        .store
+        .market_prepaid_resolve_refund(&session, &refund_id, true, note.as_deref())
+        .await?;
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
+}
+
+async fn reject_prepaid_refund(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(refund_id): Path<String>,
+    Json(input): Json<ResolvePrepaidRefundRequest>,
+) -> Result<Json<BillingDashboardView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let note = clean_optional(input.note, 2_000, "note")?;
+    state
+        .store
+        .market_prepaid_resolve_refund(&session, &refund_id, false, note.as_deref())
+        .await?;
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
+}
+
+async fn record_prepaid_refund(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(refund_id): Path<String>,
+    Json(input): Json<RecordPrepaidRefundRequest>,
+) -> Result<Json<BillingDashboardView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let reference = clean_optional(Some(input.external_reference), 200, "externalReference")?
+        .ok_or_else(|| AppError::BadRequest("externalReference is required".into()))?;
+    state
+        .store
+        .market_prepaid_record_refund(&session, &refund_id, &reference)
+        .await?;
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
     ))
 }
 
@@ -775,7 +1001,9 @@ async fn declare_payment(
             evidence_url,
         )
         .await?;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn confirm_payment(
@@ -789,7 +1017,9 @@ async fn confirm_payment(
         .market_billing_confirm_payment(&session, &invoice_id)
         .await?;
     dispatch_actions(&state, actions).await;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn reject_payment(
@@ -805,7 +1035,9 @@ async fn reject_payment(
         .store
         .market_billing_reject_payment(&session, &invoice_id, &reason)
         .await?;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn open_dispute(
@@ -823,7 +1055,9 @@ async fn open_dispute(
         .await
         .map(|actions| dispatch_actions(&state, actions))?
         .await;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn create_credit_note(
@@ -854,7 +1088,9 @@ async fn create_credit_note(
         )
         .await?;
     dispatch_actions(&state, actions).await;
-    Ok(Json(state.store.market_billing_dashboard(&session).await?))
+    Ok(Json(
+        market_billing_dashboard_for_state(&state, &session).await?,
+    ))
 }
 
 async fn record_refund_obligation(
@@ -1606,6 +1842,17 @@ pub(crate) fn reserve_contract_tx(
     quoted_trial_seconds: i64,
     now: &str,
 ) -> Result<String, AppError> {
+    let reservation_expires_at = (parse_time(now)? + Duration::hours(1)).to_rfc3339();
+    ensure_prepaid_account_tx(
+        tx,
+        input.buyer_user_id,
+        input.buyer_email,
+        input.supplier_user_id,
+        input.supplier_email,
+        input.currency,
+        now,
+    )?;
+    reserve_market_funding_tx(tx, &input, input.product_ref, &reservation_expires_at, now)?;
     create_contract_tx(tx, input, Some(quoted_trial_seconds.max(0)), true, now)
 }
 
@@ -1747,7 +1994,12 @@ pub(crate) fn activate_reserved_contract_tx(
     let contract = tx
         .query_row(
             "SELECT contract.id, contract.account_id, contract.status,
-                    contract.trial_seconds_remaining, account.status
+                    contract.trial_seconds_remaining, account.status,
+                    contract.service_ref, contract.service_label,
+                    contract.buyer_user_id, contract.buyer_email,
+                    contract.supplier_user_id, contract.supplier_email,
+                    contract.currency, contract.daily_rate_minor,
+                    contract.offer_revision
              FROM market_service_contracts contract
              JOIN market_credit_accounts account ON account.id = contract.account_id
              WHERE contract.product_kind = ?1 AND contract.product_ref = ?2
@@ -1760,18 +2012,50 @@ pub(crate) fn activate_reserved_contract_tx(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
                 ))
             },
         )
         .optional()
         .map_err(map_db("read reserved market billing contract"))?;
-    let Some((contract_id, account_id, status, trial_seconds_remaining, account_status)) = contract
+    let Some((
+        contract_id,
+        account_id,
+        status,
+        trial_seconds_remaining,
+        account_status,
+        service_ref,
+        service_label,
+        buyer_user_id,
+        buyer_email,
+        supplier_user_id,
+        supplier_email,
+        currency,
+        daily_rate_minor,
+        offer_revision,
+    )) = contract
     else {
         return Err(AppError::Internal(
             "reserved market billing contract is missing".into(),
         ));
     };
     if matches!(status.as_str(), CONTRACT_TRIAL | CONTRACT_ACTIVE) {
+        finish_market_funding_reservation_tx(
+            tx,
+            product_kind,
+            product_ref,
+            true,
+            "service_activated",
+            now,
+        )?;
         return Ok(true);
     }
     if status != CONTRACT_PENDING_ACTIVATION {
@@ -1788,6 +2072,74 @@ pub(crate) fn activate_reserved_contract_tx(
             product_kind,
             product_ref,
             "billing_account_unavailable_before_activation",
+            now,
+        )?;
+        return Ok(false);
+    }
+    let mut funding_captured = finish_market_funding_reservation_tx(
+        tx,
+        product_kind,
+        product_ref,
+        true,
+        "service_activated",
+        now,
+    )?;
+    if !funding_captured {
+        let renewal_expires_at = (parse_time(now)? + Duration::minutes(1)).to_rfc3339();
+        ensure_prepaid_account_tx(
+            tx,
+            &buyer_user_id,
+            &buyer_email,
+            &supplier_user_id,
+            &supplier_email,
+            &currency,
+            now,
+        )?;
+        let input = ActivateContractInput {
+            product_kind,
+            product_ref,
+            service_ref: &service_ref,
+            service_label: &service_label,
+            buyer_user_id: &buyer_user_id,
+            buyer_email: &buyer_email,
+            supplier_user_id: &supplier_user_id,
+            supplier_email: &supplier_email,
+            currency: &currency,
+            daily_rate_minor,
+            offer_revision,
+            replacement_of: None,
+            trial_allowance_seconds: trial_seconds_remaining,
+        };
+        match reserve_market_funding_tx(tx, &input, product_ref, &renewal_expires_at, now) {
+            Ok(()) => {
+                funding_captured = finish_market_funding_reservation_tx(
+                    tx,
+                    product_kind,
+                    product_ref,
+                    true,
+                    "service_activated",
+                    now,
+                )?;
+            }
+            Err(
+                error @ (AppError::Forbidden(_) | AppError::Conflict(_) | AppError::Coded { .. }),
+            ) => {
+                tracing::warn!(
+                    product_kind,
+                    product_ref,
+                    error = %error,
+                    "market funding could not be renewed before service activation"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !funding_captured {
+        terminate_contract_tx(
+            tx,
+            product_kind,
+            product_ref,
+            "funding_reservation_unavailable_before_activation",
             now,
         )?;
         return Ok(false);
@@ -2051,6 +2403,7 @@ pub(crate) fn terminate_contract_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
+    finish_market_funding_reservation_tx(tx, product_kind, product_ref, false, reason, now)?;
     accrue_contract_until_tx(tx, product_kind, product_ref, parse_time(now)?)?;
     let row = tx
         .query_row(
@@ -2123,7 +2476,7 @@ pub(crate) fn request_contract_resume_after_integrity_tx(
     let contract = conn
         .query_row(
             "SELECT contract.id, contract.status, contract.desired_control_state,
-                    account.status, account.close_requested, account.credit_kind
+                    account.status, account.close_requested, account.id
              FROM market_service_contracts contract
              JOIN market_credit_accounts account ON account.id = contract.account_id
              WHERE contract.product_kind = ?1 AND contract.product_ref = ?2
@@ -2153,7 +2506,7 @@ pub(crate) fn request_contract_resume_after_integrity_tx(
         contract.3.as_str(),
         ACCOUNT_ACTIVE | ACCOUNT_NEAR_CREDIT_LIMIT
     ) && !contract.4
-        && contract.5 != crate::market_access::CREDIT_NONE;
+        && account_has_resume_funding_tx(conn, &contract.5, false, now)?;
     if contract.1 != CONTRACT_BILLING_SUSPENDED || contract.2 == "terminated" || !account_can_resume
     {
         return Ok(false);
@@ -2179,6 +2532,24 @@ pub(crate) fn complete_contract_resume_after_integrity_tx(
     product_ref: &str,
     now: &str,
 ) -> Result<bool, AppError> {
+    let account_id = conn
+        .query_row(
+            "SELECT account_id FROM market_service_contracts
+             WHERE product_kind = ?1 AND product_ref = ?2
+               AND status = 'billing_suspended' AND desired_control_state = 'active'",
+            params![product_kind, product_ref],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db(
+            "read market account before completing integrity resume",
+        ))?;
+    let Some(account_id) = account_id else {
+        return Ok(false);
+    };
+    if !account_has_resume_funding_tx(conn, &account_id, false, now)? {
+        return Ok(false);
+    }
     let changed = conn
         .execute(
             "UPDATE market_service_contracts
@@ -2192,7 +2563,7 @@ pub(crate) fn complete_contract_resume_after_integrity_tx(
                SELECT 1 FROM market_credit_accounts account
                WHERE account.id = market_service_contracts.account_id
                  AND account.status IN ('active', 'near_credit_limit')
-                 AND account.close_requested = 0 AND account.credit_kind != 'none'
+                 AND account.close_requested = 0
            )",
             params![product_kind, product_ref, now],
         )
@@ -2306,8 +2677,24 @@ pub(crate) fn supplier_termination_calculation_tx(
     .clamp(0, total_ms);
     let refundable_base_units = conn
         .query_row(
-            "SELECT COALESCE(SUM(MAX(accrual.amount_units - accrual.credited_units, 0)), 0)
+            "WITH allocation_totals AS (
+                 SELECT accrual_id,
+                        SUM(CASE WHEN source_kind = 'prepaid' THEN amount_units ELSE 0 END)
+                            AS prepaid_units,
+                        SUM(CASE WHEN source_kind = 'credit' THEN amount_units ELSE 0 END)
+                            AS credit_units,
+                        COUNT(*) AS allocation_count
+                 FROM market_accrual_allocations GROUP BY accrual_id
+             )
+             SELECT COALESCE(SUM(CASE
+                 WHEN COALESCE(allocation_totals.allocation_count, 0) = 0
+                     THEN MAX(accrual.amount_units - accrual.credited_units, 0)
+                 ELSE COALESCE(allocation_totals.prepaid_units, 0)
+                      + MAX(COALESCE(allocation_totals.credit_units, 0)
+                            - accrual.credited_units, 0)
+             END), 0)
              FROM market_accrual_entries accrual
+             LEFT JOIN allocation_totals ON allocation_totals.accrual_id = accrual.id
              LEFT JOIN market_invoices invoice ON invoice.id = accrual.invoice_id
              WHERE accrual.contract_id = ?1
                AND (accrual.status = 'unbilled'
@@ -2550,10 +2937,19 @@ fn supplier_termination_adjustment_tx(
     let unbilled_credit_minor = allocation_minor("unbilled_accrual")?;
     let invoice_credit_minor = allocation_minor("invoice_credit")?;
     let external_refund_minor = allocation_minor("external_refund")?;
+    let prepaid_credit_minor = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount_minor), 0)
+             FROM market_prepaid_adjustment_credits WHERE adjustment_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(map_db("read prepaid market adjustment credit"))?;
     Ok(Some(SupplierTerminationAdjustment {
         id,
         status,
         calculation,
+        prepaid_credit_minor,
         unbilled_credit_minor,
         invoice_credit_minor,
         external_refund_minor,
@@ -2669,8 +3065,24 @@ fn validate_quoted_supplier_termination_calculation_tx(
     }
     let available_units = conn
         .query_row(
-            "SELECT COALESCE(SUM(MAX(accrual.amount_units - accrual.credited_units, 0)), 0)
+            "WITH allocation_totals AS (
+                 SELECT accrual_id,
+                        SUM(CASE WHEN source_kind = 'prepaid' THEN amount_units ELSE 0 END)
+                            AS prepaid_units,
+                        SUM(CASE WHEN source_kind = 'credit' THEN amount_units ELSE 0 END)
+                            AS credit_units,
+                        COUNT(*) AS allocation_count
+                 FROM market_accrual_allocations GROUP BY accrual_id
+             )
+             SELECT COALESCE(SUM(CASE
+                 WHEN COALESCE(allocation_totals.allocation_count, 0) = 0
+                     THEN MAX(accrual.amount_units - accrual.credited_units, 0)
+                 ELSE COALESCE(allocation_totals.prepaid_units, 0)
+                      + MAX(COALESCE(allocation_totals.credit_units, 0)
+                            - accrual.credited_units, 0)
+             END), 0)
              FROM market_accrual_entries accrual
+             LEFT JOIN allocation_totals ON allocation_totals.accrual_id = accrual.id
              LEFT JOIN market_invoices invoice ON invoice.id = accrual.invoice_id
              WHERE accrual.contract_id = ?1
                AND (accrual.status = 'unbilled'
@@ -2703,10 +3115,10 @@ fn apply_supplier_termination_calculation_tx(
             id, account_id, contract_id, product_kind, product_ref, kind, status,
             currency, elapsed_bps, refund_bps, refundable_base_units,
             amount_units, amount_minor, unbilled_credit_units, invoice_credit_units,
-            external_refund_units, reason, calculation_json, idempotency_key,
+            external_refund_units, prepaid_credit_units, reason, calculation_json, idempotency_key,
             created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, 'supplier_early_termination_refund',
-                   'applied', ?6, ?7, ?8, ?9, ?10, ?11, 0, 0, 0,
+                   'applied', ?6, ?7, ?8, ?9, ?10, ?11, 0, 0, 0, 0,
                    ?12, ?13, ?14, ?15, ?15)",
         params![
             adjustment_id,
@@ -2730,19 +3142,37 @@ fn apply_supplier_termination_calculation_tx(
 
     let rows = conn
         .prepare(
-            "SELECT accrual.id, accrual.status, accrual.invoice_id,
-                    MAX(accrual.amount_units - accrual.credited_units, 0),
-                    invoice.status
-             FROM market_accrual_entries accrual
-             LEFT JOIN market_invoices invoice ON invoice.id = accrual.invoice_id
-             WHERE accrual.contract_id = ?1
-               AND MAX(accrual.amount_units - accrual.credited_units, 0) > 0
-               AND (accrual.status = 'unbilled'
-                    OR (accrual.status = 'invoiced' AND invoice.status != 'void'))
-             ORDER BY CASE
-                        WHEN accrual.status = 'unbilled' THEN 0
-                        WHEN invoice.status != 'paid' THEN 1 ELSE 2 END,
-                      accrual.created_at, accrual.id",
+            "WITH allocation_totals AS (
+                 SELECT accrual_id,
+                        SUM(CASE WHEN source_kind = 'prepaid' THEN amount_units ELSE 0 END)
+                            AS prepaid_units,
+                        SUM(CASE WHEN source_kind = 'credit' THEN amount_units ELSE 0 END)
+                            AS credit_units,
+                        COUNT(*) AS allocation_count
+                 FROM market_accrual_allocations GROUP BY accrual_id
+             ), refundable AS (
+                 SELECT accrual.id, accrual.status, accrual.invoice_id,
+                        invoice.status AS invoice_status, accrual.created_at,
+                        CASE WHEN COALESCE(allocation_totals.allocation_count, 0) = 0
+                             THEN 0 ELSE COALESCE(allocation_totals.prepaid_units, 0)
+                        END AS prepaid_units,
+                        CASE WHEN COALESCE(allocation_totals.allocation_count, 0) = 0
+                             THEN MAX(accrual.amount_units - accrual.credited_units, 0)
+                             ELSE MAX(COALESCE(allocation_totals.credit_units, 0)
+                                      - accrual.credited_units, 0)
+                        END AS credit_units
+                 FROM market_accrual_entries accrual
+                 LEFT JOIN allocation_totals ON allocation_totals.accrual_id = accrual.id
+                 LEFT JOIN market_invoices invoice ON invoice.id = accrual.invoice_id
+                 WHERE accrual.contract_id = ?1
+                   AND (accrual.status = 'unbilled'
+                        OR (accrual.status = 'invoiced' AND invoice.status != 'void'))
+             )
+             SELECT id, status, invoice_id, invoice_status, prepaid_units, credit_units
+             FROM refundable WHERE prepaid_units + credit_units > 0
+             ORDER BY CASE WHEN status = 'unbilled' THEN 0
+                           WHEN invoice_status != 'paid' THEN 1 ELSE 2 END,
+                      created_at, id",
         )
         .and_then(|mut statement| {
             statement
@@ -2751,20 +3181,62 @@ fn apply_supplier_termination_calculation_tx(
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(map_db("read refundable market accrual entries"))?;
-    let mut remaining = calculation.amount_units;
+    let total_prepaid_units = rows.iter().try_fold(0_i64, |total, row| {
+        total
+            .checked_add(row.4)
+            .ok_or_else(|| AppError::Internal("prepaid refund basis overflowed".into()))
+    })?;
+    let total_credit_units = rows.iter().try_fold(0_i64, |total, row| {
+        total
+            .checked_add(row.5)
+            .ok_or_else(|| AppError::Internal("credit refund basis overflowed".into()))
+    })?;
+    let source_allocations = distribute_amount_by_weight(
+        &[
+            ("prepaid".into(), total_prepaid_units),
+            ("credit".into(), total_credit_units),
+        ],
+        calculation.amount_units,
+    )?;
+    let prepaid_refund_units = source_allocations[0].1;
+    let mut remaining_credit_refund_units = source_allocations[1].1;
     let mut grouped = BTreeMap::<(String, String), i64>::new();
-    for (accrual_id, accrual_status, invoice_id, available_units, invoice_status) in rows {
-        if remaining <= 0 {
+    if prepaid_refund_units > 0 {
+        let prepaid_account_id = conn
+            .query_row(
+                "SELECT prepaid.id
+                 FROM market_prepaid_accounts prepaid
+                 JOIN market_credit_accounts credit
+                   ON credit.buyer_user_id = prepaid.buyer_user_id
+                  AND credit.supplier_user_id = prepaid.supplier_user_id
+                  AND credit.currency = prepaid.currency
+                 WHERE credit.id = ?1 AND prepaid.status != 'closed'",
+                params![calculation.account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("read prepaid account for termination credit"))?
+            .ok_or_else(|| {
+                AppError::Internal("prepaid termination allocation has no prepaid account".into())
+            })?;
+        grouped.insert(
+            ("prepaid_credit".into(), prepaid_account_id),
+            prepaid_refund_units,
+        );
+    }
+    for (accrual_id, accrual_status, invoice_id, invoice_status, _, credit_units) in rows {
+        if remaining_credit_refund_units <= 0 {
             break;
         }
-        let amount_units = available_units.min(remaining);
+        let amount_units = credit_units.min(remaining_credit_refund_units);
         if amount_units <= 0 {
             continue;
         }
@@ -2794,9 +3266,9 @@ fn apply_supplier_termination_calculation_tx(
             .entry((kind.into(), target_id))
             .and_modify(|units| *units = units.saturating_add(amount_units))
             .or_insert(amount_units);
-        remaining -= amount_units;
+        remaining_credit_refund_units -= amount_units;
     }
-    if remaining != 0 {
+    if remaining_credit_refund_units != 0 {
         return Err(AppError::Internal(
             "refundable market accrual changed during adjustment".into(),
         ));
@@ -2805,6 +3277,7 @@ fn apply_supplier_termination_calculation_tx(
         .into_iter()
         .map(|((kind, target_id), amount_units)| RefundAllocationDraft {
             target_kind: match kind.as_str() {
+                "prepaid_credit" => "prepaid_credit",
                 "unbilled_accrual" => "unbilled_accrual",
                 "invoice_credit" => "invoice_credit",
                 _ => "external_refund",
@@ -2815,27 +3288,70 @@ fn apply_supplier_termination_calculation_tx(
         })
         .collect::<Vec<_>>();
     distribute_refund_minor(&mut drafts, calculation.amount_minor)?;
+    let mut prepaid_credit_units = 0_i64;
     let mut unbilled_units = 0_i64;
     let mut invoice_credit_units = 0_i64;
     let mut external_refund_units = 0_i64;
     for draft in &drafts {
-        conn.execute(
-            "INSERT INTO market_adjustment_allocations (
-                id, adjustment_id, target_kind, target_id,
-                amount_units, amount_minor, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                Uuid::new_v4().to_string(),
-                adjustment_id,
-                draft.target_kind,
-                draft.target_id,
-                draft.amount_units,
-                draft.amount_minor,
-                now_text,
-            ],
-        )
-        .map_err(map_db("record market refund allocation"))?;
+        if draft.target_kind != "prepaid_credit" {
+            conn.execute(
+                "INSERT INTO market_adjustment_allocations (
+                    id, adjustment_id, target_kind, target_id,
+                    amount_units, amount_minor, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    adjustment_id,
+                    draft.target_kind,
+                    draft.target_id,
+                    draft.amount_units,
+                    draft.amount_minor,
+                    now_text,
+                ],
+            )
+            .map_err(map_db("record market refund allocation"))?;
+        }
         match draft.target_kind {
+            "prepaid_credit" => {
+                prepaid_credit_units = prepaid_credit_units.saturating_add(draft.amount_units);
+                let ledger_entry_id = append_prepaid_ledger_entry_tx(
+                    conn,
+                    &draft.target_id,
+                    "service_credit",
+                    "credit",
+                    draft.amount_units,
+                    "contract_adjustment",
+                    &adjustment_id,
+                    &format!(
+                        "prepaid-contract-adjustment:{adjustment_id}:{}",
+                        draft.target_id
+                    ),
+                    serde_json::json!({
+                        "adjustmentId": adjustment_id,
+                        "contractId": calculation.contract_id,
+                        "reason": reason,
+                    }),
+                    None,
+                    &now_text,
+                )?;
+                conn.execute(
+                    "INSERT INTO market_prepaid_adjustment_credits (
+                        id, adjustment_id, prepaid_account_id, ledger_entry_id,
+                        amount_units, amount_minor, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        adjustment_id,
+                        draft.target_id,
+                        ledger_entry_id,
+                        draft.amount_units,
+                        draft.amount_minor,
+                        now_text,
+                    ],
+                )
+                .map_err(map_db("record prepaid termination credit"))?;
+                resume_prepaid_contracts_if_safe_tx(conn, &draft.target_id, &now_text)?;
+            }
             "unbilled_accrual" => {
                 unbilled_units = unbilled_units.saturating_add(draft.amount_units);
             }
@@ -2895,10 +3411,12 @@ fn apply_supplier_termination_calculation_tx(
                 SELECT 1 FROM market_refund_obligations obligation
                 WHERE obligation.adjustment_id = ?1 AND obligation.status != 'recorded'
              ) THEN 'refund_due' ELSE 'applied' END,
-             unbilled_credit_units = ?2, invoice_credit_units = ?3,
-             external_refund_units = ?4, updated_at = ?5 WHERE id = ?1",
+             prepaid_credit_units = ?2, unbilled_credit_units = ?3,
+             invoice_credit_units = ?4, external_refund_units = ?5,
+             updated_at = ?6 WHERE id = ?1",
         params![
             adjustment_id,
+            prepaid_credit_units,
             unbilled_units,
             invoice_credit_units,
             external_refund_units,
@@ -3058,15 +3576,13 @@ fn apply_supplier_invoice_credit_tx(
     )
     .map_err(map_db("supersede changed invoice payment declaration"))?;
     if fully_credited {
-        let (close_requested, credit_kind) = conn
+        let close_requested = conn
             .query_row(
-                "SELECT close_requested, credit_kind
-                 FROM market_credit_accounts WHERE id = ?1",
+                "SELECT close_requested FROM market_credit_accounts WHERE id = ?1",
                 params![calculation.account_id],
-                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+                |row| Ok(row.get::<_, i64>(0)? != 0),
             )
             .map_err(map_db("read fully credited market account"))?;
-        let credit_revoked = credit_kind == crate::market_access::CREDIT_NONE;
         conn.execute(
             "UPDATE market_credit_accounts
              SET balance_units = MAX(balance_units - ?2, 0),
@@ -3089,25 +3605,20 @@ fn apply_supplier_invoice_credit_tx(
             params![invoice_id, now],
         )
         .map_err(map_db("resolve fully credited invoice dispute"))?;
-        if close_requested || credit_revoked {
+        let can_resume = !close_requested
+            && account_has_resume_funding_tx(conn, &calculation.account_id, false, now)?;
+        if close_requested {
             conn.execute(
                 "UPDATE market_service_contracts
-                 SET desired_control_state = 'terminated', control_error = ?2, updated_at = ?3
+                 SET desired_control_state = 'terminated',
+                     control_error = 'supplier_credit_closed', updated_at = ?2
                  WHERE account_id = ?1 AND status = 'billing_suspended'",
-                params![
-                    calculation.account_id,
-                    if close_requested {
-                        "supplier_credit_closed"
-                    } else {
-                        "supplier_credit_revoked"
-                    },
-                    now,
-                ],
+                params![calculation.account_id, now],
             )
             .map_err(map_db(
                 "retain service termination after full supplier credit",
             ))?;
-        } else {
+        } else if can_resume {
             conn.execute(
                 "UPDATE market_service_contracts
                  SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
@@ -3117,6 +3628,15 @@ fn apply_supplier_invoice_credit_tx(
                 params![calculation.account_id, now],
             )
             .map_err(map_db("resume services after full supplier credit"))?;
+        } else {
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET desired_control_state = 'suspended',
+                     control_error = 'insufficient_funds', updated_at = ?2
+                 WHERE account_id = ?1 AND status = 'billing_suspended'",
+                params![calculation.account_id, now],
+            )
+            .map_err(map_db("retain services pending prepaid funding"))?;
         }
     } else {
         conn.execute(
@@ -3345,6 +3865,1253 @@ impl AppStore {
             .map_err(map_db("commit external market refund record"))?;
         Ok(view)
     }
+}
+
+fn ensure_prepaid_account_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    buyer_email: &str,
+    supplier_user_id: &str,
+    supplier_email: &str,
+    currency: &str,
+    now: &str,
+) -> Result<String, AppError> {
+    let currency = normalize_currency(currency)?;
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM market_prepaid_accounts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3",
+            params![buyer_user_id, supplier_user_id, currency],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db("read market prepaid account"))?
+    {
+        conn.execute(
+            "UPDATE market_prepaid_accounts
+             SET buyer_email = ?2, supplier_email = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id, buyer_email, supplier_email, now],
+        )
+        .map_err(map_db("refresh market prepaid account identities"))?;
+        return Ok(id);
+    }
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO market_prepaid_accounts (
+            id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+            currency, status, posted_balance_units, held_balance_units,
+            version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', 0, 0, 1, ?7, ?7)",
+        params![
+            id,
+            buyer_user_id,
+            buyer_email.to_ascii_lowercase(),
+            supplier_user_id,
+            supplier_email.to_ascii_lowercase(),
+            currency,
+            now,
+        ],
+    )
+    .map_err(map_db("create market prepaid account"))?;
+    Ok(id)
+}
+
+pub(crate) fn ensure_market_prepaid_account_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    buyer_email: &str,
+    supplier_user_id: &str,
+    supplier_email: &str,
+    currency: &str,
+    now: &str,
+) -> Result<String, AppError> {
+    ensure_prepaid_account_tx(
+        conn,
+        buyer_user_id,
+        buyer_email,
+        supplier_user_id,
+        supplier_email,
+        currency,
+        now,
+    )
+}
+
+fn prepaid_state_for_parties_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    currency: &str,
+) -> Result<Option<(String, i64, i64)>, AppError> {
+    conn.query_row(
+        "SELECT id, posted_balance_units, held_balance_units
+         FROM market_prepaid_accounts
+         WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
+           AND status != 'closed'",
+        params![buyer_user_id, supplier_user_id, currency],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(map_db("read market prepaid funding state"))
+}
+
+fn active_daily_rate_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    currency: &str,
+) -> Result<i64, AppError> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(daily_rate_minor), 0)
+         FROM market_service_contracts
+         WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
+           AND status IN ('trial', 'active')",
+        params![buyer_user_id, supplier_user_id, currency],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(map_db("read active market daily funding rate"))
+}
+
+pub(crate) fn market_funding_summary_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    buyer_email: &str,
+    supplier_user_id: &str,
+    supplier_email: &str,
+    product_kind: &str,
+    currency: &str,
+    additional_daily_rate_minor: i64,
+    now: &str,
+) -> Result<MarketFundingSummaryView, AppError> {
+    let currency = normalize_currency(currency)?;
+    let grant = crate::market_access::effective_credit_grant_tx(
+        conn,
+        supplier_user_id,
+        buyer_user_id,
+        buyer_email,
+        product_kind,
+        &currency,
+    )?;
+    let prepaid = prepaid_state_for_parties_tx(conn, buyer_user_id, supplier_user_id, &currency)?;
+    let (prepaid_account_id, posted_units, held_units) = prepaid
+        .map(|(id, posted, held)| (Some(id), posted, held))
+        .unwrap_or((None, 0, 0));
+    let prepaid_available_units = posted_units.saturating_sub(held_units);
+    let credit_outstanding_units = conn
+        .query_row(
+            "SELECT balance_units FROM market_credit_accounts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3",
+            params![buyer_user_id, supplier_user_id, currency],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_db("read market credit exposure for funding"))?
+        .unwrap_or(0)
+        .max(0);
+    let reserved_credit_units = conn
+        .query_row(
+            "SELECT COALESCE(SUM(credit_units), 0)
+             FROM market_funding_reservations
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
+               AND status = 'active' AND expires_at > ?4",
+            params![buyer_user_id, supplier_user_id, currency, now],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("read reserved supplier credit funding"))?
+        .max(0);
+    let credit_capacity_units = match grant.kind.as_str() {
+        crate::market_access::CREDIT_NONE => Some(0),
+        crate::market_access::CREDIT_LIMITED => Some(
+            grant
+                .limit_minor
+                .unwrap_or_default()
+                .saturating_mul(MONEY_UNITS_PER_MINOR)
+                .saturating_sub(credit_outstanding_units),
+        ),
+        crate::market_access::CREDIT_UNLIMITED => None,
+        _ => {
+            return Err(AppError::Internal(
+                "market credit grant has an invalid funding kind".into(),
+            ));
+        }
+    };
+    let credit_available_units =
+        credit_capacity_units.map(|value| value.saturating_sub(reserved_credit_units));
+    let daily_rate_minor = active_daily_rate_tx(conn, buyer_user_id, supplier_user_id, &currency)?
+        .checked_add(additional_daily_rate_minor.max(0))
+        .ok_or_else(|| AppError::Internal("market funding daily rate overflowed".into()))?;
+    let required_units = daily_rate_minor
+        .checked_mul(PREPAID_COVERAGE_SECONDS)
+        .ok_or_else(|| AppError::Internal("market funding coverage overflowed".into()))?;
+    let total_finite_units = credit_available_units
+        .map(|credit| prepaid_available_units.saturating_add(credit.max(0)))
+        .unwrap_or(i64::MAX);
+    let required_topup_units = if credit_available_units.is_none() {
+        0
+    } else {
+        required_units.saturating_sub(total_finite_units)
+    };
+    let estimated_runway_seconds = if daily_rate_minor <= 0 {
+        None
+    } else if credit_available_units.is_none() {
+        None
+    } else {
+        Some(total_finite_units / daily_rate_minor)
+    };
+    let topup_available = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM binance_payment_accounts
+                WHERE supplier_user_id = ?1 AND status = 'verified'
+                  AND automation_mode = 'enabled' AND uid_confirmed = 1
+                  AND credentials_ciphertext != ''
+             )",
+            params![supplier_user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("read supplier Binance funding availability"))?
+        != 0;
+    Ok(MarketFundingSummaryView {
+        supplier_user_id: supplier_user_id.into(),
+        supplier_email: supplier_email.to_ascii_lowercase(),
+        currency,
+        funding_mode: if grant.kind == crate::market_access::CREDIT_NONE {
+            "prepaid".into()
+        } else {
+            "prepaid_then_credit".into()
+        },
+        prepaid_account_id,
+        prepaid_balance_minor: floor_minor(posted_units),
+        prepaid_held_minor: floor_minor(held_units),
+        prepaid_available_minor: floor_minor(prepaid_available_units),
+        credit_kind: grant.kind,
+        credit_outstanding_minor: ceil_minor(credit_outstanding_units),
+        credit_available_minor: credit_available_units.map(ceil_minor),
+        required_coverage_minor: ceil_minor(required_units),
+        required_topup_minor: ceil_minor(required_topup_units),
+        estimated_runway_seconds,
+        topup_available,
+    })
+}
+
+fn reserve_market_funding_tx(
+    tx: &Connection,
+    input: &ActivateContractInput<'_>,
+    product_ref: &str,
+    expires_at: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    expire_market_funding_reservations_tx(tx, now)?;
+    let existing = tx
+        .query_row(
+            "SELECT id, status FROM market_funding_reservations
+             WHERE product_kind = ?1 AND product_ref = ?2",
+            params![input.product_kind, product_ref],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_db("read existing market funding reservation"))?;
+    if let Some((_, status)) = existing.as_ref() {
+        if matches!(status.as_str(), "active" | "captured") {
+            return Ok(());
+        }
+    }
+    let summary = market_funding_summary_tx(
+        tx,
+        input.buyer_user_id,
+        input.buyer_email,
+        input.supplier_user_id,
+        input.supplier_email,
+        input.product_kind,
+        input.currency,
+        input.daily_rate_minor,
+        now,
+    )?;
+    if summary.required_topup_minor > 0 {
+        return Err(AppError::coded_conflict(
+            crate::market_access::ERROR_MARKET_PREPAID_REQUIRED,
+            "prepaid balance or explicit supplier credit is required before renting this service",
+            serde_json::json!({
+                "supplierUserId": input.supplier_user_id,
+                "supplierEmail": input.supplier_email,
+                "currency": input.currency,
+                "requiredTopupMinor": summary.required_topup_minor,
+                "prepaidAvailableMinor": summary.prepaid_available_minor,
+                "creditAvailableMinor": summary.credit_available_minor,
+                "fundingMode": summary.funding_mode,
+            }),
+        ));
+    }
+    let service_units = input
+        .daily_rate_minor
+        .checked_mul(PREPAID_COVERAGE_SECONDS)
+        .ok_or_else(|| {
+            AppError::Internal("market service funding reservation overflowed".into())
+        })?;
+    let prepaid_units = prepaid_state_for_parties_tx(
+        tx,
+        input.buyer_user_id,
+        input.supplier_user_id,
+        input.currency,
+    )?
+    .map(|(_, posted, held)| posted.saturating_sub(held).max(0).min(service_units))
+    .unwrap_or(0);
+    let credit_units = service_units.saturating_sub(prepaid_units);
+    let exact_credit_available = match summary.credit_kind.as_str() {
+        crate::market_access::CREDIT_NONE => 0,
+        crate::market_access::CREDIT_UNLIMITED => i64::MAX,
+        crate::market_access::CREDIT_LIMITED => {
+            let limit_units = crate::market_access::effective_credit_grant_tx(
+                tx,
+                input.supplier_user_id,
+                input.buyer_user_id,
+                input.buyer_email,
+                input.product_kind,
+                input.currency,
+            )?
+            .limit_minor
+            .unwrap_or_default()
+            .saturating_mul(MONEY_UNITS_PER_MINOR);
+            let outstanding = tx
+                .query_row(
+                    "SELECT COALESCE(balance_units, 0) FROM market_credit_accounts
+                     WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3",
+                    params![input.buyer_user_id, input.supplier_user_id, input.currency],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(map_db("read exact reserved market credit exposure"))?
+                .unwrap_or(0);
+            let reserved = tx
+                .query_row(
+                    "SELECT COALESCE(SUM(credit_units), 0)
+                     FROM market_funding_reservations
+                     WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
+                       AND status = 'active' AND expires_at > ?4",
+                    params![
+                        input.buyer_user_id,
+                        input.supplier_user_id,
+                        input.currency,
+                        now
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(map_db("read exact reserved market credit"))?;
+            limit_units
+                .saturating_sub(outstanding)
+                .saturating_sub(reserved)
+        }
+        _ => 0,
+    };
+    if credit_units > exact_credit_available {
+        return Err(AppError::coded_conflict(
+            crate::market_access::ERROR_MARKET_PREPAID_REQUIRED,
+            "available prepaid balance or explicit supplier credit changed; top up and retry",
+            serde_json::json!({
+                "supplierUserId": input.supplier_user_id,
+                "currency": input.currency,
+                "requiredTopupMinor": ceil_minor(credit_units.saturating_sub(exact_credit_available)),
+                "fundingMode": summary.funding_mode,
+            }),
+        ));
+    }
+    if prepaid_units > 0 {
+        let account_id = summary
+            .prepaid_account_id
+            .as_deref()
+            .ok_or_else(|| AppError::Internal("prepaid reservation account is missing".into()))?;
+        let changed = tx
+            .execute(
+                "UPDATE market_prepaid_accounts
+                 SET held_balance_units = held_balance_units + ?2,
+                     version = version + 1, updated_at = ?3
+                 WHERE id = ?1 AND posted_balance_units - held_balance_units >= ?2
+                   AND status != 'closed'",
+                params![account_id, prepaid_units, now],
+            )
+            .map_err(map_db("hold prepaid market funding"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "prepaid balance changed while reserving this rental; retry".into(),
+            ));
+        }
+    }
+    if let Some((id, _)) = existing {
+        let changed = tx
+            .execute(
+                "UPDATE market_funding_reservations
+                 SET prepaid_account_id = ?2, buyer_user_id = ?3,
+                     supplier_user_id = ?4, currency = ?5,
+                     prepaid_units = ?6, credit_units = ?7, status = 'active',
+                     expires_at = ?8, release_reason = NULL, released_at = NULL,
+                     created_at = ?9, updated_at = ?9
+                 WHERE id = ?1 AND status IN ('released', 'expired')",
+                params![
+                    id,
+                    summary.prepaid_account_id,
+                    input.buyer_user_id,
+                    input.supplier_user_id,
+                    input.currency,
+                    prepaid_units,
+                    credit_units,
+                    expires_at,
+                    now,
+                ],
+            )
+            .map_err(map_db("renew market funding reservation"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "market funding reservation changed while it was being renewed".into(),
+            ));
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO market_funding_reservations (
+                id, prepaid_account_id, buyer_user_id, supplier_user_id, currency,
+                product_kind, product_ref, prepaid_units, credit_units, status,
+                expires_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?11, ?11)",
+            params![
+                Uuid::new_v4().to_string(),
+                summary.prepaid_account_id,
+                input.buyer_user_id,
+                input.supplier_user_id,
+                input.currency,
+                input.product_kind,
+                product_ref,
+                prepaid_units,
+                credit_units,
+                expires_at,
+                now,
+            ],
+        )
+        .map_err(map_db("create market funding reservation"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn reserve_client_market_funding_tx(
+    tx: &Transaction<'_>,
+    input: &ActivateContractInput<'_>,
+    job_id: &str,
+    expires_at: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    ensure_prepaid_account_tx(
+        tx,
+        input.buyer_user_id,
+        input.buyer_email,
+        input.supplier_user_id,
+        input.supplier_email,
+        input.currency,
+        now,
+    )?;
+    reserve_market_funding_tx(tx, input, job_id, expires_at, now)
+}
+
+pub(crate) fn finish_market_funding_reservation_tx(
+    conn: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    captured: bool,
+    reason: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    expire_market_funding_reservations_tx(conn, now)?;
+    let reservation = conn
+        .query_row(
+            "SELECT id, prepaid_account_id, prepaid_units, status
+             FROM market_funding_reservations
+             WHERE product_kind = ?1 AND product_ref = ?2",
+            params![product_kind, product_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read market funding reservation"))?;
+    let Some((id, prepaid_account_id, prepaid_units, status)) = reservation else {
+        return Ok(false);
+    };
+    if captured && status == "captured" {
+        return Ok(true);
+    }
+    if status != "active" {
+        return Ok(false);
+    }
+    if let Some(account_id) = prepaid_account_id
+        && prepaid_units > 0
+    {
+        conn.execute(
+            "UPDATE market_prepaid_accounts
+             SET held_balance_units = MAX(held_balance_units - ?2, 0),
+                 version = version + 1, updated_at = ?3 WHERE id = ?1",
+            params![account_id, prepaid_units, now],
+        )
+        .map_err(map_db("release held prepaid market funding"))?;
+    }
+    let changed = conn
+        .execute(
+            "UPDATE market_funding_reservations
+         SET status = ?2, release_reason = ?3, released_at = ?4, updated_at = ?4
+         WHERE id = ?1 AND status = 'active'",
+            params![
+                id,
+                if captured { "captured" } else { "released" },
+                reason,
+                now,
+            ],
+        )
+        .map_err(map_db("finish market funding reservation"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "market funding reservation changed while it was being completed".into(),
+        ));
+    }
+    Ok(true)
+}
+
+fn expire_market_funding_reservations_tx(conn: &Connection, now: &str) -> Result<usize, AppError> {
+    let expired = conn
+        .prepare(
+            "SELECT id, prepaid_account_id, prepaid_units
+             FROM market_funding_reservations
+             WHERE status = 'active' AND datetime(expires_at) <= datetime(?1)
+             ORDER BY expires_at, id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![now], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read expired market funding reservations"))?;
+    for (reservation_id, prepaid_account_id, prepaid_units) in &expired {
+        if let Some(account_id) = prepaid_account_id
+            && *prepaid_units > 0
+        {
+            conn.execute(
+                "UPDATE market_prepaid_accounts
+                 SET held_balance_units = MAX(held_balance_units - ?2, 0),
+                     version = version + 1, updated_at = ?3
+                 WHERE id = ?1",
+                params![account_id, prepaid_units, now],
+            )
+            .map_err(map_db("release expired prepaid funding hold"))?;
+        }
+        conn.execute(
+            "UPDATE market_funding_reservations
+             SET status = 'expired', release_reason = 'reservation_expired',
+                 released_at = ?2, updated_at = ?2
+             WHERE id = ?1 AND status = 'active'",
+            params![reservation_id, now],
+        )
+        .map_err(map_db("expire market funding reservation"))?;
+    }
+    Ok(expired.len())
+}
+
+fn append_prepaid_ledger_entry_tx(
+    conn: &Connection,
+    account_id: &str,
+    entry_kind: &str,
+    direction: &str,
+    amount_units: i64,
+    source_kind: &str,
+    source_id: &str,
+    idempotency_key: &str,
+    detail: serde_json::Value,
+    actor_user_id: Option<&str>,
+    now: &str,
+) -> Result<String, AppError> {
+    if amount_units <= 0 {
+        return Err(AppError::Internal(
+            "prepaid ledger amount must be positive".into(),
+        ));
+    }
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM market_prepaid_ledger_entries WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db("read idempotent prepaid ledger entry"))?
+    {
+        return Ok(id);
+    }
+    let changed = if direction == "credit" {
+        conn.execute(
+            "UPDATE market_prepaid_accounts
+             SET posted_balance_units = posted_balance_units + ?2,
+                 version = version + 1, updated_at = ?3
+             WHERE id = ?1 AND status != 'closed'",
+            params![account_id, amount_units, now],
+        )
+    } else {
+        conn.execute(
+            "UPDATE market_prepaid_accounts
+             SET posted_balance_units = posted_balance_units - ?2,
+                 version = version + 1, updated_at = ?3
+             WHERE id = ?1 AND posted_balance_units - held_balance_units >= ?2
+               AND status != 'closed'",
+            params![account_id, amount_units, now],
+        )
+    }
+    .map_err(map_db("apply prepaid ledger balance"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "prepaid balance is no longer sufficient for this operation".into(),
+        ));
+    }
+    let balance_after = conn
+        .query_row(
+            "SELECT posted_balance_units FROM market_prepaid_accounts WHERE id = ?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("read prepaid balance after ledger entry"))?;
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO market_prepaid_ledger_entries (
+            id, account_id, entry_kind, direction, amount_units,
+            balance_after_units, source_kind, source_id, idempotency_key,
+            detail_json, actor_user_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            id,
+            account_id,
+            entry_kind,
+            direction,
+            amount_units,
+            balance_after,
+            source_kind,
+            source_id,
+            idempotency_key,
+            detail.to_string(),
+            actor_user_id,
+            now,
+        ],
+    )
+    .map_err(map_db("append market prepaid ledger entry"))?;
+    Ok(id)
+}
+
+fn prepaid_refund_view_tx(
+    conn: &Connection,
+    refund_id: &str,
+    actor_user_id: &str,
+) -> Result<Option<PrepaidRefundRequestView>, AppError> {
+    conn.query_row(
+        "SELECT id, prepaid_account_id, buyer_user_id, supplier_user_id,
+                amount_minor, currency, status, reason, resolution_note,
+                external_reference, requested_at, resolved_at, recorded_at
+         FROM market_prepaid_refund_requests WHERE id = ?1",
+        params![refund_id],
+        |row| {
+            let supplier_user_id = row.get::<_, String>(3)?;
+            let status = row.get::<_, String>(6)?;
+            Ok(PrepaidRefundRequestView {
+                id: row.get(0)?,
+                prepaid_account_id: row.get(1)?,
+                buyer_user_id: row.get(2)?,
+                supplier_user_id: supplier_user_id.clone(),
+                amount_minor: row.get(4)?,
+                currency: row.get(5)?,
+                can_review: supplier_user_id == actor_user_id && status == "requested",
+                can_record: supplier_user_id == actor_user_id && status == "approved",
+                status,
+                reason: row.get(7)?,
+                resolution_note: row.get(8)?,
+                external_reference: row.get(9)?,
+                requested_at: row.get(10)?,
+                resolved_at: row.get(11)?,
+                recorded_at: row.get(12)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_db("read prepaid refund request"))
+}
+
+fn prepaid_account_views_for_actor_tx(
+    conn: &Connection,
+    actor_user_id: &str,
+) -> Result<Vec<PrepaidAccountView>, AppError> {
+    let rows = conn
+        .prepare(
+            "SELECT id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                    currency, status, posted_balance_units, held_balance_units,
+                    created_at, updated_at
+             FROM market_prepaid_accounts
+             WHERE buyer_user_id = ?1 OR supplier_user_id = ?1
+             ORDER BY updated_at DESC, id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![actor_user_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read prepaid accounts for dashboard"))?;
+    let mut accounts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ledger = conn
+            .prepare(
+                "SELECT id, entry_kind, direction, amount_units,
+                        balance_after_units, source_kind, source_id,
+                        detail_json, created_at
+                 FROM market_prepaid_ledger_entries
+                 WHERE account_id = ?1
+                 ORDER BY created_at DESC, id DESC LIMIT 100",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![row.0], |entry| {
+                        let detail_json = entry.get::<_, String>(7)?;
+                        Ok(PrepaidLedgerEntryView {
+                            id: entry.get(0)?,
+                            entry_kind: entry.get(1)?,
+                            direction: entry.get(2)?,
+                            amount_minor: floor_minor(entry.get(3)?),
+                            balance_after_minor: floor_minor(entry.get(4)?),
+                            source_kind: entry.get(5)?,
+                            source_id: entry.get(6)?,
+                            detail: serde_json::from_str(&detail_json)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                            created_at: entry.get(8)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read prepaid ledger for dashboard"))?;
+        let refund_requests = conn
+            .prepare(
+                "SELECT id FROM market_prepaid_refund_requests
+                 WHERE prepaid_account_id = ?1
+                 ORDER BY requested_at DESC, id DESC LIMIT 50",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![row.0], |refund| refund.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("read prepaid refund ids for dashboard"))?
+            .into_iter()
+            .map(|id| {
+                prepaid_refund_view_tx(conn, &id, actor_user_id)?.ok_or_else(|| {
+                    AppError::Internal("prepaid refund disappeared while reading dashboard".into())
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let topup_available = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM binance_payment_accounts
+                    WHERE supplier_user_id = ?1 AND status = 'verified'
+                      AND automation_mode = 'enabled' AND uid_confirmed = 1
+                      AND credentials_ciphertext != ''
+                 )",
+                params![row.3],
+                |result| result.get::<_, i64>(0),
+            )
+            .map_err(map_db("read prepaid top-up availability"))?
+            != 0;
+        accounts.push(PrepaidAccountView {
+            id: row.0,
+            buyer_user_id: row.1.clone(),
+            buyer_email: row.2,
+            supplier_user_id: row.3.clone(),
+            supplier_email: row.4,
+            currency: row.5,
+            status: row.6,
+            balance_minor: floor_minor(row.7),
+            held_minor: floor_minor(row.8),
+            available_minor: floor_minor(row.7.saturating_sub(row.8)),
+            is_buyer: row.1 == actor_user_id,
+            is_supplier: row.3 == actor_user_id,
+            topup_available,
+            ledger,
+            refund_requests,
+            created_at: row.9,
+            updated_at: row.10,
+        });
+    }
+    Ok(accounts)
+}
+
+impl AppStore {
+    pub async fn market_prepaid_request_refund(
+        &self,
+        session: &AuthSession,
+        account_id: &str,
+        amount_minor: i64,
+        reason: Option<&str>,
+    ) -> Result<PrepaidRefundRequestView, AppError> {
+        if amount_minor <= 0 {
+            return Err(AppError::BadRequest(
+                "refund amount must be positive".into(),
+            ));
+        }
+        let amount_units = amount_minor
+            .checked_mul(MONEY_UNITS_PER_MINOR)
+            .ok_or_else(|| AppError::BadRequest("refund amount is too large".into()))?;
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin prepaid refund request"))?;
+        let account = tx
+            .query_row(
+                "SELECT buyer_user_id, supplier_user_id, currency, status
+                 FROM market_prepaid_accounts WHERE id = ?1",
+                params![account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read prepaid account for refund"))?
+            .ok_or_else(|| AppError::NotFound("prepaid account not found".into()))?;
+        if account.0 != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the buyer can request a prepaid refund".into(),
+            ));
+        }
+        if account.3 == "closed" {
+            return Err(AppError::Conflict("prepaid account is closed".into()));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE market_prepaid_accounts
+                 SET held_balance_units = held_balance_units + ?2,
+                     status = 'refund_pending', version = version + 1, updated_at = ?3
+                 WHERE id = ?1 AND posted_balance_units - held_balance_units >= ?2
+                   AND status != 'closed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM market_prepaid_refund_requests
+                       WHERE prepaid_account_id = ?1 AND status IN ('requested', 'approved')
+                   )",
+                params![account_id, amount_units, now],
+            )
+            .map_err(map_db("hold prepaid refund amount"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "another refund is pending or the available prepaid balance is insufficient".into(),
+            ));
+        }
+        let refund_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO market_prepaid_refund_requests (
+                id, prepaid_account_id, buyer_user_id, supplier_user_id,
+                amount_units, amount_minor, currency, status, reason,
+                requested_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8, ?9, ?9)",
+            params![
+                refund_id,
+                account_id,
+                account.0,
+                account.1,
+                amount_units,
+                amount_minor,
+                account.2,
+                reason,
+                now,
+            ],
+        )
+        .map_err(map_db("create prepaid refund request"))?;
+        let view = prepaid_refund_view_tx(&tx, &refund_id, &session.user_id)?
+            .ok_or_else(|| AppError::Internal("created prepaid refund is missing".into()))?;
+        tx.commit()
+            .map_err(map_db("commit prepaid refund request"))?;
+        Ok(view)
+    }
+
+    pub async fn market_prepaid_resolve_refund(
+        &self,
+        session: &AuthSession,
+        refund_id: &str,
+        approve: bool,
+        note: Option<&str>,
+    ) -> Result<PrepaidRefundRequestView, AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin prepaid refund review"))?;
+        let row = tx
+            .query_row(
+                "SELECT prepaid_account_id, supplier_user_id, amount_units, status
+                 FROM market_prepaid_refund_requests WHERE id = ?1",
+                params![refund_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read prepaid refund for review"))?
+            .ok_or_else(|| AppError::NotFound("prepaid refund request not found".into()))?;
+        if row.1 != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the supplier can review this prepaid refund".into(),
+            ));
+        }
+        if row.3 != "requested" {
+            return Err(AppError::Conflict(
+                "prepaid refund request has already been reviewed".into(),
+            ));
+        }
+        let status = if approve { "approved" } else { "rejected" };
+        tx.execute(
+            "UPDATE market_prepaid_refund_requests
+             SET status = ?2, resolution_note = ?3, resolved_at = ?4, updated_at = ?4
+             WHERE id = ?1 AND status = 'requested'",
+            params![refund_id, status, note, now],
+        )
+        .map_err(map_db("resolve prepaid refund request"))?;
+        if !approve {
+            tx.execute(
+                "UPDATE market_prepaid_accounts
+                 SET held_balance_units = MAX(held_balance_units - ?2, 0),
+                     status = 'open', version = version + 1, updated_at = ?3
+                 WHERE id = ?1",
+                params![row.0, row.2, now],
+            )
+            .map_err(map_db("release rejected prepaid refund hold"))?;
+        }
+        let view = prepaid_refund_view_tx(&tx, refund_id, &session.user_id)?
+            .ok_or_else(|| AppError::Internal("reviewed prepaid refund is missing".into()))?;
+        tx.commit()
+            .map_err(map_db("commit prepaid refund review"))?;
+        Ok(view)
+    }
+
+    pub async fn market_prepaid_record_refund(
+        &self,
+        session: &AuthSession,
+        refund_id: &str,
+        external_reference: &str,
+    ) -> Result<PrepaidRefundRequestView, AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin prepaid refund record"))?;
+        let row = tx
+            .query_row(
+                "SELECT prepaid_account_id, supplier_user_id, amount_units, status,
+                        external_reference
+                 FROM market_prepaid_refund_requests WHERE id = ?1",
+                params![refund_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read approved prepaid refund"))?
+            .ok_or_else(|| AppError::NotFound("prepaid refund request not found".into()))?;
+        if row.1 != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the supplier can record this prepaid refund".into(),
+            ));
+        }
+        if row.3 == "recorded" {
+            if row.4.as_deref() != Some(external_reference) {
+                return Err(AppError::Conflict(
+                    "this refund was already recorded with another reference".into(),
+                ));
+            }
+            return prepaid_refund_view_tx(&tx, refund_id, &session.user_id)?
+                .ok_or_else(|| AppError::Internal("recorded prepaid refund is missing".into()));
+        }
+        if row.3 != "approved" {
+            return Err(AppError::Conflict(
+                "prepaid refund must be approved before it is recorded".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE market_prepaid_accounts
+             SET held_balance_units = MAX(held_balance_units - ?2, 0),
+                 version = version + 1, updated_at = ?3 WHERE id = ?1",
+            params![row.0, row.2, now],
+        )
+        .map_err(map_db("release recorded prepaid refund hold"))?;
+        append_prepaid_ledger_entry_tx(
+            &tx,
+            &row.0,
+            "refund_debit",
+            "debit",
+            row.2,
+            "refund_request",
+            refund_id,
+            &format!("prepaid-refund:{refund_id}"),
+            serde_json::json!({ "externalReference": external_reference }),
+            Some(&session.user_id),
+            &now,
+        )?;
+        tx.execute(
+            "UPDATE market_prepaid_refund_requests
+             SET status = 'recorded', external_reference = ?2,
+                 recorded_at = ?3, updated_at = ?3 WHERE id = ?1",
+            params![refund_id, external_reference, now],
+        )
+        .map_err(map_db("record prepaid refund request"))?;
+        tx.execute(
+            "UPDATE market_prepaid_accounts SET status = 'open', updated_at = ?2 WHERE id = ?1",
+            params![row.0, now],
+        )
+        .map_err(map_db("reopen prepaid account after refund"))?;
+        let view = prepaid_refund_view_tx(&tx, refund_id, &session.user_id)?
+            .ok_or_else(|| AppError::Internal("recorded prepaid refund is missing".into()))?;
+        tx.commit()
+            .map_err(map_db("commit prepaid refund record"))?;
+        Ok(view)
+    }
+}
+
+pub(crate) fn credit_market_prepaid_funding_tx(
+    tx: &Transaction<'_>,
+    account_id: &str,
+    amount_units: i64,
+    funding_intent_id: &str,
+    actor_user_id: Option<&str>,
+    now: &str,
+) -> Result<(String, Vec<BillingAction>), AppError> {
+    let entry_id = append_prepaid_ledger_entry_tx(
+        tx,
+        account_id,
+        "topup_credit",
+        "credit",
+        amount_units,
+        "funding_intent",
+        funding_intent_id,
+        &format!("funding-intent:{funding_intent_id}"),
+        serde_json::json!({ "fundingIntentId": funding_intent_id }),
+        actor_user_id,
+        now,
+    )?;
+    resume_prepaid_contracts_if_safe_tx(tx, account_id, now)?;
+    Ok((entry_id, pending_control_actions_tx(tx)?))
+}
+
+fn resume_prepaid_contracts_if_safe_tx(
+    tx: &Connection,
+    prepaid_account_id: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    let state = tx
+        .query_row(
+            "SELECT buyer_user_id, supplier_user_id, currency,
+                    posted_balance_units - held_balance_units
+             FROM market_prepaid_accounts WHERE id = ?1 AND status != 'closed'",
+            params![prepaid_account_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read prepaid account for service resume"))?;
+    let Some((buyer_user_id, supplier_user_id, currency, _available_units)) = state else {
+        return Ok(false);
+    };
+    let account_id = tx
+        .query_row(
+            "SELECT id FROM market_credit_accounts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3",
+            params![buyer_user_id, supplier_user_id, currency],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db("read credit account for prepaid service resume"))?;
+    let Some(account_id) = account_id else {
+        return Ok(false);
+    };
+    resume_account_contracts_if_safe_tx(tx, &account_id, true, now)
+}
+
+fn resume_account_contracts_if_safe_tx(
+    tx: &Connection,
+    account_id: &str,
+    insufficient_only: bool,
+    now: &str,
+) -> Result<bool, AppError> {
+    if !account_has_resume_funding_tx(tx, account_id, insufficient_only, now)? {
+        return Ok(false);
+    }
+    let changed = tx
+        .execute(
+            "UPDATE market_service_contracts
+             SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
+                 desired_control_state = 'active', applied_control_state = 'suspended',
+                 control_error = NULL, suspended_at = NULL,
+                 last_evaluated_at = ?3, updated_at = ?3
+             WHERE account_id = ?1
+               AND status = 'billing_suspended'
+               AND (?2 = 0 OR control_error = 'insufficient_funds')",
+            params![account_id, i64::from(insufficient_only), now],
+        )
+        .map_err(map_db("resume funded market services"))?;
+    Ok(changed > 0)
+}
+
+fn resume_newly_funded_contracts_tx(conn: &Connection, now: &str) -> Result<usize, AppError> {
+    let account_ids = conn
+        .prepare(
+            "SELECT DISTINCT account.id
+             FROM market_credit_accounts account
+             JOIN market_service_contracts contract ON contract.account_id = account.id
+             WHERE account.status IN ('active', 'near_credit_limit')
+               AND account.close_requested = 0
+               AND contract.status = 'billing_suspended'
+               AND contract.control_error = 'insufficient_funds'
+             ORDER BY account.id
+             LIMIT ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE as i64], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read newly funded market accounts"))?;
+    let mut resumed = 0;
+    for account_id in account_ids {
+        resumed += usize::from(resume_account_contracts_if_safe_tx(
+            conn,
+            &account_id,
+            true,
+            now,
+        )?);
+    }
+    Ok(resumed)
+}
+
+fn account_has_resume_funding_tx(
+    conn: &Connection,
+    account_id: &str,
+    insufficient_only: bool,
+    now: &str,
+) -> Result<bool, AppError> {
+    let account = conn
+        .query_row(
+            "SELECT buyer_user_id, supplier_user_id, currency, status,
+                    balance_units, credit_kind, credit_limit_minor, close_requested
+             FROM market_credit_accounts WHERE id = ?1",
+            params![account_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)? != 0,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read market account resume funding"))?;
+    let Some(account) = account else {
+        return Ok(false);
+    };
+    if account.7
+        || !matches!(
+            account.3.as_str(),
+            ACCOUNT_ACTIVE | ACCOUNT_NEAR_CREDIT_LIMIT
+        )
+    {
+        return Ok(false);
+    }
+    let daily_rate = conn
+        .query_row(
+            "SELECT COALESCE(SUM(daily_rate_minor), 0)
+             FROM market_service_contracts
+             WHERE account_id = ?1 AND status = 'billing_suspended'
+               AND (?2 = 0 OR control_error = 'insufficient_funds')",
+            params![account_id, i64::from(insufficient_only)],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("read suspended market service rate"))?;
+    if daily_rate <= 0 {
+        return Ok(true);
+    }
+    let prepaid_available = prepaid_state_for_parties_tx(conn, &account.0, &account.1, &account.2)?
+        .map(|(_, posted, held)| posted.saturating_sub(held))
+        .unwrap_or(0)
+        .max(0);
+    let credit_available = match account.5.as_str() {
+        crate::market_access::CREDIT_NONE => 0,
+        crate::market_access::CREDIT_LIMITED => {
+            let reserved_credit = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(credit_units), 0)
+                     FROM market_funding_reservations
+                     WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                       AND currency = ?3 AND status = 'active' AND expires_at > ?4",
+                    params![account.0, account.1, account.2, now],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(map_db("read reserved credit before service resume"))?;
+            account
+                .6
+                .unwrap_or_default()
+                .saturating_mul(MONEY_UNITS_PER_MINOR)
+                .saturating_sub(account.4)
+                .saturating_sub(reserved_credit)
+                .max(0)
+        }
+        crate::market_access::CREDIT_UNLIMITED => return Ok(true),
+        _ => return Ok(false),
+    };
+    Ok(prepaid_available.saturating_add(credit_available)
+        >= daily_rate.saturating_mul(PREPAID_RESUME_SECONDS))
 }
 
 fn ensure_account_tx(
@@ -3595,7 +5362,12 @@ impl AppStore {
         }
         conn.execute(
             "UPDATE market_service_contracts
-             SET applied_control_state = ?2, control_error = NULL, updated_at = ?3
+             SET applied_control_state = ?2,
+                 control_error = CASE
+                    WHEN ?2 = 'suspended' THEN control_error
+                    ELSE NULL
+                 END,
+                 updated_at = ?3
              WHERE id = ?1 AND desired_control_state = ?2",
             params![contract_id, state, now],
         )
@@ -3629,7 +5401,14 @@ impl AppStore {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE market_service_contracts
-             SET control_error = ?2, updated_at = ?3 WHERE id = ?1",
+             SET control_error = CASE
+                    WHEN desired_control_state = 'suspended'
+                         AND control_error = 'insufficient_funds'
+                    THEN control_error
+                    ELSE ?2
+                 END,
+                 updated_at = ?3
+             WHERE id = ?1",
             params![contract_id, error, now],
         )
         .map_err(map_db("mark market billing control failed"))?;
@@ -4317,6 +6096,25 @@ impl AppStore {
             .filter_map(|row| row.8.clone())
             .collect::<Vec<_>>();
         let mut open_invoices = invoice_views(&conn, &open_invoice_ids)?;
+        let prepaid_accounts = prepaid_account_views_for_actor_tx(&conn, &session.user_id)?;
+        let prepaid_by_parties = prepaid_accounts
+            .iter()
+            .map(|account| {
+                (
+                    (
+                        account.buyer_user_id.clone(),
+                        account.supplier_user_id.clone(),
+                        account.currency.clone(),
+                    ),
+                    (
+                        account.id.clone(),
+                        account.balance_minor,
+                        account.held_minor,
+                        account.available_minor,
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let mut accounts = Vec::with_capacity(account_rows.len());
         let now = Utc::now();
         for row in account_rows {
@@ -4358,6 +6156,7 @@ impl AppStore {
                 .and_then(|invoice_id| open_invoices.remove(invoice_id));
             let is_buyer = row.1 == session.user_id;
             let is_supplier = row.3 == session.user_id;
+            let prepaid = prepaid_by_parties.get(&(row.1.clone(), row.3.clone(), row.5.clone()));
             accounts.push(CreditAccountView {
                 id: row.0,
                 buyer_user_id: row.1,
@@ -4367,6 +6166,10 @@ impl AppStore {
                 currency: row.5,
                 status: row.6.clone(),
                 balance_minor: ceil_minor(row.7),
+                prepaid_account_id: prepaid.map(|value| value.0.clone()),
+                prepaid_balance_minor: prepaid.map_or(0, |value| value.1),
+                prepaid_held_minor: prepaid.map_or(0, |value| value.2),
+                prepaid_available_minor: prepaid.map_or(0, |value| value.3),
                 credit_kind: row.10,
                 credit_limit_minor: row.11,
                 utilization_bps,
@@ -4428,6 +6231,7 @@ impl AppStore {
         let refund_obligations = refund_obligations_for_actor_tx(&conn, &session.user_id)?;
         Ok(BillingDashboardView {
             accounts,
+            prepaid_accounts,
             supplier_profiles,
             restrictions,
             refund_obligations,
@@ -5046,15 +6850,8 @@ impl AppStore {
                     "recorded external refunds exceed the paid invoice amount".into(),
                 ));
             }
-            let refundable_units = tx
-                .query_row(
-                    "SELECT COALESCE(SUM(MAX(amount_units - credited_units, 0)), 0)
-                     FROM market_accrual_entries WHERE invoice_id = ?1",
-                    params![invoice_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(map_db("read paid invoice refundable accrual"))?
-                .min(invoice_amount_units);
+            let refundable_units =
+                refundable_invoice_credit_units_tx(&tx, invoice_id)?.min(invoice_amount_units);
             let amount_units =
                 if already_refunded_minor.saturating_add(amount_minor) == invoice_amount_minor {
                     refundable_units
@@ -5535,14 +7332,13 @@ fn settle_invoice_paid_core_tx(
             "this invoice can no longer be settled".into(),
         ));
     }
-    let (close_requested, credit_kind) = tx
+    let close_requested = tx
         .query_row(
-            "SELECT close_requested, credit_kind FROM market_credit_accounts WHERE id = ?1",
+            "SELECT close_requested FROM market_credit_accounts WHERE id = ?1",
             params![account_id],
-            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+            |row| Ok(row.get::<_, i64>(0)? != 0),
         )
         .map_err(map_db("read market account settlement state"))?;
-    let credit_revoked = credit_kind == crate::market_access::CREDIT_NONE;
     tx.execute(
         "UPDATE market_credit_accounts
          SET status = ?2, balance_units = 0, open_invoice_id = NULL,
@@ -5558,7 +7354,8 @@ fn settle_invoice_paid_core_tx(
         ],
     )
     .map_err(map_db("settle market credit account"))?;
-    if !close_requested && !credit_revoked {
+    let can_resume = !close_requested && account_has_resume_funding_tx(tx, account_id, false, now)?;
+    if can_resume {
         tx.execute(
             "UPDATE market_service_contracts
              SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
@@ -5569,25 +7366,26 @@ fn settle_invoice_paid_core_tx(
             params![account_id, now],
         )
         .map_err(map_db("resume settled market contracts"))?;
-    } else {
+    } else if close_requested {
         tx.execute(
             "UPDATE market_service_contracts
              SET desired_control_state = 'terminated',
-                 control_error = ?2, updated_at = ?3
+                 control_error = 'supplier_credit_closed', updated_at = ?2
              WHERE account_id = ?1 AND status = 'billing_suspended'",
-            params![
-                account_id,
-                if close_requested {
-                    "supplier_credit_closed"
-                } else {
-                    "supplier_credit_revoked"
-                },
-                now,
-            ],
+            params![account_id, now],
         )
         .map_err(map_db(
             "retain market contract termination after settlement",
         ))?;
+    } else {
+        tx.execute(
+            "UPDATE market_service_contracts
+             SET desired_control_state = 'suspended',
+                 control_error = 'insufficient_funds', updated_at = ?2
+             WHERE account_id = ?1 AND status = 'billing_suspended'",
+            params![account_id, now],
+        )
+        .map_err(map_db("retain market contracts pending prepaid funding"))?;
     }
     tx.execute(
         "UPDATE market_credit_restrictions SET status = 'lifted', lifted_at = ?2
@@ -5597,7 +7395,10 @@ fn settle_invoice_paid_core_tx(
     .map_err(map_db("lift settled market credit restriction"))?;
     if let Some(object) = detail.as_object_mut() {
         object.insert("accountClosed".into(), close_requested.into());
-        object.insert("creditRevoked".into(), credit_revoked.into());
+        object.insert(
+            "fundingRequired".into(),
+            (!close_requested && !can_resume).into(),
+        );
     }
     record_event_tx(
         tx,
@@ -5613,6 +7414,64 @@ fn settle_invoice_paid_core_tx(
     Ok(())
 }
 
+fn credit_binance_invoice_surplus_tx(
+    tx: &Transaction<'_>,
+    account_id: &str,
+    invoice_id: &str,
+    intent_id: &str,
+    base_amount_units: i64,
+    actual_amount_units: i64,
+    actor_user_id: Option<&str>,
+    now: &str,
+) -> Result<i64, AppError> {
+    let surplus_payment_units = actual_amount_units.saturating_sub(base_amount_units);
+    if surplus_payment_units <= 0 {
+        return Ok(0);
+    }
+    // Binance amounts have four decimal places. One USD cent is therefore 100
+    // payment units, and can be represented exactly by the internal ledger.
+    let credited_money_units = surplus_payment_units
+        .checked_mul(MONEY_UNITS_PER_MINOR / 100)
+        .ok_or_else(|| AppError::Internal("Binance invoice surplus overflowed".into()))?;
+    let account = tx
+        .query_row(
+            "SELECT buyer_user_id, buyer_email, supplier_user_id, supplier_email, currency
+             FROM market_credit_accounts WHERE id = ?1",
+            params![account_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(map_db("read market account for Binance invoice surplus"))?;
+    let prepaid_account_id = ensure_prepaid_account_tx(
+        tx, &account.0, &account.1, &account.2, &account.3, &account.4, now,
+    )?;
+    append_prepaid_ledger_entry_tx(
+        tx,
+        &prepaid_account_id,
+        "topup_credit",
+        "credit",
+        credited_money_units,
+        "invoice_payment_surplus",
+        invoice_id,
+        &format!("invoice-payment-surplus:{intent_id}"),
+        serde_json::json!({
+            "invoiceId": invoice_id,
+            "paymentIntentId": intent_id,
+            "surplusPaymentUnits": surplus_payment_units,
+        }),
+        actor_user_id,
+        now,
+    )?;
+    Ok(credited_money_units)
+}
+
 pub(crate) fn settle_invoice_from_binance_tx(
     tx: &Transaction<'_>,
     invoice_id: &str,
@@ -5622,10 +7481,17 @@ pub(crate) fn settle_invoice_from_binance_tx(
     actual_amount_units: i64,
     now: &str,
 ) -> Result<Vec<BillingAction>, AppError> {
-    let (account_id, invoice_status, intent_status, asset, expected_amount_units) = tx
+    let (
+        account_id,
+        invoice_status,
+        intent_status,
+        asset,
+        base_amount_units,
+        expected_amount_units,
+    ) = tx
         .query_row(
             "SELECT invoice.account_id, invoice.status, intent.status,
-                    intent.asset, intent.pay_amount_units
+                    intent.asset, intent.base_amount_units, intent.pay_amount_units
              FROM market_payment_intents intent
              JOIN market_invoices invoice ON invoice.id = intent.invoice_id
              JOIN binance_pay_transactions payment
@@ -5642,6 +7508,7 @@ pub(crate) fn settle_invoice_from_binance_tx(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
@@ -5676,6 +7543,16 @@ pub(crate) fn settle_invoice_from_binance_tx(
         ],
     )
     .map_err(map_db("create Binance payment receipt"))?;
+    let surplus_money_units = credit_binance_invoice_surplus_tx(
+        tx,
+        &account_id,
+        invoice_id,
+        intent_id,
+        base_amount_units,
+        actual_amount_units,
+        None,
+        now,
+    )?;
     settle_invoice_paid_core_tx(
         tx,
         &account_id,
@@ -5684,6 +7561,7 @@ pub(crate) fn settle_invoice_from_binance_tx(
         serde_json::json!({
             "source": "binance_auto",
             "paymentIntentId": intent_id,
+            "prepaidSurplusUnits": surplus_money_units,
         }),
         now,
     )?;
@@ -5763,6 +7641,16 @@ pub(crate) fn settle_invoice_from_binance_admin_tx(
         ],
     )
     .map_err(map_db("create reconciled Binance payment receipt"))?;
+    let surplus_money_units = credit_binance_invoice_surplus_tx(
+        tx,
+        &account_id,
+        invoice_id,
+        intent_id,
+        base_amount_units,
+        actual_amount_units,
+        Some(actor_user_id),
+        now,
+    )?;
     settle_invoice_paid_core_tx(
         tx,
         &account_id,
@@ -5772,6 +7660,7 @@ pub(crate) fn settle_invoice_from_binance_admin_tx(
             "source": "admin_reconciliation",
             "paymentIntentId": intent_id,
             "transactionId": transaction_id,
+            "prepaidSurplusUnits": surplus_money_units,
         }),
         now,
     )?;
@@ -5789,10 +7678,25 @@ fn credit_invoice_accruals_tx(
     }
     let rows = conn
         .prepare(
-            "SELECT id, MAX(amount_units - credited_units, 0)
-             FROM market_accrual_entries
-             WHERE invoice_id = ?1 AND MAX(amount_units - credited_units, 0) > 0
-             ORDER BY created_at, id",
+            "WITH allocation_totals AS (
+                 SELECT accrual_id,
+                        SUM(CASE WHEN source_kind = 'credit' THEN amount_units ELSE 0 END)
+                            AS credit_units,
+                        COUNT(*) AS allocation_count
+                 FROM market_accrual_allocations GROUP BY accrual_id
+             ), refundable AS (
+                 SELECT accrual.id, accrual.created_at,
+                        CASE WHEN COALESCE(allocation_totals.allocation_count, 0) = 0
+                             THEN MAX(accrual.amount_units - accrual.credited_units, 0)
+                             ELSE MAX(COALESCE(allocation_totals.credit_units, 0)
+                                      - accrual.credited_units, 0)
+                        END AS refundable_units
+                 FROM market_accrual_entries accrual
+                 LEFT JOIN allocation_totals ON allocation_totals.accrual_id = accrual.id
+                 WHERE accrual.invoice_id = ?1
+             )
+             SELECT id, refundable_units FROM refundable
+             WHERE refundable_units > 0 ORDER BY created_at, id",
         )
         .and_then(|mut statement| {
             statement
@@ -5825,6 +7729,34 @@ fn credit_invoice_accruals_tx(
     Ok(())
 }
 
+fn refundable_invoice_credit_units_tx(
+    conn: &Connection,
+    invoice_id: &str,
+) -> Result<i64, AppError> {
+    conn.query_row(
+        "WITH allocation_totals AS (
+             SELECT accrual_id,
+                    SUM(CASE WHEN source_kind = 'credit' THEN amount_units ELSE 0 END)
+                        AS credit_units,
+                    COUNT(*) AS allocation_count
+             FROM market_accrual_allocations GROUP BY accrual_id
+         )
+         SELECT COALESCE(SUM(
+             CASE WHEN COALESCE(allocation_totals.allocation_count, 0) = 0
+                  THEN MAX(accrual.amount_units - accrual.credited_units, 0)
+                  ELSE MAX(COALESCE(allocation_totals.credit_units, 0)
+                           - accrual.credited_units, 0)
+             END
+         ), 0)
+         FROM market_accrual_entries accrual
+         LEFT JOIN allocation_totals ON allocation_totals.accrual_id = accrual.id
+         WHERE accrual.invoice_id = ?1",
+        params![invoice_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(map_db("read paid invoice refundable credit accrual"))
+}
+
 fn void_invoice_tx(
     tx: &Transaction<'_>,
     invoice_id: &str,
@@ -5834,14 +7766,13 @@ fn void_invoice_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
-    let (close_requested, credit_kind) = tx
+    let close_requested = tx
         .query_row(
-            "SELECT close_requested, credit_kind FROM market_credit_accounts WHERE id = ?1",
+            "SELECT close_requested FROM market_credit_accounts WHERE id = ?1",
             params![account_id],
-            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+            |row| Ok(row.get::<_, i64>(0)? != 0),
         )
         .map_err(map_db("read market account settlement state for void"))?;
-    let credit_revoked = credit_kind == crate::market_access::CREDIT_NONE;
     tx.execute(
         "UPDATE market_invoices SET status = 'void', voided_at = ?2 WHERE id = ?1",
         params![invoice_id, now],
@@ -5881,24 +7812,17 @@ fn void_invoice_tx(
         params![invoice_id, now, buyer_user_id],
     )
     .map_err(map_db("lift restriction for voided market invoice"))?;
-    if close_requested || credit_revoked {
+    let can_resume = !close_requested && account_has_resume_funding_tx(tx, account_id, false, now)?;
+    if close_requested {
         tx.execute(
             "UPDATE market_service_contracts
              SET desired_control_state = 'terminated',
-                 control_error = ?2, updated_at = ?3
+                 control_error = 'supplier_credit_closed', updated_at = ?2
              WHERE account_id = ?1 AND status = 'billing_suspended'",
-            params![
-                account_id,
-                if close_requested {
-                    "supplier_credit_closed"
-                } else {
-                    "supplier_credit_revoked"
-                },
-                now,
-            ],
+            params![account_id, now],
         )
         .map_err(map_db("retain service termination after invoice void"))?;
-    } else {
+    } else if can_resume {
         tx.execute(
             "UPDATE market_service_contracts
              SET status = CASE WHEN trial_seconds_remaining > 0 THEN 'trial' ELSE 'active' END,
@@ -5909,6 +7833,17 @@ fn void_invoice_tx(
             params![account_id, now],
         )
         .map_err(map_db("resume services after invoice void"))?;
+    } else {
+        tx.execute(
+            "UPDATE market_service_contracts
+             SET desired_control_state = 'suspended',
+                 control_error = 'insufficient_funds', updated_at = ?2
+             WHERE account_id = ?1 AND status = 'billing_suspended'",
+            params![account_id, now],
+        )
+        .map_err(map_db(
+            "retain services pending prepaid funding after invoice void",
+        ))?;
     }
     record_event_tx(
         tx,
@@ -5920,7 +7855,7 @@ fn void_invoice_tx(
         serde_json::json!({
             "reason": reason,
             "accountClosed": close_requested,
-            "creditRevoked": credit_revoked,
+            "fundingRequired": !close_requested && !can_resume,
         }),
         &format!("invoice-voided:{invoice_id}"),
         now,
@@ -6156,10 +8091,10 @@ fn append_service_interval_tx(
     tx: &Connection,
     candidate: &AccrualCandidate,
     now: &str,
-) -> Result<(), AppError> {
+) -> Result<Option<String>, AppError> {
     if candidate.elapsed_seconds == 0 && candidate.observed_state == candidate.contract.health_state
     {
-        return Ok(());
+        return Ok(None);
     }
     let reusable = tx
         .query_row(
@@ -6218,6 +8153,7 @@ fn append_service_interval_tx(
         insert_service_interval_tx(tx, candidate, now)?
     };
     if candidate.requested_units > 0 {
+        let accrual_id = Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO market_accrual_entries (
                 id, account_id, contract_id, interval_id, currency, daily_rate_minor,
@@ -6230,7 +8166,7 @@ fn append_service_interval_tx(
                 amount_units = market_accrual_entries.amount_units + excluded.amount_units,
                 updated_at = excluded.updated_at",
             params![
-                Uuid::new_v4().to_string(),
+                accrual_id,
                 candidate.contract.account_id,
                 candidate.contract.id,
                 interval_id,
@@ -6241,6 +8177,33 @@ fn append_service_interval_tx(
             ],
         )
         .map_err(map_db("append market accrual entry"))?;
+        let accrual_id = tx
+            .query_row(
+                "SELECT id FROM market_accrual_entries WHERE interval_id = ?1",
+                params![interval_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_db("read appended market accrual entry"))?;
+        if candidate.trial_seconds > 0 {
+            tx.execute(
+                "UPDATE market_trial_ledgers
+                 SET consumed_seconds = MIN(allowance_seconds, consumed_seconds + ?6),
+                     updated_at = ?7
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                   AND product_kind = ?3 AND service_ref = ?4 AND currency = ?5",
+                params![
+                    candidate.contract.buyer_user_id,
+                    candidate.contract.supplier_user_id,
+                    candidate.contract.product_kind,
+                    candidate.contract.service_ref,
+                    candidate.contract.currency,
+                    candidate.trial_seconds,
+                    now,
+                ],
+            )
+            .map_err(map_db("consume persistent market trial balance"))?;
+        }
+        return Ok(Some(accrual_id));
     }
     if candidate.trial_seconds > 0 {
         tx.execute(
@@ -6261,7 +8224,313 @@ fn append_service_interval_tx(
         )
         .map_err(map_db("consume persistent market trial balance"))?;
     }
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct FundedAccrual {
+    candidate: AccrualCandidate,
+    insufficient_funds: bool,
+}
+
+fn append_prepaid_usage_allocation_tx(
+    conn: &Connection,
+    prepaid_account_id: &str,
+    credit_account_id: &str,
+    accrual_id: &str,
+    amount_units: i64,
+    detail: serde_json::Value,
+    now: &str,
+) -> Result<(), AppError> {
+    let existing = conn
+        .query_row(
+            "SELECT id, account_id, prepaid_ledger_entry_id
+             FROM market_accrual_allocations
+             WHERE accrual_id = ?1 AND source_kind = 'prepaid'
+             ORDER BY created_at, id LIMIT 1",
+            params![accrual_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_db("read prepaid market accrual allocation"))?;
+    if let Some((allocation_id, allocation_account_id, ledger_entry_id)) = existing {
+        if allocation_account_id != credit_account_id {
+            return Err(AppError::Internal(
+                "prepaid market accrual allocation belongs to another account".into(),
+            ));
+        }
+        let ledger_entry_id = ledger_entry_id.ok_or_else(|| {
+            AppError::Internal(
+                "prepaid market accrual allocation is missing its ledger entry".into(),
+            )
+        })?;
+        let changed = conn
+            .execute(
+                "UPDATE market_prepaid_accounts
+                 SET posted_balance_units = posted_balance_units - ?2,
+                     version = version + 1, updated_at = ?3
+                 WHERE id = ?1 AND posted_balance_units - held_balance_units >= ?2
+                   AND status != 'closed'",
+                params![prepaid_account_id, amount_units, now],
+            )
+            .map_err(map_db("extend prepaid market usage balance"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "prepaid balance is no longer sufficient for this operation".into(),
+            ));
+        }
+        let balance_after = conn
+            .query_row(
+                "SELECT posted_balance_units FROM market_prepaid_accounts WHERE id = ?1",
+                params![prepaid_account_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("read prepaid usage balance"))?;
+        let ledger_changed = conn
+            .execute(
+                "UPDATE market_prepaid_ledger_entries
+                 SET amount_units = amount_units + ?3,
+                     balance_after_units = ?4, detail_json = ?5
+                 WHERE id = ?1 AND account_id = ?2
+                   AND entry_kind = 'usage_debit' AND direction = 'debit'
+                   AND source_kind = 'accrual' AND source_id = ?6",
+                params![
+                    ledger_entry_id,
+                    prepaid_account_id,
+                    amount_units,
+                    balance_after,
+                    detail.to_string(),
+                    accrual_id,
+                ],
+            )
+            .map_err(map_db("extend prepaid usage ledger entry"))?;
+        if ledger_changed != 1 {
+            return Err(AppError::Internal(
+                "prepaid market accrual ledger entry changed unexpectedly".into(),
+            ));
+        }
+        let allocation_changed = conn
+            .execute(
+                "UPDATE market_accrual_allocations
+                 SET amount_units = amount_units + ?2 WHERE id = ?1",
+                params![allocation_id, amount_units],
+            )
+            .map_err(map_db("extend prepaid market accrual allocation"))?;
+        if allocation_changed != 1 {
+            return Err(AppError::Internal(
+                "prepaid market accrual allocation changed unexpectedly".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let allocation_key = format!("accrual-prepaid:{accrual_id}");
+    let ledger_entry_id = append_prepaid_ledger_entry_tx(
+        conn,
+        prepaid_account_id,
+        "usage_debit",
+        "debit",
+        amount_units,
+        "accrual",
+        accrual_id,
+        &allocation_key,
+        detail,
+        None,
+        now,
+    )?;
+    conn.execute(
+        "INSERT INTO market_accrual_allocations (
+            id, accrual_id, account_id, source_kind, amount_units,
+            prepaid_ledger_entry_id, idempotency_key, created_at
+         ) VALUES (?1, ?2, ?3, 'prepaid', ?4, ?5, ?6, ?7)",
+        params![
+            Uuid::new_v4().to_string(),
+            accrual_id,
+            credit_account_id,
+            amount_units,
+            ledger_entry_id,
+            allocation_key,
+            now,
+        ],
+    )
+    .map_err(map_db("record prepaid market accrual allocation"))?;
     Ok(())
+}
+
+fn append_credit_accrual_allocation_tx(
+    conn: &Connection,
+    account_id: &str,
+    accrual_id: &str,
+    amount_units: i64,
+    now: &str,
+) -> Result<(), AppError> {
+    let existing = conn
+        .query_row(
+            "SELECT id, account_id FROM market_accrual_allocations
+             WHERE accrual_id = ?1 AND source_kind = 'credit'
+             ORDER BY created_at, id LIMIT 1",
+            params![accrual_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_db("read supplier credit accrual allocation"))?;
+    if let Some((allocation_id, allocation_account_id)) = existing {
+        if allocation_account_id != account_id {
+            return Err(AppError::Internal(
+                "supplier credit accrual allocation belongs to another account".into(),
+            ));
+        }
+        let changed = conn
+            .execute(
+                "UPDATE market_accrual_allocations
+                 SET amount_units = amount_units + ?2 WHERE id = ?1",
+                params![allocation_id, amount_units],
+            )
+            .map_err(map_db("extend supplier credit accrual allocation"))?;
+        if changed != 1 {
+            return Err(AppError::Internal(
+                "supplier credit accrual allocation changed unexpectedly".into(),
+            ));
+        }
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO market_accrual_allocations (
+            id, accrual_id, account_id, source_kind, amount_units,
+            prepaid_ledger_entry_id, idempotency_key, created_at
+         ) VALUES (?1, ?2, ?3, 'credit', ?4, NULL, ?5, ?6)",
+        params![
+            Uuid::new_v4().to_string(),
+            accrual_id,
+            account_id,
+            amount_units,
+            format!("accrual-credit:{accrual_id}"),
+            now,
+        ],
+    )
+    .map_err(map_db("record supplier credit accrual allocation"))?;
+    Ok(())
+}
+
+fn allocate_accrual_funding_tx(
+    tx: &Connection,
+    account: &mut AccountRow,
+    candidate: AccrualCandidate,
+    now: &str,
+) -> Result<FundedAccrual, AppError> {
+    let originally_requested_units = candidate.requested_units;
+    let prepaid = prepaid_state_for_parties_tx(
+        tx,
+        &candidate.contract.buyer_user_id,
+        &candidate.contract.supplier_user_id,
+        &candidate.contract.currency,
+    )?;
+    let prepaid_available_units = prepaid
+        .as_ref()
+        .map(|(_, posted, held)| posted.saturating_sub(*held))
+        .unwrap_or(0)
+        .max(0);
+    let reserved_credit_units = tx
+        .query_row(
+            "SELECT COALESCE(SUM(credit_units), 0)
+             FROM market_funding_reservations
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
+               AND status = 'active' AND expires_at > ?4",
+            params![
+                candidate.contract.buyer_user_id,
+                candidate.contract.supplier_user_id,
+                candidate.contract.currency,
+                now,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("read reserved credit before market accrual"))?
+        .max(0);
+    let credit_available_units = match account.credit_kind.as_str() {
+        crate::market_access::CREDIT_NONE => 0,
+        crate::market_access::CREDIT_LIMITED => account
+            .credit_limit_minor
+            .ok_or_else(|| {
+                AppError::Internal("limited market credit account is missing its limit".into())
+            })?
+            .checked_mul(MONEY_UNITS_PER_MINOR)
+            .ok_or_else(|| AppError::Internal("market credit limit overflowed".into()))?
+            .saturating_sub(account.balance_units)
+            .saturating_sub(reserved_credit_units)
+            .max(0),
+        crate::market_access::CREDIT_UNLIMITED => originally_requested_units,
+        _ => {
+            return Err(AppError::Internal(
+                "market credit account has an invalid credit kind".into(),
+            ));
+        }
+    };
+    let available_units = prepaid_available_units.saturating_add(credit_available_units);
+    let funded_seconds = if candidate.contract.daily_rate_minor <= 0 {
+        candidate.billable_seconds
+    } else {
+        candidate
+            .billable_seconds
+            .min(available_units / candidate.contract.daily_rate_minor)
+    };
+    let funded_units = candidate
+        .contract
+        .daily_rate_minor
+        .checked_mul(funded_seconds)
+        .ok_or_else(|| AppError::Internal("funded market accrual overflowed".into()))?;
+    let prepaid_units = funded_units.min(prepaid_available_units);
+    let credit_units = funded_units.saturating_sub(prepaid_units);
+    if credit_units > credit_available_units {
+        return Err(AppError::Internal(
+            "market accrual exceeded available supplier credit".into(),
+        ));
+    }
+    let mut funded_candidate = candidate;
+    funded_candidate.billable_seconds = funded_seconds;
+    funded_candidate.requested_units = funded_units;
+    let accrual_id = append_service_interval_tx(tx, &funded_candidate, now)?;
+    if funded_units > 0 {
+        let accrual_id = accrual_id.ok_or_else(|| {
+            AppError::Internal("funded service interval is missing its accrual".into())
+        })?;
+        if prepaid_units > 0 {
+            let prepaid_account_id = prepaid
+                .as_ref()
+                .map(|(id, _, _)| id.as_str())
+                .ok_or_else(|| AppError::Internal("prepaid funding account is missing".into()))?;
+            append_prepaid_usage_allocation_tx(
+                tx,
+                prepaid_account_id,
+                &account.id,
+                &accrual_id,
+                prepaid_units,
+                serde_json::json!({
+                    "contractId": funded_candidate.contract.id,
+                    "productKind": funded_candidate.contract.product_kind,
+                    "productRef": funded_candidate.contract.product_ref,
+                    "intervalEndedAt": funded_candidate.interval_ended_at,
+                }),
+                now,
+            )?;
+        }
+        if credit_units > 0 {
+            append_credit_accrual_allocation_tx(tx, &account.id, &accrual_id, credit_units, now)?;
+            account.balance_units = account
+                .balance_units
+                .checked_add(credit_units)
+                .ok_or_else(|| AppError::Internal("market credit balance overflowed".into()))?;
+        }
+    }
+    Ok(FundedAccrual {
+        candidate: funded_candidate,
+        insufficient_funds: funded_units < originally_requested_units,
+    })
 }
 
 fn accrue_contract_until_tx(
@@ -6306,50 +8575,43 @@ fn accrue_contract_until_tx(
     let Some(contract) = contract else {
         return Ok(());
     };
-    let account = tx
-        .query_row(
-            "SELECT status, balance_units FROM market_credit_accounts WHERE id = ?1",
-            params![contract.account_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(map_db("read market account for final accrual"))?;
-    let Some((account_status, account_balance_units)) = account else {
-        return Ok(());
-    };
+    let mut account = load_account_row_tx(tx, &contract.account_id)?;
     if !matches!(
-        account_status.as_str(),
+        account.status.as_str(),
         ACCOUNT_ACTIVE | ACCOUNT_NEAR_CREDIT_LIMIT
     ) {
         return Ok(());
     }
     let candidate = build_accrual_candidate_tx(tx, contract, until)?;
-    append_service_interval_tx(tx, &candidate, &candidate.interval_ended_at)?;
-    let next_balance = account_balance_units
-        .checked_add(candidate.requested_units)
-        .ok_or_else(|| AppError::Internal("market account balance overflowed".into()))?;
+    let interval_ended_at = candidate.interval_ended_at.clone();
+    let funded = allocate_accrual_funding_tx(tx, &mut account, candidate, &interval_ended_at)?;
     tx.execute(
         "UPDATE market_credit_accounts
          SET balance_units = ?2, version = version + 1, updated_at = ?3
          WHERE id = ?1",
-        params![
-            candidate.contract.account_id,
-            next_balance,
-            candidate.interval_ended_at
-        ],
+        params![account.id, account.balance_units, interval_ended_at],
     )
     .map_err(map_db("apply final market accrual balance"))?;
     tx.execute(
         "UPDATE market_service_contracts
-         SET status = CASE WHEN ?2 > 0 THEN 'trial' ELSE 'active' END,
+         SET status = CASE WHEN ?5 = 1 THEN 'billing_suspended'
+                           WHEN ?2 > 0 THEN 'trial' ELSE 'active' END,
              trial_seconds_remaining = ?2, health_state = ?3,
-             last_evaluated_at = ?4, updated_at = ?4
+             last_evaluated_at = ?4,
+             desired_control_state = CASE WHEN ?5 = 1 THEN 'suspended'
+                                          ELSE desired_control_state END,
+             control_error = CASE WHEN ?5 = 1 THEN 'insufficient_funds'
+                                  ELSE control_error END,
+             suspended_at = CASE WHEN ?5 = 1 THEN COALESCE(suspended_at, ?4)
+                                 ELSE suspended_at END,
+             updated_at = ?4
          WHERE id = ?1 AND status IN ('trial', 'active')",
         params![
-            candidate.contract.id,
-            candidate.next_trial_seconds,
-            candidate.observed_state,
-            candidate.interval_ended_at,
+            funded.candidate.contract.id,
+            funded.candidate.next_trial_seconds,
+            funded.candidate.observed_state,
+            interval_ended_at,
+            i64::from(funded.insufficient_funds),
         ],
     )
     .map_err(map_db("advance market contract final accrual"))?;
@@ -6427,18 +8689,38 @@ fn open_invoice_tx(
     }
     let mut drafts = tx
         .prepare(
-            "SELECT contract.id, contract.product_kind, contract.product_ref,
+            "WITH allocation_totals AS (
+                 SELECT accrual_id,
+                        SUM(CASE WHEN source_kind = 'credit' THEN amount_units ELSE 0 END)
+                            AS credit_units,
+                        COUNT(*) AS allocation_count
+                 FROM market_accrual_allocations
+                 GROUP BY accrual_id
+             ), invoiceable AS (
+                 SELECT accrual.*,
+                        CASE WHEN COALESCE(allocation_totals.allocation_count, 0) = 0
+                             THEN MAX(accrual.amount_units - accrual.credited_units, 0)
+                             ELSE MAX(COALESCE(allocation_totals.credit_units, 0)
+                                      - accrual.credited_units, 0)
+                        END AS invoiceable_units
+                 FROM market_accrual_entries accrual
+                 LEFT JOIN allocation_totals ON allocation_totals.accrual_id = accrual.id
+                 WHERE accrual.account_id = ?1 AND accrual.status = 'unbilled'
+             )
+             SELECT contract.id, contract.product_kind, contract.product_ref,
                     contract.service_ref, contract.service_label, contract.daily_rate_minor,
-                    SUM(accrual.billable_seconds),
-                    SUM(MAX(accrual.amount_units - accrual.credited_units, 0)),
+                    SUM(MIN(invoiceable.billable_seconds,
+                            (invoiceable.invoiceable_units
+                             + invoiceable.daily_rate_minor - 1)
+                            / invoiceable.daily_rate_minor)),
+                    SUM(invoiceable.invoiceable_units),
                     MIN(interval.started_at), MAX(interval.ended_at)
-             FROM market_accrual_entries accrual
-             JOIN market_service_contracts contract ON contract.id = accrual.contract_id
-             JOIN market_service_intervals interval ON interval.id = accrual.interval_id
-             WHERE accrual.account_id = ?1 AND accrual.status = 'unbilled'
+             FROM invoiceable
+             JOIN market_service_contracts contract ON contract.id = invoiceable.contract_id
+             JOIN market_service_intervals interval ON interval.id = invoiceable.interval_id
              GROUP BY contract.id, contract.product_kind, contract.product_ref,
                       contract.service_ref, contract.service_label, contract.daily_rate_minor
-             HAVING SUM(MAX(accrual.amount_units - accrual.credited_units, 0)) > 0
+             HAVING SUM(invoiceable.invoiceable_units) > 0
              ORDER BY MIN(interval.started_at), contract.id",
         )
         .and_then(|mut statement| {
@@ -6612,7 +8894,15 @@ fn open_invoice_tx(
     tx.execute(
         "UPDATE market_accrual_entries
          SET status = 'invoiced', invoice_id = ?2, updated_at = ?3
-         WHERE account_id = ?1 AND status = 'unbilled'",
+         WHERE account_id = ?1 AND status = 'unbilled'
+           AND (NOT EXISTS (
+                    SELECT 1 FROM market_accrual_allocations allocation
+                    WHERE allocation.accrual_id = market_accrual_entries.id
+                ) OR EXISTS (
+                    SELECT 1 FROM market_accrual_allocations allocation
+                    WHERE allocation.accrual_id = market_accrual_entries.id
+                      AND allocation.source_kind = 'credit'
+                ))",
         params![account.id, invoice_id, opened_at],
     )
     .map_err(map_db("freeze market invoice accrual entries"))?;
@@ -6621,7 +8911,12 @@ fn open_invoice_tx(
          SET invoice_id = ?2, updated_at = ?3
          WHERE contract_id IN (
              SELECT id FROM market_service_contracts WHERE account_id = ?1
-         ) AND invoice_id IS NULL AND amount_units > 0",
+         ) AND invoice_id IS NULL
+           AND EXISTS (
+               SELECT 1 FROM market_accrual_entries accrual
+               WHERE accrual.interval_id = market_service_intervals.id
+                 AND accrual.invoice_id = ?2
+           )",
         params![account.id, invoice_id, opened_at],
     )
     .map_err(map_db("freeze invoiced service intervals"))?;
@@ -7043,7 +9338,10 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market billing reconciliation"))?;
+        let now_text = now.to_rfc3339();
+        expire_market_funding_reservations_tx(&tx, &now_text)?;
         process_dispute_sla_tx(&tx, now)?;
+        resume_newly_funded_contracts_tx(&tx, &now_text)?;
         let contracts = load_reconcile_contracts_tx(&tx)?;
         let mut grouped = BTreeMap::<String, Vec<AccrualCandidate>>::new();
         for contract in contracts {
@@ -7053,25 +9351,14 @@ impl AppStore {
                 .or_default()
                 .push(candidate);
         }
-        let now_text = now.to_rfc3339();
         for (account_id, candidates) in grouped {
-            let account = load_account_row_tx(&tx, &account_id)?;
+            let mut account = load_account_row_tx(&tx, &account_id)?;
             if !matches!(
                 account.status.as_str(),
                 ACCOUNT_ACTIVE | ACCOUNT_NEAR_CREDIT_LIMIT
             ) {
                 continue;
             }
-            let accrued_units = candidates.iter().try_fold(0_i64, |total, candidate| {
-                total
-                    .checked_add(candidate.requested_units)
-                    .ok_or_else(|| AppError::Internal("market account accrual overflowed".into()))
-            })?;
-            let next_balance = account
-                .balance_units
-                .checked_add(accrued_units)
-                .ok_or_else(|| AppError::Internal("market account balance overflowed".into()))?;
-            let credit_revoked = account.credit_kind == crate::market_access::CREDIT_NONE;
             let limit_units = match account.credit_kind.as_str() {
                 crate::market_access::CREDIT_LIMITED => Some(
                     account
@@ -7093,12 +9380,13 @@ impl AppStore {
                     ));
                 }
             };
-            let credit_limit_reached = limit_units.is_some_and(|limit| next_balance >= limit);
-            for candidate in &candidates {
-                append_service_interval_tx(&tx, candidate, &now_text)?;
-                let next_status = if credit_revoked || credit_limit_reached {
+            let mut funding_exhausted = false;
+            for candidate in candidates {
+                let funded = allocate_accrual_funding_tx(&tx, &mut account, candidate, &now_text)?;
+                funding_exhausted |= funded.insufficient_funds;
+                let next_status = if funded.insufficient_funds {
                     CONTRACT_BILLING_SUSPENDED
-                } else if candidate.next_trial_seconds > 0 {
+                } else if funded.candidate.next_trial_seconds > 0 {
                     CONTRACT_TRIAL
                 } else {
                     CONTRACT_ACTIVE
@@ -7108,59 +9396,76 @@ impl AppStore {
                      SET status = ?2, trial_seconds_remaining = ?3,
                          health_state = ?4, last_evaluated_at = ?5,
                          desired_control_state = CASE
-                             WHEN ?7 = 1 THEN 'terminated'
-                             WHEN ?2 = 'billing_suspended' THEN 'suspended'
+                             WHEN ?7 = 1 THEN 'suspended'
                              ELSE desired_control_state END,
-                         control_error = CASE WHEN ?7 = 1
-                             THEN 'supplier_credit_revoked' ELSE control_error END,
+                         control_error = CASE
+                             WHEN ?7 = 1 THEN 'insufficient_funds'
+                             WHEN control_error = 'insufficient_funds' THEN NULL
+                             ELSE control_error END,
                          suspended_at = CASE WHEN ?2 = 'billing_suspended'
                              THEN COALESCE(suspended_at, ?6) ELSE suspended_at END,
                          updated_at = ?6
                      WHERE id = ?1",
                     params![
-                        candidate.contract.id,
+                        funded.candidate.contract.id,
                         next_status,
-                        candidate.next_trial_seconds,
-                        candidate.observed_state,
-                        candidate.interval_ended_at,
+                        funded.candidate.next_trial_seconds,
+                        funded.candidate.observed_state,
+                        funded.candidate.interval_ended_at,
                         now_text,
-                        i64::from(credit_revoked),
+                        i64::from(funded.insufficient_funds),
                     ],
                 )
                 .map_err(map_db("advance market billing contract"))?;
             }
-            if credit_revoked {
-                tx.execute(
-                    "UPDATE market_credit_accounts
-                     SET balance_units = ?2, status = 'active',
-                         version = version + 1, updated_at = ?3 WHERE id = ?1",
-                    params![account.id, next_balance, now_text],
-                )
-                .map_err(map_db("stop market account after credit revocation"))?;
-            } else if credit_limit_reached {
+            let credit_limit_reached = limit_units
+                .is_some_and(|limit| account.balance_units >= limit && account.balance_units > 0);
+            let partial_credit_requires_settlement = funding_exhausted && account.balance_units > 0;
+            if credit_limit_reached || partial_credit_requires_settlement {
                 tx.execute(
                     "UPDATE market_credit_accounts
                      SET balance_units = ?2, status = 'settlement_due',
                          version = version + 1, updated_at = ?3 WHERE id = ?1",
-                    params![account.id, next_balance, now_text],
+                    params![account.id, account.balance_units, now_text],
                 )
                 .map_err(map_db("mark market credit limit reached"))?;
-                let settled_account = AccountRow {
-                    balance_units: next_balance,
-                    ..account
-                };
                 open_invoice_tx(
                     &tx,
-                    &settled_account,
+                    &account,
                     now,
-                    "credit_limit_reached",
+                    if credit_limit_reached {
+                        "credit_limit_reached"
+                    } else {
+                        "funding_exhausted"
+                    },
                     None,
                     usd_cny_rate_micros,
                 )?;
             } else {
+                if funding_exhausted {
+                    tx.execute(
+                        "UPDATE market_service_contracts
+                         SET status = 'billing_suspended',
+                             desired_control_state = 'suspended',
+                             control_error = 'insufficient_funds',
+                             suspended_at = COALESCE(suspended_at, ?2),
+                             updated_at = ?2
+                         WHERE account_id = ?1 AND status IN ('trial', 'active')
+                           AND trial_seconds_remaining = 0",
+                        params![account.id, now_text],
+                    )
+                    .map_err(map_db("suspend unfunded market account services"))?;
+                }
                 let utilization_bps = limit_units.map(|limit_units| {
-                    i64::try_from(i128::from(next_balance) * 10_000_i128 / i128::from(limit_units))
+                    if limit_units <= 0 {
+                        10_000
+                    } else {
+                        i64::try_from(
+                            i128::from(account.balance_units) * 10_000_i128
+                                / i128::from(limit_units),
+                        )
                         .unwrap_or(10_000)
+                    }
                 });
                 let status = if utilization_bps.is_some_and(|value| value >= NEAR_CREDIT_LIMIT_BPS)
                 {
@@ -7172,7 +9477,7 @@ impl AppStore {
                     "UPDATE market_credit_accounts
                      SET balance_units = ?2, status = ?3,
                          version = version + 1, updated_at = ?4 WHERE id = ?1",
-                    params![account.id, next_balance, status, now_text],
+                    params![account.id, account.balance_units, status, now_text],
                 )
                 .map_err(map_db("advance market credit account"))?;
                 if status == ACCOUNT_NEAR_CREDIT_LIMIT
@@ -7196,21 +9501,6 @@ impl AppStore {
                 }
             }
         }
-        tx.execute(
-            "UPDATE market_service_contracts
-             SET status = CASE WHEN status IN ('trial', 'active')
-                     THEN 'billing_suspended' ELSE status END,
-                 desired_control_state = 'terminated',
-                 control_error = 'supplier_credit_revoked',
-                 suspended_at = CASE WHEN status IN ('trial', 'active')
-                     THEN COALESCE(suspended_at, ?1) ELSE suspended_at END,
-                 updated_at = ?1
-             WHERE account_id IN (
-                 SELECT id FROM market_credit_accounts WHERE credit_kind = 'none'
-             ) AND status != 'terminated'",
-            params![now_text],
-        )
-        .map_err(map_db("terminate services with revoked market credit"))?;
         crate::share_market::apply_accepted_price_changes_tx(&tx, &now_text)?;
         open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
         mark_overdue_invoices_tx(&tx, &now_text)?;
@@ -7314,6 +9604,135 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_termination_refund_returns_prepaid_and_reverses_only_credit_debt() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO market_credit_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, balance_units, credit_kind, credit_limit_minor,
+                credit_source, credit_revision, created_at, updated_at
+            ) VALUES (
+                'mixed-refund-account', 'mixed-refund-buyer', 'buyer@example.com',
+                'mixed-refund-supplier', 'supplier@example.com', 'USD', 'active',
+                100, 'limited', 1000, 'counterparty', 1, '{now_text}', '{now_text}'
+            );
+            INSERT INTO market_prepaid_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, posted_balance_units, held_balance_units,
+                version, created_at, updated_at
+            ) VALUES (
+                'mixed-refund-prepaid', 'mixed-refund-buyer', 'buyer@example.com',
+                'mixed-refund-supplier', 'supplier@example.com', 'USD', 'open',
+                0, 0, 1, '{now_text}', '{now_text}'
+            );
+            INSERT INTO market_service_contracts (
+                id, account_id, product_kind, product_ref, service_ref, service_label,
+                buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, daily_rate_minor, offer_revision, status,
+                trial_seconds_remaining, last_evaluated_at, activated_at,
+                service_started_at, created_at, updated_at
+            ) VALUES (
+                'mixed-refund-contract', 'mixed-refund-account', 'share',
+                'mixed-refund-subscription', 'mixed-refund-share', 'Mixed funding Share',
+                'mixed-refund-buyer', 'buyer@example.com', 'mixed-refund-supplier',
+                'supplier@example.com', 'USD', 100, 1, 'active', 0,
+                '{now_text}', '{now_text}', '{now_text}', '{now_text}', '{now_text}'
+            );
+            INSERT INTO market_accrual_entries (
+                id, account_id, contract_id, interval_id, currency, daily_rate_minor,
+                billable_seconds, amount_units, status, created_at, updated_at,
+                credited_units
+            ) VALUES (
+                'mixed-refund-accrual', 'mixed-refund-account',
+                'mixed-refund-contract', 'mixed-refund-interval', 'USD', 100,
+                2, 200, 'unbilled', '{now_text}', '{now_text}', 0
+            );
+            INSERT INTO market_accrual_allocations (
+                id, accrual_id, account_id, source_kind, amount_units,
+                prepaid_ledger_entry_id, idempotency_key, created_at
+            ) VALUES
+                ('mixed-refund-prepaid-allocation', 'mixed-refund-accrual',
+                 'mixed-refund-account', 'prepaid', 100, NULL,
+                 'mixed-refund-prepaid-allocation', '{now_text}'),
+                ('mixed-refund-credit-allocation', 'mixed-refund-accrual',
+                 'mixed-refund-account', 'credit', 100, NULL,
+                 'mixed-refund-credit-allocation', '{now_text}');
+            "#,
+        ))
+        .expect("insert mixed termination funding fixture");
+        let calculation = SupplierTerminationCalculation {
+            contract_id: "mixed-refund-contract".into(),
+            account_id: "mixed-refund-account".into(),
+            product_kind: "share".into(),
+            product_ref: "mixed-refund-subscription".into(),
+            currency: MARKET_CURRENCY.into(),
+            service_started_at: now_text.clone(),
+            service_ends_at: (now + Duration::days(1)).to_rfc3339(),
+            evaluated_at: now_text.clone(),
+            elapsed_bps: 0,
+            refund_bps: 10_000,
+            refundable_base_units: 200,
+            amount_units: 200,
+            amount_minor: 1,
+        };
+
+        let adjustment = apply_quoted_supplier_early_termination_refund_tx(
+            &conn,
+            &calculation,
+            "supplier ended fixed term",
+            "mixed-refund-adjustment",
+            now,
+        )
+        .expect("apply mixed funding termination refund");
+        assert_eq!(adjustment.prepaid_credit_minor, 1);
+        assert_eq!(adjustment.unbilled_credit_minor, 0);
+        assert_eq!(adjustment.invoice_credit_minor, 0);
+        assert_eq!(adjustment.external_refund_minor, 0);
+
+        let state: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT prepaid.posted_balance_units, credit.balance_units,
+                        accrual.credited_units,
+                        adjustment.prepaid_credit_units,
+                        adjustment.unbilled_credit_units
+                 FROM market_prepaid_accounts prepaid
+                 JOIN market_credit_accounts credit
+                   ON credit.buyer_user_id = prepaid.buyer_user_id
+                  AND credit.supplier_user_id = prepaid.supplier_user_id
+                 JOIN market_accrual_entries accrual
+                   ON accrual.account_id = credit.id
+                 JOIN market_contract_adjustments adjustment
+                   ON adjustment.contract_id = accrual.contract_id
+                 WHERE prepaid.id = 'mixed-refund-prepaid'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read mixed termination refund state");
+        assert_eq!(state, (100, 0, 100, 100, 100));
+        let prepaid_credit_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_prepaid_adjustment_credits
+                 WHERE adjustment_id = ?1",
+                params![adjustment.id],
+                |row| row.get(0),
+            )
+            .expect("count audited prepaid termination credits");
+        assert_eq!(prepaid_credit_rows, 1);
     }
 
     #[tokio::test]
@@ -7538,6 +9957,99 @@ mod tests {
             )
             .expect("read rounded external refund net units");
         assert_eq!(external, (100, 100));
+    }
+
+    #[tokio::test]
+    async fn invoice_credit_never_consumes_the_prepaid_part_of_a_mixed_accrual() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO market_credit_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, balance_units, open_invoice_id, credit_kind,
+                credit_limit_minor, credit_source, credit_revision, created_at, updated_at
+            ) VALUES (
+                'mixed-invoice-credit-account', 'mixed-invoice-credit-buyer',
+                'buyer@example.com', 'mixed-invoice-credit-supplier',
+                'supplier@example.com', 'USD', 'settlement_due', 110,
+                'mixed-invoice-credit-invoice', 'limited', 1000,
+                'counterparty', 1, '{now}', '{now}'
+            );
+            INSERT INTO market_invoices (
+                id, account_id, sequence, amount_minor, amount_cny_minor,
+                usd_cny_rate_micros, amount_units, currency, payment_methods_json,
+                payment_contacts_json, payment_profile_updated_at, status,
+                due_at, deadline_at, opened_at
+            ) VALUES (
+                'mixed-invoice-credit-invoice', 'mixed-invoice-credit-account',
+                1, 1, 1, 1000000, 110, 'USD', '[]', '[]', '{now}',
+                'open', '{now}', '{now}', '{now}'
+            );
+            INSERT INTO market_accrual_entries (
+                id, account_id, contract_id, interval_id, currency, daily_rate_minor,
+                billable_seconds, amount_units, status, invoice_id, created_at,
+                updated_at, credited_units
+            ) VALUES
+                ('mixed-invoice-credit-first', 'mixed-invoice-credit-account',
+                 'mixed-invoice-credit-contract-a', 'mixed-invoice-credit-interval-a',
+                 'USD', 1, 100, 100, 'invoiced', 'mixed-invoice-credit-invoice',
+                 '{now}', '{now}', 0),
+                ('mixed-invoice-credit-second', 'mixed-invoice-credit-account',
+                 'mixed-invoice-credit-contract-b', 'mixed-invoice-credit-interval-b',
+                 'USD', 1, 100, 100, 'invoiced', 'mixed-invoice-credit-invoice',
+                 '{now}', '{now}', 0);
+            INSERT INTO market_accrual_allocations (
+                id, accrual_id, account_id, source_kind, amount_units,
+                prepaid_ledger_entry_id, idempotency_key, created_at
+            ) VALUES
+                ('mixed-invoice-credit-prepaid', 'mixed-invoice-credit-first',
+                 'mixed-invoice-credit-account', 'prepaid', 90, NULL,
+                 'mixed-invoice-credit-prepaid', '{now}'),
+                ('mixed-invoice-credit-first-credit', 'mixed-invoice-credit-first',
+                 'mixed-invoice-credit-account', 'credit', 10, NULL,
+                 'mixed-invoice-credit-first-credit', '{now}'),
+                ('mixed-invoice-credit-second-credit', 'mixed-invoice-credit-second',
+                 'mixed-invoice-credit-account', 'credit', 100, NULL,
+                 'mixed-invoice-credit-second-credit', '{now}');
+            "#,
+        ))
+        .expect("insert mixed invoice credit fixture");
+
+        assert_eq!(
+            refundable_invoice_credit_units_tx(&conn, "mixed-invoice-credit-invoice")
+                .expect("read initial refundable invoice credit"),
+            110
+        );
+        credit_invoice_accruals_tx(&conn, "mixed-invoice-credit-invoice", 50, &now)
+            .expect("allocate mixed invoice credit");
+
+        let credited = conn
+            .prepare(
+                "SELECT id, credited_units FROM market_accrual_entries
+                 WHERE invoice_id = 'mixed-invoice-credit-invoice' ORDER BY id",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("read mixed invoice credit allocation");
+        assert_eq!(
+            credited,
+            vec![
+                ("mixed-invoice-credit-first".into(), 10),
+                ("mixed-invoice-credit-second".into(), 40),
+            ]
+        );
+        assert_eq!(
+            refundable_invoice_credit_units_tx(&conn, "mixed-invoice-credit-invoice")
+                .expect("read remaining refundable invoice credit"),
+            60
+        );
     }
 
     fn session(user_id: &str, email: &str) -> AuthSession {
@@ -7784,6 +10296,1128 @@ mod tests {
             params![contract_id, now.to_rfc3339()],
         )
         .expect("finish test contract trial");
+    }
+
+    async fn disable_test_public_credit(store: &AppStore, supplier: &AuthSession) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "DELETE FROM market_public_credit_policies WHERE supplier_user_id = ?1",
+            params![supplier.user_id],
+        )
+        .expect("disable test public credit");
+    }
+
+    async fn credit_test_prepaid_units(
+        store: &AppStore,
+        buyer: &AuthSession,
+        supplier: &AuthSession,
+        amount_units: i64,
+        source_id: &str,
+        now: DateTime<Utc>,
+    ) -> String {
+        let now = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        let tx = conn.transaction().expect("begin test prepaid credit");
+        let account_id = ensure_market_prepaid_account_tx(
+            &tx,
+            &buyer.user_id,
+            &buyer.email,
+            &supplier.user_id,
+            &supplier.email,
+            MARKET_CURRENCY,
+            &now,
+        )
+        .expect("ensure test prepaid account");
+        credit_market_prepaid_funding_tx(&tx, &account_id, amount_units, source_id, None, &now)
+            .expect("credit test prepaid balance");
+        tx.commit().expect("commit test prepaid credit");
+        account_id
+    }
+
+    #[tokio::test]
+    async fn prepaid_is_consumed_before_credit_and_ledger_matches_the_posted_balance() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-prepaid-first", "buyer-prepaid-first@example.com");
+        let supplier = session(
+            "supplier-prepaid-first",
+            "supplier-prepaid-first@example.com",
+        );
+        configure_supplier(&store, &supplier, 10).await;
+        let started_at = Utc::now();
+        let contract_id = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-prepaid-first",
+            MONEY_UNITS_PER_MINOR,
+            started_at,
+        )
+        .await;
+        let prepaid_account_id = credit_test_prepaid_units(
+            &store,
+            &buyer,
+            &supplier,
+            4 * MONEY_UNITS_PER_MINOR,
+            "prepaid-first",
+            started_at,
+        )
+        .await;
+        force_contract_out_of_trial(&store, &contract_id, started_at).await;
+        record_client_health(
+            &store,
+            "client-prepaid-first",
+            started_at + Duration::seconds(3),
+            "healthy",
+        )
+        .await;
+        let actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(3))
+            .await
+            .expect("reconcile initial prepaid usage");
+        assert!(actions.is_empty());
+        record_client_health(
+            &store,
+            "client-prepaid-first",
+            started_at + Duration::seconds(5),
+            "healthy",
+        )
+        .await;
+        let actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(5))
+            .await
+            .expect("reconcile mixed prepaid and credit usage");
+        assert!(actions.is_empty());
+
+        let conn = store.conn.lock().await;
+        let prepaid: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT posted_balance_units, held_balance_units,
+                        COALESCE(SUM(CASE WHEN ledger.direction = 'credit'
+                            THEN ledger.amount_units ELSE -ledger.amount_units END), 0),
+                        COUNT(CASE WHEN ledger.entry_kind = 'usage_debit' THEN 1 END)
+                 FROM market_prepaid_accounts prepaid
+                 LEFT JOIN market_prepaid_ledger_entries ledger ON ledger.account_id = prepaid.id
+                 WHERE prepaid.id = ?1 GROUP BY prepaid.id",
+                params![prepaid_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read prepaid ledger invariant");
+        assert_eq!(prepaid, (0, 0, 0, 1));
+        let allocations: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN source_kind = 'prepaid' THEN amount_units END), 0),
+                    COALESCE(SUM(CASE WHEN source_kind = 'credit' THEN amount_units END), 0),
+                    COUNT(CASE WHEN source_kind = 'prepaid' THEN 1 END),
+                    COUNT(CASE WHEN source_kind = 'credit' THEN 1 END)
+                 FROM market_accrual_allocations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read funding allocations");
+        assert_eq!(
+            allocations,
+            (4 * MONEY_UNITS_PER_MINOR, MONEY_UNITS_PER_MINOR, 1, 1)
+        );
+        let account_balance: i64 = conn
+            .query_row(
+                "SELECT balance_units FROM market_credit_accounts
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("read supplier credit balance");
+        assert_eq!(account_balance, MONEY_UNITS_PER_MINOR);
+    }
+
+    #[tokio::test]
+    async fn prepaid_only_service_never_creates_debt_when_no_funds_are_available() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-no-credit", "buyer-no-credit@example.com");
+        let supplier = session("supplier-no-credit", "supplier-no-credit@example.com");
+        configure_supplier(&store, &supplier, 10).await;
+        disable_test_public_credit(&store, &supplier).await;
+        let started_at = Utc::now();
+        let contract_id = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-no-credit",
+            100,
+            started_at,
+        )
+        .await;
+        force_contract_out_of_trial(&store, &contract_id, started_at).await;
+        record_client_health(
+            &store,
+            "client-no-credit",
+            started_at + Duration::seconds(1),
+            "healthy",
+        )
+        .await;
+        let actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(1))
+            .await
+            .expect("suspend unfunded prepaid-only service");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, BillingActionKind::Suspend);
+
+        let conn = store.conn.lock().await;
+        let state: (String, String, i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT contract.status, contract.control_error, account.balance_units,
+                        account.open_invoice_id,
+                        (SELECT COUNT(*) FROM market_accrual_entries)
+                 FROM market_service_contracts contract
+                 JOIN market_credit_accounts account ON account.id = contract.account_id
+                 WHERE contract.id = ?1",
+                params![contract_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read prepaid-only suspension");
+        assert_eq!(
+            state,
+            (
+                CONTRACT_BILLING_SUSPENDED.into(),
+                "insufficient_funds".into(),
+                0,
+                None,
+                0,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_prepaid_exhaustion_suspends_every_non_trial_service() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-shared-prepaid", "buyer-shared-prepaid@example.com");
+        let supplier = session(
+            "supplier-shared-prepaid",
+            "supplier-shared-prepaid@example.com",
+        );
+        configure_supplier(&store, &supplier, 10).await;
+        disable_test_public_credit(&store, &supplier).await;
+        let started_at = Utc::now();
+        let first_contract = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-shared-prepaid-a",
+            100,
+            started_at,
+        )
+        .await;
+        let second_contract = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-shared-prepaid-b",
+            100,
+            started_at,
+        )
+        .await;
+        credit_test_prepaid_units(&store, &buyer, &supplier, 100, "shared-prepaid", started_at)
+            .await;
+        for contract_id in [&first_contract, &second_contract] {
+            force_contract_out_of_trial(&store, contract_id, started_at).await;
+        }
+        for installation_id in ["client-shared-prepaid-a", "client-shared-prepaid-b"] {
+            record_client_health(
+                &store,
+                installation_id,
+                started_at + Duration::seconds(1),
+                "healthy",
+            )
+            .await;
+        }
+        let actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(1))
+            .await
+            .expect("suspend all services when shared prepaid funding is exhausted");
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.kind == BillingActionKind::Suspend)
+        );
+
+        let conn = store.conn.lock().await;
+        let state: (i64, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM market_service_contracts
+                     WHERE status = 'billing_suspended'
+                       AND control_error = 'insufficient_funds'),
+                    prepaid.posted_balance_units,
+                    credit.balance_units,
+                    credit.open_invoice_id
+                 FROM market_prepaid_accounts prepaid
+                 JOIN market_credit_accounts credit
+                   ON credit.buyer_user_id = prepaid.buyer_user_id
+                  AND credit.supplier_user_id = prepaid.supplier_user_id
+                  AND credit.currency = prepaid.currency
+                 WHERE prepaid.buyer_user_id = ?1 AND prepaid.supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read shared prepaid exhaustion state");
+        assert_eq!(state, (2, 0, 0, None));
+    }
+
+    #[tokio::test]
+    async fn explicit_credit_resumes_all_insufficient_services_after_one_hour_is_covered() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-credit-resume", "buyer-credit-resume@example.com");
+        let supplier = session(
+            "supplier-credit-resume",
+            "supplier-credit-resume@example.com",
+        );
+        configure_supplier(&store, &supplier, 10).await;
+        disable_test_public_credit(&store, &supplier).await;
+        let started_at = Utc::now();
+        let mut contract_ids = Vec::new();
+        for installation_id in ["client-credit-resume-a", "client-credit-resume-b"] {
+            let contract_id =
+                add_client_contract(&store, &buyer, &supplier, installation_id, 24, started_at)
+                    .await;
+            force_contract_out_of_trial(&store, &contract_id, started_at).await;
+            record_client_health(
+                &store,
+                installation_id,
+                started_at + Duration::seconds(1),
+                "healthy",
+            )
+            .await;
+            contract_ids.push(contract_id);
+        }
+        let suspend_actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(1))
+            .await
+            .expect("suspend services without prepaid funds or credit");
+        assert_eq!(suspend_actions.len(), 2);
+        for action in &suspend_actions {
+            assert_eq!(action.kind, BillingActionKind::Suspend);
+            store
+                .market_billing_mark_control_failed(
+                    &action.contract_id,
+                    "temporary control transport failure",
+                )
+                .await
+                .expect("record retryable funding suspension failure");
+            store
+                .market_billing_mark_control_applied(&action.contract_id, &action.kind)
+                .await
+                .expect("record applied funding suspension");
+        }
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_kind = 'limited', credit_limit_minor = 1,
+                     credit_source = 'counterparty', credit_revision = credit_revision + 1
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+            )
+            .expect("grant less than one hour of shared credit");
+        }
+        let early_actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(2))
+            .await
+            .expect("retain suspension below the resume threshold");
+        assert!(early_actions.is_empty());
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_limit_minor = 2, credit_revision = credit_revision + 1
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+            )
+            .expect("grant one hour of shared credit");
+        }
+        let resume_actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(3))
+            .await
+            .expect("resume services after explicit credit covers one hour");
+        assert_eq!(resume_actions.len(), 2);
+        assert!(
+            resume_actions
+                .iter()
+                .all(|action| action.kind == BillingActionKind::Resume)
+        );
+        let conn = store.conn.lock().await;
+        let resumed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_service_contracts
+                 WHERE id IN (?1, ?2) AND status = 'active'
+                   AND control_error IS NULL",
+                params![contract_ids[0], contract_ids[1]],
+                |row| row.get(0),
+            )
+            .expect("read resumed credit-funded services");
+        assert_eq!(resumed, 2);
+    }
+
+    #[tokio::test]
+    async fn pending_credit_reservation_is_not_reused_to_resume_another_service() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-reserved-credit", "buyer-reserved-credit@example.com");
+        let supplier = session(
+            "supplier-reserved-credit",
+            "supplier-reserved-credit@example.com",
+        );
+        configure_supplier(&store, &supplier, 1).await;
+        let now = Utc::now();
+        let contract_id =
+            add_client_contract(&store, &buyer, &supplier, "client-reserved-credit", 1, now).await;
+        force_contract_out_of_trial(&store, &contract_id, now).await;
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        let account_id: String = conn
+            .query_row(
+                "SELECT account_id FROM market_service_contracts WHERE id = ?1",
+                params![contract_id],
+                |row| row.get(0),
+            )
+            .expect("read reserved-credit account");
+        conn.execute(
+            "UPDATE market_service_contracts
+             SET status = 'billing_suspended', control_error = 'insufficient_funds',
+                 desired_control_state = 'suspended', applied_control_state = 'suspended'
+             WHERE id = ?1",
+            params![contract_id],
+        )
+        .expect("suspend reserved-credit service");
+        conn.execute(
+            "INSERT INTO market_funding_reservations (
+                id, prepaid_account_id, buyer_user_id, supplier_user_id, currency,
+                product_kind, product_ref, prepaid_units, credit_units, status,
+                expires_at, created_at, updated_at
+             ) VALUES (
+                'reserved-credit-hold', NULL, ?1, ?2, 'USD', 'client_host',
+                'pending-reserved-credit-job', 0, ?3, 'active', ?4, ?5, ?5
+             )",
+            params![
+                buyer.user_id,
+                supplier.user_id,
+                MONEY_UNITS_PER_MINOR,
+                (now + Duration::hours(1)).to_rfc3339(),
+                now_text,
+            ],
+        )
+        .expect("reserve all available supplier credit for another order");
+
+        assert!(
+            !resume_account_contracts_if_safe_tx(&conn, &account_id, true, &now_text)
+                .expect("keep service suspended while credit is reserved")
+        );
+        let interval_ended_at = (now + Duration::seconds(1)).to_rfc3339();
+        let mut account = load_account_row_tx(&conn, &account_id)
+            .expect("load account while its credit is reserved");
+        let funded = allocate_accrual_funding_tx(
+            &conn,
+            &mut account,
+            AccrualCandidate {
+                contract: ContractRow {
+                    id: contract_id.clone(),
+                    account_id: account_id.clone(),
+                    product_kind: "client_host".into(),
+                    product_ref: "client-reserved-credit".into(),
+                    service_ref: "client-reserved-credit".into(),
+                    daily_rate_minor: 1,
+                    trial_seconds_remaining: 0,
+                    health_state: "healthy".into(),
+                    last_evaluated_at: now_text.clone(),
+                    buyer_user_id: buyer.user_id.clone(),
+                    supplier_user_id: supplier.user_id.clone(),
+                    currency: MARKET_CURRENCY.into(),
+                    service_ends_at: None,
+                },
+                observed_state: "healthy".into(),
+                observation_reason: "test".into(),
+                interval_started_at: now_text.clone(),
+                interval_ended_at: interval_ended_at.clone(),
+                elapsed_seconds: 1,
+                trial_seconds: 0,
+                billable_seconds: 1,
+                requested_units: 1,
+                next_trial_seconds: 0,
+            },
+            &interval_ended_at,
+        )
+        .expect("protect reserved credit from another service accrual");
+        assert!(funded.insufficient_funds);
+        assert_eq!(funded.candidate.requested_units, 0);
+        assert_eq!(account.balance_units, 0);
+        conn.execute(
+            "UPDATE market_funding_reservations SET status = 'captured'
+             WHERE id = 'reserved-credit-hold'",
+            [],
+        )
+        .expect("release pending credit commitment");
+        assert!(
+            resume_account_contracts_if_safe_tx(&conn, &account_id, true, &now_text)
+                .expect("resume service after reserved credit is released")
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_one_internal_unit_short_bills_only_complete_seconds() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-unit-short", "buyer-unit-short@example.com");
+        let supplier = session("supplier-unit-short", "supplier-unit-short@example.com");
+        configure_supplier(&store, &supplier, 10).await;
+        disable_test_public_credit(&store, &supplier).await;
+        let started_at = Utc::now();
+        let contract_id = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-unit-short",
+            100,
+            started_at,
+        )
+        .await;
+        let prepaid_account_id =
+            credit_test_prepaid_units(&store, &buyer, &supplier, 199, "unit-short", started_at)
+                .await;
+        force_contract_out_of_trial(&store, &contract_id, started_at).await;
+        record_client_health(
+            &store,
+            "client-unit-short",
+            started_at + Duration::seconds(2),
+            "healthy",
+        )
+        .await;
+        let actions = store
+            .market_billing_reconcile(started_at + Duration::seconds(2))
+            .await
+            .expect("reconcile partially funded interval");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, BillingActionKind::Suspend);
+
+        let conn = store.conn.lock().await;
+        let state: (i64, i64, i64, String, i64) = conn
+            .query_row(
+                "SELECT prepaid.posted_balance_units, prepaid.held_balance_units,
+                        accrual.billable_seconds, contract.status, account.balance_units
+                 FROM market_prepaid_accounts prepaid
+                 JOIN market_credit_accounts account
+                   ON account.buyer_user_id = prepaid.buyer_user_id
+                  AND account.supplier_user_id = prepaid.supplier_user_id
+                 JOIN market_service_contracts contract ON contract.account_id = account.id
+                 JOIN market_accrual_entries accrual ON accrual.contract_id = contract.id
+                 WHERE prepaid.id = ?1",
+                params![prepaid_account_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read partial-second funding result");
+        assert_eq!(state, (99, 0, 1, CONTRACT_BILLING_SUSPENDED.into(), 0));
+    }
+
+    #[tokio::test]
+    async fn expired_funding_reservation_releases_prepaid_hold_once() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-reservation", "buyer-reservation@example.com");
+        let supplier = session("supplier-reservation", "supplier-reservation@example.com");
+        configure_supplier(&store, &supplier, 1).await;
+        let now = Utc::now();
+        let prepaid_account_id = credit_test_prepaid_units(
+            &store,
+            &buyer,
+            &supplier,
+            MONEY_UNITS_PER_MINOR,
+            "reservation-expiry",
+            now,
+        )
+        .await;
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        let tx = conn.transaction().expect("begin funding reservation");
+        reserve_contract_tx(
+            &tx,
+            ActivateContractInput {
+                product_kind: "client_host",
+                product_ref: "reservation-expiry-job",
+                service_ref: "reservation-expiry-job",
+                service_label: "reservation-expiry-job",
+                buyer_user_id: &buyer.user_id,
+                buyer_email: &buyer.email,
+                supplier_user_id: &supplier.user_id,
+                supplier_email: &supplier.email,
+                currency: MARKET_CURRENCY,
+                daily_rate_minor: 1,
+                offer_revision: 1,
+                replacement_of: None,
+                trial_allowance_seconds: 0,
+            },
+            0,
+            &now_text,
+        )
+        .expect("reserve one day of prepaid funding");
+        tx.commit().expect("commit funding reservation");
+        let held_before: i64 = conn
+            .query_row(
+                "SELECT held_balance_units FROM market_prepaid_accounts WHERE id = ?1",
+                params![prepaid_account_id],
+                |row| row.get(0),
+            )
+            .expect("read held prepaid balance");
+        assert_eq!(held_before, MONEY_UNITS_PER_MINOR);
+        let expired_at = (now + Duration::hours(1) + Duration::seconds(1)).to_rfc3339();
+        assert_eq!(
+            expire_market_funding_reservations_tx(&conn, &expired_at)
+                .expect("expire funding reservation"),
+            1
+        );
+        assert_eq!(
+            expire_market_funding_reservations_tx(&conn, &expired_at)
+                .expect("repeat funding reservation expiry"),
+            0
+        );
+        let released: (i64, String) = conn
+            .query_row(
+                "SELECT prepaid.held_balance_units, reservation.status
+                 FROM market_prepaid_accounts prepaid
+                 JOIN market_funding_reservations reservation
+                   ON reservation.prepaid_account_id = prepaid.id
+                 WHERE prepaid.id = ?1",
+                params![prepaid_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read expired funding reservation");
+        assert_eq!(released, (0, "expired".into()));
+    }
+
+    #[tokio::test]
+    async fn funding_reservation_capture_is_validated_and_idempotent() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-capture", "buyer-capture@example.com");
+        let supplier = session("supplier-capture", "supplier-capture@example.com");
+        configure_supplier(&store, &supplier, 1).await;
+        disable_test_public_credit(&store, &supplier).await;
+        let now = Utc::now();
+        let prepaid_account_id = credit_test_prepaid_units(
+            &store,
+            &buyer,
+            &supplier,
+            MONEY_UNITS_PER_MINOR,
+            "reservation-capture",
+            now,
+        )
+        .await;
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        let tx = conn.transaction().expect("begin funding reservation");
+        reserve_client_market_funding_tx(
+            &tx,
+            &ActivateContractInput {
+                product_kind: "client_host",
+                product_ref: "capture-job",
+                service_ref: "capture-host",
+                service_label: "capture-host",
+                buyer_user_id: &buyer.user_id,
+                buyer_email: &buyer.email,
+                supplier_user_id: &supplier.user_id,
+                supplier_email: &supplier.email,
+                currency: MARKET_CURRENCY,
+                daily_rate_minor: 1,
+                offer_revision: 1,
+                replacement_of: None,
+                trial_allowance_seconds: 0,
+            },
+            "capture-job",
+            &(now + Duration::minutes(30)).to_rfc3339(),
+            &now_text,
+        )
+        .expect("reserve Client Market funding");
+        tx.commit().expect("commit funding reservation");
+
+        let captured_at = (now + Duration::seconds(1)).to_rfc3339();
+        assert!(
+            finish_market_funding_reservation_tx(
+                &conn,
+                "client_host",
+                "capture-job",
+                true,
+                "service_activated",
+                &captured_at,
+            )
+            .expect("capture active funding reservation")
+        );
+        assert!(
+            finish_market_funding_reservation_tx(
+                &conn,
+                "client_host",
+                "capture-job",
+                true,
+                "service_activated",
+                &captured_at,
+            )
+            .expect("replay funding capture")
+        );
+        let state: (i64, String) = conn
+            .query_row(
+                "SELECT prepaid.held_balance_units, reservation.status
+                 FROM market_prepaid_accounts prepaid
+                 JOIN market_funding_reservations reservation
+                   ON reservation.prepaid_account_id = prepaid.id
+                 WHERE prepaid.id = ?1 AND reservation.product_ref = 'capture-job'",
+                params![prepaid_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read captured funding reservation");
+        assert_eq!(state, (0, "captured".into()));
+    }
+
+    #[tokio::test]
+    async fn pending_contract_funding_is_not_counted_twice() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-pending-funding", "buyer-pending-funding@example.com");
+        let supplier = session(
+            "supplier-pending-funding",
+            "supplier-pending-funding@example.com",
+        );
+        configure_supplier(&store, &supplier, 1).await;
+        disable_test_public_credit(&store, &supplier).await;
+        let now = Utc::now();
+        let prepaid_account_id = credit_test_prepaid_units(
+            &store,
+            &buyer,
+            &supplier,
+            2 * MONEY_UNITS_PER_MINOR,
+            "pending-contract-funding",
+            now,
+        )
+        .await;
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .expect("begin pending funding reservations");
+        for product_ref in ["pending-funded-a", "pending-funded-b"] {
+            reserve_contract_tx(
+                &tx,
+                ActivateContractInput {
+                    product_kind: "share",
+                    product_ref,
+                    service_ref: product_ref,
+                    service_label: product_ref,
+                    buyer_user_id: &buyer.user_id,
+                    buyer_email: &buyer.email,
+                    supplier_user_id: &supplier.user_id,
+                    supplier_email: &supplier.email,
+                    currency: MARKET_CURRENCY,
+                    daily_rate_minor: 1,
+                    offer_revision: 1,
+                    replacement_of: None,
+                    trial_allowance_seconds: 0,
+                },
+                0,
+                &now_text,
+            )
+            .expect("reserve exactly funded pending contract");
+        }
+        tx.commit().expect("commit pending funding reservations");
+        let state: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT prepaid.held_balance_units,
+                        (SELECT COUNT(*) FROM market_funding_reservations
+                         WHERE status = 'active'),
+                        (SELECT COUNT(*) FROM market_service_contracts
+                         WHERE status = 'pending_activation')
+                 FROM market_prepaid_accounts prepaid WHERE prepaid.id = ?1",
+                params![prepaid_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read pending funding totals");
+        assert_eq!(state, (2 * MONEY_UNITS_PER_MINOR, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn expired_funding_is_renewed_before_activating_a_pending_contract() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session(
+            "buyer-expired-activation",
+            "buyer-expired-activation@example.com",
+        );
+        let supplier = session(
+            "supplier-expired-activation",
+            "supplier-expired-activation@example.com",
+        );
+        configure_supplier(&store, &supplier, 1).await;
+        let now = Utc::now();
+        let contract_id =
+            add_reserved_client_contract(&store, &buyer, &supplier, "expired-activation", 1, now)
+                .await;
+        let expired_at = (now + Duration::hours(1) + Duration::seconds(1)).to_rfc3339();
+        let conn = store.conn.lock().await;
+        assert!(
+            activate_reserved_contract_tx(
+                &conn,
+                "client_host",
+                "expired-activation",
+                &expired_at,
+                &expired_at,
+            )
+            .expect("renew expired funding and activate reserved contract")
+        );
+        let state: (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT contract.status, contract.termination_reason, reservation.status
+                 FROM market_service_contracts contract
+                 JOIN market_funding_reservations reservation
+                   ON reservation.product_kind = contract.product_kind
+                  AND reservation.product_ref = contract.product_ref
+                 WHERE contract.id = ?1",
+                params![contract_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read renewed contract activation");
+        assert_eq!(state.0, CONTRACT_TRIAL);
+        assert_eq!(state.1, None);
+        assert_eq!(state.2, "captured");
+        let prepaid_accounts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_prepaid_accounts
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("read migrated pending contract prepaid account");
+        assert_eq!(prepaid_accounts, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_funding_and_prepaid_account_are_created_before_pending_activation() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session(
+            "buyer-legacy-pending-activation",
+            "buyer-legacy-pending-activation@example.com",
+        );
+        let supplier = session(
+            "supplier-legacy-pending-activation",
+            "supplier-legacy-pending-activation@example.com",
+        );
+        configure_supplier(&store, &supplier, 1).await;
+        let now = Utc::now();
+        let contract_id = add_reserved_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "legacy-pending-activation",
+            1,
+            now,
+        )
+        .await;
+        let activation_at = (now + Duration::minutes(1)).to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "DELETE FROM market_funding_reservations
+             WHERE product_kind = 'client_host' AND product_ref = 'legacy-pending-activation'",
+            [],
+        )
+        .expect("remove funding record absent before the prepaid migration");
+        conn.execute(
+            "DELETE FROM market_prepaid_accounts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+            params![buyer.user_id, supplier.user_id],
+        )
+        .expect("remove prepaid account absent before the prepaid migration");
+        assert!(
+            activate_reserved_contract_tx(
+                &conn,
+                "client_host",
+                "legacy-pending-activation",
+                &activation_at,
+                &activation_at,
+            )
+            .expect("create missing funding state and activate legacy pending contract")
+        );
+        let state: (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT contract.status, contract.termination_reason, reservation.status
+                 FROM market_service_contracts contract
+                 JOIN market_funding_reservations reservation
+                   ON reservation.product_kind = contract.product_kind
+                  AND reservation.product_ref = contract.product_ref
+                 WHERE contract.id = ?1",
+                params![contract_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read migrated pending contract activation");
+        assert_eq!(state.0, CONTRACT_TRIAL);
+        assert_eq!(state.1, None);
+        assert_eq!(state.2, "captured");
+        let prepaid_accounts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_prepaid_accounts
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("read migrated pending contract prepaid account");
+        assert_eq!(prepaid_accounts, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_funding_without_available_coverage_rejects_activation() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session(
+            "buyer-depleted-activation",
+            "buyer-depleted-activation@example.com",
+        );
+        let supplier = session(
+            "supplier-depleted-activation",
+            "supplier-depleted-activation@example.com",
+        );
+        configure_supplier(&store, &supplier, 1).await;
+        let now = Utc::now();
+        let contract_id =
+            add_reserved_client_contract(&store, &buyer, &supplier, "depleted-activation", 1, now)
+                .await;
+        disable_test_public_credit(&store, &supplier).await;
+        let expired_at = (now + Duration::hours(1) + Duration::seconds(1)).to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE market_credit_accounts
+             SET credit_kind = 'none', credit_limit_minor = NULL,
+                 credit_source = 'counterparty', credit_revision = credit_revision + 1
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+            params![buyer.user_id, supplier.user_id],
+        )
+        .expect("withdraw test funding before delayed activation");
+        assert!(
+            !activate_reserved_contract_tx(
+                &conn,
+                "client_host",
+                "depleted-activation",
+                &expired_at,
+                &expired_at,
+            )
+            .expect("reject delayed activation without renewed funding")
+        );
+        let state: (String, String, String) = conn
+            .query_row(
+                "SELECT contract.status, contract.termination_reason, reservation.status
+                 FROM market_service_contracts contract
+                 JOIN market_funding_reservations reservation
+                   ON reservation.product_kind = contract.product_kind
+                  AND reservation.product_ref = contract.product_ref
+                 WHERE contract.id = ?1",
+                params![contract_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read rejected delayed activation");
+        assert_eq!(state.0, "terminated");
+        assert_eq!(state.1, "funding_reservation_unavailable_before_activation");
+        assert_eq!(state.2, "expired");
+    }
+
+    #[tokio::test]
+    async fn prepaid_refund_holds_release_and_recording_are_auditable() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-prepaid-refund", "buyer-prepaid-refund@example.com");
+        let supplier = session(
+            "supplier-prepaid-refund",
+            "supplier-prepaid-refund@example.com",
+        );
+        let now = Utc::now();
+        let prepaid_account_id = credit_test_prepaid_units(
+            &store,
+            &buyer,
+            &supplier,
+            5 * MONEY_UNITS_PER_MINOR,
+            "prepaid-refund-funding",
+            now,
+        )
+        .await;
+        let rejected = store
+            .market_prepaid_request_refund(&buyer, &prepaid_account_id, 3, Some("first request"))
+            .await
+            .expect("request prepaid refund for rejection");
+        store
+            .market_prepaid_resolve_refund(&supplier, &rejected.id, false, Some("not yet"))
+            .await
+            .expect("reject prepaid refund and release hold");
+        let approved = store
+            .market_prepaid_request_refund(&buyer, &prepaid_account_id, 4, Some("final request"))
+            .await
+            .expect("request prepaid refund for approval");
+        store
+            .market_prepaid_resolve_refund(&supplier, &approved.id, true, Some("approved"))
+            .await
+            .expect("approve prepaid refund");
+        let recorded = store
+            .market_prepaid_record_refund(&supplier, &approved.id, "external-refund-001")
+            .await
+            .expect("record prepaid refund payment");
+        assert_eq!(recorded.status, "recorded");
+        store
+            .market_prepaid_record_refund(&supplier, &approved.id, "external-refund-001")
+            .await
+            .expect("replay recorded prepaid refund");
+        assert!(matches!(
+            store
+                .market_prepaid_record_refund(&supplier, &approved.id, "different-reference")
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        let conn = store.conn.lock().await;
+        let state: (i64, i64, String, i64) = conn
+            .query_row(
+                "SELECT prepaid.posted_balance_units, prepaid.held_balance_units,
+                        prepaid.status,
+                        COALESCE(SUM(CASE WHEN ledger.direction = 'credit'
+                            THEN ledger.amount_units ELSE -ledger.amount_units END), 0)
+                 FROM market_prepaid_accounts prepaid
+                 LEFT JOIN market_prepaid_ledger_entries ledger ON ledger.account_id = prepaid.id
+                 WHERE prepaid.id = ?1 GROUP BY prepaid.id",
+                params![prepaid_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read prepaid refund ledger invariant");
+        assert_eq!(
+            state,
+            (
+                MONEY_UNITS_PER_MINOR,
+                0,
+                "open".into(),
+                MONEY_UNITS_PER_MINOR
+            )
+        );
+        let statuses: Vec<String> = conn
+            .prepare(
+                "SELECT status FROM market_prepaid_refund_requests
+                 WHERE prepaid_account_id = ?1 ORDER BY status",
+            )
+            .expect("prepare prepaid refund history")
+            .query_map(params![prepaid_account_id], |row| row.get(0))
+            .expect("query prepaid refund history")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read prepaid refund history");
+        assert_eq!(statuses, vec!["recorded", "rejected"]);
+    }
+
+    #[tokio::test]
+    async fn prepaid_refund_hold_and_active_usage_preserve_funds_exactly() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session(
+            "buyer-prepaid-refund-usage",
+            "buyer-prepaid-refund-usage@example.com",
+        );
+        let supplier = session(
+            "supplier-prepaid-refund-usage",
+            "supplier-prepaid-refund-usage@example.com",
+        );
+        configure_supplier(&store, &supplier, 100).await;
+        disable_test_public_credit(&store, &supplier).await;
+        let started_at = Utc::now();
+        let prepaid_account_id = credit_test_prepaid_units(
+            &store,
+            &buyer,
+            &supplier,
+            5 * MONEY_UNITS_PER_MINOR,
+            "prepaid-refund-active-usage-funding",
+            started_at,
+        )
+        .await;
+        let contract_id = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "prepaid-refund-active-usage",
+            8_640,
+            started_at,
+        )
+        .await;
+        force_contract_out_of_trial(&store, &contract_id, started_at).await;
+
+        let refund = store
+            .market_prepaid_request_refund(
+                &buyer,
+                &prepaid_account_id,
+                3,
+                Some("refund while service remains active"),
+            )
+            .await
+            .expect("hold three prepaid cents for refund");
+        store
+            .market_prepaid_resolve_refund(&supplier, &refund.id, true, Some("approved"))
+            .await
+            .expect("approve held prepaid refund");
+
+        let accrued_at = started_at + Duration::seconds(20);
+        record_client_health(&store, "prepaid-refund-active-usage", accrued_at, "healthy").await;
+        store
+            .market_billing_reconcile(accrued_at)
+            .await
+            .expect("bill active service without consuming its refund hold");
+
+        {
+            let conn = store.conn.lock().await;
+            let before_record: (i64, i64, i64, String) = conn
+                .query_row(
+                    "SELECT prepaid.posted_balance_units, prepaid.held_balance_units,
+                            COALESCE(SUM(CASE WHEN ledger.entry_kind = 'usage_debit'
+                                THEN ledger.amount_units ELSE 0 END), 0), contract.status
+                     FROM market_prepaid_accounts prepaid
+                     LEFT JOIN market_prepaid_ledger_entries ledger
+                       ON ledger.account_id = prepaid.id
+                     JOIN market_service_contracts contract ON contract.id = ?2
+                     WHERE prepaid.id = ?1 GROUP BY prepaid.id, contract.id",
+                    params![prepaid_account_id, contract_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read active usage beside prepaid refund hold");
+            assert_eq!(
+                before_record,
+                (
+                    3 * MONEY_UNITS_PER_MINOR,
+                    3 * MONEY_UNITS_PER_MINOR,
+                    2 * MONEY_UNITS_PER_MINOR,
+                    CONTRACT_ACTIVE.into(),
+                )
+            );
+        }
+
+        store
+            .market_prepaid_record_refund(&supplier, &refund.id, "active-usage-refund-001")
+            .await
+            .expect("record refund after concurrent active usage");
+        let conn = store.conn.lock().await;
+        let after_record: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT prepaid.posted_balance_units, prepaid.held_balance_units,
+                        COALESCE(SUM(CASE WHEN ledger.direction = 'credit'
+                            THEN ledger.amount_units ELSE -ledger.amount_units END), 0)
+                 FROM market_prepaid_accounts prepaid
+                 LEFT JOIN market_prepaid_ledger_entries ledger ON ledger.account_id = prepaid.id
+                 WHERE prepaid.id = ?1 GROUP BY prepaid.id",
+                params![prepaid_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read prepaid conservation after active usage and refund");
+        assert_eq!(after_record, (0, 0, 0));
     }
 
     fn insert_share_billing_chat_fixture(
@@ -8536,6 +12170,16 @@ mod tests {
             .market_billing_declare_payment(&buyer, &invoice_id, None, None, None, None)
             .await
             .expect("declare fast payment");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_limit_minor = 3600, credit_revision = credit_revision + 1
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+            )
+            .expect("extend credit before fast payment confirmation");
+        }
         let resume_actions = store
             .market_billing_confirm_payment(&supplier, &invoice_id)
             .await
@@ -8657,14 +12301,14 @@ mod tests {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let buyer = session("buyer-combined", "buyer-combined@example.com");
         let supplier = session("supplier-combined", "supplier-combined@example.com");
-        configure_supplier(&store, &supplier, 1).await;
+        configure_supplier(&store, &supplier, 2).await;
         let started_at = Utc::now();
         let first = add_client_contract(
             &store,
             &buyer,
             &supplier,
             "client-combined-a",
-            60_000,
+            MONEY_UNITS_PER_MINOR,
             started_at,
         )
         .await;
@@ -8673,7 +12317,7 @@ mod tests {
             &buyer,
             &supplier,
             "client-combined-b",
-            60_000,
+            MONEY_UNITS_PER_MINOR,
             started_at,
         )
         .await;
@@ -8853,6 +12497,17 @@ mod tests {
                 .status,
             INVOICE_PAYMENT_DECLARED
         );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_kind = 'unlimited', credit_limit_minor = NULL,
+                     credit_revision = credit_revision + 1
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+            )
+            .expect("grant enough credit before resuming combined services");
+        }
         let resume_actions = store
             .market_billing_confirm_payment(&supplier, &invoice_id)
             .await
@@ -9165,8 +12820,7 @@ mod tests {
             .market_billing_confirm_payment(&supplier, &invoice_id)
             .await
             .expect("confirm payment after credit revocation");
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].kind, BillingActionKind::Terminate);
+        assert!(actions.is_empty());
         let dashboard = store
             .market_billing_dashboard(&buyer)
             .await
@@ -9179,6 +12833,15 @@ mod tests {
             dashboard.accounts[0].services[0].status,
             CONTRACT_BILLING_SUSPENDED
         );
+        let conn = store.conn.lock().await;
+        let control_error: String = conn
+            .query_row(
+                "SELECT control_error FROM market_service_contracts WHERE id = ?1",
+                params![contract_id],
+                |row| row.get(0),
+            )
+            .expect("read prepaid-required control state after payment");
+        assert_eq!(control_error, "insufficient_funds");
     }
 
     #[tokio::test]
@@ -9238,8 +12901,7 @@ mod tests {
             .market_billing_void_invoice(&admin, &invoice_id, "supplier credit was revoked")
             .await
             .expect("void invoice after credit revocation");
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].kind, BillingActionKind::Terminate);
+        assert!(actions.is_empty());
         let dashboard = store
             .market_billing_dashboard(&buyer)
             .await
@@ -9252,6 +12914,15 @@ mod tests {
             dashboard.accounts[0].services[0].status,
             CONTRACT_BILLING_SUSPENDED
         );
+        let conn = store.conn.lock().await;
+        let control_error: String = conn
+            .query_row(
+                "SELECT control_error FROM market_service_contracts WHERE id = ?1",
+                params![contract_id],
+                |row| row.get(0),
+            )
+            .expect("read prepaid-required control state after invoice void");
+        assert_eq!(control_error, "insufficient_funds");
     }
 
     #[tokio::test]
@@ -9665,7 +13336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn voided_dispute_clears_debt_and_resumes_service() {
+    async fn voided_dispute_clears_debt_but_waits_for_new_funding() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let buyer = session("buyer-dispute-void", "buyer-dispute-void@example.com");
         let supplier = session("supplier-dispute-void", "supplier-dispute-void@example.com");
@@ -9749,8 +13420,7 @@ mod tests {
             )
             .await
             .expect("void disputed invoice");
-        assert_eq!(resume_actions.len(), 1);
-        assert_eq!(resume_actions[0].kind, BillingActionKind::Resume);
+        assert!(resume_actions.is_empty());
         let dashboard = store
             .market_billing_dashboard(&buyer)
             .await
@@ -9759,7 +13429,10 @@ mod tests {
         assert_eq!(dashboard.accounts[0].balance_minor, 0);
         assert!(dashboard.accounts[0].open_invoice.is_none());
         assert!(dashboard.restrictions.is_empty());
-        assert_eq!(dashboard.accounts[0].services[0].status, CONTRACT_ACTIVE);
+        assert_eq!(
+            dashboard.accounts[0].services[0].status,
+            CONTRACT_BILLING_SUSPENDED
+        );
         let conn = store.conn.lock().await;
         let invoice_status: String = conn
             .query_row(

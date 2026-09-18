@@ -420,6 +420,7 @@ pub struct TerminationAdjustmentSummaryView {
     pub elapsed_bps: i64,
     pub refund_bps: i64,
     pub amount_minor: i64,
+    pub prepaid_credit_minor: i64,
     pub unbilled_credit_minor: i64,
     pub invoice_credit_minor: i64,
     pub external_refund_minor: i64,
@@ -687,6 +688,7 @@ pub struct RentQuoteView {
     pub status: String,
     pub expires_at: String,
     pub trial_seconds_remaining: i64,
+    pub funding: Option<crate::market_billing::MarketFundingSummaryView>,
     pub offer: RentQuoteSnapshot,
 }
 
@@ -3982,6 +3984,10 @@ fn subscription_record(
                     'elapsedBps', adjustment.elapsed_bps,
                     'refundBps', adjustment.refund_bps,
                     'amountMinor', adjustment.amount_minor,
+                    'prepaidCreditMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_prepaid_adjustment_credits prepaid
+                        WHERE prepaid.adjustment_id = adjustment.id
+                    ), 0),
                     'unbilledCreditMinor', COALESCE((
                         SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
                         WHERE allocation.adjustment_id = adjustment.id
@@ -4210,6 +4216,10 @@ fn catalog_subscription_records(
                     'elapsedBps', adjustment.elapsed_bps,
                     'refundBps', adjustment.refund_bps,
                     'amountMinor', adjustment.amount_minor,
+                    'prepaidCreditMinor', COALESCE((
+                        SELECT SUM(amount_minor) FROM market_prepaid_adjustment_credits prepaid
+                        WHERE prepaid.adjustment_id = adjustment.id
+                    ), 0),
                     'unbilledCreditMinor', COALESCE((
                         SELECT SUM(amount_minor) FROM market_adjustment_allocations allocation
                         WHERE allocation.adjustment_id = adjustment.id
@@ -8233,7 +8243,7 @@ impl AppStore {
         } else {
             None
         };
-        let trial_seconds_remaining = if daily_rate_minor.is_some() {
+        let (trial_seconds_remaining, funding) = if let Some(daily_rate_minor) = daily_rate_minor {
             let quote_currency = currency
                 .as_deref()
                 .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
@@ -8245,7 +8255,7 @@ impl AppStore {
                 crate::market_access::PRODUCT_SHARE,
                 quote_currency,
             )?;
-            crate::market_billing::trial_seconds_remaining_tx(
+            let trial_seconds_remaining = crate::market_billing::trial_seconds_remaining_tx(
                 &tx,
                 &session.user_id,
                 &owner_user_id,
@@ -8253,9 +8263,21 @@ impl AppStore {
                 &share_id,
                 quote_currency,
                 trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
-            )?
+            )?;
+            let funding = crate::market_billing::market_funding_summary_tx(
+                &tx,
+                &session.user_id,
+                &session.email,
+                &owner_user_id,
+                &owner_email,
+                crate::market_access::PRODUCT_SHARE,
+                quote_currency,
+                daily_rate_minor,
+                &now,
+            )?;
+            (trial_seconds_remaining, Some(funding))
         } else {
-            0
+            (0, None)
         };
         let service = build_rent_service_snapshot(
             &bindings_json,
@@ -8377,6 +8399,7 @@ impl AppStore {
             status: "active".into(),
             expires_at,
             trial_seconds_remaining,
+            funding,
             offer: public_snapshot,
         })
     }
@@ -9859,18 +9882,23 @@ async fn quote_seat(
 ) -> Result<Json<RentQuoteView>, AppError> {
     let session = require_session(&state, &headers).await?;
     ensure_share_market_seat_online(&state, &seat_id).await?;
-    Ok(Json(
-        state
-            .store
-            .share_market_create_rent_quote(
-                &session,
-                &seat_id,
-                input
-                    .as_ref()
-                    .and_then(|input| input.required_app.as_deref()),
-            )
-            .await?,
-    ))
+    let mut quote = state
+        .store
+        .share_market_create_rent_quote(
+            &session,
+            &seat_id,
+            input
+                .as_ref()
+                .and_then(|input| input.required_app.as_deref()),
+        )
+        .await?;
+    if let Some(funding) = quote.funding.as_mut() {
+        funding.topup_available = state
+            .binance_settlement
+            .supplier_funding_available(&state.store, &funding.supplier_user_id)
+            .await?;
+    }
+    Ok(Json(quote))
 }
 
 async fn rent_seat(
@@ -20586,7 +20614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_paid_can_rent_requires_current_credit_eligibility() {
+    async fn catalog_paid_can_rent_allows_prepaid_only_and_enforces_account_blocks() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-paid-canrent", "owner-paid-canrent@example.com");
         let renter = session("renter-paid-canrent", "renter-paid-canrent@example.com");
@@ -20642,22 +20670,31 @@ mod tests {
                 params![owner.user_id, now],
             )
             .expect("remove paid credit");
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_kind = 'none', credit_limit_minor = NULL,
+                     credit_revision = credit_revision + 1, updated_at = ?3
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                   AND currency = 'USD'",
+                params![renter.user_id, owner.user_id, now],
+            )
+            .expect("remove existing account credit");
         }
         let catalog = store
             .share_market_catalog(Some(&renter), &active_subdomains)
             .await
-            .expect("catalog without credit");
-        assert!(!can_rent_second(&catalog));
+            .expect("catalog with prepaid-only funding");
+        assert!(can_rent_second(&catalog));
         assert_eq!(
             catalog
                 .listings
                 .iter()
                 .find(|listing| listing.share_id == "share-paid-canrent-b")
-                .expect("second paid listing without credit")
+                .expect("second paid listing with prepaid-only funding")
                 .seats[0]
                 .eligibility
                 .status,
-            "credit_required"
+            "allowed"
         );
 
         {
@@ -20670,6 +20707,15 @@ mod tests {
                 params![owner.user_id, now],
             )
             .expect("restore paid credit");
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_kind = 'limited', credit_limit_minor = 50000,
+                     credit_revision = credit_revision + 1, updated_at = ?3
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                   AND currency = 'USD'",
+                params![renter.user_id, owner.user_id, now],
+            )
+            .expect("restore existing account credit");
             conn.execute(
                 "INSERT INTO market_credit_restrictions (
                     id, buyer_user_id, invoice_id, reason, status, created_at
@@ -20713,7 +20759,9 @@ mod tests {
             .expect("lower paid credit");
             conn.execute(
                 "UPDATE market_credit_accounts
-                 SET status = 'active', balance_units = 8640000, updated_at = ?3
+                 SET status = 'active', credit_kind = 'limited',
+                     credit_limit_minor = 100, balance_units = 8640000,
+                     credit_revision = credit_revision + 1, updated_at = ?3
                  WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = 'USD'",
                 params![renter.user_id, owner.user_id, now],
             )
@@ -21156,6 +21204,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_paid_grant_releases_its_funding_reservation() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-paid-grant-failure", "owner-paid-grant@example.com");
+        let renter = session("renter-paid-grant-failure", "renter-paid-grant@example.com");
+        insert_share(
+            &store,
+            "share-paid-grant-failure",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        configure_payment_profile(
+            &store,
+            &owner,
+            "paid-grant-account",
+            &Utc::now().to_rfc3339(),
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-paid-grant-failure", paid_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("reserve paid Share funding");
+        {
+            let conn = store.conn.lock().await;
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM market_funding_reservations
+                     WHERE product_kind = 'share' AND product_ref = ?1",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read active paid Share funding reservation");
+            assert_eq!(status, "active");
+        }
+
+        let dispatched_at = Utc::now();
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(dispatched_at)
+                .await
+                .expect("dispatch paid Share grant")
+                .len(),
+            1
+        );
+        let rejected_at = dispatched_at + Duration::seconds(1);
+        {
+            let conn = store.conn.lock().await;
+            let edit_id: String = conn
+                .query_row(
+                    "SELECT edit_id FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read dispatched paid Share grant");
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'rejected' WHERE id = ?1",
+                params![edit_id],
+            )
+            .expect("reject paid Share grant edit");
+            handle_control_edit_ack_with_metadata(
+                &conn,
+                &edit_id,
+                "rejected",
+                Some("permanent grant failure"),
+                Some("permanent_grant_failure"),
+                Some(false),
+                &rejected_at.to_rfc3339(),
+            )
+            .expect("record non-retryable paid Share grant failure");
+        }
+
+        let state: (String, String, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT subscription.status, contract.status, reservation.status
+                 FROM share_market_subscriptions subscription
+                 JOIN market_service_contracts contract
+                   ON contract.product_kind = 'share'
+                  AND contract.product_ref = subscription.id
+                 JOIN market_funding_reservations reservation
+                   ON reservation.product_kind = 'share'
+                  AND reservation.product_ref = subscription.id
+                 WHERE subscription.id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read failed paid Share funding lifecycle");
+        assert_eq!(
+            state,
+            (
+                SUB_GRANT_FAILED.into(),
+                "terminated".into(),
+                "released".into()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn revoke_retries_back_off_then_dead_letter_and_alert() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-dead-letter", "owner-dead-letter@example.com");
@@ -21471,6 +21622,22 @@ mod tests {
             assert_eq!(state.5, 0);
             assert!(state.6.is_none());
             assert!(state.7.is_none());
+
+            if paid {
+                let reservation: (String, Option<String>, Option<String>) = store
+                    .conn
+                    .lock()
+                    .await
+                    .query_row(
+                        "SELECT status, release_reason, released_at
+                         FROM market_funding_reservations
+                         WHERE product_kind = 'share' AND product_ref = ?1",
+                        params![subscription_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .expect("read renewed paid Share funding reservation");
+                assert_eq!(reservation, ("active".into(), None, None));
+            }
 
             let final_old_edit = edit_ids.last().expect("final failed edit");
             let old_edit: (String, Option<String>) = store

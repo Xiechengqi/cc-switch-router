@@ -74,10 +74,33 @@ pub struct BinancePaymentIntentView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BinanceFundingIntentView {
+    pub id: String,
+    pub prepaid_account_id: String,
+    pub supplier_user_id: String,
+    pub status: String,
+    pub asset: String,
+    pub base_amount: String,
+    pub pay_amount: String,
+    pub receiver_uid: String,
+    pub note_code: String,
+    pub expires_at: String,
+    pub created_at: String,
+    pub credited_at: Option<String>,
+    pub credited_minor: Option<i64>,
+    pub cancellation_reason: Option<String>,
+    pub account_status: String,
+    pub last_checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BinanceReconciliationCaseView {
     pub id: String,
     pub invoice_id: Option<String>,
     pub payment_intent_id: Option<String>,
+    pub funding_intent_id: Option<String>,
+    pub prepaid_account_id: Option<String>,
     pub payment_account_id: String,
     pub transaction_id: String,
     pub order_id: Option<String>,
@@ -981,6 +1004,467 @@ impl AppStore {
             .map_err(map_db("commit Binance account disable"))
     }
 
+    pub(crate) async fn binance_supplier_funding_available_for_cipher(
+        &self,
+        supplier_user_id: &str,
+        region: &str,
+        cipher: &CredentialCipher,
+    ) -> Result<bool, AppError> {
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let account = conn
+            .query_row(
+                "SELECT id, status, automation_mode, encryption_key_version,
+                        permissions_verified_at, uid_confirmed,
+                        credentials_ciphertext, credential_nonce, credential_revision
+                 FROM binance_payment_accounts
+                 WHERE supplier_user_id = ?1 AND payment_home_region = ?2",
+                params![supplier_user_id, region],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)? != 0,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read supplier Binance funding availability"))?;
+        Ok(account.is_some_and(|account| {
+            if account.1 != "verified"
+                || account.2 != "enabled"
+                || account.3 != cipher.version()
+                || !super::permission_verification_is_fresh(account.4.as_deref(), now)
+                || !account.5
+                || account.6.is_empty()
+            {
+                return false;
+            }
+            let aad = credential_aad(&account.0, supplier_user_id, account.8);
+            cipher
+                .open_json::<BinanceCredentials>(&account.6, &account.7, aad.as_bytes())
+                .is_ok()
+        }))
+    }
+
+    pub async fn binance_create_funding_intent_for_cipher(
+        &self,
+        session: &AuthSession,
+        supplier_user_id: &str,
+        amount_minor: i64,
+        idempotency_key: &str,
+        region: &str,
+        cipher: &CredentialCipher,
+    ) -> Result<BinanceFundingIntentView, AppError> {
+        if supplier_user_id == session.user_id {
+            return Err(AppError::BadRequest(
+                "prepaid funding requires a different supplier account".into(),
+            ));
+        }
+        if amount_minor <= 0 || amount_minor > 100_000_000 {
+            return Err(AppError::BadRequest(
+                "funding amount must be between 1 and 100000000 minor USD units".into(),
+            ));
+        }
+        let idempotency_key = idempotency_key.trim();
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(AppError::BadRequest(
+                "idempotencyKey must contain 1-128 non-control characters".into(),
+            ));
+        }
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let expires_at = (now_dt + Duration::minutes(INTENT_TTL_MINUTES)).to_rfc3339();
+        let late_grace_until =
+            (now_dt + Duration::minutes(INTENT_TTL_MINUTES) + Duration::hours(LATE_GRACE_HOURS))
+                .to_rfc3339();
+        let cooldown_until = (now_dt + Duration::hours(AMOUNT_COOLDOWN_HOURS)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Binance funding intent"))?;
+        release_elapsed_reservations_tx(&tx, &now)?;
+        release_elapsed_funding_reservations_tx(&tx, &now)?;
+        expire_due_intents_tx(&tx, &now, &cooldown_until)?;
+        expire_due_funding_intents_tx(&tx, &now, &cooldown_until)?;
+        let base_amount_units = amount_minor
+            .checked_mul(PAYMENT_AMOUNT_SCALE / 100)
+            .ok_or_else(|| AppError::BadRequest("funding amount is too large".into()))?;
+        let existing_intent = tx
+            .query_row(
+                "SELECT id, supplier_user_id, base_amount_units
+                 FROM market_funding_intents
+                 WHERE buyer_user_id = ?1 AND idempotency_key = ?2",
+                params![session.user_id, idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read idempotent Binance funding intent"))?;
+        if let Some((_, existing_supplier, existing_base)) = existing_intent.as_ref() {
+            if existing_supplier != supplier_user_id || *existing_base != base_amount_units {
+                return Err(AppError::Conflict(
+                    "idempotency key was already used for another funding request".into(),
+                ));
+            }
+        }
+        let supplier_email = tx
+            .query_row(
+                "SELECT email_normalized FROM users WHERE id = ?1",
+                params![supplier_user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("read funding supplier identity"))?
+            .ok_or_else(|| AppError::NotFound("supplier account not found".into()))?;
+        let established_relationship = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM market_credit_accounts
+                    WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                      AND currency = 'USD' AND status != 'closed'
+                    UNION ALL
+                    SELECT 1 FROM market_prepaid_accounts
+                    WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                      AND currency = 'USD' AND status != 'closed'
+                 )",
+                params![session.user_id, supplier_user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("check established market funding relationship"))?
+            != 0;
+        let paid_access = crate::market_access::product_access_allowed_tx(
+            &tx,
+            supplier_user_id,
+            &session.user_id,
+            &session.email,
+            crate::market_access::PRODUCT_SHARE,
+            crate::market_access::PRICING_PAID,
+        )? || crate::market_access::product_access_allowed_tx(
+            &tx,
+            supplier_user_id,
+            &session.user_id,
+            &session.email,
+            crate::market_access::PRODUCT_CLIENT_HOST,
+            crate::market_access::PRICING_PAID,
+        )?;
+        if !established_relationship && !paid_access {
+            return Err(AppError::coded_forbidden(
+                crate::market_access::ERROR_MARKET_ACCESS_REQUIRED,
+                "supplier approval is required before adding prepaid market funds",
+                serde_json::json!({
+                    "supplierUserId": supplier_user_id,
+                    "pricingKind": crate::market_access::PRICING_PAID,
+                }),
+            ));
+        }
+        let unpaid_invoice = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM market_credit_accounts
+                    WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = 'USD'
+                      AND (open_invoice_id IS NOT NULL OR status IN (
+                          'settlement_due', 'payment_declared', 'overdue', 'disputed'
+                      ))
+                 )",
+                params![session.user_id, supplier_user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("check unpaid supplier invoice before funding"))?
+            != 0;
+        if unpaid_invoice {
+            return Err(AppError::Conflict(
+                "settle the outstanding supplier invoice before adding prepaid funds".into(),
+            ));
+        }
+        let payment_account = tx
+            .query_row(
+                "SELECT id, binance_uid, status, automation_mode,
+                        encryption_key_version, permissions_verified_at,
+                        uid_confirmed, credentials_ciphertext, credential_nonce,
+                        credential_revision
+                 FROM binance_payment_accounts
+                 WHERE supplier_user_id = ?1 AND payment_home_region = ?2",
+                params![supplier_user_id, region],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read supplier Binance funding account"))?
+            .ok_or_else(|| {
+                AppError::ServiceUnavailable(
+                    "the supplier has not enabled Binance auto-settlement".into(),
+                )
+            })?;
+        if payment_account.2 != "verified"
+            || payment_account.3 != "enabled"
+            || payment_account.4 != cipher.version()
+            || payment_account.7.is_empty()
+            || !payment_account.6
+            || !super::permission_verification_is_fresh(payment_account.5.as_deref(), now_dt)
+        {
+            return Err(AppError::ServiceUnavailable(
+                "the supplier Binance funding account is not currently available".into(),
+            ));
+        }
+        let aad = credential_aad(&payment_account.0, supplier_user_id, payment_account.9);
+        if cipher
+            .open_json::<BinanceCredentials>(&payment_account.7, &payment_account.8, aad.as_bytes())
+            .is_err()
+        {
+            let updated = tx
+                .execute(
+                    "UPDATE binance_payment_accounts
+                     SET status = 'degraded', permissions_verified_at = NULL,
+                         last_poll_error_code = 'CREDENTIAL_DECRYPT_FAILED',
+                         consecutive_failures = MIN(consecutive_failures + 1, 1000000),
+                         degraded_since = COALESCE(degraded_since, ?3),
+                         lease_owner = NULL, lease_until = NULL, next_poll_at = NULL,
+                         updated_at = ?3
+                     WHERE id = ?1 AND credential_revision = ?2
+                       AND status != 'disabled'",
+                    params![payment_account.0, payment_account.9, now],
+                )
+                .map_err(map_db("degrade undecryptable Binance funding account"))?;
+            if updated != 1 {
+                return Err(AppError::Conflict(
+                    "the supplier Binance account changed while creating a funding intent".into(),
+                ));
+            }
+            cancel_payment_account_intents_tx(
+                &tx,
+                &payment_account.0,
+                "payment_account_degraded",
+                &now,
+                &cooldown_until,
+            )?;
+            let failures = tx
+                .query_row(
+                    "SELECT consecutive_failures FROM binance_payment_accounts WHERE id = ?1",
+                    params![payment_account.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(map_db("read undecryptable Binance funding account state"))?;
+            enqueue_binance_poll_alert_tx(
+                &tx,
+                &payment_account.0,
+                supplier_user_id,
+                region,
+                "firing",
+                "CREDENTIAL_DECRYPT_FAILED",
+                failures,
+                None,
+                None,
+                true,
+                &format!("decrypt:{}", now_dt.timestamp_millis()),
+                now_dt,
+            )?;
+            tx.commit()
+                .map_err(map_db("commit undecryptable Binance funding degradation"))?;
+            return Err(AppError::ServiceUnavailable(
+                "the supplier Binance credentials cannot be decrypted; rebind is required".into(),
+            ));
+        }
+        if let Some((intent_id, _, _)) = existing_intent {
+            let view = funding_intent_view_by_id_tx(&tx, &intent_id)?;
+            tx.commit()
+                .map_err(map_db("commit idempotent Binance funding intent"))?;
+            return Ok(view);
+        }
+        let prepaid_account_id = crate::market_billing::ensure_market_prepaid_account_tx(
+            &tx,
+            &session.user_id,
+            &session.email,
+            supplier_user_id,
+            &supplier_email,
+            crate::market_billing::MARKET_CURRENCY,
+            &now,
+        )?;
+        if let Some(existing_id) = tx
+            .query_row(
+                "SELECT id FROM market_funding_intents
+                 WHERE prepaid_account_id = ?1 AND status = 'pending'",
+                params![prepaid_account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("read active Binance funding intent"))?
+        {
+            let view = funding_intent_view_by_id_tx(&tx, &existing_id)?;
+            tx.commit()
+                .map_err(map_db("commit reused Binance funding intent"))?;
+            return Ok(view);
+        }
+        enforce_funding_intent_limits_tx(&tx, &payment_account.0, &session.user_id, &now_dt)?;
+        let pay_amount_units =
+            allocate_payment_amount_tx(&tx, &payment_account.0, base_amount_units)?;
+        let intent_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO market_funding_intents (
+                id, prepaid_account_id, payment_account_id, buyer_user_id,
+                supplier_user_id, idempotency_key, receiver_uid, asset,
+                base_amount_units, pay_amount_units, amount_scale, note_code,
+                status, expires_at, late_grace_until, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'USDT', ?8, ?9, 10000,
+                       ?10, 'pending', ?11, ?12, ?13, ?13)",
+            params![
+                intent_id,
+                prepaid_account_id,
+                payment_account.0,
+                session.user_id,
+                supplier_user_id,
+                idempotency_key,
+                payment_account.1,
+                base_amount_units,
+                pay_amount_units,
+                random_note_code(),
+                expires_at,
+                late_grace_until,
+                now,
+            ],
+        )
+        .map_err(map_db("create Binance funding intent"))?;
+        tx.execute(
+            "INSERT INTO market_funding_amount_reservations (
+                id, payment_account_id, asset, pay_amount_units, intent_id,
+                status, reserved_at
+             ) VALUES (?1, ?2, 'USDT', ?3, ?4, 'reserved', ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                payment_account.0,
+                pay_amount_units,
+                intent_id,
+                now,
+            ],
+        )
+        .map_err(map_db("reserve Binance funding amount"))?;
+        tx.execute(
+            "UPDATE binance_payment_accounts
+             SET next_poll_at = ?2, updated_at = ?2 WHERE id = ?1",
+            params![payment_account.0, now],
+        )
+        .map_err(map_db("schedule Binance funding polling"))?;
+        let view = funding_intent_view_by_id_tx(&tx, &intent_id)?;
+        tx.commit()
+            .map_err(map_db("commit Binance funding intent"))?;
+        Ok(view)
+    }
+
+    pub async fn binance_funding_intent(
+        &self,
+        session: &AuthSession,
+        intent_id: &str,
+    ) -> Result<BinanceFundingIntentView, AppError> {
+        let conn = self.conn.lock().await;
+        ensure_funding_intent_actor_tx(&conn, intent_id, &session.user_id)?;
+        funding_intent_view_by_id_tx(&conn, intent_id)
+    }
+
+    pub async fn binance_cancel_funding_intent(
+        &self,
+        session: &AuthSession,
+        intent_id: &str,
+    ) -> Result<BinanceFundingIntentView, AppError> {
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let cooldown_until = (now_dt + Duration::hours(AMOUNT_COOLDOWN_HOURS)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin Binance funding intent cancellation"))?;
+        ensure_funding_intent_actor_tx(&tx, intent_id, &session.user_id)?;
+        cancel_funding_intent_tx(&tx, intent_id, "buyer_cancelled", &now, &cooldown_until)?;
+        let view = funding_intent_view_by_id_tx(&tx, intent_id)?;
+        tx.commit()
+            .map_err(map_db("commit Binance funding intent cancellation"))?;
+        Ok(view)
+    }
+
+    pub async fn binance_refresh_funding_intent_for_cipher(
+        &self,
+        session: &AuthSession,
+        intent_id: &str,
+        region: &str,
+        cipher: &CredentialCipher,
+    ) -> Result<BinanceFundingIntentView, AppError> {
+        let (supplier_user_id, base_amount_units, status, created_at) = {
+            let conn = self.conn.lock().await;
+            ensure_funding_intent_actor_tx(&conn, intent_id, &session.user_id)?;
+            conn.query_row(
+                "SELECT supplier_user_id, base_amount_units, status, created_at
+                 FROM market_funding_intents WHERE id = ?1",
+                params![intent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(map_db("read Binance funding intent for refresh"))?
+        };
+        if !matches!(status.as_str(), "pending" | "expired" | "cancelled") {
+            return Err(AppError::Conflict(
+                "funding intent can no longer be refreshed".into(),
+            ));
+        }
+        let created_at = DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|_| AppError::Internal("stored funding intent timestamp is invalid".into()))?
+            .with_timezone(&Utc);
+        let elapsed = Utc::now()
+            .signed_duration_since(created_at)
+            .num_seconds()
+            .max(0);
+        if status == "pending" && elapsed < INTENT_REFRESH_MIN_SECONDS {
+            return Err(AppError::RateLimited {
+                message: "wait before generating another Binance funding amount".into(),
+                retry_after_secs: u64::try_from(INTENT_REFRESH_MIN_SECONDS - elapsed).unwrap_or(30),
+            });
+        }
+        if matches!(status.as_str(), "pending" | "expired") {
+            self.binance_cancel_funding_intent(session, intent_id)
+                .await?;
+        }
+        let amount_minor = base_amount_units / (PAYMENT_AMOUNT_SCALE / 100);
+        self.binance_create_funding_intent_for_cipher(
+            session,
+            &supplier_user_id,
+            amount_minor,
+            &format!("refresh:{intent_id}:{}", Utc::now().timestamp_millis()),
+            region,
+            cipher,
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub async fn binance_create_or_refresh_intent(
         &self,
@@ -1053,7 +1537,9 @@ impl AppStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Binance payment intent"))?;
         release_elapsed_reservations_tx(&tx, &now)?;
+        release_elapsed_funding_reservations_tx(&tx, &now)?;
         expire_due_intents_tx(&tx, &now, &cooldown_until)?;
+        expire_due_funding_intents_tx(&tx, &now, &cooldown_until)?;
         let invoice = load_payable_invoice_tx(&tx, invoice_id, &session.user_id)?;
         let public_uid = invoice_binance_uid(&invoice.payment_methods_json)?.ok_or_else(|| {
             AppError::Conflict("this invoice does not contain a Binance UID payment method".into())
@@ -1335,7 +1821,9 @@ impl AppStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin Binance intent expiry"))?;
         expire_due_intents_tx(&tx, &now, &cooldown_until)?;
+        expire_due_funding_intents_tx(&tx, &now, &cooldown_until)?;
         release_elapsed_reservations_tx(&tx, &now)?;
+        release_elapsed_funding_reservations_tx(&tx, &now)?;
         tx.commit().map_err(map_db("commit Binance intent expiry"))
     }
 
@@ -1354,18 +1842,29 @@ impl AppStore {
                         account.last_poll_error_code, account.consecutive_failures,
                         account.last_poll_success_at, account.next_poll_at,
                         account.degraded_since,
-                        (SELECT MIN(intent.created_at)
-                           FROM market_payment_intents intent
-                          WHERE intent.payment_account_id = account.id
-                            AND (
-                                intent.status = 'pending' OR
-                                (intent.status = 'expired' AND intent.late_grace_until >= ?1) OR
-                                (intent.status = 'cancelled'
-                                 AND intent.late_grace_until >= ?1
-                                 AND COALESCE(intent.cancellation_reason, '') NOT IN (
-                                     'payment_account_rebound', 'payment_account_disabled'
-                                 ))
-                            )) AS active_intent_started_at
+                        (SELECT MIN(active.created_at) FROM (
+                            SELECT intent.created_at
+                            FROM market_payment_intents intent
+                            WHERE intent.payment_account_id = account.id
+                              AND (intent.status = 'pending'
+                                   OR (intent.status = 'expired' AND intent.late_grace_until >= ?1)
+                                   OR (intent.status = 'cancelled'
+                                       AND intent.late_grace_until >= ?1
+                                       AND COALESCE(intent.cancellation_reason, '') NOT IN (
+                                           'payment_account_rebound', 'payment_account_disabled'
+                                       )))
+                            UNION ALL
+                            SELECT intent.created_at
+                            FROM market_funding_intents intent
+                            WHERE intent.payment_account_id = account.id
+                              AND (intent.status = 'pending'
+                                   OR (intent.status = 'expired' AND intent.late_grace_until >= ?1)
+                                   OR (intent.status = 'cancelled'
+                                       AND intent.late_grace_until >= ?1
+                                       AND COALESCE(intent.cancellation_reason, '') NOT IN (
+                                           'payment_account_rebound', 'payment_account_disabled'
+                                       )))
+                        ) active) AS active_intent_started_at
                  FROM binance_payment_accounts account
                  WHERE account.status IN ('verified', 'degraded')
                    AND account.credentials_ciphertext != ''",
@@ -1513,6 +2012,28 @@ impl AppStore {
                 &cooldown_until,
             )?;
         }
+        let funding_intent_ids = tx
+            .prepare(
+                "SELECT id FROM market_funding_intents
+                 WHERE status IN ('pending', 'expired')",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db(
+                "read live Binance funding intents for global disable",
+            ))?;
+        for intent_id in funding_intent_ids {
+            cancel_funding_intent_tx(
+                &tx,
+                &intent_id,
+                "global_settlement_disabled",
+                &now,
+                &cooldown_until,
+            )?;
+        }
         // Persistently demote every account as well as fencing in-flight poll
         // leases. During a rolling restart this prevents an older enabled HTTP
         // process from creating another payable intent after the disabled
@@ -1550,25 +2071,36 @@ impl AppStore {
                         account.automation_mode, account.permissions_verified_at,
                         account.poll_cursor_at, account.poll_scan_cursor_at,
                         account.poll_scan_target_at,
-                        (SELECT MIN(intent.created_at)
-                           FROM market_payment_intents intent
-                          WHERE intent.payment_account_id = account.id
-                            AND (
-                                intent.status = 'pending' OR
-                                (intent.status = 'expired' AND intent.late_grace_until >= ?2) OR
-                                (intent.status = 'cancelled'
-                                 AND intent.late_grace_until >= ?2
-                                 AND COALESCE(intent.cancellation_reason, '') NOT IN (
-                                     'payment_account_rebound', 'payment_account_disabled'
-                                 ))
-                            ))
+                        (SELECT MIN(active.created_at) FROM (
+                            SELECT intent.created_at
+                            FROM market_payment_intents intent
+                            WHERE intent.payment_account_id = account.id
+                              AND (intent.status = 'pending'
+                                   OR (intent.status = 'expired' AND intent.late_grace_until >= ?2)
+                                   OR (intent.status = 'cancelled'
+                                       AND intent.late_grace_until >= ?2
+                                       AND COALESCE(intent.cancellation_reason, '') NOT IN (
+                                           'payment_account_rebound', 'payment_account_disabled'
+                                       )))
+                            UNION ALL
+                            SELECT intent.created_at
+                            FROM market_funding_intents intent
+                            WHERE intent.payment_account_id = account.id
+                              AND (intent.status = 'pending'
+                                   OR (intent.status = 'expired' AND intent.late_grace_until >= ?2)
+                                   OR (intent.status = 'cancelled'
+                                       AND intent.late_grace_until >= ?2
+                                       AND COALESCE(intent.cancellation_reason, '') NOT IN (
+                                           'payment_account_rebound', 'payment_account_disabled'
+                                       )))
+                        ) active)
                  FROM binance_payment_accounts account
                  WHERE account.payment_home_region = ?1
                    AND account.status IN ('verified', 'degraded')
                    AND account.credentials_ciphertext != ''
                    AND (account.next_poll_at IS NULL OR account.next_poll_at <= ?2)
                    AND (account.lease_until IS NULL OR account.lease_until <= ?2)
-                   AND EXISTS (
+                   AND (EXISTS (
                        SELECT 1 FROM market_payment_intents intent
                        WHERE intent.payment_account_id = account.id
                          AND (
@@ -1580,7 +2112,17 @@ impl AppStore {
                                   'payment_account_rebound', 'payment_account_disabled'
                               ))
                          )
-                   )
+                   ) OR EXISTS (
+                       SELECT 1 FROM market_funding_intents intent
+                       WHERE intent.payment_account_id = account.id
+                         AND (intent.status = 'pending'
+                              OR (intent.status = 'expired' AND intent.late_grace_until >= ?2)
+                              OR (intent.status = 'cancelled'
+                                  AND intent.late_grace_until >= ?2
+                                  AND COALESCE(intent.cancellation_reason, '') NOT IN (
+                                      'payment_account_rebound', 'payment_account_disabled'
+                                  )))
+                   ))
                  ORDER BY COALESCE(account.next_poll_at, ''), account.id
                  LIMIT 1",
                 params![region, now],
@@ -1832,6 +2374,7 @@ impl AppStore {
             ));
         };
         expire_due_intents_tx(&tx, &now, &cooldown_until)?;
+        expire_due_funding_intents_tx(&tx, &now, &cooldown_until)?;
         let mut actions = Vec::new();
         let mut max_transaction_time = account.poll_cursor_at.clone();
         for prepared in prepared {
@@ -2006,7 +2549,9 @@ impl AppStore {
                         payment.counterparty_fingerprint,
                         payment.counterparty_fingerprint_source,
                         payment.payer_binance_id_fingerprint, invoice.status,
-                        reconciliation.created_at, reconciliation.resolved_at
+                        reconciliation.created_at, reconciliation.resolved_at,
+                        reconciliation.funding_intent_id,
+                        reconciliation.prepaid_account_id
                  FROM market_payment_reconciliation_cases reconciliation
                  JOIN binance_payment_accounts account
                    ON account.id = reconciliation.payment_account_id
@@ -2027,6 +2572,8 @@ impl AppStore {
                             id: row.get(0)?,
                             invoice_id: row.get(1)?,
                             payment_intent_id: row.get(2)?,
+                            funding_intent_id: row.get(20)?,
+                            prepaid_account_id: row.get(21)?,
                             payment_account_id: row.get(3)?,
                             transaction_id: row.get(4)?,
                             order_id: row.get(13)?,
@@ -2094,7 +2641,8 @@ impl AppStore {
             conn.query_row(
                 "SELECT
                     (SELECT COUNT(*) FROM market_payment_reconciliation_cases WHERE status = 'open'),
-                    (SELECT COUNT(*) FROM market_payment_intents WHERE status = 'pending'),
+                    ((SELECT COUNT(*) FROM market_payment_intents WHERE status = 'pending')
+                     + (SELECT COUNT(*) FROM market_funding_intents WHERE status = 'pending')),
                     (SELECT COUNT(*) FROM binance_payment_accounts WHERE status = 'degraded'),
                     (SELECT MIN(created_at) FROM market_payment_reconciliation_cases WHERE status = 'open')",
                 [],
@@ -2136,7 +2684,8 @@ impl AppStore {
         let case = tx
             .query_row(
                 "SELECT payment_account_id, transaction_id, invoice_id,
-                        payment_intent_id, status
+                        payment_intent_id, status, funding_intent_id,
+                        prepaid_account_id
                  FROM market_payment_reconciliation_cases WHERE id = ?1",
                 params![case_id],
                 |row| {
@@ -2146,6 +2695,8 @@ impl AppStore {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -2178,6 +2729,21 @@ impl AppStore {
                     cool_intent_amount_tx(&tx, intent_id, &cooldown_until)?;
                 }
             }
+            if let Some(intent_id) = case.5.as_deref() {
+                let cancelled = tx
+                    .execute(
+                        "UPDATE market_funding_intents
+                         SET status = 'cancelled',
+                             cancellation_reason = 'admin_ignored_transaction',
+                             cancelled_at = ?2, updated_at = ?2
+                         WHERE id = ?1 AND status = 'review_required'",
+                        params![intent_id, now],
+                    )
+                    .map_err(map_db("cancel ignored reviewed Binance funding intent"))?;
+                if cancelled == 1 {
+                    cool_funding_intent_amount_tx(&tx, intent_id, &cooldown_until)?;
+                }
+            }
             tx.execute(
                 "UPDATE market_payment_reconciliation_cases
                  SET status = 'ignored', resolution = ?2, resolved_by_user_id = ?3,
@@ -2202,16 +2768,9 @@ impl AppStore {
                 "resolution must be settle or ignore".into(),
             ));
         }
-        let target_invoice_id = reconciliation_target_invoice(case.2.as_deref(), invoice_id)?;
-        let resolution_detail = serde_json::json!({
-            "resolution": resolution,
-            "note": note,
-            "invoiceId": target_invoice_id,
-        })
-        .to_string();
         let transaction = tx
             .query_row(
-                "SELECT amount_units, currency, ingestion_status
+                "SELECT amount_units, currency, ingestion_status, match_status
                  FROM binance_pay_transactions
                  WHERE payment_account_id = ?1 AND transaction_id = ?2",
                 params![case.0, case.1],
@@ -2220,6 +2779,7 @@ impl AppStore {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -2227,11 +2787,57 @@ impl AppStore {
         if transaction.0 <= 0
             || transaction.1 != PAYMENT_ASSET
             || !matches!(transaction.2.as_str(), "accepted" | "review_required")
+            || transaction.3 == "matched"
         {
             return Err(AppError::Conflict(
                 "this Binance transaction is not eligible for settlement".into(),
             ));
         }
+        if let (Some(funding_intent_id), Some(prepaid_account_id)) =
+            (case.5.as_deref(), case.6.as_deref())
+        {
+            if invoice_id.is_some() {
+                return Err(AppError::BadRequest(
+                    "invoiceId must be omitted when settling a prepaid funding case".into(),
+                ));
+            }
+            let resolution_detail = serde_json::json!({
+                "resolution": resolution,
+                "note": note,
+                "fundingIntentId": funding_intent_id,
+                "prepaidAccountId": prepaid_account_id,
+            })
+            .to_string();
+            let actions = settle_funding_transaction_admin_tx(
+                &tx,
+                funding_intent_id,
+                prepaid_account_id,
+                &case.0,
+                &case.1,
+                transaction.0,
+                &session.user_id,
+                &now,
+                &cooldown_until,
+            )?;
+            tx.execute(
+                "UPDATE market_payment_reconciliation_cases
+                 SET status = 'settled', resolution = ?2,
+                     resolved_by_user_id = ?3, resolved_at = ?4
+                 WHERE id = ?1 AND status = 'open'",
+                params![case_id, resolution_detail, session.user_id, now],
+            )
+            .map_err(map_db("settle Binance funding reconciliation case"))?;
+            tx.commit()
+                .map_err(map_db("commit settled Binance funding reconciliation"))?;
+            return Ok(actions);
+        }
+        let target_invoice_id = reconciliation_target_invoice(case.2.as_deref(), invoice_id)?;
+        let resolution_detail = serde_json::json!({
+            "resolution": resolution,
+            "note": note,
+            "invoiceId": target_invoice_id,
+        })
+        .to_string();
         let intent_id = tx
             .query_row(
                 "SELECT intent.id
@@ -2283,15 +2889,21 @@ impl AppStore {
         }
         cancel_invoice_intents_tx(&tx, &target_invoice_id, "invoice_settled_elsewhere", &now)?;
         cool_intent_amount_tx(&tx, &intent_id, &cooldown_until)?;
-        tx.execute(
-            "UPDATE binance_pay_transactions
+        let transaction_updated = tx
+            .execute(
+                "UPDATE binance_pay_transactions
              SET match_status = 'matched', match_reason = 'admin_reconciliation',
                  payment_intent_id = ?3, matched_at = ?4
              WHERE payment_account_id = ?1 AND transaction_id = ?2
                AND match_status != 'matched'",
-            params![case.0, case.1, intent_id, now],
-        )
-        .map_err(map_db("mark reconciled Binance transaction matched"))?;
+                params![case.0, case.1, intent_id, now],
+            )
+            .map_err(map_db("mark reconciled Binance transaction matched"))?;
+        if transaction_updated != 1 {
+            return Err(AppError::Conflict(
+                "this Binance transaction was already applied elsewhere".into(),
+            ));
+        }
         tx.execute(
             "UPDATE market_payment_reconciliation_cases
              SET status = 'settled', invoice_id = ?2, payment_intent_id = ?3,
@@ -2512,8 +3124,55 @@ fn match_transaction_tx(
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(map_db("find Binance transaction payment intent"))?;
-    if candidates.len() != 1 {
-        let (reason, related) = if candidates.len() > 1 {
+    let funding_candidates = tx
+        .prepare(
+            "SELECT intent.id, intent.prepaid_account_id, intent.note_code
+             FROM market_funding_intents intent
+             WHERE intent.payment_account_id = ?1
+               AND intent.status IN ('pending', 'expired')
+               AND intent.asset = ?2 AND intent.pay_amount_units = ?3
+               AND datetime(intent.created_at) <= datetime(?4, '+' || ?5 || ' seconds')
+               AND datetime(intent.late_grace_until) >= datetime(?4)
+             ORDER BY intent.created_at, intent.id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![
+                        account.id,
+                        transaction.currency,
+                        transaction.amount_units,
+                        transaction.transaction_time,
+                        PAYMENT_CLOCK_SKEW_SECONDS,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("find Binance transaction funding intent"))?;
+    if candidates.is_empty() && funding_candidates.len() == 1 {
+        let (intent_id, prepaid_account_id, _) = &funding_candidates[0];
+        return match_funding_transaction_tx(
+            tx,
+            account,
+            transaction,
+            intent_id,
+            prepaid_account_id,
+            globally_enabled,
+            now,
+            cooldown_until,
+            actions,
+        );
+    }
+    let total_candidates = candidates.len().saturating_add(funding_candidates.len());
+    if total_candidates != 1 {
+        let (reason, related) = if total_candidates > 1 {
             ("ambiguous_exact_amount", None)
         } else {
             let note_candidate = tx
@@ -2530,10 +3189,63 @@ fn match_transaction_tx(
             if let Some(candidate) = note_candidate {
                 ("amount_mismatch", Some(candidate))
             } else {
-                (
-                    "no_active_exact_amount",
-                    historical_amount_intent_tx(tx, account, transaction)?,
-                )
+                let funding_note_candidate = tx
+                    .query_row(
+                        "SELECT id, prepaid_account_id FROM market_funding_intents
+                         WHERE payment_account_id = ?1 AND status = 'pending'
+                           AND note_code != '' AND instr(upper(?2), upper(note_code)) > 0
+                         LIMIT 1",
+                        params![account.id, transaction.note],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(map_db("find Binance funding note-code candidate"))?;
+                if let Some((funding_intent_id, prepaid_account_id)) = funding_note_candidate {
+                    create_funding_reconciliation_case_tx(
+                        tx,
+                        account,
+                        transaction,
+                        "amount_mismatch",
+                        now,
+                        Some(&funding_intent_id),
+                        Some(&prepaid_account_id),
+                    )?;
+                    tx.execute(
+                        "UPDATE binance_pay_transactions
+                         SET match_status = 'review_required', match_reason = 'amount_mismatch',
+                             funding_intent_id = ?3
+                         WHERE payment_account_id = ?1 AND transaction_id = ?2",
+                        params![account.id, transaction.transaction_id, funding_intent_id],
+                    )
+                    .map_err(map_db("mark Binance funding amount mismatch for review"))?;
+                    return Ok(());
+                }
+                let historical = historical_amount_intent_tx(tx, account, transaction)?;
+                if historical.is_none()
+                    && let Some((funding_intent_id, prepaid_account_id)) =
+                        historical_funding_intent_tx(tx, account, transaction)?
+                {
+                    create_funding_reconciliation_case_tx(
+                        tx,
+                        account,
+                        transaction,
+                        "no_active_exact_amount",
+                        now,
+                        Some(&funding_intent_id),
+                        Some(&prepaid_account_id),
+                    )?;
+                    tx.execute(
+                        "UPDATE binance_pay_transactions
+                         SET match_status = 'review_required',
+                             match_reason = 'no_active_exact_amount',
+                             funding_intent_id = ?3
+                         WHERE payment_account_id = ?1 AND transaction_id = ?2",
+                        params![account.id, transaction.transaction_id, funding_intent_id],
+                    )
+                    .map_err(map_db("mark historical Binance funding payment for review"))?;
+                    return Ok(());
+                }
+                ("no_active_exact_amount", historical)
             }
         };
         if reason != "no_active_exact_amount" || related.is_some() {
@@ -2692,15 +3404,331 @@ fn match_transaction_tx(
     }
     cancel_invoice_intents_tx(tx, invoice_id, "invoice_settled_elsewhere", now)?;
     cool_intent_amount_tx(tx, intent_id, cooldown_until)?;
-    tx.execute(
-        "UPDATE binance_pay_transactions
+    let transaction_updated = tx
+        .execute(
+            "UPDATE binance_pay_transactions
          SET match_status = 'matched', match_reason = 'exact_amount',
              payment_intent_id = ?3, matched_at = ?4
-         WHERE payment_account_id = ?1 AND transaction_id = ?2",
-        params![account.id, transaction.transaction_id, intent_id, now],
-    )
-    .map_err(map_db("mark Binance transaction matched"))?;
+         WHERE payment_account_id = ?1 AND transaction_id = ?2
+           AND match_status != 'matched'",
+            params![account.id, transaction.transaction_id, intent_id, now],
+        )
+        .map_err(map_db("mark Binance transaction matched"))?;
+    if transaction_updated != 1 {
+        return Err(AppError::Conflict(
+            "this Binance transaction was already applied elsewhere".into(),
+        ));
+    }
     actions.append(&mut settlement_actions);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_funding_transaction_tx(
+    tx: &Transaction<'_>,
+    account: &StoredPaymentAccount,
+    transaction: &PreparedTransaction,
+    intent_id: &str,
+    prepaid_account_id: &str,
+    globally_enabled: bool,
+    now: &str,
+    cooldown_until: &str,
+    actions: &mut Vec<BillingAction>,
+) -> Result<(), AppError> {
+    if let Some(reason) = transaction.identity_review_reason {
+        create_funding_reconciliation_case_tx(
+            tx,
+            account,
+            transaction,
+            reason,
+            now,
+            Some(intent_id),
+            Some(prepaid_account_id),
+        )?;
+        tx.execute(
+            "UPDATE binance_pay_transactions
+             SET ingestion_status = 'review_required', match_status = 'review_required',
+                 match_reason = ?3, funding_intent_id = ?4
+             WHERE payment_account_id = ?1 AND transaction_id = ?2",
+            params![account.id, transaction.transaction_id, reason, intent_id],
+        )
+        .map_err(map_db("mark Binance funding identity drift for review"))?;
+        tx.execute(
+            "UPDATE market_funding_intents
+             SET status = 'review_required', matched_transaction_id = ?2, updated_at = ?3
+             WHERE id = ?1 AND status IN ('pending', 'expired')",
+            params![intent_id, transaction.transaction_id, now],
+        )
+        .map_err(map_db("mark Binance funding intent for identity review"))?;
+        cool_funding_intent_amount_tx(tx, intent_id, cooldown_until)?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE binance_payment_accounts
+         SET uid_confirmed = 1,
+             uid_confirmation_source = COALESCE(uid_confirmation_source, 'payment_observation'),
+             updated_at = ?2
+         WHERE id = ?1 AND uid_confirmed = 0",
+        params![account.id, now],
+    )
+    .map_err(map_db("confirm Binance UID from funding observation"))?;
+    if !globally_enabled || account.automation_mode != "enabled" {
+        create_funding_reconciliation_case_tx(
+            tx,
+            account,
+            transaction,
+            "shadow_exact_match",
+            now,
+            Some(intent_id),
+            Some(prepaid_account_id),
+        )?;
+        tx.execute(
+            "UPDATE binance_pay_transactions
+             SET match_status = 'review_required', match_reason = 'shadow_exact_match',
+                 funding_intent_id = ?3
+             WHERE payment_account_id = ?1 AND transaction_id = ?2",
+            params![account.id, transaction.transaction_id, intent_id],
+        )
+        .map_err(map_db("record Binance shadow funding match"))?;
+        tx.execute(
+            "UPDATE market_funding_intents
+             SET status = 'review_required', matched_transaction_id = ?2, updated_at = ?3
+             WHERE id = ?1 AND status IN ('pending', 'expired')",
+            params![intent_id, transaction.transaction_id, now],
+        )
+        .map_err(map_db("mark Binance shadow funding intent for review"))?;
+        cool_funding_intent_amount_tx(tx, intent_id, cooldown_until)?;
+        return Ok(());
+    }
+    let credited_money_units = transaction
+        .amount_units
+        .checked_mul(
+            100_i64.saturating_mul(crate::market_billing::MONEY_UNITS_PER_MINOR)
+                / PAYMENT_AMOUNT_SCALE,
+        )
+        .ok_or_else(|| AppError::Internal("Binance funding credit overflowed".into()))?;
+    if credited_money_units <= 0 {
+        return Err(AppError::Internal(
+            "Binance funding credit must be positive".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO market_funding_receipts (
+            id, prepaid_account_id, funding_intent_id, payment_account_id,
+            transaction_id, source, matched_by, asset, actual_amount_units,
+            credited_money_units, confirmed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'binance_auto', 'exact_amount',
+                   'USDT', ?6, ?7, ?8)",
+        params![
+            Uuid::new_v4().to_string(),
+            prepaid_account_id,
+            intent_id,
+            account.id,
+            transaction.transaction_id,
+            transaction.amount_units,
+            credited_money_units,
+            now,
+        ],
+    )
+    .map_err(map_db("create Binance funding receipt"))?;
+    let (_, mut resume_actions) = crate::market_billing::credit_market_prepaid_funding_tx(
+        tx,
+        prepaid_account_id,
+        credited_money_units,
+        intent_id,
+        None,
+        now,
+    )?;
+    let intent_updated = tx
+        .execute(
+            "UPDATE market_funding_intents
+             SET status = 'credited', matched_transaction_id = ?2,
+                 credited_money_units = ?3, credited_at = ?4, updated_at = ?4
+             WHERE id = ?1 AND status IN ('pending', 'expired')",
+            params![
+                intent_id,
+                transaction.transaction_id,
+                credited_money_units,
+                now
+            ],
+        )
+        .map_err(map_db("credit Binance funding intent"))?;
+    if intent_updated != 1 {
+        return Err(AppError::Conflict(
+            "Binance funding intent changed during credit".into(),
+        ));
+    }
+    cool_funding_intent_amount_tx(tx, intent_id, cooldown_until)?;
+    let transaction_updated = tx
+        .execute(
+            "UPDATE binance_pay_transactions
+         SET match_status = 'matched', match_reason = 'funding_exact_amount',
+             funding_intent_id = ?3, matched_at = ?4
+         WHERE payment_account_id = ?1 AND transaction_id = ?2
+           AND match_status != 'matched'",
+            params![account.id, transaction.transaction_id, intent_id, now],
+        )
+        .map_err(map_db("mark Binance funding transaction matched"))?;
+    if transaction_updated != 1 {
+        return Err(AppError::Conflict(
+            "this Binance transaction was already applied elsewhere".into(),
+        ));
+    }
+    actions.append(&mut resume_actions);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_funding_transaction_admin_tx(
+    tx: &Transaction<'_>,
+    intent_id: &str,
+    prepaid_account_id: &str,
+    payment_account_id: &str,
+    transaction_id: &str,
+    actual_amount_units: i64,
+    actor_user_id: &str,
+    now: &str,
+    cooldown_until: &str,
+) -> Result<Vec<BillingAction>, AppError> {
+    let eligible = tx
+        .query_row(
+            "SELECT 1
+             FROM market_funding_intents intent
+             JOIN market_prepaid_accounts prepaid ON prepaid.id = intent.prepaid_account_id
+             JOIN binance_payment_accounts payment ON payment.id = intent.payment_account_id
+             WHERE intent.id = ?1 AND intent.prepaid_account_id = ?2
+               AND intent.payment_account_id = ?3
+               AND intent.status IN ('pending', 'expired', 'cancelled', 'review_required')
+               AND NOT (
+                   intent.status = 'cancelled'
+                   AND COALESCE(intent.cancellation_reason, '') IN (
+                       'payment_account_rebound', 'payment_account_disabled'
+                   )
+               )
+               AND intent.asset = 'USDT'
+               AND prepaid.supplier_user_id = payment.supplier_user_id",
+            params![intent_id, prepaid_account_id, payment_account_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(map_db("validate reconciled Binance funding intent"))?
+        .is_some();
+    if !eligible || actual_amount_units <= 0 {
+        return Err(AppError::Conflict(
+            "the selected funding intent is no longer eligible".into(),
+        ));
+    }
+    let credited_money_units = actual_amount_units
+        .checked_mul(
+            100_i64.saturating_mul(crate::market_billing::MONEY_UNITS_PER_MINOR)
+                / PAYMENT_AMOUNT_SCALE,
+        )
+        .ok_or_else(|| AppError::Internal("reconciled funding credit overflowed".into()))?;
+    tx.execute(
+        "INSERT INTO market_funding_receipts (
+            id, prepaid_account_id, funding_intent_id, payment_account_id,
+            transaction_id, source, matched_by, asset, actual_amount_units,
+            credited_money_units, confirmed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'admin_reconciliation', 'admin_override',
+                   'USDT', ?6, ?7, ?8)",
+        params![
+            Uuid::new_v4().to_string(),
+            prepaid_account_id,
+            intent_id,
+            payment_account_id,
+            transaction_id,
+            actual_amount_units,
+            credited_money_units,
+            now,
+        ],
+    )
+    .map_err(map_db("create reconciled Binance funding receipt"))?;
+    let (_, actions) = crate::market_billing::credit_market_prepaid_funding_tx(
+        tx,
+        prepaid_account_id,
+        credited_money_units,
+        intent_id,
+        Some(actor_user_id),
+        now,
+    )?;
+    let changed = tx
+        .execute(
+            "UPDATE market_funding_intents
+             SET status = 'credited', matched_transaction_id = ?2,
+                 credited_money_units = ?3, credited_at = ?4,
+                 updated_at = ?4, cancellation_reason = NULL
+             WHERE id = ?1
+               AND status IN ('pending', 'expired', 'cancelled', 'review_required')
+               AND NOT (
+                   status = 'cancelled'
+                   AND COALESCE(cancellation_reason, '') IN (
+                       'payment_account_rebound', 'payment_account_disabled'
+                   )
+               )",
+            params![intent_id, transaction_id, credited_money_units, now],
+        )
+        .map_err(map_db("mark reconciled Binance funding intent credited"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "the reconciled funding intent changed concurrently".into(),
+        ));
+    }
+    cool_funding_intent_amount_tx(tx, intent_id, cooldown_until)?;
+    let transaction_updated = tx
+        .execute(
+            "UPDATE binance_pay_transactions
+         SET match_status = 'matched', match_reason = 'funding_admin_reconciliation',
+             funding_intent_id = ?3, matched_at = ?4
+         WHERE payment_account_id = ?1 AND transaction_id = ?2
+           AND match_status != 'matched'",
+            params![payment_account_id, transaction_id, intent_id, now],
+        )
+        .map_err(map_db(
+            "mark reconciled Binance funding transaction matched",
+        ))?;
+    if transaction_updated != 1 {
+        return Err(AppError::Conflict(
+            "this Binance transaction was already applied elsewhere".into(),
+        ));
+    }
+    Ok(actions)
+}
+
+fn create_funding_reconciliation_case_tx(
+    tx: &Transaction<'_>,
+    account: &StoredPaymentAccount,
+    transaction: &PreparedTransaction,
+    kind: &str,
+    now: &str,
+    funding_intent_id: Option<&str>,
+    prepaid_account_id: Option<&str>,
+) -> Result<(), AppError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO market_payment_reconciliation_cases (
+            id, invoice_id, payment_intent_id, payment_account_id, transaction_id,
+            case_kind, status, detail_json, created_at,
+            funding_intent_id, prepaid_account_id
+         ) VALUES (?1, NULL, NULL, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8)",
+        params![
+            Uuid::new_v4().to_string(),
+            account.id,
+            transaction.transaction_id,
+            kind,
+            serde_json::json!({
+                "asset": transaction.currency,
+                "amount": format_amount(transaction.amount_units),
+                "reason": kind,
+                "accountBinanceUid": account.binance_uid,
+                "credentialRevision": account.credential_revision,
+                "fundingIntentId": funding_intent_id,
+            })
+            .to_string(),
+            now,
+            funding_intent_id,
+            prepaid_account_id,
+        ],
+    )
+    .map_err(map_db("create Binance funding reconciliation case"))?;
     Ok(())
 }
 
@@ -2759,6 +3787,27 @@ fn historical_amount_intent_tx(
     )
     .optional()
     .map_err(map_db("inspect historical Binance payment amount"))
+}
+
+fn historical_funding_intent_tx(
+    tx: &Transaction<'_>,
+    account: &StoredPaymentAccount,
+    transaction: &PreparedTransaction,
+) -> Result<Option<(String, String)>, AppError> {
+    tx.query_row(
+        "SELECT id, prepaid_account_id FROM market_funding_intents
+         WHERE payment_account_id = ?1 AND asset = ?2 AND pay_amount_units = ?3
+           AND NOT (
+               status = 'cancelled' AND COALESCE(cancellation_reason, '') IN (
+                   'payment_account_rebound', 'payment_account_disabled'
+               )
+           )
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+        params![account.id, transaction.currency, transaction.amount_units],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(map_db("inspect historical Binance funding amount"))
 }
 
 fn load_payable_invoice_tx(
@@ -3040,6 +4089,70 @@ fn intent_view_from_row(row: &crate::db::Row<'_>) -> crate::db::Result<BinancePa
     })
 }
 
+fn ensure_funding_intent_actor_tx(
+    conn: &Connection,
+    intent_id: &str,
+    buyer_user_id: &str,
+) -> Result<(), AppError> {
+    let allowed = conn
+        .query_row(
+            "SELECT 1 FROM market_funding_intents
+             WHERE id = ?1 AND buyer_user_id = ?2",
+            params![intent_id, buyer_user_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(map_db("authorize Binance funding intent"))?
+        .is_some();
+    if !allowed {
+        return Err(AppError::NotFound("funding intent not found".into()));
+    }
+    Ok(())
+}
+
+fn funding_intent_view_by_id_tx(
+    conn: &Connection,
+    intent_id: &str,
+) -> Result<BinanceFundingIntentView, AppError> {
+    conn.query_row(
+        "SELECT intent.id, intent.prepaid_account_id, intent.supplier_user_id,
+                intent.status, intent.asset, intent.base_amount_units,
+                intent.pay_amount_units, intent.receiver_uid, intent.note_code,
+                intent.expires_at, intent.created_at, intent.credited_at,
+                intent.credited_money_units, intent.cancellation_reason,
+                account.status, account.last_poll_success_at
+         FROM market_funding_intents intent
+         JOIN binance_payment_accounts account ON account.id = intent.payment_account_id
+         WHERE intent.id = ?1",
+        params![intent_id],
+        |row| {
+            Ok(BinanceFundingIntentView {
+                id: row.get(0)?,
+                prepaid_account_id: row.get(1)?,
+                supplier_user_id: row.get(2)?,
+                status: row.get(3)?,
+                asset: row.get(4)?,
+                base_amount: format_amount(row.get(5)?),
+                pay_amount: format_amount(row.get(6)?),
+                receiver_uid: row.get(7)?,
+                note_code: row.get(8)?,
+                expires_at: row.get(9)?,
+                created_at: row.get(10)?,
+                credited_at: row.get(11)?,
+                credited_minor: row
+                    .get::<_, Option<i64>>(12)?
+                    .map(crate::market_billing::floor_minor_units),
+                cancellation_reason: row.get(13)?,
+                account_status: row.get(14)?,
+                last_checked_at: row.get(15)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_db("read Binance funding intent"))?
+    .ok_or_else(|| AppError::NotFound("funding intent not found".into()))
+}
+
 fn allocate_payment_amount_tx(
     tx: &Transaction<'_>,
     payment_account_id: &str,
@@ -3058,6 +4171,10 @@ fn allocate_payment_amount_tx(
                     SELECT 1 FROM market_payment_amount_reservations
                     WHERE payment_account_id = ?1 AND asset = 'USDT'
                       AND pay_amount_units = ?2 AND status IN ('reserved', 'cooldown')
+                    UNION ALL
+                    SELECT 1 FROM market_funding_amount_reservations
+                    WHERE payment_account_id = ?1 AND asset = 'USDT'
+                      AND pay_amount_units = ?2 AND status IN ('reserved', 'cooldown')
                  )",
                 params![payment_account_id, candidate],
                 |row| row.get::<_, i64>(0),
@@ -3070,6 +4187,29 @@ fn allocate_payment_amount_tx(
     Err(AppError::ServiceUnavailable(
         "no safe Binance payment amount is currently available; use manual payment".into(),
     ))
+}
+
+fn enforce_funding_intent_limits_tx(
+    tx: &Transaction<'_>,
+    payment_account_id: &str,
+    buyer_user_id: &str,
+    now: &DateTime<Utc>,
+) -> Result<(), AppError> {
+    let cutoff = (*now - Duration::hours(24)).to_rfc3339();
+    let count = tx
+        .query_row(
+            "SELECT COUNT(*) FROM market_funding_intents
+             WHERE payment_account_id = ?1 AND buyer_user_id = ?2 AND created_at >= ?3",
+            params![payment_account_id, buyer_user_id, cutoff],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("limit Binance funding intents per buyer"))?;
+    if count >= MAX_INTENTS_PER_BUYER_ACCOUNT_24H {
+        return Err(AppError::ServiceUnavailable(
+            "automatic Binance funding amount limit reached; try again later".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn enforce_intent_allocation_limits_tx(
@@ -3126,6 +4266,30 @@ fn cancel_intent_tx(
     Ok(())
 }
 
+fn cancel_funding_intent_tx(
+    tx: &Transaction<'_>,
+    intent_id: &str,
+    reason: &str,
+    now: &str,
+    cooldown_until: &str,
+) -> Result<(), AppError> {
+    let changed = tx
+        .execute(
+            "UPDATE market_funding_intents
+             SET status = 'cancelled', cancellation_reason = ?2,
+                 cancelled_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND status IN ('pending', 'expired')",
+            params![intent_id, reason, now],
+        )
+        .map_err(map_db("cancel Binance funding intent"))?;
+    if changed == 0 {
+        return Err(AppError::Conflict(
+            "funding intent can no longer be cancelled".into(),
+        ));
+    }
+    cool_funding_intent_amount_tx(tx, intent_id, cooldown_until)
+}
+
 fn cool_intent_amount_tx(
     tx: &Transaction<'_>,
     intent_id: &str,
@@ -3150,6 +4314,30 @@ fn cool_intent_amount_tx(
     Ok(())
 }
 
+fn cool_funding_intent_amount_tx(
+    tx: &Transaction<'_>,
+    intent_id: &str,
+    minimum_cooldown_until: &str,
+) -> Result<(), AppError> {
+    tx.execute(
+        "UPDATE market_funding_amount_reservations
+         SET status = 'cooldown',
+             cooldown_until = CASE
+                 WHEN COALESCE((SELECT late_grace_until
+                                  FROM market_funding_intents
+                                 WHERE id = ?1), '') > ?2
+                 THEN (SELECT late_grace_until
+                         FROM market_funding_intents
+                        WHERE id = ?1)
+                 ELSE ?2
+             END
+         WHERE intent_id = ?1 AND status = 'reserved'",
+        params![intent_id, minimum_cooldown_until],
+    )
+    .map_err(map_db("cool Binance funding amount"))?;
+    Ok(())
+}
+
 fn cancel_payment_account_intents_tx(
     tx: &Transaction<'_>,
     payment_account_id: &str,
@@ -3171,6 +4359,22 @@ fn cancel_payment_account_intents_tx(
     for intent_id in intent_ids {
         cancel_intent_tx(tx, &intent_id, reason, now, cooldown_until)?;
     }
+    let funding_intent_ids = tx
+        .prepare(
+            "SELECT id FROM market_funding_intents
+             WHERE payment_account_id = ?1 AND status IN ('pending', 'expired')",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![payment_account_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db(
+            "read payment-account Binance funding intents to cancel",
+        ))?;
+    for intent_id in funding_intent_ids {
+        cancel_funding_intent_tx(tx, &intent_id, reason, now, cooldown_until)?;
+    }
     // Buyer-cancelled/refreshed intents normally remain visible to the poller
     // until their late-payment window closes. A Binance UID change or account
     // disable is a stronger identity boundary: relabel every still-live
@@ -3185,6 +4389,16 @@ fn cancel_payment_account_intents_tx(
     )
     .map_err(map_db(
         "fence cancelled Binance intents at account boundary",
+    ))?;
+    tx.execute(
+        "UPDATE market_funding_intents
+         SET cancellation_reason = ?2, updated_at = ?3
+         WHERE payment_account_id = ?1 AND status = 'cancelled'
+           AND late_grace_until >= ?3",
+        params![payment_account_id, reason, now],
+    )
+    .map_err(map_db(
+        "fence cancelled Binance funding intents at account boundary",
     ))?;
     Ok(())
 }
@@ -3251,6 +4465,40 @@ fn expire_due_intents_tx(
     Ok(())
 }
 
+fn expire_due_funding_intents_tx(
+    tx: &Transaction<'_>,
+    now: &str,
+    cooldown_until: &str,
+) -> Result<(), AppError> {
+    tx.execute(
+        "UPDATE market_funding_intents
+         SET status = 'expired', updated_at = ?1
+         WHERE status = 'pending' AND expires_at < ?1",
+        params![now],
+    )
+    .map_err(map_db("expire Binance funding intents"))?;
+    tx.execute(
+        "UPDATE market_funding_amount_reservations
+         SET status = 'cooldown',
+             cooldown_until = CASE
+                 WHEN COALESCE((SELECT late_grace_until
+                                  FROM market_funding_intents
+                                 WHERE id = market_funding_amount_reservations.intent_id), '') > ?2
+                 THEN (SELECT late_grace_until
+                         FROM market_funding_intents
+                        WHERE id = market_funding_amount_reservations.intent_id)
+                 ELSE ?2
+             END
+         WHERE status = 'reserved' AND intent_id IN (
+            SELECT id FROM market_funding_intents
+            WHERE status = 'expired' AND updated_at = ?1
+         )",
+        params![now, cooldown_until],
+    )
+    .map_err(map_db("cool expired Binance funding amounts"))?;
+    Ok(())
+}
+
 fn release_elapsed_reservations_tx(tx: &Transaction<'_>, now: &str) -> Result<(), AppError> {
     tx.execute(
         "UPDATE market_payment_amount_reservations
@@ -3259,6 +4507,20 @@ fn release_elapsed_reservations_tx(tx: &Transaction<'_>, now: &str) -> Result<()
         params![now],
     )
     .map_err(map_db("release elapsed Binance payment amounts"))?;
+    Ok(())
+}
+
+fn release_elapsed_funding_reservations_tx(
+    tx: &Transaction<'_>,
+    now: &str,
+) -> Result<(), AppError> {
+    tx.execute(
+        "UPDATE market_funding_amount_reservations
+         SET status = 'released', released_at = ?1
+         WHERE status = 'cooldown' AND cooldown_until <= ?1",
+        params![now],
+    )
+    .map_err(map_db("release elapsed Binance funding amounts"))?;
     Ok(())
 }
 
@@ -3545,6 +4807,18 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES (?1, ?2, 'active', ?3, ?3), (?4, ?5, 'active', ?3, ?3)",
+                params![
+                    buyer.user_id,
+                    buyer.email,
+                    now,
+                    supplier.user_id,
+                    supplier.email,
+                ],
+            )
+            .expect("insert settlement fixture users");
+            conn.execute(
                 "INSERT INTO account_payment_profiles (
                     user_id, owner_email, methods_json, contacts_json, updated_at
                  ) VALUES (?1, ?2, ?3, '[]', ?4)",
@@ -3722,6 +4996,65 @@ mod tests {
         assert_eq!(
             decoded.credentials.api_secret,
             fixture.credentials.api_secret
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_availability_matches_the_create_intent_account_gate() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "funding-availability").await;
+        assert!(
+            store
+                .binance_supplier_funding_available_for_cipher(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &fixture.cipher,
+                )
+                .await
+                .expect("read available funding account")
+        );
+        assert!(
+            !store
+                .binance_supplier_funding_available_for_cipher(
+                    &fixture.supplier.user_id,
+                    "another-region",
+                    &fixture.cipher,
+                )
+                .await
+                .expect("reject a funding account in another region")
+        );
+        let rotated_cipher = CredentialCipher::new([8; 32], fixture.cipher.version() + 1);
+        assert!(
+            !store
+                .binance_supplier_funding_available_for_cipher(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &rotated_cipher,
+                )
+                .await
+                .expect("reject a funding account encrypted with an old key version")
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE binance_payment_accounts SET permissions_verified_at = ?2 WHERE id = ?1",
+                params![
+                    fixture.payment_account_id,
+                    (Utc::now() - Duration::hours(super::super::PERMISSION_REVERIFY_HOURS + 1))
+                        .to_rfc3339(),
+                ],
+            )
+            .expect("age funding account permission verification");
+        }
+        assert!(
+            !store
+                .binance_supplier_funding_available_for_cipher(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &fixture.cipher,
+                )
+                .await
+                .expect("reject stale funding permissions")
         );
     }
 
@@ -4050,6 +5383,34 @@ mod tests {
             .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
             .await
             .expect("create intent before global disable");
+        let funding_buyer = session("global-disable-funding-buyer");
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::set_product_access_decision_tx(
+                &conn,
+                &fixture.supplier.user_id,
+                &fixture.supplier.email,
+                &funding_buyer.user_id,
+                &funding_buyer.email,
+                crate::market_access::PRODUCT_SHARE,
+                crate::market_access::PRICING_PAID,
+                "allow",
+                &fixture.supplier.user_id,
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("approve funding buyer before global disable");
+        }
+        let funding_intent = store
+            .binance_create_funding_intent_for_cipher(
+                &funding_buyer,
+                &fixture.supplier.user_id,
+                500,
+                "global-disable-funding",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect("create funding intent before global disable");
         let account = claim_account(&store).await;
 
         store
@@ -4107,6 +5468,22 @@ mod tests {
         assert!(state.3 >= intent.expires_at);
         assert!(state.4.is_none());
         assert_eq!(state.5, "shadow");
+        let funding_state: (String, String, String, String) = conn
+            .query_row(
+                "SELECT intent.status, intent.cancellation_reason,
+                        reservation.status, reservation.cooldown_until
+                 FROM market_funding_intents intent
+                 JOIN market_funding_amount_reservations reservation
+                   ON reservation.intent_id = intent.id
+                 WHERE intent.id = ?1",
+                params![funding_intent.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read globally disabled funding state");
+        assert_eq!(funding_state.0, "cancelled");
+        assert_eq!(funding_state.1, "global_settlement_disabled");
+        assert_eq!(funding_state.2, "cooldown");
+        assert!(funding_state.3 >= funding_intent.expires_at);
         drop(conn);
         assert!(matches!(
             store
@@ -4808,6 +6185,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn funding_never_exposes_payment_instructions_for_an_undecryptable_account() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "funding-wrong-master-key").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_invoices SET status = 'paid', paid_at = ?2 WHERE id = ?1",
+                params![fixture.invoice_id, Utc::now().to_rfc3339()],
+            )
+            .expect("settle fixture invoice before funding key test");
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET status = 'active', balance_units = 0, open_invoice_id = NULL
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![fixture.buyer.user_id, fixture.supplier.user_id],
+            )
+            .expect("clear fixture debt before funding key test");
+        }
+        let intent = store
+            .binance_create_funding_intent_for_cipher(
+                &fixture.buyer,
+                &fixture.supplier.user_id,
+                500,
+                "funding-key-valid",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect("create funding intent with configured key");
+        let wrong_cipher = CredentialCipher::new([8; 32], fixture.cipher.version());
+        assert!(
+            !store
+                .binance_supplier_funding_available_for_cipher(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &wrong_cipher,
+                )
+                .await
+                .expect("hide funding for an undecryptable account")
+        );
+        assert!(matches!(
+            store
+                .binance_create_funding_intent_for_cipher(
+                    &fixture.buyer,
+                    &fixture.supplier.user_id,
+                    500,
+                    "funding-key-invalid",
+                    "test",
+                    &wrong_cipher,
+                )
+                .await,
+            Err(AppError::ServiceUnavailable(_))
+        ));
+
+        let conn = store.conn.lock().await;
+        let state: (String, Option<String>, String, String, i64) = conn
+            .query_row(
+                "SELECT account.status, account.permissions_verified_at,
+                        account.last_poll_error_code, intent.status,
+                        (SELECT COUNT(*) FROM market_funding_intents
+                         WHERE prepaid_account_id = intent.prepaid_account_id)
+                 FROM binance_payment_accounts account
+                 JOIN market_funding_intents intent ON intent.payment_account_id = account.id
+                 WHERE account.id = ?1 AND intent.id = ?2",
+                params![fixture.payment_account_id, intent.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read undecryptable funding account state");
+        assert_eq!(state.0, "degraded");
+        assert!(state.1.is_none());
+        assert_eq!(state.2, "CREDENTIAL_DECRYPT_FAILED");
+        assert_eq!(state.3, "cancelled");
+        assert_eq!(state.4, 1);
+    }
+
+    #[tokio::test]
     async fn unconfirmed_uid_and_stale_permissions_block_new_payment_intents() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let fixture = settlement_fixture(&store, "stale-account-proof").await;
@@ -5034,6 +6495,31 @@ mod tests {
         assert_eq!(transaction_count, 1);
         assert_eq!(receipt_count, 1);
         assert_eq!(uid_confirmed, 1);
+        let surplus: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT intent.pay_amount_units - intent.base_amount_units,
+                        prepaid.posted_balance_units,
+                        (SELECT COUNT(*) FROM market_prepaid_ledger_entries ledger
+                         WHERE ledger.account_id = prepaid.id
+                           AND ledger.source_kind = 'invoice_payment_surplus')
+                 FROM market_payment_intents intent
+                 JOIN market_invoices invoice ON invoice.id = intent.invoice_id
+                 JOIN market_credit_accounts credit ON credit.id = invoice.account_id
+                 JOIN market_prepaid_accounts prepaid
+                   ON prepaid.buyer_user_id = credit.buyer_user_id
+                  AND prepaid.supplier_user_id = credit.supplier_user_id
+                  AND prepaid.currency = credit.currency
+                 WHERE intent.id = ?1",
+                params![intent.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read exact-payment suffix credited to prepaid");
+        assert!(surplus.0 > 0);
+        assert_eq!(
+            surplus.1,
+            surplus.0 * (crate::market_billing::MONEY_UNITS_PER_MINOR / 100)
+        );
+        assert_eq!(surplus.2, 1);
         let transaction_account_snapshot: (String, i64, i64, String, String, String) = conn
             .query_row(
                 "SELECT account_binance_uid, account_credential_revision,
@@ -5072,6 +6558,265 @@ mod tests {
         assert_eq!(history.items.len(), 1);
         assert_eq!(history.items[0].source, "binance_auto");
         assert_eq!(history.items[0].transaction_id, "tx-exact");
+    }
+
+    #[tokio::test]
+    async fn funding_intent_and_duplicate_transaction_credit_prepaid_exactly_once() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "funding-idempotent").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_invoices SET status = 'paid', paid_at = ?2 WHERE id = ?1",
+                params![fixture.invoice_id, Utc::now().to_rfc3339()],
+            )
+            .expect("settle fixture invoice before prepaid funding");
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET status = 'active', balance_units = 0, open_invoice_id = NULL
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![fixture.buyer.user_id, fixture.supplier.user_id],
+            )
+            .expect("clear fixture debt before prepaid funding");
+        }
+        let intent = store
+            .binance_create_funding_intent_for_cipher(
+                &fixture.buyer,
+                &fixture.supplier.user_id,
+                500,
+                "funding-idempotent-key",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect("create prepaid funding intent");
+        let replay = store
+            .binance_create_funding_intent_for_cipher(
+                &fixture.buyer,
+                &fixture.supplier.user_id,
+                500,
+                "funding-idempotent-key",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect("replay prepaid funding intent");
+        assert_eq!(replay.id, intent.id);
+        assert!(matches!(
+            store
+                .binance_create_funding_intent_for_cipher(
+                    &fixture.buyer,
+                    &fixture.supplier.user_id,
+                    501,
+                    "funding-idempotent-key",
+                    "test",
+                    &fixture.cipher,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        let account = claim_account(&store).await;
+        let mut payment = transaction(
+            "tx-funding-idempotent",
+            &intent.pay_amount,
+            "USDT",
+            "C2C",
+            None,
+        );
+        payment.payer_info.binance_id = serde_json::json!("777888999");
+        let actions = store
+            .binance_process_poll_success(
+                &account,
+                "test-worker",
+                &[payment.clone(), payment],
+                &fixture.cipher,
+                true,
+                4,
+            )
+            .await
+            .expect("credit duplicate-observed prepaid funding transaction");
+        assert!(actions.is_empty());
+
+        let conn = store.conn.lock().await;
+        let state: (String, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT intent.status, intent.pay_amount_units,
+                        prepaid.posted_balance_units,
+                        (SELECT COUNT(*) FROM market_funding_receipts
+                         WHERE funding_intent_id = intent.id),
+                        (SELECT COUNT(*) FROM market_prepaid_ledger_entries
+                         WHERE source_kind = 'funding_intent' AND source_id = intent.id),
+                        (SELECT COUNT(*) FROM binance_pay_transactions
+                         WHERE payment_account_id = intent.payment_account_id
+                           AND transaction_id = 'tx-funding-idempotent')
+                 FROM market_funding_intents intent
+                 JOIN market_prepaid_accounts prepaid ON prepaid.id = intent.prepaid_account_id
+                 WHERE intent.id = ?1",
+                params![intent.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read idempotent prepaid funding result");
+        assert_eq!(state.0, "credited");
+        assert_eq!(
+            state.2,
+            state.1 * (100 * crate::market_billing::MONEY_UNITS_PER_MINOR / PAYMENT_AMOUNT_SCALE)
+        );
+        assert_eq!((state.3, state.4, state.5), (1, 1, 1));
+        assert!(state.1 % (PAYMENT_AMOUNT_SCALE / 100) > 0);
+        drop(conn);
+        let credited = store
+            .binance_funding_intent(&fixture.buyer, &intent.id)
+            .await
+            .expect("read credited prepaid funding intent");
+        assert_eq!(
+            credited.credited_minor,
+            Some(state.2 / crate::market_billing::MONEY_UNITS_PER_MINOR)
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_intent_requires_an_approved_or_established_market_relationship() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "funding-access").await;
+        let outsider = session("funding-access-outsider");
+
+        let error = store
+            .binance_create_funding_intent_for_cipher(
+                &outsider,
+                &fixture.supplier.user_id,
+                500,
+                "funding-access-outsider-key",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect_err("unrelated buyer must not receive supplier Binance payment details");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_ACCESS_REQUIRED)
+        );
+        let prepaid_accounts: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM market_prepaid_accounts
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![outsider.user_id, fixture.supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("count unauthorized prepaid accounts");
+        assert_eq!(prepaid_accounts, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_funding_late_payment_can_be_reconciled_without_an_invoice() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "funding-cancelled-late").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_invoices SET status = 'paid', paid_at = ?2 WHERE id = ?1",
+                params![fixture.invoice_id, Utc::now().to_rfc3339()],
+            )
+            .expect("settle fixture invoice before late prepaid funding");
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET status = 'active', balance_units = 0, open_invoice_id = NULL
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![fixture.buyer.user_id, fixture.supplier.user_id],
+            )
+            .expect("clear fixture debt before late prepaid funding");
+        }
+        let intent = store
+            .binance_create_funding_intent_for_cipher(
+                &fixture.buyer,
+                &fixture.supplier.user_id,
+                500,
+                "funding-cancelled-late-key",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect("create cancellable prepaid funding intent");
+        store
+            .binance_cancel_funding_intent(&fixture.buyer, &intent.id)
+            .await
+            .expect("cancel prepaid funding intent before its late payment arrives");
+
+        let account = claim_account(&store).await;
+        let mut payment = transaction(
+            "tx-funding-cancelled-late",
+            &intent.pay_amount,
+            "USDT",
+            "C2C",
+            None,
+        );
+        payment.payer_info.binance_id = serde_json::json!("777888999");
+        store
+            .binance_process_poll_success(
+                &account,
+                "test-worker",
+                &[payment],
+                &fixture.cipher,
+                true,
+                4,
+            )
+            .await
+            .expect("route cancelled-intent payment to review");
+        let case_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT id FROM market_payment_reconciliation_cases
+                 WHERE funding_intent_id = ?1 AND status = 'open'",
+                params![intent.id],
+                |row| row.get(0),
+            )
+            .expect("read cancelled funding reconciliation case");
+        let actions = store
+            .binance_resolve_reconciliation_case(
+                &session("funding-admin"),
+                &case_id,
+                "settle",
+                None,
+                Some("late transfer verified"),
+            )
+            .await
+            .expect("settle cancelled funding without an invoice");
+        assert!(actions.is_empty());
+
+        let state: (String, i64, String, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT intent.status, prepaid.posted_balance_units, reconciliation.status,
+                        (SELECT COUNT(*) FROM market_funding_receipts
+                         WHERE funding_intent_id = intent.id)
+                 FROM market_funding_intents intent
+                 JOIN market_prepaid_accounts prepaid ON prepaid.id = intent.prepaid_account_id
+                 JOIN market_payment_reconciliation_cases reconciliation
+                   ON reconciliation.funding_intent_id = intent.id
+                 WHERE intent.id = ?1",
+                params![intent.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read reconciled late funding state");
+        assert_eq!(state.0, "credited");
+        assert!(state.1 > 0);
+        assert_eq!((state.2, state.3), ("settled".into(), 1));
     }
 
     #[tokio::test]

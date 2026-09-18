@@ -25,6 +25,10 @@ import {
 } from "@/components/common/seller-approval-dialog";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import {
+  MarketFundingSummaryCard,
+  MarketFundingTopupDialog,
+} from "@/components/dashboard/market-funding-topup-dialog";
+import {
   CatalogSeatPreviewList,
   MARKET_SHARE_CARD_GRID_CLASS,
   MarketShareCard,
@@ -38,9 +42,14 @@ import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-ut
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
+import {
+  applyMarketFundingConflict,
+  marketFundingConflictFromError,
+} from "@/lib/market-funding";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
   MarketEligibility,
+  MarketFundingSummary,
   ShareMarketCatalog,
   ShareMarketListing,
   ShareMarketProviderFamily,
@@ -285,6 +294,7 @@ export function ShareMarketBuyerCatalog({
   const [page, setPage] = React.useState(1);
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
   const [rentTarget, setRentTarget] = React.useState<RentTarget | null>(null);
+  const [topupFunding, setTopupFunding] = React.useState<MarketFundingSummary>();
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
   const [busySeatId, setBusySeatId] = React.useState("");
   const [error, setError] = React.useState("");
@@ -292,7 +302,7 @@ export function ShareMarketBuyerCatalog({
   const focusedRef = React.useRef("");
   const skipPageResetRef = React.useRef(false);
   const rentals = useShareMarketRentalActions(onChanged);
-  const pausePolling = !!rentTarget || !!accessTarget || !!busySeatId || rentals.interactionActive;
+  const pausePolling = !!rentTarget || !!topupFunding || !!accessTarget || !!busySeatId || rentals.interactionActive;
 
   React.useEffect(() => {
     onInteractionChange?.(pausePolling);
@@ -438,6 +448,16 @@ export function ShareMarketBuyerCatalog({
         setQuoteNowMs(Date.parse(rentTarget.quote.expiresAt));
         setError(t("shareMarket.rentConfirm.expired"));
       } else {
+        const fundingConflict = marketFundingConflictFromError(reason);
+        if (fundingConflict) {
+          setRentTarget((current) => current?.quote.funding ? {
+            ...current,
+            quote: {
+              ...current.quote,
+              funding: applyMarketFundingConflict(current.quote.funding, fundingConflict),
+            },
+          } : current);
+        }
         setError(shareMarketMutationError(reason, t));
       }
     } finally {
@@ -452,6 +472,7 @@ export function ShareMarketBuyerCatalog({
     ? Math.max(0, Math.ceil((Date.parse(rentTarget.quote.expiresAt) - quoteNowMs) / 1_000))
     : 0;
   const quoteExpired = !!rentTarget && quoteRemainingSeconds <= 0;
+  const fundingShortfall = rentTarget?.quote.funding?.requiredTopupMinor || 0;
 
   const displayError = error || rentals.error;
 
@@ -620,6 +641,8 @@ export function ShareMarketBuyerCatalog({
                     <dt className="text-slate-500">{t("shareMarket.dialog.amount")}</dt><dd className="font-medium">{formatSeatPrice({ isFree: rentTarget.quote.offer.dailyRateMinor == null, dailyRateMinor: rentTarget.quote.offer.dailyRateMinor }, locale, t("shareMarket.free"), t("marketBilling.day"))}</dd>
                   </dl>
                   <div className="flex gap-3 border-l-2 border-sky-400 bg-sky-50 px-3 py-2 text-sm leading-6 text-sky-950"><Clock3 className="mt-1 h-4 w-4 shrink-0" /><div><p>{rentTarget.quote.offer.dailyRateMinor == null ? t("shareMarket.rentConfirm.freeBilling") : t("shareMarket.rentConfirm.postpaid", { hours: rentTarget.quote.offer.trialHours ?? catalog.trialHours, tokens: rentTarget.quote.offer.trialTokenLimit != null ? t("shareMarket.rentConfirm.trialTokens", { tokens: formatTokenMillions(rentTarget.quote.offer.trialTokenLimit, locale) }) : "" })}</p>{rentTarget.quote.offer.dailyRateMinor != null ? <strong className="mt-1 block text-xs">{rentTarget.quote.trialSecondsRemaining > 0 ? t("shareMarket.rentConfirm.remainingTrial", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1) }) : t("shareMarket.rentConfirm.noTrial")}</strong> : null}</div></div>
+                  {rentTarget.quote.funding ? <MarketFundingSummaryCard funding={rentTarget.quote.funding} /> : null}
+                  {fundingShortfall > 0 && !rentTarget.quote.funding?.topupAvailable ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t("marketFunding.topup.unavailable")}</p> : null}
                   <div className="flex gap-3 border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-950"><CalendarClock className="mt-1 h-4 w-4 shrink-0" /><p>{rentTarget.quote.offer.serviceDurationDays == null ? t("shareMarket.rentConfirm.servicePermanent") : t("shareMarket.rentConfirm.serviceFixed", { days: rentTarget.quote.offer.serviceDurationDays })}</p></div>
                   <p className={cn("flex items-start gap-2 text-xs leading-5", quoteExpired ? "text-rose-700" : "text-slate-500")} title={t("shareMarket.rentConfirm.quoteExpiry", { time: new Intl.DateTimeFormat(locale, { timeStyle: "medium" }).format(new Date(rentTarget.quote.expiresAt)) })}><Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />{quoteExpired ? t("shareMarket.rentConfirm.expired") : t("shareMarket.rentConfirm.expiresIn", { seconds: quoteRemainingSeconds })}</p>
                   {error ? <p className="text-sm text-rose-700">{error}</p> : null}
@@ -628,11 +651,22 @@ export function ShareMarketBuyerCatalog({
             </Modal.Body>
             <Modal.Footer>
               <Button variant="ghost" isDisabled={!!busySeatId} onClick={() => setRentTarget(null)}>{t("common.cancel")}</Button>
-              <Button variant="primary" isDisabled={!!busySeatId} onClick={() => void (quoteExpired ? refreshQuote() : confirmRent())}>{busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : quoteExpired ? <RefreshCw className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}{quoteExpired ? t("shareMarket.rentConfirm.requote") : t("shareMarket.rentConfirm.confirm")}</Button>
+              {!quoteExpired && fundingShortfall > 0 && rentTarget?.quote.funding?.topupAvailable ? <Button variant="outline" isDisabled={!!busySeatId} onClick={() => setTopupFunding(rentTarget.quote.funding)}>{t("marketFunding.topup.action")}</Button> : null}
+              <Button variant="primary" isDisabled={!!busySeatId || (!quoteExpired && fundingShortfall > 0)} onClick={() => void (quoteExpired ? refreshQuote() : confirmRent())}>{busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : quoteExpired ? <RefreshCw className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}{quoteExpired ? t("shareMarket.rentConfirm.requote") : t("shareMarket.rentConfirm.confirm")}</Button>
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
+
+      <MarketFundingTopupDialog
+        open={!!topupFunding}
+        funding={topupFunding}
+        onClose={() => setTopupFunding(undefined)}
+        onCredited={async () => {
+          setTopupFunding(undefined);
+          await refreshQuote();
+        }}
+      />
 
       <MarketAccessDialog
         open={!!accessTarget}

@@ -132,7 +132,7 @@ export const messages = {
     "shareMarket.catalog.noObservations": "No recent observations",
     "shareMarket.catalog.thinSamples": "Not enough data yet",
     "shareMarket.catalog.approvalRequired": "Owner approval required",
-    "shareMarket.catalog.postpaid": "Postpaid",
+    "shareMarket.catalog.postpaid": "Paid",
     "shareMarket.catalog.details": "Details",
     "shareMarket.catalog.allFamilies": "All providers",
     "shareMarket.catalog.search": "Search provider, app, model, Share, owner, or rider",
@@ -161,7 +161,7 @@ export const messages = {
     "shareMarket.catalog.alreadyRenting": "You already rent this Share",
     "shareMarket.catalog.offlineHint": "Offline · cannot rent until the owner restores service",
     "shareMarket.catalog.multiProviders": "Multiple providers",
-    "shareMarket.catalog.postpaidHint": "Usage after the free window accrues on this owner's credit until an invoice is issued.",
+    "shareMarket.catalog.postpaidHint": "After the free window, paid usage consumes prepaid funds first; only explicit supplier credit covers a remainder.",
     "shareMarket.catalog.granting": "Granting access…",
     "shareMarket.catalog.seatPosition": "Seat {position}",
     "shareMarket.catalog.appCapabilities": "Provider",
@@ -291,15 +291,15 @@ export const messages = {
     "shareMarket.rentConfirm.expired": "This frozen quote has expired. Refresh it before confirming.",
     "shareMarket.rentConfirm.requote": "Refresh quote",
     "shareMarket.rentConfirm.postpaid":
-      "The first {hours} hours of healthy service are free and do not create charges{tokens}. After that, usage accrues on this Owner account at the daily rate. When this Owner's credit threshold is reached, one payable invoice may combine multiple Share and Client Host services.",
+      "The first {hours} hours of healthy service are free and do not create charges{tokens}. After that, usage is charged at the daily rate, using prepaid funds first and this Owner's explicit credit only for any remainder.",
     "shareMarket.rentConfirm.trialTokens":
       ", with a free trial token quota of {tokens}",
     "shareMarket.rentConfirm.freeBilling":
-      "This seat is free and does not create credit charges.",
+      "This seat is free and does not create charges.",
     "shareMarket.rentConfirm.remainingTrial":
       "You have {hours} hours of healthy-service trial remaining with this seller and Share. Billing starts only after it is used.",
     "shareMarket.rentConfirm.noTrial":
-      "No healthy-service trial remains for this seller and Share. Postpaid billing starts with healthy service.",
+      "No healthy-service trial remains for this seller and Share. Paid usage starts with healthy service.",
     "shareMarket.rentConfirm.activationStart":
       "A fixed service term and token-period anchor start when the first access dispatch begins, not when you click confirm.",
     "shareMarket.rentConfirm.quoteExpiry":
@@ -1467,11 +1467,11 @@ export const messages = {
       "Successful Clients remain allocated. Failed items were rolled back independently.",
     "createClient.selectHosts": "Select Hosts",
     "createClient.confirmCreate": "Confirm & create",
-    "createClient.quoteTerms.postpaidTitle": "Postpaid service",
+    "createClient.quoteTerms.postpaidTitle": "Paid service funding",
     "createClient.quoteTerms.postpaid":
-      "{count} paid Host(s) from {suppliers} supplier account(s) include {hours} hours of free healthy-service time. Charges then accrue by actual healthy service time and settle only when each supplier's credit threshold is reached; each supplier invoice may combine multiple Share and Client Host services.",
+      "{count} paid Host(s) from {suppliers} supplier account(s) include {hours} hours of free healthy-service time. Usage then consumes prepaid funds first and each supplier's explicit credit only for any remainder.",
     "createClient.quoteTerms.free":
-      "{count} free Host(s) create no credit charge. Any fixed free period starts after the Host is activated.",
+      "{count} free Host(s) create no charge. Any fixed free period starts after the Host is activated.",
     "createClient.tabManual": "Manual install",
     "createClient.tabOnline": "Online install",
     "createClient.manualDescription":
@@ -1547,18 +1547,18 @@ export const messages = {
     "marketAccess.mode.openHint":
       "New buyers can use this scope unless you explicitly deny them.",
     "marketAccess.policySaved": "Access policy saved.",
-    "marketAccess.blacklistBannerTitle": "Public paid-credit risk",
+    "marketAccess.blacklistBannerTitle": "Legacy public credit is enabled",
     "marketAccess.blacklistBanner":
-      "At least one paid scope is default-open, or public credit remains enabled. Unknown buyers can use this credit only while a paid scope is default-open; review or disable the public limit below.",
+      "This legacy public credit line can create debt for buyers without an individual grant. Review it below and disable it when migration is complete.",
     "marketAccess.blacklistConfirmTitle": "Enable blacklist mode?",
     "marketAccess.blacklistConfirmDescription":
-      "This scope will allow users without a private trust relationship unless you explicitly deny them. Paid rentals also require public credit to be enabled.",
+      "This scope will allow users without a private trust relationship unless you explicitly deny them. Paid rentals still require prepaid funds or an individual credit grant.",
     "marketAccess.blacklistConfirmCheckbox":
       "I understand that unknown users may consume my services before I can deny them.",
     "marketAccess.enableBlacklist": "Enable blacklist mode",
-    "marketAccess.publicCreditTitle": "Public credit for blacklist mode",
+    "marketAccess.publicCreditTitle": "Legacy public credit",
     "marketAccess.publicCreditHint":
-      "Optional limited credit for paid rentals by users without a private credit grant. Unlimited public credit is never allowed.",
+      "This compatibility-only credit applies to old accounts. New public credit cannot be enabled; disable it after affected buyers receive individual grants or move to prepaid funding.",
     "marketAccess.publicConfirm": "I accept this public credit exposure",
     "marketAccess.publicConfirmRequired":
       "Confirm the public credit exposure before saving.",
@@ -1566,7 +1566,7 @@ export const messages = {
     "marketAccess.addTitle": "Add a trusted buyer",
     "marketAccess.addCreditTitle": "Initial account-level USD credit",
     "marketAccess.addCreditHint":
-      "Required for paid access. This credit is shared by all paid Share seats and Client Hosts this buyer rents from you.",
+      "Optional. Leave as no credit for prepaid-only access, or grant a limit shared by all paid Share seats and Client Hosts this buyer rents from you.",
     "marketAccess.addCreditRequired":
       "Set an initial USD credit limit or explicitly allow unlimited credit for paid access.",
     "marketAccess.buyersTitle": "Trusted buyers",
@@ -1608,7 +1608,7 @@ export const messages = {
       "This grants {buyer} access to every {pricing} {product} offer from your supplier account. {target} is the current request context, not the approval boundary.",
     "marketAccess.approvalCreditTitle": "Account-level USD credit",
     "marketAccess.approvalCreditHint":
-      "This limit is shared by all paid Share seats and Client Hosts this buyer rents from you. The suggested amount covers about seven days of this requested service.",
+      "Optional. Leave as no credit for prepaid-only access, or grant a limit shared by all paid Share seats and Client Hosts this buyer rents from you.",
     "marketAccess.currentExposure": "Current accrued exposure",
     "marketAccess.activeServicesLabel": "Active paid services",
     "marketAccess.approveFreeHint":
@@ -1617,7 +1617,7 @@ export const messages = {
     "marketAccess.rejectionReasonRequired": "Enter a rejection reason.",
     "marketAccess.rejectionCooldown":
       "After rejection, this buyer must wait 24 hours before applying for the same supplier scope again.",
-    "marketAccess.approveConfirm": "Approve and grant credit",
+    "marketAccess.approveConfirm": "Approve access",
     "marketAccess.rejectConfirm": "Reject request",
     "marketAccess.revokeConfirmTitle": "Review relationship revocation",
     "marketAccess.revokeConfirmDescription":
@@ -1680,7 +1680,7 @@ export const messages = {
     "marketBilling.title": "Market billing",
     "marketBilling.open": "Open billing",
     "marketBilling.subtitle":
-      "Share and Client Host usage is postpaid by supplier account. Only healthy service time is billed, after a {hours}-hour healthy-time trial.",
+      "Healthy usage starts after a {hours}-hour trial. Prepaid balance is used first; explicit supplier credit is the fallback.",
     "marketBilling.supplier": "Supplier",
     "marketBilling.buyer": "Buyer",
     "marketBilling.day": "day",
@@ -1697,6 +1697,57 @@ export const messages = {
     "marketBilling.estimatedSettlement": "Estimated credit limit time",
     "marketBilling.creditUsed": "Credit used",
     "marketBilling.unbilledBalance": "Accrued, not yet invoiced",
+    "marketBilling.creditOutstanding": "Credit owed",
+    "marketBilling.creditAvailable": "Credit remaining",
+    "marketBilling.prepaid.badge": "Prepaid",
+    "marketBilling.prepaid.balance": "Prepaid balance",
+    "marketBilling.prepaid.held": "Reserved funds",
+    "marketBilling.prepaid.available": "Available balance",
+    "marketBilling.prepaid.amountUsd": "Amount (USD)",
+    "marketBilling.prepaid.amountInvalid": "Enter a valid positive USD amount with no more than two decimal places.",
+    "marketBilling.prepaid.topup.action": "Top up",
+    "marketBilling.prepaid.topup.create": "Create Binance transfer",
+    "marketBilling.prepaid.topup.credited": "Prepaid funds received.",
+    "marketBilling.prepaid.topup.unavailable": "This supplier has not enabled Binance automatic top-ups.",
+    "marketBilling.prepaid.topup.status.credited": "Funds credited",
+    "marketBilling.prepaid.ledger.title": "Prepaid transactions",
+    "marketBilling.prepaid.ledger.topup": "Top-up received",
+    "marketBilling.prepaid.ledger.usage": "Service usage",
+    "marketBilling.prepaid.ledger.refund": "Refund paid",
+    "marketBilling.prepaid.ledger.serviceCredit": "Service credit",
+    "marketBilling.prepaid.ledger.adjustment": "Balance adjustment",
+    "marketBilling.prepaid.ledger.after": "balance {amount}",
+    "marketBilling.prepaid.ledger.empty": "No prepaid transactions yet.",
+    "marketBilling.prepaid.refund.title": "Prepaid refund requests",
+    "marketBilling.prepaid.refund.request": "Request refund",
+    "marketBilling.prepaid.refund.approve": "Approve refund",
+    "marketBilling.prepaid.refund.reject": "Reject refund",
+    "marketBilling.prepaid.refund.record": "Record refund paid",
+    "marketBilling.prepaid.refund.reason": "Reason (optional)",
+    "marketBilling.prepaid.refund.amount": "Requested refund",
+    "marketBilling.prepaid.refund.status.requested": "Awaiting review",
+    "marketBilling.prepaid.refund.status.approved": "Approved; awaiting payment",
+    "marketBilling.prepaid.refund.status.rejected": "Rejected",
+    "marketBilling.prepaid.refund.status.recorded": "Paid",
+    "marketBilling.prepaid.refund.status.cancelled": "Cancelled",
+    "marketFunding.title": "Funding for this supplier",
+    "marketFunding.mode.prepaid": "Prepaid only",
+    "marketFunding.mode.hybrid": "Prepaid + credit",
+    "marketFunding.prepaidAvailable": "Available prepaid",
+    "marketFunding.creditAvailable": "Available credit",
+    "marketFunding.credit.unlimited": "Unlimited",
+    "marketFunding.credit.none": "No credit",
+    "marketFunding.coverage": "One-day coverage",
+    "marketFunding.shortfall": "Amount to top up",
+    "marketFunding.policy":
+      "Paid usage consumes prepaid funds first. Only an explicit supplier credit line can cover the remainder.",
+    "marketFunding.topup.minimum": "Top up at least {amount} to cover this order.",
+    "marketFunding.topup.action": "Top up with Binance",
+    "marketFunding.topup.unavailable":
+      "This supplier has not enabled Binance top-ups. Ask the supplier to enable them or grant an explicit credit line.",
+    "marketFunding.topup.quoteRefreshFallback":
+      "The top-up was credited. The existing quote remains open and funding will be checked again when you confirm.",
+    "marketFunding.blocked": "Add enough prepaid funds before confirming this order.",
     "marketBilling.product.share": "Share seat",
     "marketBilling.product.clientHost": "Client Host",
     "marketBilling.status.active": "Accruing",
@@ -1794,12 +1845,12 @@ export const messages = {
     "marketBilling.profile.saved": "{currency} payment policy saved.",
     "marketBilling.payables.title": "Accounts payable",
     "marketBilling.payables.hint":
-      "Each supplier has one USD balance shared across all rented Share seats and Client Hosts.",
-    "marketBilling.payables.empty": "No supplier credit accounts yet.",
+      "Each supplier has a separate USD prepaid balance and credit account shared by Share seats and Client Hosts.",
+    "marketBilling.payables.empty": "No supplier billing accounts yet.",
     "marketBilling.receivables.title": "Accounts receivable",
     "marketBilling.receivables.hint":
-      "Review buyer exposure, combined invoices, and payment declarations before confirming receipt.",
-    "marketBilling.receivables.empty": "No buyer credit accounts yet.",
+      "Review buyer prepaid funds, explicit credit exposure, invoices, and refund requests.",
+    "marketBilling.receivables.empty": "No buyer billing accounts yet.",
     "marketBilling.declare.method": "Payment method",
     "marketBilling.declare.methodOther": "Other / arranged offline",
     "marketBilling.declare.reference": "Transfer reference",
@@ -1882,9 +1933,12 @@ export const messages = {
     "marketBilling.binance.admin.uid": "UID {uid}",
     "marketBilling.binance.admin.account": "Account {account}",
     "marketBilling.binance.admin.invoiceId": "Target invoice ID",
+    "marketBilling.binance.admin.prepaidFunding": "Prepaid funding",
     "marketBilling.binance.admin.settle": "Settle invoice",
     "marketBilling.binance.admin.settleConfirm":
       "Settle invoice {invoice} using the observed payment of {amount}? This changes billing state and is recorded in the audit trail.",
+    "marketBilling.binance.admin.settleFundingConfirm":
+      "Credit the observed payment of {amount} to this prepaid account? This changes billing state and is recorded in the audit trail.",
     "marketBilling.binance.admin.ignore": "Ignore transaction",
     "marketBilling.binance.admin.empty": "No Binance transactions require review.",
     "marketBilling.binance.admin.invoiceRequired": "Enter the target invoice ID.",
@@ -1907,6 +1961,11 @@ export const messages = {
     "marketBilling.dialog.admin-void": "Void disputed invoice",
     "marketBilling.dialog.admin-invoice-void": "Force void invoice",
     "marketBilling.dialog.record-refund": "Record completed external refund",
+    "marketBilling.dialog.topup": "Top up prepaid balance",
+    "marketBilling.dialog.request-prepaid-refund": "Request prepaid refund",
+    "marketBilling.dialog.approve-prepaid-refund": "Approve prepaid refund",
+    "marketBilling.dialog.reject-prepaid-refund": "Reject prepaid refund",
+    "marketBilling.dialog.record-prepaid-refund": "Record prepaid refund paid",
     "marketBilling.dialog.settle.description":
       "The current accrued balance becomes payable now and all services on this supplier account pause until the supplier confirms receipt.",
     "marketBilling.dialog.request-settlement.description":
@@ -3638,7 +3697,7 @@ export const messages = {
     "shareMarket.catalog.noObservations": "暂无近期观测",
     "shareMarket.catalog.thinSamples": "样本不足",
     "shareMarket.catalog.approvalRequired": "需要车主准入",
-    "shareMarket.catalog.postpaid": "后付费",
+    "shareMarket.catalog.postpaid": "付费",
     "shareMarket.catalog.details": "详情",
     "shareMarket.catalog.allFamilies": "全部供应商",
     "shareMarket.catalog.search": "搜索供应商、App、模型、Share、车主或拼车用户",
@@ -3667,7 +3726,7 @@ export const messages = {
     "shareMarket.catalog.alreadyRenting": "你已租用该 Share",
     "shareMarket.catalog.offlineHint": "离线 · 车主恢复服务前无法租用",
     "shareMarket.catalog.multiProviders": "多供应商",
-    "shareMarket.catalog.postpaidHint": "免费窗口结束后按实际用量计入该车主赊账，额度用满后出账。",
+    "shareMarket.catalog.postpaidHint": "免费窗口结束后，付费消费优先扣除预存，仅不足部分使用商家明确授予的信用额度。",
     "shareMarket.catalog.granting": "正在授权…",
     "shareMarket.catalog.seatPosition": "拼车位 {position}",
     "shareMarket.catalog.appCapabilities": "供应商",
@@ -3796,14 +3855,14 @@ export const messages = {
     "shareMarket.rentConfirm.expired": "该冻结报价已失效，请刷新报价后再确认。",
     "shareMarket.rentConfirm.requote": "刷新报价",
     "shareMarket.rentConfirm.postpaid":
-      "前 {hours} 小时健康服务时间免费且不产生费用{tokens}；之后按实际健康服务时间和日费累计到该 Owner 的赊账账户。用满该 Owner 授予的信用额度后生成应付账单，一张账单可能合并多个 Share 和 Client Host 服务。",
+      "前 {hours} 小时健康服务时间免费且不产生费用{tokens}；之后按日费计费，优先扣除预存，仅不足部分使用该 Owner 明确授予的信用额度。",
     "shareMarket.rentConfirm.trialTokens":
       "，试用 Token 额度为 {tokens}",
-    "shareMarket.rentConfirm.freeBilling": "该拼车位免费，不会产生赊账费用。",
+    "shareMarket.rentConfirm.freeBilling": "该拼车位免费，不会产生费用。",
     "shareMarket.rentConfirm.remainingTrial":
       "你在该卖家和 Share 下还剩 {hours} 小时健康服务试用；用完后才开始计费。",
     "shareMarket.rentConfirm.noTrial":
-      "你在该卖家和 Share 下已无健康服务试用；健康服务开始后进入后付费。",
+      "你在该卖家和 Share 下已无健康服务试用；健康服务开始后进入付费。",
     "shareMarket.rentConfirm.activationStart":
       "固定服务期限和 Token 周期从首次开始下发访问权限时起算，而不是从点击确认时起算。",
     "shareMarket.rentConfirm.quoteExpiry":
@@ -4929,11 +4988,11 @@ export const messages = {
       "成功的 Client 会保留分配；失败项已分别回滚。",
     "createClient.selectHosts": "选择 Host",
     "createClient.confirmCreate": "确认并创建",
-    "createClient.quoteTerms.postpaidTitle": "后付费服务",
+    "createClient.quoteTerms.postpaidTitle": "付费服务资金",
     "createClient.quoteTerms.postpaid":
-      "本次包含来自 {suppliers} 个供应商账户的 {count} 台付费 Host；每台都有 {hours} 小时免费健康服务时间，之后按实际健康服务时间累计费用。用满各供应商授予的信用额度后分别生成账单，一张账单可能合并多个 Share 和 Client Host 服务。",
+      "本次包含来自 {suppliers} 个供应商账户的 {count} 台付费 Host；每台都有 {hours} 小时免费健康服务时间，之后优先扣除预存，仅不足部分使用各供应商明确授予的信用额度。",
     "createClient.quoteTerms.free":
-      "本次包含 {count} 台免费 Host，不产生赊账费用；如有固定免费期限，将从 Host 实际激活后开始计算。",
+      "本次包含 {count} 台免费 Host，不产生费用；如有固定免费期限，将从 Host 实际激活后开始计算。",
     "createClient.tabManual": "手动安装",
     "createClient.tabOnline": "在线安装",
     "createClient.manualDescription":
@@ -5005,25 +5064,25 @@ export const messages = {
     "marketAccess.mode.openHint":
       "新买家默认可以使用此作用域，除非你明确拒绝。",
     "marketAccess.policySaved": "准入策略已保存。",
-    "marketAccess.blacklistBannerTitle": "公共付费授信风险",
+    "marketAccess.blacklistBannerTitle": "仍启用历史公共额度",
     "marketAccess.blacklistBanner":
-      "至少一个付费作用域处于默认开放状态，或公共额度仍然启用。只有在付费作用域默认开放时，未知买家才能使用该额度；请在下方检查或关闭公共额度。",
+      "该历史公共额度可能让未单独授信的买家产生欠款。请在下方检查，并在相关买家改为预存或获得单独授信后关闭。",
     "marketAccess.blacklistConfirmTitle": "启用黑名单模式？",
     "marketAccess.blacklistConfirmDescription":
-      "该作用域将默认允许尚未与你私下建立信任关系、且未被明确拒绝的用户使用；付费租用还需要启用公共额度。",
+      "该作用域将默认允许尚未与你私下建立信任关系、且未被明确拒绝的用户使用；付费租用仍需预存资金或单独授信。",
     "marketAccess.blacklistConfirmCheckbox":
       "我了解未知用户可能在我拒绝其访问前使用服务。",
     "marketAccess.enableBlacklist": "启用黑名单模式",
-    "marketAccess.publicCreditTitle": "黑名单模式公共额度",
+    "marketAccess.publicCreditTitle": "历史公共额度",
     "marketAccess.publicCreditHint":
-      "可为没有私有授信的用户提供有限公共额度；公共额度永远不能设为无限。",
+      "该兼容额度仅服务历史账户，已无法新开；请在相关买家获得单独授信或改用预存后关闭。",
     "marketAccess.publicConfirm": "我接受该公共额度风险",
     "marketAccess.publicConfirmRequired": "保存前请确认接受公共额度风险。",
     "marketAccess.publicSaved": "{currency} 公共额度已保存。",
     "marketAccess.addTitle": "添加可信买家",
     "marketAccess.addCreditTitle": "初始账户级美元信用额度",
     "marketAccess.addCreditHint":
-      "开通付费准入时必须设置；该额度由此买家向你租用的所有付费 Share 和 Client Host 共用。",
+      "可选。保持“未授信”即仅允许预存消费；也可授予由该买家所有付费 Share 和 Client Host 共用的额度。",
     "marketAccess.addCreditRequired":
       "开通付费准入时，请设置初始美元信用额度，或明确授予无限额度。",
     "marketAccess.buyersTitle": "可信买家",
@@ -5065,7 +5124,7 @@ export const messages = {
       "批准后，{buyer} 可访问你作为供应商发布的全部“{pricing} · {product}”服务；{target} 只是本次申请入口，不是准入边界。",
     "marketAccess.approvalCreditTitle": "账户级美元信用额度",
     "marketAccess.approvalCreditHint":
-      "该额度由此买家向你租用的所有付费 Share 和 Client Host 共用；建议值约覆盖当前申请服务七天费用。",
+      "可选。保持“未授信”即仅允许预存消费；也可授予由该买家所有付费 Share 和 Client Host 共用的额度。",
     "marketAccess.currentExposure": "当前累计敞口",
     "marketAccess.activeServicesLabel": "活跃付费服务",
     "marketAccess.approveFreeHint":
@@ -5074,7 +5133,7 @@ export const messages = {
     "marketAccess.rejectionReasonRequired": "请输入拒绝原因。",
     "marketAccess.rejectionCooldown":
       "拒绝后，该买家需要等待 24 小时才能再次申请同一供应商作用域。",
-    "marketAccess.approveConfirm": "批准并授信",
+    "marketAccess.approveConfirm": "批准准入",
     "marketAccess.rejectConfirm": "拒绝申请",
     "marketAccess.revokeConfirmTitle": "确认撤销买家关系",
     "marketAccess.revokeConfirmDescription":
@@ -5134,7 +5193,7 @@ export const messages = {
     "marketBilling.title": "市场账务",
     "marketBilling.open": "查看账务",
     "marketBilling.subtitle":
-      "Share 与 Client Host 按供应商账户统一后付费；仅健康服务时间计费，并先享受 {hours} 小时健康时长试用。",
+      "健康使用先享受 {hours} 小时试用；之后优先扣预存余额，仅在商家明确授信时才使用信用额度。",
     "marketBilling.supplier": "供应商",
     "marketBilling.buyer": "用户",
     "marketBilling.day": "天",
@@ -5151,6 +5210,54 @@ export const messages = {
     "marketBilling.estimatedSettlement": "预计用满信用额度",
     "marketBilling.creditUsed": "赊账额度使用",
     "marketBilling.unbilledBalance": "已累计，尚未出账",
+    "marketBilling.creditOutstanding": "信用欠款",
+    "marketBilling.creditAvailable": "剩余信用额度",
+    "marketBilling.prepaid.badge": "预存",
+    "marketBilling.prepaid.balance": "预存余额",
+    "marketBilling.prepaid.held": "冻结资金",
+    "marketBilling.prepaid.available": "可用余额",
+    "marketBilling.prepaid.amountUsd": "金额（美元）",
+    "marketBilling.prepaid.amountInvalid": "请输入大于 0、最多两位小数的美元金额。",
+    "marketBilling.prepaid.topup.action": "充值",
+    "marketBilling.prepaid.topup.create": "生成币安转账",
+    "marketBilling.prepaid.topup.credited": "预存充值已到账。",
+    "marketBilling.prepaid.topup.unavailable": "该商家尚未启用币安自动充值。",
+    "marketBilling.prepaid.topup.status.credited": "已充值到账",
+    "marketBilling.prepaid.ledger.title": "预存流水",
+    "marketBilling.prepaid.ledger.topup": "充值到账",
+    "marketBilling.prepaid.ledger.usage": "服务消费",
+    "marketBilling.prepaid.ledger.refund": "退款支出",
+    "marketBilling.prepaid.ledger.serviceCredit": "服务退回",
+    "marketBilling.prepaid.ledger.adjustment": "余额调整",
+    "marketBilling.prepaid.ledger.after": "余额 {amount}",
+    "marketBilling.prepaid.ledger.empty": "暂无预存流水。",
+    "marketBilling.prepaid.refund.title": "预存退款申请",
+    "marketBilling.prepaid.refund.request": "申请退款",
+    "marketBilling.prepaid.refund.approve": "批准退款",
+    "marketBilling.prepaid.refund.reject": "拒绝退款",
+    "marketBilling.prepaid.refund.record": "登记已退款",
+    "marketBilling.prepaid.refund.reason": "原因（可选）",
+    "marketBilling.prepaid.refund.amount": "申请退款金额",
+    "marketBilling.prepaid.refund.status.requested": "待商家审核",
+    "marketBilling.prepaid.refund.status.approved": "已批准，待退款",
+    "marketBilling.prepaid.refund.status.rejected": "已拒绝",
+    "marketBilling.prepaid.refund.status.recorded": "已退款",
+    "marketBilling.prepaid.refund.status.cancelled": "已取消",
+    "marketFunding.title": "该商家的资金保障",
+    "marketFunding.mode.prepaid": "仅预存",
+    "marketFunding.mode.hybrid": "预存 + 授信",
+    "marketFunding.prepaidAvailable": "可用预存",
+    "marketFunding.creditAvailable": "可用授信",
+    "marketFunding.credit.unlimited": "无限额度",
+    "marketFunding.credit.none": "未授信",
+    "marketFunding.coverage": "一天所需保障",
+    "marketFunding.shortfall": "还需充值",
+    "marketFunding.policy": "付费消费优先扣除预存；只有商家明确授予的信用额度才会承担不足部分。",
+    "marketFunding.topup.minimum": "至少充值 {amount} 才能覆盖本次订单。",
+    "marketFunding.topup.action": "通过币安充值",
+    "marketFunding.topup.unavailable": "该商家尚未开通币安充值，请联系商家开通或明确授信。",
+    "marketFunding.topup.quoteRefreshFallback": "充值已到账；当前报价仍可继续，确认时会再次校验资金。",
+    "marketFunding.blocked": "请先补足预存资金，再确认本次订单。",
     "marketBilling.product.share": "Share 拼车位",
     "marketBilling.product.clientHost": "Client Host",
     "marketBilling.status.active": "累计中",
@@ -5246,12 +5353,12 @@ export const messages = {
     "marketBilling.profile.saved": "{currency} 付款策略已保存。",
     "marketBilling.payables.title": "我的应付",
     "marketBilling.payables.hint":
-      "同一供应商下，所有 Share 与 Client Host 共用一个美元赊账余额。",
-    "marketBilling.payables.empty": "尚无供应商赊账账户。",
+      "同一商家下，所有 Share 与 Client Host 共用独立的美元预存余额与信用账户。",
+    "marketBilling.payables.empty": "尚无商家账务账户。",
     "marketBilling.receivables.title": "我的应收",
     "marketBilling.receivables.hint":
-      "查看用户风险敞口、聚合账单和付款声明，核实到账后再确认。",
-    "marketBilling.receivables.empty": "尚无用户赊账账户。",
+      "查看用户预存资金、明确授予的信用敞口、账单和退款申请。",
+    "marketBilling.receivables.empty": "尚无用户账务账户。",
     "marketBilling.declare.method": "付款方式",
     "marketBilling.declare.methodOther": "其他 / 已线下协商",
     "marketBilling.declare.reference": "转账参考号",
@@ -5331,9 +5438,12 @@ export const messages = {
     "marketBilling.binance.admin.uid": "UID {uid}",
     "marketBilling.binance.admin.account": "账户 {account}",
     "marketBilling.binance.admin.invoiceId": "目标账单 ID",
+    "marketBilling.binance.admin.prepaidFunding": "预存充值",
     "marketBilling.binance.admin.settle": "结算账单",
     "marketBilling.binance.admin.settleConfirm":
       "确认使用已观测到的 {amount} 入账结算账单 {invoice}？该操作会改变账务状态并写入审计记录。",
+    "marketBilling.binance.admin.settleFundingConfirm":
+      "确认将已观测到的 {amount} 入账计入该预存账户？该操作会改变账务状态并写入审计记录。",
     "marketBilling.binance.admin.ignore": "忽略流水",
     "marketBilling.binance.admin.empty": "没有需要复核的币安流水。",
     "marketBilling.binance.admin.invoiceRequired": "请输入目标账单 ID。",
@@ -5354,6 +5464,11 @@ export const messages = {
     "marketBilling.dialog.admin-void": "作废争议账单",
     "marketBilling.dialog.admin-invoice-void": "强制作废账单",
     "marketBilling.dialog.record-refund": "登记已完成的线下退款",
+    "marketBilling.dialog.topup": "充值预存余额",
+    "marketBilling.dialog.request-prepaid-refund": "申请预存退款",
+    "marketBilling.dialog.approve-prepaid-refund": "批准预存退款",
+    "marketBilling.dialog.reject-prepaid-refund": "拒绝预存退款",
+    "marketBilling.dialog.record-prepaid-refund": "登记预存退款已支付",
     "marketBilling.dialog.settle.description":
       "当前累计余额会立即生成应付账单；该供应商账户下的全部服务暂停，直到供应商确认到账。",
     "marketBilling.dialog.request-settlement.description":
