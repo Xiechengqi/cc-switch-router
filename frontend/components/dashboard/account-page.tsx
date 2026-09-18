@@ -173,9 +173,11 @@ export function AccountPaymentsPanel() {
 
   const dirty = serializePaymentDraft(draft) !== baseline;
   const binanceUiState = binanceAutoSettlementUiState(binanceStatus);
+  const binanceConfigurationBlocked = binanceUiState === "unavailable"
+    || binanceUiState === "regionRestricted";
   const binanceUiStateClass = binanceUiState === "active"
     ? "bg-emerald-100 text-emerald-700"
-    : binanceUiState === "degraded"
+    : binanceUiState === "degraded" || binanceUiState === "regionRestricted"
       ? "bg-rose-100 text-rose-700"
       : binanceUiState === "actionRequired"
         ? "bg-amber-100 text-amber-800"
@@ -302,7 +304,7 @@ export function AccountPaymentsPanel() {
     if (
       binanceBusy
       || binanceDiscoveryInFlightRef.current
-      || binanceUiState === "unavailable"
+      || binanceConfigurationBlocked
       || binanceApiKey.trim().length < 16
       || binanceApiSecret.trim().length < 16
     ) return;
@@ -334,7 +336,7 @@ export function AccountPaymentsPanel() {
       binanceDiscoveryInFlightRef.current = false;
       if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
     }
-  }, [actorKey, binanceApiKey, binanceApiSecret, binanceBusy, binanceUiState]);
+  }, [actorKey, binanceApiKey, binanceApiSecret, binanceBusy, binanceConfigurationBlocked]);
 
   const confirmBinanceCredentials = async () => {
     if (binanceBusy || !binanceDiscovery) return;
@@ -422,7 +424,7 @@ export function AccountPaymentsPanel() {
     if (
       !authed
       || binanceBusy
-      || binanceUiState === "unavailable"
+      || binanceConfigurationBlocked
       || binanceApiKey.trim().length < 16
       || binanceApiSecret.trim().length < 16
     ) return;
@@ -435,7 +437,7 @@ export function AccountPaymentsPanel() {
     binanceApiKey,
     binanceApiSecret,
     binanceBusy,
-    binanceUiState,
+    binanceConfigurationBlocked,
     discoverBinanceCredentials,
   ]);
 
@@ -639,6 +641,16 @@ export function AccountPaymentsPanel() {
               {t("account.binanceAuto.notice.unavailable")}
             </p>
           ) : null}
+          {binanceStatus && binanceUiState === "regionRestricted" ? (
+            <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+              {t("account.binanceAuto.notice.regionRestricted")}
+            </p>
+          ) : null}
+          {binanceStatus?.serviceAvailability === "temporarily_unavailable" ? (
+            <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">
+              {t("account.binanceAuto.notice.temporarilyUnavailable")}
+            </p>
+          ) : null}
           {binanceStatus && binanceUiState === "trial" ? (
             <p className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-700">
               {t("account.binanceAuto.notice.trial")}
@@ -727,9 +739,10 @@ export function AccountPaymentsPanel() {
                 type="text"
                 value={binanceApiKey}
                 onChange={(event) => setBinanceApiKey(event.target.value)}
+                disabled={binanceConfigurationBlocked}
                 autoComplete="off"
                 spellCheck={false}
-                className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
+                className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
               />
             </label>
             <label className="grid gap-1.5 text-sm">
@@ -738,9 +751,10 @@ export function AccountPaymentsPanel() {
                 type="text"
                 value={binanceApiSecret}
                 onChange={(event) => setBinanceApiSecret(event.target.value)}
+                disabled={binanceConfigurationBlocked}
                 autoComplete="off"
                 spellCheck={false}
-                className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20"
+                className="h-10 rounded-md border bg-white px-3 font-mono text-xs outline-none focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
               />
             </label>
           </div>
@@ -792,7 +806,7 @@ export function AccountPaymentsPanel() {
                 })}
               </p>
               <div className="flex flex-wrap gap-2">
-                <Button size="sm" variant="primary" isDisabled={!!binanceBusy} onClick={() => void confirmBinanceCredentials()}>
+                <Button size="sm" variant="primary" isDisabled={!!binanceBusy || binanceConfigurationBlocked} onClick={() => void confirmBinanceCredentials()}>
                   {binanceBusy === "confirm" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
                   {t("account.binanceAuto.confirm")}
                 </Button>
@@ -818,7 +832,7 @@ export function AccountPaymentsPanel() {
                   variant="outline"
                   isDisabled={
                     !!binanceBusy
-                    || binanceUiState === "unavailable"
+                    || binanceConfigurationBlocked
                     || binanceStatus.account.status === "disabled"
                   }
                   onClick={() => void verifyBinanceCredentials()}

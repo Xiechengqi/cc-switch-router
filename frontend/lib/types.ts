@@ -2236,6 +2236,14 @@ export type BinanceAutoSettlementStatus = {
   globalMode: "disabled" | "shadow" | "enabled" | string;
   credentialStorageConfigured: boolean;
   paymentHomeRegion: string;
+  serviceAvailability:
+    | "unchecked"
+    | "available"
+    | "region_restricted"
+    | "temporarily_unavailable"
+    | string;
+  serviceAvailabilityCheckedAt?: string;
+  serviceAvailabilityErrorCode?: string;
   account?: BinanceAutoSettlementAccount;
 };
 
@@ -2503,6 +2511,7 @@ export type MarketBillingConfig = {
   currency: "USD";
   usdCnyRateMicros: number;
   binanceAutoSettlementEnabled: boolean;
+  binanceServiceAvailability?: string;
 };
 
 export type AdminMarketBillingDispute = {

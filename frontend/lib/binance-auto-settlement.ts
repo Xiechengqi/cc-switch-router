@@ -2,6 +2,7 @@ import type { BinanceAutoSettlementStatus } from "@/lib/types";
 
 export type BinanceAutoSettlementUiState =
   | "unavailable"
+  | "regionRestricted"
   | "trial"
   | "ready"
   | "actionRequired"
@@ -18,6 +19,7 @@ export function binanceAutoSettlementUiState(
   ) {
     return "unavailable";
   }
+  if (status.serviceAvailability === "region_restricted") return "regionRestricted";
   if (status.account?.status === "degraded") return "degraded";
   if (status.account?.status === "disabled") return "accountDisabled";
   if (status.globalMode === "shadow") return "trial";

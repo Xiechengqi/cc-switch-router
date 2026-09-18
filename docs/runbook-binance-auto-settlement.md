@@ -29,11 +29,18 @@
 
 ```dotenv
 CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE=shadow
+# 仅在 Router 直连 Binance 不可用时配置；只影响 Binance 请求。
+CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL=socks5h://127.0.0.1:1080
 ```
 
 普通部署只需配置模式。Router 会在数据目录自动生成并以 `0600` 权限保存
 `binance-master-key`，API 地址、密钥版本、付款归属 Region 和轮询间隔均使用安全默认值。
 外部 Secret、多 Region 或本地测试部署仍可通过对应环境变量覆盖这些隐藏参数。
+
+Router 会通过 Binance `/api/v3/time` 检测当前直连或代理出口。HTTP 451 会标记为
+`BINANCE_REGION_RESTRICTED`，禁止新绑定、复验、轮询和自动付款；账户页仍允许查看或删除既有绑定。
+地区限制状态每 30 分钟自动重试，临时网络错误每 30 秒重试。代理仅接受带明确端口的
+`socks5h://` URL，确保 Binance 域名也由代理解析；该代理不会影响 Share、通知或其他出站请求。
 
 生产 API base 只接受 `api.binance.com`、`api-gcp.binance.com` 和 `api1` 至 `api4.binance.com` 的标准 HTTPS 端口；任意第三方 HTTPS 主机都会在启动时被拒绝，防止配置错误把商家凭据发送到非 Binance 端点。HTTP/HTTPS loopback 仅用于本机测试。
 

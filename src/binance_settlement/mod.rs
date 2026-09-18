@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -56,6 +56,9 @@ const MAX_VERIFICATION_ATTEMPT_SCOPES: usize = 10_000;
 const DEFAULT_MASTER_KEY_VERSION: i64 = 1;
 const DEFAULT_POLL_INTERVAL_SECS: i64 = 4;
 const MASTER_KEY_FILE: &str = "binance-master-key";
+const AVAILABILITY_OK_TTL: StdDuration = StdDuration::from_secs(10 * 60);
+const AVAILABILITY_REGION_RESTRICTED_TTL: StdDuration = StdDuration::from_secs(30 * 60);
+const AVAILABILITY_TEMPORARY_FAILURE_TTL: StdDuration = StdDuration::from_secs(30);
 const MIN_POLL_INTERVAL_SECS: i64 = 2;
 const MAX_POLL_INTERVAL_SECS: i64 = 60;
 const MAX_MASTER_KEY_VERSION: i64 = 1_000_000;
@@ -107,6 +110,76 @@ impl GlobalMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinanceServiceAvailability {
+    Unchecked,
+    Available,
+    RegionRestricted,
+    TemporarilyUnavailable,
+}
+
+impl BinanceServiceAvailability {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchecked => "unchecked",
+            Self::Available => "available",
+            Self::RegionRestricted => "region_restricted",
+            Self::TemporarilyUnavailable => "temporarily_unavailable",
+        }
+    }
+
+    fn cache_ttl(self) -> StdDuration {
+        match self {
+            Self::Unchecked => StdDuration::ZERO,
+            Self::Available => AVAILABILITY_OK_TTL,
+            Self::RegionRestricted => AVAILABILITY_REGION_RESTRICTED_TTL,
+            Self::TemporarilyUnavailable => AVAILABILITY_TEMPORARY_FAILURE_TTL,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BinanceServiceAvailabilitySnapshot {
+    pub(crate) status: BinanceServiceAvailability,
+    pub(crate) checked_at: Option<String>,
+    pub(crate) error_code: Option<String>,
+}
+
+#[derive(Debug)]
+struct BinanceServiceAvailabilityCache {
+    status: BinanceServiceAvailability,
+    checked_at: Option<String>,
+    checked_instant: Option<Instant>,
+    error_code: Option<String>,
+}
+
+impl Default for BinanceServiceAvailabilityCache {
+    fn default() -> Self {
+        Self {
+            status: BinanceServiceAvailability::Unchecked,
+            checked_at: None,
+            checked_instant: None,
+            error_code: None,
+        }
+    }
+}
+
+impl BinanceServiceAvailabilityCache {
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.checked_instant.is_some_and(|checked_at| {
+            now.saturating_duration_since(checked_at) < self.status.cache_ttl()
+        })
+    }
+
+    fn snapshot(&self) -> BinanceServiceAvailabilitySnapshot {
+        BinanceServiceAvailabilitySnapshot {
+            status: self.status,
+            checked_at: self.checked_at.clone(),
+            error_code: self.error_code.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BinanceSettlementRuntime {
     mode: GlobalMode,
@@ -116,6 +189,7 @@ pub struct BinanceSettlementRuntime {
     poll_interval_secs: i64,
     worker_id: Arc<str>,
     verification_attempts: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    service_availability: Arc<tokio::sync::Mutex<BinanceServiceAvailabilityCache>>,
 }
 
 impl BinanceSettlementRuntime {
@@ -140,6 +214,14 @@ impl BinanceSettlementRuntime {
             .unwrap_or_else(|_| "https://api.binance.com".into());
         let base_url = Url::parse(base_url.trim()).context("invalid Binance API base URL")?;
         validate_api_base(&base_url)?;
+        let socks_proxy = std::env::var("CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                validate_binance_socks_proxy_url(&value)?;
+                Url::parse(value.trim()).context("invalid Binance SOCKS proxy URL")
+            })
+            .transpose()?;
         let region = std::env::var("CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -168,11 +250,14 @@ impl BinanceSettlementRuntime {
         Ok(Self {
             mode,
             cipher: Some(CredentialCipher::from_zeroizing(key, key_version)),
-            client: BinanceClient::new(base_url)?,
+            client: BinanceClient::with_proxy(base_url, socks_proxy.as_ref())?,
             payment_home_region: Arc::from(region),
             poll_interval_secs,
             worker_id: Arc::from(Uuid::new_v4().to_string()),
             verification_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_availability: Arc::new(tokio::sync::Mutex::new(
+                BinanceServiceAvailabilityCache::default(),
+            )),
         })
     }
 
@@ -186,6 +271,9 @@ impl BinanceSettlementRuntime {
             poll_interval_secs: 4,
             worker_id: Arc::from("test-worker"),
             verification_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_availability: Arc::new(tokio::sync::Mutex::new(
+                BinanceServiceAvailabilityCache::default(),
+            )),
         }
     }
 
@@ -212,6 +300,19 @@ impl BinanceSettlementRuntime {
         self.cipher()
     }
 
+    async fn require_binance_available(&self) -> Result<&CredentialCipher, AppError> {
+        self.require_binance_network_enabled()?;
+        let availability = self.service_availability(false).await;
+        match availability.status {
+            BinanceServiceAvailability::Available => self.cipher(),
+            BinanceServiceAvailability::RegionRestricted => Err(binance_region_restricted_error()),
+            BinanceServiceAvailability::Unchecked
+            | BinanceServiceAvailability::TemporarilyUnavailable => Err(
+                binance_temporarily_unavailable_error(availability.error_code.as_deref()),
+            ),
+        }
+    }
+
     fn require_payment_enabled(&self) -> Result<&CredentialCipher, AppError> {
         if self.mode != GlobalMode::Enabled {
             return Err(AppError::ServiceUnavailable(
@@ -219,6 +320,106 @@ impl BinanceSettlementRuntime {
             ));
         }
         self.cipher()
+    }
+
+    async fn require_payment_available(&self) -> Result<&CredentialCipher, AppError> {
+        self.require_payment_enabled()?;
+        let availability = self.service_availability(false).await;
+        match availability.status {
+            BinanceServiceAvailability::Available => self.cipher(),
+            BinanceServiceAvailability::RegionRestricted => Err(binance_region_restricted_error()),
+            BinanceServiceAvailability::Unchecked
+            | BinanceServiceAvailability::TemporarilyUnavailable => Err(
+                binance_temporarily_unavailable_error(availability.error_code.as_deref()),
+            ),
+        }
+    }
+
+    pub(crate) async fn service_availability(
+        &self,
+        force: bool,
+    ) -> BinanceServiceAvailabilitySnapshot {
+        let mut cache = self.service_availability.lock().await;
+        if self.mode == GlobalMode::Disabled {
+            return cache.snapshot();
+        }
+        let now = Instant::now();
+        if !force && cache.is_fresh(now) {
+            return cache.snapshot();
+        }
+        let previous = cache.status;
+        let (status, error_code) = match self.client.probe_service_availability().await {
+            Ok(()) => (BinanceServiceAvailability::Available, None),
+            Err(error) if error.code == "BINANCE_REGION_RESTRICTED" => (
+                BinanceServiceAvailability::RegionRestricted,
+                Some(error.code),
+            ),
+            Err(error) => (
+                BinanceServiceAvailability::TemporarilyUnavailable,
+                Some(error.code),
+            ),
+        };
+        cache.status = status;
+        cache.checked_at = Some(Utc::now().to_rfc3339());
+        cache.checked_instant = Some(now);
+        cache.error_code = error_code.clone();
+        let snapshot = cache.snapshot();
+        drop(cache);
+        if status != previous {
+            match status {
+                BinanceServiceAvailability::Available
+                    if previous == BinanceServiceAvailability::Unchecked =>
+                {
+                    tracing::info!("Binance service availability confirmed")
+                }
+                BinanceServiceAvailability::Available => {
+                    tracing::info!("Binance service availability recovered")
+                }
+                BinanceServiceAvailability::RegionRestricted => tracing::warn!(
+                    error_code = error_code.as_deref().unwrap_or("BINANCE_REGION_RESTRICTED"),
+                    "Binance is unavailable from the Router network region"
+                ),
+                BinanceServiceAvailability::TemporarilyUnavailable => tracing::warn!(
+                    error_code = error_code.as_deref().unwrap_or("BINANCE_UNAVAILABLE"),
+                    "Binance service availability probe failed"
+                ),
+                BinanceServiceAvailability::Unchecked => {}
+            }
+        }
+        snapshot
+    }
+
+    async fn observe_api_error(&self, error: &BinanceApiError) {
+        let status = if error.code == "BINANCE_REGION_RESTRICTED" {
+            Some(BinanceServiceAvailability::RegionRestricted)
+        } else if matches!(
+            error.code.as_str(),
+            "BINANCE_TIMEOUT"
+                | "BINANCE_NETWORK_ERROR"
+                | "BINANCE_UPSTREAM_ERROR"
+                | "BINANCE_RESPONSE_READ_FAILED"
+                | "BINANCE_RESPONSE_TOO_LARGE"
+        ) {
+            Some(BinanceServiceAvailability::TemporarilyUnavailable)
+        } else {
+            None
+        };
+        let Some(status) = status else {
+            return;
+        };
+        let mut cache = self.service_availability.lock().await;
+        let changed = cache.status != status;
+        cache.status = status;
+        cache.checked_at = Some(Utc::now().to_rfc3339());
+        cache.checked_instant = Some(Instant::now());
+        cache.error_code = Some(error.code.clone());
+        drop(cache);
+        if changed && status == BinanceServiceAvailability::RegionRestricted {
+            tracing::warn!(
+                error_code = %error.code,
+                "Binance signed API reported a Router network region restriction"
+            );
+        }
     }
 
     async fn consume_verification_attempt(&self, supplier_user_id: &str) -> Result<(), AppError> {
@@ -255,6 +456,11 @@ pub struct BinanceAccountStatusResponse {
     global_mode: &'static str,
     credential_storage_configured: bool,
     payment_home_region: String,
+    service_availability: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_availability_checked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_availability_error_code: Option<String>,
     account: Option<BinancePaymentAccountView>,
 }
 
@@ -461,10 +667,14 @@ async fn account_status(
     state: &ServerState,
     session: &AuthSession,
 ) -> Result<BinanceAccountStatusResponse, AppError> {
+    let availability = state.binance_settlement.service_availability(false).await;
     Ok(BinanceAccountStatusResponse {
         global_mode: state.binance_settlement.mode().as_str(),
         credential_storage_configured: state.binance_settlement.cipher.is_some(),
         payment_home_region: state.binance_settlement.payment_home_region().to_string(),
+        service_availability: availability.status.as_str(),
+        service_availability_checked_at: availability.checked_at,
+        service_availability_error_code: availability.error_code,
         account: state
             .store
             .binance_payment_account_view(
@@ -549,7 +759,7 @@ async fn discover_account(
     Json(input): Json<DiscoverBinanceAccountRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    let cipher = state.binance_settlement.require_binance_network_enabled()?;
+    let cipher = state.binance_settlement.require_binance_available().await?;
     validate_credentials(&input.api_key, &input.api_secret)?;
     state
         .binance_settlement
@@ -559,12 +769,18 @@ async fn discover_account(
         api_key: input.api_key.trim().to_string(),
         api_secret: input.api_secret.trim().to_string(),
     };
-    let discovery = state
+    let discovery = match state
         .binance_settlement
         .client
         .discover_account(&credentials)
         .await
-        .map_err(map_verification_error)?;
+    {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            state.binance_settlement.observe_api_error(&error).await;
+            return Err(map_verification_error(error));
+        }
+    };
     let binance_uid = validate_uid(&discovery.binance_uid)?;
     let previous_binance_uid = state
         .store
@@ -626,7 +842,7 @@ async fn bind_account(
     Json(input): Json<ConfirmBinanceAccountRequest>,
 ) -> Result<Json<BinanceAccountStatusResponse>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let cipher = state.binance_settlement.require_binance_network_enabled()?;
+    let cipher = state.binance_settlement.require_binance_available().await?;
     let payload = open_binding_confirmation(
         cipher,
         input.confirmation_token.trim(),
@@ -647,12 +863,15 @@ async fn bind_account(
         .binance_settlement
         .consume_verification_attempt(&format!("binding-confirm:{}", session.user_id))
         .await?;
-    state
+    if let Err(error) = state
         .binance_settlement
         .client
         .verify_permissions(&payload.credentials)
         .await
-        .map_err(map_verification_error)?;
+    {
+        state.binance_settlement.observe_api_error(&error).await;
+        return Err(map_verification_error(error));
+    }
     let aad = credential_aad(
         &payload.account_id,
         &session.user_id,
@@ -684,7 +903,7 @@ async fn verify_account(
     headers: HeaderMap,
 ) -> Result<Json<BinanceAccountStatusResponse>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let cipher = state.binance_settlement.require_binance_network_enabled()?;
+    let cipher = state.binance_settlement.require_binance_available().await?;
     let stored = state
         .store
         .binance_load_payment_account(
@@ -723,6 +942,7 @@ async fn verify_account(
     {
         Ok(verification) => verification,
         Err(error) => {
+            state.binance_settlement.observe_api_error(&error).await;
             state
                 .store
                 .binance_mark_account_verification_failed(
@@ -788,7 +1008,7 @@ async fn create_payment_intent(
     Path(invoice_id): Path<String>,
 ) -> Result<Json<BinancePaymentIntentView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let cipher = state.binance_settlement.require_payment_enabled()?;
+    let cipher = state.binance_settlement.require_payment_available().await?;
     Ok(Json(
         state
             .store
@@ -809,7 +1029,7 @@ async fn refresh_payment_intent(
     Path(invoice_id): Path<String>,
 ) -> Result<Json<BinancePaymentIntentView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let cipher = state.binance_settlement.require_payment_enabled()?;
+    let cipher = state.binance_settlement.require_payment_available().await?;
     Ok(Json(
         state
             .store
@@ -953,6 +1173,15 @@ async fn run_poll_cycle(state: &ServerState, last_health_reconciliation: &mut In
         }
         *last_health_reconciliation = Instant::now();
     }
+    if state
+        .binance_settlement
+        .service_availability(false)
+        .await
+        .status
+        != BinanceServiceAvailability::Available
+    {
+        return;
+    }
     let mut claimed = Vec::new();
     for _ in 0..MAX_POLL_ACCOUNTS_PER_CYCLE {
         match state
@@ -1013,6 +1242,7 @@ async fn poll_one_account(
         {
             Ok(verification) => verification,
             Err(error) => {
+                state.binance_settlement.observe_api_error(&error).await;
                 tracing::warn!(
                     account_id = %account.id,
                     error_code = %error.code,
@@ -1070,6 +1300,7 @@ async fn poll_one_account(
     {
         Ok(transactions) => transactions,
         Err(error) => {
+            state.binance_settlement.observe_api_error(&error).await;
             tracing::warn!(
                 account_id = %account.id,
                 error_code = %error.code,
@@ -1360,6 +1591,7 @@ fn select_poll_cursor_ms(
 
 fn map_verification_error(error: BinanceApiError) -> AppError {
     match error.code.as_str() {
+        "BINANCE_REGION_RESTRICTED" => binance_region_restricted_error(),
         "READ_PERMISSION_REQUIRED"
         | "DANGEROUS_PERMISSION_ENABLED"
         | "ACCOUNT_UID_UNCONFIRMED"
@@ -1387,6 +1619,29 @@ fn map_verification_error(error: BinanceApiError) -> AppError {
         _ => AppError::ServiceUnavailable(
             "Binance credential verification is temporarily unavailable".into(),
         ),
+    }
+}
+
+fn binance_region_restricted_error() -> AppError {
+    AppError::Coded {
+        status: StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        code: "BINANCE_REGION_RESTRICTED",
+        message: "Binance is unavailable from this Router's network region".into(),
+        details: serde_json::json!({
+            "serviceAvailability": BinanceServiceAvailability::RegionRestricted.as_str(),
+        }),
+    }
+}
+
+fn binance_temporarily_unavailable_error(reason: Option<&str>) -> AppError {
+    AppError::Coded {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "BINANCE_TEMPORARILY_UNAVAILABLE",
+        message: "Binance is temporarily unreachable from this Router".into(),
+        details: serde_json::json!({
+            "serviceAvailability": BinanceServiceAvailability::TemporarilyUnavailable.as_str(),
+            "reason": reason.unwrap_or("BINANCE_UNAVAILABLE"),
+        }),
     }
 }
 
@@ -1512,6 +1767,30 @@ pub(crate) fn validate_api_base(url: &Url) -> anyhow::Result<()> {
     }
     if url.port_or_known_default() != Some(443) {
         bail!("Binance API base must use the standard HTTPS port");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_binance_socks_proxy_url(value: &str) -> anyhow::Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() > 2_048 {
+        bail!("Binance SOCKS proxy URL must be at most 2048 characters");
+    }
+    let url = Url::parse(value).context("Binance SOCKS proxy must be a valid URL")?;
+    if url.scheme() != "socks5h" {
+        bail!("Binance SOCKS proxy must use socks5h:// so DNS is resolved by the proxy");
+    }
+    if url.host_str().is_none() || !url.port().is_some_and(|port| port > 0) {
+        bail!("Binance SOCKS proxy must include a host and port");
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        bail!("Binance SOCKS proxy must not contain a path, query, or fragment");
+    }
+    if url.username().is_empty() && url.password().is_some() {
+        bail!("Binance SOCKS proxy cannot contain a password without a username");
     }
     Ok(())
 }
@@ -1815,6 +2094,23 @@ mod tests {
         assert!(
             validate_api_base(&Url::parse("https://api.binance.com?redirect=1").unwrap()).is_err()
         );
+        assert!(validate_binance_socks_proxy_url("socks5h://127.0.0.1:1080").is_ok());
+        assert!(
+            validate_binance_socks_proxy_url("socks5h://user:secret@proxy.example:1080").is_ok()
+        );
+        for invalid in [
+            "socks5://proxy.example:1080",
+            "http://proxy.example:1080",
+            "socks5h://proxy.example",
+            "socks5h://proxy.example:0",
+            "socks5h://proxy.example:1080/path",
+            "socks5h://:secret@proxy.example:1080",
+        ] {
+            assert!(
+                validate_binance_socks_proxy_url(invalid).is_err(),
+                "proxy URL should be rejected: {invalid}"
+            );
+        }
         assert!(
             BinanceSettlementRuntime::disabled_for_tests()
                 .require_binance_network_enabled()

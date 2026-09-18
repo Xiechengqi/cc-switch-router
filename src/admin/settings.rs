@@ -1405,6 +1405,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: None,
         dynamic_group: None,
     },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL",
+        label: "Binance SOCKS5 proxy",
+        group: "Binance settlement",
+        field_type: FieldType::Secret,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Optional proxy used only for Binance checks and Pay polling. Use socks5h:// so DNS also goes through the proxy.",
+        placeholder: Some("socks5h://127.0.0.1:1080"),
+        dynamic_group: None,
+    },
     // ── External verification ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL",
@@ -2070,6 +2082,7 @@ fn risk_for_field(field: &SettingsField) -> RiskLevel {
         | "CC_SWITCH_ROUTER_ADMIN_EMAILS"
         | "CC_SWITCH_ROUTER_IP_BLACKLIST"
         | "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE"
+        | "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL"
         | "CC_SWITCH_ROUTER_BARK_SERVER_URL"
         | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY"
         | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION" => RiskLevel::Critical,
@@ -3271,6 +3284,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
             Ok(Some(trimmed.to_string()))
         }
+        FieldType::Secret if field.key == "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL" => {
+            crate::binance_settlement::validate_binance_socks_proxy_url(trimmed)
+                .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
+            Ok(Some(trimmed.to_string()))
+        }
         FieldType::Path | FieldType::Text | FieldType::Secret => Ok(Some(trimmed.to_string())),
     }
 }
@@ -4433,13 +4451,21 @@ mod tests {
     }
 
     #[test]
-    fn binance_settings_expose_only_the_strict_global_mode() {
+    fn binance_settings_expose_mode_and_dedicated_socks_proxy() {
         let mode = field_by_key("CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE").unwrap();
         assert_eq!(
             normalize_value(mode, " ShAdOw ").unwrap(),
             Some("shadow".into())
         );
         assert!(normalize_value(mode, "live").is_err());
+        let proxy = field_by_key("CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL").unwrap();
+        assert_eq!(
+            normalize_value(proxy, " socks5h://proxy.example:1080 ").unwrap(),
+            Some("socks5h://proxy.example:1080".into())
+        );
+        assert!(normalize_value(proxy, "socks5://proxy.example:1080").is_err());
+        assert!(normalize_value(proxy, "http://proxy.example:1080").is_err());
+        assert!(normalize_value(proxy, "socks5h://proxy.example").is_err());
         for hidden in [
             "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY",
             "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION",
@@ -5396,8 +5422,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 130);
-        assert_eq!(schema.fields.len(), 130);
+        assert_eq!(SETTINGS_FIELDS.len(), 131);
+        assert_eq!(schema.fields.len(), 131);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -5411,7 +5437,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            130
+            131
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema
@@ -5455,8 +5481,15 @@ mod tests {
                 .iter()
                 .filter(|field| field.group == "Binance settlement")
                 .count(),
-            1
+            2
         );
+        let binance_proxy = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL")
+            .expect("Binance proxy field");
+        assert!(matches!(binance_proxy.risk, RiskLevel::Critical));
+        assert!(binance_proxy.restart_required);
         for key in [
             "CC_SWITCH_ROUTER_BARK_SERVER_URL",
             "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",

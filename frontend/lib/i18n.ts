@@ -896,6 +896,7 @@ export const messages = {
     "account.binanceAuto.receipts.orderId": "Binance order ID",
     "account.binanceAuto.receipts.loadMore": "Load more",
     "account.binanceAuto.state.unavailable": "Not enabled",
+    "account.binanceAuto.state.regionRestricted": "Region unsupported",
     "account.binanceAuto.state.trial": "Observe only",
     "account.binanceAuto.state.ready": "Ready to bind",
     "account.binanceAuto.state.actionRequired": "Rebind required",
@@ -904,6 +905,10 @@ export const messages = {
     "account.binanceAuto.state.accountDisabled": "Disabled",
     "account.binanceAuto.notice.unavailable":
       "Automatic confirmation is not enabled on this Router. Contact the administrator to enable it.",
+    "account.binanceAuto.notice.regionRestricted":
+      "Binance does not serve this Router's current network region. Account binding and automatic checks are disabled; the Router owner can configure a dedicated Binance SOCKS5 proxy.",
+    "account.binanceAuto.notice.temporarilyUnavailable":
+      "Binance is temporarily unreachable from this Router. Existing records remain available; retry after connectivity recovers.",
     "account.binanceAuto.notice.trial":
       "Deposits are currently observed without settling invoices automatically.",
     "account.binanceAuto.notice.actionRequired":
@@ -4383,6 +4388,7 @@ export const messages = {
     "account.binanceAuto.receipts.orderId": "币安订单 ID",
     "account.binanceAuto.receipts.loadMore": "加载更多",
     "account.binanceAuto.state.unavailable": "未启用",
+    "account.binanceAuto.state.regionRestricted": "地区不支持",
     "account.binanceAuto.state.trial": "仅观察",
     "account.binanceAuto.state.ready": "可以绑定",
     "account.binanceAuto.state.actionRequired": "需要重新绑定",
@@ -4390,6 +4396,10 @@ export const messages = {
     "account.binanceAuto.state.degraded": "需要处理",
     "account.binanceAuto.state.accountDisabled": "已停用",
     "account.binanceAuto.notice.unavailable": "当前 Router 尚未启用自动到账确认，请联系管理员。",
+    "account.binanceAuto.notice.regionRestricted":
+      "Binance 不支持当前 Router 的网络出口地区，已禁止账户绑定和自动检查；Router owner 可配置 Binance 专用 SOCKS5 代理。",
+    "account.binanceAuto.notice.temporarilyUnavailable":
+      "Router 暂时无法连接 Binance，历史记录仍可查看；网络恢复后可重试。",
     "account.binanceAuto.notice.trial": "当前只观察到账，不会自动结算账单。",
     "account.binanceAuto.notice.actionRequired": "请重新绑定并验证该账户，以启用自动结算。",
     "account.binanceAuto.notice.degraded":

@@ -10,6 +10,7 @@ function status(
     globalMode: "enabled",
     credentialStorageConfigured: true,
     paymentHomeRegion: "region-a",
+    serviceAvailability: "available",
     ...overrides,
   };
 }
@@ -57,6 +58,16 @@ test("account failures take precedence over rollout state", () => {
   assert.equal(
     binanceAutoSettlementUiState(status({ account: account({ status: "disabled" }) })),
     "accountDisabled",
+  );
+});
+
+test("region restriction blocks configuration before account state", () => {
+  assert.equal(
+    binanceAutoSettlementUiState(status({
+      serviceAvailability: "region_restricted",
+      account: account({ status: "degraded" }),
+    })),
+    "regionRestricted",
   );
 });
 

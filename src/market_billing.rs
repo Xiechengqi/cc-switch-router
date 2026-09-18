@@ -330,6 +330,7 @@ pub struct MarketBillingConfigView {
     pub currency: &'static str,
     pub usd_cny_rate_micros: i64,
     pub binance_auto_settlement_enabled: bool,
+    pub binance_service_availability: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -663,11 +664,15 @@ async fn get_dashboard(
 }
 
 async fn get_billing_config(State(state): State<ServerState>) -> Json<MarketBillingConfigView> {
+    let availability = state.binance_settlement.service_availability(false).await;
     Json(MarketBillingConfigView {
         currency: MARKET_CURRENCY,
         usd_cny_rate_micros: state.store.market_usd_cny_rate_micros(),
         binance_auto_settlement_enabled: state.binance_settlement.mode()
-            == crate::binance_settlement::GlobalMode::Enabled,
+            == crate::binance_settlement::GlobalMode::Enabled
+            && availability.status
+                == crate::binance_settlement::BinanceServiceAvailability::Available,
+        binance_service_availability: availability.status.as_str(),
     })
 }
 

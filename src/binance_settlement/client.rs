@@ -167,21 +167,59 @@ struct BinanceErrorEnvelope {
     code: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceTimeEnvelope {
+    server_time: i64,
+}
+
 impl BinanceClient {
+    #[cfg(test)]
     pub fn new(base_url: Url) -> Result<Self, anyhow::Error> {
-        Self::with_timeout(base_url, Duration::from_secs(15))
+        Self::with_options(base_url, None, Duration::from_secs(15))
     }
 
+    #[cfg(test)]
     fn with_timeout(base_url: Url, timeout: Duration) -> Result<Self, anyhow::Error> {
-        let http = reqwest::Client::builder()
+        Self::with_options(base_url, None, timeout)
+    }
+
+    pub fn with_proxy(base_url: Url, proxy_url: Option<&Url>) -> Result<Self, anyhow::Error> {
+        Self::with_options(base_url, proxy_url, Duration::from_secs(15))
+    }
+
+    fn with_options(
+        base_url: Url,
+        proxy_url: Option<&Url>,
+        timeout: Duration,
+    ) -> Result<Self, anyhow::Error> {
+        let mut builder = reqwest::Client::builder()
             .user_agent("cc-switch-router/0.1 binance-settlement")
             .connect_timeout(Duration::from_secs(5))
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(16)
-            .build()?;
+            .no_proxy();
+        if let Some(proxy_url) = proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url.as_str())
+                .map_err(|_| anyhow::anyhow!("invalid Binance SOCKS proxy configuration"))?;
+            builder = builder.proxy(proxy);
+        }
+        let http = builder.build()?;
         Ok(Self { http, base_url })
+    }
+
+    pub async fn probe_service_availability(&self) -> Result<(), BinanceApiError> {
+        let url = self
+            .base_url
+            .join("/api/v3/time")
+            .map_err(|_| BinanceApiError::new("BINANCE_URL_INVALID"))?;
+        let response: BinanceTimeEnvelope = self.execute_json(self.http.get(url)).await?;
+        if response.server_time <= 0 {
+            return Err(BinanceApiError::new("BINANCE_RESPONSE_INVALID"));
+        }
+        Ok(())
     }
 
     pub async fn verify_permissions(
@@ -350,19 +388,25 @@ impl BinanceClient {
             .join(path)
             .map_err(|_| BinanceApiError::new("BINANCE_URL_INVALID"))?;
         url.set_query(Some(&format!("{query}&signature={signature}")));
-        let response = self
-            .http
-            .get(url)
-            .header("X-MBX-APIKEY", &credentials.api_key)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    BinanceApiError::new("BINANCE_TIMEOUT")
-                } else {
-                    BinanceApiError::new("BINANCE_NETWORK_ERROR")
-                }
-            })?;
+        self.execute_json(
+            self.http
+                .get(url)
+                .header("X-MBX-APIKEY", &credentials.api_key),
+        )
+        .await
+    }
+
+    async fn execute_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, BinanceApiError> {
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                BinanceApiError::new("BINANCE_TIMEOUT")
+            } else {
+                BinanceApiError::new("BINANCE_NETWORK_ERROR")
+            }
+        })?;
         let status = response.status();
         let retry_after_secs = response
             .headers()
@@ -389,6 +433,7 @@ impl BinanceClient {
                 .ok()
                 .map(|error| error.code);
             let code = match (status.as_u16(), upstream_code) {
+                (451, _) => "BINANCE_REGION_RESTRICTED",
                 (418, _) => "BINANCE_IP_BANNED",
                 (429, _) => "BINANCE_RATE_LIMITED",
                 (401 | 403, _) => "BINANCE_CREDENTIALS_REJECTED",
@@ -516,6 +561,7 @@ mod tests {
                     200 => "OK",
                     418 => "I'm a teapot",
                     429 => "Too Many Requests",
+                    451 => "Unavailable For Legal Reasons",
                     503 => "Service Unavailable",
                     _ => "Error",
                 };
@@ -689,6 +735,13 @@ mod tests {
     async fn upstream_statuses_and_malformed_json_map_to_stable_codes() {
         for (status, headers, body, expected, retry_after) in [
             (
+                451,
+                vec![],
+                r#"{"code":0,"msg":"restricted location"}"#,
+                "BINANCE_REGION_RESTRICTED",
+                None,
+            ),
+            (
                 429,
                 vec![("Retry-After", "7")],
                 "{}",
@@ -735,6 +788,38 @@ mod tests {
             assert_eq!(error.code, expected);
             assert_eq!(error.retry_after_secs, retry_after);
         }
+    }
+
+    #[tokio::test]
+    async fn availability_probe_uses_unsigned_time_endpoint_and_classifies_region_restriction() {
+        let (base_url, requests) = mock_server(vec![(
+            451,
+            vec![],
+            r#"{"code":0,"msg":"restricted location"}"#,
+            0,
+        )])
+        .await;
+        let client = BinanceClient::new(base_url).expect("Binance client");
+        let error = client
+            .probe_service_availability()
+            .await
+            .expect_err("HTTP 451 must block Binance configuration");
+        assert_eq!(error.code, "BINANCE_REGION_RESTRICTED");
+        let requests = requests.await.expect("captured request");
+        assert!(requests[0].starts_with("GET /api/v3/time "));
+        assert!(!requests[0].to_ascii_lowercase().contains("x-mbx-apikey"));
+        assert!(!requests[0].contains("signature="));
+    }
+
+    #[tokio::test]
+    async fn availability_probe_requires_a_valid_server_time() {
+        let (base_url, _) =
+            mock_server(vec![(200, vec![], r#"{"serverTime":1789700000000}"#, 0)]).await;
+        BinanceClient::new(base_url)
+            .expect("Binance client")
+            .probe_service_availability()
+            .await
+            .expect("valid server time should mark Binance available");
     }
 
     #[tokio::test]
