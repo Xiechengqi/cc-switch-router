@@ -899,6 +899,7 @@ export const messages = {
     "account.binanceAuto.state.regionRestricted": "Region unsupported",
     "account.binanceAuto.state.trial": "Observe only",
     "account.binanceAuto.state.ready": "Ready to bind",
+    "account.binanceAuto.state.activationRequired": "Ready to enable",
     "account.binanceAuto.state.actionRequired": "Rebind required",
     "account.binanceAuto.state.active": "Enabled",
     "account.binanceAuto.state.degraded": "Needs attention",
@@ -911,6 +912,8 @@ export const messages = {
       "Binance is temporarily unreachable from this Router. Existing records remain available; retry after connectivity recovers.",
     "account.binanceAuto.notice.trial":
       "Deposits are currently observed without settling invoices automatically.",
+    "account.binanceAuto.notice.activationRequired":
+      "Your encrypted credentials are still stored. Confirm to recheck the read-only permissions and bound UID, then enable automatic settlement without entering the key again.",
     "account.binanceAuto.notice.actionRequired":
       "Rebind and verify this account to enable automatic settlement.",
     "account.binanceAuto.notice.degraded":
@@ -971,6 +974,10 @@ export const messages = {
     "account.binanceAuto.guide.note.body":
       "Router derives the UID from signed Binance Pay history; it cannot be entered manually. If no UID is found, make or receive one small Pay transfer, then enter the key and secret again. The secret is encrypted and never shown again. Binance app menu names can vary by region, account type, and app version.",
     "account.binanceAuto.guide.openOfficialGuide": "View Binance's official guide",
+    "account.binanceAuto.enable": "Enable with saved credentials",
+    "account.binanceAuto.enableConfirm":
+      "Enable automatic Binance settlement with the saved credentials? Router will recheck the read-only permissions and bound UID first. Buyers can then create Binance payments and prepaid top-ups.",
+    "account.binanceAuto.enabled": "Binance automatic settlement is enabled.",
     "account.binanceAuto.verify": "Verify again",
     "account.binanceAuto.disable": "Disable",
     "account.binanceAuto.disableConfirm":
@@ -4494,6 +4501,7 @@ export const messages = {
     "account.binanceAuto.state.regionRestricted": "地区不支持",
     "account.binanceAuto.state.trial": "仅观察",
     "account.binanceAuto.state.ready": "可以绑定",
+    "account.binanceAuto.state.activationRequired": "等待确认启用",
     "account.binanceAuto.state.actionRequired": "需要重新绑定",
     "account.binanceAuto.state.active": "已启用",
     "account.binanceAuto.state.degraded": "需要处理",
@@ -4504,6 +4512,8 @@ export const messages = {
     "account.binanceAuto.notice.temporarilyUnavailable":
       "Router 暂时无法连接 Binance，历史记录仍可查看；网络恢复后可重试。",
     "account.binanceAuto.notice.trial": "当前只观察到账，不会自动结算账单。",
+    "account.binanceAuto.notice.activationRequired":
+      "已加密保存的凭据仍然可用。确认后 Router 会重新校验只读权限和绑定 UID，并直接启用自动到账，无需再次输入 Key。",
     "account.binanceAuto.notice.actionRequired": "请重新绑定并验证该账户，以启用自动结算。",
     "account.binanceAuto.notice.degraded":
       "该账户暂时无法自动确认到账。请查看最近错误，修复凭据后重新验证。",
@@ -4560,6 +4570,10 @@ export const messages = {
     "account.binanceAuto.guide.note.body":
       "UID 由 Router 从签名的 Binance Pay 流水自动识别，不能手填。若未识别，先使用该账户支付或接收一笔小额 Pay，再重新输入 Key 和 Secret。Secret 会加密保存且不回显。币安 APP 菜单名称可能因地区、账户类型和版本不同。",
     "account.binanceAuto.guide.openOfficialGuide": "查看币安官方教程",
+    "account.binanceAuto.enable": "使用已保存凭据启用",
+    "account.binanceAuto.enableConfirm":
+      "确认使用已保存凭据启用币安自动到账？Router 会先重新校验只读权限和绑定 UID；通过后买家即可使用币安付款和充值预存。",
+    "account.binanceAuto.enabled": "币安自动到账已启用。",
     "account.binanceAuto.verify": "重新验证",
     "account.binanceAuto.disable": "停用",
     "account.binanceAuto.disableConfirm": "停用自动到账确认，并取消全部待处理的自动付款金额？",

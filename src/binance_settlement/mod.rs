@@ -607,6 +607,10 @@ pub fn router() -> Router<ServerState> {
             post(verify_account),
         )
         .route(
+            "/v1/account/binance-auto-settlement/enable",
+            post(enable_account),
+        )
+        .route(
             "/v1/account/binance-auto-settlement/discover",
             post(discover_account),
         )
@@ -952,12 +956,16 @@ async fn bind_account(
     Ok(Json(account_status(&state, &session).await?))
 }
 
-async fn verify_account(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<BinanceAccountStatusResponse>, AppError> {
-    let session = require_session(&state, &headers).await?;
-    let cipher = state.binance_settlement.require_binance_available().await?;
+async fn verify_stored_account(
+    state: &ServerState,
+    session: &AuthSession,
+    enable_automation: bool,
+) -> Result<(), AppError> {
+    let cipher = if enable_automation {
+        state.binance_settlement.require_payment_available().await?
+    } else {
+        state.binance_settlement.require_binance_available().await?
+    };
     let stored = state
         .store
         .binance_load_payment_account(
@@ -1010,17 +1018,48 @@ async fn verify_account(
             return Err(map_verification_error(error));
         }
     };
-    state
-        .store
-        .binance_mark_account_verified(
-            &session.user_id,
-            state.binance_settlement.payment_home_region(),
-            &envelope.account.id,
-            envelope.account.credential_revision,
-            None,
-            &verification,
-        )
-        .await?;
+    if enable_automation {
+        state
+            .store
+            .binance_enable_payment_account(
+                &session.user_id,
+                state.binance_settlement.payment_home_region(),
+                &envelope.account.id,
+                envelope.account.credential_revision,
+                &verification,
+            )
+            .await?;
+    } else {
+        state
+            .store
+            .binance_mark_account_verified(
+                &session.user_id,
+                state.binance_settlement.payment_home_region(),
+                &envelope.account.id,
+                envelope.account.credential_revision,
+                None,
+                &verification,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn verify_account(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<BinanceAccountStatusResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    verify_stored_account(&state, &session, false).await?;
+    Ok(Json(account_status(&state, &session).await?))
+}
+
+async fn enable_account(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<BinanceAccountStatusResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    verify_stored_account(&state, &session, true).await?;
     Ok(Json(account_status(&state, &session).await?))
 }
 

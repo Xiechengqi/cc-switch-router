@@ -255,7 +255,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_AUTH_SOURCE_HOURLY_LIMIT` | `10` | 单认证来源每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `free_access = 1` 的公开免费 Share 共用的单真实用户 IP 并发上限；v1 `forSale=Free` 只在 migration 20 的持久化迁移边界识别，不属于 active contract；设为 `0` 可关闭 |
 | `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
-| `CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE` | `disabled` | 币安自动到账总开关：`disabled`、`shadow` 或 `enabled`；修改后需重启。`disabled` 还会持久化把全部绑定降为账户级 shadow，`shadow` 读取和匹配但不改账，并强制该阶段的新绑定保持账户级 shadow |
+| `CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE` | `disabled` | 币安自动到账总开关：`disabled`、`shadow` 或 `enabled`；修改后需重启。`disabled` 还会持久化把全部绑定降为账户级 shadow，`shadow` 读取和匹配但不改账，并强制该阶段的新绑定保持账户级 shadow；切到 `enabled` 后仍需各 Provider 使用已保存凭据明确确认启用 |
 | `CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL` | 空 | 仅供 Binance 地区检测、凭据验证与 Pay 流水轮询使用的 `socks5h://` 代理；支持 URL 内认证，DNS 由代理解析，修改后需重启 |
 | `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY` | 自动托管 | 高级部署覆盖项。默认在 Router 数据目录自动生成权限为 `0600` 的 `binance-master-key`，无需在 Settings 配置；变更密钥后已有商家必须重新绑定 |
 | `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION` | `1` | 隐藏的高级部署覆盖项；普通部署保持默认值 |

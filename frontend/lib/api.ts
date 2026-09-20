@@ -1365,6 +1365,12 @@ export async function verifyBinanceAutoSettlement() {
   );
 }
 
+export async function enableBinanceAutoSettlement() {
+  return parseJson<BinanceAutoSettlementStatus>(
+    await authFetch("/v1/account/binance-auto-settlement/enable", { method: "POST" }),
+  );
+}
+
 export async function disableBinanceAutoSettlement() {
   return parseJson<BinanceAutoSettlementStatus>(
     await authFetch("/v1/account/binance-auto-settlement/disable", { method: "POST" }),

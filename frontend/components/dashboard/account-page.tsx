@@ -25,6 +25,7 @@ import {
   deleteBinanceAutoSettlement,
   disableBinanceAutoSettlement,
   discoverBinanceAutoSettlement,
+  enableBinanceAutoSettlement,
   getAccountPaymentProfile,
   getBinanceAutoSettlementStatus,
   getMarketBillingConfig,
@@ -181,7 +182,9 @@ export function AccountPaymentsPanel() {
       ? "bg-rose-100 text-rose-700"
       : binanceUiState === "actionRequired"
         ? "bg-amber-100 text-amber-800"
-        : "bg-slate-100 text-slate-600";
+        : binanceUiState === "activationRequired"
+          ? "bg-sky-100 text-sky-800"
+          : "bg-slate-100 text-slate-600";
 
   const applyProfile = React.useCallback((methods: ClientMarketPaymentMethod[], contacts: PaymentContact[] = []) => {
     const alipay = methods.find((method) => method.kind === "alipay");
@@ -371,6 +374,25 @@ export function AccountPaymentsPanel() {
       setBinanceStatus(next);
       setBinanceStatusError("");
       toast.success(t("account.binanceAuto.verified"));
+    } catch (error) {
+      if (actorKeyRef.current === requestedActorKey) {
+        toast.danger(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (actorKeyRef.current === requestedActorKey) setBinanceBusy("");
+    }
+  };
+
+  const enableBinanceCredentials = async () => {
+    if (binanceBusy || !window.confirm(t("account.binanceAuto.enableConfirm"))) return;
+    const requestedActorKey = actorKey;
+    setBinanceBusy("enable");
+    try {
+      const next = await enableBinanceAutoSettlement();
+      if (actorKeyRef.current !== requestedActorKey) return;
+      setBinanceStatus(next);
+      setBinanceStatusError("");
+      toast.success(t("account.binanceAuto.enabled"));
     } catch (error) {
       if (actorKeyRef.current === requestedActorKey) {
         toast.danger(error instanceof Error ? error.message : String(error));
@@ -655,6 +677,20 @@ export function AccountPaymentsPanel() {
             <p className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-700">
               {t("account.binanceAuto.notice.trial")}
             </p>
+          ) : null}
+          {binanceStatus && binanceUiState === "activationRequired" ? (
+            <div className="flex flex-wrap items-center gap-3 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-950">
+              <p className="min-w-[14rem] flex-1">{t("account.binanceAuto.notice.activationRequired")}</p>
+              <Button
+                size="sm"
+                variant="primary"
+                isDisabled={!!binanceBusy || binanceConfigurationBlocked}
+                onClick={() => void enableBinanceCredentials()}
+              >
+                {binanceBusy === "enable" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                {t("account.binanceAuto.enable")}
+              </Button>
+            </div>
           ) : null}
           {binanceStatus && binanceUiState === "actionRequired" ? (
             <p className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs leading-5 text-amber-900">

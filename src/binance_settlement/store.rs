@@ -734,7 +734,55 @@ impl AppStore {
         expected_lease_owner: Option<&str>,
         verification: &VerificationResult,
     ) -> Result<(), AppError> {
+        self.binance_apply_account_verification(
+            supplier_user_id,
+            region,
+            account_id,
+            credential_revision,
+            expected_lease_owner,
+            false,
+            verification,
+        )
+        .await
+    }
+
+    pub async fn binance_enable_payment_account(
+        &self,
+        supplier_user_id: &str,
+        region: &str,
+        account_id: &str,
+        credential_revision: i64,
+        verification: &VerificationResult,
+    ) -> Result<(), AppError> {
+        self.binance_apply_account_verification(
+            supplier_user_id,
+            region,
+            account_id,
+            credential_revision,
+            None,
+            true,
+            verification,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn binance_apply_account_verification(
+        &self,
+        supplier_user_id: &str,
+        region: &str,
+        account_id: &str,
+        credential_revision: i64,
+        expected_lease_owner: Option<&str>,
+        enable_automation: bool,
+        verification: &VerificationResult,
+    ) -> Result<(), AppError> {
         ensure_safe_verification(verification, false)?;
+        if enable_automation && expected_lease_owner.is_some() {
+            return Err(AppError::Internal(
+                "Binance automation can only be enabled by the account owner".into(),
+            ));
+        }
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
         let permissions_json = serde_json::to_string(verification)
@@ -750,7 +798,7 @@ impl AppStore {
         let previous = tx
             .query_row(
                 "SELECT status, consecutive_failures, last_poll_error_code,
-                        last_poll_success_at
+                        last_poll_success_at, uid_confirmed
                  FROM binance_payment_accounts
                  WHERE supplier_user_id = ?1 AND payment_home_region = ?2
                    AND id = ?3 AND credential_revision = ?4
@@ -769,6 +817,7 @@ impl AppStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
@@ -779,10 +828,17 @@ impl AppStore {
                     "Binance payment account changed while credentials were verified; retry".into(),
                 )
             })?;
+        if enable_automation && !previous.4 && !verification.uid_confirmed {
+            return Err(AppError::Conflict(
+                "Binance UID confirmation is required before enabling automatic settlement".into(),
+            ));
+        }
         let updated = tx
             .execute(
                 "UPDATE binance_payment_accounts
                  SET status = CASE WHEN ?10 = 1 THEN 'verified' ELSE status END,
+                     automation_mode = CASE WHEN ?11 = 1
+                         THEN 'enabled' ELSE automation_mode END,
                      permissions_json = ?6,
                      permissions_verified_at = ?9,
                      uid_confirmed = MAX(uid_confirmed, ?7),
@@ -795,6 +851,8 @@ impl AppStore {
                      degraded_since = CASE WHEN ?10 = 1
                          THEN NULL ELSE degraded_since END,
                      next_poll_at = CASE WHEN ?10 = 1 THEN ?9 ELSE next_poll_at END,
+                     lease_owner = CASE WHEN ?11 = 1 THEN NULL ELSE lease_owner END,
+                     lease_until = CASE WHEN ?11 = 1 THEN NULL ELSE lease_until END,
                      updated_at = ?9
                  WHERE supplier_user_id = ?1 AND payment_home_region = ?2
                    AND id = ?3 AND credential_revision = ?4
@@ -811,6 +869,7 @@ impl AppStore {
                     uid_confirmation_source,
                     now,
                     i64::from(manual_verification),
+                    i64::from(enable_automation),
                 ],
             )
             .map_err(map_db("mark Binance account verified"))?;
@@ -2065,7 +2124,7 @@ impl AppStore {
         // leases. During a rolling restart this prevents an older enabled HTTP
         // process from creating another payable intent after the disabled
         // process commits the kill switch. Re-enabling is therefore always an
-        // explicit, per-account credential rebind.
+        // explicit, per-account activation after credential re-verification.
         tx.execute(
             "UPDATE binance_payment_accounts
              SET automation_mode = 'shadow', lease_owner = NULL, lease_until = NULL,
@@ -5654,6 +5713,18 @@ mod tests {
         ));
         assert!(matches!(
             store
+                .binance_enable_payment_account(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &account.id,
+                    account.credential_revision,
+                    &verified_permissions(),
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            store
                 .binance_process_poll_success(
                     &account,
                     "test-worker",
@@ -6131,6 +6202,203 @@ mod tests {
         assert_eq!(state.1, 0);
         assert!(state.2.is_none());
         assert_eq!(state.3, 1);
+    }
+
+    #[tokio::test]
+    async fn verified_shadow_account_can_be_enabled_without_rebinding_credentials() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "activate-shadow").await;
+        let before = {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE binance_payment_accounts
+                 SET automation_mode = 'shadow', lease_owner = 'old-shadow-worker',
+                     lease_until = ?2,
+                     poll_cursor_at = '2026-09-20T00:00:00Z',
+                     poll_scan_cursor_at = '2026-09-20T00:00:01Z',
+                     poll_scan_target_at = '2026-09-20T00:00:02Z'
+                 WHERE id = ?1",
+                params![
+                    fixture.payment_account_id,
+                    (Utc::now() + Duration::minutes(5)).to_rfc3339(),
+                ],
+            )
+            .expect("demote fixture account to shadow");
+            conn.query_row(
+                "SELECT credentials_ciphertext, credential_nonce, credential_revision,
+                        poll_cursor_at, poll_scan_cursor_at, poll_scan_target_at
+                 FROM binance_payment_accounts WHERE id = ?1",
+                params![fixture.payment_account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("read encrypted credential identity")
+        };
+        let account = store
+            .binance_load_payment_account(&fixture.supplier.user_id, "test")
+            .await
+            .expect("load shadow account")
+            .expect("shadow account exists");
+        assert!(
+            !store
+                .binance_supplier_funding_available_for_cipher(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &fixture.cipher,
+                )
+                .await
+                .expect("check shadow funding availability")
+        );
+
+        store
+            .binance_mark_account_verified(
+                &fixture.supplier.user_id,
+                "test",
+                &account.id,
+                account.credential_revision,
+                None,
+                &verified_permissions(),
+            )
+            .await
+            .expect("ordinary verification succeeds");
+        let view = store
+            .binance_payment_account_view(&fixture.supplier.user_id, "test")
+            .await
+            .expect("read verified shadow account")
+            .expect("verified shadow account exists");
+        assert_eq!(view.automation_mode, "shadow");
+
+        store
+            .binance_enable_payment_account(
+                &fixture.supplier.user_id,
+                "test",
+                &account.id,
+                account.credential_revision,
+                &verified_permissions(),
+            )
+            .await
+            .expect("explicit owner activation succeeds");
+        let conn = store.conn.lock().await;
+        let credentials_after: (String, String, i64) = conn
+            .query_row(
+                "SELECT credentials_ciphertext, credential_nonce, credential_revision
+                 FROM binance_payment_accounts WHERE id = ?1",
+                params![fixture.payment_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read activated credentials");
+        let state_after: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, automation_mode, lease_owner, lease_until, next_poll_at
+                 FROM binance_payment_accounts WHERE id = ?1",
+                params![fixture.payment_account_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read activated account state");
+        let cursors_after: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT poll_cursor_at, poll_scan_cursor_at, poll_scan_target_at
+                 FROM binance_payment_accounts WHERE id = ?1",
+                params![fixture.payment_account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read activated poll cursors");
+        assert_eq!(
+            (
+                &credentials_after.0,
+                &credentials_after.1,
+                credentials_after.2,
+            ),
+            (&before.0, &before.1, before.2)
+        );
+        assert_eq!(state_after.0, "verified");
+        assert_eq!(state_after.1, "enabled");
+        assert!(state_after.2.is_none());
+        assert!(state_after.3.is_none());
+        assert_eq!(
+            (&cursors_after.0, &cursors_after.1, &cursors_after.2),
+            (&before.3, &before.4, &before.5)
+        );
+        assert!(state_after.4.is_some());
+        drop(conn);
+        assert!(
+            store
+                .binance_supplier_funding_available_for_cipher(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &fixture.cipher,
+                )
+                .await
+                .expect("check activated funding availability")
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_account_without_uid_evidence_cannot_be_enabled() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "activate-unconfirmed").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE binance_payment_accounts
+                 SET automation_mode = 'shadow', uid_confirmed = 0,
+                     uid_confirmation_source = NULL
+                 WHERE id = ?1",
+                params![fixture.payment_account_id],
+            )
+            .expect("remove fixture UID evidence");
+        }
+        let account = store
+            .binance_load_payment_account(&fixture.supplier.user_id, "test")
+            .await
+            .expect("load unconfirmed shadow account")
+            .expect("unconfirmed shadow account exists");
+        let unconfirmed = VerificationResult {
+            reading_enabled: true,
+            dangerous_permissions_disabled: true,
+            uid_confirmed: false,
+            uid_confirmation_source: None,
+        };
+        assert!(matches!(
+            store
+                .binance_enable_payment_account(
+                    &fixture.supplier.user_id,
+                    "test",
+                    &account.id,
+                    account.credential_revision,
+                    &unconfirmed,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let view = store
+            .binance_payment_account_view(&fixture.supplier.user_id, "test")
+            .await
+            .expect("read rejected shadow account")
+            .expect("rejected shadow account exists");
+        assert_eq!(view.automation_mode, "shadow");
     }
 
     #[tokio::test]

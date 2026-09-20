@@ -1401,7 +1401,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: true,
         default: Some("disabled"),
-        description: "Choose disabled, observation-only shadow, or enabled automatic settlement. Router manages credential encryption and safe connection defaults automatically.",
+        description: "Choose disabled, observation-only shadow, or globally enabled automatic settlement. After restart, each shadow Provider account must explicitly enable settlement with its saved credentials. Router manages credential encryption and safe connection defaults automatically.",
         placeholder: None,
         dynamic_group: None,
     },

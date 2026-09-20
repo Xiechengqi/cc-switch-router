@@ -5,6 +5,7 @@ export type BinanceAutoSettlementUiState =
   | "regionRestricted"
   | "trial"
   | "ready"
+  | "activationRequired"
   | "actionRequired"
   | "active"
   | "degraded"
@@ -24,6 +25,10 @@ export function binanceAutoSettlementUiState(
   if (status.account?.status === "disabled") return "accountDisabled";
   if (status.globalMode === "shadow") return "trial";
   if (!status.account) return "ready";
+  if (
+    status.account.automationMode === "shadow"
+    && status.account.status === "verified"
+  ) return "activationRequired";
   if (status.account.automationMode !== "enabled") return "actionRequired";
   if (status.account.status !== "verified") return "actionRequired";
   return "active";

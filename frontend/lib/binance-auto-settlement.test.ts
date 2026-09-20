@@ -71,10 +71,16 @@ test("region restriction blocks configuration before account state", () => {
   );
 });
 
-test("enabled router distinguishes new, shadow, and active bindings", () => {
+test("enabled router distinguishes new, activatable, invalid, and active bindings", () => {
   assert.equal(binanceAutoSettlementUiState(status()), "ready");
   assert.equal(
     binanceAutoSettlementUiState(status({ account: account({ automationMode: "shadow" }) })),
+    "activationRequired",
+  );
+  assert.equal(
+    binanceAutoSettlementUiState(status({
+      account: account({ automationMode: "shadow", status: "verifying" }),
+    })),
     "actionRequired",
   );
   assert.equal(
