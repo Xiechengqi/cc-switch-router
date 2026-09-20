@@ -82,6 +82,8 @@ Router 会通过 Binance `/api/v3/time` 检测当前直连或代理出口。HTTP
 
 管理员“结算”仍会重新校验：正向 USDT、可接受的 ingestion 状态、目标账单与付款账户属于同一商家、存在 Binance intent、实付不低于基础金额且账单仍为 open/overdue。系统已经关联到账单的案例不能改挂到另一张账单，只有无关联案例才允许管理员输入目标账单。“忽略”与“结算”都会记录操作人、时间和 resolution；UI 只展示 Binance order ID 和截断后的匿名身份指纹，不解密展示原始流水。
 
+Provider 账户页的“币安到账记录”是 Router 已确认收款的统一审计视图，同时包含 Market 账单收款与用户预存充值，并按确认时间和收据 ID 统一倒序分页。预存充值展示实付 USDT、实际记入预存账户的 USD 分金额、买家、funding intent 和自动/人工来源；账单收款继续展示账单与服务行。该视图只读取已落账的收据，不等同于 Binance 全量流水；删除或停用凭据不会删除历史收据。接口会同时校验付款账户、intent 和账务账户的 Provider 归属，任何归属链不一致的数据都会 fail closed，不向任一 Provider 展示。API Key/Secret、原始流水密文、付款方 Binance ID 和身份指纹均不进入响应。
+
 Router 会把以下异常写入现有 operator alert outbox，由已配置的 Telegram/Bark 等管理员通知渠道投递；轮询恢复、人工复验成功、重新绑定或停用账户会发送同一 fingerprint 的 resolved 信号：
 
 - 任一账户连续失败 3 次进入 `degraded`；

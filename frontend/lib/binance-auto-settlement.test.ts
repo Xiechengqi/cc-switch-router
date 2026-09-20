@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { binanceAutoSettlementUiState } from "./binance-auto-settlement";
-import type { BinanceAutoSettlementStatus } from "./types";
+import {
+  binanceAutoSettlementUiState,
+  binanceReceiptBuyerEmail,
+  binanceReceiptStatus,
+} from "./binance-auto-settlement";
+import type {
+  BinanceAutoSettlementStatus,
+  BinanceReceiptHistoryEntry,
+} from "./types";
 
 function status(
   overrides: Partial<BinanceAutoSettlementStatus> = {},
@@ -92,4 +99,53 @@ test("enabled router distinguishes new, activatable, invalid, and active binding
 
 test("shadow router is presented as a trial", () => {
   assert.equal(binanceAutoSettlementUiState(status({ globalMode: "shadow" })), "trial");
+});
+
+test("receipt presentation handles invoice payments and prepaid top-ups", () => {
+  const common = {
+    receiptId: "receipt-1",
+    transactionId: "transaction-1",
+    transactionAt: "2026-09-20T12:00:00Z",
+    confirmedAt: "2026-09-20T12:00:01Z",
+    source: "binance_auto",
+    matchedBy: "exact_amount",
+    asset: "USDT",
+    expectedAmount: "5.0037",
+    actualAmount: "5.0037",
+  };
+  const invoice = {
+    ...common,
+    kind: "invoice_payment",
+    paymentIntentId: "payment-intent-1",
+    invoice: {
+      id: "invoice-1",
+      sequence: 7,
+      status: "paid",
+      paidAt: "2026-09-20T12:00:01Z",
+      buyerEmail: "invoice-buyer@example.com",
+      amountUsdMinor: 500,
+      amountCnyMinor: 3500,
+      lines: [],
+    },
+  } satisfies BinanceReceiptHistoryEntry;
+  const topup = {
+    ...common,
+    receiptId: "receipt-2",
+    kind: "prepaid_topup",
+    fundingIntentId: "funding-intent-1",
+    topup: {
+      prepaidAccountId: "prepaid-1",
+      buyerEmail: "topup-buyer@example.com",
+      status: "credited",
+      creditedAt: "2026-09-20T12:00:01Z",
+      currency: "USD",
+      creditedAmountMinor: 500,
+    },
+  } satisfies BinanceReceiptHistoryEntry;
+
+  assert.equal(binanceReceiptBuyerEmail(invoice), "invoice-buyer@example.com");
+  assert.equal(binanceReceiptStatus(invoice), "paid");
+  assert.equal(binanceReceiptBuyerEmail(topup), "topup-buyer@example.com");
+  assert.equal(binanceReceiptStatus(topup), "credited");
+  assert.equal(topup.topup.creditedAmountMinor, 500);
 });

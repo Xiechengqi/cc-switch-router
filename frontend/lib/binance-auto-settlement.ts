@@ -1,4 +1,7 @@
-import type { BinanceAutoSettlementStatus } from "@/lib/types";
+import type {
+  BinanceAutoSettlementStatus,
+  BinanceReceiptHistoryEntry,
+} from "@/lib/types";
 
 export type BinanceAutoSettlementUiState =
   | "unavailable"
@@ -32,4 +35,16 @@ export function binanceAutoSettlementUiState(
   if (status.account.automationMode !== "enabled") return "actionRequired";
   if (status.account.status !== "verified") return "actionRequired";
   return "active";
+}
+
+export function binanceReceiptBuyerEmail(entry: BinanceReceiptHistoryEntry) {
+  return entry.kind === "invoice_payment"
+    ? entry.invoice.buyerEmail
+    : entry.topup.buyerEmail;
+}
+
+export function binanceReceiptStatus(entry: BinanceReceiptHistoryEntry) {
+  return entry.kind === "invoice_payment"
+    ? entry.invoice.status
+    : entry.topup.status;
 }

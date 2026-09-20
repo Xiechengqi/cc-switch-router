@@ -675,8 +675,8 @@ fn decode_receipt_cursor(value: &str) -> Result<ReceiptHistoryCursor, AppError> 
 fn encode_receipt_cursor(item: &BinanceReceiptHistoryEntryView) -> Result<String, AppError> {
     let bytes = serde_json::to_vec(&ReceiptHistoryCursor {
         v: 1,
-        confirmed_at: item.confirmed_at.clone(),
-        receipt_id: item.receipt_id.clone(),
+        confirmed_at: item.confirmed_at().to_string(),
+        receipt_id: item.receipt_id().to_string(),
     })
     .map_err(|error| AppError::Internal(format!("encode receipt history cursor: {error}")))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))

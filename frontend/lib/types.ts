@@ -2256,9 +2256,8 @@ export type BinanceReceiptMarketLine = {
   amountCnyMinor: number;
 };
 
-export type BinanceReceiptHistoryEntry = {
+type BinanceReceiptHistoryCommon = {
   receiptId: string;
-  paymentIntentId: string;
   transactionId: string;
   orderId?: string;
   transactionAt: string;
@@ -2268,17 +2267,36 @@ export type BinanceReceiptHistoryEntry = {
   asset: string;
   expectedAmount: string;
   actualAmount: string;
-  invoice: {
-    id: string;
-    sequence: number;
-    status: string;
-    paidAt?: string;
-    buyerEmail: string;
-    amountUsdMinor: number;
-    amountCnyMinor: number;
-    lines: BinanceReceiptMarketLine[];
-  };
 };
+
+export type BinanceReceiptHistoryEntry = BinanceReceiptHistoryCommon & (
+  | {
+      kind: "invoice_payment";
+      paymentIntentId: string;
+      invoice: {
+        id: string;
+        sequence: number;
+        status: string;
+        paidAt?: string;
+        buyerEmail: string;
+        amountUsdMinor: number;
+        amountCnyMinor: number;
+        lines: BinanceReceiptMarketLine[];
+      };
+    }
+  | {
+      kind: "prepaid_topup";
+      fundingIntentId: string;
+      topup: {
+        prepaidAccountId: string;
+        buyerEmail: string;
+        status: string;
+        creditedAt: string;
+        currency: "USD";
+        creditedAmountMinor: number;
+      };
+    }
+);
 
 export type BinanceReceiptHistoryResponse = {
   items: BinanceReceiptHistoryEntry[];

@@ -5,6 +5,11 @@ import { Button, Chip, Modal } from "@heroui/react";
 import { ChevronDown, Loader2, ReceiptText } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getBinanceReceiptHistory } from "@/lib/api";
+import {
+  binanceReceiptBuyerEmail,
+  binanceReceiptStatus,
+} from "@/lib/binance-auto-settlement";
+import { formatUsdMoney } from "@/lib/market-money";
 import type { BinanceReceiptHistoryEntry } from "@/lib/types";
 
 function receiptSource(source: string, t: ReturnType<typeof useLocaleText>["t"]) {
@@ -85,22 +90,48 @@ export function BinanceReceiptHistoryDialog({
                         </div>
                       </div>
                       <div className="text-right text-xs">
-                        <div className="flex items-center justify-end gap-2">
-                          <strong>#{item.invoice.sequence}</strong>
+                        <div className="flex flex-wrap items-center justify-end gap-2">
+                          <Chip size="sm" variant="soft">
+                            {t(item.kind === "invoice_payment"
+                              ? "account.binanceAuto.receipts.kindInvoice"
+                              : "account.binanceAuto.receipts.kindTopup")}
+                          </Chip>
+                          <strong>
+                            {item.kind === "invoice_payment"
+                              ? `#${item.invoice.sequence}`
+                              : formatUsdMoney(item.topup.creditedAmountMinor, locale)}
+                          </strong>
                           <Chip size="sm" variant="soft">{receiptSource(item.source, t)}</Chip>
                         </div>
-                        <span className="mt-1 block text-muted-foreground">{item.invoice.buyerEmail}</span>
+                        <span className="mt-1 block text-muted-foreground">{binanceReceiptBuyerEmail(item)}</span>
                       </div>
                     </summary>
                     <div className="grid gap-3 border-t p-4 text-xs">
                       <div className="grid gap-1 text-muted-foreground sm:grid-cols-2">
                         <span>{t("account.binanceAuto.receipts.confirmedAt")}: {date(item.confirmedAt)}</span>
-                        <span>{t("account.binanceAuto.receipts.invoiceStatus")}: {item.invoice.status}</span>
+                        <span>
+                          {t(item.kind === "invoice_payment"
+                            ? "account.binanceAuto.receipts.invoiceStatus"
+                            : "account.binanceAuto.receipts.topupStatus")}: {binanceReceiptStatus(item)}
+                        </span>
                         <span>{t("account.binanceAuto.receipts.expected")}: {item.expectedAmount} {item.asset}</span>
                         <span>{t("account.binanceAuto.receipts.transactionId")}: <span className="break-all font-mono">{item.transactionId}</span></span>
                         {item.orderId ? <span>{t("account.binanceAuto.receipts.orderId")}: <span className="break-all font-mono">{item.orderId}</span></span> : null}
+                        {item.kind === "prepaid_topup" ? (
+                          <>
+                            <span>
+                              {t("account.binanceAuto.receipts.creditedAmount")}: {formatUsdMoney(item.topup.creditedAmountMinor, locale)}
+                            </span>
+                            <span>
+                              {t("account.binanceAuto.receipts.creditedAt")}: {date(item.topup.creditedAt)}
+                            </span>
+                            <span>
+                              {t("account.binanceAuto.receipts.fundingIntent")}: <span className="break-all font-mono">{item.fundingIntentId}</span>
+                            </span>
+                          </>
+                        ) : null}
                       </div>
-                      {item.invoice.lines.length ? (
+                      {item.kind === "invoice_payment" && item.invoice.lines.length ? (
                         <div className="grid gap-2">
                           {item.invoice.lines.map((line, index) => (
                             <div key={`${line.serviceLabel}-${index}`} className="flex flex-wrap justify-between gap-2 rounded-md bg-slate-50 p-2">

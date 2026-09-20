@@ -175,19 +175,75 @@ pub struct BinanceReceiptInvoiceView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BinanceReceiptHistoryEntryView {
-    pub receipt_id: String,
-    pub payment_intent_id: String,
-    pub transaction_id: String,
-    pub order_id: Option<String>,
-    pub transaction_at: String,
-    pub confirmed_at: String,
-    pub source: String,
-    pub matched_by: String,
-    pub asset: String,
-    pub expected_amount: String,
-    pub actual_amount: String,
-    pub invoice: BinanceReceiptInvoiceView,
+pub struct BinanceReceiptTopupView {
+    pub prepaid_account_id: String,
+    pub buyer_email: String,
+    pub status: String,
+    pub credited_at: String,
+    pub currency: String,
+    pub credited_amount_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum BinanceReceiptHistoryEntryView {
+    InvoicePayment {
+        receipt_id: String,
+        payment_intent_id: String,
+        transaction_id: String,
+        order_id: Option<String>,
+        transaction_at: String,
+        confirmed_at: String,
+        source: String,
+        matched_by: String,
+        asset: String,
+        expected_amount: String,
+        actual_amount: String,
+        invoice: BinanceReceiptInvoiceView,
+    },
+    PrepaidTopup {
+        receipt_id: String,
+        funding_intent_id: String,
+        transaction_id: String,
+        order_id: Option<String>,
+        transaction_at: String,
+        confirmed_at: String,
+        source: String,
+        matched_by: String,
+        asset: String,
+        expected_amount: String,
+        actual_amount: String,
+        topup: BinanceReceiptTopupView,
+    },
+}
+
+impl BinanceReceiptHistoryEntryView {
+    pub fn receipt_id(&self) -> &str {
+        match self {
+            Self::InvoicePayment { receipt_id, .. } | Self::PrepaidTopup { receipt_id, .. } => {
+                receipt_id
+            }
+        }
+    }
+
+    pub fn confirmed_at(&self) -> &str {
+        match self {
+            Self::InvoicePayment { confirmed_at, .. } | Self::PrepaidTopup { confirmed_at, .. } => {
+                confirmed_at
+            }
+        }
+    }
+
+    fn invoice_mut(&mut self) -> Option<&mut BinanceReceiptInvoiceView> {
+        match self {
+            Self::InvoicePayment { invoice, .. } => Some(invoice),
+            Self::PrepaidTopup { .. } => None,
+        }
+    }
 }
 
 pub struct BinanceReceiptHistoryBatch {
@@ -231,29 +287,114 @@ impl AppStore {
             .unwrap_or((None, None));
         let rows = conn
             .prepare(
-                "SELECT receipt.id, receipt.payment_intent_id, receipt.transaction_id,
-                        payment.order_id, payment.transaction_time, receipt.confirmed_at,
-                        receipt.source, receipt.matched_by, receipt.asset,
-                        receipt.expected_amount_units, receipt.actual_amount_units,
-                        invoice.id, invoice.sequence, invoice.status, invoice.paid_at,
-                        credit.buyer_email, invoice.amount_minor, invoice.amount_cny_minor
-                 FROM market_external_payment_receipts receipt
-                 JOIN binance_payment_accounts payment_account
-                   ON payment_account.id = receipt.payment_account_id
-                 JOIN binance_pay_transactions payment
-                   ON payment.payment_account_id = receipt.payment_account_id
-                  AND payment.transaction_id = receipt.transaction_id
-                 JOIN market_payment_intents intent
-                   ON intent.id = receipt.payment_intent_id
-                  AND intent.invoice_id = receipt.invoice_id
-                  AND intent.payment_account_id = receipt.payment_account_id
-                 JOIN market_invoices invoice ON invoice.id = receipt.invoice_id
-                 JOIN market_credit_accounts credit ON credit.id = invoice.account_id
-                 WHERE payment_account.supplier_user_id = ?1
-                   AND credit.supplier_user_id = ?1
-                   AND (?2 IS NULL OR receipt.confirmed_at < ?2
-                        OR (receipt.confirmed_at = ?2 AND receipt.id < ?3))
-                 ORDER BY receipt.confirmed_at DESC, receipt.id DESC
+                "SELECT history.kind, history.receipt_id, history.intent_id,
+                        history.transaction_id, history.order_id, history.transaction_at,
+                        history.confirmed_at, history.source, history.matched_by,
+                        history.asset, history.expected_amount_units,
+                        history.actual_amount_units, history.invoice_id,
+                        history.invoice_sequence, history.entry_status,
+                        history.invoice_paid_at, history.buyer_email,
+                        history.invoice_amount_minor, history.invoice_amount_cny_minor,
+                        history.prepaid_account_id, history.credited_at,
+                        history.currency, history.credited_money_units
+                 FROM (
+                    SELECT 'invoice_payment' AS kind, receipt.id AS receipt_id,
+                           receipt.payment_intent_id AS intent_id,
+                           receipt.transaction_id AS transaction_id,
+                           payment.order_id AS order_id,
+                           payment.transaction_time AS transaction_at,
+                           receipt.confirmed_at AS confirmed_at,
+                           receipt.source AS source, receipt.matched_by AS matched_by,
+                           receipt.asset AS asset,
+                           receipt.expected_amount_units AS expected_amount_units,
+                           receipt.actual_amount_units AS actual_amount_units,
+                           invoice.id AS invoice_id, invoice.sequence AS invoice_sequence,
+                           invoice.status AS entry_status,
+                           invoice.paid_at AS invoice_paid_at,
+                           credit.buyer_email AS buyer_email,
+                           invoice.amount_minor AS invoice_amount_minor,
+                           invoice.amount_cny_minor AS invoice_amount_cny_minor,
+                           NULL AS prepaid_account_id, NULL AS credited_at,
+                           NULL AS currency, NULL AS credited_money_units
+                    FROM market_external_payment_receipts receipt
+                    JOIN binance_payment_accounts payment_account
+                      ON payment_account.id = receipt.payment_account_id
+                    JOIN binance_pay_transactions payment
+                      ON payment.payment_account_id = receipt.payment_account_id
+                     AND payment.transaction_id = receipt.transaction_id
+                     AND payment.payment_intent_id = receipt.payment_intent_id
+                     AND payment.currency = receipt.asset
+                     AND payment.amount_units = receipt.actual_amount_units
+                    JOIN market_payment_intents intent
+                      ON intent.id = receipt.payment_intent_id
+                     AND intent.invoice_id = receipt.invoice_id
+                     AND intent.payment_account_id = receipt.payment_account_id
+                     AND intent.asset = receipt.asset
+                     AND intent.pay_amount_units = receipt.expected_amount_units
+                     AND intent.status = 'paid'
+                    JOIN market_invoices invoice ON invoice.id = receipt.invoice_id
+                    JOIN market_credit_accounts credit
+                      ON credit.id = invoice.account_id
+                     AND credit.buyer_user_id = intent.buyer_user_id
+                     AND credit.supplier_user_id = intent.supplier_user_id
+                    WHERE payment_account.supplier_user_id = ?1
+                      AND intent.supplier_user_id = ?1
+                      AND credit.supplier_user_id = ?1
+                      AND (?2 IS NULL OR receipt.confirmed_at < ?2
+                           OR (receipt.confirmed_at = ?2 AND receipt.id < ?3))
+
+                    UNION ALL
+
+                    SELECT 'prepaid_topup' AS kind, receipt.id AS receipt_id,
+                           receipt.funding_intent_id AS intent_id,
+                           receipt.transaction_id AS transaction_id,
+                           payment.order_id AS order_id,
+                           payment.transaction_time AS transaction_at,
+                           receipt.confirmed_at AS confirmed_at,
+                           receipt.source AS source, receipt.matched_by AS matched_by,
+                           receipt.asset AS asset,
+                           intent.pay_amount_units AS expected_amount_units,
+                           receipt.actual_amount_units AS actual_amount_units,
+                           NULL AS invoice_id, NULL AS invoice_sequence,
+                           intent.status AS entry_status, NULL AS invoice_paid_at,
+                           prepaid.buyer_email AS buyer_email,
+                           NULL AS invoice_amount_minor,
+                           NULL AS invoice_amount_cny_minor,
+                           prepaid.id AS prepaid_account_id,
+                           intent.credited_at AS credited_at,
+                           prepaid.currency AS currency,
+                           receipt.credited_money_units AS credited_money_units
+                    FROM market_funding_receipts receipt
+                    JOIN binance_payment_accounts payment_account
+                      ON payment_account.id = receipt.payment_account_id
+                    JOIN binance_pay_transactions payment
+                      ON payment.payment_account_id = receipt.payment_account_id
+                     AND payment.transaction_id = receipt.transaction_id
+                     AND payment.funding_intent_id = receipt.funding_intent_id
+                     AND payment.currency = receipt.asset
+                     AND payment.amount_units = receipt.actual_amount_units
+                    JOIN market_funding_intents intent
+                      ON intent.id = receipt.funding_intent_id
+                     AND intent.prepaid_account_id = receipt.prepaid_account_id
+                     AND intent.payment_account_id = receipt.payment_account_id
+                     AND intent.matched_transaction_id = receipt.transaction_id
+                     AND intent.asset = receipt.asset
+                     AND intent.pay_amount_units > 0
+                     AND intent.status = 'credited'
+                     AND intent.credited_money_units = receipt.credited_money_units
+                     AND intent.credited_at IS NOT NULL
+                    JOIN market_prepaid_accounts prepaid
+                      ON prepaid.id = receipt.prepaid_account_id
+                     AND prepaid.id = intent.prepaid_account_id
+                     AND prepaid.buyer_user_id = intent.buyer_user_id
+                     AND prepaid.supplier_user_id = intent.supplier_user_id
+                    WHERE payment_account.supplier_user_id = ?1
+                      AND intent.supplier_user_id = ?1
+                      AND prepaid.supplier_user_id = ?1
+                      AND (?2 IS NULL OR receipt.confirmed_at < ?2
+                           OR (receipt.confirmed_at = ?2 AND receipt.id < ?3))
+                 ) history
+                 ORDER BY history.confirmed_at DESC, history.receipt_id DESC
                  LIMIT ?4",
             )
             .and_then(|mut statement| {
@@ -261,29 +402,55 @@ impl AppStore {
                     .query_map(
                         params![session.user_id, before_at, before_id, (limit + 1) as i64],
                         |row| {
-                            Ok(BinanceReceiptHistoryEntryView {
-                                receipt_id: row.get(0)?,
-                                payment_intent_id: row.get(1)?,
-                                transaction_id: row.get(2)?,
-                                order_id: row.get(3)?,
-                                transaction_at: row.get(4)?,
-                                confirmed_at: row.get(5)?,
-                                source: row.get(6)?,
-                                matched_by: row.get(7)?,
-                                asset: row.get(8)?,
-                                expected_amount: format_amount(row.get(9)?),
-                                actual_amount: format_amount(row.get(10)?),
-                                invoice: BinanceReceiptInvoiceView {
-                                    id: row.get(11)?,
-                                    sequence: row.get(12)?,
-                                    status: row.get(13)?,
-                                    paid_at: row.get(14)?,
-                                    buyer_email: row.get(15)?,
-                                    amount_usd_minor: row.get(16)?,
-                                    amount_cny_minor: row.get(17)?,
-                                    lines: Vec::new(),
-                                },
-                            })
+                            let kind = row.get::<_, String>(0)?;
+                            if kind == "invoice_payment" {
+                                Ok(BinanceReceiptHistoryEntryView::InvoicePayment {
+                                    receipt_id: row.get(1)?,
+                                    payment_intent_id: row.get(2)?,
+                                    transaction_id: row.get(3)?,
+                                    order_id: row.get(4)?,
+                                    transaction_at: row.get(5)?,
+                                    confirmed_at: row.get(6)?,
+                                    source: row.get(7)?,
+                                    matched_by: row.get(8)?,
+                                    asset: row.get(9)?,
+                                    expected_amount: format_amount(row.get(10)?),
+                                    actual_amount: format_amount(row.get(11)?),
+                                    invoice: BinanceReceiptInvoiceView {
+                                        id: row.get(12)?,
+                                        sequence: row.get(13)?,
+                                        status: row.get(14)?,
+                                        paid_at: row.get(15)?,
+                                        buyer_email: row.get(16)?,
+                                        amount_usd_minor: row.get(17)?,
+                                        amount_cny_minor: row.get(18)?,
+                                        lines: Vec::new(),
+                                    },
+                                })
+                            } else {
+                                Ok(BinanceReceiptHistoryEntryView::PrepaidTopup {
+                                    receipt_id: row.get(1)?,
+                                    funding_intent_id: row.get(2)?,
+                                    transaction_id: row.get(3)?,
+                                    order_id: row.get(4)?,
+                                    transaction_at: row.get(5)?,
+                                    confirmed_at: row.get(6)?,
+                                    source: row.get(7)?,
+                                    matched_by: row.get(8)?,
+                                    asset: row.get(9)?,
+                                    expected_amount: format_amount(row.get(10)?),
+                                    actual_amount: format_amount(row.get(11)?),
+                                    topup: BinanceReceiptTopupView {
+                                        prepaid_account_id: row.get(19)?,
+                                        buyer_email: row.get(16)?,
+                                        status: row.get(14)?,
+                                        credited_at: row.get(20)?,
+                                        currency: row.get(21)?,
+                                        credited_amount_minor:
+                                            crate::market_billing::floor_minor_units(row.get(22)?),
+                                    },
+                                })
+                            }
                         },
                     )?
                     .collect::<Result<Vec<_>, _>>()
@@ -295,7 +462,12 @@ impl AppStore {
         let mut items = rows.into_iter().take(limit).collect::<Vec<_>>();
         let invoice_ids = items
             .iter()
-            .map(|item| item.invoice.id.clone())
+            .filter_map(|item| match item {
+                BinanceReceiptHistoryEntryView::InvoicePayment { invoice, .. } => {
+                    Some(invoice.id.clone())
+                }
+                BinanceReceiptHistoryEntryView::PrepaidTopup { .. } => None,
+            })
             .collect::<Vec<_>>();
         if !invoice_ids.is_empty() {
             let placeholders = std::iter::repeat_n("?", invoice_ids.len())
@@ -335,7 +507,9 @@ impl AppStore {
                 by_invoice.entry(invoice_id).or_default().push(line);
             }
             for item in &mut items {
-                item.invoice.lines = by_invoice.remove(&item.invoice.id).unwrap_or_default();
+                if let Some(invoice) = item.invoice_mut() {
+                    invoice.lines = by_invoice.remove(&invoice.id).unwrap_or_default();
+                }
             }
         }
         Ok(BinanceReceiptHistoryBatch { items, has_more })
@@ -6851,8 +7025,28 @@ mod tests {
             .await
             .expect("load automatic receipt history");
         assert_eq!(history.items.len(), 1);
-        assert_eq!(history.items[0].source, "binance_auto");
-        assert_eq!(history.items[0].transaction_id, "tx-exact");
+        match &history.items[0] {
+            BinanceReceiptHistoryEntryView::InvoicePayment {
+                source,
+                transaction_id,
+                invoice,
+                ..
+            } => {
+                assert_eq!(source, "binance_auto");
+                assert_eq!(transaction_id, "tx-exact");
+                assert_eq!(invoice.id, fixture.invoice_id);
+            }
+            BinanceReceiptHistoryEntryView::PrepaidTopup { .. } => {
+                panic!("invoice settlement must be returned as an invoice payment")
+            }
+        }
+        let serialized =
+            serde_json::to_value(&history.items[0]).expect("serialize invoice receipt history");
+        assert_eq!(serialized["kind"], "invoice_payment");
+        assert_eq!(serialized["paymentIntentId"], intent.id);
+        assert_eq!(serialized["invoice"]["id"], fixture.invoice_id);
+        assert!(serialized.get("fundingIntentId").is_none());
+        assert!(serialized.get("topup").is_none());
     }
 
     #[tokio::test]
@@ -6977,6 +7171,269 @@ mod tests {
             credited.credited_minor,
             Some(state.2 / crate::market_billing::MONEY_UNITS_PER_MINOR)
         );
+        let history = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("load prepaid funding receipt history");
+        assert_eq!(history.items.len(), 1);
+        assert!(!history.has_more);
+        match &history.items[0] {
+            BinanceReceiptHistoryEntryView::PrepaidTopup {
+                funding_intent_id,
+                transaction_id,
+                source,
+                expected_amount,
+                actual_amount,
+                topup,
+                ..
+            } => {
+                assert_eq!(funding_intent_id, &intent.id);
+                assert_eq!(transaction_id, "tx-funding-idempotent");
+                assert_eq!(source, "binance_auto");
+                assert_eq!(expected_amount, &intent.pay_amount);
+                assert_eq!(actual_amount, &intent.pay_amount);
+                assert_eq!(topup.buyer_email, fixture.buyer.email);
+                assert_eq!(topup.status, "credited");
+                assert_eq!(topup.currency, "USD");
+                assert_eq!(
+                    topup.credited_amount_minor,
+                    credited.credited_minor.unwrap()
+                );
+                assert!(!topup.credited_at.is_empty());
+            }
+            BinanceReceiptHistoryEntryView::InvoicePayment { .. } => {
+                panic!("prepaid funding must be returned as a prepaid top-up")
+            }
+        }
+        let value =
+            serde_json::to_value(&history.items[0]).expect("serialize prepaid top-up history");
+        assert_eq!(value["kind"], "prepaid_topup");
+        assert_eq!(value["fundingIntentId"], intent.id);
+        assert_eq!(
+            value["topup"]["creditedAmountMinor"],
+            credited.credited_minor.unwrap()
+        );
+        assert!(value.get("paymentIntentId").is_none());
+        assert!(value.get("invoice").is_none());
+        let serialized = serde_json::to_string(&history.items).expect("serialize top-up history");
+        for forbidden in [
+            "credentialsCiphertext",
+            "rawPayload",
+            "payerBinance",
+            "counterpartyFingerprint",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+        let unrelated = store
+            .binance_receipt_history(&session("funding-history-unrelated"), None, 20)
+            .await
+            .expect("scope prepaid receipt history to its supplier");
+        assert!(unrelated.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unified_receipt_history_orders_and_paginates_invoice_and_topup_receipts() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let fixture = settlement_fixture(&store, "unified-receipt-history").await;
+
+        let payment_intent = store
+            .binance_create_or_refresh_intent(&fixture.buyer, &fixture.invoice_id, "test", false)
+            .await
+            .expect("create invoice payment intent");
+        let account = claim_account(&store).await;
+        let mut invoice_payment = transaction(
+            "tx-unified-invoice",
+            &payment_intent.pay_amount,
+            "USDT",
+            "C2C",
+            None,
+        );
+        invoice_payment.payer_info.binance_id = serde_json::json!("700000001");
+        store
+            .binance_process_poll_success(
+                &account,
+                "test-worker",
+                &[invoice_payment],
+                &fixture.cipher,
+                true,
+                4,
+            )
+            .await
+            .expect("settle invoice payment");
+
+        let funding_intent = store
+            .binance_create_funding_intent_for_cipher(
+                &fixture.buyer,
+                &fixture.supplier.user_id,
+                500,
+                "unified-receipt-history-funding",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect("create prepaid funding intent");
+        let account = claim_account(&store).await;
+        let mut topup_payment = transaction(
+            "tx-unified-topup",
+            &funding_intent.pay_amount,
+            "USDT",
+            "C2C",
+            None,
+        );
+        topup_payment.payer_info.binance_id = serde_json::json!("700000001");
+        store
+            .binance_process_poll_success(
+                &account,
+                "test-worker",
+                &[topup_payment],
+                &fixture.cipher,
+                true,
+                4,
+            )
+            .await
+            .expect("settle prepaid top-up");
+
+        let confirmed_at = "2026-09-20T12:00:00Z";
+        let mut expected_receipt_ids = {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_external_payment_receipts SET confirmed_at = ?1",
+                params![confirmed_at],
+            )
+            .expect("fix invoice receipt confirmation time");
+            conn.execute(
+                "UPDATE market_funding_receipts SET confirmed_at = ?1",
+                params![confirmed_at],
+            )
+            .expect("fix top-up receipt confirmation time");
+            let invoice_receipt_id = conn
+                .query_row(
+                    "SELECT id FROM market_external_payment_receipts
+                     WHERE payment_intent_id = ?1",
+                    params![payment_intent.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read invoice receipt ID");
+            let topup_receipt_id = conn
+                .query_row(
+                    "SELECT id FROM market_funding_receipts WHERE funding_intent_id = ?1",
+                    params![funding_intent.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read top-up receipt ID");
+            vec![invoice_receipt_id, topup_receipt_id]
+        };
+        expected_receipt_ids.sort_by(|left, right| right.cmp(left));
+
+        let first_page = store
+            .binance_receipt_history(&fixture.supplier, None, 1)
+            .await
+            .expect("load first unified receipt page");
+        assert!(first_page.has_more);
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.items[0].receipt_id(), expected_receipt_ids[0]);
+        let cursor_at = first_page.items[0].confirmed_at().to_string();
+        let cursor_id = first_page.items[0].receipt_id().to_string();
+
+        let second_page = store
+            .binance_receipt_history(
+                &fixture.supplier,
+                Some((cursor_at.as_str(), cursor_id.as_str())),
+                1,
+            )
+            .await
+            .expect("load second unified receipt page");
+        assert!(!second_page.has_more);
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].receipt_id(), expected_receipt_ids[1]);
+        assert_ne!(
+            first_page.items[0].receipt_id(),
+            second_page.items[0].receipt_id()
+        );
+
+        let full_history = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("load complete unified receipt history");
+        assert_eq!(full_history.items.len(), 2);
+        assert!(full_history.items.iter().any(|entry| matches!(
+            entry,
+            BinanceReceiptHistoryEntryView::InvoicePayment {
+                payment_intent_id,
+                transaction_id,
+                ..
+            } if payment_intent_id == &payment_intent.id
+                && transaction_id == "tx-unified-invoice"
+        )));
+        let credited = store
+            .binance_funding_intent(&fixture.buyer, &funding_intent.id)
+            .await
+            .expect("read credited funding intent");
+        assert!(full_history.items.iter().any(|entry| matches!(
+            entry,
+            BinanceReceiptHistoryEntryView::PrepaidTopup {
+                funding_intent_id,
+                transaction_id,
+                topup,
+                ..
+            } if funding_intent_id == &funding_intent.id
+                && transaction_id == "tx-unified-topup"
+                && topup.buyer_email == fixture.buyer.email
+                && Some(topup.credited_amount_minor) == credited.credited_minor
+        )));
+
+        let unrelated = store
+            .binance_receipt_history(&session("unified-history-unrelated"), None, 20)
+            .await
+            .expect("scope unified receipt history to the provider");
+        assert!(unrelated.items.is_empty());
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE binance_payment_accounts
+                 SET status = 'disabled', credentials_ciphertext = '', credential_nonce = ''
+                 WHERE id = ?1",
+                params![fixture.payment_account_id],
+            )
+            .expect("remove credentials after both receipt kinds settled");
+        }
+        let retained = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("retain both receipt kinds after credential deletion");
+        assert_eq!(retained.items.len(), 2);
+        let serialized =
+            serde_json::to_string(&retained.items).expect("serialize unified receipt history");
+        assert!(serialized.contains("\"kind\":\"invoice_payment\""));
+        assert!(serialized.contains("\"kind\":\"prepaid_topup\""));
+        for forbidden in [
+            "credentialsCiphertext",
+            "rawPayload",
+            "payerBinance",
+            "counterpartyFingerprint",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_funding_intents SET supplier_user_id = 'wrong-provider'
+                 WHERE id = ?1",
+                params![funding_intent.id],
+            )
+            .expect("corrupt top-up intent ownership for fail-closed check");
+        }
+        let fail_closed = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("omit a top-up whose ownership chain is inconsistent");
+        assert_eq!(fail_closed.items.len(), 1);
+        assert!(matches!(
+            fail_closed.items[0],
+            BinanceReceiptHistoryEntryView::InvoicePayment { .. }
+        ));
     }
 
     #[tokio::test]
@@ -7162,6 +7619,23 @@ mod tests {
         assert_eq!(state.0, "credited");
         assert!(state.1 > 0);
         assert_eq!((state.2, state.3), ("settled".into(), 1));
+        let history = store
+            .binance_receipt_history(&fixture.supplier, None, 20)
+            .await
+            .expect("load administrator-reconciled top-up history");
+        assert!(matches!(
+            history.items.as_slice(),
+            [BinanceReceiptHistoryEntryView::PrepaidTopup {
+                funding_intent_id,
+                transaction_id,
+                source,
+                matched_by,
+                ..
+            }] if funding_intent_id == &intent.id
+                && transaction_id == "tx-funding-cancelled-late"
+                && source == "admin_reconciliation"
+                && matched_by == "admin_override"
+        ));
     }
 
     #[tokio::test]
@@ -8015,9 +8489,18 @@ mod tests {
             .expect("load supplier receipt history");
         assert_eq!(history.items.len(), 1);
         assert!(!history.has_more);
-        assert_eq!(history.items[0].source, "admin_reconciliation");
-        assert_eq!(history.items[0].invoice.id, fixture.invoice_id);
-        assert_eq!(history.items[0].invoice.buyer_email, fixture.buyer.email);
+        match &history.items[0] {
+            BinanceReceiptHistoryEntryView::InvoicePayment {
+                source, invoice, ..
+            } => {
+                assert_eq!(source, "admin_reconciliation");
+                assert_eq!(invoice.id, fixture.invoice_id);
+                assert_eq!(invoice.buyer_email, fixture.buyer.email);
+            }
+            BinanceReceiptHistoryEntryView::PrepaidTopup { .. } => {
+                panic!("reconciled invoice must be returned as an invoice payment")
+            }
+        }
 
         let unrelated = store
             .binance_receipt_history(&session("unrelated"), None, 20)
