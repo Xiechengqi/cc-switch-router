@@ -2504,6 +2504,9 @@ export type MarketCreditAccount = {
   creditLimitMinor?: number;
   utilizationBps?: number;
   dailyRateMinor: number;
+  prepaidRunwaySeconds?: number;
+  estimatedRunwaySeconds?: number;
+  fundingRunwayAlertLevel: "none" | "warning" | "critical" | string;
   estimatedSettlementAt?: string;
   isBuyer: boolean;
   isSupplier: boolean;
@@ -2560,6 +2563,7 @@ export type MarketPrepaidAccount = {
   isBuyer: boolean;
   isSupplier: boolean;
   topupAvailable: boolean;
+  topupUnavailableReason?: string;
   ledger: MarketPrepaidLedgerEntry[];
   refundRequests: MarketPrepaidRefundRequest[];
   createdAt: string;
@@ -2576,12 +2580,23 @@ export type MarketFundingSummary = {
   prepaidHeldMinor: number;
   prepaidAvailableMinor: number;
   creditKind: MarketCreditKind;
+  creditLimitMinor?: number;
   creditOutstandingMinor: number;
+  creditReservedMinor: number;
   creditAvailableMinor?: number;
+  activeDailyRateMinor: number;
+  additionalDailyRateMinor: number;
+  projectedDailyRateMinor: number;
   requiredCoverageMinor: number;
+  prepaidCoverageMinor: number;
+  creditCoverageMinor: number;
   requiredTopupMinor: number;
+  recommendedTopupMinor: number;
+  recommendedCoverageDays: number;
+  prepaidRunwaySeconds?: number;
   estimatedRunwaySeconds?: number;
   topupAvailable: boolean;
+  topupUnavailableReason?: string;
 };
 
 export type MarketCreditRestriction = {

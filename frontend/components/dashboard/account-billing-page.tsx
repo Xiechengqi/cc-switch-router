@@ -84,6 +84,10 @@ import {
   MARKET_CURRENCY,
   usdMinorToCnyMinor,
 } from "@/lib/market-money";
+import {
+  formatFundingRunway,
+  marketFundingTopupUnavailableKey,
+} from "@/lib/market-funding";
 import { preferredScrollBehavior } from "@/lib/utils";
 
 type Currency = typeof MARKET_CURRENCY;
@@ -520,7 +524,7 @@ function PrepaidAccountPanel({
         </div>
 
         {perspective === "buyer" && !account.topupAvailable ? (
-          <p className="text-xs leading-5 text-muted-foreground">{t("marketBilling.prepaid.topup.unavailable")}</p>
+          <p className="text-xs leading-5 text-muted-foreground">{t(marketFundingTopupUnavailableKey(account.topupUnavailableReason))}</p>
         ) : null}
 
         {account.refundRequests.length ? (
@@ -616,6 +620,16 @@ function CreditAccountPanel({
     : account.creditKind === "limited"
       ? Math.max(0, (account.creditLimitMinor || 0) - account.balanceMinor)
       : 0;
+  const prepaidRunway = account.dailyRateMinor > 0
+    ? formatFundingRunway(account.prepaidRunwaySeconds, locale, "-")
+    : "-";
+  const totalRunway = account.dailyRateMinor > 0
+    ? formatFundingRunway(
+      account.estimatedRunwaySeconds,
+      locale,
+      account.creditKind === "unlimited" ? t("marketFunding.runway.unlimited") : "-",
+    )
+    : "-";
   const invoiceCanBePaid = perspective === "buyer" && invoice && ["open", "overdue"].includes(invoice.status);
   const invoiceSupportsBinance = binanceAutoSettlementEnabled
     && invoiceCanBePaid
@@ -687,7 +701,7 @@ function CreditAccountPanel({
           </div> : null}
         </div>
 
-        {mode === "full" ? <><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {mode === "full" ? <><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
           <div>
             <span className="text-xs text-muted-foreground">{t("marketBilling.prepaid.available")}</span>
             <strong className="mt-0.5 block text-sm tabular-nums text-emerald-700">{formatUsdCnyMoney(
@@ -724,7 +738,25 @@ function CreditAccountPanel({
               {account.estimatedSettlementAt ? formatDate(account.estimatedSettlementAt, locale) : "-"}
             </strong>
           </div>
+          <div>
+            <span className="text-xs text-muted-foreground">{t("marketBilling.runway.prepaid")}</span>
+            <strong className="mt-0.5 block text-sm tabular-nums">{prepaidRunway}</strong>
+          </div>
+          <div>
+            <span className="text-xs text-muted-foreground">{t("marketBilling.runway.total")}</span>
+            <strong className="mt-0.5 block text-sm tabular-nums">{totalRunway}</strong>
+          </div>
         </div>
+
+        {perspective === "buyer"
+          && ["active", "near_credit_limit"].includes(account.status)
+          && account.dailyRateMinor > 0
+          && account.fundingRunwayAlertLevel !== "none" ? (
+          <div className={`flex gap-2 rounded-md border px-3 py-2 ${account.fundingRunwayAlertLevel === "critical" ? "border-rose-200 bg-rose-50 text-rose-900" : "border-amber-200 bg-amber-50 text-amber-900"}`}>
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            <p className="text-xs leading-5">{t(account.fundingRunwayAlertLevel === "critical" ? "marketBilling.runway.critical" : "marketBilling.runway.warning")}</p>
+          </div>
+        ) : null}
 
         {utilization != null ? <div>
           <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">

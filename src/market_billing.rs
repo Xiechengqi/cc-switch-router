@@ -29,8 +29,15 @@ const MIN_USD_CNY_RATE_MICROS: i64 = USD_CNY_RATE_SCALE / 100;
 const MAX_USD_CNY_RATE_MICROS: i64 = 100 * USD_CNY_RATE_SCALE;
 pub(crate) const MONEY_UNITS_PER_MINOR: i64 = 86_400;
 pub(crate) const PREPAID_COVERAGE_SECONDS: i64 = 86_400;
+pub(crate) const RECOMMENDED_PREPAID_DAYS: i64 = 7;
+const RECOMMENDED_PREPAID_SECONDS: i64 = RECOMMENDED_PREPAID_DAYS * 86_400;
 const PREPAID_RESUME_SECONDS: i64 = 3_600;
 const NEAR_CREDIT_LIMIT_BPS: i64 = 8_000;
+const FUNDING_RUNWAY_WARNING_SECONDS: i64 = 3 * 86_400;
+const FUNDING_RUNWAY_CRITICAL_SECONDS: i64 = 86_400;
+const FUNDING_RUNWAY_NONE: &str = "none";
+const FUNDING_RUNWAY_WARNING: &str = "warning";
+const FUNDING_RUNWAY_CRITICAL: &str = "critical";
 const DEFAULT_SETTLEMENT_GRACE_HOURS: i64 = 24;
 const DISPUTE_RESPONSE_HOURS: i64 = 72;
 const DISPUTE_AUTO_RESOLVE_DAYS: i64 = 7;
@@ -299,6 +306,9 @@ pub struct CreditAccountView {
     pub credit_limit_minor: Option<i64>,
     pub utilization_bps: Option<i64>,
     pub daily_rate_minor: i64,
+    pub prepaid_runway_seconds: Option<i64>,
+    pub estimated_runway_seconds: Option<i64>,
+    pub funding_runway_alert_level: String,
     pub estimated_settlement_at: Option<String>,
     pub is_buyer: bool,
     pub is_supplier: bool,
@@ -323,12 +333,23 @@ pub struct MarketFundingSummaryView {
     pub prepaid_held_minor: i64,
     pub prepaid_available_minor: i64,
     pub credit_kind: String,
+    pub credit_limit_minor: Option<i64>,
     pub credit_outstanding_minor: i64,
+    pub credit_reserved_minor: i64,
     pub credit_available_minor: Option<i64>,
+    pub active_daily_rate_minor: i64,
+    pub additional_daily_rate_minor: i64,
+    pub projected_daily_rate_minor: i64,
     pub required_coverage_minor: i64,
+    pub prepaid_coverage_minor: i64,
+    pub credit_coverage_minor: i64,
     pub required_topup_minor: i64,
+    pub recommended_topup_minor: i64,
+    pub recommended_coverage_days: i64,
+    pub prepaid_runway_seconds: Option<i64>,
     pub estimated_runway_seconds: Option<i64>,
     pub topup_available: bool,
+    pub topup_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -381,6 +402,7 @@ pub struct PrepaidAccountView {
     pub is_buyer: bool,
     pub is_supplier: bool,
     pub topup_available: bool,
+    pub topup_unavailable_reason: Option<String>,
     pub ledger: Vec<PrepaidLedgerEntryView>,
     pub refund_requests: Vec<PrepaidRefundRequestView>,
     pub created_at: String,
@@ -561,6 +583,7 @@ struct AccountRow {
     credit_limit_minor: Option<i64>,
     settlement_grace_hours: i64,
     version: i64,
+    funding_runway_alert_level: String,
 }
 
 fn default_settlement_grace_hours() -> i64 {
@@ -787,19 +810,55 @@ async fn market_billing_dashboard_for_state(
     session: &AuthSession,
 ) -> Result<BillingDashboardView, AppError> {
     let mut dashboard = state.store.market_billing_dashboard(session).await?;
-    let mut availability = HashMap::<String, bool>::new();
+    let topup_blocked_suppliers = dashboard
+        .accounts
+        .iter()
+        .filter_map(|account| {
+            if !account.is_buyer {
+                return None;
+            }
+            let reason = if account.status == ACCOUNT_CLOSED {
+                "relationship_closed"
+            } else if account.open_invoice.is_some()
+                || matches!(
+                    account.status.as_str(),
+                    ACCOUNT_SETTLEMENT_DUE
+                        | ACCOUNT_PAYMENT_DECLARED
+                        | ACCOUNT_OVERDUE
+                        | ACCOUNT_DISPUTED
+                )
+            {
+                "settlement_required"
+            } else {
+                return None;
+            };
+            Some((account.supplier_user_id.clone(), reason.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut availability = HashMap::<String, Option<String>>::new();
     for account in &mut dashboard.prepaid_accounts {
-        let available = if let Some(available) = availability.get(&account.supplier_user_id) {
-            *available
+        let blocked_reason = if account.is_buyer {
+            topup_blocked_suppliers
+                .get(&account.supplier_user_id)
+                .cloned()
         } else {
-            let available = state
-                .binance_settlement
-                .supplier_funding_available(&state.store, &account.supplier_user_id)
-                .await?;
-            availability.insert(account.supplier_user_id.clone(), available);
-            available
+            None
         };
-        account.topup_available = available;
+        let reason = if let Some(reason) = blocked_reason {
+            Some(reason)
+        } else if let Some(reason) = availability.get(&account.supplier_user_id) {
+            reason.clone()
+        } else {
+            let reason = state
+                .binance_settlement
+                .supplier_funding_unavailable_reason(&state.store, &account.supplier_user_id)
+                .await?
+                .map(str::to_string);
+            availability.insert(account.supplier_user_id.clone(), reason.clone());
+            reason
+        };
+        account.topup_available = reason.is_none();
+        account.topup_unavailable_reason = reason;
     }
     Ok(dashboard)
 }
@@ -1321,6 +1380,9 @@ fn billing_client_chat_event_type(event_type: &str) -> Option<&'static str> {
         "invoice_dispute_resolved" => Some("billing_dispute_resolved"),
         "invoice_voided" => Some("billing_invoice_voided"),
         "credit_limit_warning" => Some("billing_credit_limit_warning"),
+        "funding_runway_warning" => Some("billing_funding_runway_warning"),
+        "funding_runway_critical" => Some("billing_funding_runway_critical"),
+        "funding_runway_recovered" => Some("billing_funding_runway_recovered"),
         _ => None,
     }
 }
@@ -1520,6 +1582,8 @@ fn enqueue_billing_client_chat_events_tx(
             "utilizationBps",
             "accountClosed",
             "creditRevoked",
+            "alertLevel",
+            "billingUrl",
         ] {
             if let Some(value) = detail.get(field) {
                 object.insert(field.into(), value.clone());
@@ -3965,11 +4029,33 @@ fn active_daily_rate_tx(
         "SELECT COALESCE(SUM(daily_rate_minor), 0)
          FROM market_service_contracts
          WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
-           AND status IN ('trial', 'active')",
+           AND (
+               status IN ('trial', 'active')
+               OR (status = 'billing_suspended' AND desired_control_state != 'terminated')
+           )",
         params![buyer_user_id, supplier_user_id, currency],
         |row| row.get::<_, i64>(0),
     )
     .map_err(map_db("read active market daily funding rate"))
+}
+
+fn reserved_credit_units_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    currency: &str,
+    now: &str,
+) -> Result<i64, AppError> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(credit_units), 0)
+         FROM market_funding_reservations
+         WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
+           AND status = 'active' AND expires_at > ?4",
+        params![buyer_user_id, supplier_user_id, currency, now],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(map_db("read reserved supplier credit funding"))
+    .map(|value| value.max(0))
 }
 
 pub(crate) fn market_funding_summary_tx(
@@ -3996,7 +4082,7 @@ pub(crate) fn market_funding_summary_tx(
     let (prepaid_account_id, posted_units, held_units) = prepaid
         .map(|(id, posted, held)| (Some(id), posted, held))
         .unwrap_or((None, 0, 0));
-    let prepaid_available_units = posted_units.saturating_sub(held_units);
+    let prepaid_available_units = posted_units.saturating_sub(held_units).max(0);
     let credit_outstanding_units = conn
         .query_row(
             "SELECT balance_units FROM market_credit_accounts
@@ -4008,17 +4094,8 @@ pub(crate) fn market_funding_summary_tx(
         .map_err(map_db("read market credit exposure for funding"))?
         .unwrap_or(0)
         .max(0);
-    let reserved_credit_units = conn
-        .query_row(
-            "SELECT COALESCE(SUM(credit_units), 0)
-             FROM market_funding_reservations
-             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
-               AND status = 'active' AND expires_at > ?4",
-            params![buyer_user_id, supplier_user_id, currency, now],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(map_db("read reserved supplier credit funding"))?
-        .max(0);
+    let reserved_credit_units =
+        reserved_credit_units_tx(conn, buyer_user_id, supplier_user_id, &currency, now)?;
     let credit_capacity_units = match grant.kind.as_str() {
         crate::market_access::CREDIT_NONE => Some(0),
         crate::market_access::CREDIT_LIMITED => Some(
@@ -4036,11 +4113,14 @@ pub(crate) fn market_funding_summary_tx(
         }
     };
     let credit_available_units =
-        credit_capacity_units.map(|value| value.saturating_sub(reserved_credit_units));
-    let daily_rate_minor = active_daily_rate_tx(conn, buyer_user_id, supplier_user_id, &currency)?
-        .checked_add(additional_daily_rate_minor.max(0))
+        credit_capacity_units.map(|value| value.saturating_sub(reserved_credit_units).max(0));
+    let active_daily_rate_minor =
+        active_daily_rate_tx(conn, buyer_user_id, supplier_user_id, &currency)?;
+    let additional_daily_rate_minor = additional_daily_rate_minor.max(0);
+    let projected_daily_rate_minor = active_daily_rate_minor
+        .checked_add(additional_daily_rate_minor)
         .ok_or_else(|| AppError::Internal("market funding daily rate overflowed".into()))?;
-    let required_units = daily_rate_minor
+    let required_units = projected_daily_rate_minor
         .checked_mul(PREPAID_COVERAGE_SECONDS)
         .ok_or_else(|| AppError::Internal("market funding coverage overflowed".into()))?;
     let total_finite_units = credit_available_units
@@ -4049,14 +4129,29 @@ pub(crate) fn market_funding_summary_tx(
     let required_topup_units = if credit_available_units.is_none() {
         0
     } else {
-        required_units.saturating_sub(total_finite_units)
+        required_units.saturating_sub(total_finite_units).max(0)
     };
-    let estimated_runway_seconds = if daily_rate_minor <= 0 {
+    let prepaid_coverage_units = prepaid_available_units.min(required_units).max(0);
+    let credit_coverage_units = required_units
+        .saturating_sub(prepaid_coverage_units)
+        .saturating_sub(required_topup_units);
+    let recommended_units = projected_daily_rate_minor
+        .checked_mul(RECOMMENDED_PREPAID_SECONDS)
+        .ok_or_else(|| AppError::Internal("recommended prepaid funding overflowed".into()))?
+        .saturating_sub(prepaid_available_units)
+        .max(0);
+    let recommended_topup_units = recommended_units.max(required_topup_units);
+    let prepaid_runway_seconds = if projected_daily_rate_minor <= 0 {
+        None
+    } else {
+        Some(prepaid_available_units / projected_daily_rate_minor)
+    };
+    let estimated_runway_seconds = if projected_daily_rate_minor <= 0 {
         None
     } else if credit_available_units.is_none() {
         None
     } else {
-        Some(total_finite_units / daily_rate_minor)
+        Some(total_finite_units / projected_daily_rate_minor)
     };
     let topup_available = conn
         .query_row(
@@ -4085,12 +4180,23 @@ pub(crate) fn market_funding_summary_tx(
         prepaid_held_minor: floor_minor(held_units),
         prepaid_available_minor: floor_minor(prepaid_available_units),
         credit_kind: grant.kind,
+        credit_limit_minor: grant.limit_minor,
         credit_outstanding_minor: ceil_minor(credit_outstanding_units),
+        credit_reserved_minor: ceil_minor(reserved_credit_units),
         credit_available_minor: credit_available_units.map(ceil_minor),
+        active_daily_rate_minor,
+        additional_daily_rate_minor,
+        projected_daily_rate_minor,
         required_coverage_minor: ceil_minor(required_units),
+        prepaid_coverage_minor: floor_minor(prepaid_coverage_units),
+        credit_coverage_minor: ceil_minor(credit_coverage_units),
         required_topup_minor: ceil_minor(required_topup_units),
+        recommended_topup_minor: ceil_minor(recommended_topup_units),
+        recommended_coverage_days: RECOMMENDED_PREPAID_DAYS,
+        prepaid_runway_seconds,
         estimated_runway_seconds,
         topup_available,
+        topup_unavailable_reason: (!topup_available).then(|| "supplier_unavailable".into()),
     })
 }
 
@@ -4654,6 +4760,7 @@ fn prepaid_account_views_for_actor_tx(
             is_buyer: row.1 == actor_user_id,
             is_supplier: row.3 == actor_user_id,
             topup_available,
+            topup_unavailable_reason: (!topup_available).then(|| "supplier_unavailable".into()),
             ledger,
             refund_requests,
             created_at: row.9,
@@ -6058,6 +6165,7 @@ impl AppStore {
                         account.status, account.balance_units, account.open_invoice_id,
                         account.close_requested, account.credit_kind,
                         account.credit_limit_minor,
+                        account.funding_runway_alert_level,
                         account.created_at, account.updated_at
                  FROM market_credit_accounts account
                  JOIN supplier_billing_profiles profile
@@ -6085,6 +6193,7 @@ impl AppStore {
                             row.get::<_, Option<i64>>(11)?,
                             row.get::<_, String>(12)?,
                             row.get::<_, String>(13)?,
+                            row.get::<_, String>(14)?,
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -6117,17 +6226,10 @@ impl AppStore {
             .collect::<HashMap<_, _>>();
         let mut accounts = Vec::with_capacity(account_rows.len());
         let now = Utc::now();
+        let now_text = now.to_rfc3339();
         for row in account_rows {
             let services = services_by_account.remove(&row.0).unwrap_or_default();
-            let daily_rate_minor = services
-                .iter()
-                .filter(|service| service.status == CONTRACT_ACTIVE)
-                .map(|service| service.daily_rate_minor)
-                .try_fold(0_i64, |total, rate| {
-                    total.checked_add(rate).ok_or_else(|| {
-                        AppError::Internal("market daily exposure overflowed".into())
-                    })
-                })?;
+            let daily_rate_minor = active_daily_rate_tx(&conn, &row.1, &row.3, &row.5)?;
             let limit_units = row
                 .11
                 .map(|limit| limit.saturating_mul(MONEY_UNITS_PER_MINOR));
@@ -6157,6 +6259,33 @@ impl AppStore {
             let is_buyer = row.1 == session.user_id;
             let is_supplier = row.3 == session.user_id;
             let prepaid = prepaid_by_parties.get(&(row.1.clone(), row.3.clone(), row.5.clone()));
+            let prepaid_available_minor = prepaid.map_or(0, |value| value.3);
+            let prepaid_available_units =
+                prepaid_state_for_parties_tx(&conn, &row.1, &row.3, &row.5)?
+                    .map(|(_, posted, held)| posted.saturating_sub(held).max(0))
+                    .unwrap_or(0);
+            let reserved_credit_units =
+                reserved_credit_units_tx(&conn, &row.1, &row.3, &row.5, &now_text)?;
+            let prepaid_runway_seconds =
+                (daily_rate_minor > 0).then(|| prepaid_available_units / daily_rate_minor);
+            let estimated_runway_seconds =
+                if daily_rate_minor <= 0 || row.10 == crate::market_access::CREDIT_UNLIMITED {
+                    None
+                } else {
+                    let credit_available_units = if row.10 == crate::market_access::CREDIT_LIMITED {
+                        limit_units
+                            .unwrap_or_default()
+                            .saturating_sub(row.7)
+                            .saturating_sub(reserved_credit_units)
+                            .max(0)
+                    } else {
+                        0
+                    };
+                    Some(
+                        prepaid_available_units.saturating_add(credit_available_units)
+                            / daily_rate_minor,
+                    )
+                };
             accounts.push(CreditAccountView {
                 id: row.0,
                 buyer_user_id: row.1,
@@ -6169,11 +6298,14 @@ impl AppStore {
                 prepaid_account_id: prepaid.map(|value| value.0.clone()),
                 prepaid_balance_minor: prepaid.map_or(0, |value| value.1),
                 prepaid_held_minor: prepaid.map_or(0, |value| value.2),
-                prepaid_available_minor: prepaid.map_or(0, |value| value.3),
+                prepaid_available_minor,
                 credit_kind: row.10,
                 credit_limit_minor: row.11,
                 utilization_bps,
                 daily_rate_minor,
+                prepaid_runway_seconds,
+                estimated_runway_seconds,
+                funding_runway_alert_level: row.12,
                 estimated_settlement_at,
                 is_buyer,
                 is_supplier,
@@ -6184,8 +6316,8 @@ impl AppStore {
                 close_requested: row.9,
                 services,
                 open_invoice,
-                created_at: row.12,
-                updated_at: row.13,
+                created_at: row.13,
+                updated_at: row.14,
             });
         }
         let supplier_profiles = conn
@@ -7992,7 +8124,7 @@ fn load_account_row_tx(tx: &Connection, account_id: &str) -> Result<AccountRow, 
                 account.open_invoice_id, account.close_requested,
                 account.credit_kind, account.credit_limit_minor,
                 profile.settlement_grace_hours,
-                account.version
+                account.version, account.funding_runway_alert_level
          FROM market_credit_accounts account
          JOIN supplier_billing_profiles profile
            ON profile.supplier_user_id = account.supplier_user_id
@@ -8013,12 +8145,209 @@ fn load_account_row_tx(tx: &Connection, account_id: &str) -> Result<AccountRow, 
                 credit_limit_minor: row.get(9)?,
                 settlement_grace_hours: row.get(10)?,
                 version: row.get(11)?,
+                funding_runway_alert_level: row.get(12)?,
             })
         },
     )
     .optional()
     .map_err(map_db("read market credit account for reconciliation"))?
     .ok_or_else(|| AppError::NotFound("market credit account not found".into()))
+}
+
+fn finite_funding_runway_seconds_tx(
+    tx: &Connection,
+    account: &AccountRow,
+    daily_rate_minor: i64,
+    now: &str,
+) -> Result<Option<i64>, AppError> {
+    if daily_rate_minor <= 0 || account.credit_kind == crate::market_access::CREDIT_UNLIMITED {
+        return Ok(None);
+    }
+    let prepaid_available_units = prepaid_state_for_parties_tx(
+        tx,
+        &account.buyer_user_id,
+        &account.supplier_user_id,
+        &account.currency,
+    )?
+    .map(|(_, posted, held)| posted.saturating_sub(held).max(0))
+    .unwrap_or(0);
+    let reserved_credit_units = reserved_credit_units_tx(
+        tx,
+        &account.buyer_user_id,
+        &account.supplier_user_id,
+        &account.currency,
+        now,
+    )?;
+    let credit_available_units = match account.credit_kind.as_str() {
+        crate::market_access::CREDIT_NONE => 0,
+        crate::market_access::CREDIT_LIMITED => account
+            .credit_limit_minor
+            .ok_or_else(|| {
+                AppError::Internal("limited market credit account is missing its limit".into())
+            })?
+            .saturating_mul(MONEY_UNITS_PER_MINOR)
+            .saturating_sub(account.balance_units)
+            .saturating_sub(reserved_credit_units)
+            .max(0),
+        _ => {
+            return Err(AppError::Internal(
+                "market credit account has an invalid funding kind".into(),
+            ));
+        }
+    };
+    Ok(Some(
+        prepaid_available_units.saturating_add(credit_available_units) / daily_rate_minor,
+    ))
+}
+
+fn funding_runway_alert_level(runway_seconds: Option<i64>) -> &'static str {
+    match runway_seconds {
+        Some(seconds) if seconds < FUNDING_RUNWAY_CRITICAL_SECONDS => FUNDING_RUNWAY_CRITICAL,
+        Some(seconds) if seconds < FUNDING_RUNWAY_WARNING_SECONDS => FUNDING_RUNWAY_WARNING,
+        _ => FUNDING_RUNWAY_NONE,
+    }
+}
+
+fn sync_funding_runway_alert_tx(
+    tx: &Connection,
+    account: &AccountRow,
+    daily_rate_minor: i64,
+    now: &str,
+) -> Result<(), AppError> {
+    let runway_seconds = finite_funding_runway_seconds_tx(tx, account, daily_rate_minor, now)?;
+    let next_level = funding_runway_alert_level(runway_seconds);
+    if next_level == account.funding_runway_alert_level {
+        return Ok(());
+    }
+    let changed = tx
+        .execute(
+            "UPDATE market_credit_accounts
+         SET funding_runway_alert_level = ?2, version = version + 1, updated_at = ?4
+         WHERE id = ?1 AND funding_runway_alert_level = ?3",
+            params![
+                account.id,
+                next_level,
+                account.funding_runway_alert_level,
+                now
+            ],
+        )
+        .map_err(map_db("update market funding runway alert level"))?;
+    if changed == 0 {
+        return Ok(());
+    }
+    let event_type = match next_level {
+        FUNDING_RUNWAY_WARNING => "funding_runway_warning",
+        FUNDING_RUNWAY_CRITICAL => "funding_runway_critical",
+        _ => "funding_runway_recovered",
+    };
+    let transition_version = tx
+        .query_row(
+            "SELECT version FROM market_credit_accounts WHERE id = ?1",
+            params![account.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("read market funding runway transition version"))?;
+    record_event_tx(
+        tx,
+        Some(&account.id),
+        None,
+        None,
+        None,
+        event_type,
+        serde_json::json!({
+            "alertLevel": next_level,
+            "billingUrl": "/account/billing/",
+        }),
+        &format!(
+            "funding-runway:{}:{next_level}:{transition_version}",
+            account.id
+        ),
+        now,
+    )?;
+    Ok(())
+}
+
+fn recover_inactive_funding_runway_alerts_tx(tx: &Connection, now: &str) -> Result<(), AppError> {
+    let account_ids = tx
+        .prepare(
+            "SELECT account.id
+             FROM market_credit_accounts account
+             WHERE account.funding_runway_alert_level != 'none'
+               AND NOT EXISTS (
+                   SELECT 1 FROM market_service_contracts contract
+                   WHERE contract.account_id = account.id
+                     AND (
+                         contract.status IN ('trial', 'active')
+                         OR (contract.status = 'billing_suspended'
+                             AND contract.desired_control_state != 'terminated')
+                     )
+               )
+             ORDER BY account.updated_at, account.id
+             LIMIT ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read inactive market funding alerts"))?;
+    for account_id in account_ids {
+        let account = load_account_row_tx(tx, &account_id)?;
+        sync_funding_runway_alert_tx(tx, &account, 0, now)?;
+    }
+    Ok(())
+}
+
+fn sync_suspended_funding_runway_alerts_tx(tx: &Connection, now: &str) -> Result<(), AppError> {
+    let account_ids = tx
+        .prepare(
+            "SELECT account.id
+             FROM market_credit_accounts account
+             WHERE account.status IN ('active', 'near_credit_limit')
+               AND EXISTS (
+                   SELECT 1 FROM market_service_contracts contract
+                   WHERE contract.account_id = account.id
+                     AND contract.status = 'billing_suspended'
+                     AND contract.desired_control_state != 'terminated'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM market_service_contracts contract
+                   WHERE contract.account_id = account.id
+                     AND contract.status IN ('trial', 'active')
+               )
+             ORDER BY account.updated_at, account.id
+             LIMIT ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("read suspended market funding alerts"))?;
+    for account_id in account_ids {
+        let account = load_account_row_tx(tx, &account_id)?;
+        let daily_rate_minor = active_daily_rate_tx(
+            tx,
+            &account.buyer_user_id,
+            &account.supplier_user_id,
+            &account.currency,
+        )?;
+        sync_funding_runway_alert_tx(tx, &account, daily_rate_minor, now)?;
+        // Rotate stable suspended-only accounts behind the bounded scan so a
+        // large first page cannot permanently starve later accounts.
+        tx.execute(
+            "UPDATE market_credit_accounts
+             SET updated_at = MAX(updated_at, ?2)
+             WHERE id = ?1",
+            params![account.id, now],
+        )
+        .map_err(map_db("advance suspended funding runway scan"))?;
+    }
+    Ok(())
 }
 
 fn build_accrual_candidate_tx(
@@ -9359,6 +9688,15 @@ impl AppStore {
             ) {
                 continue;
             }
+            // Funding runway represents the exposure that would resume after a
+            // successful top-up, so already suspended services must remain in
+            // the denominator alongside the contracts being accrued now.
+            let daily_rate_minor = active_daily_rate_tx(
+                &tx,
+                &account.buyer_user_id,
+                &account.supplier_user_id,
+                &account.currency,
+            )?;
             let limit_units = match account.credit_kind.as_str() {
                 crate::market_access::CREDIT_LIMITED => Some(
                     account
@@ -9499,9 +9837,12 @@ impl AppStore {
                         &now_text,
                     )?;
                 }
+                sync_funding_runway_alert_tx(&tx, &account, daily_rate_minor, &now_text)?;
             }
         }
         crate::share_market::apply_accepted_price_changes_tx(&tx, &now_text)?;
+        sync_suspended_funding_runway_alerts_tx(&tx, &now_text)?;
+        recover_inactive_funding_runway_alerts_tx(&tx, &now_text)?;
         open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
         mark_overdue_invoices_tx(&tx, &now_text)?;
         mark_overdue_refund_obligations_tx(&tx, now)?;
@@ -9536,6 +9877,27 @@ mod tests {
         assert!(parse_usd_cny_rate_micros("7.1234567").is_err());
         assert!(parse_usd_cny_rate_micros("0").is_err());
         assert!(parse_usd_cny_rate_micros("100.01").is_err());
+    }
+
+    #[test]
+    fn funding_runway_alert_thresholds_are_strict_and_stable() {
+        assert_eq!(funding_runway_alert_level(None), FUNDING_RUNWAY_NONE);
+        assert_eq!(
+            funding_runway_alert_level(Some(FUNDING_RUNWAY_WARNING_SECONDS)),
+            FUNDING_RUNWAY_NONE
+        );
+        assert_eq!(
+            funding_runway_alert_level(Some(FUNDING_RUNWAY_WARNING_SECONDS - 1)),
+            FUNDING_RUNWAY_WARNING
+        );
+        assert_eq!(
+            funding_runway_alert_level(Some(FUNDING_RUNWAY_CRITICAL_SECONDS)),
+            FUNDING_RUNWAY_WARNING
+        );
+        assert_eq!(
+            funding_runway_alert_level(Some(FUNDING_RUNWAY_CRITICAL_SECONDS - 1)),
+            FUNDING_RUNWAY_CRITICAL
+        );
     }
 
     #[test]
@@ -10332,6 +10694,473 @@ mod tests {
             .expect("credit test prepaid balance");
         tx.commit().expect("commit test prepaid credit");
         account_id
+    }
+
+    #[tokio::test]
+    async fn funding_summary_separates_prepaid_credit_and_seven_day_recommendation() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("summary-supplier", "summary-supplier@example.com");
+        let limited_buyer = session("summary-limited", "summary-limited@example.com");
+        let no_credit_buyer = session("summary-none", "summary-none@example.com");
+        let unlimited_buyer = session("summary-unlimited", "summary-unlimited@example.com");
+        configure_supplier(&store, &supplier, 500).await;
+        let now = Utc::now();
+        for (buyer, source) in [
+            (&limited_buyer, "summary-limited-prepaid"),
+            (&no_credit_buyer, "summary-none-prepaid"),
+            (&unlimited_buyer, "summary-unlimited-prepaid"),
+        ] {
+            credit_test_prepaid_units(
+                &store,
+                buyer,
+                &supplier,
+                150 * MONEY_UNITS_PER_MINOR,
+                source,
+                now,
+            )
+            .await;
+        }
+
+        let now_text = now.to_rfc3339();
+        let conn = store.conn.lock().await;
+        let limited = market_funding_summary_tx(
+            &conn,
+            &limited_buyer.user_id,
+            &limited_buyer.email,
+            &supplier.user_id,
+            &supplier.email,
+            crate::market_access::PRODUCT_CLIENT_HOST,
+            MARKET_CURRENCY,
+            300,
+            &now_text,
+        )
+        .expect("summarize limited funding");
+        assert_eq!(limited.active_daily_rate_minor, 0);
+        assert_eq!(limited.additional_daily_rate_minor, 300);
+        assert_eq!(limited.projected_daily_rate_minor, 300);
+        assert_eq!(limited.prepaid_coverage_minor, 150);
+        assert_eq!(limited.credit_coverage_minor, 150);
+        assert_eq!(limited.required_topup_minor, 0);
+        assert_eq!(limited.recommended_topup_minor, 1_950);
+        assert_eq!(limited.recommended_coverage_days, 7);
+        assert_eq!(limited.prepaid_runway_seconds, Some(43_200));
+        assert_eq!(limited.estimated_runway_seconds, Some(187_200));
+
+        conn.execute(
+            "DELETE FROM market_public_credit_policies WHERE supplier_user_id = ?1",
+            params![supplier.user_id],
+        )
+        .expect("remove public credit for no-credit summary");
+        let no_credit = market_funding_summary_tx(
+            &conn,
+            &no_credit_buyer.user_id,
+            &no_credit_buyer.email,
+            &supplier.user_id,
+            &supplier.email,
+            crate::market_access::PRODUCT_CLIENT_HOST,
+            MARKET_CURRENCY,
+            300,
+            &now_text,
+        )
+        .expect("summarize prepaid-only funding");
+        assert_eq!(no_credit.credit_kind, crate::market_access::CREDIT_NONE);
+        assert_eq!(no_credit.prepaid_coverage_minor, 150);
+        assert_eq!(no_credit.credit_coverage_minor, 0);
+        assert_eq!(no_credit.required_topup_minor, 150);
+        assert_eq!(no_credit.recommended_topup_minor, 1_950);
+        assert_eq!(no_credit.estimated_runway_seconds, Some(43_200));
+
+        conn.execute(
+            "INSERT INTO market_counterparties (
+                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
+                status, revision, created_at, updated_at
+             ) VALUES (
+                'summary-unlimited-counterparty', ?1, ?2, ?3, ?4,
+                'active', 1, ?5, ?5
+             )",
+            params![
+                supplier.user_id,
+                supplier.email,
+                unlimited_buyer.user_id,
+                unlimited_buyer.email,
+                now_text,
+            ],
+        )
+        .expect("insert unlimited counterparty");
+        conn.execute(
+            "INSERT INTO market_credit_grants (
+                counterparty_id, currency, kind, limit_minor, revision,
+                created_at, updated_at
+             ) VALUES (
+                'summary-unlimited-counterparty', 'USD', 'unlimited', NULL, 1, ?1, ?1
+             )",
+            params![now_text],
+        )
+        .expect("insert unlimited credit grant");
+        let unlimited = market_funding_summary_tx(
+            &conn,
+            &unlimited_buyer.user_id,
+            &unlimited_buyer.email,
+            &supplier.user_id,
+            &supplier.email,
+            crate::market_access::PRODUCT_CLIENT_HOST,
+            MARKET_CURRENCY,
+            300,
+            &now_text,
+        )
+        .expect("summarize unlimited funding");
+        assert_eq!(
+            unlimited.credit_kind,
+            crate::market_access::CREDIT_UNLIMITED
+        );
+        assert_eq!(unlimited.credit_available_minor, None);
+        assert_eq!(unlimited.credit_coverage_minor, 150);
+        assert_eq!(unlimited.required_topup_minor, 0);
+        assert_eq!(unlimited.recommended_topup_minor, 1_950);
+        assert_eq!(unlimited.estimated_runway_seconds, None);
+    }
+
+    #[tokio::test]
+    async fn billing_dashboard_runway_subtracts_reserved_credit() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session(
+            "dashboard-runway-buyer",
+            "dashboard-runway-buyer@example.com",
+        );
+        let supplier = session(
+            "dashboard-runway-supplier",
+            "dashboard-runway-supplier@example.com",
+        );
+        configure_supplier(&store, &supplier, 500).await;
+        let now = Utc::now();
+        add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "dashboard-runway-active",
+            100,
+            now,
+        )
+        .await;
+        add_reserved_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "dashboard-runway-pending",
+            100,
+            now,
+        )
+        .await;
+
+        let dashboard = store
+            .market_billing_dashboard(&buyer)
+            .await
+            .expect("load dashboard funding runway");
+        assert_eq!(dashboard.accounts.len(), 1);
+        let account = &dashboard.accounts[0];
+        assert_eq!(account.daily_rate_minor, 100);
+        assert_eq!(account.prepaid_runway_seconds, Some(0));
+        assert_eq!(account.estimated_runway_seconds, Some(4 * 86_400));
+    }
+
+    #[tokio::test]
+    async fn funding_runway_alerts_transition_once_and_recover_after_topup() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("runway-buyer", "runway-buyer@example.com");
+        let supplier = session("runway-supplier", "runway-supplier@example.com");
+        configure_supplier(&store, &supplier, 400).await;
+        let started_at = Utc::now();
+        let contract_id =
+            add_client_contract(&store, &buyer, &supplier, "runway-client", 100, started_at).await;
+        let account_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT account_id FROM market_service_contracts WHERE id = ?1",
+                params![contract_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read runway account")
+        };
+
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(1))
+            .await
+            .expect("establish healthy runway state");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_limit_minor = 250, credit_revision = credit_revision + 1
+                 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("reduce credit into warning runway");
+        }
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(2))
+            .await
+            .expect("emit runway warning");
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(3))
+            .await
+            .expect("deduplicate runway warning");
+        {
+            let conn = store.conn.lock().await;
+            let warning_state: (String, i64) = conn
+                .query_row(
+                    "SELECT funding_runway_alert_level,
+                            (SELECT COUNT(*) FROM market_billing_events
+                             WHERE account_id = ?1 AND event_type = 'funding_runway_warning')
+                     FROM market_credit_accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read de-duplicated runway warning");
+            assert_eq!(warning_state, (FUNDING_RUNWAY_WARNING.into(), 1));
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_limit_minor = 50, credit_revision = credit_revision + 1
+                 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("reduce credit into critical runway");
+        }
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(4))
+            .await
+            .expect("emit critical runway alert");
+        credit_test_prepaid_units(
+            &store,
+            &buyer,
+            &supplier,
+            400 * MONEY_UNITS_PER_MINOR,
+            "runway-recovery-topup",
+            started_at + Duration::seconds(5),
+        )
+        .await;
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(5))
+            .await
+            .expect("emit runway recovery");
+
+        let conn = store.conn.lock().await;
+        let state: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT funding_runway_alert_level,
+                        (SELECT COUNT(*) FROM market_billing_events
+                         WHERE account_id = ?1 AND event_type = 'funding_runway_warning'),
+                        (SELECT COUNT(*) FROM market_billing_events
+                         WHERE account_id = ?1 AND event_type = 'funding_runway_critical'),
+                        (SELECT COUNT(*) FROM market_billing_events
+                         WHERE account_id = ?1 AND event_type = 'funding_runway_recovered')
+                 FROM market_credit_accounts WHERE id = ?1",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read runway transition history");
+        assert_eq!(state, (FUNDING_RUNWAY_NONE.into(), 1, 1, 1));
+        let public_payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM client_chat_system_outbox
+                 WHERE source_kind = 'market_billing'
+                   AND event_type = 'billing_funding_runway_warning'
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read public runway warning");
+        let public_payload: serde_json::Value =
+            serde_json::from_str(&public_payload).expect("parse public runway warning");
+        assert_eq!(public_payload["billingUrl"], "/account/billing/");
+        assert_eq!(public_payload["alertLevel"], "warning");
+        assert!(public_payload.get("estimatedRunwaySeconds").is_none());
+        assert!(public_payload.get("creditLimitMinor").is_none());
+    }
+
+    #[tokio::test]
+    async fn funding_runway_alerts_count_suspended_exposure_and_clear_after_services_end() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session(
+            "runway-suspended-buyer",
+            "runway-suspended-buyer@example.com",
+        );
+        let supplier = session(
+            "runway-suspended-supplier",
+            "runway-suspended-supplier@example.com",
+        );
+        configure_supplier(&store, &supplier, 400).await;
+        let started_at = Utc::now();
+        let active_contract = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "runway-active-client",
+            100,
+            started_at,
+        )
+        .await;
+        let suspended_contract = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "runway-suspended-client",
+            100,
+            started_at,
+        )
+        .await;
+        let account_id = {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET status = 'billing_suspended', desired_control_state = 'suspended',
+                     control_error = 'manual_test_hold'
+                 WHERE id = ?1",
+                params![suspended_contract],
+            )
+            .expect("suspend one runway contract");
+            conn.query_row(
+                "SELECT account_id FROM market_service_contracts WHERE id = ?1",
+                params![active_contract],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read suspended runway account")
+        };
+
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(1))
+            .await
+            .expect("include suspended service in runway warning");
+        {
+            let conn = store.conn.lock().await;
+            let warning: (String, i64) = conn
+                .query_row(
+                    "SELECT funding_runway_alert_level,
+                            (SELECT COUNT(*) FROM market_billing_events
+                             WHERE account_id = ?1 AND event_type = 'funding_runway_warning')
+                     FROM market_credit_accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read suspended exposure warning");
+            assert_eq!(warning, (FUNDING_RUNWAY_WARNING.into(), 1));
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET status = 'terminated', desired_control_state = 'terminated',
+                     terminated_at = ?2, updated_at = ?2
+                 WHERE id = ?1",
+                params![
+                    active_contract,
+                    (started_at + Duration::seconds(2)).to_rfc3339()
+                ],
+            )
+            .expect("end active runway test service");
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_limit_minor = 50, credit_revision = credit_revision + 1
+                 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("reduce suspended-only runway funding");
+        }
+
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(3))
+            .await
+            .expect("sync runway alert for a suspended-only account");
+        {
+            let conn = store.conn.lock().await;
+            let critical: (String, i64) = conn
+                .query_row(
+                    "SELECT funding_runway_alert_level,
+                            (SELECT COUNT(*) FROM market_billing_events
+                             WHERE account_id = ?1 AND event_type = 'funding_runway_critical')
+                     FROM market_credit_accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read suspended-only critical alert");
+            assert_eq!(critical, (FUNDING_RUNWAY_CRITICAL.into(), 1));
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_limit_minor = 400, credit_revision = credit_revision + 1
+                 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("restore suspended-only runway funding");
+        }
+
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(4))
+            .await
+            .expect("recover a suspended-only runway alert");
+        {
+            let conn = store.conn.lock().await;
+            let recovered: (String, i64) = conn
+                .query_row(
+                    "SELECT funding_runway_alert_level,
+                            (SELECT COUNT(*) FROM market_billing_events
+                             WHERE account_id = ?1 AND event_type = 'funding_runway_recovered')
+                     FROM market_credit_accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read suspended-only funding recovery");
+            assert_eq!(recovered, (FUNDING_RUNWAY_NONE.into(), 1));
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET credit_limit_minor = 50, credit_revision = credit_revision + 1
+                 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("reduce suspended-only runway funding again");
+        }
+
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(5))
+            .await
+            .expect("emit a new critical transition after recovery");
+        {
+            let conn = store.conn.lock().await;
+            let repeated_critical: (String, i64) = conn
+                .query_row(
+                    "SELECT funding_runway_alert_level,
+                            (SELECT COUNT(*) FROM market_billing_events
+                             WHERE account_id = ?1 AND event_type = 'funding_runway_critical')
+                     FROM market_credit_accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read repeated suspended-only critical alert");
+            assert_eq!(repeated_critical, (FUNDING_RUNWAY_CRITICAL.into(), 2));
+            conn.execute(
+                "UPDATE market_service_contracts
+                 SET status = 'terminated', desired_control_state = 'terminated',
+                     terminated_at = ?2, updated_at = ?2
+                 WHERE id = ?1",
+                params![
+                    suspended_contract,
+                    (started_at + Duration::seconds(6)).to_rfc3339()
+                ],
+            )
+            .expect("end suspended runway test service");
+        }
+
+        store
+            .market_billing_reconcile(started_at + Duration::seconds(7))
+            .await
+            .expect("clear runway alert after all services end");
+        let conn = store.conn.lock().await;
+        let recovered: (String, i64) = conn
+            .query_row(
+                "SELECT funding_runway_alert_level,
+                        (SELECT COUNT(*) FROM market_billing_events
+                         WHERE account_id = ?1 AND event_type = 'funding_runway_recovered')
+                 FROM market_credit_accounts WHERE id = ?1",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read cleared inactive runway alert");
+        assert_eq!(recovered, (FUNDING_RUNWAY_NONE.into(), 2));
     }
 
     #[tokio::test]
@@ -11499,6 +12328,12 @@ mod tests {
             ("invoice_dispute_resolved", "billing_dispute_resolved"),
             ("invoice_voided", "billing_invoice_voided"),
             ("credit_limit_warning", "billing_credit_limit_warning"),
+            ("funding_runway_warning", "billing_funding_runway_warning"),
+            ("funding_runway_critical", "billing_funding_runway_critical"),
+            (
+                "funding_runway_recovered",
+                "billing_funding_runway_recovered",
+            ),
         ] {
             assert_eq!(
                 billing_client_chat_event_type(billing_event),
@@ -11509,6 +12344,35 @@ mod tests {
             billing_client_chat_event_type("service_contract_activated"),
             None
         );
+    }
+
+    #[test]
+    fn funding_runway_public_projection_exposes_only_safe_navigation_state() {
+        let projected =
+            crate::store::client_chat::public_market_event_payload(&serde_json::json!({
+                "summary": "Funding runway warning",
+                "marketKind": "billing",
+                "billingEventType": "funding_runway_warning",
+                "alertLevel": "warning",
+                "billingUrl": "/account/billing/",
+                "balanceMinor": 12_345,
+                "creditLimitMinor": 20_000,
+                "estimatedRunwaySeconds": 86_399,
+                "buyerEmail": "private-buyer@example.com",
+            }));
+        assert_eq!(projected["alertLevel"], "warning");
+        assert_eq!(projected["billingUrl"], "/account/billing/");
+        for private_field in [
+            "balanceMinor",
+            "creditLimitMinor",
+            "estimatedRunwaySeconds",
+            "buyerEmail",
+        ] {
+            assert!(
+                projected.get(private_field).is_none(),
+                "public funding alert leaked {private_field}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12348,6 +13212,7 @@ mod tests {
             .expect("combined supplier account");
         assert_eq!(account.balance_minor, 2);
         assert_eq!(account.status, ACCOUNT_SETTLEMENT_DUE);
+        assert_eq!(account.funding_runway_alert_level, FUNDING_RUNWAY_NONE);
         let invoice = account.open_invoice.as_ref().expect("combined invoice");
         assert_eq!(invoice.amount_minor, 2);
         assert_eq!(invoice.amount_usd_minor, 2);

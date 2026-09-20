@@ -179,6 +179,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         49,
         include_str!("../schema/0049_market_prepaid_funding.sql"),
     ),
+    (
+        50,
+        include_str!("../schema/0050_market_funding_runway_alerts.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1148,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_49_upgrade_a_version_26_database() {
+    fn migrations_27_through_50_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1277,8 +1281,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 49);
-        check_compatibility(&conn).expect("upgraded version 49 is compatible");
+        assert_eq!(latest_version, 50);
+        check_compatibility(&conn).expect("upgraded version 50 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1857,6 +1861,47 @@ mod tests {
     }
 
     #[test]
+    fn migration_50_adds_a_safe_default_funding_runway_alert_state() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 49);
+        conn.execute_batch(
+            r#"
+            INSERT INTO market_credit_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, balance_units, credit_kind, credit_source,
+                credit_revision, created_at, updated_at
+            ) VALUES (
+                'migration-50-account', 'migration-50-buyer', 'buyer@example.com',
+                'migration-50-supplier', 'supplier@example.com', 'USD', 'active',
+                0, 'none', 'counterparty', 1, '2026-09-20T00:00:00Z',
+                '2026-09-20T00:00:00Z'
+            );
+            "#,
+        )
+        .expect("seed version 49 credit account");
+
+        apply(&conn).expect("apply funding runway alert migration");
+        let level: String = conn
+            .query_row(
+                "SELECT funding_runway_alert_level FROM market_credit_accounts
+                 WHERE id = 'migration-50-account'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated runway alert level");
+        assert_eq!(level, "none");
+        assert!(
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET funding_runway_alert_level = 'invalid'
+                 WHERE id = 'migration-50-account'",
+                [],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn migration_30_installs_user_model_routing_without_a_share_foreign_key() {
         let conn = memory_connection();
         install_schema_through(&conn, 29);
@@ -1915,7 +1960,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 49);
+        assert_eq!(latest_version, 50);
     }
 
     #[test]
@@ -1939,7 +1984,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 49);
+        assert_eq!(latest_version, 50);
     }
 
     #[test]
@@ -2119,7 +2164,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 49);
+        assert_eq!(latest_version, 50);
     }
 
     #[test]

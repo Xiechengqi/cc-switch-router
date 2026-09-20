@@ -1272,10 +1272,12 @@ async fn create_quote(
         .client_market_create_quote(&session, input)
         .await?;
     for funding in &mut quote.funding {
-        funding.topup_available = state
+        funding.topup_unavailable_reason = state
             .binance_settlement
-            .supplier_funding_available(&state.store, &funding.supplier_user_id)
-            .await?;
+            .supplier_funding_unavailable_reason(&state.store, &funding.supplier_user_id)
+            .await?
+            .map(str::to_string);
+        funding.topup_available = funding.topup_unavailable_reason.is_none();
     }
     Ok(Json(quote))
 }

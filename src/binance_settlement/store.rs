@@ -1131,6 +1131,28 @@ impl AppStore {
             .optional()
             .map_err(map_db("read funding supplier identity"))?
             .ok_or_else(|| AppError::NotFound("supplier account not found".into()))?;
+        let relationship_closed = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM market_credit_accounts
+                    WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                      AND currency = 'USD' AND status = 'closed'
+                 )",
+                params![session.user_id, supplier_user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_db("check closed supplier relationship before funding"))?
+            != 0;
+        if relationship_closed {
+            return Err(AppError::coded_conflict(
+                crate::market_access::ERROR_MARKET_RELATIONSHIP_CLOSED,
+                "the supplier relationship is closed; unused prepaid funds can only be refunded",
+                serde_json::json!({
+                    "supplierUserId": supplier_user_id,
+                    "currency": crate::market_billing::MARKET_CURRENCY,
+                }),
+            ));
+        }
         let established_relationship = tx
             .query_row(
                 "SELECT EXISTS(
@@ -1187,8 +1209,13 @@ impl AppStore {
             .map_err(map_db("check unpaid supplier invoice before funding"))?
             != 0;
         if unpaid_invoice {
-            return Err(AppError::Conflict(
-                "settle the outstanding supplier invoice before adding prepaid funds".into(),
+            return Err(AppError::coded_conflict(
+                crate::market_access::ERROR_MARKET_SETTLEMENT_REQUIRED,
+                "settle the outstanding supplier invoice before adding prepaid funds",
+                serde_json::json!({
+                    "supplierUserId": supplier_user_id,
+                    "currency": crate::market_billing::MARKET_CURRENCY,
+                }),
             ));
         }
         let payment_account = tx
@@ -6717,6 +6744,56 @@ mod tests {
             )
             .expect("count unauthorized prepaid accounts");
         assert_eq!(prepaid_accounts, 0);
+
+        let error = store
+            .binance_create_funding_intent_for_cipher(
+                &fixture.buyer,
+                &fixture.supplier.user_id,
+                500,
+                "funding-access-unpaid-key",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect_err("an unpaid supplier invoice must block prepaid funding");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_SETTLEMENT_REQUIRED)
+        );
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_invoices
+                 SET status = 'paid', paid_at = ?2
+                 WHERE id = ?1",
+                params![fixture.invoice_id, Utc::now().to_rfc3339()],
+            )
+            .expect("settle fixture invoice before closing funding relationship");
+            conn.execute(
+                "UPDATE market_credit_accounts
+                 SET status = 'closed', balance_units = 0, open_invoice_id = NULL,
+                     close_requested = 1
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![fixture.buyer.user_id, fixture.supplier.user_id],
+            )
+            .expect("close fixture funding relationship");
+        }
+        let error = store
+            .binance_create_funding_intent_for_cipher(
+                &fixture.buyer,
+                &fixture.supplier.user_id,
+                500,
+                "funding-access-closed-key",
+                "test",
+                &fixture.cipher,
+            )
+            .await
+            .expect_err("closed supplier relationship must reject new prepaid funding");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_RELATIONSHIP_CLOSED)
+        );
     }
 
     #[tokio::test]

@@ -32,7 +32,12 @@ import { shareMarketMutationError } from "./market-utils";
 import { ApiError } from "@/lib/api";
 import {
   applyMarketFundingConflict,
+  defaultMarketFundingTopupMinor,
+  formatFundingRunway,
   marketFundingConflictFromError,
+  marketFundingTopupErrorKey,
+  marketFundingTopupUnavailableKey,
+  marketFundingUsesCredit,
 } from "@/lib/market-funding";
 
 function seat(
@@ -320,10 +325,23 @@ test("prepaid funding race details update only the affected supplier", () => {
     prepaidHeldMinor: 0,
     prepaidAvailableMinor: 10,
     creditKind: "none",
+    creditLimitMinor: undefined,
     creditOutstandingMinor: 0,
+    creditReservedMinor: 0,
+    creditAvailableMinor: 0,
+    activeDailyRateMinor: 0,
+    additionalDailyRateMinor: 300,
+    projectedDailyRateMinor: 300,
     requiredCoverageMinor: 300,
+    prepaidCoverageMinor: 25,
+    creditCoverageMinor: 0,
     requiredTopupMinor: 0,
+    recommendedTopupMinor: 2_075,
+    recommendedCoverageDays: 7,
+    prepaidRunwaySeconds: 7_200,
+    estimatedRunwaySeconds: 7_200,
     topupAvailable: true,
+    topupUnavailableReason: undefined,
   } satisfies MarketFundingSummary;
   assert.deepEqual(applyMarketFundingConflict(funding, conflict!), {
     ...funding,
@@ -347,4 +365,54 @@ test("prepaid funding race details update only the affected supplier", () => {
     )),
     null,
   );
+});
+
+test("voluntary funding defaults to the seven-day recommendation", () => {
+  const funding = {
+    supplierUserId: "supplier-a",
+    supplierEmail: "supplier@example.com",
+    currency: "USD",
+    fundingMode: "prepaid_then_credit",
+    prepaidBalanceMinor: 500,
+    prepaidHeldMinor: 0,
+    prepaidAvailableMinor: 500,
+    creditKind: "limited",
+    creditLimitMinor: 10_000,
+    creditOutstandingMinor: 1_000,
+    creditReservedMinor: 300,
+    creditAvailableMinor: 8_700,
+    activeDailyRateMinor: 100,
+    additionalDailyRateMinor: 200,
+    projectedDailyRateMinor: 300,
+    requiredCoverageMinor: 300,
+    prepaidCoverageMinor: 300,
+    creditCoverageMinor: 0,
+    requiredTopupMinor: 0,
+    recommendedTopupMinor: 1_600,
+    recommendedCoverageDays: 7,
+    prepaidRunwaySeconds: 144_000,
+    estimatedRunwaySeconds: 2_649_600,
+    topupAvailable: true,
+  } satisfies MarketFundingSummary;
+
+  assert.equal(defaultMarketFundingTopupMinor(funding), 1_600);
+  assert.equal(defaultMarketFundingTopupMinor({
+    ...funding,
+    requiredTopupMinor: 2_000,
+  }), 2_000);
+  assert.equal(defaultMarketFundingTopupMinor({
+    ...funding,
+    recommendedTopupMinor: 100_000_001,
+  }), 100_000_000);
+  assert.equal(marketFundingUsesCredit(funding), false);
+  assert.equal(marketFundingUsesCredit({ ...funding, creditCoverageMinor: 125 }), true);
+  assert.equal(marketFundingTopupUnavailableKey("region_restricted"), "marketFunding.topup.unavailable.regionRestricted");
+  assert.equal(marketFundingTopupUnavailableKey("relationship_closed"), "marketFunding.topup.unavailable.relationshipClosed");
+  assert.equal(marketFundingTopupUnavailableKey("future_reason"), "marketFunding.topup.unavailable");
+  assert.equal(
+    marketFundingTopupErrorKey(new ApiError(409, "closed", "MARKET_RELATIONSHIP_CLOSED")),
+    "marketFunding.topup.unavailable.relationshipClosed",
+  );
+  assert.match(formatFundingRunway(129_600, "en", "Unlimited"), /1\.5/);
+  assert.equal(formatFundingRunway(undefined, "en", "Unlimited"), "Unlimited");
 });

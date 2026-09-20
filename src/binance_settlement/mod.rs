@@ -335,28 +335,38 @@ impl BinanceSettlementRuntime {
         }
     }
 
-    pub(crate) async fn supplier_funding_available(
+    pub(crate) async fn supplier_funding_unavailable_reason(
         &self,
         store: &crate::store::AppStore,
         supplier_user_id: &str,
-    ) -> Result<bool, AppError> {
-        if self.mode != GlobalMode::Enabled {
-            return Ok(false);
+    ) -> Result<Option<&'static str>, AppError> {
+        match self.mode {
+            GlobalMode::Disabled => return Ok(Some("router_disabled")),
+            GlobalMode::Shadow => return Ok(Some("router_shadow")),
+            GlobalMode::Enabled => {}
         }
         let availability = self.service_availability(false).await;
-        if availability.status != BinanceServiceAvailability::Available {
-            return Ok(false);
+        match availability.status {
+            BinanceServiceAvailability::Available => {}
+            BinanceServiceAvailability::RegionRestricted => {
+                return Ok(Some("region_restricted"));
+            }
+            BinanceServiceAvailability::Unchecked
+            | BinanceServiceAvailability::TemporarilyUnavailable => {
+                return Ok(Some("temporarily_unavailable"));
+            }
         }
         let Some(cipher) = self.cipher.as_ref() else {
-            return Ok(false);
+            return Ok(Some("credential_storage_unavailable"));
         };
-        store
+        let available = store
             .binance_supplier_funding_available_for_cipher(
                 supplier_user_id,
                 self.payment_home_region(),
                 cipher,
             )
-            .await
+            .await?;
+        Ok((!available).then_some("supplier_unavailable"))
     }
 
     pub(crate) async fn service_availability(

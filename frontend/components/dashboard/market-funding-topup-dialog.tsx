@@ -10,6 +10,14 @@ import {
   getBinanceFundingIntent,
   refreshBinanceFundingIntent,
 } from "@/lib/api";
+import {
+  defaultMarketFundingTopupMinor,
+  formatFundingRunway,
+  MAX_MARKET_FUNDING_TOPUP_MINOR,
+  marketFundingTopupErrorKey,
+  marketFundingTopupUnavailableKey,
+  marketFundingUsesCredit,
+} from "@/lib/market-funding";
 import type { BinanceFundingIntent, MarketFundingSummary } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
 
@@ -36,7 +44,23 @@ export function MarketFundingSummaryCard({
     ? t("marketFunding.credit.unlimited")
     : funding.creditKind === "none"
       ? t("marketFunding.credit.none")
-      : formatUsdMoney(funding.creditAvailableMinor || 0, locale);
+      : formatUsdMoney(funding.creditAvailableMinor ?? 0, locale);
+  const creditLimit = funding.creditKind === "unlimited"
+    ? t("marketFunding.credit.unlimited")
+    : funding.creditKind === "none"
+      ? t("marketFunding.credit.none")
+      : formatUsdMoney(funding.creditLimitMinor ?? 0, locale);
+  const prepaidRunway = funding.projectedDailyRateMinor > 0
+    ? formatFundingRunway(funding.prepaidRunwaySeconds, locale, "-")
+    : "-";
+  const totalRunway = funding.projectedDailyRateMinor > 0
+    ? formatFundingRunway(
+      funding.estimatedRunwaySeconds,
+      locale,
+      funding.creditKind === "unlimited" ? t("marketFunding.runway.unlimited") : "-",
+    )
+    : "-";
+  const usesCredit = marketFundingUsesCredit(funding);
 
   return (
     <section className={`grid gap-3 rounded-md border border-slate-200 bg-slate-50 p-3 ${className}`.trim()}>
@@ -49,12 +73,35 @@ export function MarketFundingSummaryCard({
           {funding.fundingMode === "prepaid" ? t("marketFunding.mode.prepaid") : t("marketFunding.mode.hybrid")}
         </span>
       </div>
+      <div className="grid gap-3 border-y border-slate-200 py-3 text-sm lg:grid-cols-3">
+        <div className="grid grid-cols-3 gap-2">
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidTotal")}</span><strong className="tabular-nums">{formatUsdMoney(funding.prepaidBalanceMinor, locale)}</strong></div>
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidHeld")}</span><strong className="tabular-nums">{formatUsdMoney(funding.prepaidHeldMinor, locale)}</strong></div>
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</span><strong className="tabular-nums text-emerald-700">{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</strong></div>
+        </div>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-2">
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.creditLimit")}</span><strong className="tabular-nums">{creditLimit}</strong></div>
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.creditUsed")}</span><strong className="tabular-nums">{formatUsdMoney(funding.creditOutstandingMinor, locale)}</strong></div>
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.creditReserved")}</span><strong className="tabular-nums">{formatUsdMoney(funding.creditReservedMinor, locale)}</strong></div>
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.creditAvailable")}</span><strong className="tabular-nums">{credit}</strong></div>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.rate.current")}</span><strong className="tabular-nums">{formatUsdMoney(funding.activeDailyRateMinor, locale)}</strong></div>
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.rate.new")}</span><strong className="tabular-nums">{formatUsdMoney(funding.additionalDailyRateMinor, locale)}</strong></div>
+          <div><span className="block text-xs text-slate-500">{t("marketFunding.rate.projected")}</span><strong className="tabular-nums">{formatUsdMoney(funding.projectedDailyRateMinor, locale)}</strong></div>
+        </div>
+      </div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-4">
-        <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</span><strong className="tabular-nums">{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</strong></div>
-        <div><span className="block text-xs text-slate-500">{t("marketFunding.creditAvailable")}</span><strong className="tabular-nums">{credit}</strong></div>
+        <div><span className="block text-xs text-slate-500">{t("marketFunding.runway.prepaid")}</span><strong className="tabular-nums">{prepaidRunway}</strong></div>
+        <div><span className="block text-xs text-slate-500">{t("marketFunding.runway.total")}</span><strong className="tabular-nums">{totalRunway}</strong></div>
         <div><span className="block text-xs text-slate-500">{t("marketFunding.coverage")}</span><strong className="tabular-nums">{formatUsdMoney(funding.requiredCoverageMinor, locale)}</strong></div>
         <div><span className="block text-xs text-slate-500">{t("marketFunding.shortfall")}</span><strong className={`tabular-nums ${funding.requiredTopupMinor > 0 ? "text-rose-700" : "text-emerald-700"}`}>{formatUsdMoney(funding.requiredTopupMinor, locale)}</strong></div>
       </div>
+      <p className="text-xs leading-5 text-slate-600">{t("marketFunding.coverageSplit", {
+        prepaid: formatUsdMoney(funding.prepaidCoverageMinor, locale),
+        credit: formatUsdMoney(funding.creditCoverageMinor, locale),
+      })}</p>
+      {usesCredit ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">{t("marketFunding.creditWarning", { amount: formatUsdMoney(funding.creditCoverageMinor, locale) })}</p> : null}
       <p className="text-xs leading-5 text-slate-600">{t("marketFunding.policy")}</p>
     </section>
   );
@@ -82,20 +129,24 @@ export function MarketFundingTopupDialog({
   const intentEpochRef = React.useRef(0);
   const intentMutationRef = React.useRef(false);
   const intentPollInFlightRef = React.useRef(false);
+  const fundingErrorText = React.useCallback((reason: unknown) => {
+    const messageKey = marketFundingTopupErrorKey(reason);
+    return messageKey ? t(messageKey) : reason instanceof Error ? reason.message : String(reason);
+  }, [t]);
 
   React.useEffect(() => {
     if (!open) return;
     intentEpochRef.current += 1;
     intentMutationRef.current = false;
     intentPollInFlightRef.current = false;
-    setAmount(((funding?.requiredTopupMinor || 1) / 100).toFixed(2));
+    setAmount(funding ? (defaultMarketFundingTopupMinor(funding) / 100).toFixed(2) : "");
     setIntent(null);
     setError("");
     setBusy("");
     setClockMs(Date.now());
     idempotencyRef.current = null;
     creditedRef.current = "";
-  }, [funding?.requiredTopupMinor, funding?.supplierUserId, open]);
+  }, [funding, open]);
 
   React.useEffect(() => {
     if (!open || !intent?.id || intent.status !== "pending") return;
@@ -119,7 +170,7 @@ export function MarketFundingTopupDialog({
           setIntent((current) => current?.id === intentId
             ? { ...current, accountStatus: "unavailable" }
             : current);
-          setError(reason instanceof Error ? reason.message : String(reason));
+          setError(fundingErrorText(reason));
         })
         .finally(() => {
           if (active && intentEpochRef.current === epoch) {
@@ -135,7 +186,7 @@ export function MarketFundingTopupDialog({
       window.clearInterval(clock);
       intentPollInFlightRef.current = false;
     };
-  }, [intent?.id, intent?.status, open]);
+  }, [fundingErrorText, intent?.id, intent?.status, open]);
 
   React.useEffect(() => {
     if (!open || intent?.status !== "credited" || creditedRef.current === intent.id) return;
@@ -149,8 +200,27 @@ export function MarketFundingTopupDialog({
     if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) return null;
     const value = Number(normalized);
     const minor = Math.round(value * 100);
-    return Number.isSafeInteger(minor) && minor > 0 ? minor : null;
+    return Number.isSafeInteger(minor)
+      && minor > 0
+      && minor <= MAX_MARKET_FUNDING_TOPUP_MINOR
+      ? minor
+      : null;
   }, [amount]);
+  const minimumPresetMinor = Math.min(
+    funding?.requiredTopupMinor ?? 0,
+    MAX_MARKET_FUNDING_TOPUP_MINOR,
+  );
+  const recommendedTopupMinor = Math.max(
+    funding?.recommendedTopupMinor ?? 0,
+    funding?.requiredTopupMinor ?? 0,
+  );
+  const recommendedPresetMinor = Math.min(
+    recommendedTopupMinor,
+    MAX_MARKET_FUNDING_TOPUP_MINOR,
+  );
+  const partialRemainingMinor = funding && amountMinor != null
+    ? Math.max(0, funding.requiredTopupMinor - amountMinor)
+    : 0;
   const remainingSeconds = intent
     ? Math.max(0, Math.floor((Date.parse(intent.expiresAt) - clockMs) / 1_000))
     : 0;
@@ -161,10 +231,6 @@ export function MarketFundingTopupDialog({
 
   const createIntent = async () => {
     if (!funding || amountMinor == null || busy) return;
-    if (amountMinor < funding.requiredTopupMinor) {
-      setError(t("marketFunding.topup.minimum", { amount: formatUsdMoney(funding.requiredTopupMinor, locale) }));
-      return;
-    }
     if (!idempotencyRef.current || idempotencyRef.current.amountMinor !== amountMinor) {
       idempotencyRef.current = { amountMinor, key: `market-funding:${crypto.randomUUID()}` };
     }
@@ -184,7 +250,7 @@ export function MarketFundingTopupDialog({
       setClockMs(Date.now());
     } catch (reason) {
       if (intentEpochRef.current !== mutationEpoch) return;
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(fundingErrorText(reason));
     } finally {
       if (intentEpochRef.current === mutationEpoch) {
         intentMutationRef.current = false;
@@ -208,7 +274,7 @@ export function MarketFundingTopupDialog({
       setClockMs(Date.now());
     } catch (reason) {
       if (intentEpochRef.current !== mutationEpoch) return;
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(fundingErrorText(reason));
     } finally {
       if (intentEpochRef.current === mutationEpoch) {
         intentMutationRef.current = false;
@@ -230,7 +296,7 @@ export function MarketFundingTopupDialog({
       setError("");
     } catch (reason) {
       if (intentEpochRef.current !== mutationEpoch) return;
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(fundingErrorText(reason));
     } finally {
       if (intentEpochRef.current === mutationEpoch) {
         intentMutationRef.current = false;
@@ -255,16 +321,29 @@ export function MarketFundingTopupDialog({
           <Modal.Header><Modal.Heading>{t("marketBilling.dialog.topup")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid max-h-[70vh] gap-4 overflow-y-auto">
             {funding ? (
-              <div className="grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
+              <div className="grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm sm:grid-cols-4">
                 <div><span className="block text-xs text-slate-500">{t("marketBilling.supplier")}</span><strong className="break-all">{funding.supplierEmail}</strong></div>
+                <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</span><strong>{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</strong></div>
                 <div><span className="block text-xs text-slate-500">{t("marketFunding.shortfall")}</span><strong>{formatUsdMoney(funding.requiredTopupMinor, locale)}</strong></div>
+                <div><span className="block text-xs text-slate-500">{t("marketFunding.topup.recommended", { days: funding.recommendedCoverageDays })}</span><strong>{formatUsdMoney(recommendedTopupMinor, locale)}</strong></div>
               </div>
             ) : null}
             {!intent ? (
-              <label className="grid gap-1 text-sm">
-                <span className="text-slate-500">{t("marketBilling.prepaid.amountUsd")}</span>
-                <input value={amount} onChange={(event) => { setAmount(event.target.value); idempotencyRef.current = null; }} inputMode="decimal" className="h-10 rounded-md border border-slate-200 px-3 tabular-nums" autoFocus />
-              </label>
+              <div className="grid gap-3">
+                <div className="flex flex-wrap gap-2">
+                  {funding && minimumPresetMinor > 0 ? <Button size="sm" variant="outline" onClick={() => { setAmount((minimumPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(funding.requiredTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.minimumPreset", { amount: formatUsdMoney(minimumPresetMinor, locale) })}</Button> : null}
+                  {funding && recommendedPresetMinor > 0 && recommendedPresetMinor !== minimumPresetMinor ? <Button size="sm" variant="outline" onClick={() => { setAmount((recommendedPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(recommendedTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.recommendedPreset", { days: funding.recommendedCoverageDays, amount: formatUsdMoney(recommendedPresetMinor, locale) })}</Button> : null}
+                </div>
+                <label className="grid gap-1 text-sm">
+                  <span className="text-slate-500">{t("marketFunding.topup.custom")}</span>
+                  <input value={amount} onChange={(event) => { setAmount(event.target.value); idempotencyRef.current = null; }} inputMode="decimal" max={MAX_MARKET_FUNDING_TOPUP_MINOR / 100} className="h-10 rounded-md border border-slate-200 px-3 tabular-nums" autoFocus />
+                  <span className="text-xs text-slate-500">{t("marketFunding.topup.transferLimit", { amount: formatUsdMoney(MAX_MARKET_FUNDING_TOPUP_MINOR, locale) })}</span>
+                </label>
+                {partialRemainingMinor > 0 ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">{t("marketFunding.topup.partialNotice", { remaining: formatUsdMoney(partialRemainingMinor, locale) })}</p> : null}
+                <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">{t("marketFunding.topup.providerScope")}</p>
+                <p className="text-xs leading-5 text-slate-500">{t("marketFunding.topup.refundDisclosure")}</p>
+                {!funding?.topupAvailable ? <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding?.topupUnavailableReason))}</p> : null}
+              </div>
             ) : null}
             {error ? <div className="flex gap-2 rounded-md border border-rose-200 bg-rose-50 p-3 text-xs leading-5 text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div> : null}
             {intent ? (
@@ -293,7 +372,7 @@ export function MarketFundingTopupDialog({
           </Modal.Body>
           <Modal.Footer>
             <Button variant="ghost" isDisabled={!!busy} onClick={onClose}>{intent ? t("common.close") : t("common.cancel")}</Button>
-            {!intent ? <Button variant="primary" isDisabled={!!busy || amountMinor == null} onClick={() => void createIntent()}>{busy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("marketBilling.prepaid.topup.create")}</Button> : null}
+            {!intent ? <Button variant="primary" isDisabled={!!busy || amountMinor == null || !funding?.topupAvailable} onClick={() => void createIntent()}>{busy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("marketBilling.prepaid.topup.create")}</Button> : null}
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>

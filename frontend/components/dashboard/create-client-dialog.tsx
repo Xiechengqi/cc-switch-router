@@ -27,6 +27,7 @@ import {
 import {
   applyMarketFundingConflict,
   marketFundingConflictFromError,
+  marketFundingTopupUnavailableKey,
 } from "@/lib/market-funding";
 import type {
   ClientMarketAllocationQuote,
@@ -772,14 +773,12 @@ export function CreateClientDialog({
                 {quote.funding.map((funding) => (
                   <div key={`${funding.supplierUserId}:${funding.currency}`} className="grid gap-2">
                     <MarketFundingSummaryCard funding={funding} />
-                    {funding.requiredTopupMinor > 0 ? (
-                      funding.topupAvailable ? (
-                        <Button size="sm" variant="outline" className="justify-self-start" onClick={() => setTopupFunding(funding)}>
-                          {t("marketFunding.topup.action")}
-                        </Button>
-                      ) : (
-                        <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t("marketFunding.topup.unavailable")}</p>
-                      )
+                    {funding.topupAvailable ? (
+                      <Button size="sm" variant="outline" className="justify-self-start" onClick={() => setTopupFunding(funding)}>
+                        {t(funding.requiredTopupMinor > 0 ? "marketFunding.topup.requiredAction" : "marketFunding.topup.optionalAction")}
+                      </Button>
+                    ) : funding.requiredTopupMinor > 0 ? (
+                      <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding.topupUnavailableReason))}</p>
                     ) : null}
                   </div>
                 ))}
@@ -816,44 +815,23 @@ export function CreateClientDialog({
       open={!!topupFunding}
       funding={topupFunding}
       onClose={() => setTopupFunding(undefined)}
-      onCredited={async (creditedIntent) => {
+      onCredited={async () => {
         setTopupFunding(undefined);
+        setPhase("form");
         if (quote) {
+          setLoading(true);
           const rescued: Record<string, Draft> = {};
           for (const item of quote.items) {
             const draft = drafts[item.id];
             if (draft && (draft.subdomain || draft.password)) rescued[item.hostId] = draft;
           }
           preservedDrafts.current = rescued;
-          try {
-            await cancelClientMarketQuote(quote.id);
-          } catch {
-            if (secondsRemaining(quote.expiresAt) > 0) {
-              const creditedMinor = creditedIntent.creditedMinor
-                ?? topupFunding?.requiredTopupMinor
-                ?? 0;
-              setQuote((current) => current ? {
-                ...current,
-                funding: current.funding.map((funding) => {
-                  if (funding.supplierUserId !== creditedIntent.supplierUserId) return funding;
-                  return {
-                    ...funding,
-                    prepaidBalanceMinor: funding.prepaidBalanceMinor + creditedMinor,
-                    prepaidAvailableMinor: funding.prepaidAvailableMinor + creditedMinor,
-                    requiredTopupMinor: Math.max(0, funding.requiredTopupMinor - creditedMinor),
-                  };
-                }),
-              } : current);
-              setError(t("marketFunding.topup.quoteRefreshFallback"));
-              setPhase("quote");
-              return;
-            }
-          }
           setQuote(null);
           setDrafts({});
           setSubdomainChecks({});
+          await cancelClientMarketQuote(quote.id).catch(() => undefined);
+          setLoading(false);
         }
-        setPhase("form");
         await requestQuote();
       }}
     />

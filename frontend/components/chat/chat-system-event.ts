@@ -20,12 +20,14 @@ export type ChatSystemEventDetail = {
 };
 
 const DETAIL_LABELS: Record<string, MessageKey> = {
+  alertLevel: "chat.detail.alertLevel",
   activatedAt: "chat.detail.activatedAt",
   address: "chat.detail.address",
   amountMinor: "chat.detail.amount",
   appType: "chat.detail.appType",
   assetUrl: "chat.detail.assetUrl",
   balanceMinor: "chat.detail.balance",
+  billingUrl: "chat.detail.billingUrl",
   buyerEmail: "chat.detail.buyerEmail",
   chain: "chat.detail.chain",
   clientOwnerEmail: "chat.detail.clientOwnerEmail",
@@ -194,6 +196,9 @@ const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
     "creditLimitMinor",
     "currency",
   ],
+  billing_funding_runway_warning: ["alertLevel", "billingUrl"],
+  billing_funding_runway_critical: ["alertLevel", "billingUrl"],
+  billing_funding_runway_recovered: ["alertLevel", "billingUrl"],
   billing_account_closing: ["supplierEmail", "reason"],
 };
 
@@ -588,6 +593,12 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
       return t("chat.event.billingCreditLimitWarning", {
         utilization: payloadPercent(payload, "utilizationBps", locale),
       });
+    case "billing_funding_runway_warning":
+      return t("chat.event.billingFundingRunwayWarning");
+    case "billing_funding_runway_critical":
+      return t("chat.event.billingFundingRunwayCritical");
+    case "billing_funding_runway_recovered":
+      return t("chat.event.billingFundingRunwayRecovered");
     case "billing_account_closing":
       return t("chat.event.billingAccountClosing");
     case "client_provisioned":

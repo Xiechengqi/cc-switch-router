@@ -552,6 +552,8 @@ pub(crate) fn public_market_event_payload(payload: &serde_json::Value) -> serde_
         "subdomain",
         "ownerEmail",
         "supplierEmail",
+        "alertLevel",
+        "billingUrl",
     ] {
         if let Some(value) = payload.get(field) {
             public.insert(field.into(), value.clone());
