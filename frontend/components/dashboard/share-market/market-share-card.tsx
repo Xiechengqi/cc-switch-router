@@ -102,20 +102,28 @@ function compactSeatTerms(
 export function CatalogSeatPreview({
   seat,
   onSelect,
+  onRent,
   interactive = true,
   mine = false,
   attention = false,
 }: {
   seat: ShareMarketSeat;
   onSelect?: () => void;
+  onRent?: () => void;
   interactive?: boolean;
   mine?: boolean;
   attention?: boolean;
 }) {
   const { locale, t } = useLocaleText();
+  const idle = isSeatIdle(seat);
+  const showRent = idle && !!onRent && !mine && seat.canRent !== false;
   const className = cn(
     "grid min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left text-[11px]",
-    mine ? "grid-cols-[auto_auto_minmax(0,1fr)_auto] bg-sky-50" : "grid-cols-[auto_minmax(0,1fr)_auto]",
+    mine
+      ? "grid-cols-[auto_auto_minmax(0,1fr)_auto] bg-sky-50"
+      : showRent
+        ? "grid-cols-[auto_minmax(0,1fr)_auto_auto]"
+        : "grid-cols-[auto_minmax(0,1fr)_auto]",
   );
   const body = (
     <>
@@ -137,25 +145,48 @@ export function CatalogSeatPreview({
       <strong className="shrink-0 tabular-nums text-slate-800">
         {formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}
       </strong>
+      {showRent ? (
+        <button
+          type="button"
+          data-no-card-open
+          className="shrink-0 rounded-md bg-primary px-2 py-0.5 text-[10px] font-semibold text-primary-foreground hover:bg-primary/90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          onClick={(event) => {
+            event.stopPropagation();
+            onRent();
+          }}
+        >
+          {t("shareMarket.rent")}
+        </button>
+      ) : null}
     </>
   );
-  if (!interactive) {
-    return <div className={className}>{body}</div>;
-  }
   return (
-    <button
-      type="button"
-      className={`${className} hover:bg-slate-50 active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary`}
-      onClick={onSelect}
+    <div
+      role={interactive ? "button" : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      className={cn(
+        className,
+        interactive
+          ? "cursor-pointer hover:bg-slate-50 active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          : null,
+      )}
+      onClick={interactive ? onSelect : undefined}
+      onKeyDown={interactive ? (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect?.();
+        }
+      } : undefined}
     >
       {body}
-    </button>
+    </div>
   );
 }
 
 export function CatalogSeatPreviewList({
   listing,
   onOpen,
+  onRent,
   preferredSeatIds,
   seats,
   showHint = true,
@@ -164,6 +195,7 @@ export function CatalogSeatPreviewList({
 }: {
   listing: ShareMarketListing;
   onOpen?: (seat?: ShareMarketSeat) => void;
+  onRent?: (seat: ShareMarketSeat) => void;
   preferredSeatIds?: string[];
   seats?: ShareMarketSeat[];
   showHint?: boolean;
@@ -195,6 +227,7 @@ export function CatalogSeatPreviewList({
           key={seat.id}
           seat={seat}
           onSelect={() => onOpen?.(seat)}
+          onRent={onRent ? () => onRent(seat) : undefined}
           interactive={!!onOpen}
           mine={mineIds.has(seat.id)}
           attention={attentionIds.has(seat.id)}

@@ -137,6 +137,8 @@ export const messages = {
     "shareMarket.catalog.allFamilies": "All providers",
     "shareMarket.catalog.search": "Search provider, app, model, Share, owner, or rider",
     "shareMarket.catalog.searchCompact": "Search Share",
+    "shareMarket.catalog.ownerFilter": "Filter by owner email",
+    "shareMarket.catalog.ownerPlaceholder": "Owner email",
     "shareMarket.catalog.filters": "Filter and sort",
     "shareMarket.catalog.onlyRentable": "Idle seats only",
     "shareMarket.catalog.familyFilter": "Filter by provider type",
@@ -286,10 +288,34 @@ export const messages = {
     "shareMarket.rentOfflineHint":
       "This Share is offline. Access will apply after the Server reconnects.",
     "shareMarket.rentConfirm.title": "Confirm Share rental",
+    "shareMarket.rentConfirm.titleSeat": "Confirm seat #{position}",
     "shareMarket.rentConfirm.confirm": "Confirm rental",
+    "shareMarket.rentConfirm.confirmFree": "Confirm free rental",
     "shareMarket.rentConfirm.expiresIn": "Frozen quote expires in {seconds}s.",
+    "shareMarket.rentConfirm.expiresInShort": "{seconds}s left",
     "shareMarket.rentConfirm.expired": "This frozen quote has expired. Refresh it before confirming.",
+    "shareMarket.rentConfirm.expiredShort": "Quote expired",
+    "shareMarket.rentConfirm.refreshRequired":
+      "This quote must be refreshed before you continue.",
+    "shareMarket.rentConfirm.refreshRequiredShort": "Refresh required",
     "shareMarket.rentConfirm.requote": "Refresh quote",
+    "shareMarket.rentConfirm.priceLabel": "Daily rate",
+    "shareMarket.rentConfirm.noTrialCompact":
+      "No trial remains · billing starts when healthy service begins.",
+    "shareMarket.rentConfirm.remainingTrialCompact":
+      "{hours} hours of healthy-service trial remain{tokens}. Billing starts after the trial.",
+    "shareMarket.rentConfirm.trialTokenCompact": " · up to {tokens}",
+    "shareMarket.rentConfirm.usageQuota": "Usage allowance",
+    "shareMarket.rentConfirm.quotaSummary": "Concurrency {parallel} · Token {tokens}",
+    "shareMarket.rentConfirm.termFixedCompact":
+      "{days} days · starts on first access dispatch and is reclaimed at expiry",
+    "shareMarket.rentConfirm.termPermanentCompact":
+      "Ongoing · either party can return or reclaim the seat",
+    "shareMarket.rentConfirm.details": "View all details",
+    "shareMarket.rentConfirm.billingDetails": "Billing and service terms",
+    "shareMarket.rentConfirm.technicalDetails": "Technical details",
+    "shareMarket.rentConfirm.fundingChanged":
+      "Funding changed. This is the latest quote; review it before confirming again.",
     "shareMarket.rentConfirm.postpaid":
       "The first {hours} hours of healthy service are free and do not create charges{tokens}. After that, usage is charged at the daily rate, using prepaid funds first and this Owner's explicit credit only for any remainder.",
     "shareMarket.rentConfirm.trialTokens":
@@ -1771,6 +1797,16 @@ export const messages = {
     "marketFunding.shortfall": "Amount to top up",
     "marketFunding.policy":
       "Paid usage consumes prepaid funds first. Only an explicit supplier credit line can cover the remainder.",
+    "marketFunding.decision.ready": "Funds ready",
+    "marketFunding.decision.lowRunway": "Ready to rent · limited runway",
+    "marketFunding.decision.usesCredit": "Ready to rent · credit will be used",
+    "marketFunding.decision.shortfall": "Top-up required",
+    "marketFunding.decision.runway":
+      "At the projected supplier total of {rate}/day, funds cover about {runway}.",
+    "marketFunding.decision.creditWarning":
+      "One day of coverage will use {amount} of supplier credit. Add prepaid funds to avoid interruption when credit is exhausted.",
+    "marketFunding.decision.lowRunwayWarning":
+      "Only about {runway} remains. Service pauses when prepaid funds and available credit are exhausted.",
     "marketFunding.topup.minimum": "Top up at least {amount} to cover this order.",
     "marketFunding.topup.action": "Top up with Binance",
     "marketFunding.topup.requiredAction": "Top up and continue",
@@ -3759,6 +3795,8 @@ export const messages = {
     "shareMarket.catalog.allFamilies": "全部供应商",
     "shareMarket.catalog.search": "搜索供应商、App、模型、Share、车主或拼车用户",
     "shareMarket.catalog.searchCompact": "搜索 Share",
+    "shareMarket.catalog.ownerFilter": "按车主邮箱筛选",
+    "shareMarket.catalog.ownerPlaceholder": "车主邮箱",
     "shareMarket.catalog.filters": "筛选与排序",
     "shareMarket.catalog.onlyRentable": "只看有空位",
     "shareMarket.catalog.familyFilter": "按供应商类型筛选",
@@ -3907,10 +3945,33 @@ export const messages = {
     "shareMarket.rentOfflineHint":
       "该 Share 当前离线，权限将在 Server 重新上线后生效。",
     "shareMarket.rentConfirm.title": "确认租用 Share 拼车位",
+    "shareMarket.rentConfirm.titleSeat": "确认租用拼车位 #{position}",
     "shareMarket.rentConfirm.confirm": "确认租用",
+    "shareMarket.rentConfirm.confirmFree": "确认免费租用",
     "shareMarket.rentConfirm.expiresIn": "冻结报价将在 {seconds} 秒后失效。",
+    "shareMarket.rentConfirm.expiresInShort": "剩余 {seconds} 秒",
     "shareMarket.rentConfirm.expired": "该冻结报价已失效，请刷新报价后再确认。",
+    "shareMarket.rentConfirm.expiredShort": "报价已失效",
+    "shareMarket.rentConfirm.refreshRequired": "继续操作前必须刷新当前报价。",
+    "shareMarket.rentConfirm.refreshRequiredShort": "需刷新报价",
     "shareMarket.rentConfirm.requote": "刷新报价",
+    "shareMarket.rentConfirm.priceLabel": "每日价格",
+    "shareMarket.rentConfirm.noTrialCompact":
+      "无剩余试用 · 健康服务开始后计费。",
+    "shareMarket.rentConfirm.remainingTrialCompact":
+      "剩余 {hours} 小时健康服务试用{tokens}，用完后开始计费。",
+    "shareMarket.rentConfirm.trialTokenCompact": " · 最多 {tokens}",
+    "shareMarket.rentConfirm.usageQuota": "使用额度",
+    "shareMarket.rentConfirm.quotaSummary": "并发 {parallel} · Token {tokens}",
+    "shareMarket.rentConfirm.termFixedCompact":
+      "{days} 天 · 首次下发访问权限时起算，到期自动回收",
+    "shareMarket.rentConfirm.termPermanentCompact":
+      "长期有效 · 任一方可归还或回收拼车位",
+    "shareMarket.rentConfirm.details": "查看完整明细",
+    "shareMarket.rentConfirm.billingDetails": "计费与服务条款",
+    "shareMarket.rentConfirm.technicalDetails": "技术明细",
+    "shareMarket.rentConfirm.fundingChanged":
+      "资金状态已变化，以下是最新报价，请重新核对后确认。",
     "shareMarket.rentConfirm.postpaid":
       "前 {hours} 小时健康服务时间免费且不产生费用{tokens}；之后按日费计费，优先扣除预存，仅不足部分使用该 Owner 明确授予的信用额度。",
     "shareMarket.rentConfirm.trialTokens":
@@ -5340,6 +5401,16 @@ export const messages = {
     "marketFunding.creditWarning": "下单后预计一天的服务资金中将使用 {amount} 商家授信。建议充值预存，避免额度用完后服务中断。",
     "marketFunding.shortfall": "还需充值",
     "marketFunding.policy": "付费消费优先扣除预存；只有商家明确授予的信用额度才会承担不足部分。",
+    "marketFunding.decision.ready": "资金已满足租用条件",
+    "marketFunding.decision.lowRunway": "可以租用 · 可用时长较短",
+    "marketFunding.decision.usesCredit": "可以租用 · 将使用授信",
+    "marketFunding.decision.shortfall": "需要先充值",
+    "marketFunding.decision.runway":
+      "按向该商家的下单后合计 {rate}/天估算，资金约可用 {runway}。",
+    "marketFunding.decision.creditWarning":
+      "一天资金保障中将使用 {amount} 商家授信。建议充值预存，避免授信用完后服务中断。",
+    "marketFunding.decision.lowRunwayWarning":
+      "当前资金仅约可用 {runway}；预存和可用授信用完后，服务将暂停。",
     "marketFunding.topup.minimum": "至少充值 {amount} 才能覆盖本次订单。",
     "marketFunding.topup.action": "通过币安充值",
     "marketFunding.topup.requiredAction": "充值并继续",

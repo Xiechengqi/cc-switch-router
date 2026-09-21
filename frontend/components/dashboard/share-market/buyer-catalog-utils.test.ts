@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   catalogSeatPreview,
+  canOptionallyTopupRent,
   filterMarketListings,
   filterMergedCatalogListings,
   initialCatalogSeat,
+  listingMatchesOwner,
   listingFamilyTabs,
   MARKET_CATALOG_PAGE_SIZE,
   MARKET_RENTAL_HISTORY_PAGE_SIZE,
@@ -15,6 +17,7 @@ import {
   pageForShareId,
   paginateListings,
   preserveCatalogSeat,
+  rentConfirmPrimaryAction,
   rentedShareIdsFromSubscriptions,
   sortMergedCatalogListings,
 } from "./buyer-catalog-utils";
@@ -35,6 +38,21 @@ const seat = (id: string, status = "available", readOnly = false) => ({ id, stat
 test("multiple idle seats require an explicit selection", () => {
   assert.equal(initialCatalogSeat([seat("a"), seat("b")]), undefined);
   assert.equal(initialCatalogSeat([seat("a")])?.id, "a");
+});
+
+test("rent confirmation exposes exactly one valid primary action", () => {
+  const ready = { requiredTopupMinor: 0, topupAvailable: true };
+  const payable = { requiredTopupMinor: 125, topupAvailable: true };
+  const blocked = { requiredTopupMinor: 125, topupAvailable: false };
+
+  assert.equal(rentConfirmPrimaryAction(false, undefined), "confirm");
+  assert.equal(rentConfirmPrimaryAction(false, ready), "confirm");
+  assert.equal(rentConfirmPrimaryAction(false, payable), "topup");
+  assert.equal(rentConfirmPrimaryAction(false, blocked), "blocked");
+  assert.equal(rentConfirmPrimaryAction(true, payable), "refresh");
+  assert.equal(canOptionallyTopupRent(false, ready), true);
+  assert.equal(canOptionallyTopupRent(false, payable), false);
+  assert.equal(canOptionallyTopupRent(true, ready), false);
 });
 
 test("a selected seat is preserved by id without falling back", () => {
@@ -90,6 +108,7 @@ test("family and search filters match catalog listing fields", () => {
   assert.deepEqual(listingFamilyTabs(listings).map((item) => item.value), ["anthropic", "openai"]);
   assert.deepEqual(filterMarketListings(listings, "openai", "").map((item) => item.id), ["openai"]);
   assert.deepEqual(filterMarketListings(listings, "all", "opus").map((item) => item.id), ["anthropic"]);
+  assert.deepEqual(filterMarketListings(listings, "all", "", "other@").map((item) => item.id), ["anthropic"]);
 });
 
 const capability = (
@@ -415,6 +434,54 @@ test("closed rented listings are merged over the public catalog copy", () => {
     "share-a:closed",
     "share-b:active",
   ]);
+});
+
+test("owner filter matches email independently of the Share search box", () => {
+  const openaiRented = listing("openai-rented", {
+    shareId: "share-openai",
+    ownerEmail: "alice@example.com",
+    providerFamily: "openai",
+    providerFamilies: ["openai"],
+    shareName: "alpha",
+  });
+  const anthropicRented = listing("anthropic-rented", {
+    shareId: "share-anthropic",
+    ownerEmail: "bob@example.com",
+    providerFamily: "anthropic",
+    providerFamilies: ["anthropic"],
+    shareName: "bravo",
+  });
+  const openaiPublic = listing("openai-public", {
+    shareId: "share-public",
+    ownerEmail: "alice@example.com",
+    providerFamily: "openai",
+    providerFamilies: ["openai"],
+    shareName: "charlie",
+  });
+  const rentedShareIds = new Set(["share-openai"]);
+  const listings = [openaiRented, anthropicRented, openaiPublic];
+  assert.equal(listingMatchesOwner(openaiRented, "ALICE"), true);
+  assert.equal(listingMatchesOwner(anthropicRented, "alice"), false);
+  assert.deepEqual(
+    filterMergedCatalogListings(listings, {
+      mine: false,
+      family: "all",
+      query: "",
+      owner: "alice@",
+      rentedShareIds,
+    }).map((item) => item.id),
+    ["openai-rented", "openai-public"],
+  );
+  assert.deepEqual(
+    filterMergedCatalogListings(listings, {
+      mine: true,
+      family: "all",
+      query: "",
+      owner: "alice@",
+      rentedShareIds,
+    }).map((item) => item.id),
+    ["openai-rented"],
+  );
 });
 
 test("mine filter is orthogonal to family and search", () => {

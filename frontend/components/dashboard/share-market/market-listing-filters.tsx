@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { CircleDot, Search, X } from "lucide-react";
+import { CircleDot, Search, UserRound, X } from "lucide-react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { ShareMarketListing, ShareMarketProviderFamily } from "@/lib/types";
@@ -19,8 +19,10 @@ export function MarketListingFilters({
   listings,
   family,
   query,
+  owner = "",
   onFamilyChange,
   onQueryChange,
+  onOwnerChange,
   leading,
   trailing,
   mine = false,
@@ -35,8 +37,10 @@ export function MarketListingFilters({
   listings: ShareMarketListing[];
   family: ShareMarketProviderFamily | "all";
   query: string;
+  owner?: string;
   onFamilyChange: (family: ShareMarketProviderFamily | "all") => void;
   onQueryChange: (query: string) => void;
+  onOwnerChange?: (owner: string) => void;
   leading?: ReactNode;
   trailing?: ReactNode;
   mine?: boolean;
@@ -53,7 +57,8 @@ export function MarketListingFilters({
   const showMine = !!onMineChange;
   const showIdleOnly = !!onIdleOnlyChange;
   const showSort = !!onSortChange && !!sort;
-  if (!familyTabs.length && !query && !leading && !trailing && !showMine && !showIdleOnly && !showSort) return null;
+  const showOwner = !!onOwnerChange;
+  if (!familyTabs.length && !query && !owner && !leading && !trailing && !showMine && !showIdleOnly && !showSort && !showOwner) return null;
   return (
     // Wraps instead of scrolling sideways: the provider tabs, the availability toggle and
     // the sort are three different decisions, and on a narrow screen each deserves a line
@@ -130,11 +135,34 @@ export function MarketListingFilters({
           onChange={(value) => onSortChange(value as MarketCatalogSort)}
           ariaLabel={t("shareMarket.catalog.sort")}
           className="shrink-0"
+          triggerClassName="min-w-[9.5rem] pr-2"
           options={MARKET_CATALOG_SORTS.map((value) => ({
             value,
             label: t(`shareMarket.catalog.sort.${value}`),
           }))}
         />
+      ) : null}
+      {showOwner ? (
+        <label className="flex h-9 w-52 shrink-0 grow items-center gap-1.5 sm:grow-0 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
+          <UserRound className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+          <input
+            aria-label={t("shareMarket.catalog.ownerFilter")}
+            value={owner}
+            onChange={(event) => onOwnerChange(event.target.value)}
+            className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-slate-400"
+            placeholder={t("shareMarket.catalog.ownerPlaceholder")}
+          />
+          {owner ? (
+            <button
+              type="button"
+              aria-label={t("common.reset")}
+              className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              onClick={() => onOwnerChange("")}
+            >
+              <X className="h-3.5 w-3.5 text-slate-400" />
+            </button>
+          ) : null}
+        </label>
       ) : null}
       <label className="flex h-9 w-44 shrink-0 grow items-center gap-1.5 sm:grow-0 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
         <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" />

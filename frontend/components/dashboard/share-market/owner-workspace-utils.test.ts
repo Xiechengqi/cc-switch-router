@@ -35,6 +35,7 @@ import {
   defaultMarketFundingTopupMinor,
   formatFundingRunway,
   marketFundingConflictFromError,
+  marketFundingDecisionState,
   marketFundingTopupErrorKey,
   marketFundingTopupUnavailableKey,
   marketFundingUsesCredit,
@@ -415,4 +416,48 @@ test("voluntary funding defaults to the seven-day recommendation", () => {
   );
   assert.match(formatFundingRunway(129_600, "en", "Unlimited"), /1\.5/);
   assert.equal(formatFundingRunway(undefined, "en", "Unlimited"), "Unlimited");
+});
+
+test("funding decision state prioritizes blockers and material risk", () => {
+  const funding = {
+    supplierUserId: "supplier-a",
+    supplierEmail: "supplier@example.com",
+    currency: "USD",
+    fundingMode: "prepaid",
+    prepaidBalanceMinor: 700,
+    prepaidHeldMinor: 0,
+    prepaidAvailableMinor: 700,
+    creditKind: "none",
+    creditOutstandingMinor: 0,
+    creditReservedMinor: 0,
+    activeDailyRateMinor: 0,
+    additionalDailyRateMinor: 100,
+    projectedDailyRateMinor: 100,
+    requiredCoverageMinor: 100,
+    prepaidCoverageMinor: 100,
+    creditCoverageMinor: 0,
+    requiredTopupMinor: 0,
+    recommendedTopupMinor: 0,
+    recommendedCoverageDays: 7,
+    prepaidRunwaySeconds: 604_800,
+    estimatedRunwaySeconds: 604_800,
+    topupAvailable: true,
+  } satisfies MarketFundingSummary;
+
+  assert.equal(marketFundingDecisionState(funding), "ready");
+  assert.equal(marketFundingDecisionState({
+    ...funding,
+    prepaidRunwaySeconds: 86_400,
+    estimatedRunwaySeconds: 86_400,
+  }), "low_runway");
+  assert.equal(marketFundingDecisionState({
+    ...funding,
+    creditKind: "limited",
+    creditCoverageMinor: 50,
+  }), "uses_credit");
+  assert.equal(marketFundingDecisionState({
+    ...funding,
+    creditCoverageMinor: 50,
+    requiredTopupMinor: 25,
+  }), "shortfall");
 });

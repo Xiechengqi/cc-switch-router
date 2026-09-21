@@ -9,6 +9,14 @@ export type MarketFundingConflict = {
   creditAvailableMinor?: number;
 };
 
+export type MarketFundingDecisionState =
+  | "ready"
+  | "low_runway"
+  | "uses_credit"
+  | "shortfall";
+
+const MARKET_FUNDING_LOW_RUNWAY_SECONDS = 86_400;
+
 export const MAX_MARKET_FUNDING_TOPUP_MINOR = 100_000_000;
 
 function finiteNonNegative(value: unknown) {
@@ -95,6 +103,20 @@ export function defaultMarketFundingTopupMinor(funding: MarketFundingSummary) {
 
 export function marketFundingUsesCredit(funding: MarketFundingSummary) {
   return funding.creditCoverageMinor > 0;
+}
+
+export function marketFundingDecisionState(
+  funding: MarketFundingSummary,
+): MarketFundingDecisionState {
+  if (funding.requiredTopupMinor > 0) return "shortfall";
+  if (marketFundingUsesCredit(funding)) return "uses_credit";
+  if (
+    funding.estimatedRunwaySeconds != null
+    && funding.estimatedRunwaySeconds <= MARKET_FUNDING_LOW_RUNWAY_SECONDS
+  ) {
+    return "low_runway";
+  }
+  return "ready";
 }
 
 export function formatFundingRunway(

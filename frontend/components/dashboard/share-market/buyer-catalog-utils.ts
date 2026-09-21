@@ -1,4 +1,5 @@
 import type {
+  MarketFundingSummary,
   ShareMarketListing,
   ShareMarketProviderFamily,
   ShareMarketSeat,
@@ -15,6 +16,31 @@ import {
 } from "@/components/dashboard/share-market/subscription-utils";
 
 type SelectableSeat = Pick<ShareMarketSeat, "id" | "status" | "readOnly">;
+
+export type RentConfirmPrimaryAction = "confirm" | "topup" | "refresh" | "blocked";
+
+type RentConfirmFunding = Pick<
+  MarketFundingSummary,
+  "requiredTopupMinor" | "topupAvailable"
+>;
+
+export function rentConfirmPrimaryAction(
+  quoteRequiresRefresh: boolean,
+  funding?: RentConfirmFunding,
+): RentConfirmPrimaryAction {
+  if (quoteRequiresRefresh) return "refresh";
+  if (!funding || funding.requiredTopupMinor <= 0) return "confirm";
+  return funding.topupAvailable ? "topup" : "blocked";
+}
+
+export function canOptionallyTopupRent(
+  quoteRequiresRefresh: boolean,
+  funding?: RentConfirmFunding,
+) {
+  return !quoteRequiresRefresh
+    && !!funding?.topupAvailable
+    && funding.requiredTopupMinor <= 0;
+}
 
 function isIdle(seat: SelectableSeat) {
   return seat.status === "available" && !seat.readOnly;
@@ -96,6 +122,15 @@ export function listingMatchesQuery(
   ].filter(Boolean).join(" ").toLocaleLowerCase().includes(needle);
 }
 
+export function listingMatchesOwner(
+  listing: Pick<ShareMarketListing, "ownerEmail">,
+  owner: string,
+) {
+  const needle = owner.trim().toLocaleLowerCase();
+  if (!needle) return true;
+  return listing.ownerEmail.trim().toLocaleLowerCase().includes(needle);
+}
+
 export function listingFamilyTabs(listings: ShareMarketListing[]) {
   return PROVIDER_FAMILY_ORDER.map((value) => ({
     value,
@@ -110,9 +145,12 @@ export function filterMarketListings(
   listings: ShareMarketListing[],
   family: ShareMarketProviderFamily | "all",
   query: string,
+  owner = "",
 ) {
   return listings.filter((listing) =>
-    listingMatchesFamily(listing, family) && listingMatchesQuery(listing, query)
+    listingMatchesFamily(listing, family)
+    && listingMatchesQuery(listing, query)
+    && listingMatchesOwner(listing, owner)
   );
 }
 
@@ -210,19 +248,23 @@ export function filterMergedCatalogListings(
     idleOnly = false,
     family,
     query,
+    owner = "",
     rentedShareIds,
   }: {
     mine: boolean;
     idleOnly?: boolean;
     family: ShareMarketProviderFamily | "all";
     query: string;
+    owner?: string;
     rentedShareIds: Set<string>;
   },
 ) {
   return listings.filter((listing) => {
     if (mine && !rentedShareIds.has(listing.shareId)) return false;
     if (idleOnly && !listingIdleCount(listing)) return false;
-    return listingMatchesFamily(listing, family) && listingMatchesQuery(listing, query);
+    return listingMatchesFamily(listing, family)
+      && listingMatchesQuery(listing, query)
+      && listingMatchesOwner(listing, owner);
   });
 }
 

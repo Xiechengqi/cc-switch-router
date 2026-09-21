@@ -44,12 +44,12 @@ export function CompactSelect({
     >
       <Select.Trigger
         className={cn(
-          "min-h-9 rounded-lg border bg-white px-3 text-xs shadow-sm",
+          "min-h-9 gap-3 rounded-lg border bg-white px-3 text-xs shadow-sm",
           selected?.content ? undefined : selected?.description && "py-2",
           triggerClassName,
         )}
       >
-        <Select.Value className="min-w-0 flex-1 pr-2 text-left text-xs text-foreground">
+        <Select.Value className="min-w-0 flex-1 pr-3 text-left text-xs text-foreground">
           {selected?.content ? (
             <span className="block min-w-0">{selected.content}</span>
           ) : (
@@ -63,7 +63,7 @@ export function CompactSelect({
             </span>
           )}
         </Select.Value>
-        <Select.Indicator className="text-muted-foreground" />
+        <Select.Indicator className="ml-1 shrink-0 text-muted-foreground" />
       </Select.Trigger>
       <Select.Popover className="min-w-[var(--trigger-width)] bg-white text-foreground">
         <ListBox aria-label={ariaLabel}>

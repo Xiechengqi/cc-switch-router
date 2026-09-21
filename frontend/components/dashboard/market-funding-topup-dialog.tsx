@@ -14,10 +14,13 @@ import {
   defaultMarketFundingTopupMinor,
   formatFundingRunway,
   MAX_MARKET_FUNDING_TOPUP_MINOR,
+  marketFundingDecisionState,
   marketFundingTopupErrorKey,
   marketFundingTopupUnavailableKey,
   marketFundingUsesCredit,
+  type MarketFundingDecisionState,
 } from "@/lib/market-funding";
+import type { MessageKey } from "@/lib/i18n";
 import type { BinanceFundingIntent, MarketFundingSummary } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
 
@@ -30,6 +33,107 @@ function statusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
     case "review_required": return t("marketBilling.binance.status.review");
     default: return status.replaceAll("_", " ");
   }
+}
+
+const FUNDING_DECISION_KEYS: Record<MarketFundingDecisionState, MessageKey> = {
+  ready: "marketFunding.decision.ready",
+  low_runway: "marketFunding.decision.lowRunway",
+  uses_credit: "marketFunding.decision.usesCredit",
+  shortfall: "marketFunding.decision.shortfall",
+};
+
+export function MarketFundingDecisionCard({
+  funding,
+  onTopup,
+  topupDisabled = false,
+}: {
+  funding: MarketFundingSummary;
+  onTopup?: () => void;
+  topupDisabled?: boolean;
+}) {
+  const { locale, t } = useLocaleText();
+  const state = marketFundingDecisionState(funding);
+  const credit = funding.creditKind === "unlimited"
+    ? t("marketFunding.credit.unlimited")
+    : funding.creditKind === "none"
+      ? t("marketFunding.credit.none")
+      : formatUsdMoney(funding.creditAvailableMinor ?? 0, locale);
+  const runway = funding.projectedDailyRateMinor > 0
+    ? formatFundingRunway(
+      funding.estimatedRunwaySeconds,
+      locale,
+      funding.creditKind === "unlimited" ? t("marketFunding.runway.unlimited") : "-",
+    )
+    : "-";
+  const statusTone = state === "shortfall"
+    ? "border-rose-200 bg-rose-50/80"
+    : state === "uses_credit" || state === "low_runway"
+      ? "border-amber-200 bg-amber-50/70"
+      : "border-slate-200 bg-slate-50";
+  const statusIconTone = state === "shortfall"
+    ? "text-rose-700"
+    : state === "uses_credit" || state === "low_runway"
+      ? "text-amber-700"
+      : "text-emerald-700";
+  const guidance = state === "shortfall"
+    ? funding.topupAvailable
+      ? t("marketFunding.topup.minimum", {
+        amount: formatUsdMoney(funding.requiredTopupMinor, locale),
+      })
+      : t(marketFundingTopupUnavailableKey(funding.topupUnavailableReason))
+    : state === "uses_credit"
+      ? t("marketFunding.decision.creditWarning", {
+        amount: formatUsdMoney(funding.creditCoverageMinor, locale),
+      })
+      : state === "low_runway"
+        ? t("marketFunding.decision.lowRunwayWarning", { runway })
+        : "";
+
+  return (
+    <section className={`grid gap-3 rounded-md border p-3 ${statusTone}`} aria-live="polite">
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+        <div className="flex min-w-0 items-start gap-2">
+          {state === "ready"
+            ? <CircleCheckBig className={`mt-0.5 h-4 w-4 shrink-0 ${statusIconTone}`} aria-hidden="true" />
+            : <AlertTriangle className={`mt-0.5 h-4 w-4 shrink-0 ${statusIconTone}`} aria-hidden="true" />}
+          <div className="min-w-0">
+            <strong className="block text-sm text-slate-900">{t(FUNDING_DECISION_KEYS[state])}</strong>
+            <span className="block truncate text-xs text-slate-600" title={funding.supplierEmail}>{funding.supplierEmail}</span>
+          </div>
+        </div>
+        {onTopup ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="min-h-11 shrink-0 whitespace-nowrap"
+            isDisabled={topupDisabled}
+            onClick={onTopup}
+          >
+            {t("marketFunding.topup.optionalAction")}
+          </Button>
+        ) : null}
+      </div>
+      <p className="text-sm leading-6 text-slate-700">
+        {t("marketFunding.decision.runway", {
+          rate: formatUsdMoney(funding.projectedDailyRateMinor, locale),
+          runway,
+        })}
+      </p>
+      <dl className="grid grid-cols-2 gap-3 border-t border-slate-200/80 pt-3 text-sm">
+        <div className="min-w-0">
+          <dt className="text-xs text-slate-600">{t("marketFunding.prepaidAvailable")}</dt>
+          <dd className="mt-0.5 truncate font-semibold tabular-nums text-slate-950">
+            {formatUsdMoney(funding.prepaidAvailableMinor, locale)}
+          </dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-xs text-slate-600">{t("marketFunding.creditAvailable")}</dt>
+          <dd className="mt-0.5 truncate font-semibold tabular-nums text-slate-950">{credit}</dd>
+        </div>
+      </dl>
+      {guidance ? <p className="text-xs leading-5 text-slate-700">{guidance}</p> : null}
+    </section>
+  );
 }
 
 export function MarketFundingSummaryCard({
@@ -74,7 +178,7 @@ export function MarketFundingSummaryCard({
         </span>
       </div>
       <div className="grid gap-3 border-y border-slate-200 py-3 text-sm lg:grid-cols-3">
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid gap-2 sm:grid-cols-3">
           <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidTotal")}</span><strong className="tabular-nums">{formatUsdMoney(funding.prepaidBalanceMinor, locale)}</strong></div>
           <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidHeld")}</span><strong className="tabular-nums">{formatUsdMoney(funding.prepaidHeldMinor, locale)}</strong></div>
           <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</span><strong className="tabular-nums text-emerald-700">{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</strong></div>
@@ -85,7 +189,7 @@ export function MarketFundingSummaryCard({
           <div><span className="block text-xs text-slate-500">{t("marketFunding.creditReserved")}</span><strong className="tabular-nums">{formatUsdMoney(funding.creditReservedMinor, locale)}</strong></div>
           <div><span className="block text-xs text-slate-500">{t("marketFunding.creditAvailable")}</span><strong className="tabular-nums">{credit}</strong></div>
         </div>
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid gap-2 sm:grid-cols-3">
           <div><span className="block text-xs text-slate-500">{t("marketFunding.rate.current")}</span><strong className="tabular-nums">{formatUsdMoney(funding.activeDailyRateMinor, locale)}</strong></div>
           <div><span className="block text-xs text-slate-500">{t("marketFunding.rate.new")}</span><strong className="tabular-nums">{formatUsdMoney(funding.additionalDailyRateMinor, locale)}</strong></div>
           <div><span className="block text-xs text-slate-500">{t("marketFunding.rate.projected")}</span><strong className="tabular-nums">{formatUsdMoney(funding.projectedDailyRateMinor, locale)}</strong></div>
