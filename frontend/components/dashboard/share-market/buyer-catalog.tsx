@@ -26,6 +26,7 @@ import {
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import {
   MarketFundingDecisionCard,
+  MarketRecurringFundingSummaryCard,
   MarketFundingSummaryCard,
   MarketFundingTopupDialog,
 } from "@/components/dashboard/market-funding-topup-dialog";
@@ -45,11 +46,12 @@ import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
 import {
   marketFundingConflictFromError,
+  recurringFundingForRenewal,
+  type MarketTopupFunding,
 } from "@/lib/market-funding";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
   MarketEligibility,
-  MarketFundingSummary,
   ShareMarketCatalog,
   ShareMarketListing,
   ShareMarketProviderFamily,
@@ -73,6 +75,7 @@ import {
 } from "@/components/dashboard/share-market/market-utils";
 import {
   canOptionallyTopupRent,
+  catalogOwnerOptions,
   filterMergedCatalogListings,
   initialCatalogSeat,
   MARKET_CATALOG_PAGE_SIZE,
@@ -240,7 +243,11 @@ function SeatChoice({ seat, selected, onSelect }: { seat: ShareMarketSeat; selec
           {formatTokenLimit(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}
         </span>
         <span className="mt-0.5 block text-slate-500">
-          {seat.serviceDurationDays == null ? t("shareMarket.serviceDuration.permanent") : t("shareMarket.serviceDuration.daysValue", { count: seat.serviceDurationDays })}
+          {seat.pricingModel === "prepaid_calendar_month"
+            ? t("shareMarket.serviceDuration.monthlyManaged")
+            : seat.serviceDurationDays == null
+              ? t("shareMarket.serviceDuration.permanent")
+              : t("shareMarket.serviceDuration.daysValue", { count: seat.serviceDurationDays })}
           {!seat.isFree && seat.trialHours != null ? ` · ${t("shareMarket.dialog.trialHours")} ${seat.trialHours}` : ""}
         </span>
       </span>
@@ -292,7 +299,7 @@ export function ShareMarketBuyerCatalog({
   const { session } = useAuth();
   const chat = useClientChat();
   const [query, setQuery] = React.useState("");
-  const [owner, setOwner] = React.useState("");
+  const [owners, setOwners] = React.useState<string[]>([]);
   const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
   const [mine, setMine] = React.useState(initialMine);
   const [idleOnly, setIdleOnly] = React.useState(false);
@@ -300,7 +307,8 @@ export function ShareMarketBuyerCatalog({
   const [page, setPage] = React.useState(1);
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
   const [rentTarget, setRentTarget] = React.useState<RentTarget | null>(null);
-  const [topupFunding, setTopupFunding] = React.useState<MarketFundingSummary>();
+  const [rentAutoRenew, setRentAutoRenew] = React.useState(false);
+  const [topupFunding, setTopupFunding] = React.useState<MarketTopupFunding>();
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
   const [busySeatId, setBusySeatId] = React.useState("");
   const [error, setError] = React.useState("");
@@ -339,13 +347,13 @@ export function ShareMarketBuyerCatalog({
         idleOnly,
         family,
         query,
-        owner,
+        owner: owners,
         rentedShareIds,
       }),
       subscriptions,
       sort,
     ),
-    [authed, family, idleOnly, mergedListings, mine, owner, query, rentedShareIds, sort, subscriptions],
+    [authed, family, idleOnly, mergedListings, mine, owners, query, rentedShareIds, sort, subscriptions],
   );
   const paged = React.useMemo(
     () => paginateListings(filteredListings, page, MARKET_CATALOG_PAGE_SIZE),
@@ -366,7 +374,7 @@ export function ShareMarketBuyerCatalog({
       return;
     }
     setPage(1);
-  }, [family, idleOnly, mine, owner, query, sort]);
+  }, [family, idleOnly, mine, owners, query, sort]);
 
   React.useEffect(() => {
     if (!selected) return;
@@ -414,6 +422,7 @@ export function ShareMarketBuyerCatalog({
     try {
       const quote = await quoteShareMarketSeat(item.seat.id);
       setRentQuoteInvalidated(false);
+      setRentAutoRenew(false);
       setRentTarget({ ...item, quote, idempotencyKey: `share-rent:${quote.id}:${crypto.randomUUID()}` });
     } catch (reason) {
       const eligibility = marketEligibilityFromError(reason);
@@ -456,7 +465,12 @@ export function ShareMarketBuyerCatalog({
     setError("");
     setRentNotice("");
     try {
-      await rentShareMarketSeat(rentTarget.seat.id, rentTarget.quote.id, rentTarget.idempotencyKey);
+      await rentShareMarketSeat(
+        rentTarget.seat.id,
+        rentTarget.quote.id,
+        rentTarget.idempotencyKey,
+        rentAutoRenew,
+      );
       setRentTarget(null);
       setRentNotice("");
       setRentQuoteInvalidated(false);
@@ -502,8 +516,12 @@ export function ShareMarketBuyerCatalog({
   const quoteExpired = !!rentTarget && quoteRemainingSeconds <= 0;
   const quoteRequiresRefresh = quoteExpired || rentQuoteInvalidated;
   const rentFunding = rentTarget?.quote.funding;
-  const rentPrimaryAction = rentConfirmPrimaryAction(quoteRequiresRefresh, rentFunding);
-  const optionalTopup = canOptionallyTopupRent(quoteRequiresRefresh, rentFunding);
+  const rentRecurringFunding = rentTarget?.quote.recurringFunding
+    ? recurringFundingForRenewal(rentTarget.quote.recurringFunding, rentAutoRenew)
+    : undefined;
+  const effectiveRentFunding = rentRecurringFunding ?? rentFunding;
+  const rentPrimaryAction = rentConfirmPrimaryAction(quoteRequiresRefresh, effectiveRentFunding);
+  const optionalTopup = canOptionallyTopupRent(quoteRequiresRefresh, effectiveRentFunding);
   const quoteExpiringSoon = !quoteRequiresRefresh && quoteRemainingSeconds <= 30;
   const rentQuoteStatusDetails = !rentTarget
     ? ""
@@ -515,10 +533,15 @@ export function ShareMarketBuyerCatalog({
           time: new Intl.DateTimeFormat(locale, { timeStyle: "medium" }).format(new Date(rentTarget.quote.expiresAt)),
         });
   const rentOffer = rentTarget?.quote.offer;
-  const rentIsFree = rentOffer?.dailyRateMinor == null;
+  const rentIsFree = rentOffer?.pricingModel === "free"
+    || (rentOffer?.dailyRateMinor == null && rentOffer?.cyclePriceMinor == null);
   const rentPrice = rentOffer
     ? formatSeatPrice(
-      { isFree: rentIsFree, dailyRateMinor: rentOffer.dailyRateMinor },
+      {
+        isFree: rentIsFree,
+        dailyRateMinor: rentOffer.dailyRateMinor,
+        cyclePriceMinor: rentOffer.cyclePriceMinor,
+      },
       locale,
       t("shareMarket.free"),
       t("marketBilling.day"),
@@ -554,6 +577,8 @@ export function ShareMarketBuyerCatalog({
     : "";
   const rentTermSummary = !rentOffer
     ? ""
+    : rentOffer.pricingModel === "prepaid_calendar_month"
+      ? t("shareMarket.rentConfirm.termMonthlyCompact")
     : rentOffer.serviceDurationDays == null
       ? t("shareMarket.rentConfirm.termPermanentCompact")
       : t("shareMarket.rentConfirm.termFixedCompact", {
@@ -565,6 +590,15 @@ export function ShareMarketBuyerCatalog({
     ? ""
     : rentIsFree
       ? t("shareMarket.rentConfirm.freeBilling")
+      : rentOffer.pricingModel === "prepaid_calendar_month"
+        ? t("shareMarket.rentConfirm.prepaidMonthly", {
+          hours: rentTrialHours,
+          tokens: rentTrialTokenLimit > 0
+            ? t("shareMarket.rentConfirm.trialTokens", {
+              tokens: formatTokenMillions(rentTrialTokenLimit, locale),
+            })
+            : "",
+        })
       : rentTrialHours > 0 || rentTrialTokenLimit > 0
         ? t("shareMarket.rentConfirm.postpaid", {
           hours: rentTrialHours,
@@ -578,6 +612,7 @@ export function ShareMarketBuyerCatalog({
   const closeRentDialog = () => {
     if (busySeatId) return;
     setRentTarget(null);
+    setRentAutoRenew(false);
     setRentNotice("");
     setRentQuoteInvalidated(false);
     setError("");
@@ -591,10 +626,11 @@ export function ShareMarketBuyerCatalog({
         listings={mergedListings}
         family={family}
         query={query}
-        owner={owner}
+        owners={owners}
+        ownerOptions={catalogOwnerOptions(mergedListings, rentedShareIds)}
         onFamilyChange={setFamily}
         onQueryChange={setQuery}
-        onOwnerChange={setOwner}
+        onOwnersChange={setOwners}
         mine={mine}
         mineCount={rentedShareIds.size}
         mineEnabled={authed && rentedShareIds.size > 0}
@@ -800,7 +836,48 @@ export function ShareMarketBuyerCatalog({
                     </dl>
                   </section>
 
-                  {rentFunding ? (
+                  {rentRecurringFunding ? (
+                    <section className="grid gap-3">
+                      <label className="flex cursor-pointer items-start gap-3 rounded-md border border-slate-200 bg-white p-3 text-sm">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4 accent-emerald-600"
+                          checked={rentAutoRenew}
+                          disabled={!!busySeatId || quoteRequiresRefresh}
+                          onChange={(event) => setRentAutoRenew(event.target.checked)}
+                        />
+                        <span className="min-w-0">
+                          <strong className="block text-slate-900">{t("marketRecurring.autoRenew")}</strong>
+                          <span className="mt-0.5 block text-xs leading-5 text-slate-600">
+                            {t("marketRecurring.autoRenewAtCheckout", {
+                              amount: formatSeatPrice(
+                                {
+                                  isFree: false,
+                                  dailyRateMinor: rentOffer?.dailyRateMinor,
+                                  cyclePriceMinor: rentOffer?.cyclePriceMinor,
+                                },
+                                locale,
+                                t("shareMarket.free"),
+                                t("marketBilling.day"),
+                              ),
+                            })}
+                          </span>
+                        </span>
+                      </label>
+                      <MarketRecurringFundingSummaryCard funding={rentRecurringFunding} />
+                      {optionalTopup ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="justify-self-start"
+                          isDisabled={!!busySeatId}
+                          onClick={() => setTopupFunding(rentRecurringFunding)}
+                        >
+                          {t("marketFunding.topup.optionalAction")}
+                        </Button>
+                      ) : null}
+                    </section>
+                  ) : rentFunding ? (
                     <MarketFundingDecisionCard
                       funding={rentFunding}
                       topupDisabled={!!busySeatId}
@@ -825,7 +902,9 @@ export function ShareMarketBuyerCatalog({
                         <div className="grid gap-2 text-xs leading-5 text-slate-600">
                           <p>{rentBillingDetails}</p>
                           <p>
-                            {rentTarget.quote.offer.serviceDurationDays == null
+                            {rentTarget.quote.offer.pricingModel === "prepaid_calendar_month"
+                              ? t("shareMarket.rentConfirm.serviceMonthly")
+                              : rentTarget.quote.offer.serviceDurationDays == null
                               ? t("shareMarket.rentConfirm.servicePermanent")
                               : t("shareMarket.rentConfirm.serviceFixed", {
                                 days: rentTarget.quote.offer.serviceDurationDays,
@@ -834,7 +913,11 @@ export function ShareMarketBuyerCatalog({
                         </div>
                       </section>
 
-                      {rentFunding ? <MarketFundingSummaryCard funding={rentFunding} /> : null}
+                      {rentRecurringFunding
+                        ? <MarketRecurringFundingSummaryCard funding={rentRecurringFunding} />
+                        : rentFunding
+                          ? <MarketFundingSummaryCard funding={rentFunding} />
+                          : null}
 
                       <section className="grid gap-2">
                         <h3 className="text-sm font-semibold text-slate-900">{t("shareMarket.rentConfirm.technicalDetails")}</h3>
@@ -872,8 +955,8 @@ export function ShareMarketBuyerCatalog({
                   {t("shareMarket.rentConfirm.requote")}
                 </Button>
               ) : null}
-              {rentPrimaryAction === "topup" && rentFunding ? (
-                <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={() => setTopupFunding(rentFunding)}>
+              {rentPrimaryAction === "topup" && effectiveRentFunding ? (
+                <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={() => setTopupFunding(effectiveRentFunding)}>
                   {t("marketFunding.topup.requiredAction")}
                 </Button>
               ) : null}

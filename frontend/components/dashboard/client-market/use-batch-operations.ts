@@ -232,6 +232,7 @@ export function useBatchOperations({
             reason: cleanupReasonForHost(host),
             denyClientAccess: false,
           });
+          if (!jobId) throw new Error(t("clientMarket.cleanupFailed"));
           const result = await pollCleanupJobQuiet(jobId);
           if (result.ok) patch(host.id, { status: "succeeded" });
           else patch(host.id, { status: "failed", detail: result.detail });

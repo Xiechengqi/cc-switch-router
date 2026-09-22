@@ -7,6 +7,7 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
+import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
 import { CountryFlag } from "@/components/common/country-flag";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -239,7 +240,7 @@ export function MyRentalsPanel({
               </span>
               {/* Keep mounted through `releasing` so the same instance can finish polling
                   (and reattach after refresh). Retries for release_failed live in the banner. */}
-              {rental.status !== "release_failed" ? (
+              {rental.status !== "release_failed" && !rental.recurring?.cancelAtPeriodEnd ? (
                 <ReleaseRentalAction rental={rental} onChanged={onChanged} />
               ) : null}
             </div>
@@ -248,6 +249,12 @@ export function MyRentalsPanel({
               onChanged={onChanged}
               resumeRelease={false}
             />
+            {rental.recurring ? (
+              <MarketRecurringContractCard
+                contract={rental.recurring}
+                onChanged={onChanged}
+              />
+            ) : null}
             {host?.clientConnection?.state === "offline" ? (
               <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
                 <p>{t("clientMarket.connection.manualAction")}</p>

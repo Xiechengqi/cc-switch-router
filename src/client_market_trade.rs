@@ -124,6 +124,8 @@ pub struct ProviderSummary {
     pub anomalous_host_rate: f64,
     pub min_daily_rate_minor: Option<i64>,
     pub max_daily_rate_minor: Option<i64>,
+    pub min_cycle_price_minor: Option<i64>,
+    pub max_cycle_price_minor: Option<i64>,
     pub successful_allocations: i64,
     pub payment_method_kinds: Vec<String>,
     pub countries: Vec<ProviderCountrySummary>,
@@ -150,7 +152,13 @@ pub struct ProviderSupplyResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateHostOfferRequest {
+    /// Legacy metered-daily prices are read-only. Kept in the request shape so
+    /// stale clients receive a useful validation error instead of silently
+    /// reinterpreting a daily price as a monthly one.
+    #[serde(default)]
     pub daily_rate_minor: Option<i64>,
+    #[serde(default)]
+    pub cycle_price_minor: Option<i64>,
     #[serde(default)]
     pub currency: Option<String>,
     #[serde(default)]
@@ -162,6 +170,11 @@ pub struct UpdateHostOfferRequest {
 pub struct HostOfferView {
     pub host_id: String,
     pub daily_rate_minor: Option<i64>,
+    pub pricing_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +204,11 @@ pub struct QuoteItemView {
     pub hostname: Option<String>,
     pub ip: Option<String>,
     pub daily_rate_minor: Option<i64>,
+    pub pricing_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +224,7 @@ pub struct AllocationQuoteView {
     pub expires_at: String,
     pub items: Vec<QuoteItemView>,
     pub funding: Vec<crate::market_billing::MarketFundingSummaryView>,
+    pub recurring_funding: Vec<crate::market_recurring::RecurringFundingSummaryView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,6 +251,8 @@ pub struct CommitQuoteItem {
     pub offer_revision: i64,
     pub subdomain: String,
     pub password: String,
+    #[serde(default)]
+    pub auto_renew: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,6 +285,13 @@ pub struct RentalView {
     pub client_owner_email: String,
     pub status: String,
     pub daily_rate_minor: Option<i64>,
+    pub pricing_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_interval: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<crate::market_recurring::RecurringContractView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,6 +333,9 @@ pub struct HostUsageHistoryEntry {
     pub ended_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daily_rate_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    pub pricing_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     pub charges_minor: i64,
@@ -495,6 +526,23 @@ pub(crate) fn validate_offer(daily_rate_minor: Option<i64>) -> Result<Option<i64
     }
 }
 
+pub(crate) fn validate_monthly_offer(
+    cycle_price_minor: Option<i64>,
+) -> Result<Option<i64>, AppError> {
+    match cycle_price_minor {
+        None | Some(0) => Ok(None),
+        Some(price)
+            if (1..=crate::market_billing::MAX_DAILY_RATE_MINOR).contains(&price) =>
+        {
+            Ok(Some(price))
+        }
+        _ => Err(AppError::BadRequest(
+            "paid Hosts require cyclePriceMinor between 1 and 100000000; omit it or use zero for free"
+                .into(),
+        )),
+    }
+}
+
 pub(crate) fn validate_free_duration_days(
     daily_rate_minor: Option<i64>,
     free_duration_days: Option<u32>,
@@ -582,18 +630,24 @@ fn ensure_payment_profile_can_be_cleared(
             "SELECT
                 EXISTS(
                     SELECT 1 FROM router_ssh_hosts
-                    WHERE provider_id = ?1 AND daily_rate_minor IS NOT NULL
+                    WHERE provider_id = ?1
+                      AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)
                 ) OR EXISTS(
                     SELECT 1
                     FROM share_market_seats seat
                     JOIN share_market_listings listing ON listing.id = seat.listing_id
                     WHERE listing.owner_user_id = ?1
                       AND listing.status = 'active' AND listing.deleted_at IS NULL
-                      AND seat.daily_rate_minor IS NOT NULL AND seat.retired_at IS NULL
+                      AND (seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL)
+                      AND seat.retired_at IS NULL
                       AND seat.status != 'deleted'
                 ) OR EXISTS(
                     SELECT 1 FROM market_service_contracts
                     WHERE supplier_user_id = ?1 AND status != 'terminated'
+                ) OR EXISTS(
+                    SELECT 1 FROM market_recurring_contracts
+                    WHERE supplier_user_id = ?1
+                      AND status NOT IN ('ended', 'activation_failed')
                 ) OR EXISTS(
                     SELECT 1 FROM market_credit_accounts
                     WHERE supplier_user_id = ?1 AND balance_units > 0
@@ -1243,17 +1297,23 @@ async fn update_host_offer(
     Json(input): Json<UpdateHostOfferRequest>,
 ) -> Result<Json<HostOfferView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let daily_rate_minor = validate_offer(input.daily_rate_minor)?;
-    let currency = normalize_offer_currency(daily_rate_minor, input.currency)?;
+    if input.daily_rate_minor.is_some() {
+        return Err(AppError::BadRequest(
+            "dailyRateMinor is legacy and read-only; use cyclePriceMinor for a calendar-month offer"
+                .into(),
+        ));
+    }
+    let cycle_price_minor = validate_monthly_offer(input.cycle_price_minor)?;
+    let currency = normalize_offer_currency(cycle_price_minor, input.currency)?;
     let free_duration_days =
-        validate_free_duration_days(daily_rate_minor, input.free_duration_days)?;
+        validate_free_duration_days(cycle_price_minor, input.free_duration_days)?;
     Ok(Json(
         state
             .store
-            .client_market_update_host_offer(
+            .client_market_update_host_monthly_offer(
                 &id,
                 &session,
-                daily_rate_minor,
+                cycle_price_minor,
                 currency,
                 free_duration_days,
             )
@@ -1272,6 +1332,14 @@ async fn create_quote(
         .client_market_create_quote(&session, input)
         .await?;
     for funding in &mut quote.funding {
+        funding.topup_unavailable_reason = state
+            .binance_settlement
+            .supplier_funding_unavailable_reason(&state.store, &funding.supplier_user_id)
+            .await?
+            .map(str::to_string);
+        funding.topup_available = funding.topup_unavailable_reason.is_none();
+    }
+    for funding in &mut quote.recurring_funding {
         funding.topup_unavailable_reason = state
             .binance_settlement
             .supplier_funding_unavailable_reason(&state.store, &funding.supplier_user_id)
@@ -1347,12 +1415,13 @@ async fn commit_quote_for_session(
             subdomain,
             item.password,
             item.offer_revision,
+            item.auto_renew,
         ));
     }
-    let request_fingerprint = commit_request_fingerprint(&prepared)?;
+    let request_fingerprint = commit_request_fingerprint_with_renewal(&prepared)?;
     let response = state
         .store
-        .client_market_commit_quote_idempotent(
+        .client_market_commit_quote_with_renewal_idempotent(
             id,
             session,
             &idempotency_key,
@@ -1365,7 +1434,7 @@ async fn commit_quote_for_session(
     }
     {
         let mut secrets = state.client_market_job_secrets.lock().await;
-        for (job_id, (_, _, password, _)) in response.job_ids.iter().zip(prepared.iter()) {
+        for (job_id, (_, _, password, _, _)) in response.job_ids.iter().zip(prepared.iter()) {
             secrets.insert_pending_password(job_id.clone(), password.clone());
         }
     }
@@ -1463,6 +1532,94 @@ async fn get_client_rental(
 }
 
 impl AppStore {
+    /// Schedule a renter-owned monthly Client for release at the paid period
+    /// boundary. Trials and renewal-recovery contracts end immediately and
+    /// return `false` so the caller can start the normal cleanup job.
+    pub async fn client_market_schedule_recurring_release(
+        &self,
+        installation_id: &str,
+        session: &AuthSession,
+    ) -> Result<bool, AppError> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin Client monthly release scheduling failed: {error}"
+                ))
+            })?;
+        let (client_user_id, pricing_model, host_id) = tx
+            .query_row(
+                "SELECT client_user_id, pricing_model, host_id
+                 FROM client_market_subscriptions WHERE installation_id = ?1",
+                params![installation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read Client rental for release failed: {error}"))
+            })?
+            .ok_or_else(|| AppError::NotFound("Client rental not found".into()))?;
+        if client_user_id != session.user_id {
+            return Err(AppError::Forbidden(
+                "only the Client owner may release this rental".into(),
+            ));
+        }
+        if pricing_model != crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH {
+            return Ok(false);
+        }
+        if !crate::market_recurring::cancel_at_period_end_for_product_tx(
+            &tx,
+            "client_host",
+            installation_id,
+            &session.user_id,
+            &now_text,
+        )? {
+            return Ok(false);
+        }
+        let ended = tx
+            .query_row(
+                "SELECT status = 'ended' FROM market_recurring_contracts
+                 WHERE product_kind = 'client_host' AND product_ref = ?1
+                 ORDER BY created_at DESC LIMIT 1",
+                params![installation_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read scheduled Client cancellation failed: {error}"
+                ))
+            })?
+            .unwrap_or(false);
+        if !ended {
+            insert_audit_tx(
+                &tx,
+                Some(installation_id),
+                Some(&host_id),
+                Some(&session.user_id),
+                Some(&session.email),
+                "rental_cancelled_at_period_end",
+                serde_json::json!({ "reason": "cancel_at_period_end" }),
+                now,
+            )?;
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit Client monthly release scheduling failed: {error}"
+            ))
+        })?;
+        Ok(!ended)
+    }
+
     /// Record a Client Market audit event outside of an existing transaction.
     /// Used by surfaces that are not themselves transactional — notably the web
     /// terminal, whose root sessions previously left no durable trace at all.
@@ -2136,12 +2293,13 @@ impl AppStore {
                         COUNT(h.id) AS host_total,
                         COALESCE(SUM(CASE WHEN h.status = 'idle' THEN 1 ELSE 0 END), 0) AS idle_total,
                         COALESCE(SUM(CASE WHEN h.status = 'allocated' THEN 1 ELSE 0 END), 0) AS allocated_total,
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NULL THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NULL AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NOT NULL THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NOT NULL AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND (h.daily_rate_minor IS NOT NULL OR h.cycle_price_minor IS NOT NULL) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND (h.daily_rate_minor IS NOT NULL OR h.cycle_price_minor IS NOT NULL) AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN h.last_error IS NOT NULL AND TRIM(h.last_error) != '' THEN 1 ELSE 0 END), 0),
                         MIN(h.daily_rate_minor), MAX(h.daily_rate_minor),
+                        MIN(h.cycle_price_minor), MAX(h.cycle_price_minor),
                         (SELECT COUNT(*) FROM provisioning_jobs j
                          WHERE j.host_id IN (SELECT id FROM router_ssh_hosts WHERE provider_id = p.provider_id)
                            AND j.type = 'create' AND j.status = 'succeeded') AS successful_allocations,
@@ -2174,9 +2332,11 @@ impl AppStore {
                     row.get::<_, i64>(10)?,
                     row.get::<_, Option<i64>>(11)?,
                     row.get::<_, Option<i64>>(12)?,
-                    row.get::<_, i64>(13)?,
-                    row.get::<_, String>(14)?,
-                    row.get::<_, String>(15)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
                 ))
             })
             .map_err(|error| {
@@ -2198,6 +2358,8 @@ impl AppStore {
                 anomalous_host_total,
                 min_daily_rate_minor,
                 max_daily_rate_minor,
+                min_cycle_price_minor,
+                max_cycle_price_minor,
                 successful,
                 methods_json,
                 offer_stable_since,
@@ -2217,8 +2379,8 @@ impl AppStore {
                     "SELECT country_code,
                             SUM(CASE WHEN status = 'idle' THEN 1 ELSE 0 END),
                             COUNT(*),
-                            SUM(CASE WHEN status = 'idle' AND daily_rate_minor IS NULL THEN 1 ELSE 0 END),
-                            SUM(CASE WHEN daily_rate_minor IS NULL THEN 1 ELSE 0 END)
+                            SUM(CASE WHEN status = 'idle' AND daily_rate_minor IS NULL AND cycle_price_minor IS NULL THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN daily_rate_minor IS NULL AND cycle_price_minor IS NULL THEN 1 ELSE 0 END)
                      FROM router_ssh_hosts
                      WHERE provider_id = ?1 AND country_code IS NOT NULL
                      GROUP BY country_code ORDER BY country_code",
@@ -2306,6 +2468,8 @@ impl AppStore {
                 anomalous_host_rate: ratio(anomalous_host_total, host_total),
                 min_daily_rate_minor,
                 max_daily_rate_minor,
+                min_cycle_price_minor,
+                max_cycle_price_minor,
                 successful_allocations: successful,
                 payment_method_kinds,
                 countries,
@@ -2413,13 +2577,17 @@ impl AppStore {
             Option<String>,
             String,
             Option<i64>,
+            String,
+            Option<i64>,
+            Option<String>,
             Option<String>,
             Option<i64>,
             i64,
             String,
         )> = tx
             .query_row(
-                "SELECT provider_id, host_owner_email, daily_rate_minor, currency,
+                "SELECT provider_id, host_owner_email, daily_rate_minor, pricing_model,
+                        cycle_price_minor, billing_interval, currency,
                         free_duration_days, offer_revision, status
                  FROM router_ssh_hosts WHERE id = ?1",
                 params![host_id],
@@ -2432,6 +2600,9 @@ impl AppStore {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -2441,6 +2612,9 @@ impl AppStore {
             provider_id,
             _host_owner_email,
             old_price,
+            old_pricing_model,
+            old_cycle_price,
+            old_billing_interval,
             old_currency,
             old_free_duration_days,
             old_revision,
@@ -2483,7 +2657,15 @@ impl AppStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_uppercase());
+        let pricing_model = if daily_rate_minor.is_some() {
+            crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+        } else {
+            crate::market_recurring::PRICING_FREE
+        };
         if old_price == daily_rate_minor
+            && old_pricing_model == pricing_model
+            && old_cycle_price.is_none()
+            && old_billing_interval.is_none()
             && old_currency_norm == currency
             && old_free_duration_days == free_duration_days.map(i64::from)
         {
@@ -2493,6 +2675,13 @@ impl AppStore {
             return Ok(HostOfferView {
                 host_id: host_id.to_string(),
                 daily_rate_minor,
+                pricing_model: if daily_rate_minor.is_some() {
+                    crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into()
+                } else {
+                    crate::market_recurring::PRICING_FREE.into()
+                },
+                cycle_price_minor: None,
+                billing_interval: None,
                 currency,
                 free_duration_days,
                 offer_revision: old_revision,
@@ -2517,12 +2706,14 @@ impl AppStore {
         let revision = old_revision + 1;
         tx.execute(
             "UPDATE router_ssh_hosts
-             SET daily_rate_minor = ?2, currency = ?3,
-                 free_duration_days = ?4, offer_revision = ?5, updated_at = ?6
+             SET daily_rate_minor = ?2, pricing_model = ?3,
+                 cycle_price_minor = NULL, billing_interval = NULL, currency = ?4,
+                 free_duration_days = ?5, offer_revision = ?6, updated_at = ?7
              WHERE id = ?1",
             params![
                 host_id,
                 daily_rate_minor,
+                pricing_model,
                 currency,
                 free_duration_days.map(i64::from),
                 revision,
@@ -2539,9 +2730,15 @@ impl AppStore {
             "host_offer_updated",
             serde_json::json!({
                 "oldDailyRateMinor": old_price,
+                "oldPricingModel": old_pricing_model,
+                "oldCyclePriceMinor": old_cycle_price,
+                "oldBillingInterval": old_billing_interval,
                 "oldCurrency": old_currency,
                 "oldFreeDurationDays": old_free_duration_days,
                 "dailyRateMinor": daily_rate_minor,
+                "pricingModel": pricing_model,
+                "cyclePriceMinor": null,
+                "billingInterval": null,
                 "currency": currency,
                 "freeDurationDays": free_duration_days,
                 "offerRevision": revision,
@@ -2553,6 +2750,198 @@ impl AppStore {
         Ok(HostOfferView {
             host_id: host_id.to_string(),
             daily_rate_minor,
+            pricing_model: if daily_rate_minor.is_some() {
+                crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into()
+            } else {
+                crate::market_recurring::PRICING_FREE.into()
+            },
+            cycle_price_minor: None,
+            billing_interval: None,
+            currency,
+            free_duration_days,
+            offer_revision: revision,
+        })
+    }
+
+    pub async fn client_market_update_host_monthly_offer(
+        &self,
+        host_id: &str,
+        session: &AuthSession,
+        cycle_price_minor: Option<i64>,
+        currency: Option<String>,
+        free_duration_days: Option<u32>,
+    ) -> Result<HostOfferView, AppError> {
+        let cycle_price_minor = validate_monthly_offer(cycle_price_minor)?;
+        let currency = normalize_offer_currency(cycle_price_minor, currency)?;
+        let free_duration_days =
+            validate_free_duration_days(cycle_price_minor, free_duration_days)?;
+        let pricing_model = if cycle_price_minor.is_some() {
+            crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+        } else {
+            crate::market_recurring::PRICING_FREE
+        };
+        let billing_interval = cycle_price_minor
+            .map(|_| crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.to_string());
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin monthly offer update failed: {error}"))
+            })?;
+        let host = tx
+            .query_row(
+                "SELECT provider_id, daily_rate_minor, pricing_model, cycle_price_minor,
+                        billing_interval, currency, free_duration_days,
+                        offer_revision, status
+                 FROM router_ssh_hosts WHERE id = ?1",
+                params![host_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read monthly Host offer failed: {error}"))
+            })?
+            .ok_or_else(|| AppError::NotFound("host not found".into()))?;
+        if !crate::client_market::session_is_host_owner(session, host.0.as_deref()) {
+            return Err(AppError::Forbidden(
+                "not allowed to edit this Host offer".into(),
+            ));
+        }
+        let email = normalize_email(&session.email)?;
+        tx.execute(
+            "INSERT INTO host_provider_profiles
+                (provider_id, owner_email, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(provider_id) DO UPDATE SET
+                owner_email = excluded.owner_email, updated_at = excluded.updated_at",
+            params![session.user_id, email, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("sync monthly offer Provider failed: {error}"))
+        })?;
+        if host.0.as_deref() != Some(session.user_id.as_str()) {
+            tx.execute(
+                "UPDATE router_ssh_hosts
+                 SET provider_id = ?2, host_owner_email = ?3, updated_at = ?4
+                 WHERE id = ?1",
+                params![host_id, session.user_id, email, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("heal monthly offer Provider failed: {error}"))
+            })?;
+        }
+        let normalized_old_currency = host
+            .5
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_uppercase);
+        if host.1.is_none()
+            && host.2 == pricing_model
+            && host.3 == cycle_price_minor
+            && host.4 == billing_interval
+            && normalized_old_currency == currency
+            && host.6 == free_duration_days.map(i64::from)
+        {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit unchanged monthly Host offer failed: {error}"
+                ))
+            })?;
+            return Ok(HostOfferView {
+                host_id: host_id.to_string(),
+                daily_rate_minor: None,
+                pricing_model: pricing_model.into(),
+                cycle_price_minor,
+                billing_interval,
+                currency,
+                free_duration_days,
+                offer_revision: host.7,
+            });
+        }
+        if matches!(host.8.as_str(), "reserved" | "locked") {
+            return Err(AppError::Conflict(
+                "the Host offer is reserved or locked by an active order; retry after it completes"
+                    .into(),
+            ));
+        }
+        if cycle_price_minor.is_some() {
+            require_paid_offer_setup(
+                &tx,
+                &session.user_id,
+                currency
+                    .as_deref()
+                    .ok_or_else(|| AppError::Internal("paid Host currency is missing".into()))?,
+            )?;
+        }
+        let revision = host.7 + 1;
+        let now = Utc::now();
+        tx.execute(
+            "UPDATE router_ssh_hosts
+             SET daily_rate_minor = NULL, pricing_model = ?2,
+                 cycle_price_minor = ?3, billing_interval = ?4,
+                 currency = ?5, free_duration_days = ?6,
+                 offer_revision = ?7, updated_at = ?8
+             WHERE id = ?1",
+            params![
+                host_id,
+                pricing_model,
+                cycle_price_minor,
+                billing_interval,
+                currency,
+                free_duration_days.map(i64::from),
+                revision,
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("update monthly Host offer failed: {error}"))
+        })?;
+        insert_audit_tx(
+            &tx,
+            None,
+            Some(host_id),
+            Some(&session.user_id),
+            Some(&session.email),
+            "host_offer_updated",
+            serde_json::json!({
+                "oldDailyRateMinor": host.1,
+                "oldPricingModel": host.2,
+                "oldCyclePriceMinor": host.3,
+                "oldBillingInterval": host.4,
+                "oldCurrency": host.5,
+                "oldFreeDurationDays": host.6,
+                "dailyRateMinor": null,
+                "pricingModel": pricing_model,
+                "cyclePriceMinor": cycle_price_minor,
+                "billingInterval": billing_interval,
+                "currency": currency,
+                "freeDurationDays": free_duration_days,
+                "offerRevision": revision,
+            }),
+            now,
+        )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit monthly Host offer failed: {error}"))
+        })?;
+        Ok(HostOfferView {
+            host_id: host_id.to_string(),
+            daily_rate_minor: None,
+            pricing_model: pricing_model.into(),
+            cycle_price_minor,
+            billing_interval,
             currency,
             free_duration_days,
             offer_revision: revision,
@@ -2636,8 +3025,9 @@ impl AppStore {
             let candidate = tx
                 .query_row(
                     "SELECT h.id, h.provider_id, h.host_owner_email, h.country_code, h.hostname,
-                            h.ip, h.daily_rate_minor,
-                            CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                            h.ip, h.daily_rate_minor, h.pricing_model,
+                            h.cycle_price_minor, h.billing_interval,
+                            CASE WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                                  ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
                             h.free_duration_days, h.offer_revision
                      FROM router_ssh_hosts h
@@ -2661,13 +3051,14 @@ impl AppStore {
             // Host on live Routers; application-side sampling is explicit and testable.
             let sql = format!(
                 "SELECT h.id, h.provider_id, h.host_owner_email, h.country_code, h.hostname,
-                        h.ip, h.daily_rate_minor,
-                        CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                        h.ip, h.daily_rate_minor, h.pricing_model,
+                        h.cycle_price_minor, h.billing_interval,
+                        CASE WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                              ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
                         h.free_duration_days, h.offer_revision
                  FROM router_ssh_hosts h
                  WHERE h.status = 'idle'
-                   AND h.daily_rate_minor IS NULL
+                   AND h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL
                    AND h.provider_id IN ({provider_vars})
                    AND h.country_code IN ({country_vars})"
             );
@@ -2739,10 +3130,13 @@ impl AppStore {
             ));
         }
         for candidate in &mut candidates {
-            let pricing_kind =
-                crate::market_access::pricing_kind_for_rate(candidate.daily_rate_minor);
+            let price_minor = candidate.cycle_price_minor.or(candidate.daily_rate_minor);
+            let pricing_kind = crate::market_access::pricing_kind_for_rate(price_minor);
             if candidate.provider_id == session.user_id {
                 candidate.daily_rate_minor = None;
+                candidate.pricing_model = crate::market_recurring::PRICING_FREE.into();
+                candidate.cycle_price_minor = None;
+                candidate.billing_interval = None;
                 candidate.currency = None;
             }
             crate::market_access::ensure_product_access_tx(
@@ -2782,6 +3176,7 @@ impl AppStore {
             }
         }
         let mut funding_rates = BTreeMap::<(String, String), (String, i64)>::new();
+        let mut recurring_prices = BTreeMap::<(String, String), (String, i64)>::new();
         for candidate in &candidates {
             if let Some(daily_rate_minor) = candidate.daily_rate_minor {
                 let currency = candidate.currency.as_deref().ok_or_else(|| {
@@ -2793,6 +3188,18 @@ impl AppStore {
                     .or_insert_with(|| (candidate.host_owner_email.clone(), 0));
                 *rate = rate.checked_add(daily_rate_minor).ok_or_else(|| {
                     AppError::Internal("quoted Host funding rate overflowed".into())
+                })?;
+            }
+            if let Some(cycle_price_minor) = candidate.cycle_price_minor {
+                let currency = candidate.currency.as_deref().ok_or_else(|| {
+                    AppError::Internal("monthly quoted Host currency is missing".into())
+                })?;
+                let key = (candidate.provider_id.clone(), currency.to_string());
+                let (_, price) = recurring_prices
+                    .entry(key)
+                    .or_insert_with(|| (candidate.host_owner_email.clone(), 0));
+                *price = price.checked_add(cycle_price_minor).ok_or_else(|| {
+                    AppError::Internal("quoted Host monthly price overflowed".into())
                 })?;
             }
         }
@@ -2810,6 +3217,22 @@ impl AppStore {
                         &currency,
                         daily_rate_minor,
                         &now_rfc,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let recurring_funding = recurring_prices
+            .into_iter()
+            .map(
+                |((provider_id, currency), (provider_email, cycle_price_minor))| {
+                    crate::market_recurring::recurring_funding_summary_tx(
+                        &tx,
+                        &session.user_id,
+                        &provider_id,
+                        &provider_email,
+                        &currency,
+                        cycle_price_minor,
+                        crate::market_recurring::RENEWAL_MANUAL,
                     )
                 },
             )
@@ -2853,8 +3276,10 @@ impl AppStore {
                 "INSERT INTO client_market_allocation_quote_items
                     (id, quote_id, position, host_id, provider_id, host_owner_email,
                      country_code, hostname, daily_rate_minor, currency,
-                     free_duration_days, offer_revision)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     free_duration_days, offer_revision, pricing_model,
+                     cycle_price_minor, billing_interval)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15)",
                 params![
                     item_id,
                     quote_id,
@@ -2868,6 +3293,9 @@ impl AppStore {
                     candidate.currency,
                     candidate.free_duration_days.map(i64::from),
                     candidate.offer_revision,
+                    candidate.pricing_model,
+                    candidate.cycle_price_minor,
+                    candidate.billing_interval,
                 ],
             )
             .map_err(|error| AppError::Internal(format!("insert quote item failed: {error}")))?;
@@ -2880,6 +3308,9 @@ impl AppStore {
                 hostname: candidate.hostname,
                 ip: candidate.ip,
                 daily_rate_minor: candidate.daily_rate_minor,
+                pricing_model: candidate.pricing_model,
+                cycle_price_minor: candidate.cycle_price_minor,
+                billing_interval: candidate.billing_interval,
                 currency: candidate.currency,
                 free_duration_days: candidate.free_duration_days,
                 offer_revision: candidate.offer_revision,
@@ -2904,6 +3335,7 @@ impl AppStore {
             expires_at: expires_at.to_rfc3339(),
             items,
             funding,
+            recurring_funding,
         })
     }
 
@@ -2931,6 +3363,36 @@ impl AppStore {
         idempotency_key: &str,
         request_fingerprint: &str,
         prepared: &[(String, String, String, i64)],
+    ) -> Result<CommitQuoteResponse, AppError> {
+        let prepared = prepared
+            .iter()
+            .map(|(item, subdomain, password, revision)| {
+                (
+                    item.clone(),
+                    subdomain.clone(),
+                    password.clone(),
+                    *revision,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.client_market_commit_quote_with_renewal_idempotent(
+            quote_id,
+            session,
+            idempotency_key,
+            request_fingerprint,
+            &prepared,
+        )
+        .await
+    }
+
+    pub async fn client_market_commit_quote_with_renewal_idempotent(
+        &self,
+        quote_id: &str,
+        session: &AuthSession,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        prepared: &[(String, String, String, i64, bool)],
     ) -> Result<CommitQuoteResponse, AppError> {
         let now = Utc::now();
         let conn = self.conn.lock().await;
@@ -3023,7 +3485,7 @@ impl AppStore {
         }
         let mut unique_item_ids = std::collections::HashSet::new();
         let mut unique_subdomains = std::collections::HashSet::new();
-        for (item_id, subdomain, _, _) in prepared {
+        for (item_id, subdomain, _, _, _) in prepared {
             if !unique_item_ids.insert(item_id.to_string())
                 || !unique_subdomains.insert(subdomain.to_ascii_lowercase())
             {
@@ -3073,12 +3535,44 @@ impl AppStore {
             ],
         )
         .map_err(|error| AppError::Internal(format!("insert Client batch failed: {error}")))?;
-        let mut job_ids = Vec::with_capacity(prepared.len());
-        for (item_id, subdomain, _, confirmed_revision) in prepared {
+        // Calendar-month products can only consume prepaid funds, while legacy
+        // metered products may fall back to an explicit supplier credit line.
+        // Reserve the less-flexible monthly funds first so request order cannot
+        // make an otherwise fundable mixed quote fail. The response is restored
+        // to request order below because callers pair job ids with passwords.
+        let mut processing_order = prepared
+            .iter()
+            .enumerate()
+            .map(|(index, (item_id, _, _, _, _))| {
+                let monthly = tx
+                    .query_row(
+                        "SELECT cycle_price_minor IS NOT NULL
+                         FROM client_market_allocation_quote_items
+                         WHERE id = ?1 AND quote_id = ?2",
+                        params![item_id, quote_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "read quote item billing priority failed: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        AppError::BadRequest("quote item does not belong to this quote".into())
+                    })?;
+                Ok((index, monthly))
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        processing_order.sort_by_key(|(index, monthly)| (!*monthly, *index));
+        let mut job_ids_by_request = vec![None; prepared.len()];
+        for (prepared_index, _) in processing_order {
+            let (item_id, subdomain, _, confirmed_revision, auto_renew) = &prepared[prepared_index];
             let item = tx
                 .query_row(
                     "SELECT host_id, provider_id, host_owner_email, country_code,
-                            daily_rate_minor, currency, offer_revision
+                            daily_rate_minor, pricing_model, cycle_price_minor,
+                            billing_interval, currency, offer_revision
                      FROM client_market_allocation_quote_items
                      WHERE id = ?1 AND quote_id = ?2",
                     params![item_id, quote_id],
@@ -3089,8 +3583,11 @@ impl AppStore {
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<String>>(3)?,
                             row.get::<_, Option<i64>>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                            row.get::<_, i64>(9)?,
                         ))
                     },
                 )
@@ -3099,7 +3596,7 @@ impl AppStore {
                 .ok_or_else(|| {
                     AppError::BadRequest("quote item does not belong to this quote".into())
                 })?;
-            if *confirmed_revision != item.6 {
+            if *confirmed_revision != item.9 {
                 return Err(AppError::Conflict(
                     "the confirmed Host offer revision does not match the allocation quote; review the current offer"
                         .into(),
@@ -3111,7 +3608,7 @@ impl AppStore {
                 &session.user_id,
                 &session.email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
-                crate::market_access::pricing_kind_for_rate(item.4),
+                crate::market_access::pricing_kind_for_rate(item.6.or(item.4)),
             )?;
             if item.4.is_some() {
                 crate::market_billing::ensure_credit_allowed_tx(
@@ -3120,7 +3617,7 @@ impl AppStore {
                     &session.email,
                     &item.1,
                     crate::market_access::PRODUCT_CLIENT_HOST,
-                    item.5.as_deref().ok_or_else(|| {
+                    item.8.as_deref().ok_or_else(|| {
                         AppError::Internal("paid quote item currency is missing".into())
                     })?,
                 )?;
@@ -3129,7 +3626,7 @@ impl AppStore {
                 .execute(
                     "UPDATE router_ssh_hosts SET status = 'locked', updated_at = ?2
                      WHERE id = ?1 AND status = ?3 AND offer_revision = ?4",
-                    params![item.0, now.to_rfc3339(), HOST_STATUS_RESERVED, item.6],
+                    params![item.0, now.to_rfc3339(), HOST_STATUS_RESERVED, item.9],
                 )
                 .map_err(|error| AppError::Internal(format!("lock quoted Host failed: {error}")))?;
             if changed != 1 {
@@ -3169,8 +3666,48 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("insert quoted provisioning job failed: {error}"))
             })?;
-            if let Some(daily_rate_minor) = item.4 {
-                let currency = item.5.as_deref().ok_or_else(|| {
+            if let Some(cycle_price_minor) = item.6 {
+                let currency = item.8.as_deref().ok_or_else(|| {
+                    AppError::Internal("monthly quote item currency is missing".into())
+                })?;
+                let now_text = now.to_rfc3339();
+                let trial_allowance_seconds = crate::market_billing::trial_seconds_remaining_tx(
+                    &tx,
+                    &session.user_id,
+                    &item.1,
+                    crate::market_access::PRODUCT_CLIENT_HOST,
+                    &item.0,
+                    currency,
+                    crate::market_billing::TRIAL_SECONDS,
+                )?;
+                crate::market_recurring::prepare_contract_tx(
+                    &tx,
+                    crate::market_recurring::PrepareRecurringContractInput {
+                        product_kind: "client_host",
+                        product_ref: &job_id,
+                        activation_ref: &job_id,
+                        service_ref: &item.0,
+                        service_label: subdomain,
+                        buyer_user_id: &session.user_id,
+                        buyer_email: &session.email,
+                        supplier_user_id: &item.1,
+                        supplier_email: &item.2,
+                        currency,
+                        cycle_price_minor,
+                        offer_revision: item.9,
+                        renewal_policy: if *auto_renew {
+                            crate::market_recurring::RENEWAL_AUTOMATIC
+                        } else {
+                            crate::market_recurring::RENEWAL_MANUAL
+                        },
+                        auto_renew_max_price_minor: Some(cycle_price_minor),
+                        renewal_priority: 0,
+                        trial_allowance_seconds,
+                    },
+                    &now_text,
+                )?;
+            } else if let Some(daily_rate_minor) = item.4 {
+                let currency = item.8.as_deref().ok_or_else(|| {
                     AppError::Internal("paid quote item currency is missing".into())
                 })?;
                 let reservation_expires_at = (now + Duration::minutes(30)).to_rfc3339();
@@ -3188,7 +3725,7 @@ impl AppStore {
                         supplier_email: &item.2,
                         currency,
                         daily_rate_minor,
-                        offer_revision: item.6,
+                        offer_revision: item.9,
                         replacement_of: None,
                         trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
                     },
@@ -3212,8 +3749,12 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("reserve quoted subdomain failed: {error}"))
             })?;
-            job_ids.push(job_id);
+            job_ids_by_request[prepared_index] = Some(job_id);
         }
+        let job_ids = job_ids_by_request
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| AppError::Internal("Client quote job ordering is incomplete".into()))?;
         tx.execute(
             "UPDATE client_market_allocation_quotes
              SET status = 'committed', updated_at = ?2 WHERE id = ?1 AND status = 'active'",
@@ -3487,7 +4028,7 @@ impl AppStore {
                             WHEN s.status = 'released' THEN COALESCE(s.released_at, s.updated_at)
                             ELSE NULL
                         END,
-                        s.daily_rate_minor, s.currency,
+                        s.daily_rate_minor, s.cycle_price_minor, s.pricing_model, s.currency,
                         COALESCE((
                             SELECT SUM(accrual.amount_units)
                             FROM market_service_contracts contract
@@ -3495,6 +4036,14 @@ impl AppStore {
                               ON accrual.contract_id = contract.id
                             WHERE contract.product_kind = 'client_host'
                               AND contract.service_ref = s.installation_id
+                        ), 0) + COALESCE((
+                            SELECT SUM(period.amount_minor * ?3 - period.refunded_units)
+                            FROM market_recurring_contracts contract
+                            JOIN market_recurring_periods period
+                              ON period.contract_id = contract.id
+                            WHERE contract.product_kind = 'client_host'
+                              AND contract.product_ref = s.installation_id
+                              AND period.status IN ('paid', 'partially_refunded', 'refunded')
                         ), 0),
                         COALESCE((
                             SELECT SUM(accrual.amount_units)
@@ -3522,21 +4071,30 @@ impl AppStore {
                 AppError::Internal(format!("prepare Host usage history failed: {error}"))
             })?;
         let rows = statement
-            .query_map(params![host_id, HOST_USAGE_HISTORY_LIMIT], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                ))
-            })
+            .query_map(
+                params![
+                    host_id,
+                    HOST_USAGE_HISTORY_LIMIT,
+                    crate::market_billing::MONEY_UNITS_PER_MINOR,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                    ))
+                },
+            )
             .map_err(|error| {
                 AppError::Internal(format!("query Host usage history failed: {error}"))
             })?
@@ -3555,6 +4113,8 @@ impl AppStore {
                     started_at,
                     ended_at,
                     daily_rate_minor,
+                    cycle_price_minor,
+                    pricing_model,
                     currency,
                     charge_units,
                     unbilled_units,
@@ -3569,6 +4129,8 @@ impl AppStore {
                     started_at,
                     ended_at,
                     daily_rate_minor,
+                    cycle_price_minor,
+                    pricing_model,
                     currency,
                     charges_minor: crate::market_billing::ceil_minor_units(charge_units),
                     unbilled_minor: crate::market_billing::ceil_minor_units(unbilled_units),
@@ -3878,6 +4440,7 @@ impl AppStore {
                     "SELECT s.installation_id, s.host_id, s.expires_at
                      FROM client_market_subscriptions s
                      WHERE s.status = 'active' AND s.daily_rate_minor IS NULL
+                       AND s.cycle_price_minor IS NULL
                        AND s.expires_at > ?1 AND s.expires_at <= ?2
                        AND NOT EXISTS (
                            SELECT 1 FROM client_market_subscription_events e
@@ -3931,6 +4494,7 @@ impl AppStore {
                     "SELECT installation_id
                      FROM client_market_subscriptions
                      WHERE status = 'active' AND daily_rate_minor IS NULL
+                       AND cycle_price_minor IS NULL
                        AND expires_at IS NOT NULL AND expires_at <= ?1
                      ORDER BY expires_at, installation_id",
                 )
@@ -3971,6 +4535,9 @@ struct QuoteCandidate {
     hostname: Option<String>,
     ip: Option<String>,
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    cycle_price_minor: Option<i64>,
+    billing_interval: Option<String>,
     currency: Option<String>,
     free_duration_days: Option<u32>,
     offer_revision: i64,
@@ -3985,11 +4552,14 @@ fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandi
         hostname: row.get(4)?,
         ip: row.get(5)?,
         daily_rate_minor: row.get(6)?,
-        currency: row.get(7)?,
+        pricing_model: row.get(7)?,
+        cycle_price_minor: row.get(8)?,
+        billing_interval: row.get(9)?,
+        currency: row.get(10)?,
         free_duration_days: row
-            .get::<_, Option<i64>>(8)?
+            .get::<_, Option<i64>>(11)?
             .and_then(|value| u32::try_from(value).ok()),
-        offer_revision: row.get(9)?,
+        offer_revision: row.get(12)?,
     })
 }
 
@@ -4011,6 +4581,21 @@ fn commit_request_fingerprint(
     let fingerprint_payload = prepared
         .iter()
         .map(|(item_id, subdomain, _, revision)| (item_id, subdomain, revision))
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&fingerprint_payload).map_err(|error| {
+        AppError::Internal(format!("encode quote commit fingerprint failed: {error}"))
+    })?;
+    Ok(hex::encode(Sha256::digest(&encoded)))
+}
+
+fn commit_request_fingerprint_with_renewal(
+    prepared: &[(String, String, String, i64, bool)],
+) -> Result<String, AppError> {
+    let fingerprint_payload = prepared
+        .iter()
+        .map(|(item_id, subdomain, _, revision, auto_renew)| {
+            (item_id, subdomain, revision, auto_renew)
+        })
         .collect::<Vec<_>>();
     let encoded = serde_json::to_vec(&fingerprint_payload).map_err(|error| {
         AppError::Internal(format!("encode quote commit fingerprint failed: {error}"))
@@ -4126,6 +4711,9 @@ struct RentalRow {
     client_owner_email: String,
     status: String,
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    cycle_price_minor: Option<i64>,
+    billing_interval: Option<String>,
     currency: Option<String>,
     free_duration_days: Option<u32>,
     offer_revision: i64,
@@ -4160,7 +4748,8 @@ fn load_rental_views(
                  LIMIT 1),
                 a.expires_at,
                 a.revoked_at,
-                s.updated_at
+                s.updated_at, s.pricing_model, s.cycle_price_minor,
+                s.billing_interval
          FROM client_market_subscriptions s
          LEFT JOIN client_market_provider_terminal_authorizations a
            ON a.installation_id = s.installation_id
@@ -4198,6 +4787,9 @@ fn load_rental_views(
             provider_terminal_expires_at: row.get(16)?,
             provider_terminal_revoked_at: row.get(17)?,
             updated_at: row.get(18)?,
+            pricing_model: row.get(19)?,
+            cycle_price_minor: row.get(20)?,
+            billing_interval: row.get(21)?,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -4233,6 +4825,16 @@ fn load_rental_views(
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .is_some_and(|expires_at| expires_at > Utc::now());
+        let recurring =
+            if row.pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH {
+                crate::market_recurring::contract_view_for_product_tx(
+                    conn,
+                    "client_host",
+                    &row.installation_id,
+                )?
+            } else {
+                None
+            };
         output.push(RentalView {
             installation_id: row.installation_id,
             host_id: row.host_id,
@@ -4241,6 +4843,10 @@ fn load_rental_views(
             client_owner_email: row.client_owner_email,
             status: row.status.clone(),
             daily_rate_minor: row.daily_rate_minor,
+            pricing_model: row.pricing_model,
+            cycle_price_minor: row.cycle_price_minor,
+            billing_interval: row.billing_interval,
+            recurring,
             currency: row.currency,
             free_duration_days: row.free_duration_days,
             offer_revision: row.offer_revision,
@@ -4292,6 +4898,9 @@ type ClientMarketChatContext = (
     String,
     String,
     Option<i64>,
+    String,
+    Option<i64>,
+    Option<String>,
     Option<String>,
     i64,
     String,
@@ -4332,7 +4941,8 @@ fn enqueue_client_market_chat_event_tx(
             "SELECT COALESCE(NULLIF(t.subdomain, ''), s.installation_id),
                     s.client_user_id, s.client_owner_email, s.provider_id,
                     COALESCE(p.owner_email, s.host_owner_email),
-                    s.daily_rate_minor, s.currency, s.offer_revision, s.status,
+                    s.daily_rate_minor, s.pricing_model, s.cycle_price_minor,
+                    s.billing_interval, s.currency, s.offer_revision, s.status,
                     h.hostname
              FROM client_market_subscriptions s
              LEFT JOIN installation_client_tunnels t ON t.installation_id = s.installation_id
@@ -4352,6 +4962,9 @@ fn enqueue_client_market_chat_event_tx(
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )
@@ -4382,8 +4995,9 @@ fn enqueue_client_market_chat_event_tx(
                         'email:' || lower(trim(h.host_owner_email))
                     ),
                     COALESCE(p.owner_email, h.host_owner_email),
-                    h.daily_rate_minor,
-                    CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                    h.daily_rate_minor, h.pricing_model, h.cycle_price_minor,
+                    h.billing_interval,
+                    CASE WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                          ELSE COALESCE(NULLIF(trim(h.currency), ''), 'USD') END,
                     COALESCE(h.offer_revision, 1), ?3, h.hostname
              FROM installations i
@@ -4411,6 +5025,9 @@ fn enqueue_client_market_chat_event_tx(
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )
@@ -4428,6 +5045,9 @@ fn enqueue_client_market_chat_event_tx(
         provider_user_id,
         provider_email,
         daily_rate_minor,
+        pricing_model,
+        cycle_price_minor,
+        billing_interval,
         currency,
         offer_revision,
         status,
@@ -4451,6 +5071,9 @@ fn enqueue_client_market_chat_event_tx(
         "hostname": hostname,
         "status": status,
         "dailyRateMinor": daily_rate_minor,
+        "pricingModel": pricing_model,
+        "cyclePriceMinor": cycle_price_minor,
+        "billingInterval": billing_interval,
         "currency": currency,
         "offerRevision": offer_revision,
         "actorUserId": actor_user_id,
@@ -4664,6 +5287,9 @@ pub(crate) fn complete_provisioning_tx(
         String,
         String,
         Option<i64>,
+        String,
+        Option<i64>,
+        Option<String>,
         Option<String>,
         Option<i64>,
         i64,
@@ -4675,8 +5301,14 @@ pub(crate) fn complete_provisioning_tx(
                              'email:' || LOWER(j.client_owner_email)),
                     CASE WHEN j.quote_id IS NOT NULL THEN qi.daily_rate_minor
                          ELSE h.daily_rate_minor END,
+                    CASE WHEN j.quote_id IS NOT NULL THEN qi.pricing_model
+                         ELSE h.pricing_model END,
+                    CASE WHEN j.quote_id IS NOT NULL THEN qi.cycle_price_minor
+                         ELSE h.cycle_price_minor END,
+                    CASE WHEN j.quote_id IS NOT NULL THEN qi.billing_interval
+                         ELSE h.billing_interval END,
                     CASE WHEN j.quote_id IS NOT NULL THEN qi.currency
-                         WHEN h.daily_rate_minor IS NULL THEN NULL
+                         WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                          ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
                     CASE WHEN j.quote_id IS NOT NULL THEN qi.free_duration_days
                          ELSE h.free_duration_days END,
@@ -4693,6 +5325,7 @@ pub(crate) fn complete_provisioning_tx(
                 Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                     row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                    row.get(8)?, row.get(9)?, row.get(10)?,
                 ))
             },
         )
@@ -4703,7 +5336,10 @@ pub(crate) fn complete_provisioning_tx(
         host_email,
         client_email,
         client_user_id,
-        price,
+        daily_rate_minor,
+        pricing_model,
+        cycle_price_minor,
+        billing_interval,
         currency,
         free_duration_days,
         revision,
@@ -4713,12 +5349,33 @@ pub(crate) fn complete_provisioning_tx(
             "provisioned Host has no stable Provider identity".into(),
         ));
     };
-    let (price, currency, free_duration_days) = if provider_id == client_user_id {
-        (None, None, free_duration_days)
+    let (
+        daily_rate_minor,
+        pricing_model,
+        cycle_price_minor,
+        billing_interval,
+        currency,
+        free_duration_days,
+    ) = if provider_id == client_user_id {
+        (
+            None,
+            crate::market_recurring::PRICING_FREE.to_string(),
+            None,
+            None,
+            None,
+            free_duration_days,
+        )
     } else {
-        (price, currency, free_duration_days)
+        (
+            daily_rate_minor,
+            pricing_model,
+            cycle_price_minor,
+            billing_interval,
+            currency,
+            free_duration_days,
+        )
     };
-    let free_usage_seconds = if price.is_none() {
+    let free_usage_seconds = if daily_rate_minor.is_none() && cycle_price_minor.is_none() {
         match free_duration_days {
             Some(days) if provider_id != client_user_id => {
                 let days = u32::try_from(days).map_err(|_| {
@@ -4755,8 +5412,10 @@ pub(crate) fn complete_provisioning_tx(
             (installation_id, host_id, provider_id, host_owner_email,
              client_user_id, client_owner_email, status, daily_rate_minor,
              currency, free_duration_days, offer_revision, activated_at, expires_at,
-             created_at, updated_at, free_usage_seconds)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?12, ?12, ?14)",
+             created_at, updated_at, free_usage_seconds, pricing_model,
+             cycle_price_minor, billing_interval, recurring_contract_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?12, ?12, ?14, ?15, ?16, ?17, NULL)",
         params![
             installation_id,
             host_id,
@@ -4765,13 +5424,16 @@ pub(crate) fn complete_provisioning_tx(
             client_user_id,
             client_email,
             status,
-            price,
+            daily_rate_minor,
             currency,
             free_duration_days,
             revision,
             now.to_rfc3339(),
             expires_at.map(|value| value.to_rfc3339()),
             free_usage_seconds,
+            pricing_model,
+            cycle_price_minor,
+            billing_interval,
         ],
     )
     .map_err(|error| {
@@ -4779,7 +5441,41 @@ pub(crate) fn complete_provisioning_tx(
     })?;
     persist_subscription_client_subdomain_tx(tx, installation_id)?;
     let label = client_label_tx(tx, installation_id)?;
-    if let Some(daily_rate_minor) = price {
+    if let Some(cycle_price_minor) = cycle_price_minor {
+        if pricing_model != crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+            || billing_interval.as_deref()
+                != Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH)
+        {
+            return Err(AppError::Internal(
+                "monthly Client Host quote has inconsistent billing terms".into(),
+            ));
+        }
+        let contract_id = crate::market_recurring::activate_contract_tx(
+            tx,
+            "client_host",
+            job_id,
+            installation_id,
+            installation_id,
+            &label,
+            now,
+            &now.to_rfc3339(),
+        )?
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "the Client Market monthly funding reservation expired before provisioning completed"
+                    .into(),
+            )
+        })?;
+        tx.execute(
+            "UPDATE client_market_subscriptions
+             SET recurring_contract_id = ?2 WHERE installation_id = ?1",
+            params![installation_id, contract_id],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("link Client recurring contract failed: {error}"))
+        })?;
+        let _ = cycle_price_minor;
+    } else if let Some(daily_rate_minor) = daily_rate_minor {
         let currency = currency
             .as_deref()
             .ok_or_else(|| AppError::Internal("paid Client Host currency is missing".into()))?;
@@ -4877,7 +5573,10 @@ pub(crate) fn complete_provisioning_tx(
         serde_json::json!({
             "providerId": provider_id,
             "hostOwnerEmail": host_email,
-            "dailyRateMinor": price,
+            "dailyRateMinor": daily_rate_minor,
+            "pricingModel": pricing_model,
+            "cyclePriceMinor": cycle_price_minor,
+            "billingInterval": billing_interval,
             "currency": currency,
             "freeDurationDays": free_duration_days,
             "offerRevision": revision,
@@ -4900,11 +5599,20 @@ pub(crate) fn cleanup_started_tx(
     deny_client_access: bool,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
-    let subscription: Option<(String, String, String, String, Option<i64>, Option<String>)> = tx
+    let subscription: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        String,
+        Option<i64>,
+    )> = tx
         .query_row(
             "SELECT s.provider_id, s.client_user_id, s.client_owner_email,
                     COALESCE(p.owner_email, s.host_owner_email), s.daily_rate_minor,
-                    s.expires_at
+                    s.expires_at, s.pricing_model, s.cycle_price_minor
              FROM client_market_subscriptions s
              LEFT JOIN host_provider_profiles p ON p.provider_id = s.provider_id
              WHERE s.installation_id = ?1",
@@ -4917,6 +5625,8 @@ pub(crate) fn cleanup_started_tx(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -4931,8 +5641,29 @@ pub(crate) fn cleanup_started_tx(
         provider_email,
         daily_rate_minor,
         expires_at,
+        pricing_model,
+        cycle_price_minor,
     )) = subscription
     {
+        if pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+            && actor_user_id == Some(provider_id.as_str())
+        {
+            crate::market_recurring::supplier_terminate_and_refund_tx(
+                tx,
+                "client_host",
+                installation_id,
+                reason,
+                &now.to_rfc3339(),
+            )?;
+        } else {
+            crate::market_recurring::terminate_contract_tx(
+                tx,
+                "client_host",
+                installation_id,
+                reason,
+                &now.to_rfc3339(),
+            )?;
+        }
         crate::market_billing::terminate_contract_tx(
             tx,
             "client_host",
@@ -4968,7 +5699,7 @@ pub(crate) fn cleanup_started_tx(
                 &client_user_id,
                 &client_owner_email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
-                crate::market_access::pricing_kind_for_rate(daily_rate_minor),
+                crate::market_access::pricing_kind_for_rate(cycle_price_minor.or(daily_rate_minor)),
                 crate::market_access::DECISION_DENY,
                 actor_user_id.unwrap_or(&provider_id),
                 &now.to_rfc3339(),
@@ -5165,6 +5896,225 @@ mod tests {
         assert_eq!(
             error.code(),
             Some(crate::market_billing::ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED)
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_quote_reserves_monthly_prepaid_before_legacy_credit() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("mixed-supplier", "mixed-supplier@example.com");
+        let buyer = session("mixed-buyer", "mixed-buyer@example.com");
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        store
+            .market_billing_update_supplier_profile(
+                &supplier,
+                crate::market_billing::MARKET_CURRENCY,
+                24,
+            )
+            .await
+            .expect("configure mixed-quote supplier settlement terms");
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(
+                &conn,
+                &supplier,
+                crate::market_billing::MARKET_CURRENCY,
+                1_000,
+                &now_text,
+            );
+            let account_id = crate::market_billing::ensure_market_prepaid_account_tx(
+                &conn,
+                &buyer.user_id,
+                &buyer.email,
+                &supplier.user_id,
+                &supplier.email,
+                crate::market_billing::MARKET_CURRENCY,
+                &now_text,
+            )
+            .expect("create mixed-quote prepaid account");
+            conn.execute(
+                "UPDATE market_prepaid_accounts
+                 SET posted_balance_units = ?2, updated_at = ?3 WHERE id = ?1",
+                params![
+                    account_id,
+                    1_000 * crate::market_billing::MONEY_UNITS_PER_MINOR,
+                    now_text
+                ],
+            )
+            .expect("fund mixed-quote prepaid account");
+            for (host_id, ip, pricing_model, daily_rate, cycle_price, interval) in [
+                (
+                    "mixed-daily-host",
+                    "203.0.113.41",
+                    crate::market_recurring::PRICING_LEGACY_METERED_DAILY,
+                    Some(1_000_i64),
+                    None,
+                    None,
+                ),
+                (
+                    "mixed-monthly-host",
+                    "203.0.113.42",
+                    crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH,
+                    None,
+                    Some(1_000_i64),
+                    Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO router_ssh_hosts (
+                        id, ip, port, host_owner_email, status, created_at, updated_at,
+                        provider_id, daily_rate_minor, pricing_model, cycle_price_minor,
+                        billing_interval, currency, offer_revision
+                     ) VALUES (?1, ?2, 22, ?3, 'reserved', ?4, ?4, ?5, ?6, ?7, ?8,
+                               ?9, 'USD', 1)",
+                    params![
+                        host_id,
+                        ip,
+                        supplier.email,
+                        now_text,
+                        supplier.user_id,
+                        daily_rate,
+                        pricing_model,
+                        cycle_price,
+                        interval,
+                    ],
+                )
+                .expect("insert mixed-quote Host");
+            }
+            conn.execute(
+                "INSERT INTO client_market_allocation_quotes (
+                    id, client_user_id, client_owner_email, status, expires_at,
+                    created_at, updated_at
+                 ) VALUES ('mixed-quote', ?1, ?2, 'active', ?3, ?4, ?4)",
+                params![
+                    buyer.user_id,
+                    buyer.email,
+                    (now + Duration::minutes(2)).to_rfc3339(),
+                    now_text,
+                ],
+            )
+            .expect("insert mixed allocation quote");
+            for (item_id, position, host_id, pricing_model, daily_rate, cycle_price, interval) in [
+                (
+                    "mixed-daily-item",
+                    0_i64,
+                    "mixed-daily-host",
+                    crate::market_recurring::PRICING_LEGACY_METERED_DAILY,
+                    Some(1_000_i64),
+                    None,
+                    None,
+                ),
+                (
+                    "mixed-monthly-item",
+                    1_i64,
+                    "mixed-monthly-host",
+                    crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH,
+                    None,
+                    Some(1_000_i64),
+                    Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO client_market_allocation_quote_items (
+                        id, quote_id, position, host_id, provider_id, host_owner_email,
+                        daily_rate_minor, pricing_model, cycle_price_minor,
+                        billing_interval, currency, offer_revision
+                     ) VALUES (?1, 'mixed-quote', ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                               ?9, 'USD', 1)",
+                    params![
+                        item_id,
+                        position,
+                        host_id,
+                        supplier.user_id,
+                        supplier.email,
+                        daily_rate,
+                        pricing_model,
+                        cycle_price,
+                        interval,
+                    ],
+                )
+                .expect("insert mixed allocation quote item");
+            }
+        }
+
+        // Deliberately submit the legacy item first. Monthly must still reserve
+        // the prepaid balance, leaving the flexible legacy item to use credit.
+        let prepared = vec![
+            (
+                "mixed-daily-item".into(),
+                "mixed-daily".into(),
+                "daily-password".into(),
+                1,
+                false,
+            ),
+            (
+                "mixed-monthly-item".into(),
+                "mixed-monthly".into(),
+                "monthly-password".into(),
+                1,
+                false,
+            ),
+        ];
+        let fingerprint =
+            commit_request_fingerprint_with_renewal(&prepared).expect("fingerprint mixed quote");
+        let response = store
+            .client_market_commit_quote_with_renewal_idempotent(
+                "mixed-quote",
+                &buyer,
+                "mixed-quote-key",
+                &fingerprint,
+                &prepared,
+            )
+            .await
+            .expect("commit fundable mixed quote");
+        assert!(!response.replayed);
+
+        let conn = store.conn.lock().await;
+        let daily_job_id: String = conn
+            .query_row(
+                "SELECT id FROM provisioning_jobs WHERE subdomain = 'mixed-daily'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read daily mixed job");
+        let monthly_job_id: String = conn
+            .query_row(
+                "SELECT id FROM provisioning_jobs WHERE subdomain = 'mixed-monthly'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read monthly mixed job");
+        assert_eq!(
+            response.job_ids,
+            vec![daily_job_id.clone(), monthly_job_id.clone()]
+        );
+        let legacy_reservation: (i64, i64) = conn
+            .query_row(
+                "SELECT prepaid_units, credit_units FROM market_funding_reservations
+                 WHERE product_kind = 'client_host' AND product_ref = ?1",
+                params![daily_job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read legacy mixed funding reservation");
+        assert_eq!(legacy_reservation.0, 0);
+        assert_eq!(
+            legacy_reservation.1,
+            1_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
+        );
+        let monthly_hold: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(hold.amount_units), 0)
+                 FROM market_recurring_holds hold
+                 JOIN market_recurring_contracts contract ON contract.id = hold.contract_id
+                 WHERE contract.product_ref = ?1 AND hold.status = 'active'",
+                params![monthly_job_id],
+                |row| row.get(0),
+            )
+            .expect("read monthly mixed hold");
+        assert_eq!(
+            monthly_hold,
+            1_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
         );
     }
 

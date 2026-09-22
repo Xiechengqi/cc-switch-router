@@ -98,7 +98,12 @@ export function hostCanCleanup(host: ClientMarketHost, viewerEmail?: string | nu
 /** Renter (or self-renter) may release their Client with reason `client_release`. */
 export function hostCanClientRelease(
   host: ClientMarketHost,
-  rental?: { isClientOwner?: boolean; canRelease?: boolean; status?: string } | null,
+  rental?: {
+    isClientOwner?: boolean;
+    canRelease?: boolean;
+    status?: string;
+    recurring?: { cancelAtPeriodEnd?: boolean };
+  } | null,
 ) {
   if (host.isClientOwner !== true || !host.installationId) return false;
   if (
@@ -111,6 +116,7 @@ export function hostCanClientRelease(
   if (!rental) return true;
   if (rental.isClientOwner === false) return false;
   if (rental.status === "released" || rental.status === "releasing") return false;
+  if (rental.recurring?.cancelAtPeriodEnd) return false;
   return rental.canRelease !== false;
 }
 
@@ -156,7 +162,14 @@ export function hostExportKey(host: { ip?: string | null; port?: number | null }
   return formatHostEndpoint(host.ip, host.port);
 }
 
-/** Fixed line format: ip:port|note|dailyPriceMinor|USD|freeDurationDays|fingerprint */
+/**
+ * Transfer line format:
+ * ip:port|note|priceMinor|USD|freeDurationDays|fingerprint|pricingModel
+ *
+ * The seventh field was added for calendar-month offers.  A missing field is
+ * intentionally interpreted as `legacy_metered_daily`, so every transfer file
+ * produced before the recurring-billing migration keeps its original meaning.
+ */
 export type HostTransferLineEntry = ClientMarketHostTransferDocument["hosts"][number];
 
 export function formatHostEndpoint(ip: string, port: number) {
@@ -185,12 +198,21 @@ export function splitHostEndpoint(endpoint: string): { ip: string; port: number 
 export function encodeHostTransferLine(entry: HostTransferLineEntry): string {
   const endpoint = formatHostEndpoint(entry.ip, entry.port);
   const note = entry.note?.trim() || "";
-  const price = entry.dailyRateMinor != null ? String(entry.dailyRateMinor) : "";
+  const price = entry.cyclePriceMinor != null
+    ? String(entry.cyclePriceMinor)
+    : entry.dailyRateMinor != null
+      ? String(entry.dailyRateMinor)
+      : "";
   const currency = entry.currency?.trim().toUpperCase() || "";
   const freeDurationDays = entry.freeDurationDays != null ? String(entry.freeDurationDays) : "";
   const fingerprint = entry.expectedFingerprint?.trim() || "";
+  const pricingModel = price
+    ? entry.cyclePriceMinor != null
+      ? "prepaid_calendar_month"
+      : "legacy_metered_daily"
+    : "";
   const status = entry.informationalStatus?.trim();
-  const line = `${endpoint}|${note}|${price}|${currency}|${freeDurationDays}|${fingerprint}`;
+  const line = `${endpoint}|${note}|${price}|${currency}|${freeDurationDays}|${fingerprint}|${pricingModel}`;
   return status ? `${line} # ${status}` : line;
 }
 
@@ -213,6 +235,7 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
       currencyRaw = "",
       freeDurationRaw = "",
       fingerprint = "",
+      pricingModelRaw = "",
     ] = line
       .split("|")
       .map((part) => part.trim());
@@ -221,14 +244,23 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
     const key = formatHostEndpoint(endpoint.ip, endpoint.port);
     if (seen.has(key)) continue;
     seen.add(key);
-    let dailyRateMinor: number | undefined;
-    if (priceRaw) {
-      if (!/^\d+$/.test(priceRaw)) return { errorLine: trimmed };
-      dailyRateMinor = Number(priceRaw);
-      if (!Number.isSafeInteger(dailyRateMinor) || dailyRateMinor > 100_000_000) {
+    // Version-1 transfer files accepted `0` as the free-offer sentinel. Keep
+    // that meaning only when no explicit pricing model is present; a version-2
+    // row that names a paid model must still carry a positive price.
+    const normalizedPriceRaw = !pricingModelRaw && priceRaw === "0" ? "" : priceRaw;
+    const pricingModel = pricingModelRaw || (normalizedPriceRaw ? "legacy_metered_daily" : "free");
+    if (!["free", "legacy_metered_daily", "prepaid_calendar_month"].includes(pricingModel)) {
+      return { errorLine: trimmed };
+    }
+    let priceMinor: number | undefined;
+    if (normalizedPriceRaw) {
+      if (!/^\d+$/.test(normalizedPriceRaw)) return { errorLine: trimmed };
+      priceMinor = Number(normalizedPriceRaw);
+      if (!Number.isSafeInteger(priceMinor) || priceMinor < 1 || priceMinor > 100_000_000) {
         return { errorLine: trimmed };
       }
     }
+    if ((pricingModel === "free") !== (priceMinor == null)) return { errorLine: trimmed };
     const currency = currencyRaw ? currencyRaw.toUpperCase() : undefined;
     if (currency && currency !== MARKET_CURRENCY) return { errorLine: trimmed };
     let freeDurationDays: number | undefined;
@@ -238,19 +270,27 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
         return { errorLine: trimmed };
       }
     }
-    if (dailyRateMinor && freeDurationDays != null) return { errorLine: trimmed };
+    if (priceMinor && freeDurationDays != null) return { errorLine: trimmed };
     hosts.push({
       ip: endpoint.ip,
       port: endpoint.port,
       note: note || undefined,
-      dailyRateMinor,
+      dailyRateMinor: pricingModel === "legacy_metered_daily" ? priceMinor : undefined,
+      cyclePriceMinor: pricingModel === "prepaid_calendar_month" ? priceMinor : undefined,
+      pricingModel,
+      billingInterval: pricingModel === "prepaid_calendar_month" ? "calendar_month" : undefined,
       currency: currency ? MARKET_CURRENCY : undefined,
       freeDurationDays,
       expectedFingerprint: fingerprint || undefined,
     });
   }
   if (!hosts.length) return {};
-  return { document: { version: 1, hosts } };
+  return {
+    document: {
+      version: hosts.some((host) => host.cyclePriceMinor != null) ? 2 : 1,
+      hosts,
+    },
+  };
 }
 
 /** The host table only exposes cleanup to the Host owner, so this is always a
@@ -442,8 +482,13 @@ export function formatHostOffer(
   dailyRateMinor: number | undefined,
   locale: string,
   freeDurationDays?: number,
+  cyclePriceMinor?: number,
 ) {
-  if (!dailyRateMinor) {
+  if (cyclePriceMinor != null) {
+    const amount = formatUsdMoney(cyclePriceMinor, locale);
+    return locale.startsWith("zh") ? `${amount} / 月` : `${amount} / month`;
+  }
+  if (dailyRateMinor == null) {
     if (freeDurationDays != null) {
       return locale.startsWith("zh")
         ? `免费 · ${freeDurationDays} 天`
@@ -468,16 +513,16 @@ export function parseFreeDurationDays(value: string, t: Translate) {
 
 export function parseHostOffer(priceValue: string, t: Translate) {
   const price = priceValue.trim();
-  if (!price) return { dailyRateMinor: undefined, currency: undefined as string | undefined };
+  if (!price) return { cyclePriceMinor: undefined, currency: undefined as string | undefined };
   if (!/^\d{1,7}(?:\.\d{1,2})?$/.test(price)) {
     throw new Error(t("clientMarket.offerInvalid"));
   }
   const [whole, fraction = ""] = price.split(".");
-  const dailyRateMinor = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
-  if (dailyRateMinor < 1 || dailyRateMinor > 100_000_000) {
+  const cyclePriceMinor = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+  if (cyclePriceMinor < 1 || cyclePriceMinor > 100_000_000) {
     throw new Error(t("clientMarket.offerRange"));
   }
-  return { dailyRateMinor, currency: MARKET_CURRENCY };
+  return { cyclePriceMinor, currency: MARKET_CURRENCY };
 }
 
 export function isPaymentProfileRequiredError(message: string) {
@@ -683,10 +728,15 @@ export function normalizeHostSortPrefs(value: unknown): HostSortPrefs {
 }
 
 export function compareHostOffer(left: ClientMarketHost, right: ClientMarketHost) {
-  const leftFree = !left.dailyRateMinor;
-  const rightFree = !right.dailyRateMinor;
+  const leftFree = left.dailyRateMinor == null && left.cyclePriceMinor == null;
+  const rightFree = right.dailyRateMinor == null && right.cyclePriceMinor == null;
   if (leftFree !== rightFree) return leftFree ? -1 : 1;
-  const priceCmp = (left.dailyRateMinor || 0) - (right.dailyRateMinor || 0);
+  // Legacy daily offers remain comparable while new supply is monthly.  A
+  // 30-day normalization is only a sorting key; the UI always keeps the true
+  // billing unit visible.
+  const normalized = (host: ClientMarketHost) =>
+    host.cyclePriceMinor ?? (host.dailyRateMinor == null ? 0 : host.dailyRateMinor * 30);
+  const priceCmp = normalized(left) - normalized(right);
   if (priceCmp !== 0) return priceCmp;
   return (left.currency || "USD").localeCompare(right.currency || "USD");
 }

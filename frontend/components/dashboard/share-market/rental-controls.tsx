@@ -61,13 +61,26 @@ function rentalApps(subscription: ShareMarketSubscription) {
 }
 
 export function rentalPrice(subscription: ShareMarketSubscription, locale: string, t: Translate) {
-  return subscription.dailyRateMinor == null
-    ? t("shareMarket.free")
-    : `${formatUsdMoney(subscription.dailyRateMinor, locale)} / ${t("marketBilling.day")}`;
+  if (
+    subscription.pricingModel === "prepaid_calendar_month"
+    && subscription.cyclePriceMinor != null
+  ) {
+    return `${formatUsdMoney(subscription.cyclePriceMinor, locale)} / ${t("marketBilling.month")}`;
+  }
+  if (
+    subscription.pricingModel === "free"
+    || subscription.dailyRateMinor == null
+  ) {
+    return t("shareMarket.free");
+  }
+  return `${formatUsdMoney(subscription.dailyRateMinor, locale)} / ${t("marketBilling.day")}`;
 }
 
 /** The term frozen into the rental at rent time, independent of what the listing says today. */
 export function rentalServiceTerm(subscription: ShareMarketSubscription, t: Translate) {
+  if (subscription.pricingModel === "prepaid_calendar_month") {
+    return t("shareMarket.serviceDuration.monthlyManaged");
+  }
   return subscription.serviceDurationDays == null
     ? t("shareMarket.serviceDuration.permanent")
     : t("shareMarket.serviceDuration.daysValue", { count: subscription.serviceDurationDays });
@@ -94,17 +107,31 @@ export function RentalTermLine({
     return () => window.clearInterval(timer);
   }, []);
 
+  const recurring = subscription.pricingModel === "prepaid_calendar_month"
+    ? subscription.recurring
+    : undefined;
   const progress = rentalTermProgress(subscription, nowMs);
-  const remaining = progress.pending
-    ? t("account.share.activationPending")
-    : progress.expired
-      ? t("shareMarket.serviceDuration.expired")
-      : progress.days != null
-        ? t("shareMarket.serviceDuration.remainingDays", { count: progress.days })
-        : progress.hours != null
-          ? t("shareMarket.serviceDuration.remainingHours", { count: progress.hours })
-          : t("shareMarket.serviceDuration.permanent");
-  const urgent = progress.expired || progress.hours != null || (progress.days ?? 99) <= 2;
+  const recurringTime = (value?: string) => formatUtcDateTime(value, locale);
+  const remaining = recurring
+    ? recurring.cancelAtPeriodEnd
+      ? t("marketRecurring.compact.cancelAt", { time: recurringTime(recurring.currentPeriodEnd) })
+      : recurring.status === "recovery"
+        ? t("marketRecurring.compact.recoveryBy", { time: recurringTime(recurring.recoveryDeadline) })
+        : recurring.status === "trial"
+          ? t("marketRecurring.compact.trialUntil", { time: recurringTime(recurring.trialEndsAt) })
+          : t("marketRecurring.compact.renewsAt", { time: recurringTime(recurring.currentPeriodEnd) })
+    : progress.pending
+      ? t("account.share.activationPending")
+      : progress.expired
+        ? t("shareMarket.serviceDuration.expired")
+        : progress.days != null
+          ? t("shareMarket.serviceDuration.remainingDays", { count: progress.days })
+          : progress.hours != null
+            ? t("shareMarket.serviceDuration.remainingHours", { count: progress.hours })
+            : t("shareMarket.serviceDuration.permanent");
+  const urgent = recurring
+    ? recurring.status === "recovery" || recurring.cancelAtPeriodEnd
+    : progress.expired || progress.hours != null || (progress.days ?? 99) <= 2;
 
   return (
     <p className={cn("flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[10px] leading-4 text-slate-500", className)}>
@@ -169,7 +196,7 @@ export function RentalActions({
           {t("shareMarket.priceChange.reject")}
         </Button>
       ) : null}
-      {subscription.canRelease && onRelease ? (
+      {subscription.canRelease && !subscription.recurring?.cancelAtPeriodEnd && onRelease ? (
         <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onClick={onRelease}>
           {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
           {t("shareMarket.release")}
@@ -387,10 +414,24 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
 
   const rowActions = (subscription: ShareMarketSubscription) => ({
     onRelease: subscription.canRelease
+      && !subscription.recurring?.cancelAtPeriodEnd
       ? () => setAction({
         subscriptionId: subscription.id,
-        title: t("shareMarket.confirm.releaseTitle"),
-        description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }),
+        title: subscription.recurring
+          ? t(subscription.recurring.status === "active"
+              ? "shareMarket.confirm.releaseMonthlyTitle"
+              : "shareMarket.confirm.releaseImmediateTitle")
+          : t("shareMarket.confirm.releaseTitle"),
+        description: subscription.recurring
+          ? subscription.recurring.status === "active"
+            ? t("shareMarket.confirm.releaseMonthlyDescription", {
+                share: subscription.shareName,
+                time: formatUtcDateTime(subscription.recurring.currentPeriodEnd, locale),
+              })
+            : t("shareMarket.confirm.releaseImmediateDescription", {
+                share: subscription.shareName,
+              })
+          : t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }),
         label: t("shareMarket.release"),
         run: () => releaseShareMarketSubscription(subscription.id),
       })

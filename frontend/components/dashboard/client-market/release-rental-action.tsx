@@ -93,7 +93,7 @@ export function ReleaseRentalAction({
   label?: string;
   className?: string;
 }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [job, setJob] = React.useState<ProvisioningJob | null>(null);
@@ -226,7 +226,22 @@ export function ReleaseRentalAction({
   const release = React.useCallback(async () => {
     setBusy(true);
     try {
-      const { jobId } = await releaseClientMarketRental(rental.installationId);
+      const response = await releaseClientMarketRental(rental.installationId);
+      if (response.cancellationScheduled) {
+        trackingJobIdRef.current = null;
+        try {
+          sessionStorage.removeItem(resumeStorageKey(rental.installationId));
+        } catch {
+          /* ignore quota / private mode */
+        }
+        setConfirmOpen(false);
+        setProgressOpen(false);
+        toast.success(t("clientMarket.release.scheduled"));
+        await onChanged();
+        return;
+      }
+      const jobId = response.jobId;
+      if (!jobId) throw new Error(t("clientMarket.release.missingJob"));
       try {
         sessionStorage.setItem(resumeStorageKey(rental.installationId), jobId);
       } catch {
@@ -246,12 +261,24 @@ export function ReleaseRentalAction({
     } finally {
       setBusy(false);
     }
-  }, [rental.installationId, onChanged, pollJob]);
+  }, [rental.installationId, onChanged, pollJob, t]);
 
   const jobPhase: "running" | "failed" | "success" =
     job?.status === "failed" ? "failed" : job?.status === "succeeded" ? "success" : "running";
   const settled = job?.status === "failed" || job?.status === "succeeded";
-  const showReleaseButton = rental.canRelease && rental.status !== "releasing";
+  const recurring = rental.pricingModel === "prepaid_calendar_month"
+    ? rental.recurring
+    : undefined;
+  const schedulesAtPeriodEnd = recurring?.status === "active";
+  const periodEnd = recurring?.currentPeriodEnd
+    ? new Intl.DateTimeFormat(locale, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(new Date(recurring.currentPeriodEnd))
+    : "—";
+  const showReleaseButton = rental.canRelease
+    && rental.status !== "releasing"
+    && recurring?.cancelAtPeriodEnd !== true;
 
   return (
     <>
@@ -269,12 +296,22 @@ export function ReleaseRentalAction({
 
       <ConfirmAlertDialog
         open={confirmOpen}
-        title={t("clientMarket.release.confirmTitle")}
-        description={t("clientMarket.release.confirmDescription")}
-        confirmLabel={t("clientMarket.release.action")}
+        title={recurring
+          ? t(schedulesAtPeriodEnd
+              ? "clientMarket.release.scheduleTitle"
+              : "clientMarket.release.immediateMonthlyTitle")
+          : t("clientMarket.release.confirmTitle")}
+        description={recurring
+          ? schedulesAtPeriodEnd
+            ? t("clientMarket.release.scheduleDescription", { time: periodEnd })
+            : t("clientMarket.release.immediateMonthlyDescription")
+          : t("clientMarket.release.confirmDescription")}
+        confirmLabel={t(schedulesAtPeriodEnd
+          ? "clientMarket.release.scheduleAction"
+          : "clientMarket.release.action")}
         cancelLabel={t("common.cancel")}
         busy={busy}
-        tone="danger"
+        tone={schedulesAtPeriodEnd ? "warning" : "danger"}
         extra={
           <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">
             {t("chat.marketPublicNotice")}

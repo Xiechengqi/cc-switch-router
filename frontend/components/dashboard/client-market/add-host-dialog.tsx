@@ -150,7 +150,7 @@ export function AddHostDialog({
     const parsedPort = parsePort();
     if (parsedPort == null) return;
     let offer: {
-      dailyRateMinor?: number;
+      cyclePriceMinor?: number;
       currency?: string;
       freeDurationDays?: number;
     };
@@ -167,8 +167,8 @@ export function AddHostDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (pricing === "paid" && (!offer.dailyRateMinor || !paidOfferReady)) {
-      if (!offer.dailyRateMinor) {
+    if (pricing === "paid" && (!offer.cyclePriceMinor || !paidOfferReady)) {
+      if (!offer.cyclePriceMinor) {
         setError(t("clientMarket.offerInvalid"));
         return;
       }
@@ -453,7 +453,7 @@ export function AddHostDialog({
                 {pricing === "paid" ? (
                   <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
                     <label className="grid gap-1 text-sm">
-                      <span className="text-muted-foreground">{t("clientMarket.dailyPrice")}</span>
+                      <span className="text-muted-foreground">{t("clientMarket.monthlyPrice")}</span>
                       <input value={priceUsd} onChange={(event) => setPriceUsd(event.target.value)} inputMode="decimal" className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30" />
                     </label>
                     <label className="grid gap-1 text-sm">

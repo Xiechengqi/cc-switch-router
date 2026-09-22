@@ -129,6 +129,11 @@ pub struct AccessRequestView {
     pub target_label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daily_rate_minor: Option<i64>,
+    pub pricing_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     pub status: String,
@@ -782,7 +787,8 @@ fn access_request_view_tx(conn: &Connection, id: &str) -> Result<AccessRequestVi
     conn.query_row(
         "SELECT id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
                 product_kind, pricing_kind, target_kind, target_id, target_label,
-                daily_rate_minor, currency, status, revision, requested_at, resolved_at,
+                daily_rate_minor, pricing_model, cycle_price_minor, billing_interval,
+                currency, status, revision, requested_at, resolved_at,
                 resolved_by_user_id, resolution_reason, resolution_note
          FROM market_access_requests WHERE id = ?1",
         params![id],
@@ -799,14 +805,17 @@ fn access_request_view_tx(conn: &Connection, id: &str) -> Result<AccessRequestVi
                 target_id: row.get(8)?,
                 target_label: row.get(9)?,
                 daily_rate_minor: row.get(10)?,
-                currency: row.get(11)?,
-                status: row.get(12)?,
-                revision: row.get(13)?,
-                requested_at: row.get(14)?,
-                resolved_at: row.get(15)?,
-                resolved_by_user_id: row.get(16)?,
-                resolution_reason: row.get(17)?,
-                resolution_note: row.get(18)?,
+                pricing_model: row.get(11)?,
+                cycle_price_minor: row.get(12)?,
+                billing_interval: row.get(13)?,
+                currency: row.get(14)?,
+                status: row.get(15)?,
+                revision: row.get(16)?,
+                requested_at: row.get(17)?,
+                resolved_at: row.get(18)?,
+                resolved_by_user_id: row.get(19)?,
+                resolution_reason: row.get(20)?,
+                resolution_note: row.get(21)?,
             })
         },
     )
@@ -1040,7 +1049,8 @@ impl AppStore {
             .prepare(
                 "SELECT id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
                         product_kind, pricing_kind, target_kind, target_id, target_label,
-                        daily_rate_minor, currency, status, revision, requested_at, resolved_at,
+                        daily_rate_minor, pricing_model, cycle_price_minor, billing_interval,
+                        currency, status, revision, requested_at, resolved_at,
                         resolved_by_user_id, resolution_reason, resolution_note
                  FROM market_access_requests
                  WHERE supplier_user_id = ?1 AND status = 'requested'
@@ -1061,14 +1071,17 @@ impl AppStore {
                             target_id: row.get(8)?,
                             target_label: row.get(9)?,
                             daily_rate_minor: row.get(10)?,
-                            currency: row.get(11)?,
-                            status: row.get(12)?,
-                            revision: row.get(13)?,
-                            requested_at: row.get(14)?,
-                            resolved_at: row.get(15)?,
-                            resolved_by_user_id: row.get(16)?,
-                            resolution_reason: row.get(17)?,
-                            resolution_note: row.get(18)?,
+                            pricing_model: row.get(11)?,
+                            cycle_price_minor: row.get(12)?,
+                            billing_interval: row.get(13)?,
+                            currency: row.get(14)?,
+                            status: row.get(15)?,
+                            revision: row.get(16)?,
+                            requested_at: row.get(17)?,
+                            resolved_at: row.get(18)?,
+                            resolved_by_user_id: row.get(19)?,
+                            resolution_reason: row.get(20)?,
+                            resolution_note: row.get(21)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -1154,6 +1167,9 @@ struct ResolvedAccessTarget {
     target_id: String,
     target_label: String,
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    cycle_price_minor: Option<i64>,
+    billing_interval: Option<String>,
     currency: Option<String>,
 }
 
@@ -1171,8 +1187,9 @@ fn resolve_access_target_tx(
         TARGET_SHARE_SEAT => conn
             .query_row(
                 "SELECT listing.owner_user_id, listing.owner_email, listing.share_id,
-                        seat.daily_rate_minor,
-                        CASE WHEN seat.daily_rate_minor IS NULL THEN NULL
+                        seat.daily_rate_minor, seat.pricing_model,
+                        seat.cycle_price_minor, seat.billing_interval,
+                        CASE WHEN seat.daily_rate_minor IS NULL AND seat.cycle_price_minor IS NULL THEN NULL
                              ELSE COALESCE(NULLIF(TRIM(seat.currency), ''), 'USD') END
                  FROM share_market_seats seat
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
@@ -1181,17 +1198,24 @@ fn resolve_access_target_tx(
                 params![target_id],
                 |row| {
                     let daily_rate_minor = row.get::<_, Option<i64>>(3)?;
+                    let cycle_price_minor = row.get::<_, Option<i64>>(5)?;
                     Ok(ResolvedAccessTarget {
                         supplier_user_id: row.get(0)?,
                         supplier_email: row.get(1)?,
                         product_kind: PRODUCT_SHARE.into(),
-                        pricing_kind: pricing_kind_for_rate(daily_rate_minor).into(),
+                        pricing_kind: pricing_kind_for_rate(
+                            cycle_price_minor.or(daily_rate_minor),
+                        )
+                        .into(),
                         target_kind: TARGET_SHARE_SEAT.into(),
                         target_id: target_id.into(),
                         target_label: row.get(2)?,
                         daily_rate_minor,
+                        pricing_model: row.get(4)?,
+                        cycle_price_minor,
+                        billing_interval: row.get(6)?,
                         currency: row
-                            .get::<_, Option<String>>(4)?
+                            .get::<_, Option<String>>(7)?
                             .map(|value| value.to_ascii_uppercase()),
                     })
                 },
@@ -1204,8 +1228,9 @@ fn resolve_access_target_tx(
                 .query_row(
                     "SELECT host.provider_id, host.host_owner_email,
                             COALESCE(NULLIF(TRIM(host.hostname), ''), host.ip),
-                            host.daily_rate_minor,
-                            CASE WHEN host.daily_rate_minor IS NULL THEN NULL
+                            host.daily_rate_minor, host.pricing_model,
+                            host.cycle_price_minor, host.billing_interval,
+                            CASE WHEN host.daily_rate_minor IS NULL AND host.cycle_price_minor IS NULL THEN NULL
                                  ELSE COALESCE(NULLIF(TRIM(host.currency), ''), 'USD') END
                      FROM router_ssh_hosts host WHERE host.id = ?1 AND host.status = 'idle'",
                     params![target_id],
@@ -1215,7 +1240,10 @@ fn resolve_access_target_tx(
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<i64>>(3)?,
-                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -1229,12 +1257,15 @@ fn resolve_access_target_tx(
                 supplier_user_id,
                 supplier_email: target.1,
                 product_kind: PRODUCT_CLIENT_HOST.into(),
-                pricing_kind: pricing_kind_for_rate(target.3).into(),
+                pricing_kind: pricing_kind_for_rate(target.5.or(target.3)).into(),
                 target_kind: TARGET_CLIENT_HOST.into(),
                 target_id: target_id.into(),
                 target_label: target.2,
                 daily_rate_minor: target.3,
-                currency: target.4.map(|value| value.to_ascii_uppercase()),
+                pricing_model: target.4,
+                cycle_price_minor: target.5,
+                billing_interval: target.6,
+                currency: target.7.map(|value| value.to_ascii_uppercase()),
             })
         }
         _ => Err(AppError::BadRequest(
@@ -1321,8 +1352,10 @@ fn create_access_request_tx(
         "INSERT INTO market_access_requests (
             id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
             product_kind, pricing_kind, target_kind, target_id, target_label,
-            daily_rate_minor, currency, status, revision, requested_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'requested', 1, ?13)",
+            daily_rate_minor, pricing_model, cycle_price_minor, billing_interval,
+            currency, status, revision, requested_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                   ?13, ?14, ?15, 'requested', 1, ?16)",
         params![
             id,
             target.supplier_user_id,
@@ -1335,6 +1368,9 @@ fn create_access_request_tx(
             target.target_id,
             target.target_label,
             target.daily_rate_minor,
+            target.pricing_model,
+            target.cycle_price_minor,
+            target.billing_interval,
             target.currency,
             requested_at,
         ],
@@ -1351,6 +1387,8 @@ fn create_access_request_tx(
             "buyerEmail": actor.email,
             "productKind": target.product_kind,
             "pricingKind": target.pricing_kind,
+            "pricingModel": target.pricing_model,
+            "cyclePriceMinor": target.cycle_price_minor,
             "targetKind": target.target_kind,
             "targetId": target.target_id,
         }),
@@ -1382,6 +1420,18 @@ fn approve_access_request_tx(
     credit_line: Option<&ApprovalCreditLineInput>,
     now: &str,
 ) -> Result<String, AppError> {
+    if credit_line.is_some() {
+        if request.pricing_kind == PRICING_FREE {
+            return Err(AppError::BadRequest(
+                "free market access approval cannot include a credit line".into(),
+            ));
+        }
+        if request.pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH {
+            return Err(AppError::BadRequest(
+                "prepaid calendar-month access approval cannot include a credit line".into(),
+            ));
+        }
+    }
     let existing = relationship_for_buyer_tx(
         tx,
         &request.supplier_user_id,
@@ -1467,11 +1517,6 @@ fn approve_access_request_tx(
         },
         now,
     )?;
-    if request.pricing_kind == PRICING_FREE && credit_line.is_some() {
-        return Err(AppError::BadRequest(
-            "free market access approval cannot include a credit line".into(),
-        ));
-    }
     if request.pricing_kind == PRICING_PAID {
         let currency = normalize_currency(
             request
@@ -2963,6 +3008,40 @@ mod tests {
         .expect("insert access request seat");
     }
 
+    fn insert_monthly_share_target(conn: &Connection, seat_id: &str) {
+        let listing_id = format!("listing-{seat_id}");
+        let share_id = format!("share-{seat_id}");
+        let now = test_request_time().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO supplier_billing_profiles (
+                supplier_user_id, supplier_email, currency, settlement_grace_hours,
+                revision, created_at, updated_at
+             ) VALUES ('supplier', 'supplier@example.com', 'USD', 24, 1, ?1, ?1)",
+            params![now],
+        )
+        .expect("insert monthly supplier billing profile");
+        conn.execute(
+            "INSERT INTO share_market_listings (
+                id, share_id, installation_id, owner_user_id, owner_email,
+                status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'supplier', 'supplier@example.com',
+                       'active', ?4, ?4)",
+            params![listing_id, share_id, format!("installation-{seat_id}"), now],
+        )
+        .expect("insert monthly access request listing");
+        conn.execute(
+            "INSERT INTO share_market_seats (
+                id, listing_id, position, status, token_period_json,
+                daily_rate_minor, pricing_model, cycle_price_minor, billing_interval,
+                currency, offer_revision, created_at, updated_at
+             ) VALUES (?1, ?2, 1, 'available', 'null', NULL,
+                       'prepaid_calendar_month', 1000, 'calendar_month',
+                       'USD', 1, ?3, ?3)",
+            params![seat_id, listing_id, now],
+        )
+        .expect("insert monthly access request seat");
+    }
+
     fn share_request_input(seat_id: &str) -> CreateAccessRequest {
         CreateAccessRequest {
             target_kind: TARGET_SHARE_SEAT.into(),
@@ -3292,6 +3371,98 @@ mod tests {
         .expect("read prepaid-only eligibility");
         assert!(eligibility.allowed);
         assert_eq!(eligibility.status, "allowed");
+    }
+
+    #[test]
+    fn monthly_approval_rejects_injected_credit_without_side_effects() {
+        let conn = access_request_connection();
+        insert_monthly_share_target(&conn, "seat-monthly-credit-injection");
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let supplier = test_actor("supplier", "supplier@example.com");
+        let now = test_request_time();
+        let now_text = now.to_rfc3339();
+        conn.execute(
+            "INSERT INTO market_counterparties (
+                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
+                status, revision, created_at, updated_at
+             ) VALUES ('monthly-existing-relationship', 'supplier', 'supplier@example.com',
+                       'buyer', 'buyer@example.com', 'active', 1, ?1, ?1)",
+            params![now_text],
+        )
+        .expect("insert existing monthly relationship");
+        upsert_credit_line_tx(
+            &conn,
+            "monthly-existing-relationship",
+            &CreditLineInput {
+                currency: "USD".into(),
+                kind: CREDIT_LIMITED.into(),
+                limit_minor: Some(5_000),
+                risk_acknowledged: false,
+            },
+            Some(0),
+            &now_text,
+        )
+        .expect("insert existing credit line");
+        let request = create_access_request_tx(
+            &conn,
+            &buyer,
+            &share_request_input("seat-monthly-credit-injection"),
+            now,
+        )
+        .expect("create monthly access request");
+        assert_eq!(
+            request.pricing_model,
+            crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+        );
+
+        let error = approve_access_request_for_actor_tx(
+            &conn,
+            &supplier,
+            &request.id,
+            request.revision,
+            Some(&ApprovalCreditLineInput {
+                currency: "USD".into(),
+                kind: CREDIT_LIMITED.into(),
+                limit_minor: Some(9_000),
+                risk_acknowledged: false,
+                expected_revision: 1,
+            }),
+            &(now + Duration::minutes(1)).to_rfc3339(),
+        )
+        .expect_err("monthly approval must reject an injected credit line");
+        assert!(matches!(error, AppError::BadRequest(_)));
+
+        let relationship: (String, i64) = conn
+            .query_row(
+                "SELECT status, revision FROM market_counterparties
+                 WHERE id = 'monthly-existing-relationship'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read unchanged monthly relationship");
+        assert_eq!(relationship, ("active".into(), 1));
+        let credit: (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT kind, limit_minor, revision FROM market_credit_grants
+                 WHERE counterparty_id = 'monthly-existing-relationship' AND currency = 'USD'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read unchanged monthly credit line");
+        assert_eq!(credit, (CREDIT_LIMITED.into(), Some(5_000), 1));
+        let rule_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_counterparty_access_rules
+                 WHERE counterparty_id = 'monthly-existing-relationship'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count monthly access rules");
+        assert_eq!(rule_count, 0);
+        let unchanged_request =
+            access_request_view_tx(&conn, &request.id).expect("read unchanged monthly request");
+        assert_eq!(unchanged_request.status, ACCESS_REQUEST_REQUESTED);
+        assert_eq!(unchanged_request.revision, request.revision);
     }
 
     #[test]

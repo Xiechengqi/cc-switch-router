@@ -230,6 +230,24 @@ function formatRequestTime(value: string, locale: string) {
     : value;
 }
 
+function accessRequestPrice(
+  request: MarketAccessRequest,
+  locale: string,
+  usdCnyRateMicros: number,
+  dayLabel: string,
+  monthLabel: string,
+) {
+  const monthly = request.pricingModel === "prepaid_calendar_month"
+    && request.cyclePriceMinor != null;
+  const amount = monthly ? request.cyclePriceMinor : request.dailyRateMinor;
+  if (amount == null) return null;
+  return `${formatUsdCnyMoney(
+    amount,
+    locale,
+    usdMinorToCnyMinor(amount, usdCnyRateMicros),
+  )} / ${monthly ? monthLabel : dayLabel}`;
+}
+
 function CounterpartyCreditCell({
   line,
   currency,
@@ -772,7 +790,11 @@ export function AccountMarketAccessPage() {
       riskAcknowledged?: boolean;
       expectedRevision: number;
     } | undefined;
-    if (kind === "approve" && request.pricingKind === "paid") {
+    if (
+      kind === "approve"
+      && request.pricingKind === "paid"
+      && request.pricingModel !== "prepaid_calendar_month"
+    ) {
       const limitMinor = approvalCredit.kind === "limited" ? parseLimitMinor(approvalCredit.limit) : undefined;
       if (approvalCredit.kind === "limited" && limitMinor == null) {
         toast.danger(t("marketAccess.invalidLimit"));
@@ -845,13 +867,19 @@ export function AccountMarketAccessPage() {
             <strong className="break-words text-xs font-medium text-sky-950">{request.targetLabel}</strong>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-sky-800/80">
               <span className="inline-flex items-center gap-1"><Clock3 className="h-3 w-3" />{formatRequestTime(request.requestedAt, locale)}</span>
-              {request.dailyRateMinor != null ? (
-                <span>{formatUsdCnyMoney(
-                  request.dailyRateMinor,
+              {accessRequestPrice(
+                request,
+                locale,
+                usdCnyRateMicros,
+                t("marketBilling.day"),
+                t("marketBilling.month"),
+              ) ? <span>{accessRequestPrice(
+                  request,
                   locale,
-                  usdMinorToCnyMinor(request.dailyRateMinor, usdCnyRateMicros),
-                )} / {t("marketBilling.day")}</span>
-              ) : null}
+                  usdCnyRateMicros,
+                  t("marketBilling.day"),
+                  t("marketBilling.month"),
+                )}</span> : null}
             </div>
             <div className="flex flex-wrap gap-1.5">
               <Button
@@ -1318,9 +1346,19 @@ export function AccountMarketAccessPage() {
                   <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                     <span>{t(requestAction.request.productKind === "share" ? "marketAccess.product.share" : "marketAccess.product.clientHost")}</span>
                     <span>{t(requestAction.request.pricingKind === "free" ? "marketAccess.pricing.free" : "marketAccess.pricing.paid")}</span>
-                    {requestAction.request.dailyRateMinor != null ? (
-                      <span>{formatUsdCnyMoney(requestAction.request.dailyRateMinor, locale, usdMinorToCnyMinor(requestAction.request.dailyRateMinor, usdCnyRateMicros))} / {t("marketBilling.day")}</span>
-                    ) : null}
+                    {accessRequestPrice(
+                      requestAction.request,
+                      locale,
+                      usdCnyRateMicros,
+                      t("marketBilling.day"),
+                      t("marketBilling.month"),
+                    ) ? <span>{accessRequestPrice(
+                        requestAction.request,
+                        locale,
+                        usdCnyRateMicros,
+                        t("marketBilling.day"),
+                        t("marketBilling.month"),
+                      )}</span> : null}
                   </div>
                 </div>
               ) : null}
@@ -1337,7 +1375,9 @@ export function AccountMarketAccessPage() {
                 </p>
               ) : null}
 
-              {requestAction?.kind === "approve" && requestAction.request.pricingKind === "paid" ? (
+              {requestAction?.kind === "approve"
+              && requestAction.request.pricingKind === "paid"
+              && requestAction.request.pricingModel !== "prepaid_calendar_month" ? (
                 <section className="grid gap-3">
                   <div>
                     <strong className="text-sm">{t("marketAccess.approvalCreditTitle")}</strong>
@@ -1360,6 +1400,13 @@ export function AccountMarketAccessPage() {
                     onChange={setApprovalCredit}
                   />
                 </section>
+              ) : null}
+
+              {requestAction?.kind === "approve"
+              && requestAction.request.pricingModel === "prepaid_calendar_month" ? (
+                <p className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm leading-6 text-emerald-900">
+                  {t("marketAccess.approveMonthlyHint")}
+                </p>
               ) : null}
 
               {requestAction?.kind === "approve" && requestAction.request.pricingKind === "free" ? (

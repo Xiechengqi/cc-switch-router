@@ -1,19 +1,21 @@
 "use client";
 
-import { Clock3, HandCoins, Loader2 } from "lucide-react";
+import { CalendarClock, Clock3, HandCoins, Loader2 } from "lucide-react";
 import {
   FinalizeFailedRentalAction,
   ReleaseRentalAction,
 } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
+import { formatUsdMoney } from "@/lib/market-money";
 import type { ClientMarketRental } from "@/lib/types";
 
 /** True when the banner would show non-redundant lifecycle info (not just "Free · permanent"). */
 export function clientMarketRentalHasBanner(rental?: ClientMarketRental | null): boolean {
   if (!rental || !rental.isClientOwner || rental.status === "released") return false;
   if (rental.status === "releasing" || rental.status === "release_failed") return true;
-  if (!rental.dailyRateMinor) {
+  if (rental.pricingModel === "prepaid_calendar_month" || rental.recurring) return true;
+  if (rental.pricingModel === "free" || (rental.dailyRateMinor == null && rental.cyclePriceMinor == null)) {
     if (!rental.activatedAt) return true;
     if (rental.expiresAt) return true;
     return false;
@@ -69,7 +71,47 @@ export function ClientMarketRentalBanner({
     );
   }
 
-  if (!rental.dailyRateMinor) {
+  if (rental.pricingModel === "prepaid_calendar_month" && rental.recurring) {
+    const contract = rental.recurring;
+    const formatTime = (value?: string) => {
+      if (!value) return "—";
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed)
+        ? new Intl.DateTimeFormat(locale, {
+            dateStyle: "medium",
+            timeStyle: "short",
+          }).format(new Date(parsed))
+        : value;
+    };
+    const lifecycle = contract.cancelAtPeriodEnd
+      ? t("marketRecurring.compact.cancelAt", { time: formatTime(contract.currentPeriodEnd) })
+      : contract.status === "recovery"
+        ? t("marketRecurring.compact.recoveryBy", { time: formatTime(contract.recoveryDeadline) })
+        : contract.status === "trial"
+          ? t("marketRecurring.compact.trialUntil", { time: formatTime(contract.trialEndsAt) })
+          : t("marketRecurring.compact.renewsAt", { time: formatTime(contract.currentPeriodEnd) });
+    return (
+      <span
+        className={`inline-flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-muted-foreground ${compact ? "text-[11px]" : "text-xs"}`}
+        data-no-row-drawer
+        onClick={(event) => event.stopPropagation()}
+      >
+        <CalendarClock className="h-3 w-3 shrink-0" />
+        <strong className="font-medium text-foreground">
+          {formatUsdMoney(contract.cyclePriceMinor, locale)} / {t("marketBilling.month")}
+        </strong>
+        <span>{lifecycle}</span>
+        <a
+          href={manageHref || DASHBOARD_ACCOUNT_BILLING_PATH}
+          className="font-medium text-accent hover:underline"
+        >
+          {manageHref ? t("clientMarket.release.manageInMarket") : t("marketBilling.open")}
+        </a>
+      </span>
+    );
+  }
+
+  if (rental.pricingModel === "free" || (rental.dailyRateMinor == null && rental.cyclePriceMinor == null)) {
     if (!showSchedule) return null;
     const activated = rental.activatedAt
       ? new Date(rental.activatedAt).toLocaleString(locale)

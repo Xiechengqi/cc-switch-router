@@ -29,9 +29,13 @@ export function HostOfferDialog({
 }) {
   const { t } = useLocaleText();
   const [pricing, setPricing] = React.useState<"free" | "paid">(
-    host.dailyRateMinor ? "paid" : "free",
+    host.cyclePriceMinor != null || host.dailyRateMinor != null ? "paid" : "free",
   );
-  const [price, setPrice] = React.useState(host.dailyRateMinor ? (host.dailyRateMinor / 100).toFixed(2) : "");
+  const [price, setPrice] = React.useState(
+    host.cyclePriceMinor != null
+      ? (host.cyclePriceMinor / 100).toFixed(2)
+      : "",
+  );
   const [freeDurationMode, setFreeDurationMode] = React.useState<"fixed" | "permanent">(
     host.freeDurationDays == null ? "permanent" : "fixed",
   );
@@ -49,16 +53,20 @@ export function HostOfferDialog({
 
   React.useEffect(() => {
     if (!open) return;
-    setPricing(host.dailyRateMinor ? "paid" : "free");
-    setPrice(host.dailyRateMinor ? (host.dailyRateMinor / 100).toFixed(2) : "");
+    setPricing(host.cyclePriceMinor != null || host.dailyRateMinor != null ? "paid" : "free");
+    setPrice(
+      host.cyclePriceMinor != null
+        ? (host.cyclePriceMinor / 100).toFixed(2)
+        : "",
+    );
     setFreeDurationMode(host.freeDurationDays == null ? "permanent" : "fixed");
     setFreeDurationDays(String(host.freeDurationDays ?? 1));
     setError("");
-  }, [host.dailyRateMinor, host.freeDurationDays, open]);
+  }, [host.cyclePriceMinor, host.dailyRateMinor, host.freeDurationDays, open]);
 
   const save = async () => {
     let offer: {
-      dailyRateMinor?: number;
+      cyclePriceMinor?: number;
       currency?: string;
       freeDurationDays?: number;
     };
@@ -75,8 +83,8 @@ export function HostOfferDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (pricing === "paid" && (!offer.dailyRateMinor || !paidOfferReady)) {
-      if (!offer.dailyRateMinor) {
+    if (pricing === "paid" && (!offer.cyclePriceMinor || !paidOfferReady)) {
+      if (!offer.cyclePriceMinor) {
         setError(t("clientMarket.offerInvalid"));
         return;
       }
@@ -149,7 +157,7 @@ export function HostOfferDialog({
             {pricing === "paid" ? (
               <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
                 <label className="grid gap-1 text-sm">
-                  <span className="text-muted-foreground">{t("clientMarket.dailyPrice")}</span>
+                  <span className="text-muted-foreground">{t("clientMarket.monthlyPrice")}</span>
                   <input value={price} onChange={(event) => setPrice(event.target.value)} inputMode="decimal" className="h-10 rounded-md border px-3" />
                 </label>
                 <label className="grid gap-1 text-sm">

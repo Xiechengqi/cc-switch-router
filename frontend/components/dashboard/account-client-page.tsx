@@ -27,17 +27,28 @@ type MonitorEntry = {
 
 const RECENT_RELEASED_MS = 30 * 24 * 60 * 60 * 1000;
 
-function isFreeOffer(dailyRateMinor?: number | null) {
-  return !dailyRateMinor;
+function isFreeOffer(
+  pricingModel: string | undefined,
+  dailyRateMinor?: number | null,
+  cyclePriceMinor?: number | null,
+) {
+  return pricingModel === "free"
+    || (dailyRateMinor == null && cyclePriceMinor == null);
 }
 
 function offerLabel(
   dailyRateMinor: number | undefined,
+  cyclePriceMinor: number | undefined,
+  pricingModel: string | undefined,
   freeDurationDays: number | undefined,
   locale: string,
   _currency = "USD",
 ) {
-  if (isFreeOffer(dailyRateMinor)) {
+  if (pricingModel === "prepaid_calendar_month" && cyclePriceMinor != null) {
+    const amount = formatUsdMoney(cyclePriceMinor, locale);
+    return locale.startsWith("zh") ? `${amount} / 月` : `${amount} / month`;
+  }
+  if (isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor)) {
     if (freeDurationDays != null) {
       return locale.startsWith("zh")
         ? `免费 / ${freeDurationDays} 天`
@@ -54,7 +65,11 @@ function freePeriodTiming(
   locale: string,
   t: ReturnType<typeof useLocaleText>["t"],
 ) {
-  if (!rental || !isFreeOffer(rental.dailyRateMinor)) return null;
+  if (!rental || !isFreeOffer(
+    rental.pricingModel,
+    rental.dailyRateMinor,
+    rental.cyclePriceMinor,
+  )) return null;
   if (!rental.activatedAt) {
     return rental.status === "idle" ? null : t("clientMarket.freeDuration.pendingActivation");
   }
@@ -118,6 +133,9 @@ function synthesizeRentalFromHost(
     clientOwnerEmail: host.clientOwnerEmail || "",
     status: host.installationId ? "active" : "idle",
     dailyRateMinor: host.dailyRateMinor,
+    pricingModel: host.pricingModel,
+    cyclePriceMinor: host.cyclePriceMinor,
+    billingInterval: host.billingInterval,
     currency: host.currency,
     freeDurationDays: host.freeDurationDays,
     offerRevision: host.offerRevision ?? 0,
@@ -152,6 +170,8 @@ function MonitorCard({
   const host = entry.host;
   const status = rental?.status || host?.status || "unknown";
   const dailyRateMinor = rental?.dailyRateMinor ?? host?.dailyRateMinor;
+  const cyclePriceMinor = rental?.cyclePriceMinor ?? host?.cyclePriceMinor;
+  const pricingModel = rental?.pricingModel ?? host?.pricingModel;
   const freeDurationDays = rental?.freeDurationDays ?? host?.freeDurationDays;
   const currency = rental?.currency || host?.currency || "USD";
   const subdomain = host?.clientSubdomain;
@@ -206,12 +226,12 @@ function MonitorCard({
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.client.offer")}</dt>
-          <dd className="font-medium">{offerLabel(dailyRateMinor, freeDurationDays, locale, currency)}</dd>
+          <dd className="font-medium">{offerLabel(dailyRateMinor, cyclePriceMinor, pricingModel, freeDurationDays, locale, currency)}</dd>
           {freeTiming ? <dd className="text-xs text-muted-foreground">{freeTiming}</dd> : null}
         </div>
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.nav.billing")}</dt>
-          <dd className="font-medium">{dailyRateMinor ? t("marketBilling.status.active") : t("shareMarket.free")}</dd>
+          <dd className="font-medium">{isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? t("shareMarket.free") : t("marketBilling.status.active")}</dd>
         </div>
         <div className="grid gap-0.5 sm:col-span-2">
           <dt className="text-xs text-muted-foreground">{t("account.client.updated")}</dt>
@@ -224,7 +244,7 @@ function MonitorCard({
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
         <p className="text-xs text-muted-foreground">{t("account.client.readOnlyHint")}</p>
         <div className="flex flex-wrap gap-2">
-          {dailyRateMinor ? <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t("marketBilling.open")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link> : null}
+          {!isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t("marketBilling.open")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link> : null}
           <Link href={marketHref} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t("account.client.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link>
         </div>
       </div>
@@ -429,7 +449,7 @@ export function AccountClientPage() {
       // Idle free Hosts: still show under Provider monitor.
       if (
         !host.installationId &&
-        isFreeOffer(host.dailyRateMinor) &&
+        isFreeOffer(host.pricingModel, host.dailyRateMinor, host.cyclePriceMinor) &&
         !seenHosts.has(host.id)
       ) {
         seenHosts.add(host.id);

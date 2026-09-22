@@ -183,6 +183,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         50,
         include_str!("../schema/0050_market_funding_runway_alerts.sql"),
     ),
+    (
+        51,
+        include_str!("../schema/0051_market_recurring_billing.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -710,7 +714,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 153);
+        assert_eq!(table_count, 157);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1152,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_50_upgrade_a_version_26_database() {
+    fn migrations_27_through_51_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1281,8 +1285,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 50);
-        check_compatibility(&conn).expect("upgraded version 50 is compatible");
+        assert_eq!(latest_version, 51);
+        check_compatibility(&conn).expect("upgraded version 51 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1902,6 +1906,73 @@ mod tests {
     }
 
     #[test]
+    fn migration_51_preserves_legacy_share_quotes_and_tolerates_bad_snapshots() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 50);
+        conn.execute_batch(
+            r#"
+            INSERT INTO share_market_listings (
+                id, share_id, installation_id, owner_user_id, owner_email,
+                status, created_at, updated_at
+            ) VALUES (
+                'migration-51-listing', 'migration-51-share', 'migration-51-installation',
+                'migration-51-owner', 'owner@example.com', 'active',
+                '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z'
+            );
+            INSERT INTO share_market_seats (
+                id, listing_id, position, status, token_period_json,
+                daily_rate_minor, currency, offer_revision, created_at, updated_at
+            ) VALUES
+                ('migration-51-paid-seat', 'migration-51-listing', 1, 'available',
+                 '"day"', 1200, 'USD', 1, '2026-09-20T00:00:00Z',
+                 '2026-09-20T00:00:00Z'),
+                ('migration-51-bad-seat', 'migration-51-listing', 2, 'available',
+                 '"day"', NULL, NULL, 1, '2026-09-20T00:00:00Z',
+                 '2026-09-20T00:00:00Z');
+            INSERT INTO share_market_rent_quotes (
+                id, seat_id, listing_id, share_id, renter_user_id, renter_email,
+                offer_revision, snapshot_json, trial_seconds_remaining, status,
+                expires_at, created_at, updated_at
+            ) VALUES
+                ('migration-51-paid-quote', 'migration-51-paid-seat',
+                 'migration-51-listing', 'migration-51-share', 'migration-51-renter',
+                 'renter@example.com', 1, '{"dailyRateMinor":1200}', 0, 'active',
+                 '2026-09-20T00:02:00Z', '2026-09-20T00:00:00Z',
+                 '2026-09-20T00:00:00Z'),
+                ('migration-51-bad-quote', 'migration-51-bad-seat',
+                 'migration-51-listing', 'migration-51-share', 'migration-51-renter-bad',
+                 'bad@example.com', 1, 'not-json', 0, 'active',
+                 '2026-09-20T00:02:00Z', '2026-09-20T00:00:00Z',
+                 '2026-09-20T00:00:00Z');
+            "#,
+        )
+        .expect("seed version 50 Share quotes");
+
+        apply(&conn).expect("apply recurring billing migration");
+        let paid: (String, String) = conn
+            .query_row(
+                "SELECT pricing_model, json_extract(snapshot_json, '$.pricingModel')
+                 FROM share_market_rent_quotes WHERE id = 'migration-51-paid-quote'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated legacy paid quote");
+        assert_eq!(
+            paid,
+            ("legacy_metered_daily".into(), "legacy_metered_daily".into())
+        );
+        let malformed: (String, String) = conn
+            .query_row(
+                "SELECT pricing_model, snapshot_json FROM share_market_rent_quotes
+                 WHERE id = 'migration-51-bad-quote'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated malformed quote");
+        assert_eq!(malformed, ("free".into(), "not-json".into()));
+    }
+
+    #[test]
     fn migration_30_installs_user_model_routing_without_a_share_foreign_key() {
         let conn = memory_connection();
         install_schema_through(&conn, 29);
@@ -1960,7 +2031,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 50);
+        assert_eq!(latest_version, 51);
     }
 
     #[test]
@@ -1984,7 +2055,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 50);
+        assert_eq!(latest_version, 51);
     }
 
     #[test]
@@ -2164,7 +2235,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 50);
+        assert_eq!(latest_version, 51);
     }
 
     #[test]

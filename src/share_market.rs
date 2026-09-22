@@ -78,6 +78,7 @@ const ERROR_OFFER_CHANGED: &str = "share_market_offer_changed";
 const SUB_GRANT_PENDING: &str = "grant_pending";
 const SUB_ACTIVE_FREE: &str = "active_free";
 const SUB_ACTIVE_POSTPAID: &str = "active_postpaid";
+const SUB_ACTIVE_PREPAID: &str = "active_prepaid";
 const SUB_REVOKE_PENDING: &str = "revoke_pending";
 const SUB_REVOKE_FAILED: &str = "revoke_failed";
 const SUB_GRANT_FAILED: &str = "grant_failed";
@@ -323,6 +324,11 @@ pub struct SeatView {
     pub token_limit: Option<u64>,
     pub token_period: ShareTokenPeriod,
     pub daily_rate_minor: Option<i64>,
+    pub pricing_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_interval: Option<String>,
     pub currency: Option<String>,
     pub service_duration_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,6 +383,13 @@ pub struct SubscriptionView {
     pub token_limit: Option<u64>,
     pub token_period: ShareTokenPeriod,
     pub daily_rate_minor: Option<i64>,
+    pub pricing_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<crate::market_recurring::RecurringContractView>,
     pub currency: Option<String>,
     pub service_duration_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -486,6 +499,8 @@ pub struct SeatInput {
     #[serde(default)]
     pub token_period: ShareTokenPeriod,
     pub daily_rate_minor: Option<i64>,
+    #[serde(default)]
+    pub cycle_price_minor: Option<i64>,
     pub currency: Option<String>,
     #[serde(default)]
     pub service_duration_days: Option<u32>,
@@ -640,6 +655,12 @@ pub struct RentQuoteSnapshot {
     pub token_limit: Option<u64>,
     pub token_period: ShareTokenPeriod,
     pub daily_rate_minor: Option<i64>,
+    #[serde(default = "default_free_pricing_model")]
+    pub pricing_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_price_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_interval: Option<String>,
     pub currency: Option<String>,
     pub service_duration_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -658,6 +679,9 @@ struct RentOfferTerms {
     token_limit: Option<u64>,
     token_period: ShareTokenPeriod,
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    cycle_price_minor: Option<i64>,
+    billing_interval: Option<String>,
     currency: Option<String>,
     service_duration_days: Option<u32>,
     trial_hours: Option<i64>,
@@ -673,6 +697,9 @@ impl RentOfferTerms {
             token_limit: snapshot.token_limit,
             token_period: snapshot.token_period,
             daily_rate_minor: snapshot.daily_rate_minor,
+            pricing_model: snapshot.pricing_model.clone(),
+            cycle_price_minor: snapshot.cycle_price_minor,
+            billing_interval: snapshot.billing_interval.clone(),
             currency: snapshot.currency.clone(),
             service_duration_days: snapshot.service_duration_days,
             trial_hours: snapshot.trial_hours,
@@ -689,6 +716,8 @@ pub struct RentQuoteView {
     pub expires_at: String,
     pub trial_seconds_remaining: i64,
     pub funding: Option<crate::market_billing::MarketFundingSummaryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurring_funding: Option<crate::market_recurring::RecurringFundingSummaryView>,
     pub offer: RentQuoteSnapshot,
 }
 
@@ -697,6 +726,8 @@ pub struct RentQuoteView {
 pub struct CommitRentQuoteRequest {
     pub quote_id: String,
     pub idempotency_key: String,
+    #[serde(default)]
+    pub auto_renew: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -755,6 +786,9 @@ struct NormalizedSeat {
     token_limit: Option<u64>,
     token_period: ShareTokenPeriod,
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    cycle_price_minor: Option<i64>,
+    billing_interval: Option<String>,
     currency: Option<String>,
     service_duration_days: Option<u32>,
     trial_hours: Option<i64>,
@@ -763,8 +797,12 @@ struct NormalizedSeat {
 
 impl NormalizedSeat {
     fn is_free(&self) -> bool {
-        self.daily_rate_minor.is_none()
+        self.daily_rate_minor.is_none() && self.cycle_price_minor.is_none()
     }
+}
+
+fn default_free_pricing_model() -> String {
+    crate::market_recurring::PRICING_FREE.into()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -889,6 +927,12 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         return Err(AppError::BadRequest("seat token limit is too large".into()));
     }
     let daily_rate_minor = input.daily_rate_minor;
+    let cycle_price_minor = input.cycle_price_minor;
+    if daily_rate_minor.is_some() && cycle_price_minor.is_some() {
+        return Err(AppError::BadRequest(
+            "dailyRateMinor and cyclePriceMinor cannot both be set".into(),
+        ));
+    }
     if input
         .service_duration_days
         .is_some_and(|days| !(1..=MAX_SERVICE_DURATION_DAYS).contains(&days))
@@ -906,7 +950,8 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         .currency
         .map(|value| value.trim().to_ascii_uppercase())
         .filter(|value| !value.is_empty());
-    let pricing_empty = daily_rate_minor.is_none() && currency.is_none();
+    let price_minor = cycle_price_minor.or(daily_rate_minor);
+    let pricing_empty = price_minor.is_none() && currency.is_none();
     if pricing_empty {
         if input.trial_hours.is_some() || input.trial_token_limit.is_some() {
             return Err(AppError::BadRequest(
@@ -918,18 +963,26 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             token_limit: input.token_limit,
             token_period,
             daily_rate_minor: None,
+            pricing_model: crate::market_recurring::PRICING_FREE.into(),
+            cycle_price_minor: None,
+            billing_interval: None,
             currency: None,
             service_duration_days: input.service_duration_days,
             trial_hours: None,
             trial_token_limit: None,
         });
     }
-    let daily_rate_minor = daily_rate_minor.ok_or_else(|| {
-        AppError::BadRequest("daily price and currency must both be set or both be empty".into())
+    let price_minor = price_minor.ok_or_else(|| {
+        AppError::BadRequest("price and currency must both be set or both be empty".into())
     })?;
-    if daily_rate_minor <= 0 || daily_rate_minor > crate::market_billing::MAX_DAILY_RATE_MINOR {
+    if price_minor <= 0 || price_minor > crate::market_billing::MAX_DAILY_RATE_MINOR {
         return Err(AppError::BadRequest(
-            "paid seat daily price is outside the supported range".into(),
+            "paid seat price is outside the supported range".into(),
+        ));
+    }
+    if cycle_price_minor.is_some() && input.service_duration_days.is_some() {
+        return Err(AppError::BadRequest(
+            "monthly seats renew by calendar month and cannot set serviceDurationDays".into(),
         ));
     }
     let currency = currency.unwrap_or_else(|| crate::market_billing::MARKET_CURRENCY.into());
@@ -952,9 +1005,21 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         parallel_limit: input.parallel_limit,
         token_limit: input.token_limit,
         token_period,
-        daily_rate_minor: Some(daily_rate_minor),
+        daily_rate_minor,
+        pricing_model: if cycle_price_minor.is_some() {
+            crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH.into()
+        } else {
+            crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into()
+        },
+        cycle_price_minor,
+        billing_interval: cycle_price_minor
+            .map(|_| crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.into()),
         currency: Some(currency),
-        service_duration_days: input.service_duration_days,
+        service_duration_days: if cycle_price_minor.is_some() {
+            None
+        } else {
+            input.service_duration_days
+        },
         trial_hours: Some(trial_hours),
         trial_token_limit: Some(trial_token_limit),
     })
@@ -1836,7 +1901,9 @@ fn grant_token_limit(record: &SubscriptionRecord) -> Option<u64> {
 }
 
 fn should_apply_trial_tokens(record: &SubscriptionRecord) -> bool {
-    if record.daily_rate_minor.is_none() || record.trial_hours.unwrap_or(0) <= 0 {
+    if (record.daily_rate_minor.is_none() && record.cycle_price_minor.is_none())
+        || record.trial_hours.unwrap_or(0) <= 0
+    {
         return false;
     }
     match record.contract_trial_seconds_remaining {
@@ -1999,7 +2066,7 @@ fn subscription_integrity_violations_tx(
 
     if matches!(
         record.status.as_str(),
-        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID | SUB_ACTIVE_PREPAID
     ) {
         let grants_json = conn
             .query_row(
@@ -2047,12 +2114,18 @@ fn begin_subscription_integrity_remediation_tx(
         reject_unfulfillable_activation_tx(conn, record, &reason, &now)?;
         return Ok(());
     }
-    crate::market_billing::suspend_contract_for_integrity_tx(
-        conn, "share", &record.id, &reason, now_dt,
-    )?;
+    if record.cycle_price_minor.is_some() {
+        crate::market_recurring::suspend_contract_for_integrity_tx(
+            conn, "share", &record.id, &reason, &now,
+        )?;
+    } else if record.daily_rate_minor.is_some() {
+        crate::market_billing::suspend_contract_for_integrity_tx(
+            conn, "share", &record.id, &reason, now_dt,
+        )?;
+    }
     if matches!(
         record.status.as_str(),
-        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID | SUB_ACTIVE_PREPAID
     ) {
         enqueue_control_operation_tx(
             conn,
@@ -2067,7 +2140,7 @@ fn begin_subscription_integrity_remediation_tx(
         conn.execute(
             "UPDATE share_market_subscriptions
              SET status = 'billing_suspend_pending', release_reason = ?2, updated_at = ?3
-             WHERE id = ?1 AND status IN ('active_free', 'active_postpaid')",
+             WHERE id = ?1 AND status IN ('active_free', 'active_postpaid', 'active_prepaid')",
             params![record.id, reason, now],
         )
         .map_err(map_db("isolate violated Share contract"))?;
@@ -2095,7 +2168,7 @@ fn is_pending_all_app_scope_upgrade(record: &SubscriptionRecord, violations: &[S
         && record.app_scope_enforced_at.is_none()
         && matches!(
             record.status.as_str(),
-            SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+            SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID | SUB_ACTIVE_PREPAID
         )
         && violations == ["app_scope_not_enforced"]
 }
@@ -2187,7 +2260,15 @@ fn reconcile_subscription_integrity_tx(
             .unwrap_or(now_dt);
         if now_dt >= violated_at + Duration::hours(CONTRACT_REPAIR_WINDOW_HOURS) {
             let reason = "contract_integrity_repair_timeout";
-            if record.daily_rate_minor.is_some()
+            if record.cycle_price_minor.is_some() {
+                crate::market_recurring::supplier_terminate_and_refund_tx(
+                    conn,
+                    "share",
+                    &record.id,
+                    reason,
+                    &violated_at.to_rfc3339(),
+                )?;
+            } else if record.daily_rate_minor.is_some()
                 && record.service_duration_days.is_some()
                 && record.service_started_at.is_some()
             {
@@ -2242,14 +2323,24 @@ fn reconcile_subscription_integrity_tx(
         return Ok(false);
     }
     if record.status == SUB_BILLING_SUSPENDED && !record.has_active_control_work {
-        if record.daily_rate_minor.is_some()
-            && !crate::market_billing::request_contract_resume_after_integrity_tx(
+        let billing_can_resume = if record.cycle_price_minor.is_some() {
+            crate::market_recurring::request_contract_resume_after_integrity_tx(
                 conn,
                 "share",
                 &record.id,
                 &now_dt.to_rfc3339(),
             )?
-        {
+        } else if record.daily_rate_minor.is_some() {
+            crate::market_billing::request_contract_resume_after_integrity_tx(
+                conn,
+                "share",
+                &record.id,
+                &now_dt.to_rfc3339(),
+            )?
+        } else {
+            true
+        };
+        if !billing_can_resume {
             conn.execute(
                 "UPDATE share_market_subscriptions
                  SET integrity_state = 'compatible', integrity_reason = NULL,
@@ -2306,7 +2397,7 @@ fn reconcile_subscription_integrity_tx(
     }
     if matches!(
         record.status.as_str(),
-        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID
+        SUB_ACTIVE_FREE | SUB_ACTIVE_POSTPAID | SUB_ACTIVE_PREPAID
     ) {
         let grants_json = conn
             .query_row(
@@ -2318,14 +2409,21 @@ fn reconcile_subscription_integrity_tx(
             .map_err(map_db("read repaired Share App scope"))?
             .flatten();
         if active_grant_has_contract_scope(grants_json.as_deref(), record) {
-            if record.daily_rate_minor.is_some()
-                && !crate::market_billing::complete_contract_resume_after_integrity_tx(
+            let billing_resume_completed = if record.cycle_price_minor.is_some() {
+                crate::market_recurring::complete_contract_resume_after_integrity_tx(
+                    conn, "share", &record.id,
+                )?
+            } else if record.daily_rate_minor.is_some() {
+                crate::market_billing::complete_contract_resume_after_integrity_tx(
                     conn,
                     "share",
                     &record.id,
                     &now_dt.to_rfc3339(),
                 )?
-            {
+            } else {
+                true
+            };
+            if !billing_resume_completed {
                 enqueue_control_operation_tx(
                     conn,
                     &record.share_id,
@@ -2393,7 +2491,7 @@ pub(crate) fn share_market_billing_observation_tx(
             "SELECT share_id, required_app, contract_apps_json,
                     service_snapshot_json, integrity_state
              FROM share_market_subscriptions
-             WHERE id = ?1 AND status = 'active_postpaid'",
+             WHERE id = ?1 AND status IN ('active_postpaid', 'active_prepaid')",
             params![subscription_id],
             |row| {
                 Ok((
@@ -3846,6 +3944,10 @@ struct SubscriptionRecord {
     token_limit: Option<i64>,
     token_period_json: String,
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    cycle_price_minor: Option<i64>,
+    billing_interval: Option<String>,
+    recurring_contract_id: Option<String>,
     currency: Option<String>,
     service_duration_days: Option<u32>,
     trial_hours: Option<i64>,
@@ -3973,6 +4075,10 @@ fn subscription_record(
                     SELECT 1 FROM market_service_contracts contract
                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                       AND contract.status != 'terminated'
+                ) OR EXISTS (
+                    SELECT 1 FROM market_recurring_contracts contract
+                    WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                      AND contract.status NOT IN ('ended', 'activation_failed')
                 ),
                 COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
                 sub.parallel_limit, sub.token_limit, sub.token_period_json,
@@ -4018,11 +4124,24 @@ fn subscription_record(
                     THEN CAST(json_extract(sub.service_snapshot_json, '$.schemaVersion') AS INTEGER)
                     END, 0),
                 sub.trial_hours, sub.trial_token_limit,
-                (SELECT contract.trial_seconds_remaining
-                 FROM market_service_contracts contract
-                 WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
-                   AND contract.status != 'terminated'
-                 ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
+                COALESCE(
+                    (SELECT contract.trial_seconds_remaining
+                     FROM market_service_contracts contract
+                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                       AND contract.status != 'terminated'
+                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1),
+                    (SELECT CASE
+                         WHEN contract.status IN ('pending_activation', 'trial')
+                         THEN contract.trial_seconds_remaining
+                         ELSE 0
+                     END
+                     FROM market_recurring_contracts contract
+                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                       AND contract.status NOT IN ('ended', 'activation_failed')
+                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
+                ),
+                sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
+                sub.recurring_contract_id
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -4074,6 +4193,10 @@ fn subscription_record(
                 trial_hours: row.get(40)?,
                 trial_token_limit: row.get(41)?,
                 contract_trial_seconds_remaining: row.get(42)?,
+                pricing_model: row.get(43)?,
+                cycle_price_minor: row.get(44)?,
+                billing_interval: row.get(45)?,
+                recurring_contract_id: row.get(46)?,
             })
         },
     )
@@ -4205,6 +4328,10 @@ fn catalog_subscription_records(
                     SELECT 1 FROM market_service_contracts contract
                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                       AND contract.status != 'terminated'
+                ) OR EXISTS (
+                    SELECT 1 FROM market_recurring_contracts contract
+                    WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                      AND contract.status NOT IN ('ended', 'activation_failed')
                 ),
                 COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
                 sub.parallel_limit, sub.token_limit, sub.token_period_json,
@@ -4250,11 +4377,24 @@ fn catalog_subscription_records(
                     THEN CAST(json_extract(sub.service_snapshot_json, '$.schemaVersion') AS INTEGER)
                     END, 0),
                 sub.trial_hours, sub.trial_token_limit,
-                (SELECT contract.trial_seconds_remaining
-                 FROM market_service_contracts contract
-                 WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
-                   AND contract.status != 'terminated'
-                 ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
+                COALESCE(
+                    (SELECT contract.trial_seconds_remaining
+                     FROM market_service_contracts contract
+                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                       AND contract.status != 'terminated'
+                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1),
+                    (SELECT CASE
+                         WHEN contract.status IN ('pending_activation', 'trial')
+                         THEN contract.trial_seconds_remaining
+                         ELSE 0
+                     END
+                     FROM market_recurring_contracts contract
+                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                       AND contract.status NOT IN ('ended', 'activation_failed')
+                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
+                ),
+                sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
+                sub.recurring_contract_id
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -4312,6 +4452,10 @@ fn catalog_subscription_records(
                         trial_hours: row.get(40)?,
                         trial_token_limit: row.get(41)?,
                         contract_trial_seconds_remaining: row.get(42)?,
+                        pricing_model: row.get(43)?,
+                        cycle_price_minor: row.get(44)?,
+                        billing_interval: row.get(45)?,
+                        recurring_contract_id: row.get(46)?,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -4329,6 +4473,9 @@ struct CatalogSeatRecord {
     token_limit: Option<i64>,
     token_period_json: String,
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    cycle_price_minor: Option<i64>,
+    billing_interval: Option<String>,
     currency: Option<String>,
     service_duration_days: Option<i64>,
     trial_hours: Option<i64>,
@@ -4515,6 +4662,14 @@ fn listing_delete_capability_tx(
                     WHERE subscription.listing_id = ?1
                       AND contract.product_kind = 'share'
                       AND contract.status != 'terminated'
+                ) OR EXISTS (
+                    SELECT 1
+                    FROM market_recurring_contracts contract
+                    JOIN share_market_subscriptions subscription
+                      ON subscription.id = contract.product_ref
+                    WHERE subscription.listing_id = ?1
+                      AND contract.product_kind = 'share'
+                      AND contract.status NOT IN ('ended', 'activation_failed')
                 )",
             params![listing_id],
             |row| {
@@ -4556,6 +4711,7 @@ fn catalog_seats(
                 seat.trial_hours, seat.trial_token_limit,
                 seat.offer_revision, seat.current_subscription_id,
                 seat.retired_subscription_id, seat.retired_at,
+                seat.pricing_model, seat.cycle_price_minor, seat.billing_interval,
                 (SELECT COUNT(*) FROM share_market_subscriptions subscription
                  WHERE subscription.seat_id = seat.id)
          FROM share_market_seats seat
@@ -4591,7 +4747,10 @@ fn catalog_seats(
                             current_subscription_id: row.get(13)?,
                             retired_subscription_id: row.get(14)?,
                             retired_at: row.get(15)?,
-                            subscription_count: row.get(16)?,
+                            pricing_model: row.get(16)?,
+                            cycle_price_minor: row.get(17)?,
+                            billing_interval: row.get(18)?,
+                            subscription_count: row.get(19)?,
                         },
                     ))
                 })?
@@ -5061,12 +5220,13 @@ fn active_price_change_view(
 }
 
 fn subscription_view(
+    conn: &Connection,
     record: SubscriptionRecord,
     viewer: Option<&AuthSession>,
     active_subdomains: &HashSet<String>,
     payment_profile: Option<&PaymentProfileSnapshot>,
     price_change: Option<&ActivePriceChangeRecord>,
-) -> SubscriptionView {
+) -> Result<SubscriptionView, AppError> {
     let is_renter = viewer.is_some_and(|session| session.user_id == record.renter_user_id);
     let is_owner = viewer.is_some_and(|session| session.user_id == record.owner_user_id);
     let (payment_method_kinds, contacts) = if is_renter || is_owner {
@@ -5118,7 +5278,12 @@ fn subscription_view(
         .termination_adjustment_json
         .as_deref()
         .and_then(|value| serde_json::from_str(value).ok());
-    SubscriptionView {
+    let recurring = if record.recurring_contract_id.is_some() {
+        crate::market_recurring::contract_view_for_product_tx(conn, "share", &record.id)?
+    } else {
+        None
+    };
+    Ok(SubscriptionView {
         id: record.id,
         seat_id: record.seat_id,
         listing_id: record.listing_id,
@@ -5146,6 +5311,10 @@ fn subscription_view(
         token_period: serde_json::from_str(&record.token_period_json)
             .unwrap_or(ShareTokenPeriod::Lifetime),
         daily_rate_minor: record.daily_rate_minor,
+        pricing_model: record.pricing_model,
+        cycle_price_minor: record.cycle_price_minor,
+        billing_interval: record.billing_interval,
+        recurring,
         currency: record.currency,
         service_duration_days: record.service_duration_days,
         trial_hours: record.trial_hours,
@@ -5169,7 +5338,7 @@ fn subscription_view(
         released_at: record.released_at,
         created_at: record.created_at,
         updated_at: record.updated_at,
-    }
+    })
 }
 
 impl AppStore {
@@ -5434,6 +5603,7 @@ impl AppStore {
                 let profile = profiles.get(&record.owner_user_id);
                 let price_change = price_changes.get(&record.id);
                 subscription_view(
+                    &conn,
                     record,
                     Some(session),
                     &active_subdomains,
@@ -5441,7 +5611,7 @@ impl AppStore {
                     price_change,
                 )
             })
-            .collect();
+            .collect::<Result<Vec<_>, AppError>>()?;
         Ok(ShareMarketSubscriptions {
             subscriptions,
             next_cursor,
@@ -5636,8 +5806,8 @@ impl AppStore {
             let seat_rows = seats_by_listing.remove(&id).unwrap_or_default();
             let mut seats = Vec::with_capacity(seat_rows.len());
             for seat in seat_rows {
-                let pricing_kind =
-                    crate::market_access::pricing_kind_for_rate(seat.daily_rate_minor);
+                let offer_price_minor = seat.cycle_price_minor.or(seat.daily_rate_minor);
+                let pricing_kind = crate::market_access::pricing_kind_for_rate(offer_price_minor);
                 let eligibility_key = (
                     owner_user_id.clone(),
                     pricing_kind.to_string(),
@@ -5659,7 +5829,7 @@ impl AppStore {
                                 &session.user_id,
                                 &session.email,
                                 crate::market_access::PRODUCT_SHARE,
-                                seat.daily_rate_minor,
+                                offer_price_minor,
                                 seat.currency.as_deref(),
                             )?;
                             eligibility_by_supplier_pricing
@@ -5683,17 +5853,20 @@ impl AppStore {
                     seat.subscription_count,
                     subscription_record.as_ref(),
                 );
-                let subscription = subscription_record.map(|record| {
-                    let payment_profile = payment_profiles.get(&record.owner_user_id);
-                    let price_change = price_changes.get(&record.id);
-                    subscription_view(
-                        record,
-                        viewer,
-                        &active_subdomains,
-                        payment_profile,
-                        price_change,
-                    )
-                });
+                let subscription = subscription_record
+                    .map(|record| {
+                        let payment_profile = payment_profiles.get(&record.owner_user_id);
+                        let price_change = price_changes.get(&record.id);
+                        subscription_view(
+                            &conn,
+                            record,
+                            viewer,
+                            &active_subdomains,
+                            payment_profile,
+                            price_change,
+                        )
+                    })
+                    .transpose()?;
                 let base_rent_prerequisites = viewer.is_some_and(|session| {
                     status == "active"
                         && share_status == "active"
@@ -5753,16 +5926,19 @@ impl AppStore {
                     token_period: serde_json::from_str(&seat.token_period_json)
                         .unwrap_or(ShareTokenPeriod::Lifetime),
                     daily_rate_minor: seat.daily_rate_minor,
+                    pricing_model: seat.pricing_model,
+                    cycle_price_minor: seat.cycle_price_minor,
+                    billing_interval: seat.billing_interval,
                     currency: seat.currency,
                     service_duration_days: seat
                         .service_duration_days
                         .and_then(|value| u32::try_from(value).ok()),
-                    trial_hours: if seat.daily_rate_minor.is_some() {
+                    trial_hours: if offer_price_minor.is_some() {
                         Some(seat.trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
                     } else {
                         None
                     },
-                    trial_token_limit: if seat.daily_rate_minor.is_some() {
+                    trial_token_limit: if offer_price_minor.is_some() {
                         Some(
                             seat.trial_token_limit
                                 .and_then(|value| u64::try_from(value).ok())
@@ -5772,7 +5948,7 @@ impl AppStore {
                         None
                     },
                     offer_revision: seat.offer_revision,
-                    is_free: seat.daily_rate_minor.is_none(),
+                    is_free: offer_price_minor.is_none(),
                     can_rent,
                     rent_prerequisites_met: base_rent_prerequisites,
                     seller_approval_required,
@@ -5861,6 +6037,7 @@ impl AppStore {
                 let payment_profile = payment_profiles.get(&record.owner_user_id);
                 let price_change = price_changes.get(&record.id);
                 subscription_view(
+                    &conn,
                     record,
                     viewer,
                     &active_subdomains,
@@ -5868,7 +6045,7 @@ impl AppStore {
                     price_change,
                 )
             })
-            .collect();
+            .collect::<Result<Vec<_>, AppError>>()?;
         Ok(ShareMarketCatalog {
             listings,
             my_subscriptions,
@@ -6132,8 +6309,10 @@ fn insert_seat_tx(
             id, listing_id, position, status, parallel_limit, token_limit,
             token_period_json, daily_rate_minor, currency, service_duration_days,
             trial_hours, trial_token_limit,
-            offer_revision, current_subscription_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, 'available', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, NULL, ?12, ?12)",
+            offer_revision, current_subscription_id, created_at, updated_at,
+            pricing_model, cycle_price_minor, billing_interval
+         ) VALUES (?1, ?2, ?3, 'available', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                   1, NULL, ?12, ?12, ?13, ?14, ?15)",
         params![
             id,
             listing_id,
@@ -6148,6 +6327,9 @@ fn insert_seat_tx(
             seat.trial_token_limit
                 .and_then(|value| i64::try_from(value).ok()),
             now,
+            seat.pricing_model,
+            seat.cycle_price_minor,
+            seat.billing_interval,
         ],
     )
     .map_err(map_db("insert Share Market seat"))?;
@@ -6804,6 +6986,7 @@ impl AppStore {
                      SET status = 'available', parallel_limit = ?3, token_limit = ?4,
                          token_period_json = ?5, daily_rate_minor = ?6, currency = ?7,
                          service_duration_days = ?8, trial_hours = ?9, trial_token_limit = ?10,
+                         pricing_model = ?13, cycle_price_minor = ?14, billing_interval = ?15,
                          offer_revision = offer_revision + 1,
                          updated_at = ?11
                      WHERE id = ?1 AND listing_id = ?2 AND status = 'disabled'
@@ -6823,6 +7006,9 @@ impl AppStore {
                             .and_then(|value| i64::try_from(value).ok()),
                         now,
                         expected_revision,
+                        seat.pricing_model,
+                        seat.cycle_price_minor,
+                        seat.billing_interval,
                     ],
                 )
                 .map_err(map_db("republish stopped Share seat"))?;
@@ -7008,6 +7194,7 @@ impl AppStore {
              SET parallel_limit = ?2, token_limit = ?3, token_period_json = ?4,
                  daily_rate_minor = ?5, currency = ?6, service_duration_days = ?7,
                  trial_hours = ?8, trial_token_limit = ?9,
+                 pricing_model = ?12, cycle_price_minor = ?13, billing_interval = ?14,
                  offer_revision = offer_revision + 1, updated_at = ?10
              WHERE id = ?1 AND status = 'available' AND offer_revision = ?11",
                 params![
@@ -7023,6 +7210,9 @@ impl AppStore {
                         .and_then(|value| i64::try_from(value).ok()),
                     now,
                     input.offer_revision,
+                    seat.pricing_model,
+                    seat.cycle_price_minor,
+                    seat.billing_interval,
                 ],
             )
             .map_err(map_db("update Share seat"))?;
@@ -8098,6 +8288,9 @@ impl AppStore {
             String,
             Option<i64>,
             Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
             Option<i64>,
             Option<i64>,
             Option<i64>,
@@ -8118,6 +8311,7 @@ impl AppStore {
                         listing.owner_user_id, listing.owner_email, listing.status,
                         seat.position, seat.offer_revision, seat.parallel_limit, seat.token_limit,
                         seat.token_period_json, seat.daily_rate_minor, seat.currency,
+                        seat.pricing_model, seat.cycle_price_minor, seat.billing_interval,
                         seat.service_duration_days, seat.trial_hours, seat.trial_token_limit,
                         COALESCE(share.user_grants_json, '{}'),
                         COALESCE(share.bindings_json, '{}'),
@@ -8139,7 +8333,7 @@ impl AppStore {
                         row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
                         row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?,
                         row.get(20)?, row.get(21)?, row.get(22)?, row.get(23)?, row.get(24)?,
-                        row.get(25)?, row.get(26)?,
+                        row.get(25)?, row.get(26)?, row.get(27)?, row.get(28)?, row.get(29)?,
                     ))
                 },
             )
@@ -8159,6 +8353,9 @@ impl AppStore {
             token_period_json,
             daily_rate_minor,
             currency,
+            pricing_model,
+            cycle_price_minor,
+            billing_interval,
             service_duration_days,
             trial_hours,
             trial_token_limit,
@@ -8221,20 +8418,21 @@ impl AppStore {
                 serde_json::json!({ "reason": "direct_access" }),
             ));
         }
+        let offer_price_minor = cycle_price_minor.or(daily_rate_minor);
         crate::market_access::ensure_product_access_tx(
             &tx,
             &owner_user_id,
             &session.user_id,
             &session.email,
             crate::market_access::PRODUCT_SHARE,
-            crate::market_access::pricing_kind_for_rate(daily_rate_minor),
+            crate::market_access::pricing_kind_for_rate(offer_price_minor),
         )?;
-        let quoted_trial_hours = if daily_rate_minor.is_some() {
+        let quoted_trial_hours = if offer_price_minor.is_some() {
             Some(trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
         } else {
             None
         };
-        let quoted_trial_token_limit = if daily_rate_minor.is_some() {
+        let quoted_trial_token_limit = if offer_price_minor.is_some() {
             Some(
                 trial_token_limit
                     .and_then(|value| u64::try_from(value).ok())
@@ -8243,42 +8441,66 @@ impl AppStore {
         } else {
             None
         };
-        let (trial_seconds_remaining, funding) = if let Some(daily_rate_minor) = daily_rate_minor {
-            let quote_currency = currency
-                .as_deref()
-                .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
-            crate::market_billing::ensure_credit_allowed_tx(
-                &tx,
-                &session.user_id,
-                &session.email,
-                &owner_user_id,
-                crate::market_access::PRODUCT_SHARE,
-                quote_currency,
-            )?;
-            let trial_seconds_remaining = crate::market_billing::trial_seconds_remaining_tx(
-                &tx,
-                &session.user_id,
-                &owner_user_id,
-                crate::market_access::PRODUCT_SHARE,
-                &share_id,
-                quote_currency,
-                trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
-            )?;
-            let funding = crate::market_billing::market_funding_summary_tx(
-                &tx,
-                &session.user_id,
-                &session.email,
-                &owner_user_id,
-                &owner_email,
-                crate::market_access::PRODUCT_SHARE,
-                quote_currency,
-                daily_rate_minor,
-                &now,
-            )?;
-            (trial_seconds_remaining, Some(funding))
-        } else {
-            (0, None)
-        };
+        let (trial_seconds_remaining, funding, recurring_funding) =
+            if let Some(cycle_price_minor) = cycle_price_minor {
+                let quote_currency = currency
+                    .as_deref()
+                    .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
+                let trial_seconds_remaining = crate::market_billing::trial_seconds_remaining_tx(
+                    &tx,
+                    &session.user_id,
+                    &owner_user_id,
+                    crate::market_access::PRODUCT_SHARE,
+                    &share_id,
+                    quote_currency,
+                    trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
+                )?;
+                let recurring_funding = crate::market_recurring::recurring_funding_summary_tx(
+                    &tx,
+                    &session.user_id,
+                    &owner_user_id,
+                    &owner_email,
+                    quote_currency,
+                    cycle_price_minor,
+                    crate::market_recurring::RENEWAL_MANUAL,
+                )?;
+                (trial_seconds_remaining, None, Some(recurring_funding))
+            } else if let Some(daily_rate_minor) = daily_rate_minor {
+                let quote_currency = currency
+                    .as_deref()
+                    .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
+                crate::market_billing::ensure_credit_allowed_tx(
+                    &tx,
+                    &session.user_id,
+                    &session.email,
+                    &owner_user_id,
+                    crate::market_access::PRODUCT_SHARE,
+                    quote_currency,
+                )?;
+                let trial_seconds_remaining = crate::market_billing::trial_seconds_remaining_tx(
+                    &tx,
+                    &session.user_id,
+                    &owner_user_id,
+                    crate::market_access::PRODUCT_SHARE,
+                    &share_id,
+                    quote_currency,
+                    trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
+                )?;
+                let funding = crate::market_billing::market_funding_summary_tx(
+                    &tx,
+                    &session.user_id,
+                    &session.email,
+                    &owner_user_id,
+                    &owner_email,
+                    crate::market_access::PRODUCT_SHARE,
+                    quote_currency,
+                    daily_rate_minor,
+                    &now,
+                )?;
+                (trial_seconds_remaining, Some(funding), None)
+            } else {
+                (0, None, None)
+            };
         let service = build_rent_service_snapshot(
             &bindings_json,
             app_runtimes_json.as_deref(),
@@ -8341,6 +8563,9 @@ impl AppStore {
             token_period: serde_json::from_str(&token_period_json)
                 .unwrap_or(ShareTokenPeriod::Lifetime),
             daily_rate_minor,
+            pricing_model: pricing_model.clone(),
+            cycle_price_minor,
+            billing_interval: billing_interval.clone(),
             currency,
             service_duration_days: service_duration_days
                 .and_then(|value| u32::try_from(value).ok()),
@@ -8368,9 +8593,11 @@ impl AppStore {
             "INSERT INTO share_market_rent_quotes (
                 id, seat_id, listing_id, share_id, renter_user_id, renter_email,
                 offer_revision, snapshot_json, trial_seconds_remaining, status,
-                required_app, contract_apps_json,
+                required_app, contract_apps_json, pricing_model,
+                cycle_price_minor, billing_interval,
                 expires_at, consumed_subscription_id, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?11, ?12, NULL, ?13, ?13)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?11,
+                       ?12, ?13, ?14, ?15, NULL, ?16, ?16)",
             params![
                 quote_id,
                 seat_id,
@@ -8383,6 +8610,9 @@ impl AppStore {
                 trial_seconds_remaining,
                 service.required_app,
                 contract_apps_json,
+                pricing_model,
+                cycle_price_minor,
+                billing_interval,
                 expires_at,
                 now,
             ],
@@ -8400,6 +8630,7 @@ impl AppStore {
             expires_at,
             trial_seconds_remaining,
             funding,
+            recurring_funding,
             offer: public_snapshot,
         })
     }
@@ -8429,6 +8660,26 @@ impl AppStore {
         idempotency_key: &str,
         share_online: bool,
     ) -> Result<CommitRentQuoteResponse, AppError> {
+        self.share_market_commit_rent_quote_with_renewal_and_online_state(
+            session,
+            seat_id,
+            quote_id,
+            idempotency_key,
+            false,
+            share_online,
+        )
+        .await
+    }
+
+    async fn share_market_commit_rent_quote_with_renewal_and_online_state(
+        &self,
+        session: &AuthSession,
+        seat_id: &str,
+        quote_id: &str,
+        idempotency_key: &str,
+        auto_renew: bool,
+        share_online: bool,
+    ) -> Result<CommitRentQuoteResponse, AppError> {
         let quote_id = quote_id.trim();
         let idempotency_key = idempotency_key.trim();
         if quote_id.is_empty() {
@@ -8442,7 +8693,10 @@ impl AppStore {
                 "idempotencyKey must contain 1-128 non-control characters".into(),
             ));
         }
-        let fingerprint = format!("share-rent:{quote_id}:{seat_id}");
+        // Renewal policy is part of the purchased terms. Reusing an
+        // idempotency key with a different policy must not silently replay the
+        // first request.
+        let fingerprint = format!("share-rent-v2:{quote_id}:{seat_id}:{auto_renew}");
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
         let conn = self.conn.lock().await;
@@ -8566,6 +8820,7 @@ impl AppStore {
             Some(&metadata),
             Some(&snapshot),
             Some(trial_seconds_remaining),
+            auto_renew,
             &now,
         )?;
         consume_share_rent_quote_tx(&tx, quote_id, &subscription_id, &session.user_id, &now)?;
@@ -8625,8 +8880,9 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin rent Share seat"))?;
-        let subscription_id = self
-            .share_market_rent_seat_tx(&tx, session, seat_id, input, metadata, None, None, &now)?;
+        let subscription_id = self.share_market_rent_seat_tx(
+            &tx, session, seat_id, input, metadata, None, None, false, &now,
+        )?;
         tx.commit().map_err(map_db("commit Share seat rental"))?;
         Ok(subscription_id)
     }
@@ -8812,7 +9068,85 @@ impl AppStore {
                 i64::MAX,
                 &now,
             )?;
+        } else if let Some(cycle_price_minor) = record.cycle_price_minor {
+            if record.pricing_model != crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+                || record.billing_interval.as_deref()
+                    != Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH)
+            {
+                return Err(AppError::Internal(
+                    "monthly Share subscription has inconsistent billing terms".into(),
+                ));
+            }
+            let currency = record.currency.as_deref().ok_or_else(|| {
+                AppError::Internal("paid Share subscription currency is missing".into())
+            })?;
+            let (renewal_policy, max_price, renewal_priority) = tx
+                .query_row(
+                    "SELECT renewal_policy, auto_renew_max_price_minor, renewal_priority
+                     FROM market_recurring_contracts
+                     WHERE product_kind = 'share' AND product_ref = ?1
+                       AND status = 'activation_failed'
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    params![subscription_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db("read failed Share recurring reservation"))?
+                .ok_or_else(|| {
+                    AppError::Conflict(
+                        "the failed Share monthly billing reservation is missing".into(),
+                    )
+                })?;
+            let trial_allowance_seconds = crate::market_billing::trial_seconds_remaining_tx(
+                &tx,
+                &record.renter_user_id,
+                &record.owner_user_id,
+                crate::market_access::PRODUCT_SHARE,
+                &record.share_id,
+                currency,
+                trial_seconds_from_hours(record.trial_hours.unwrap_or(0))?,
+            )?;
+            let recurring_contract_id = crate::market_recurring::prepare_contract_tx(
+                &tx,
+                crate::market_recurring::PrepareRecurringContractInput {
+                    product_kind: "share",
+                    product_ref: &record.id,
+                    activation_ref: &record.id,
+                    service_ref: &record.share_id,
+                    service_label: &record.share_name,
+                    buyer_user_id: &record.renter_user_id,
+                    buyer_email: &record.renter_email,
+                    supplier_user_id: &record.owner_user_id,
+                    supplier_email: &record.owner_email,
+                    currency,
+                    cycle_price_minor,
+                    offer_revision: record.offer_revision,
+                    renewal_policy: &renewal_policy,
+                    auto_renew_max_price_minor: max_price,
+                    renewal_priority,
+                    trial_allowance_seconds,
+                },
+                &now,
+            )?;
+            tx.execute(
+                "UPDATE share_market_subscriptions
+                 SET recurring_contract_id = ?2 WHERE id = ?1",
+                params![subscription_id, recurring_contract_id],
+            )
+            .map_err(map_db("link retried Share recurring contract"))?;
         }
+        // Refresh the contract projection before rebuilding the managed grant.
+        // In particular, a retried paid contract must restore its trial token
+        // policy from the newly reserved billing contract rather than using the
+        // stale, already-failed subscription snapshot above.
+        let record = subscription_record(&tx, subscription_id)?
+            .ok_or_else(|| AppError::NotFound("Share subscription not found".into()))?;
         let policy = contract_policy(&record)?;
         let policy_json = serde_json::to_string(&policy).map_err(|error| {
             AppError::Internal(format!("encode retried Share grant policy failed: {error}"))
@@ -8884,6 +9218,7 @@ impl AppStore {
         metadata: Option<&RentCommitMetadata>,
         quote_snapshot: Option<&RentQuoteSnapshot>,
         quoted_trial_seconds: Option<i64>,
+        auto_renew: bool,
         now: &str,
     ) -> Result<String, AppError> {
         #[allow(clippy::type_complexity)]
@@ -8902,6 +9237,9 @@ impl AppStore {
             Option<i64>,
             Option<String>,
             Option<i64>,
+            String,
+            Option<i64>,
+            Option<String>,
             Option<i64>,
             Option<i64>,
             String,
@@ -8924,6 +9262,7 @@ impl AppStore {
                         seat.offer_revision,
                         seat.parallel_limit, seat.token_limit, seat.token_period_json,
                         seat.daily_rate_minor, seat.currency, seat.service_duration_days,
+                        seat.pricing_model, seat.cycle_price_minor, seat.billing_interval,
                         seat.trial_hours, seat.trial_token_limit,
                         COALESCE(s.user_grants_json, '{}'),
                         COALESCE(s.share_name, listing.share_id), listing.installation_id,
@@ -8970,6 +9309,9 @@ impl AppStore {
                         row.get(26)?,
                         row.get(27)?,
                         row.get(28)?,
+                        row.get(29)?,
+                        row.get(30)?,
+                        row.get(31)?,
                     ))
                 },
             )
@@ -8990,6 +9332,9 @@ impl AppStore {
             daily_rate_minor,
             currency,
             service_duration_days,
+            pricing_model,
+            cycle_price_minor,
+            billing_interval,
             trial_hours,
             trial_token_limit,
             grants_json,
@@ -9032,7 +9377,7 @@ impl AppStore {
             &session.user_id,
             &session.email,
             crate::market_access::PRODUCT_SHARE,
-            crate::market_access::pricing_kind_for_rate(daily_rate_minor),
+            crate::market_access::pricing_kind_for_rate(cycle_price_minor.or(daily_rate_minor)),
         )?;
         let already_renting = tx
             .query_row(
@@ -9060,19 +9405,21 @@ impl AppStore {
                 "this account already has direct Share access".into(),
             ));
         }
-        if daily_rate_minor.is_some() {
+        if cycle_price_minor.is_some() || daily_rate_minor.is_some() {
             ensure_payment_profile_tx(&tx, &owner_user_id)?;
             let currency = currency
                 .as_deref()
                 .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
-            crate::market_billing::ensure_credit_allowed_tx(
-                &tx,
-                &session.user_id,
-                &session.email,
-                &owner_user_id,
-                crate::market_access::PRODUCT_SHARE,
-                currency,
-            )?;
+            if daily_rate_minor.is_some() {
+                crate::market_billing::ensure_credit_allowed_tx(
+                    &tx,
+                    &session.user_id,
+                    &session.email,
+                    &owner_user_id,
+                    crate::market_access::PRODUCT_SHARE,
+                    currency,
+                )?;
+            }
         }
         let service_duration_days = service_duration_days
             .map(|days| {
@@ -9086,19 +9433,20 @@ impl AppStore {
                 Ok(days)
             })
             .transpose()?;
-        let free_usage_seconds = if daily_rate_minor.is_none() {
+        let offer_price_minor = cycle_price_minor.or(daily_rate_minor);
+        let free_usage_seconds = if offer_price_minor.is_none() {
             service_duration_days.map(|days| i64::from(days) * 86_400)
         } else {
             None
         };
         let token_period: ShareTokenPeriod = serde_json::from_str(&token_period_json)
             .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
-        let rented_trial_hours = if daily_rate_minor.is_some() {
+        let rented_trial_hours = if offer_price_minor.is_some() {
             Some(trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
         } else {
             None
         };
-        let rented_trial_token_limit = if daily_rate_minor.is_some() {
+        let rented_trial_token_limit = if offer_price_minor.is_some() {
             Some(
                 trial_token_limit
                     .and_then(|value| u64::try_from(value).ok())
@@ -9114,6 +9462,9 @@ impl AppStore {
             token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
             token_period,
             daily_rate_minor,
+            pricing_model: pricing_model.clone(),
+            cycle_price_minor,
+            billing_interval: billing_interval.clone(),
             currency: currency.clone(),
             service_duration_days,
             trial_hours: rented_trial_hours,
@@ -9188,7 +9539,7 @@ impl AppStore {
             serde_json::to_string(&current_service.supported_apps).map_err(|error| {
                 AppError::Internal(format!("encode Share contract Apps failed: {error}"))
             })?;
-        let grant_token_limit = if daily_rate_minor.is_some()
+        let grant_token_limit = if offer_price_minor.is_some()
             && rented_trial_hours.unwrap_or(0) > 0
             && quoted_trial_seconds.unwrap_or(i64::MAX) > 0
         {
@@ -9216,10 +9567,11 @@ impl AppStore {
                 activated_at, expires_at, created_at, updated_at, released_at,
                 free_usage_seconds, rent_quote_id, idempotency_key, request_fingerprint,
                 required_app, service_snapshot_json, contract_apps_json
+                , pricing_model, cycle_price_minor, billing_interval, recurring_contract_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'grant_pending',
                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                        NULL, NULL, ?20, ?21, ?21, NULL, ?22, ?23, ?24, ?25,
-                       ?26, ?27, ?28)",
+                       ?26, ?27, ?28, ?29, ?30, ?31, NULL)",
             params![
                 subscription_id,
                 seat_id,
@@ -9249,6 +9601,9 @@ impl AppStore {
                 current_service.required_app,
                 service_snapshot_json,
                 contract_apps_json,
+                pricing_model,
+                cycle_price_minor,
+                billing_interval,
             ],
         )
         .map_err(|error| {
@@ -9258,7 +9613,44 @@ impl AppStore {
                 AppError::Internal(format!("create Share subscription failed: {error}"))
             }
         })?;
-        if let Some(daily_rate_minor) = daily_rate_minor {
+        if let Some(cycle_price_minor) = cycle_price_minor {
+            let currency = currency
+                .as_deref()
+                .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
+            let recurring_contract_id = crate::market_recurring::prepare_contract_tx(
+                tx,
+                crate::market_recurring::PrepareRecurringContractInput {
+                    product_kind: "share",
+                    product_ref: &subscription_id,
+                    activation_ref: &subscription_id,
+                    service_ref: &share_id,
+                    service_label: &share_name,
+                    buyer_user_id: &session.user_id,
+                    buyer_email: &session.email,
+                    supplier_user_id: &owner_user_id,
+                    supplier_email: &owner_email,
+                    currency,
+                    cycle_price_minor,
+                    offer_revision,
+                    renewal_policy: if auto_renew {
+                        crate::market_recurring::RENEWAL_AUTOMATIC
+                    } else {
+                        crate::market_recurring::RENEWAL_MANUAL
+                    },
+                    auto_renew_max_price_minor: Some(cycle_price_minor),
+                    renewal_priority: 0,
+                    trial_allowance_seconds: quoted_trial_seconds
+                        .unwrap_or(trial_seconds_from_hours(rented_trial_hours.unwrap_or(0))?),
+                },
+                now,
+            )?;
+            tx.execute(
+                "UPDATE share_market_subscriptions
+                 SET recurring_contract_id = ?2 WHERE id = ?1",
+                params![subscription_id, recurring_contract_id],
+            )
+            .map_err(map_db("link Share recurring contract"))?;
+        } else if let Some(daily_rate_minor) = daily_rate_minor {
             let currency = currency
                 .as_deref()
                 .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
@@ -9316,7 +9708,9 @@ impl AppStore {
             Some(&subscription_id),
             Some(session),
             "seat_rented",
-            serde_json::json!({ "free": daily_rate_minor.is_none() }),
+            serde_json::json!({
+                "free": cycle_price_minor.or(daily_rate_minor).is_none()
+            }),
             &now,
         )?;
         Ok(subscription_id)
@@ -9352,11 +9746,12 @@ impl AppStore {
             Option<i64>,
             Option<i64>,
             Option<String>,
+            String,
         )> = tx
             .query_row(
                 "SELECT share_id, seat_id, listing_id, entitlement_id, owner_user_id,
                         renter_user_id, renter_email, status, daily_rate_minor,
-                        service_duration_days, service_started_at
+                        service_duration_days, service_started_at, pricing_model
                  FROM share_market_subscriptions
                  WHERE id = ?1 AND status NOT IN ('released', 'grant_failed')",
                 params![subscription_id],
@@ -9373,6 +9768,7 @@ impl AppStore {
                         row.get(8)?,
                         row.get(9)?,
                         row.get(10)?,
+                        row.get(11)?,
                     ))
                 },
             )
@@ -9390,6 +9786,7 @@ impl AppStore {
             daily_rate_minor,
             service_duration_days,
             service_started_at,
+            pricing_model,
         )) = row
         else {
             return Err(AppError::NotFound("active subscription not found".into()));
@@ -9403,6 +9800,49 @@ impl AppStore {
             return Err(AppError::Forbidden(
                 "subscription does not belong to this account".into(),
             ));
+        }
+        if !owner_override
+            && pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+            && crate::market_recurring::cancel_at_period_end_for_product_tx(
+                &tx,
+                "share",
+                subscription_id,
+                &session.user_id,
+                &now,
+            )?
+        {
+            let ended = tx
+                .query_row(
+                    "SELECT status = 'ended' FROM market_recurring_contracts
+                     WHERE product_kind = 'share' AND product_ref = ?1
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![subscription_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .map_err(map_db("read scheduled Share cancellation"))?
+                .unwrap_or(false);
+            event_tx(
+                &tx,
+                Some(&listing_id),
+                Some(&seat_id),
+                Some(subscription_id),
+                Some(session),
+                if ended {
+                    "renter_release_requested"
+                } else {
+                    "rental_cancelled_at_period_end"
+                },
+                serde_json::json!({
+                    "reason": if ended { "trial_cancelled" } else { "cancel_at_period_end" },
+                }),
+                &now,
+            )?;
+            if !ended {
+                tx.commit()
+                    .map_err(map_db("commit Share period-end cancellation"))?;
+                return Ok(());
+            }
         }
         if owner_override
             && daily_rate_minor.is_some()
@@ -9423,6 +9863,19 @@ impl AppStore {
         } else {
             "renter_release"
         };
+        if owner_override
+            && pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+        {
+            apply_automatic_supplier_termination_refund_tx(&tx, subscription_id, reason, &now)?;
+        } else {
+            crate::market_recurring::terminate_contract_tx(
+                &tx,
+                "share",
+                subscription_id,
+                reason,
+                &now,
+            )?;
+        }
         crate::market_billing::terminate_contract_tx(&tx, "share", subscription_id, reason, &now)?;
         // Retire stuck pending/dispatched grant edits so revoke can dispatch, or so
         // never-dispatched grants can finish without waiting on an offline Client.
@@ -9900,6 +10353,14 @@ async fn quote_seat(
             .map(str::to_string);
         funding.topup_available = funding.topup_unavailable_reason.is_none();
     }
+    if let Some(funding) = quote.recurring_funding.as_mut() {
+        funding.topup_unavailable_reason = state
+            .binance_settlement
+            .supplier_funding_unavailable_reason(&state.store, &funding.supplier_user_id)
+            .await?
+            .map(str::to_string);
+        funding.topup_available = funding.topup_unavailable_reason.is_none();
+    }
     Ok(Json(quote))
 }
 
@@ -9915,11 +10376,12 @@ async fn rent_seat(
         .unwrap_or(false);
     let response = state
         .store
-        .share_market_commit_rent_quote_with_online_state(
+        .share_market_commit_rent_quote_with_renewal_and_online_state(
             &session,
             &seat_id,
             &input.quote_id,
             &input.idempotency_key,
+            input.auto_renew,
             share_online,
         )
         .await?;
@@ -10328,6 +10790,7 @@ fn reject_unfulfillable_activation_tx(
     now: &str,
 ) -> Result<(), AppError> {
     crate::market_billing::terminate_contract_tx(conn, "share", &record.id, reason, now)?;
+    crate::market_recurring::fail_activation_tx(conn, "share", &record.id, reason, now)?;
     let retired = retire_unconfirmed_grant_tx(conn, &record.id, reason, now)?;
     let grants_json = conn
         .query_row(
@@ -10411,7 +10874,9 @@ fn activate_granted_subscription_tx(
                 })
         })
         .transpose()?;
-    let status = if record.daily_rate_minor.is_some() {
+    let status = if record.cycle_price_minor.is_some() {
+        SUB_ACTIVE_PREPAID
+    } else if record.daily_rate_minor.is_some() {
         SUB_ACTIVE_POSTPAID
     } else {
         SUB_ACTIVE_FREE
@@ -10461,6 +10926,31 @@ fn activate_granted_subscription_tx(
             )?;
             return Ok(());
         }
+    }
+    if record.cycle_price_minor.is_some()
+        && crate::market_recurring::activate_contract_tx(
+            conn,
+            "share",
+            &record.id,
+            &record.id,
+            &record.share_id,
+            &record.share_name,
+            parse_time(&service_started_at)?,
+            now,
+        )?
+        .is_none()
+    {
+        request_revoke_tx(
+            conn,
+            &record.id,
+            &record.share_id,
+            &record.seat_id,
+            &record.entitlement_id,
+            &record.renter_email,
+            "monthly_billing_reservation_unavailable_before_activation",
+            now,
+        )?;
+        return Ok(());
     }
     if record.daily_rate_minor.is_some()
         && !crate::market_billing::activate_reserved_contract_tx(
@@ -10520,7 +11010,7 @@ fn activate_granted_subscription_tx(
         None,
         "entitlement_activated",
         serde_json::json!({
-            "free": record.daily_rate_minor.is_none(),
+            "free": record.cycle_price_minor.is_none() && record.daily_rate_minor.is_none(),
             "serviceDurationDays": record.service_duration_days,
             "serviceStartedAt": service_started_at,
             "expiresAt": expires_at,
@@ -10815,6 +11305,7 @@ fn finish_release_tx(
     now: &str,
 ) -> Result<(), AppError> {
     crate::market_billing::terminate_contract_tx(tx, "share", subscription_id, reason, now)?;
+    crate::market_recurring::terminate_contract_tx(tx, "share", subscription_id, reason, now)?;
     let released = tx
         .execute(
             "UPDATE share_market_subscriptions
@@ -11229,6 +11720,17 @@ fn apply_automatic_supplier_termination_refund_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
+    if crate::market_recurring::supplier_terminate_and_refund_tx(
+        conn,
+        "share",
+        subscription_id,
+        reason,
+        now,
+    )?
+    .is_some()
+    {
+        return Ok(());
+    }
     let terms = conn
         .query_row(
             "SELECT daily_rate_minor, service_duration_days, service_started_at, expires_at
@@ -11676,7 +12178,9 @@ impl AppStore {
                         continue;
                     }
                     confirm_control_effect_tx(&tx, &record.id, "upsert", &now)?;
-                    let active_status = if record.daily_rate_minor.is_some() {
+                    let active_status = if record.cycle_price_minor.is_some() {
+                        SUB_ACTIVE_PREPAID
+                    } else if record.daily_rate_minor.is_some() {
                         SUB_ACTIVE_POSTPAID
                     } else {
                         SUB_ACTIVE_FREE
@@ -11820,8 +12324,10 @@ impl AppStore {
                 )?;
                 continue;
             }
-            if record.status == SUB_ACTIVE_POSTPAID
-                && record.daily_rate_minor.is_some()
+            if matches!(
+                record.status.as_str(),
+                SUB_ACTIVE_POSTPAID | SUB_ACTIVE_PREPAID
+            ) && (record.daily_rate_minor.is_some() || record.cycle_price_minor.is_some())
                 && record.trial_hours.unwrap_or(0) > 0
                 && record.contract_trial_seconds_remaining == Some(0)
             {
@@ -12454,6 +12960,13 @@ pub(crate) fn handle_control_edit_ack_with_effect(
                 "entitlement_grant_failed",
                 now,
             )?;
+            crate::market_recurring::fail_activation_tx(
+                conn,
+                "share",
+                &subscription_id,
+                "entitlement_grant_failed",
+                now,
+            )?;
             retire_seat(conn, &seat_id, &subscription_id, now)?;
             enqueue_subscription_lifecycle_event_tx(
                 conn,
@@ -12811,7 +13324,10 @@ pub async fn resume_after_billing(
             tx.commit()
                 .map_err(map_db("commit expired Share billing resume"))?;
         } else {
-            if row.5 == SUB_BILLING_RESUME_PENDING || row.5 == SUB_ACTIVE_POSTPAID {
+            if row.5 == SUB_BILLING_RESUME_PENDING
+                || row.5 == SUB_ACTIVE_POSTPAID
+                || row.5 == SUB_ACTIVE_PREPAID
+            {
                 tx.commit()
                     .map_err(map_db("commit idempotent Share billing resume"))?;
                 return Ok(());
@@ -13125,6 +13641,7 @@ mod tests {
             token_limit: Some(10_000),
             token_period: ShareTokenPeriod::Day,
             daily_rate_minor: None,
+            cycle_price_minor: None,
             currency: None,
             service_duration_days: Some(1),
             trial_hours: None,
@@ -13137,6 +13654,18 @@ mod tests {
             daily_rate_minor: Some(1_200),
             currency: Some("USD".into()),
             service_duration_days: None,
+            ..free_seat()
+        }
+    }
+
+    fn monthly_seat() -> SeatInput {
+        SeatInput {
+            daily_rate_minor: None,
+            cycle_price_minor: Some(1_200),
+            currency: Some("USD".into()),
+            service_duration_days: None,
+            trial_hours: Some(1),
+            trial_token_limit: Some(250),
             ..free_seat()
         }
     }
@@ -15446,6 +15975,9 @@ mod tests {
             token_limit: Some(40_000),
             token_period: ShareTokenPeriod::SevenDays,
             daily_rate_minor: Some(1_200),
+            pricing_model: crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into(),
+            cycle_price_minor: None,
+            billing_interval: None,
             currency: Some("USD".into()),
             service_duration_days: Some(30),
             trial_hours: Some(12),
@@ -17282,6 +17814,172 @@ mod tests {
         assert_eq!(contract.3, crate::market_billing::TRIAL_SECONDS);
         assert_eq!(contract.4, 1_200);
         assert_eq!(contract.5, "USD");
+    }
+
+    #[tokio::test]
+    async fn monthly_trial_tokens_refresh_to_the_paid_policy_after_trial() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-monthly-trial", "owner-monthly-trial@example.com");
+        let renter = session("renter-monthly-trial", "renter-monthly-trial@example.com");
+        configure_payment_profile(
+            &store,
+            &owner,
+            "account-monthly-trial",
+            "profile-monthly-trial",
+        )
+        .await;
+        insert_share(
+            &store,
+            "share-monthly-trial",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-monthly-trial", monthly_seat()).await;
+        {
+            let now = Utc::now().to_rfc3339();
+            let conn = store.conn.lock().await;
+            let tx = conn.transaction().expect("begin monthly Share funding");
+            let account_id = crate::market_billing::ensure_market_prepaid_account_tx(
+                &tx,
+                &renter.user_id,
+                &renter.email,
+                &owner.user_id,
+                &owner.email,
+                crate::market_billing::MARKET_CURRENCY,
+                &now,
+            )
+            .expect("create monthly Share prepaid account");
+            crate::market_billing::credit_market_prepaid_funding_tx(
+                &tx,
+                &account_id,
+                1_200 * crate::market_billing::MONEY_UNITS_PER_MINOR,
+                "monthly-share-initial-funding",
+                None,
+                &now,
+            )
+            .expect("fund monthly Share first period");
+            tx.commit().expect("commit monthly Share funding");
+        }
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent monthly Share seat");
+        {
+            let conn = store.conn.lock().await;
+            let record = subscription_record(&conn, &subscription_id)
+                .expect("read pending monthly subscription")
+                .expect("pending monthly subscription");
+            assert_eq!(record.contract_trial_seconds_remaining, Some(3_600));
+            assert_eq!(grant_token_limit(&record), Some(250));
+            let policy_json: String = conn
+                .query_row(
+                    "SELECT policy_json FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'
+                     ORDER BY share_sequence DESC LIMIT 1",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read initial monthly trial policy");
+            let policy: ShareUserPolicy =
+                serde_json::from_str(&policy_json).expect("decode monthly trial policy");
+            assert_eq!(policy.token_limit, Some(250));
+        }
+
+        let activated_at = Utc::now() + Duration::seconds(1);
+        activate_subscription(&store, &subscription_id, activated_at).await;
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_ACTIVE_PREPAID
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_recurring_contracts
+                 SET trial_allowance_seconds = 3, trial_seconds_remaining = 3
+                 WHERE product_ref = ?1",
+                params![subscription_id],
+            )
+            .expect("shorten monthly trial for health boundary test");
+            conn.execute(
+                "UPDATE market_recurring_trial_claims SET claimed_seconds = 3
+                 WHERE contract_id = (
+                    SELECT id FROM market_recurring_contracts WHERE product_ref = ?1
+                 )",
+                params![subscription_id],
+            )
+            .expect("shorten monthly trial claim for health boundary test");
+            conn.execute(
+                "UPDATE market_trial_ledgers SET allowance_seconds = 3
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                   AND product_kind = 'share' AND service_ref = ?3",
+                params![renter.user_id, owner.user_id, "share-monthly-trial"],
+            )
+            .expect("shorten monthly trial ledger for health boundary test");
+        }
+        let unknown_at = activated_at + Duration::seconds(5);
+        store
+            .market_billing_reconcile(unknown_at)
+            .await
+            .expect("reconcile unknown monthly Share trial time");
+        {
+            let conn = store.conn.lock().await;
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT trial_seconds_remaining FROM market_recurring_contracts
+                     WHERE product_ref = ?1",
+                    params![subscription_id],
+                    |row| row.get(0),
+                )
+                .expect("read paused monthly healthy-service trial");
+            assert_eq!(remaining, 3);
+        }
+        let healthy_at = activated_at + Duration::seconds(10);
+        record_share_health(&store, "share-monthly-trial", healthy_at).await;
+        store
+            .market_billing_reconcile(healthy_at)
+            .await
+            .expect("finish healthy monthly Share trial");
+        let refresh_at = healthy_at + Duration::seconds(1);
+        let dispatched = store
+            .share_market_reconcile_and_dispatch(refresh_at)
+            .await
+            .expect("dispatch monthly paid token policy");
+        assert_eq!(dispatched.len(), 1);
+        {
+            let conn = store.conn.lock().await;
+            let record = subscription_record(&conn, &subscription_id)
+                .expect("read paid monthly subscription")
+                .expect("paid monthly subscription");
+            assert_eq!(record.contract_trial_seconds_remaining, Some(0));
+            assert_eq!(grant_token_limit(&record), Some(10_000));
+            let (operation_status, policy_json): (String, String) = conn
+                .query_row(
+                    "SELECT status, policy_json FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'
+                     ORDER BY share_sequence DESC LIMIT 1",
+                    params![subscription_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read refreshed monthly token policy");
+            assert_eq!(operation_status, "dispatched");
+            let policy: ShareUserPolicy =
+                serde_json::from_str(&policy_json).expect("decode monthly paid policy");
+            assert_eq!(policy.token_limit, Some(10_000));
+        }
+        set_entitlement_from_stored_policy(&store, &subscription_id, refresh_at).await;
+        assert!(
+            store
+                .share_market_reconcile_and_dispatch(refresh_at + Duration::seconds(1))
+                .await
+                .expect("confirm monthly paid token policy")
+                .is_empty()
+        );
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_ACTIVE_PREPAID
+        );
     }
 
     #[tokio::test]
@@ -20171,6 +20869,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_recurring_contract_blocks_deleting_closed_listing() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-delete-monthly", "owner-delete-monthly@example.com");
+        let renter = session("renter-delete-monthly", "renter-delete-monthly@example.com");
+        configure_payment_profile(
+            &store,
+            &owner,
+            "account-delete-monthly",
+            "profile-delete-monthly",
+        )
+        .await;
+        insert_share(
+            &store,
+            "share-delete-monthly",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-delete-monthly", monthly_seat()).await;
+        {
+            let now = Utc::now().to_rfc3339();
+            let conn = store.conn.lock().await;
+            let tx = conn.transaction().expect("begin monthly delete funding");
+            let account_id = crate::market_billing::ensure_market_prepaid_account_tx(
+                &tx,
+                &renter.user_id,
+                &renter.email,
+                &owner.user_id,
+                &owner.email,
+                crate::market_billing::MARKET_CURRENCY,
+                &now,
+            )
+            .expect("create monthly delete prepaid account");
+            crate::market_billing::credit_market_prepaid_funding_tx(
+                &tx,
+                &account_id,
+                1_200 * crate::market_billing::MONEY_UNITS_PER_MINOR,
+                "monthly-share-delete-funding",
+                None,
+                &now,
+            )
+            .expect("fund monthly delete period");
+            tx.commit().expect("commit monthly delete funding");
+        }
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent monthly delete seat");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_market_subscriptions SET status = 'grant_failed' WHERE id = ?1",
+                params![subscription_id],
+            )
+            .expect("simulate terminal subscription state");
+            conn.execute(
+                "UPDATE share_control_operations SET status = 'rejected'
+                 WHERE subscription_id = ?1",
+                params![subscription_id],
+            )
+            .expect("simulate terminal control state");
+        }
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("close listing with anomalous monthly contract");
+
+        let owner_catalog = store
+            .share_market_catalog_with_scope(Some(&owner), &[], ShareMarketCatalogScope::Owner)
+            .await
+            .expect("read monthly listing delete capability");
+        let listing = owner_catalog
+            .listings
+            .iter()
+            .find(|listing| listing.id == listing_id)
+            .expect("closed monthly listing");
+        assert!(!listing.can_delete);
+        assert_eq!(
+            listing.delete_blocked_reason.as_deref(),
+            Some("billing_active")
+        );
+        assert!(matches!(
+            store.share_market_delete_listing(&owner, &listing_id).await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn owner_can_soft_delete_closed_listing_with_only_failed_grants() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-delete-failed", "owner-delete-failed@example.com");
@@ -21686,6 +22473,163 @@ mod tests {
                 assert!(contracts.is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn failed_monthly_grant_retry_recreates_billing_and_trial_policy() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-retry-monthly", "owner-retry-monthly@example.com");
+        let renter = session("renter-retry-monthly", "renter-retry-monthly@example.com");
+        configure_payment_profile(
+            &store,
+            &owner,
+            "account-retry-monthly",
+            "profile-retry-monthly",
+        )
+        .await;
+        insert_share(
+            &store,
+            "share-retry-monthly",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) =
+            create_listing(&store, &owner, "share-retry-monthly", monthly_seat()).await;
+        {
+            let now = Utc::now().to_rfc3339();
+            let conn = store.conn.lock().await;
+            let tx = conn.transaction().expect("begin monthly retry funding");
+            let account_id = crate::market_billing::ensure_market_prepaid_account_tx(
+                &tx,
+                &renter.user_id,
+                &renter.email,
+                &owner.user_id,
+                &owner.email,
+                crate::market_billing::MARKET_CURRENCY,
+                &now,
+            )
+            .expect("create monthly retry prepaid account");
+            crate::market_billing::credit_market_prepaid_funding_tx(
+                &tx,
+                &account_id,
+                1_200 * crate::market_billing::MONEY_UNITS_PER_MINOR,
+                "monthly-share-retry-funding",
+                None,
+                &now,
+            )
+            .expect("fund monthly retry period");
+            tx.commit().expect("commit monthly retry funding");
+        }
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent monthly retry seat");
+        let original_contract_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT recurring_contract_id FROM share_market_subscriptions WHERE id = ?1",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read original monthly contract");
+
+        exhaust_control_operation(&store, &subscription_id, "upsert", Utc::now()).await;
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_GRANT_FAILED
+        );
+        let failed_status: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status FROM market_recurring_contracts WHERE id = ?1",
+                params![original_contract_id],
+                |row| row.get(0),
+            )
+            .expect("read failed monthly contract");
+        assert_eq!(failed_status, "activation_failed");
+
+        store
+            .share_market_retry_grant(&owner, &subscription_id)
+            .await
+            .expect("retry failed monthly grant");
+        store
+            .share_market_retry_grant(&owner, &subscription_id)
+            .await
+            .expect("repeat monthly grant retry idempotently");
+
+        let conn = store.conn.lock().await;
+        let record = subscription_record(&conn, &subscription_id)
+            .expect("read retried monthly subscription")
+            .expect("retried monthly subscription");
+        assert_eq!(record.status, SUB_GRANT_PENDING);
+        assert_eq!(record.contract_trial_seconds_remaining, Some(3_600));
+        assert_eq!(grant_token_limit(&record), Some(250));
+        assert_ne!(
+            record.recurring_contract_id.as_deref(),
+            Some(original_contract_id.as_str())
+        );
+        let (operation_status, policy_json): (String, String) = conn
+            .query_row(
+                "SELECT status, policy_json FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'
+                 ORDER BY share_sequence DESC LIMIT 1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read retried monthly grant policy");
+        assert_eq!(operation_status, "pending");
+        let policy: ShareUserPolicy =
+            serde_json::from_str(&policy_json).expect("decode retried monthly grant policy");
+        assert_eq!(policy.token_limit, Some(250));
+        let contracts = conn
+            .prepare(
+                "SELECT id, status FROM market_recurring_contracts
+                 WHERE product_kind = 'share' AND product_ref = ?1 ORDER BY created_at, id",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![subscription_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("read retried monthly contracts");
+        assert_eq!(contracts.len(), 2);
+        assert!(contracts.iter().any(|contract| {
+            contract.0 == original_contract_id && contract.1 == "activation_failed"
+        }));
+        assert_eq!(
+            contracts
+                .iter()
+                .filter(|contract| contract.1 == "pending_activation")
+                .count(),
+            1
+        );
+        drop(conn);
+
+        activate_subscription(&store, &subscription_id, Utc::now() + Duration::seconds(1)).await;
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_ACTIVE_PREPAID
+        );
+        let active_contract_status: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status FROM market_recurring_contracts
+                 WHERE id = (SELECT recurring_contract_id FROM share_market_subscriptions
+                             WHERE id = ?1)",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read activated retried monthly contract");
+        assert_eq!(active_contract_status, "trial");
     }
 
     #[tokio::test]

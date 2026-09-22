@@ -879,6 +879,11 @@ struct RouterSshHostView {
     host_owner_email: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     daily_rate_minor: Option<i64>,
+    pricing_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cycle_price_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    billing_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -995,7 +1000,8 @@ async fn list_hosts(
             let Some(provider_id) = host.provider_id.as_deref() else {
                 continue;
             };
-            let pricing_kind = crate::market_access::pricing_kind_for_rate(host.daily_rate_minor);
+            let price_minor = host.cycle_price_minor.or(host.daily_rate_minor);
+            let pricing_kind = crate::market_access::pricing_kind_for_rate(price_minor);
             let access_key = (provider_id.to_string(), pricing_kind.to_string());
             let eligibility_key = (
                 provider_id.to_string(),
@@ -1013,10 +1019,10 @@ async fn list_hosts(
                 &session.user_id,
                 &session.email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
-                host.daily_rate_minor,
+                price_minor,
                 host.currency
                     .as_deref()
-                    .or_else(|| host.daily_rate_minor.map(|_| "USD")),
+                    .or_else(|| price_minor.map(|_| "USD")),
             )?;
             access_by_scope
                 .entry(access_key)
@@ -1073,7 +1079,7 @@ async fn list_hosts(
                 is_host_owner,
                 host.status == HOST_STATUS_IDLE,
                 host.provider_id.as_deref(),
-                host.daily_rate_minor,
+                host.cycle_price_minor.or(host.daily_rate_minor),
                 &access_by_scope,
             );
             let eligibility = if viewer.is_none() {
@@ -1084,8 +1090,10 @@ async fn list_hosts(
                 eligibility_by_scope
                     .get(&(
                         provider_id.to_string(),
-                        crate::market_access::pricing_kind_for_rate(host.daily_rate_minor)
-                            .to_string(),
+                        crate::market_access::pricing_kind_for_rate(
+                            host.cycle_price_minor.or(host.daily_rate_minor),
+                        )
+                        .to_string(),
                         host.currency
                             .clone()
                             .map(|value| value.to_ascii_uppercase()),
@@ -1108,10 +1116,14 @@ async fn list_hosts(
                 port: reveal_operations.then_some(host.port),
                 host_owner_email: host.host_owner_email,
                 daily_rate_minor: host.daily_rate_minor,
-                currency: host
-                    .currency
-                    .clone()
-                    .or_else(|| host.daily_rate_minor.map(|_| "USD".into())),
+                pricing_model: host.pricing_model,
+                cycle_price_minor: host.cycle_price_minor,
+                billing_interval: host.billing_interval,
+                currency: host.currency.clone().or_else(|| {
+                    host.cycle_price_minor
+                        .or(host.daily_rate_minor)
+                        .map(|_| "USD".into())
+                }),
                 free_duration_days: host.free_duration_days,
                 offer_revision: host.offer_revision,
                 payment_method_kinds: host.payment_method_kinds,
@@ -1174,6 +1186,8 @@ struct CreateHostRequest {
     root_password: Option<String>,
     daily_rate_minor: Option<i64>,
     #[serde(default)]
+    cycle_price_minor: Option<i64>,
+    #[serde(default)]
     currency: Option<String>,
     #[serde(default)]
     free_duration_days: Option<u32>,
@@ -1188,6 +1202,12 @@ struct HostTransferEntry {
     note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     daily_rate_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cycle_price_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pricing_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    billing_interval: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1205,6 +1225,69 @@ struct HostTransferDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exported_at: Option<String>,
     hosts: Vec<HostTransferEntry>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NormalizedHostTransferPricing {
+    daily_rate_minor: Option<i64>,
+    cycle_price_minor: Option<i64>,
+    pricing_model: String,
+    billing_interval: Option<String>,
+    currency: Option<String>,
+    free_duration_days: Option<u32>,
+}
+
+fn normalize_host_transfer_pricing(
+    entry: &HostTransferEntry,
+) -> Result<NormalizedHostTransferPricing, AppError> {
+    let daily_rate_minor = crate::client_market_trade::validate_offer(entry.daily_rate_minor)?;
+    let cycle_price_minor =
+        crate::client_market_trade::validate_monthly_offer(entry.cycle_price_minor)?;
+    if daily_rate_minor.is_some() && cycle_price_minor.is_some() {
+        return Err(AppError::BadRequest(
+            "imported Host cannot have both dailyRateMinor and cyclePriceMinor".into(),
+        ));
+    }
+    let expected_pricing_model = if cycle_price_minor.is_some() {
+        crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+    } else if daily_rate_minor.is_some() {
+        crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+    } else {
+        crate::market_recurring::PRICING_FREE
+    };
+    if entry
+        .pricing_model
+        .as_deref()
+        .is_some_and(|model| model != expected_pricing_model)
+    {
+        return Err(AppError::BadRequest(
+            "imported Host pricingModel is inconsistent with its price".into(),
+        ));
+    }
+    let expected_billing_interval = cycle_price_minor
+        .map(|_| crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.to_string());
+    if entry.billing_interval.is_some()
+        && entry.billing_interval.as_ref() != expected_billing_interval.as_ref()
+    {
+        return Err(AppError::BadRequest(
+            "imported Host billingInterval is inconsistent with its price".into(),
+        ));
+    }
+    let price_minor = cycle_price_minor.or(daily_rate_minor);
+    let currency =
+        crate::client_market_trade::normalize_offer_currency(price_minor, entry.currency.clone())?;
+    let free_duration_days = crate::client_market_trade::validate_free_duration_days(
+        price_minor,
+        entry.free_duration_days,
+    )?;
+    Ok(NormalizedHostTransferPricing {
+        daily_rate_minor,
+        cycle_price_minor,
+        pricing_model: expected_pricing_model.into(),
+        billing_interval: expected_billing_interval,
+        currency,
+        free_duration_days,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1391,14 +1474,21 @@ async fn create_host(
             "host note cannot exceed 500 bytes".into(),
         ));
     }
-    let daily_rate_minor = crate::client_market_trade::validate_offer(input.daily_rate_minor)?;
+    if input.daily_rate_minor.is_some() {
+        return Err(AppError::BadRequest(
+            "dailyRateMinor is legacy and read-only; use cyclePriceMinor for a calendar-month offer"
+                .into(),
+        ));
+    }
+    let cycle_price_minor =
+        crate::client_market_trade::validate_monthly_offer(input.cycle_price_minor)?;
     let currency =
-        crate::client_market_trade::normalize_offer_currency(daily_rate_minor, input.currency)?;
+        crate::client_market_trade::normalize_offer_currency(cycle_price_minor, input.currency)?;
     let free_duration_days = crate::client_market_trade::validate_free_duration_days(
-        daily_rate_minor,
+        cycle_price_minor,
         input.free_duration_days,
     )?;
-    if daily_rate_minor.is_some() {
+    if cycle_price_minor.is_some() {
         let conn = state.store.conn.lock().await;
         crate::client_market_trade::require_paid_offer_setup(
             &conn,
@@ -1443,7 +1533,7 @@ async fn create_host(
         .await?;
     let host = state
         .store
-        .client_market_insert_host_for_provider(
+        .client_market_insert_host_for_provider_with_pricing(
             &session.user_id,
             &owner,
             &ip.to_string(),
@@ -1453,7 +1543,14 @@ async fn create_host(
             fingerprint.as_deref(),
             input.note.as_deref(),
             Some(&intel_json),
-            daily_rate_minor,
+            None,
+            cycle_price_minor,
+            if cycle_price_minor.is_some() {
+                crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+            } else {
+                crate::market_recurring::PRICING_FREE
+            },
+            cycle_price_minor.map(|_| crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH),
             currency.as_deref(),
             free_duration_days,
         )
@@ -1478,6 +1575,9 @@ async fn export_hosts(
             port: host.port,
             note: host.note,
             daily_rate_minor: host.daily_rate_minor,
+            cycle_price_minor: host.cycle_price_minor,
+            pricing_model: Some(host.pricing_model),
+            billing_interval: host.billing_interval,
             currency: host.currency,
             free_duration_days: host.free_duration_days,
             expected_fingerprint: host.ssh_host_key_fingerprint,
@@ -1485,7 +1585,7 @@ async fn export_hosts(
         })
         .collect();
     Ok(Json(HostTransferDocument {
-        version: 1,
+        version: 2,
         exported_at: Some(Utc::now().to_rfc3339()),
         hosts,
     }))
@@ -1507,7 +1607,7 @@ async fn import_hosts(
     let mut document: HostTransferDocument = serde_json::from_slice(&body).map_err(|_| {
         AppError::BadRequest("Host import must be a valid versioned JSON document".into())
     })?;
-    if document.version != 1 {
+    if !matches!(document.version, 1 | 2) {
         return Err(AppError::BadRequest(
             "unsupported Host import version".into(),
         ));
@@ -1633,19 +1733,14 @@ async fn import_one_host(
                 "Host note cannot exceed 500 bytes".into(),
             ));
         }
-        let daily_rate_minor = crate::client_market_trade::validate_offer(entry.daily_rate_minor)?;
-        let currency =
-            crate::client_market_trade::normalize_offer_currency(daily_rate_minor, entry.currency)?;
-        let free_duration_days = crate::client_market_trade::validate_free_duration_days(
-            daily_rate_minor,
-            entry.free_duration_days,
-        )?;
-        if daily_rate_minor.is_some() {
+        let pricing = normalize_host_transfer_pricing(&entry)?;
+        if pricing.daily_rate_minor.is_some() || pricing.cycle_price_minor.is_some() {
             let conn = state.store.conn.lock().await;
             crate::client_market_trade::require_paid_offer_setup(
                 &conn,
                 &provider_id,
-                currency
+                pricing
+                    .currency
                     .as_deref()
                     .ok_or_else(|| AppError::Internal("paid Host currency is missing".into()))?,
             )?;
@@ -1695,7 +1790,7 @@ async fn import_one_host(
         })?;
         let host = state
             .store
-            .client_market_insert_host_for_provider(
+            .client_market_insert_host_for_provider_with_pricing(
                 &provider_id,
                 &owner_email,
                 &ip.to_string(),
@@ -1705,9 +1800,12 @@ async fn import_one_host(
                 fingerprint.as_deref(),
                 entry.note.as_deref(),
                 Some(&intel_json),
-                daily_rate_minor,
-                currency.as_deref(),
-                free_duration_days,
+                pricing.daily_rate_minor,
+                pricing.cycle_price_minor,
+                &pricing.pricing_model,
+                pricing.billing_interval.as_deref(),
+                pricing.currency.as_deref(),
+                pricing.free_duration_days,
             )
             .await?;
         Ok(Some(host.id))
@@ -1970,7 +2068,9 @@ async fn retire_unreachable_host(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateClientResponse {
-    job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    cancellation_scheduled: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2022,6 +2122,17 @@ async fn release_client(
     headers: HeaderMap,
     AxumPath(installation_id): AxumPath<String>,
 ) -> Result<Json<CreateClientResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    if state
+        .store
+        .client_market_schedule_recurring_release(&installation_id, &session)
+        .await?
+    {
+        return Ok(Json(CreateClientResponse {
+            job_id: None,
+            cancellation_scheduled: true,
+        }));
+    }
     start_client_cleanup(
         state,
         headers,
@@ -2101,7 +2212,10 @@ async fn start_client_cleanup(
             error!(job_id = %response_job_id, error = %err, "client market cleanup job failed");
         }
     });
-    Ok(Json(CreateClientResponse { job_id }))
+    Ok(Json(CreateClientResponse {
+        job_id: Some(job_id),
+        cancellation_scheduled: false,
+    }))
 }
 
 pub(crate) async fn terminate_for_billing(
@@ -5417,6 +5531,9 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         port: reveal.then_some(host.port),
         host_owner_email: host.host_owner_email,
         daily_rate_minor: host.daily_rate_minor,
+        pricing_model: host.pricing_model,
+        cycle_price_minor: host.cycle_price_minor,
+        billing_interval: host.billing_interval,
         currency: host.currency,
         free_duration_days: host.free_duration_days,
         offer_revision: host.offer_revision,
@@ -5480,6 +5597,9 @@ pub struct RouterSshHostRecord {
     pub port: u16,
     pub host_owner_email: String,
     pub daily_rate_minor: Option<i64>,
+    pub pricing_model: String,
+    pub cycle_price_minor: Option<i64>,
+    pub billing_interval: Option<String>,
     pub currency: Option<String>,
     pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
@@ -5952,7 +6072,8 @@ impl AppStore {
                     COALESCE((SELECT contacts_json FROM account_payment_profiles p
                               WHERE p.user_id = h.provider_id), '[]'),
                     NULLIF(TRIM(h.currency), ''), h.free_duration_days,
-                    t.enabled, ns.last_heartbeat_at
+                    t.enabled, ns.last_heartbeat_at, h.pricing_model,
+                    h.cycle_price_minor, h.billing_interval
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
              LEFT JOIN installations i ON i.id = h.installation_id
@@ -6073,16 +6194,84 @@ impl AppStore {
         currency: Option<&str>,
         free_duration_days: Option<u32>,
     ) -> Result<RouterSshHostRecord, AppError> {
+        self.client_market_insert_host_for_provider_with_pricing(
+            provider_id,
+            owner_email,
+            ip,
+            port,
+            country_code,
+            hostname,
+            fingerprint,
+            note,
+            ip_intel_json,
+            daily_rate_minor,
+            None,
+            if daily_rate_minor.is_some() {
+                crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+            } else {
+                crate::market_recurring::PRICING_FREE
+            },
+            None,
+            currency,
+            free_duration_days,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn client_market_insert_host_for_provider_with_pricing(
+        &self,
+        provider_id: &str,
+        owner_email: &str,
+        ip: &str,
+        port: u16,
+        country_code: Option<&str>,
+        hostname: Option<&str>,
+        fingerprint: Option<&str>,
+        note: Option<&str>,
+        ip_intel_json: Option<&str>,
+        daily_rate_minor: Option<i64>,
+        cycle_price_minor: Option<i64>,
+        pricing_model: &str,
+        billing_interval: Option<&str>,
+        currency: Option<&str>,
+        free_duration_days: Option<u32>,
+    ) -> Result<RouterSshHostRecord, AppError> {
         let owner = normalize_market_email(owner_email)?;
         let daily_rate_minor = crate::client_market_trade::validate_offer(daily_rate_minor)?;
+        let cycle_price_minor =
+            crate::client_market_trade::validate_monthly_offer(cycle_price_minor)?;
+        if daily_rate_minor.is_some() && cycle_price_minor.is_some() {
+            return Err(AppError::BadRequest(
+                "dailyRateMinor and cyclePriceMinor cannot both be set".into(),
+            ));
+        }
+        let expected_pricing_model = if cycle_price_minor.is_some() {
+            crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+        } else if daily_rate_minor.is_some() {
+            crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+        } else {
+            crate::market_recurring::PRICING_FREE
+        };
+        if pricing_model != expected_pricing_model
+            || (cycle_price_minor.is_some()
+                && billing_interval
+                    != Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH))
+            || (cycle_price_minor.is_none() && billing_interval.is_some())
+        {
+            return Err(AppError::BadRequest(
+                "Host pricing model is inconsistent with its price and billing interval".into(),
+            ));
+        }
+        let price_minor = cycle_price_minor.or(daily_rate_minor);
         let free_duration_days = crate::client_market_trade::validate_free_duration_days(
-            daily_rate_minor,
+            price_minor,
             free_duration_days,
         )?;
         let now = Utc::now().to_rfc3339();
         let id = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
-        if daily_rate_minor.is_some() {
+        if price_minor.is_some() {
             crate::client_market_trade::require_paid_offer_setup(
                 &conn,
                 provider_id,
@@ -6101,9 +6290,10 @@ impl AppStore {
             "INSERT INTO router_ssh_hosts (
                 id, provider_id, ip, port, host_owner_email, country_code, hostname, ssh_host_key_fingerprint,
                 status, installation_id, last_verified_at, last_error, note, ip_intel_json,
-                daily_rate_minor, currency, free_duration_days, offer_revision, created_at, updated_at
+                daily_rate_minor, currency, free_duration_days, offer_revision, created_at, updated_at,
+                pricing_model, cycle_price_minor, billing_interval
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?12,
-                       ?13, ?14, ?15, 1, ?10, ?10)",
+                       ?13, ?14, ?15, 1, ?10, ?10, ?16, ?17, ?18)",
             params![
                 id,
                 provider_id,
@@ -6120,6 +6310,9 @@ impl AppStore {
                 daily_rate_minor,
                 currency,
                 free_duration_days.map(i64::from),
+                pricing_model,
+                cycle_price_minor,
+                billing_interval,
             ],
         )
         .map_err(|e| {
@@ -6944,6 +7137,13 @@ impl AppStore {
             "provisioning_failed",
             &now,
         )?;
+        crate::market_recurring::fail_activation_tx(
+            &tx,
+            "client_host",
+            job_id,
+            "provisioning_failed",
+            &now,
+        )?;
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit failed provisioning job failed: {error}"))
         })?;
@@ -7021,7 +7221,7 @@ impl AppStore {
         let sql = format!(
             "SELECT id, provider_id FROM router_ssh_hosts
              WHERE status = '{HOST_STATUS_IDLE}'
-               AND daily_rate_minor IS NULL
+               AND daily_rate_minor IS NULL AND cycle_price_minor IS NULL
                AND host_owner_email IN ({owner_placeholders})
                AND country_code IN ({region_placeholders})
              ORDER BY RANDOM()"
@@ -7136,7 +7336,8 @@ impl AppStore {
                         COALESCE((SELECT contacts_json FROM account_payment_profiles p
                                   WHERE p.user_id = h.provider_id), '[]'),
                         NULLIF(TRIM(h.currency), ''), h.free_duration_days,
-                        t.enabled, ns.last_heartbeat_at
+                        t.enabled, ns.last_heartbeat_at, h.pricing_model,
+                        h.cycle_price_minor, h.billing_interval
                  FROM router_ssh_hosts h
                  LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
                  LEFT JOIN installations i ON i.id = h.installation_id
@@ -8067,6 +8268,13 @@ impl AppStore {
             failure_code,
             &now,
         )?;
+        crate::market_recurring::fail_activation_tx(
+            &tx,
+            "client_host",
+            job_id,
+            failure_code,
+            &now,
+        )?;
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit create failure transaction failed: {e}"))
         })?;
@@ -8766,7 +8974,8 @@ fn get_router_ssh_host(
                 COALESCE((SELECT contacts_json FROM account_payment_profiles p
                           WHERE p.user_id = h.provider_id), '[]'),
                 NULLIF(TRIM(h.currency), ''), h.free_duration_days,
-                t.enabled, ns.last_heartbeat_at
+                t.enabled, ns.last_heartbeat_at, h.pricing_model,
+                h.cycle_price_minor, h.billing_interval
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
          LEFT JOIN installations i ON i.id = h.installation_id
@@ -8836,6 +9045,9 @@ fn map_router_ssh_host_row(row: &crate::db::Row<'_>) -> crate::db::Result<Router
         client_owner_user_id: row.get(17)?,
         client_tunnel_enabled: row.get::<_, Option<i64>>(25)?.map(|value| value != 0),
         client_last_heartbeat_at: row.get(26)?,
+        pricing_model: row.get(27)?,
+        cycle_price_minor: row.get(28)?,
+        billing_interval: row.get(29)?,
         provider_id: row.get(18)?,
         daily_rate_minor: row.get(19)?,
         offer_revision: row.get(20)?,
@@ -9731,6 +9943,9 @@ mod tests {
                 port: 22,
                 note: Some("first".into()),
                 daily_rate_minor: None,
+                cycle_price_minor: None,
+                pricing_model: Some(crate::market_recurring::PRICING_FREE.into()),
+                billing_interval: None,
                 currency: None,
                 free_duration_days: Some(1),
                 expected_fingerprint: Some("SHA256:first".into()),
@@ -9741,6 +9956,9 @@ mod tests {
                 port: 2222,
                 note: Some("second".into()),
                 daily_rate_minor: Some(500),
+                cycle_price_minor: None,
+                pricing_model: Some(crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into()),
+                billing_interval: None,
                 currency: Some("USD".into()),
                 free_duration_days: None,
                 expected_fingerprint: Some("SHA256:second".into()),
@@ -9855,6 +10073,79 @@ mod tests {
         assert_eq!(reread.failed, 1);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn host_transfer_pricing_round_trips_and_rejects_inconsistent_metadata() {
+        let legacy: HostTransferDocument = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "hosts": [{
+                "ip": "203.0.113.20",
+                "port": 22,
+                "dailyRateMinor": 500,
+                "currency": "USD"
+            }]
+        }))
+        .expect("decode legacy Host transfer");
+        assert_eq!(legacy.version, 1);
+        assert!(legacy.hosts[0].pricing_model.is_none());
+        assert_eq!(
+            normalize_host_transfer_pricing(&legacy.hosts[0]).expect("normalize legacy pricing"),
+            NormalizedHostTransferPricing {
+                daily_rate_minor: Some(500),
+                cycle_price_minor: None,
+                pricing_model: crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into(),
+                billing_interval: None,
+                currency: Some("USD".into()),
+                free_duration_days: None,
+            }
+        );
+
+        let monthly = HostTransferDocument {
+            version: 2,
+            exported_at: Some("2026-09-21T00:00:00Z".into()),
+            hosts: vec![HostTransferEntry {
+                ip: "203.0.113.21".into(),
+                port: 2222,
+                note: Some("monthly".into()),
+                daily_rate_minor: None,
+                cycle_price_minor: Some(3_000),
+                pricing_model: Some(crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH.into()),
+                billing_interval: Some(
+                    crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.into(),
+                ),
+                currency: Some("USD".into()),
+                free_duration_days: None,
+                expected_fingerprint: Some("SHA256:monthly".into()),
+                informational_status: Some("idle".into()),
+            }],
+        };
+        let encoded = serde_json::to_vec(&monthly).expect("encode monthly Host transfer");
+        let decoded: HostTransferDocument =
+            serde_json::from_slice(&encoded).expect("decode monthly Host transfer");
+        assert_eq!(decoded.version, 2);
+        assert_eq!(
+            normalize_host_transfer_pricing(&decoded.hosts[0])
+                .expect("normalize monthly Host transfer"),
+            NormalizedHostTransferPricing {
+                daily_rate_minor: None,
+                cycle_price_minor: Some(3_000),
+                pricing_model: crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH.into(),
+                billing_interval: Some(
+                    crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.into(),
+                ),
+                currency: Some("USD".into()),
+                free_duration_days: None,
+            }
+        );
+
+        let mut wrong_model = decoded.hosts[0].clone();
+        wrong_model.pricing_model = Some(crate::market_recurring::PRICING_FREE.into());
+        assert!(normalize_host_transfer_pricing(&wrong_model).is_err());
+        let mut wrong_interval = legacy.hosts[0].clone();
+        wrong_interval.billing_interval =
+            Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.into());
+        assert!(normalize_host_transfer_pricing(&wrong_interval).is_err());
     }
 
     #[tokio::test]
@@ -10939,6 +11230,9 @@ mod tests {
             port: 2222,
             host_owner_email: "host@example.com".into(),
             daily_rate_minor: Some(500),
+            pricing_model: crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into(),
+            cycle_price_minor: None,
+            billing_interval: None,
             currency: Some("USD".into()),
             free_duration_days: None,
             offer_revision: 1,
@@ -11752,6 +12046,93 @@ mod tests {
             .expect("read frozen Client contract offer");
         assert_eq!(frozen, (Some(500), Some("USD".into()), 1));
         drop(conn);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_host_offer_update_clears_monthly_pricing_metadata() {
+        let (store, _config, root) = test_store("legacy-offer-normalization");
+        let host = add_provider_host(
+            &store,
+            "provider-normalize",
+            "provider-normalize@example.com",
+            "198.18.21.2",
+            "US",
+            None,
+        )
+        .await;
+        let provider = market_session("provider-normalize", "provider-normalize@example.com");
+        ensure_payment_profile(
+            &store,
+            "provider-normalize",
+            "provider-normalize@example.com",
+        )
+        .await;
+        store
+            .market_billing_update_supplier_profile(&provider, "USD", 24)
+            .await
+            .expect("configure normalized Provider billing profile");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE router_ssh_hosts
+                 SET daily_rate_minor = NULL, pricing_model = 'prepaid_calendar_month',
+                     cycle_price_minor = 3000, billing_interval = 'calendar_month',
+                     currency = 'USD' WHERE id = ?1",
+                params![host.id],
+            )
+            .expect("seed monthly Host metadata");
+        }
+
+        let updated = store
+            .client_market_update_host_offer(
+                &host.id,
+                &provider,
+                Some(500),
+                Some("USD".into()),
+                None,
+            )
+            .await
+            .expect("normalize Host to legacy daily pricing");
+        assert_eq!(updated.daily_rate_minor, Some(500));
+        assert_eq!(
+            updated.pricing_model,
+            crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+        );
+        assert!(updated.cycle_price_minor.is_none());
+        assert!(updated.billing_interval.is_none());
+        let first_revision = updated.offer_revision;
+        let unchanged = store
+            .client_market_update_host_offer(
+                &host.id,
+                &provider,
+                Some(500),
+                Some("USD".into()),
+                None,
+            )
+            .await
+            .expect("save normalized legacy offer unchanged");
+        assert_eq!(unchanged.offer_revision, first_revision);
+        let stored: (String, Option<i64>, Option<String>) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT pricing_model, cycle_price_minor, billing_interval
+                 FROM router_ssh_hosts WHERE id = ?1",
+                params![host.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read normalized Host pricing metadata");
+        assert_eq!(
+            stored,
+            (
+                crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into(),
+                None,
+                None,
+            )
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

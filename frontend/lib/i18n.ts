@@ -139,6 +139,11 @@ export const messages = {
     "shareMarket.catalog.searchCompact": "Search Share",
     "shareMarket.catalog.ownerFilter": "Filter by owner email",
     "shareMarket.catalog.ownerPlaceholder": "Owner email",
+    "shareMarket.catalog.ownerAll": "All owners",
+    "shareMarket.catalog.ownerSearch": "Search owner email",
+    "shareMarket.catalog.ownerEmpty": "No matching owners",
+    "shareMarket.catalog.ownerMore": "+{count} more",
+    "shareMarket.catalog.ownerRented": "Renting",
     "shareMarket.catalog.filters": "Filter and sort",
     "shareMarket.catalog.onlyRentable": "Idle seats only",
     "shareMarket.catalog.familyFilter": "Filter by provider type",
@@ -158,12 +163,12 @@ export const messages = {
     "shareMarket.catalog.sort": "Sort listings",
     "shareMarket.catalog.sort.recommended": "Recommended",
     "shareMarket.catalog.sort.idle": "Most idle seats",
-    "shareMarket.catalog.sort.price": "Lowest daily rate",
+    "shareMarket.catalog.sort.price": "Lowest monthly equivalent",
     "shareMarket.catalog.sort.uptime": "Highest 24h uptime",
     "shareMarket.catalog.alreadyRenting": "You already rent this Share",
     "shareMarket.catalog.offlineHint": "Offline · cannot rent until the owner restores service",
     "shareMarket.catalog.multiProviders": "Multiple providers",
-    "shareMarket.catalog.postpaidHint": "After the free window, paid usage consumes prepaid funds first; only explicit supplier credit covers a remainder.",
+    "shareMarket.catalog.postpaidHint": "New paid seats use prepaid calendar-month billing. Existing legacy daily rentals keep their original terms.",
     "shareMarket.catalog.granting": "Granting access…",
     "shareMarket.catalog.seatPosition": "Seat {position}",
     "shareMarket.catalog.appCapabilities": "Provider",
@@ -299,7 +304,7 @@ export const messages = {
       "This quote must be refreshed before you continue.",
     "shareMarket.rentConfirm.refreshRequiredShort": "Refresh required",
     "shareMarket.rentConfirm.requote": "Refresh quote",
-    "shareMarket.rentConfirm.priceLabel": "Daily rate",
+    "shareMarket.rentConfirm.priceLabel": "Price",
     "shareMarket.rentConfirm.noTrialCompact":
       "No trial remains · billing starts when healthy service begins.",
     "shareMarket.rentConfirm.remainingTrialCompact":
@@ -311,6 +316,8 @@ export const messages = {
       "{days} days · starts on first access dispatch and is reclaimed at expiry",
     "shareMarket.rentConfirm.termPermanentCompact":
       "Ongoing · either party can return or reclaim the seat",
+    "shareMarket.rentConfirm.termMonthlyCompact":
+      "One calendar month at a time · the activation day becomes the monthly renewal day",
     "shareMarket.rentConfirm.details": "View all details",
     "shareMarket.rentConfirm.billingDetails": "Billing and service terms",
     "shareMarket.rentConfirm.technicalDetails": "Technical details",
@@ -318,6 +325,8 @@ export const messages = {
       "Funding changed. This is the latest quote; review it before confirming again.",
     "shareMarket.rentConfirm.postpaid":
       "The first {hours} hours of healthy service are free and do not create charges{tokens}. After that, usage is charged at the daily rate, using prepaid funds first and this Owner's explicit credit only for any remainder.",
+    "shareMarket.rentConfirm.prepaidMonthly":
+      "The first {hours} hours of healthy service are free{tokens}. Before activation, the first calendar month is reserved from your prepaid balance. Leaving during a paid month does not refund that month; automatic renewal reserves one additional full month.",
     "shareMarket.rentConfirm.trialTokens":
       ", with a free trial token quota of {tokens}",
     "shareMarket.rentConfirm.freeBilling":
@@ -334,6 +343,8 @@ export const messages = {
       "The {days}-day service term starts when the first access dispatch begins. Router automatically reclaims access when the term ends.",
     "shareMarket.rentConfirm.servicePermanent":
       "This service has no fixed end date and continues until either party returns or reclaims the seat.",
+    "shareMarket.rentConfirm.serviceMonthly":
+      "After any trial, the first paid calendar month starts when healthy service begins. The same day anchors later renewals; leaving early does not refund the current month.",
     "shareMarket.rentConfirm.offline":
       "This Share is currently offline and cannot be rented. Try again after the Owner restores service.",
     "shareMarket.status": "Status",
@@ -384,6 +395,7 @@ export const messages = {
     "shareMarket.subscription.grantPending": "Grant pending",
     "shareMarket.subscription.activeFree": "Free access",
     "shareMarket.subscription.activePostpaid": "Postpaid access",
+    "shareMarket.subscription.activePrepaid": "Prepaid monthly access",
     "shareMarket.subscription.billingSuspendPending": "Pausing for settlement",
     "shareMarket.subscription.billingSuspended": "Paused for settlement",
     "shareMarket.subscription.billingResumePending": "Restoring access",
@@ -453,6 +465,12 @@ export const messages = {
     "shareMarket.confirm.releaseTitle": "Return this seat?",
     "shareMarket.confirm.releaseDescription":
       "Access to {share} will be removed after the Server confirms the change.",
+    "shareMarket.confirm.releaseMonthlyTitle": "End this rental at the current period?",
+    "shareMarket.confirm.releaseMonthlyDescription":
+      "Access to {share} continues until {time}. The current prepaid month is not refunded, and any next-period reservation is released.",
+    "shareMarket.confirm.releaseImmediateTitle": "End this rental now?",
+    "shareMarket.confirm.releaseImmediateDescription":
+      "This rental is still in trial or renewal recovery. Access to {share} will be removed after the Server confirms the change; no paid current period is refunded.",
     "shareMarket.confirm.revokeTitle": "Reclaim this seat?",
     "shareMarket.confirm.revokeDescription":
       "Access for {email} will be removed. The renter will not be blocked.",
@@ -476,7 +494,8 @@ export const messages = {
       "{field} must be a M amount of 0 or more with no more than six decimal places.",
     "shareMarket.error.price":
       "Price must be greater than zero with no more than two decimal places.",
-    "shareMarket.error.priceRange": "Daily price cannot exceed USD 1,000,000.00.",
+    "shareMarket.error.priceRange": "Monthly price cannot exceed USD 1,000,000.00.",
+    "shareMarket.error.dailyPriceRange": "Daily price cannot exceed USD 1,000,000.00.",
     "shareMarket.error.currency": "Currency must be USD.",
     "shareMarket.error.serviceDuration":
       "Service term must be 1 to 365 days, or have no fixed end date.",
@@ -561,7 +580,8 @@ export const messages = {
     "shareMarket.dialog.create": "Publish listing",
     "shareMarket.dialog.freeMode": "Free",
     "shareMarket.dialog.paidMode": "Paid",
-    "shareMarket.dialog.amount": "Daily price",
+    "shareMarket.dialog.amount": "Pricing type",
+    "shareMarket.dialog.monthlyAmount": "Monthly price",
     "shareMarket.dialog.currency": "Currency",
     "shareMarket.dialog.trialHours": "Free trial hours",
     "shareMarket.dialog.trialTokenLimit": "Free trial tokens (M)",
@@ -595,6 +615,7 @@ export const messages = {
     "shareMarket.serviceDuration.label": "Service term",
     "shareMarket.serviceDuration.fixed": "Fixed term",
     "shareMarket.serviceDuration.permanent": "No fixed end date",
+    "shareMarket.serviceDuration.monthlyManaged": "Calendar-month subscription",
     "shareMarket.serviceDuration.days": "Service term (days)",
     "shareMarket.serviceDuration.dayValue": "{count} day",
     "shareMarket.serviceDuration.daysValue": "{count} days",
@@ -824,9 +845,9 @@ export const messages = {
       "Replace <share-subdomain> with your Share subdomain. Reveal the token above to fill it into the sample, or copy with the real token when available.",
     "account.apiKeys.signInRequired": "Sign in to manage your API token.",
     "account.clientHint":
-      "Monitor Market rentals as renter or Host Provider. Combined postpaid balances and invoices are managed in Market billing.",
+      "Monitor Market rentals as renter or Host Provider. Prepaid monthly funds and legacy billing are managed in Market billing.",
     "account.shareHint":
-      "Monitor Share Market seat rentals as User or Provider. Rent and reclaim in Share Market; manage combined postpaid balances and invoices in Market billing.",
+      "Monitor Share Market seat rentals as User or Provider. Rent and reclaim in Share Market; manage prepaid monthly funds and legacy billing in Market billing.",
     "account.client.tab.user": "User",
     "account.client.tab.provider": "Provider",
     "account.client.userEmpty": "No rentals as a Client user right now.",
@@ -1090,22 +1111,23 @@ export const messages = {
     "clientMarket.hostPort": "SSH port",
     "clientMarket.hostNote": "Note (optional)",
     "clientMarket.dailyPrice": "Daily price",
+    "clientMarket.monthlyPrice": "Monthly price",
     "clientMarket.rentalCurrency": "Currency",
     "clientMarket.priceUsd": "Price",
     "clientMarket.currency": "Currency",
     "clientMarket.free": "Free",
     "clientMarket.paid": "Paid",
     "clientMarket.offerHint":
-      "Paid Hosts use this fixed daily rate and unified postpaid billing.",
+      "New paid Hosts use a fixed calendar-month price, with the first period prepaid before activation.",
     "clientMarket.offerInvalid":
-      "Enter a valid daily price with at most two decimal places.",
+      "Enter a valid monthly price with at most two decimal places.",
     "clientMarket.offerRange":
-      "Paid Hosts require a daily price from 0.01 to 1,000,000.00.",
+      "Paid Hosts require a monthly price from 0.01 to 1,000,000.00.",
     "clientMarket.offerUpdated": "Host offer updated",
     "clientMarket.editOffer": "Edit Host offer",
     "clientMarket.editOfferAction": "Edit offer",
     "clientMarket.editOfferHint":
-      "The daily rate is frozen when a Client starts renting this Host. Existing rentals keep their contracted rate.",
+      "New rentals freeze the current monthly price; existing rentals keep their own terms. Editing a legacy daily offer migrates future rentals to prepaid monthly billing.",
     "clientMarket.makeFreeHint":
       "Switch to Free, then choose a fixed duration or permanent access.",
     "clientMarket.freeDuration.fixed": "Fixed duration",
@@ -1200,6 +1222,15 @@ export const messages = {
     "clientMarket.release.confirmTitle": "Release this Client now?",
     "clientMarket.release.confirmDescription":
       "The Client tunnel will be disabled immediately. Router will erase the remote installation and return the Host to its Provider. Any data on the Client may be lost.",
+    "clientMarket.release.scheduleTitle": "End this Client rental at the current period?",
+    "clientMarket.release.scheduleDescription":
+      "The Client remains available until {time}. The current prepaid month is not refunded; any next-period reservation is released, and Router cleans the Client at period end.",
+    "clientMarket.release.immediateMonthlyTitle": "End this Client rental now?",
+    "clientMarket.release.immediateMonthlyDescription":
+      "This Client is still in trial or renewal recovery, so ending it starts cleanup immediately. No paid current period is refunded.",
+    "clientMarket.release.scheduleAction": "End at period close",
+    "clientMarket.release.scheduled": "Cancellation scheduled for the end of the current period.",
+    "clientMarket.release.missingJob": "Router did not return a cleanup job. Refresh and try again.",
     "clientMarket.release.progressTitle": "Releasing Client",
     "clientMarket.release.starting": "Starting release...",
     "clientMarket.release.succeeded":
@@ -1352,13 +1383,13 @@ export const messages = {
     "clientMarket.exportedHosts": "Exported {count} Hosts",
     "clientMarket.importSizeLimit": "Host import text must not exceed 1 MB.",
     "clientMarket.importVersionRequired":
-      "Each line must be ip:port with optional |note|dailyPriceMinor|currency|freeDurationDays|fingerprint.",
+      "Each line must be ip:port with optional |note|priceMinor|currency|freeDurationDays|fingerprint|pricingModel.",
     "clientMarket.importMyHosts": "Import my Hosts",
     "clientMarket.exportMyHosts": "Export my Hosts",
     "clientMarket.importDialogTitle": "Import Hosts",
     "clientMarket.exportDialogTitle": "Export Hosts",
     "clientMarket.transferFormatHint":
-      "One host per line: ip:port|note|dailyPriceMinor|currency|freeDurationDays|fingerprint. Free duration is 1-365 days; leave it blank for permanent access. Paid Hosts must leave free duration blank. Only ip:port is required; lines starting with # are ignored.",
+      "One host per line: ip:port|note|priceMinor|currency|freeDurationDays|fingerprint|pricingModel. New paid rows use prepaid_calendar_month; files without pricingModel retain legacy daily semantics. Free duration is 1-365 days or blank for permanent access.",
     "clientMarket.importPlaceholder":
       "203.0.113.9:22\n203.0.113.10:22|trial host|||7",
     "clientMarket.importSubmit": "Import",
@@ -1509,6 +1540,9 @@ export const messages = {
     "createClient.quoteTerms.postpaidTitle": "Paid service funding",
     "createClient.quoteTerms.postpaid":
       "{count} paid Host(s) from {suppliers} supplier account(s) include {hours} hours of free healthy-service time. Usage then consumes prepaid funds first and each supplier's explicit credit only for any remainder.",
+    "createClient.quoteTerms.prepaidMonthlyTitle": "Prepaid monthly service",
+    "createClient.quoteTerms.prepaidMonthly":
+      "{count} Host(s) from {suppliers} supplier account(s) reserve the first calendar month before installation. Automatic renewal, when selected per Host, reserves one additional full month.",
     "createClient.quoteTerms.free":
       "{count} free Host(s) create no charge. Any fixed free period starts after the Host is activated.",
     "createClient.tabManual": "Manual install",
@@ -1652,6 +1686,8 @@ export const messages = {
     "marketAccess.activeServicesLabel": "Active paid services",
     "marketAccess.approveFreeHint":
       "This approval only grants the requested free product scope. It does not create a credit line.",
+    "marketAccess.approveMonthlyHint":
+      "This approval grants prepaid monthly access only. The buyer must fund each calendar month in advance; no supplier credit line is created or changed.",
     "marketAccess.rejectionReason": "Reason shown in the audit record",
     "marketAccess.rejectionReasonRequired": "Enter a rejection reason.",
     "marketAccess.rejectionCooldown":
@@ -1719,10 +1755,11 @@ export const messages = {
     "marketBilling.title": "Market billing",
     "marketBilling.open": "Open billing",
     "marketBilling.subtitle":
-      "Healthy usage starts after a {hours}-hour trial. Prepaid balance is used first; explicit supplier credit is the fallback.",
+      "New monthly rentals are prepaid. Existing legacy daily services still use prepaid balance first and explicit supplier credit only for any remainder.",
     "marketBilling.supplier": "Supplier",
     "marketBilling.buyer": "Buyer",
     "marketBilling.day": "day",
+    "marketBilling.month": "month",
     "marketBilling.service": "Service",
     "marketBilling.services": "Services on this account",
     "marketBilling.noServices": "No active services remain on this account.",
@@ -1756,6 +1793,8 @@ export const messages = {
     "marketBilling.prepaid.ledger.title": "Prepaid transactions",
     "marketBilling.prepaid.ledger.topup": "Top-up received",
     "marketBilling.prepaid.ledger.usage": "Service usage",
+    "marketBilling.prepaid.ledger.recurringPeriod": "Monthly service payment",
+    "marketBilling.prepaid.ledger.recurringRefund": "Monthly service refund",
     "marketBilling.prepaid.ledger.refund": "Refund paid",
     "marketBilling.prepaid.ledger.serviceCredit": "Service credit",
     "marketBilling.prepaid.ledger.adjustment": "Balance adjustment",
@@ -1833,6 +1872,43 @@ export const messages = {
     "marketFunding.topup.quoteRefreshFallback":
       "The top-up was credited. The existing quote remains open and funding will be checked again when you confirm.",
     "marketFunding.blocked": "Add enough prepaid funds before confirming this order.",
+    "marketRecurringFunding.title": "Prepaid monthly funding",
+    "marketRecurringFunding.prepaidOnly": "Calendar-month rentals use prepaid funds only; supplier credit is not used.",
+    "marketRecurringFunding.shortfall": "Amount still required",
+    "marketRecurringFunding.firstPeriod": "First month reserved",
+    "marketRecurringFunding.nextPeriod": "Next month reserved",
+    "marketRecurringFunding.totalReserved": "Total required now",
+    "marketRecurringFunding.policy": "The first month is reserved before activation. Automatic renewal also reserves the next full month so other rentals cannot spend it.",
+    "marketRecurringFunding.topupTarget": "Funding target for this monthly rental",
+    "marketRecurring.updated": "Renewal settings updated.",
+    "marketRecurring.reserved": "The next month is reserved.",
+    "marketRecurring.fundingRequired": "A full monthly payment is not currently available. Add prepaid funds and try again.",
+    "marketRecurring.autoRenew": "Automatic renewal",
+    "marketRecurring.autoRenewAtCheckout": "Reserve an additional {amount} now for the next month. You can turn this off later.",
+    "marketRecurring.periodStart": "Current period starts",
+    "marketRecurring.periodEnd": "Current period ends",
+    "marketRecurring.nextHeld": "Next month reserved",
+    "marketRecurring.renewalMode": "Renewal",
+    "marketRecurring.automatic": "Automatic",
+    "marketRecurring.manual": "Manual",
+    "marketRecurring.trialEnds": "Estimated healthy-service trial end",
+    "marketRecurring.recoveryDeadline": "Top up before",
+    "marketRecurring.cancelScheduled": "Cancellation is scheduled for {time}. Service remains available until then.",
+    "marketRecurring.recoveryHint": "Renewal funding is missing. Top up and reserve the next month before the recovery deadline to restore service.",
+    "marketRecurring.keepService": "Keep service",
+    "marketRecurring.disableAutoRenew": "Turn off auto-renew",
+    "marketRecurring.enableAutoRenew": "Enable auto-renew",
+    "marketRecurring.reserveNext": "Reserve next month",
+    "marketRecurring.compact.renewsAt": "Current month ends {time}",
+    "marketRecurring.compact.trialUntil": "Healthy-service trial estimate: {time}",
+    "marketRecurring.compact.recoveryBy": "Top up by {time}",
+    "marketRecurring.compact.cancelAt": "Ends {time}",
+    "marketRecurring.status.pending_activation": "Pending activation",
+    "marketRecurring.status.trial": "Trial",
+    "marketRecurring.status.active": "Active",
+    "marketRecurring.status.recovery": "Funding recovery",
+    "marketRecurring.status.ended": "Ended",
+    "marketRecurring.status.activation_failed": "Activation failed",
     "marketBilling.product.share": "Share seat",
     "marketBilling.product.clientHost": "Client Host",
     "marketBilling.status.active": "Accruing",
@@ -3797,6 +3873,11 @@ export const messages = {
     "shareMarket.catalog.searchCompact": "搜索 Share",
     "shareMarket.catalog.ownerFilter": "按车主邮箱筛选",
     "shareMarket.catalog.ownerPlaceholder": "车主邮箱",
+    "shareMarket.catalog.ownerAll": "全部车主",
+    "shareMarket.catalog.ownerSearch": "搜索车主邮箱",
+    "shareMarket.catalog.ownerEmpty": "没有匹配的车主",
+    "shareMarket.catalog.ownerMore": "另 {count} 个",
+    "shareMarket.catalog.ownerRented": "正在租用",
     "shareMarket.catalog.filters": "筛选与排序",
     "shareMarket.catalog.onlyRentable": "只看有空位",
     "shareMarket.catalog.familyFilter": "按供应商类型筛选",
@@ -3816,12 +3897,12 @@ export const messages = {
     "shareMarket.catalog.sort": "排序",
     "shareMarket.catalog.sort.recommended": "推荐排序",
     "shareMarket.catalog.sort.idle": "空闲车位最多",
-    "shareMarket.catalog.sort.price": "日费最低",
+    "shareMarket.catalog.sort.price": "月度折算价最低",
     "shareMarket.catalog.sort.uptime": "24h 在线率最高",
     "shareMarket.catalog.alreadyRenting": "你已租用该 Share",
     "shareMarket.catalog.offlineHint": "离线 · 车主恢复服务前无法租用",
     "shareMarket.catalog.multiProviders": "多供应商",
-    "shareMarket.catalog.postpaidHint": "免费窗口结束后，付费消费优先扣除预存，仅不足部分使用商家明确授予的信用额度。",
+    "shareMarket.catalog.postpaidHint": "新付费拼车位采用日历月预付；已有旧版按日租约继续沿用原条款。",
     "shareMarket.catalog.granting": "正在授权…",
     "shareMarket.catalog.seatPosition": "拼车位 {position}",
     "shareMarket.catalog.appCapabilities": "供应商",
@@ -3955,7 +4036,7 @@ export const messages = {
     "shareMarket.rentConfirm.refreshRequired": "继续操作前必须刷新当前报价。",
     "shareMarket.rentConfirm.refreshRequiredShort": "需刷新报价",
     "shareMarket.rentConfirm.requote": "刷新报价",
-    "shareMarket.rentConfirm.priceLabel": "每日价格",
+    "shareMarket.rentConfirm.priceLabel": "价格",
     "shareMarket.rentConfirm.noTrialCompact":
       "无剩余试用 · 健康服务开始后计费。",
     "shareMarket.rentConfirm.remainingTrialCompact":
@@ -3967,6 +4048,8 @@ export const messages = {
       "{days} 天 · 首次下发访问权限时起算，到期自动回收",
     "shareMarket.rentConfirm.termPermanentCompact":
       "长期有效 · 任一方可归还或回收拼车位",
+    "shareMarket.rentConfirm.termMonthlyCompact":
+      "按日历月续期 · 激活日作为每月续费日",
     "shareMarket.rentConfirm.details": "查看完整明细",
     "shareMarket.rentConfirm.billingDetails": "计费与服务条款",
     "shareMarket.rentConfirm.technicalDetails": "技术明细",
@@ -3974,6 +4057,8 @@ export const messages = {
       "资金状态已变化，以下是最新报价，请重新核对后确认。",
     "shareMarket.rentConfirm.postpaid":
       "前 {hours} 小时健康服务时间免费且不产生费用{tokens}；之后按日费计费，优先扣除预存，仅不足部分使用该 Owner 明确授予的信用额度。",
+    "shareMarket.rentConfirm.prepaidMonthly":
+      "前 {hours} 小时为健康服务免费试用{tokens}。激活前会从预存余额冻结首个日历月费用；付费周期内提前退出不退当期费用，开启自动续费还会额外冻结完整下一期费用。",
     "shareMarket.rentConfirm.trialTokens":
       "，试用 Token 额度为 {tokens}",
     "shareMarket.rentConfirm.freeBilling": "该拼车位免费，不会产生费用。",
@@ -3989,6 +4074,8 @@ export const messages = {
       "服务期限为 {days} 天，从首次开始下发访问权限时起算；期限结束后 Router 会自动回收权限。",
     "shareMarket.rentConfirm.servicePermanent":
       "该服务没有固定到期时间，直至任一方归还或回收拼车位。",
+    "shareMarket.rentConfirm.serviceMonthly":
+      "试用结束后，首个付费日历月从健康服务开始时起算，该日期作为后续每月续费锚点；提前退出不退当期费用。",
     "shareMarket.rentConfirm.offline":
       "该 Share 当前离线，暂时无法租用。请等待 Owner 恢复服务后重试。",
     "shareMarket.status": "状态",
@@ -4039,6 +4126,7 @@ export const messages = {
     "shareMarket.subscription.grantPending": "授权中",
     "shareMarket.subscription.activeFree": "免费使用中",
     "shareMarket.subscription.activePostpaid": "后付费使用中",
+    "shareMarket.subscription.activePrepaid": "月付预付使用中",
     "shareMarket.subscription.billingSuspendPending": "正在因清账暂停",
     "shareMarket.subscription.billingSuspended": "已因清账暂停",
     "shareMarket.subscription.billingResumePending": "正在恢复访问",
@@ -4107,6 +4195,12 @@ export const messages = {
     "shareMarket.confirm.releaseTitle": "归还这个拼车位？",
     "shareMarket.confirm.releaseDescription":
       "Server 确认变更后，你对 {share} 的访问权限将被移除。",
+    "shareMarket.confirm.releaseMonthlyTitle": "在本期结束时终止租用？",
+    "shareMarket.confirm.releaseMonthlyDescription":
+      "你对 {share} 的访问将持续至 {time}。当期预付费用不退，下一期已冻结资金会释放。",
+    "shareMarket.confirm.releaseImmediateTitle": "立即终止该租用？",
+    "shareMarket.confirm.releaseImmediateDescription":
+      "当前仍处于试用或续费恢复期。Server 确认变更后会移除你对 {share} 的访问；不存在可退的付费当期。",
     "shareMarket.confirm.revokeTitle": "强制回收这个拼车位？",
     "shareMarket.confirm.revokeDescription":
       "将移除 {email} 的访问权限，但不会拉黑该用户。",
@@ -4129,7 +4223,8 @@ export const messages = {
     "shareMarket.error.nonNegativeMillions":
       "{field} 必须是大于等于 0 的百万 Token（百万），且最多保留 6 位小数。",
     "shareMarket.error.price": "价格必须大于 0，且最多保留两位小数。",
-    "shareMarket.error.priceRange": "每日价格不能超过 USD 1,000,000.00。",
+    "shareMarket.error.priceRange": "每月价格不能超过 USD 1,000,000.00。",
+    "shareMarket.error.dailyPriceRange": "每日价格不能超过 USD 1,000,000.00。",
     "shareMarket.error.currency": "币种仅支持 USD。",
     "shareMarket.error.serviceDuration":
       "服务期限必须为 1 至 365 天，或选择无固定期限。",
@@ -4212,7 +4307,8 @@ export const messages = {
     "shareMarket.dialog.create": "发布挂售",
     "shareMarket.dialog.freeMode": "免费",
     "shareMarket.dialog.paidMode": "付费",
-    "shareMarket.dialog.amount": "每日价格",
+    "shareMarket.dialog.amount": "计价类型",
+    "shareMarket.dialog.monthlyAmount": "每月价格",
     "shareMarket.dialog.currency": "币种",
     "shareMarket.dialog.trialHours": "免费试用时间(小时)",
     "shareMarket.dialog.trialTokenLimit": "免费试用Token额度（百万）",
@@ -4246,6 +4342,7 @@ export const messages = {
     "shareMarket.serviceDuration.label": "服务期限",
     "shareMarket.serviceDuration.fixed": "固定期限",
     "shareMarket.serviceDuration.permanent": "无固定期限",
+    "shareMarket.serviceDuration.monthlyManaged": "日历月订阅",
     "shareMarket.serviceDuration.days": "服务期限（天）",
     "shareMarket.serviceDuration.dayValue": "{count} 天",
     "shareMarket.serviceDuration.daysValue": "{count} 天",
@@ -4469,9 +4566,9 @@ export const messages = {
       "把 <share-subdomain> 换成你的 Share 子域名。上方点开眼睛可把 token 填进示例；复制时会优先使用真实 token。",
     "account.apiKeys.signInRequired": "登录后可管理你的 API Token。",
     "account.clientHint":
-      "以租户或 Host 供给方视角监控 Market 租用；聚合后付费余额与账单统一在市场账务中管理。",
+      "以租户或 Host 供给方视角监控 Market 租用；月租预存资金与旧版账务统一在市场账务中管理。",
     "account.shareHint":
-      "以用户或供应商视角监控 Share Market 拼车位租用。租用和回收在 Share Market 操作；聚合后付费余额与账单统一在市场账务中管理。",
+      "以用户或供应商视角监控 Share Market 拼车位租用。租用和回收在 Share Market 操作；月租预存资金与旧版账务统一在市场账务中管理。",
     "account.client.tab.user": "用户",
     "account.client.tab.provider": "供应商",
     "account.client.userEmpty": "你当前没有作为租户的租用。",
@@ -4725,20 +4822,21 @@ export const messages = {
     "clientMarket.hostPort": "SSH 端口",
     "clientMarket.hostNote": "备注（可选）",
     "clientMarket.dailyPrice": "每日费用",
+    "clientMarket.monthlyPrice": "每月价格",
     "clientMarket.rentalCurrency": "币种",
     "clientMarket.priceUsd": "价格",
     "clientMarket.currency": "币种",
     "clientMarket.free": "免费",
     "clientMarket.paid": "付费",
-    "clientMarket.offerHint": "付费 Host 使用固定每日费率和统一后付费账务。",
-    "clientMarket.offerInvalid": "请输入最多两位小数的有效每日费用。",
+    "clientMarket.offerHint": "新付费 Host 使用固定日历月价格，并在激活前预付首期。",
+    "clientMarket.offerInvalid": "请输入最多两位小数的有效每月价格。",
     "clientMarket.offerRange":
-      "收费 Host 的每日费用范围为 0.01 至 1,000,000.00。",
+      "收费 Host 的每月价格范围为 0.01 至 1,000,000.00。",
     "clientMarket.offerUpdated": "Host 报价已更新",
     "clientMarket.editOffer": "修改 Host 报价",
     "clientMarket.editOfferAction": "修改报价",
     "clientMarket.editOfferHint":
-      "Client 开始租用时会冻结每日费率；已有租用继续按合同费率计费。",
+      "新租用会冻结当前月价；已有租用继续按各自合同条款计费。编辑旧版按日报价会将后续新租用迁移为月租预付。",
     "clientMarket.makeFreeHint": "切换为免费后，可选择固定期限或永久使用。",
     "clientMarket.freeDuration.fixed": "固定期限",
     "clientMarket.freeDuration.permanent": "永久",
@@ -4830,6 +4928,15 @@ export const messages = {
     "clientMarket.release.confirmTitle": "立即释放此 Client？",
     "clientMarket.release.confirmDescription":
       "Client 隧道会立即禁用，Router 将清除远程安装并把 Host 归还给 Provider。Client 上的数据可能永久丢失。",
+    "clientMarket.release.scheduleTitle": "在本期结束时终止 Client 租用？",
+    "clientMarket.release.scheduleDescription":
+      "Client 可继续使用至 {time}。当期预付费用不退，下一期已冻结资金会释放，Router 将在周期结束时清理 Client。",
+    "clientMarket.release.immediateMonthlyTitle": "立即终止该 Client 租用？",
+    "clientMarket.release.immediateMonthlyDescription":
+      "当前 Client 仍处于试用或续费恢复期，因此确认后会立即开始清理；不存在可退的付费当期。",
+    "clientMarket.release.scheduleAction": "本期结束时终止",
+    "clientMarket.release.scheduled": "已安排在本期结束时终止。",
+    "clientMarket.release.missingJob": "Router 未返回清理任务，请刷新后重试。",
     "clientMarket.release.progressTitle": "正在释放 Client",
     "clientMarket.release.starting": "正在发起释放...",
     "clientMarket.release.succeeded": "释放完成，主机已交还供给方。",
@@ -4975,13 +5082,13 @@ export const messages = {
     "clientMarket.exportedHosts": "已导出 {count} 台 Host",
     "clientMarket.importSizeLimit": "Host 导入文本不能超过 1 MB。",
     "clientMarket.importVersionRequired":
-      "每行格式为 ip:port，可选 |备注|每日价格（最小货币单位）|币种|免费期限天数|指纹。",
+      "每行格式为 ip:port，可选 |备注|价格（最小货币单位）|币种|免费期限天数|指纹|计价模式。",
     "clientMarket.importMyHosts": "导入我的 Host",
     "clientMarket.exportMyHosts": "导出我的 Host",
     "clientMarket.importDialogTitle": "导入 Host",
     "clientMarket.exportDialogTitle": "导出 Host",
     "clientMarket.transferFormatHint":
-      "每行一台：ip:port|备注|每日价格（最小货币单位）|币种|免费期限天数|指纹。免费期限为 1-365 天，留空表示永久；付费 Host 必须留空。仅 ip:port 必填；以 # 开头的行为注释。",
+      "每行一台：ip:port|备注|价格（最小货币单位）|币种|免费期限天数|指纹|计价模式。新付费行使用 prepaid_calendar_month；没有计价模式的旧文件继续按日计费。免费期限为 1-365 天，留空表示永久。",
     "clientMarket.importPlaceholder":
       "203.0.113.9:22\n203.0.113.10:22|体验主机|||7",
     "clientMarket.importSubmit": "导入",
@@ -5122,6 +5229,9 @@ export const messages = {
     "createClient.quoteTerms.postpaidTitle": "付费服务资金",
     "createClient.quoteTerms.postpaid":
       "本次包含来自 {suppliers} 个供应商账户的 {count} 台付费 Host；每台都有 {hours} 小时免费健康服务时间，之后优先扣除预存，仅不足部分使用各供应商明确授予的信用额度。",
+    "createClient.quoteTerms.prepaidMonthlyTitle": "月租预付服务",
+    "createClient.quoteTerms.prepaidMonthly":
+      "本次包含来自 {suppliers} 个供应商账户的 {count} 台 Host；安装前会冻结首个日历月费用，为某台 Host 勾选自动续费时还会额外冻结其完整下一期费用。",
     "createClient.quoteTerms.free":
       "本次包含 {count} 台免费 Host，不产生费用；如有固定免费期限，将从 Host 实际激活后开始计算。",
     "createClient.tabManual": "手动安装",
@@ -5260,6 +5370,8 @@ export const messages = {
     "marketAccess.activeServicesLabel": "活跃付费服务",
     "marketAccess.approveFreeHint":
       "本次只批准所申请的免费产品作用域，不会创建信用额度。",
+    "marketAccess.approveMonthlyHint":
+      "本次只批准月租预付准入；买家必须提前支付每个日历月，不会创建或修改商家信用额度。",
     "marketAccess.rejectionReason": "写入审计记录的拒绝原因",
     "marketAccess.rejectionReasonRequired": "请输入拒绝原因。",
     "marketAccess.rejectionCooldown":
@@ -5324,10 +5436,11 @@ export const messages = {
     "marketBilling.title": "市场账务",
     "marketBilling.open": "查看账务",
     "marketBilling.subtitle":
-      "健康使用先享受 {hours} 小时试用；之后优先扣预存余额，仅在商家明确授信时才使用信用额度。",
+      "新月租服务采用预付；已有旧版按日服务仍优先扣预存，仅不足部分使用商家明确授予的信用额度。",
     "marketBilling.supplier": "供应商",
     "marketBilling.buyer": "用户",
     "marketBilling.day": "天",
+    "marketBilling.month": "月",
     "marketBilling.service": "服务",
     "marketBilling.services": "账户关联服务",
     "marketBilling.noServices": "此账户当前没有有效服务。",
@@ -5361,6 +5474,8 @@ export const messages = {
     "marketBilling.prepaid.ledger.title": "预存流水",
     "marketBilling.prepaid.ledger.topup": "充值到账",
     "marketBilling.prepaid.ledger.usage": "服务消费",
+    "marketBilling.prepaid.ledger.recurringPeriod": "月租扣款",
+    "marketBilling.prepaid.ledger.recurringRefund": "月租退款",
     "marketBilling.prepaid.ledger.refund": "退款支出",
     "marketBilling.prepaid.ledger.serviceCredit": "服务退回",
     "marketBilling.prepaid.ledger.adjustment": "余额调整",
@@ -5435,6 +5550,43 @@ export const messages = {
     "marketFunding.topup.unavailable.relationshipClosed": "该商家关系已关闭；未使用的预存仍可申请退款，但不能继续充值。",
     "marketFunding.topup.quoteRefreshFallback": "充值已到账；当前报价仍可继续，确认时会再次校验资金。",
     "marketFunding.blocked": "请先补足预存资金，再确认本次订单。",
+    "marketRecurringFunding.title": "月租预付资金",
+    "marketRecurringFunding.prepaidOnly": "日历月租约仅使用预存资金，不使用商家信用额度。",
+    "marketRecurringFunding.shortfall": "仍需充值",
+    "marketRecurringFunding.firstPeriod": "首月冻结",
+    "marketRecurringFunding.nextPeriod": "次月冻结",
+    "marketRecurringFunding.totalReserved": "当前合计所需",
+    "marketRecurringFunding.policy": "激活前冻结首月费用；开启自动续费时同时冻结完整下一期，避免该笔资金被其他租约占用。",
+    "marketRecurringFunding.topupTarget": "该月租租约的资金目标",
+    "marketRecurring.updated": "续费设置已更新。",
+    "marketRecurring.reserved": "下一期费用已冻结。",
+    "marketRecurring.fundingRequired": "当前没有足够预存余额支付完整一期，请充值后重试。",
+    "marketRecurring.autoRenew": "自动续费",
+    "marketRecurring.autoRenewAtCheckout": "现在额外冻结 {amount} 作为下一期费用，之后可随时关闭。",
+    "marketRecurring.periodStart": "本期开始",
+    "marketRecurring.periodEnd": "本期结束",
+    "marketRecurring.nextHeld": "下一期已冻结",
+    "marketRecurring.renewalMode": "续费方式",
+    "marketRecurring.automatic": "自动",
+    "marketRecurring.manual": "手动",
+    "marketRecurring.trialEnds": "健康服务试用预计结束",
+    "marketRecurring.recoveryDeadline": "最晚充值时间",
+    "marketRecurring.cancelScheduled": "已安排在 {time} 终止；在此之前服务仍可使用。",
+    "marketRecurring.recoveryHint": "续费资金不足，服务已进入恢复期。请在期限前充值并冻结下一期费用以恢复服务。",
+    "marketRecurring.keepService": "继续使用",
+    "marketRecurring.disableAutoRenew": "关闭自动续费",
+    "marketRecurring.enableAutoRenew": "开启自动续费",
+    "marketRecurring.reserveNext": "冻结下一期",
+    "marketRecurring.compact.renewsAt": "本期结束于 {time}",
+    "marketRecurring.compact.trialUntil": "健康服务试用预计结束于 {time}",
+    "marketRecurring.compact.recoveryBy": "请在 {time} 前充值",
+    "marketRecurring.compact.cancelAt": "将在 {time} 结束",
+    "marketRecurring.status.pending_activation": "等待激活",
+    "marketRecurring.status.trial": "试用中",
+    "marketRecurring.status.active": "生效中",
+    "marketRecurring.status.recovery": "续费恢复期",
+    "marketRecurring.status.ended": "已结束",
+    "marketRecurring.status.activation_failed": "激活失败",
     "marketBilling.product.share": "Share 拼车位",
     "marketBilling.product.clientHost": "Client Host",
     "marketBilling.status.active": "累计中",

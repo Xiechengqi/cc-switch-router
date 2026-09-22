@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
+import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import {
@@ -84,6 +85,27 @@ function rentalQuota(subscription: ShareMarketSubscription, locale: string, t: T
 }
 
 function rentalServiceTiming(subscription: ShareMarketSubscription, locale: string, t: Translate) {
+  if (subscription.pricingModel === "prepaid_calendar_month" && subscription.recurring) {
+    const recurring = subscription.recurring;
+    if (recurring.cancelAtPeriodEnd) {
+      return t("marketRecurring.compact.cancelAt", {
+        time: formatDate(recurring.currentPeriodEnd, locale),
+      });
+    }
+    if (recurring.status === "recovery") {
+      return t("marketRecurring.compact.recoveryBy", {
+        time: formatDate(recurring.recoveryDeadline, locale),
+      });
+    }
+    if (recurring.status === "trial") {
+      return t("marketRecurring.compact.trialUntil", {
+        time: formatDate(recurring.trialEndsAt, locale),
+      });
+    }
+    return t("marketRecurring.compact.renewsAt", {
+      time: formatDate(recurring.currentPeriodEnd, locale),
+    });
+  }
   if (!subscription.serviceStartedAt) return t("account.share.activationPending");
   return subscription.expiresAt
     ? `${t("shareMarket.serviceDuration.started")}: ${formatDate(subscription.serviceStartedAt, locale)} · ${t("shareMarket.serviceDuration.expires")}: ${formatDate(subscription.expiresAt, locale)}`
@@ -242,7 +264,7 @@ export function ShareMarketSubscriptionCard({
               {t("account.share.openShare")}<ExternalLink className="h-3.5 w-3.5" />
             </a>
           ) : null}
-          {perspective === "user" && subscription.canRelease && onRelease ? (
+          {perspective === "user" && subscription.canRelease && !subscription.recurring?.cancelAtPeriodEnd && onRelease ? (
             <Button size="sm" variant="outline" isDisabled={busy} onClick={onRelease}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button>
           ) : null}
           {manageHref ? (
@@ -365,6 +387,15 @@ export function ShareMarketBuyerRentals({
                     showHint={false}
                   />
                   <RentalTermLine subscription={subscription} className="px-1.5 pt-1" />
+                  {subscription.recurring ? (
+                    <div className="mt-2" data-no-card-open>
+                      <MarketRecurringContractCard
+                        contract={subscription.recurring}
+                        onChanged={onChanged}
+                        compact
+                      />
+                    </div>
+                  ) : null}
                   <div data-no-card-open>
                     <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease} onAcceptPrice={actions.onAcceptPrice} onRejectPrice={actions.onRejectPrice} />
                   </div>
@@ -372,6 +403,15 @@ export function ShareMarketBuyerRentals({
               ) : (
                 <div className="grid content-start gap-1.5 border-t border-slate-100 pt-1.5">
                   <RentalTermLine subscription={subscription} className="px-1.5" />
+                  {subscription.recurring ? (
+                    <div className="mt-2" data-no-card-open>
+                      <MarketRecurringContractCard
+                        contract={subscription.recurring}
+                        onChanged={onChanged}
+                        compact
+                      />
+                    </div>
+                  ) : null}
                   <p className="min-w-0 truncate px-1.5 text-[10px] leading-4 text-slate-500">
                     {rentalQuota(subscription, locale, t)}
                   </p>

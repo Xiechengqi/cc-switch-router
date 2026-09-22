@@ -436,7 +436,17 @@ function ExternalReceiptDetails({ invoice, locale }: { invoice: MarketBillingInv
   );
 }
 
-function prepaidEntryLabel(kind: string, t: ReturnType<typeof useLocaleText>["t"]) {
+function prepaidEntryLabel(
+  kind: string,
+  sourceKind: string,
+  t: ReturnType<typeof useLocaleText>["t"],
+) {
+  if (sourceKind === "recurring_period") {
+    return t("marketBilling.prepaid.ledger.recurringPeriod");
+  }
+  if (sourceKind === "recurring_refund") {
+    return t("marketBilling.prepaid.ledger.recurringRefund");
+  }
   switch (kind) {
     case "topup_credit": return t("marketBilling.prepaid.ledger.topup");
     case "usage_debit": return t("marketBilling.prepaid.ledger.usage");
@@ -577,7 +587,7 @@ function PrepaidAccountPanel({
               {account.ledger.length ? account.ledger.map((entry) => (
                 <div key={entry.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 text-xs">
                   <span>
-                    <strong>{prepaidEntryLabel(entry.entryKind, t)}</strong>
+                    <strong>{prepaidEntryLabel(entry.entryKind, entry.sourceKind, t)}</strong>
                     <span className="ml-2 text-muted-foreground">{formatDate(entry.createdAt, locale)}</span>
                   </span>
                   <span className={`font-medium tabular-nums ${entry.direction === "credit" ? "text-emerald-700" : "text-foreground"}`}>

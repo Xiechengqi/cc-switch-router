@@ -135,11 +135,13 @@ export function listingIdleSeats<T extends Pick<ShareMarketSeat, "position" | "s
 }
 
 export function listingLowestIdleSeat<
-  T extends Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription" | "isFree" | "dailyRateMinor">,
+  T extends Pick<ShareMarketSeat, "position" | "status" | "readOnly" | "subscription" | "isFree" | "dailyRateMinor" | "cyclePriceMinor">,
 >(listing: { seats: T[] }) {
   const idle = listingIdleSeats(listing);
   if (!idle.length) return null;
-  const amount = (seat: T) => seat.isFree ? 0 : seat.dailyRateMinor ?? 0;
+  const amount = (seat: T) => seat.isFree
+    ? 0
+    : seat.cyclePriceMinor ?? (seat.dailyRateMinor ?? 0) * 30;
   const lowest = Math.min(...idle.map(amount));
   return idle.find((seat) => amount(seat) === lowest) || idle[0];
 }

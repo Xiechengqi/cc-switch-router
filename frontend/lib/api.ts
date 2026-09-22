@@ -106,6 +106,7 @@ import type {
   MarketBillingDashboard,
   MarketBillingConfig,
   MarketBillingInvoiceHistory,
+  MarketRecurringContract,
   MarketAccessDashboard,
   MarketAccessInboxSummary,
   MarketAccessRequest,
@@ -1152,6 +1153,7 @@ export async function createClientMarketHost(body: {
   note?: string;
   rootPassword?: string;
   dailyRateMinor?: number;
+  cyclePriceMinor?: number;
   currency?: string;
   freeDurationDays?: number;
 }) {
@@ -1875,11 +1877,14 @@ export async function getClientMarketProviderSupply() {
 
 export async function updateClientMarketHostOffer(
   hostId: string,
-  body: { dailyRateMinor?: number; currency?: string; freeDurationDays?: number },
+  body: { cyclePriceMinor?: number; currency?: string; freeDurationDays?: number },
 ) {
   return parseJson<{
     hostId: string;
     dailyRateMinor?: number;
+    pricingModel: string;
+    cyclePriceMinor?: number;
+    billingInterval?: string;
     currency?: string;
     freeDurationDays?: number;
     offerRevision: number;
@@ -1909,7 +1914,13 @@ export async function createClientMarketQuote(body: {
 
 export async function commitClientMarketQuote(
   quoteId: string,
-  items: Array<{ quoteItemId: string; offerRevision: number; subdomain: string; password: string }>,
+  items: Array<{
+    quoteItemId: string;
+    offerRevision: number;
+    subdomain: string;
+    password: string;
+    autoRenew?: boolean;
+  }>,
   idempotencyKey: string,
 ) {
   return parseJson<ClientMarketCommitQuoteResponse>(
@@ -2130,13 +2141,59 @@ export async function rentShareMarketSeat(
   seatId: string,
   quoteId: string,
   idempotencyKey: string,
+  autoRenew = false,
 ) {
   return parseJson<{ ok: true; subscriptionId: string; replayed: boolean }>(
     await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/rent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ quoteId, idempotencyKey }),
+      body: JSON.stringify({ quoteId, idempotencyKey, autoRenew }),
     }),
+  );
+}
+
+export async function updateMarketRecurringRenewal(
+  contractId: string,
+  body: {
+    renewalPolicy: "manual" | "automatic";
+    autoRenewMaxPriceMinor?: number;
+    renewalPriority?: number;
+  },
+) {
+  return parseJson<MarketRecurringContract>(
+    await authFetch(
+      `/v1/market-billing/recurring-contracts/${encodeURIComponent(contractId)}/renewal`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  );
+}
+
+export async function reserveNextMarketRecurringPeriod(contractId: string) {
+  return parseJson<MarketRecurringContract>(
+    await authFetch(
+      `/v1/market-billing/recurring-contracts/${encodeURIComponent(contractId)}/reserve-next`,
+      { method: "POST" },
+    ),
+  );
+}
+
+export async function cancelMarketRecurringContract(
+  contractId: string,
+  mode: "period_end" | "immediate" = "period_end",
+) {
+  return parseJson<MarketRecurringContract>(
+    await authFetch(
+      `/v1/market-billing/recurring-contracts/${encodeURIComponent(contractId)}/cancel`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      },
+    ),
   );
 }
 

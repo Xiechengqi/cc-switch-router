@@ -124,11 +124,40 @@ export function listingMatchesQuery(
 
 export function listingMatchesOwner(
   listing: Pick<ShareMarketListing, "ownerEmail">,
-  owner: string,
+  owners: string | string[],
 ) {
-  const needle = owner.trim().toLocaleLowerCase();
-  if (!needle) return true;
-  return listing.ownerEmail.trim().toLocaleLowerCase().includes(needle);
+  const selected = (Array.isArray(owners) ? owners : [owners])
+    .map((owner) => owner.trim().toLocaleLowerCase())
+    .filter(Boolean);
+  if (!selected.length) return true;
+  const email = listing.ownerEmail.trim().toLocaleLowerCase();
+  return selected.includes(email);
+}
+
+export function catalogOwnerOptions(
+  listings: Array<Pick<ShareMarketListing, "shareId" | "ownerEmail">>,
+  rentedShareIds: Iterable<string> = [],
+) {
+  const rented = new Set(
+    [...rentedShareIds].map((shareId) => shareId.trim()).filter(Boolean),
+  );
+  const byEmail = new Map<string, { value: string; label: string; rented: boolean }>();
+  for (const listing of listings) {
+    const label = listing.ownerEmail.trim();
+    if (!label) continue;
+    const value = label.toLocaleLowerCase();
+    const current = byEmail.get(value);
+    const rentedHere = rented.has(listing.shareId);
+    if (!current) {
+      byEmail.set(value, { value, label, rented: rentedHere });
+      continue;
+    }
+    if (rentedHere) current.rented = true;
+  }
+  return [...byEmail.values()].sort((left, right) =>
+    Number(right.rented) - Number(left.rented)
+    || left.label.localeCompare(right.label, undefined, { sensitivity: "base" }),
+  );
 }
 
 export function listingFamilyTabs(listings: ShareMarketListing[]) {
@@ -145,7 +174,7 @@ export function filterMarketListings(
   listings: ShareMarketListing[],
   family: ShareMarketProviderFamily | "all",
   query: string,
-  owner = "",
+  owner: string | string[] = [],
 ) {
   return listings.filter((listing) =>
     listingMatchesFamily(listing, family)
@@ -248,14 +277,14 @@ export function filterMergedCatalogListings(
     idleOnly = false,
     family,
     query,
-    owner = "",
+    owner = [],
     rentedShareIds,
   }: {
     mine: boolean;
     idleOnly?: boolean;
     family: ShareMarketProviderFamily | "all";
     query: string;
-    owner?: string;
+    owner?: string | string[];
     rentedShareIds: Set<string>;
   },
 ) {

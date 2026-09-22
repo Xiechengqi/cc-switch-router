@@ -176,6 +176,7 @@ function HostRowImpl({
         reason: cleanupReasonForHost(host),
         denyClientAccess,
       });
+      if (!jobId) throw new Error(t("clientMarket.cleanupFailed"));
       toast.info(t("clientMarket.cleanupStarted"));
       const initial = await getClientMarketJob(jobId).catch(() => null);
       if (initial) setCleanupJob(initial);
@@ -261,7 +262,7 @@ function HostRowImpl({
   }, [history]);
 
   const formatHistoryCharges = (entry: ClientMarketHostUsageHistoryEntry) => {
-    if (!entry.dailyRateMinor) {
+    if (entry.dailyRateMinor == null && entry.cyclePriceMinor == null) {
       return locale.startsWith("zh") ? "免费" : "Free";
     }
     const total = formatUsdMoney(entry.chargesMinor, locale);
@@ -459,7 +460,7 @@ function HostRowImpl({
               className="block whitespace-nowrap text-xs font-semibold text-foreground"
               title={t("clientMarket.currentOffer")}
             >
-              {formatHostOffer(host.dailyRateMinor, locale, host.freeDurationDays)}
+              {formatHostOffer(host.dailyRateMinor, locale, host.freeDurationDays, host.cyclePriceMinor)}
             </span>
             {showRenterRental && rental ? (
               <div className="mt-0.5 min-w-0" onClick={(event) => event.stopPropagation()}>

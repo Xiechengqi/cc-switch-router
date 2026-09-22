@@ -2295,10 +2295,23 @@ pub(crate) fn trial_seconds_remaining_tx(
 ) -> Result<i64, AppError> {
     let remaining = tx
         .query_row(
-            "SELECT MAX(allowance_seconds - consumed_seconds, 0)
-             FROM market_trial_ledgers
-             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
-               AND product_kind = ?3 AND service_ref = ?4 AND currency = ?5
+            "SELECT MAX(
+                    ledger.allowance_seconds - ledger.consumed_seconds - COALESCE((
+                        SELECT SUM(claim.claimed_seconds)
+                        FROM market_recurring_trial_claims claim
+                        WHERE claim.buyer_user_id = ledger.buyer_user_id
+                          AND claim.supplier_user_id = ledger.supplier_user_id
+                          AND claim.product_kind = ledger.product_kind
+                          AND claim.service_ref = ledger.service_ref
+                          AND claim.currency = ledger.currency
+                          AND claim.status IN ('reserved', 'active')
+                    ), 0),
+                    0
+                )
+             FROM market_trial_ledgers ledger
+             WHERE ledger.buyer_user_id = ?1 AND ledger.supplier_user_id = ?2
+               AND ledger.product_kind = ?3 AND ledger.service_ref = ?4
+               AND ledger.currency = ?5
              LIMIT 1",
             params![
                 buyer_user_id,
@@ -4241,6 +4254,7 @@ fn reserve_market_funding_tx(
                 "supplierUserId": input.supplier_user_id,
                 "supplierEmail": input.supplier_email,
                 "currency": input.currency,
+                "pricingModel": crate::market_recurring::PRICING_LEGACY_METERED_DAILY,
                 "requiredTopupMinor": summary.required_topup_minor,
                 "prepaidAvailableMinor": summary.prepaid_available_minor,
                 "creditAvailableMinor": summary.credit_available_minor,
@@ -4316,6 +4330,7 @@ fn reserve_market_funding_tx(
             serde_json::json!({
                 "supplierUserId": input.supplier_user_id,
                 "currency": input.currency,
+                "pricingModel": crate::market_recurring::PRICING_LEGACY_METERED_DAILY,
                 "requiredTopupMinor": ceil_minor(credit_units.saturating_sub(exact_credit_available)),
                 "fundingMode": summary.funding_mode,
             }),
@@ -5036,8 +5051,11 @@ pub(crate) fn credit_market_prepaid_funding_tx(
         actor_user_id,
         now,
     )?;
+    crate::market_recurring::reserve_automatic_contracts_for_account_tx(tx, account_id, now)?;
     resume_prepaid_contracts_if_safe_tx(tx, account_id, now)?;
-    Ok((entry_id, pending_control_actions_tx(tx)?))
+    let mut actions = pending_control_actions_tx(tx)?;
+    actions.extend(crate::market_recurring::pending_control_actions_tx(tx)?);
+    Ok((entry_id, actions))
 }
 
 fn resume_prepaid_contracts_if_safe_tx(
@@ -5435,6 +5453,78 @@ impl AppStore {
         let state = kind.control_state();
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
+        let recurring = conn
+            .query_row(
+                "SELECT product_kind, product_ref, status
+                 FROM market_recurring_contracts WHERE id = ?1",
+                params![contract_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("read recurring billing control completion"))?;
+        if let Some((product_kind, product_ref, contract_status)) = recurring {
+            let share_control_complete = if product_kind != "share" {
+                true
+            } else {
+                match state {
+                    "suspended" => conn
+                        .query_row(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM share_market_subscriptions
+                                WHERE id = ?1 AND status = 'billing_suspended'
+                             )",
+                            params![product_ref],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .map_err(map_db("check recurring Share suspension"))?,
+                    "active" => conn
+                        .query_row(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM share_market_subscriptions
+                                WHERE id = ?1 AND status = 'active_prepaid'
+                             )",
+                            params![product_ref],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .map_err(map_db("check recurring Share resume"))?,
+                    "terminated" => {
+                        contract_status == "ended"
+                            || conn
+                                .query_row(
+                                    "SELECT NOT EXISTS(
+                                        SELECT 1 FROM share_market_subscriptions
+                                        WHERE id = ?1
+                                          AND status NOT IN ('released', 'grant_failed')
+                                     )",
+                                    params![product_ref],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .map_err(map_db("check recurring Share termination"))?
+                    }
+                    _ => false,
+                }
+            };
+            if !share_control_complete {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE market_recurring_contracts
+                 SET applied_control_state = ?2,
+                     control_error = CASE
+                        WHEN ?2 = 'suspended' THEN control_error ELSE NULL END,
+                     version = version + 1, updated_at = ?3
+                 WHERE id = ?1 AND desired_control_state = ?2",
+                params![contract_id, state, now],
+            )
+            .map_err(map_db("mark recurring billing control applied"))?;
+            return Ok(());
+        }
         let share_control_complete = conn
             .query_row(
                 "SELECT contract.product_kind != 'share' OR
@@ -5488,15 +5578,27 @@ impl AppStore {
         kind: &BillingActionKind,
     ) -> Result<bool, AppError> {
         let conn = self.conn.lock().await;
+        let legacy = conn
+            .query_row(
+                "SELECT desired_control_state = ?2 AND applied_control_state != ?2
+             FROM market_service_contracts WHERE id = ?1",
+                params![contract_id, kind.control_state()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_db("verify current market billing control"))?;
+        if let Some(current) = legacy {
+            return Ok(current);
+        }
         conn.query_row(
             "SELECT desired_control_state = ?2 AND applied_control_state != ?2
-             FROM market_service_contracts WHERE id = ?1",
+             FROM market_recurring_contracts WHERE id = ?1",
             params![contract_id, kind.control_state()],
             |row| row.get(0),
         )
         .optional()
         .map(|value| value.unwrap_or(false))
-        .map_err(map_db("verify current market billing control"))
+        .map_err(map_db("verify current recurring billing control"))
     }
 
     pub async fn market_billing_mark_control_failed(
@@ -5506,8 +5608,9 @@ impl AppStore {
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE market_service_contracts
+        let legacy_changed = conn
+            .execute(
+                "UPDATE market_service_contracts
              SET control_error = CASE
                     WHEN desired_control_state = 'suspended'
                          AND control_error = 'insufficient_funds'
@@ -5516,9 +5619,22 @@ impl AppStore {
                  END,
                  updated_at = ?3
              WHERE id = ?1",
-            params![contract_id, error, now],
-        )
-        .map_err(map_db("mark market billing control failed"))?;
+                params![contract_id, error, now],
+            )
+            .map_err(map_db("mark market billing control failed"))?;
+        if legacy_changed == 0 {
+            conn.execute(
+                "UPDATE market_recurring_contracts
+                 SET control_error = CASE
+                        WHEN desired_control_state = 'suspended'
+                             AND control_error = 'renewal_funding_required'
+                        THEN control_error ELSE ?2 END,
+                     version = version + 1, updated_at = ?3
+                 WHERE id = ?1",
+                params![contract_id, error, now],
+            )
+            .map_err(map_db("mark recurring billing control failed"))?;
+        }
         Ok(())
     }
 
@@ -8006,7 +8122,7 @@ fn latest_health_observation_tx(
         "share" => tx
             .query_row(
                 "SELECT 1 FROM share_market_subscriptions
-                 WHERE id = ?1 AND status = 'active_postpaid'",
+                 WHERE id = ?1 AND status IN ('active_postpaid', 'active_prepaid')",
                 params![product_ref],
                 |row| row.get::<_, i64>(0),
             )
@@ -8054,6 +8170,42 @@ fn latest_health_observation_tx(
     )
     .optional()
     .map_err(map_db("read latest service health observation"))
+}
+
+pub(crate) fn effective_service_health_tx(
+    tx: &Connection,
+    product_kind: &str,
+    product_ref: &str,
+    service_ref: &str,
+    evaluation_started_at: DateTime<Utc>,
+    evaluation_ended_at: DateTime<Utc>,
+) -> Result<(String, String), AppError> {
+    let gap = (evaluation_ended_at - evaluation_started_at)
+        .num_seconds()
+        .max(0);
+    let observation = latest_health_observation_tx(
+        tx,
+        product_kind,
+        product_ref,
+        service_ref,
+        evaluation_ended_at,
+    )?;
+    let (observed_state, observation_reason) = match observation {
+        Some((checked_at, status, reason))
+            if status == "healthy"
+                && evaluation_ended_at.timestamp() - checked_at <= HEALTH_FRESHNESS_SECS =>
+        {
+            ("healthy".to_string(), reason)
+        }
+        Some((_, status, reason)) if status == "unhealthy" => ("unhealthy".to_string(), reason),
+        Some((_, _, reason)) => ("unknown".to_string(), reason),
+        None => ("unknown".to_string(), "no_router_observation".to_string()),
+    };
+    if gap > MAX_ACCRUAL_GAP_SECS {
+        Ok(("unknown".into(), "billing_worker_gap".into()))
+    } else {
+        Ok((observed_state, observation_reason))
+    }
 }
 
 fn contract_evaluation_end(
@@ -8359,29 +8511,15 @@ fn build_accrual_candidate_tx(
     let capped_end = contract_evaluation_end(&contract, requested_end)?;
     let now = capped_end.max(last);
     let gap = (now - last).num_seconds().max(0);
-    let observation = latest_health_observation_tx(
+    let (effective_state, observation_reason) = effective_service_health_tx(
         tx,
         &contract.product_kind,
         &contract.product_ref,
         &contract.service_ref,
+        last,
         now,
     )?;
-    let (observed_state, observation_reason) = match observation {
-        Some((checked_at, status, reason))
-            if status == "healthy" && now.timestamp() - checked_at <= HEALTH_FRESHNESS_SECS =>
-        {
-            ("healthy".to_string(), reason)
-        }
-        Some((_, status, reason)) if status == "unhealthy" => ("unhealthy".to_string(), reason),
-        Some((_, _, reason)) => ("unknown".to_string(), reason),
-        None => ("unknown".to_string(), "no_router_observation".to_string()),
-    };
     let elapsed_seconds = gap;
-    let effective_state = if gap > MAX_ACCRUAL_GAP_SECS {
-        "unknown".to_string()
-    } else {
-        observed_state
-    };
     let trial_seconds = if effective_state == "healthy" {
         elapsed_seconds.min(contract.trial_seconds_remaining.max(0))
     } else {
@@ -8402,11 +8540,7 @@ fn build_accrual_candidate_tx(
             .saturating_sub(trial_seconds),
         contract,
         observed_state: effective_state,
-        observation_reason: if gap > MAX_ACCRUAL_GAP_SECS {
-            "billing_worker_gap".to_string()
-        } else {
-            observation_reason
-        },
+        observation_reason,
         interval_started_at: last.to_rfc3339(),
         interval_ended_at: now.to_rfc3339(),
         elapsed_seconds,
@@ -9846,7 +9980,9 @@ impl AppStore {
         open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
         mark_overdue_invoices_tx(&tx, &now_text)?;
         mark_overdue_refund_obligations_tx(&tx, now)?;
-        let actions = pending_control_actions_tx(&tx)?;
+        crate::market_recurring::reconcile_tx(&tx, now)?;
+        let mut actions = pending_control_actions_tx(&tx)?;
+        actions.extend(crate::market_recurring::pending_control_actions_tx(&tx)?);
         tx.commit()
             .map_err(map_db("commit market billing reconciliation"))?;
         Ok(actions)

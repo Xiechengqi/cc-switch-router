@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type {
   MarketFundingSummary,
+  MarketRecurringFundingSummary,
   ShareMarketListing,
   ShareMarketOwnedShare,
   ShareMarketSeat,
@@ -32,13 +33,16 @@ import { shareMarketMutationError } from "./market-utils";
 import { ApiError } from "@/lib/api";
 import {
   applyMarketFundingConflict,
+  applyRecurringFundingConflict,
   defaultMarketFundingTopupMinor,
   formatFundingRunway,
   marketFundingConflictFromError,
+  marketFundingAfterRecurringHolds,
   marketFundingDecisionState,
   marketFundingTopupErrorKey,
   marketFundingTopupUnavailableKey,
   marketFundingUsesCredit,
+  recurringFundingForRenewal,
 } from "@/lib/market-funding";
 
 function seat(
@@ -248,6 +252,90 @@ test("free idle seats beat paid idle seats for the collapsed price", () => {
   assert.equal(listingLowestIdleSeat(listing("mix", "active", [paid, free]))?.id, "free");
 });
 
+test("mixed legacy daily and monthly seats compare by monthly equivalent", () => {
+  const legacyDaily = rentedSeat("legacy-daily", "available", {
+    position: 1,
+    isFree: false,
+    dailyRateMinor: 100,
+  });
+  const monthly = rentedSeat("monthly", "available", {
+    position: 2,
+    isFree: false,
+    cyclePriceMinor: 2_500,
+  });
+  assert.equal(
+    listingLowestIdleSeat(listing("mixed-pricing", "active", [legacyDaily, monthly]))?.id,
+    "monthly",
+  );
+});
+
+test("recurring funding recalculates the exact automatic-renewal hold", () => {
+  const funding = {
+    supplierUserId: "supplier",
+    supplierEmail: "supplier@example.com",
+    currency: "USD",
+    pricingModel: "prepaid_calendar_month",
+    billingInterval: "calendar_month",
+    cyclePriceMinor: 1_200,
+    renewalPolicy: "manual",
+    prepaidBalanceMinor: 1_500,
+    prepaidHeldMinor: 0,
+    prepaidAvailableMinor: 1_500,
+    initialHoldMinor: 1_200,
+    renewalHoldMinor: 0,
+    totalRequiredHoldMinor: 1_200,
+    requiredTopupMinor: 0,
+    topupAvailable: true,
+  } as const;
+  const automatic = recurringFundingForRenewal(funding, true);
+  assert.equal(automatic.renewalPolicy, "automatic");
+  assert.equal(automatic.renewalHoldMinor, 1_200);
+  assert.equal(automatic.totalRequiredHoldMinor, 2_400);
+  assert.equal(automatic.requiredTopupMinor, 900);
+  const manual = recurringFundingForRenewal(automatic, false);
+  assert.equal(manual.renewalPolicy, "manual");
+  assert.equal(manual.renewalHoldMinor, 0);
+  assert.equal(manual.requiredTopupMinor, 0);
+});
+
+test("calendar-month holds are applied before legacy metered funding", () => {
+  const funding = {
+    supplierUserId: "supplier",
+    supplierEmail: "supplier@example.com",
+    currency: "USD",
+    fundingMode: "prepaid_then_credit",
+    prepaidBalanceMinor: 1_500,
+    prepaidHeldMinor: 0,
+    prepaidAvailableMinor: 1_500,
+    creditKind: "limited",
+    creditLimitMinor: 500,
+    creditOutstandingMinor: 0,
+    creditReservedMinor: 0,
+    creditAvailableMinor: 500,
+    activeDailyRateMinor: 0,
+    additionalDailyRateMinor: 1_000,
+    projectedDailyRateMinor: 1_000,
+    requiredCoverageMinor: 1_000,
+    prepaidCoverageMinor: 1_000,
+    creditCoverageMinor: 0,
+    requiredTopupMinor: 0,
+    recommendedTopupMinor: 5_500,
+    recommendedCoverageDays: 7,
+    prepaidRunwaySeconds: 129_600,
+    estimatedRunwaySeconds: 172_800,
+    topupAvailable: true,
+  } satisfies MarketFundingSummary;
+  const projected = marketFundingAfterRecurringHolds(funding, 1_200);
+  assert.equal(projected.prepaidHeldMinor, 1_200);
+  assert.equal(projected.prepaidAvailableMinor, 300);
+  assert.equal(projected.prepaidCoverageMinor, 300);
+  assert.equal(projected.creditCoverageMinor, 500);
+  assert.equal(projected.requiredTopupMinor, 200);
+  assert.equal(projected.recommendedTopupMinor, 6_700);
+  assert.equal(projected.prepaidRunwaySeconds, 25_920);
+  assert.equal(projected.estimatedRunwaySeconds, 69_120);
+});
+
 test("expandable seats are live seats on active listings and remaining rentals when closed", () => {
   const failed = rentedSeat("failed", "occupied", { position: 2, subscriptionStatus: "grant_failed" });
   const idle = rentedSeat("idle", "available", { position: 1 });
@@ -355,6 +443,48 @@ test("prepaid funding race details update only the affected supplier", () => {
       { ...funding, supplierUserId: "supplier-b" },
       conflict!,
     ).requiredTopupMinor,
+    0,
+  );
+
+  const recurringFunding = {
+    supplierUserId: "supplier-a",
+    supplierEmail: "supplier@example.com",
+    currency: "USD",
+    pricingModel: "prepaid_calendar_month",
+    billingInterval: "calendar_month",
+    cyclePriceMinor: 300,
+    renewalPolicy: "manual",
+    prepaidBalanceMinor: 300,
+    prepaidHeldMinor: 0,
+    prepaidAvailableMinor: 300,
+    initialHoldMinor: 300,
+    renewalHoldMinor: 0,
+    totalRequiredHoldMinor: 300,
+    requiredTopupMinor: 0,
+    topupAvailable: true,
+  } satisfies MarketRecurringFundingSummary;
+  const monthlyConflict = marketFundingConflictFromError(new ApiError(
+    409,
+    "monthly funding changed",
+    "MARKET_PREPAID_REQUIRED",
+    {
+      supplierUserId: "supplier-a",
+      pricingModel: "prepaid_calendar_month",
+      requiredTopupMinor: 125,
+      prepaidAvailableMinor: 175,
+    },
+  ));
+  assert.equal(
+    applyMarketFundingConflict(funding, monthlyConflict!).requiredTopupMinor,
+    0,
+  );
+  assert.equal(
+    applyRecurringFundingConflict(recurringFunding, monthlyConflict!).requiredTopupMinor,
+    125,
+  );
+  const legacyConflict = { ...conflict!, pricingModel: "legacy_metered_daily" };
+  assert.equal(
+    applyRecurringFundingConflict(recurringFunding, legacyConflict).requiredTopupMinor,
     0,
   );
   assert.equal(

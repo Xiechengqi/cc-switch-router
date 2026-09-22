@@ -97,6 +97,12 @@ function lineAt(source, index) {
 
 function allowedLegacyAssertion(relativePath, source, index, ruleName) {
   if (
+    relativePath === "src/market_recurring.rs"
+    && ruleName === "product prepaid period end"
+  ) {
+    return true;
+  }
+  if (
     relativePath === "src/client_market.rs"
     && [
       "Client rental period field",
@@ -185,6 +191,7 @@ function main() {
   const shareSource = fs.readFileSync(path.join(root, "src/share_market.rs"), "utf8");
   const accessSource = fs.readFileSync(path.join(root, "src/market_access.rs"), "utf8");
   const billingSource = fs.readFileSync(path.join(root, "src/market_billing.rs"), "utf8");
+  const recurringSource = fs.readFileSync(path.join(root, "src/market_recurring.rs"), "utf8");
   const chatSource = fs.readFileSync(path.join(root, "src/store/client_chat.rs"), "utf8");
   const apiSource = fs.readFileSync(path.join(root, "src/api.rs"), "utf8");
   const typeSource = fs.readFileSync(path.join(root, "frontend/lib/types.ts"), "utf8");
@@ -197,12 +204,14 @@ function main() {
     ["Share SeatView", extractRustBlock(shareSource, "pub struct SeatView")],
     ["Share SubscriptionView", extractRustBlock(shareSource, "pub struct SubscriptionView")],
     ["CreditAccountView", extractRustBlock(billingSource, "pub struct CreditAccountView")],
+    ["RecurringContractView", extractRustBlock(recurringSource, "pub struct RecurringContractView")],
     ["ClientMarketHost", extractTypeBlock(typeSource, "ClientMarketHost")],
     ["ClientMarketRental", extractTypeBlock(typeSource, "ClientMarketRental")],
     ["ShareMarketListing", extractTypeBlock(typeSource, "ShareMarketListing")],
     ["ShareMarketAppCapability", extractTypeBlock(typeSource, "ShareMarketAppCapability")],
     ["ShareMarketSubscription", extractTypeBlock(typeSource, "ShareMarketSubscription")],
     ["MarketCreditAccount", extractTypeBlock(typeSource, "MarketCreditAccount")],
+    ["MarketRecurringContract", extractTypeBlock(typeSource, "MarketRecurringContract")],
   ]) {
     assertProductDtoIsRedacted(errors, label, block);
   }
@@ -325,6 +334,9 @@ function main() {
     "/v1/market-billing/dashboard",
     "/v1/market-billing/config",
     "/v1/market-billing/accounts/:account_id/request-settlement",
+    "/v1/market-billing/recurring-contracts/:id/renewal",
+    "/v1/market-billing/recurring-contracts/:id/reserve-next",
+    "/v1/market-billing/recurring-contracts/:id/cancel",
   ]) {
     if (!files.some((relativePath) => {
       if (!relativePath.startsWith("src/")) return false;
@@ -448,7 +460,7 @@ function main() {
         "quoteShareMarketSeat(item.seat.id)",
         "setRentTarget({ ...item, quote, idempotencyKey:",
         "crypto.randomUUID()",
-        "rentShareMarketSeat(rentTarget.seat.id, rentTarget.quote.id, rentTarget.idempotencyKey)",
+        "rentTarget.idempotencyKey,\n        rentAutoRenew,",
         "rentTarget.quote.offer.parallelLimit",
         "rentTarget.quote.offer.serviceDurationDays",
         "rentTarget.quote.trialSecondsRemaining",
@@ -533,7 +545,7 @@ function main() {
         "/v1/market-access/inbox-summary",
         "/v1/share-market/seats/${encodeURIComponent(seatId)}/quote",
         "export async function quoteShareMarketSeat(seatId: string)",
-        "body: JSON.stringify({ quoteId, idempotencyKey })",
+        "body: JSON.stringify({ quoteId, idempotencyKey, autoRenew })",
       ],
     ],
   ]) {
@@ -602,6 +614,21 @@ function main() {
   ]) {
     if (!rentQuoteType.includes(required)) {
       errors.push(`ShareMarketRentQuote is missing ${required}`);
+    }
+  }
+  const recurringContractType = extractTypeBlock(typeSource, "MarketRecurringContract");
+  for (const required of [
+    "pricingModel",
+    "billingInterval",
+    "cyclePriceMinor",
+    "renewalPolicy",
+    "renewalStatus",
+    "currentPeriodEnd",
+    "nextPeriodHeldMinor",
+    "cancelAtPeriodEnd",
+  ]) {
+    if (!recurringContractType.includes(required)) {
+      errors.push(`MarketRecurringContract is missing ${required}`);
     }
   }
   const rentServiceType = extractTypeBlock(typeSource, "ShareMarketRentService");

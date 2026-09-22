@@ -135,7 +135,7 @@ const TOKEN_PERIODS: ShareTokenPeriod[] = [
   "calendarMonth",
   "thirtyDays",
 ];
-const MAX_DAILY_RATE_MINOR = 100_000_000;
+const MAX_PRICE_MINOR = 100_000_000;
 
 class SeatDraftError extends Error {
   readonly field: SeatDraftField;
@@ -205,14 +205,16 @@ function seatDraft(seat: ShareMarketSeat): SeatDraft {
     tokenLimit: seat.tokenLimit == null ? "" : tokensToMillionsInput(seat.tokenLimit),
     tokenPeriod: seat.tokenPeriod,
     paid: !seat.isFree,
-    price: seat.dailyRateMinor == null ? "" : (seat.dailyRateMinor / 100).toFixed(2),
+    price: seat.cyclePriceMinor != null
+      ? (seat.cyclePriceMinor / 100).toFixed(2)
+      : "",
     trialHours: !seat.isFree
       ? String(seat.trialHours ?? DEFAULT_TRIAL_HOURS)
       : trial.hours,
     trialTokenLimit: !seat.isFree
       ? tokensToMillionsInput(seat.trialTokenLimit ?? 1_000_000)
       : trial.tokens,
-    serviceDurationMode: seat.serviceDurationDays == null ? "permanent" : "fixed",
+    serviceDurationMode: !seat.isFree || seat.serviceDurationDays == null ? "permanent" : "fixed",
     serviceDurationDays: String(seat.serviceDurationDays ?? 1),
     serviceDurationTouched: true,
   };
@@ -255,7 +257,7 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
     t,
   );
   const tokenLimit = positiveOptionalTokenMillions(draft.tokenLimit, t("shareMarket.tokens"), t);
-  const serviceDurationDays = draft.serviceDurationMode === "permanent"
+  const serviceDurationDays = draft.paid || draft.serviceDurationMode === "permanent"
     ? undefined
     : positiveOptional(
         draft.serviceDurationDays,
@@ -277,11 +279,11 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   };
   if (!draft.paid) return base;
   const amount = Number(draft.price);
-  const dailyRateMinor = Math.round(amount * 100);
-  if (!/^\d+(?:\.\d{1,2})?$/.test(draft.price.trim()) || amount <= 0 || !Number.isSafeInteger(dailyRateMinor)) {
+  const cyclePriceMinor = Math.round(amount * 100);
+  if (!/^\d+(?:\.\d{1,2})?$/.test(draft.price.trim()) || amount <= 0 || !Number.isSafeInteger(cyclePriceMinor)) {
     throw new SeatDraftError("price", t("shareMarket.error.price"));
   }
-  if (dailyRateMinor > MAX_DAILY_RATE_MINOR) {
+  if (cyclePriceMinor > MAX_PRICE_MINOR) {
     throw new SeatDraftError("price", t("shareMarket.error.priceRange"));
   }
   const trialHours = Number(draft.trialHours);
@@ -295,7 +297,7 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   if (trialTokenLimit == null) {
     throw new SeatDraftError("trialTokenLimit", t("shareMarket.error.nonNegativeMillions", { field: t("shareMarket.dialog.trialTokenLimit") }));
   }
-  return { ...base, dailyRateMinor, currency: MARKET_CURRENCY, trialHours, trialTokenLimit };
+  return { ...base, serviceDurationDays: undefined, cyclePriceMinor, currency: MARKET_CURRENCY, trialHours, trialTokenLimit };
 }
 
 function seatDraftValidation(
@@ -404,12 +406,11 @@ function SeatFields({
           const paid = value === "paid";
           patch({
             paid,
-            ...(!draft.serviceDurationTouched
-              ? {
-                  serviceDurationMode: paid ? "permanent" as const : "fixed" as const,
-                  serviceDurationDays: "1",
-                }
-              : {}),
+            ...(paid
+              ? { serviceDurationMode: "permanent" as const }
+              : !draft.serviceDurationTouched
+                ? { serviceDurationMode: "fixed" as const, serviceDurationDays: "1" }
+                : {}),
           });
         }}
         ariaLabel={t("shareMarket.dialog.amount")}
@@ -425,7 +426,7 @@ function SeatFields({
         <>
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="grid gap-1 text-xs text-slate-500">
-              {t("shareMarket.dialog.amount")}
+              {t("shareMarket.dialog.monthlyAmount")}
               <input className={fieldClass(invalid("price"))} inputMode="decimal" disabled={disabled} aria-invalid={invalid("price")} aria-describedby={describedBy("price")} value={draft.price} onChange={(event) => patch({ price: event.target.value })} />
             </label>
             <div className="grid gap-1 text-xs text-slate-500">
@@ -469,7 +470,7 @@ function SeatFields({
           </div>
         </>
       ) : null}
-      <div className="grid gap-2">
+      {!draft.paid ? <div className="grid gap-2">
         <span className="text-xs text-slate-500">{t("shareMarket.serviceDuration.label")}</span>
         <SegmentedControl
           value={draft.serviceDurationMode}
@@ -489,7 +490,9 @@ function SeatFields({
             <input type="number" min={1} max={365} className={fieldClass(invalid("serviceDurationDays"))} disabled={disabled} aria-invalid={invalid("serviceDurationDays")} aria-describedby={describedBy("serviceDurationDays")} value={draft.serviceDurationDays} onChange={(event) => patch({ serviceDurationDays: event.target.value, serviceDurationTouched: true })} />
           </label>
         ) : null}
-      </div>
+      </div> : (
+        <p className="text-xs leading-5 text-slate-500">{t("shareMarket.serviceDuration.monthlyManaged")}</p>
+      )}
       {validation.message ? <p id={errorId} role="alert" className="text-xs leading-5 text-rose-700">{validation.message}</p> : null}
     </div>
   );
@@ -973,8 +976,8 @@ function PriceDialog({ subscription, onOpenChange, onSaved }: { subscription: Sh
       setError(t("shareMarket.error.price"));
       return;
     }
-    if (dailyRateMinor > MAX_DAILY_RATE_MINOR) {
-      setError(t("shareMarket.error.priceRange"));
+    if (dailyRateMinor > MAX_PRICE_MINOR) {
+      setError(t("shareMarket.error.dailyPriceRange"));
       return;
     }
     setBusy(true);

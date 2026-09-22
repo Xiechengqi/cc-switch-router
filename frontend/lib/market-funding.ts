@@ -1,9 +1,96 @@
 import { ApiError } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
-import type { MarketFundingSummary } from "@/lib/types";
+import type { MarketFundingSummary, MarketRecurringFundingSummary } from "@/lib/types";
+
+export type MarketTopupFunding = MarketFundingSummary | MarketRecurringFundingSummary;
+
+export function isRecurringFunding(
+  funding: MarketTopupFunding,
+): funding is MarketRecurringFundingSummary {
+  return "totalRequiredHoldMinor" in funding;
+}
+
+export function recurringFundingForRenewal(
+  funding: MarketRecurringFundingSummary,
+  autoRenew: boolean,
+  renewalHoldMinor = funding.cyclePriceMinor,
+): MarketRecurringFundingSummary {
+  const renewal = autoRenew ? renewalHoldMinor : 0;
+  const total = funding.initialHoldMinor + renewal;
+  return {
+    ...funding,
+    renewalPolicy: autoRenew ? "automatic" : "manual",
+    renewalHoldMinor: renewal,
+    totalRequiredHoldMinor: total,
+    requiredTopupMinor: Math.max(0, total - funding.prepaidAvailableMinor),
+  };
+}
+
+/**
+ * Project a legacy metered funding summary after calendar-month holds against
+ * the same supplier account. Monthly contracts cannot use credit, so they must
+ * consume prepaid funds before the metered reservation chooses prepaid/credit.
+ */
+export function marketFundingAfterRecurringHolds(
+  funding: MarketFundingSummary,
+  recurringHoldMinor: number,
+): MarketFundingSummary {
+  const requestedHold = Number.isSafeInteger(recurringHoldMinor)
+    ? Math.max(0, recurringHoldMinor)
+    : 0;
+  const plannedHold = Math.min(funding.prepaidAvailableMinor, requestedHold);
+  if (plannedHold === 0) return funding;
+
+  const prepaidAvailableMinor = funding.prepaidAvailableMinor - plannedHold;
+  const requiredCoverageMinor = Math.max(0, funding.requiredCoverageMinor);
+  const prepaidCoverageMinor = Math.min(prepaidAvailableMinor, requiredCoverageMinor);
+  const uncoveredAfterPrepaid = requiredCoverageMinor - prepaidCoverageMinor;
+  const unlimitedCredit = funding.creditKind === "unlimited";
+  const creditAvailableMinor = unlimitedCredit
+    ? uncoveredAfterPrepaid
+    : Math.max(0, funding.creditAvailableMinor ?? 0);
+  const creditCoverageMinor = Math.min(uncoveredAfterPrepaid, creditAvailableMinor);
+  const requiredTopupMinor = Math.max(
+    0,
+    uncoveredAfterPrepaid - creditCoverageMinor,
+  );
+  const recommendedTargetMinor = Math.max(
+    0,
+    funding.projectedDailyRateMinor * funding.recommendedCoverageDays,
+  );
+  const recommendedTopupMinor = Math.max(
+    requiredTopupMinor,
+    recommendedTargetMinor - prepaidAvailableMinor,
+  );
+  const prepaidRunwaySeconds = funding.projectedDailyRateMinor > 0
+    ? Math.floor(
+      prepaidAvailableMinor * 86_400 / funding.projectedDailyRateMinor,
+    )
+    : undefined;
+  const estimatedRunwaySeconds = funding.projectedDailyRateMinor <= 0
+    || unlimitedCredit
+    ? undefined
+    : Math.floor(
+      (prepaidAvailableMinor + creditAvailableMinor) * 86_400
+        / funding.projectedDailyRateMinor,
+    );
+
+  return {
+    ...funding,
+    prepaidHeldMinor: funding.prepaidHeldMinor + plannedHold,
+    prepaidAvailableMinor,
+    prepaidCoverageMinor,
+    creditCoverageMinor,
+    requiredTopupMinor,
+    recommendedTopupMinor,
+    prepaidRunwaySeconds,
+    estimatedRunwaySeconds,
+  };
+}
 
 export type MarketFundingConflict = {
   supplierUserId: string;
+  pricingModel?: string;
   requiredTopupMinor: number;
   prepaidAvailableMinor?: number;
   creditAvailableMinor?: number;
@@ -31,9 +118,13 @@ export function marketFundingConflictFromError(reason: unknown): MarketFundingCo
   const supplierUserId = typeof reason.details?.supplierUserId === "string"
     ? reason.details.supplierUserId
     : "";
+  const pricingModel = typeof reason.details?.pricingModel === "string"
+    ? reason.details.pricingModel
+    : undefined;
   if (requiredTopupMinor == null || !supplierUserId) return null;
   return {
     supplierUserId,
+    ...(pricingModel ? { pricingModel } : {}),
     requiredTopupMinor,
     prepaidAvailableMinor: finiteNonNegative(reason.details?.prepaidAvailableMinor),
     creditAvailableMinor: finiteNonNegative(reason.details?.creditAvailableMinor),
@@ -43,15 +134,36 @@ export function marketFundingConflictFromError(reason: unknown): MarketFundingCo
 export function applyMarketFundingConflict(
   funding: MarketFundingSummary,
   conflict: MarketFundingConflict,
+  recurringHoldMinor = 0,
 ) {
-  if (conflict.supplierUserId !== funding.supplierUserId) {
+  if (
+    conflict.supplierUserId !== funding.supplierUserId
+    || conflict.pricingModel === "prepaid_calendar_month"
+  ) {
     return funding;
   }
   return {
     ...funding,
     requiredTopupMinor: conflict.requiredTopupMinor,
-    prepaidAvailableMinor: conflict.prepaidAvailableMinor ?? funding.prepaidAvailableMinor,
+    prepaidAvailableMinor: conflict.prepaidAvailableMinor == null
+      ? funding.prepaidAvailableMinor
+      : conflict.prepaidAvailableMinor + Math.max(0, recurringHoldMinor),
     creditAvailableMinor: conflict.creditAvailableMinor ?? funding.creditAvailableMinor,
+  };
+}
+
+export function applyRecurringFundingConflict(
+  funding: MarketRecurringFundingSummary,
+  conflict: MarketFundingConflict,
+) {
+  if (
+    conflict.supplierUserId !== funding.supplierUserId
+    || conflict.pricingModel === "legacy_metered_daily"
+  ) return funding;
+  return {
+    ...funding,
+    requiredTopupMinor: conflict.requiredTopupMinor,
+    prepaidAvailableMinor: conflict.prepaidAvailableMinor ?? funding.prepaidAvailableMinor,
   };
 }
 
@@ -88,7 +200,13 @@ export function marketFundingTopupErrorKey(reason: unknown): MessageKey | undefi
   }
 }
 
-export function defaultMarketFundingTopupMinor(funding: MarketFundingSummary) {
+export function defaultMarketFundingTopupMinor(funding: MarketTopupFunding) {
+  if (isRecurringFunding(funding)) {
+    const preferred = funding.requiredTopupMinor > 0
+      ? funding.requiredTopupMinor
+      : funding.cyclePriceMinor;
+    return Math.min(preferred, MAX_MARKET_FUNDING_TOPUP_MINOR);
+  }
   const quotedTarget = Math.max(
     funding.recommendedTopupMinor,
     funding.requiredTopupMinor,

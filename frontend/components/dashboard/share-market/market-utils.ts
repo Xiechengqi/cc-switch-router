@@ -142,12 +142,20 @@ export function listingIdleCount(listing: { seats: Array<Pick<ShareMarketSeat, "
 }
 
 export function listingLowestDailyRate(listing: {
-  seats: Array<Pick<ShareMarketSeat, "status" | "readOnly" | "dailyRateMinor" | "isFree">>;
+  seats: Array<Pick<ShareMarketSeat, "status" | "readOnly" | "dailyRateMinor" | "cyclePriceMinor" | "isFree">>;
 }) {
   const idle = listing.seats.filter(isSeatIdle);
   const seats = idle.length ? idle : listing.seats;
   if (!seats.length) return Number.POSITIVE_INFINITY;
-  return Math.min(...seats.map((seat) => seat.dailyRateMinor ?? 0));
+  return Math.min(...seats.map(seatComparableMonthlyMinor));
+}
+
+/** Comparable monthly key for mixed legacy-daily and calendar-month catalog rows. */
+export function seatComparableMonthlyMinor(
+  seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor" | "cyclePriceMinor">,
+) {
+  if (seat.isFree) return 0;
+  return seat.cyclePriceMinor ?? (seat.dailyRateMinor == null ? 0 : seat.dailyRateMinor * 30);
 }
 
 export type ListingPriceSummary = {
@@ -165,30 +173,40 @@ export type ListingPriceSummary = {
  * whole Share stand in, so a full Share still advertises the level it sells at.
  */
 export function listingPriceSummary(
-  listing: { seats: Array<Pick<ShareMarketSeat, "status" | "readOnly" | "dailyRateMinor" | "isFree">> },
+  listing: { seats: Array<Pick<ShareMarketSeat, "status" | "readOnly" | "dailyRateMinor" | "cyclePriceMinor" | "isFree">> },
   locale: string,
   freeLabel: string,
   dayLabel: string,
+  monthLabel?: string,
 ): ListingPriceSummary {
   const idle = listing.seats.filter(isSeatIdle);
   const seats = idle.length ? idle : listing.seats;
   if (!seats.length) return { rateMinor: null, price: "-", isFrom: false };
-  const rates = seats.map((seat) => (seat.isFree ? 0 : seat.dailyRateMinor ?? 0));
-  const rateMinor = Math.min(...rates);
+  const comparableRates = seats.map(seatComparableMonthlyMinor);
+  const lowestComparable = Math.min(...comparableRates);
+  const selected = seats[comparableRates.indexOf(lowestComparable)];
+  const rateMinor = selected.isFree
+    ? 0
+    : selected.cyclePriceMinor ?? selected.dailyRateMinor ?? 0;
   return {
     rateMinor,
-    price: formatSeatPrice({ isFree: rateMinor === 0, dailyRateMinor: rateMinor }, locale, freeLabel, dayLabel),
-    isFrom: rates.some((rate) => rate !== rateMinor),
+    price: formatSeatPrice(selected, locale, freeLabel, dayLabel, monthLabel),
+    isFrom: comparableRates.some((rate) => rate !== lowestComparable),
   };
 }
 
 export function formatSeatPrice(
-  seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor">,
+  seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor" | "cyclePriceMinor">,
   locale: string,
   freeLabel: string,
   dayLabel: string,
+  monthLabel = locale.startsWith("zh") ? "月" : "month",
 ) {
-  return seat.isFree || seat.dailyRateMinor == null
+  if (seat.isFree) return freeLabel;
+  if (seat.cyclePriceMinor != null) {
+    return `${formatUsdMoney(seat.cyclePriceMinor, locale)} / ${monthLabel}`;
+  }
+  return seat.dailyRateMinor == null
     ? freeLabel
     : `${formatUsdMoney(seat.dailyRateMinor, locale)} / ${dayLabel}`;
 }
@@ -338,6 +356,7 @@ export function subscriptionStatusKey(status: string): MessageKey | null {
     grant_pending: "shareMarket.subscription.grantPending",
     active_free: "shareMarket.subscription.activeFree",
     active_postpaid: "shareMarket.subscription.activePostpaid",
+    active_prepaid: "shareMarket.subscription.activePrepaid",
     billing_suspend_pending: "shareMarket.subscription.billingSuspendPending",
     billing_suspended: "shareMarket.subscription.billingSuspended",
     billing_resume_pending: "shareMarket.subscription.billingResumePending",

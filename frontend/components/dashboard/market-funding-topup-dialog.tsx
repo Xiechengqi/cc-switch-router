@@ -13,15 +13,21 @@ import {
 import {
   defaultMarketFundingTopupMinor,
   formatFundingRunway,
+  isRecurringFunding,
   MAX_MARKET_FUNDING_TOPUP_MINOR,
   marketFundingDecisionState,
   marketFundingTopupErrorKey,
   marketFundingTopupUnavailableKey,
   marketFundingUsesCredit,
   type MarketFundingDecisionState,
+  type MarketTopupFunding,
 } from "@/lib/market-funding";
 import type { MessageKey } from "@/lib/i18n";
-import type { BinanceFundingIntent, MarketFundingSummary } from "@/lib/types";
+import type {
+  BinanceFundingIntent,
+  MarketFundingSummary,
+  MarketRecurringFundingSummary,
+} from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
 
 function statusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
@@ -211,6 +217,41 @@ export function MarketFundingSummaryCard({
   );
 }
 
+export function MarketRecurringFundingSummaryCard({
+  funding,
+  className = "",
+}: {
+  funding: MarketRecurringFundingSummary;
+  className?: string;
+}) {
+  const { locale, t } = useLocaleText();
+  return (
+    <section className={`grid gap-3 rounded-md border border-slate-200 bg-slate-50 p-3 ${className}`.trim()}>
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <strong className="block text-sm">{t("marketRecurringFunding.title")}</strong>
+          <span className="block truncate text-xs text-slate-500" title={funding.supplierEmail}>
+            {funding.supplierEmail}
+          </span>
+        </div>
+        <span className="rounded-full bg-white px-2 py-1 text-[11px] text-slate-600 ring-1 ring-slate-200">
+          {t("marketRecurringFunding.prepaidOnly")}
+        </span>
+      </div>
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 border-y border-slate-200 py-3 text-sm sm:grid-cols-4">
+        <div><dt className="text-xs text-slate-500">{t("marketFunding.prepaidTotal")}</dt><dd className="font-semibold tabular-nums">{formatUsdMoney(funding.prepaidBalanceMinor, locale)}</dd></div>
+        <div><dt className="text-xs text-slate-500">{t("marketFunding.prepaidHeld")}</dt><dd className="font-semibold tabular-nums">{formatUsdMoney(funding.prepaidHeldMinor, locale)}</dd></div>
+        <div><dt className="text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</dt><dd className="font-semibold tabular-nums text-emerald-700">{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</dd></div>
+        <div><dt className="text-xs text-slate-500">{t("marketRecurringFunding.shortfall")}</dt><dd className={`font-semibold tabular-nums ${funding.requiredTopupMinor > 0 ? "text-rose-700" : "text-emerald-700"}`}>{formatUsdMoney(funding.requiredTopupMinor, locale)}</dd></div>
+        <div><dt className="text-xs text-slate-500">{t("marketRecurringFunding.firstPeriod")}</dt><dd className="font-semibold tabular-nums">{formatUsdMoney(funding.initialHoldMinor, locale)}</dd></div>
+        <div><dt className="text-xs text-slate-500">{t("marketRecurringFunding.nextPeriod")}</dt><dd className="font-semibold tabular-nums">{formatUsdMoney(funding.renewalHoldMinor, locale)}</dd></div>
+        <div className="col-span-2"><dt className="text-xs text-slate-500">{t("marketRecurringFunding.totalReserved")}</dt><dd className="font-semibold tabular-nums">{formatUsdMoney(funding.totalRequiredHoldMinor, locale)}</dd></div>
+      </dl>
+      <p className="text-xs leading-5 text-slate-600">{t("marketRecurringFunding.policy")}</p>
+    </section>
+  );
+}
+
 export function MarketFundingTopupDialog({
   open,
   funding,
@@ -218,7 +259,7 @@ export function MarketFundingTopupDialog({
   onCredited,
 }: {
   open: boolean;
-  funding?: MarketFundingSummary;
+  funding?: MarketTopupFunding;
   onClose: () => void;
   onCredited: (intent: BinanceFundingIntent) => void | Promise<void>;
 }) {
@@ -314,8 +355,10 @@ export function MarketFundingTopupDialog({
     funding?.requiredTopupMinor ?? 0,
     MAX_MARKET_FUNDING_TOPUP_MINOR,
   );
+  const recurringFunding = funding && isRecurringFunding(funding) ? funding : undefined;
+  const meteredFunding = funding && !isRecurringFunding(funding) ? funding : undefined;
   const recommendedTopupMinor = Math.max(
-    funding?.recommendedTopupMinor ?? 0,
+    meteredFunding?.recommendedTopupMinor ?? recurringFunding?.requiredTopupMinor ?? 0,
     funding?.requiredTopupMinor ?? 0,
   );
   const recommendedPresetMinor = Math.min(
@@ -429,14 +472,14 @@ export function MarketFundingTopupDialog({
                 <div><span className="block text-xs text-slate-500">{t("marketBilling.supplier")}</span><strong className="break-all">{funding.supplierEmail}</strong></div>
                 <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</span><strong>{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</strong></div>
                 <div><span className="block text-xs text-slate-500">{t("marketFunding.shortfall")}</span><strong>{formatUsdMoney(funding.requiredTopupMinor, locale)}</strong></div>
-                <div><span className="block text-xs text-slate-500">{t("marketFunding.topup.recommended", { days: funding.recommendedCoverageDays })}</span><strong>{formatUsdMoney(recommendedTopupMinor, locale)}</strong></div>
+                <div><span className="block text-xs text-slate-500">{recurringFunding ? t("marketRecurringFunding.topupTarget") : t("marketFunding.topup.recommended", { days: meteredFunding?.recommendedCoverageDays ?? 0 })}</span><strong>{formatUsdMoney(recommendedTopupMinor, locale)}</strong></div>
               </div>
             ) : null}
             {!intent ? (
               <div className="grid gap-3">
                 <div className="flex flex-wrap gap-2">
                   {funding && minimumPresetMinor > 0 ? <Button size="sm" variant="outline" onClick={() => { setAmount((minimumPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(funding.requiredTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.minimumPreset", { amount: formatUsdMoney(minimumPresetMinor, locale) })}</Button> : null}
-                  {funding && recommendedPresetMinor > 0 && recommendedPresetMinor !== minimumPresetMinor ? <Button size="sm" variant="outline" onClick={() => { setAmount((recommendedPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(recommendedTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.recommendedPreset", { days: funding.recommendedCoverageDays, amount: formatUsdMoney(recommendedPresetMinor, locale) })}</Button> : null}
+                  {meteredFunding && recommendedPresetMinor > 0 && recommendedPresetMinor !== minimumPresetMinor ? <Button size="sm" variant="outline" onClick={() => { setAmount((recommendedPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(recommendedTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.recommendedPreset", { days: meteredFunding.recommendedCoverageDays, amount: formatUsdMoney(recommendedPresetMinor, locale) })}</Button> : null}
                 </div>
                 <label className="grid gap-1 text-sm">
                   <span className="text-slate-500">{t("marketFunding.topup.custom")}</span>

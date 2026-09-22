@@ -2085,6 +2085,14 @@ export type ClientMarketConnection = {
   lastHeartbeatAt?: string;
 };
 
+export type MarketPricingModel =
+  | "free"
+  | "legacy_metered_daily"
+  | "prepaid_calendar_month"
+  | string;
+
+export type MarketBillingInterval = "calendar_month" | string;
+
 export type ClientMarketHost = {
   id: string;
   providerId?: string;
@@ -2092,6 +2100,9 @@ export type ClientMarketHost = {
   port?: number;
   hostOwnerEmail: string;
   dailyRateMinor?: number;
+  pricingModel: MarketPricingModel;
+  cyclePriceMinor?: number;
+  billingInterval?: MarketBillingInterval;
   currency?: "USD";
   freeDurationDays?: number;
   offerRevision: number;
@@ -2168,7 +2179,8 @@ export type ProvisioningJob = {
 };
 
 export type CreateClientMarketClientResponse = {
-  jobId: string;
+  jobId?: string;
+  cancellationScheduled: boolean;
 };
 
 export type ClientMarketPaymentMethod = {
@@ -2617,6 +2629,50 @@ export type MarketFundingSummary = {
   topupUnavailableReason?: string;
 };
 
+export type MarketRecurringFundingSummary = {
+  supplierUserId: string;
+  supplierEmail: string;
+  currency: "USD";
+  pricingModel: "prepaid_calendar_month" | string;
+  billingInterval: "calendar_month" | string;
+  cyclePriceMinor: number;
+  renewalPolicy: "manual" | "automatic" | string;
+  prepaidAccountId?: string;
+  prepaidBalanceMinor: number;
+  prepaidHeldMinor: number;
+  prepaidAvailableMinor: number;
+  initialHoldMinor: number;
+  renewalHoldMinor: number;
+  totalRequiredHoldMinor: number;
+  requiredTopupMinor: number;
+  topupAvailable: boolean;
+  topupUnavailableReason?: string;
+};
+
+export type MarketRecurringContract = {
+  id: string;
+  productKind: "share" | "client_host" | string;
+  productRef: string;
+  pricingModel: "prepaid_calendar_month" | string;
+  billingInterval: "calendar_month" | string;
+  cyclePriceMinor: number;
+  currency: "USD" | string;
+  supplierUserId: string;
+  supplierEmail: string;
+  status: "pending_activation" | "trial" | "active" | "recovery" | "ended" | "activation_failed" | string;
+  renewalPolicy: "manual" | "automatic" | string;
+  renewalStatus: "initial_funded" | "funded" | "funding_required" | "cancel_at_period_end" | "ended" | string;
+  autoRenewMaxPriceMinor?: number;
+  renewalPriority: number;
+  currentPeriodStart?: string;
+  currentPeriodEnd?: string;
+  nextRenewalAt?: string;
+  nextPeriodHeldMinor: number;
+  cancelAtPeriodEnd: boolean;
+  recoveryDeadline?: string;
+  trialEndsAt?: string;
+};
+
 export type MarketCreditRestriction = {
   id: string;
   invoiceId: string;
@@ -2734,6 +2790,9 @@ export type MarketAccessRequest = {
   targetId: string;
   targetLabel: string;
   dailyRateMinor?: number;
+  pricingModel: MarketPricingModel;
+  cyclePriceMinor?: number;
+  billingInterval?: MarketBillingInterval;
   currency?: "USD";
   status: "requested" | "approved" | "rejected" | "cancelled" | string;
   revision: number;
@@ -2792,6 +2851,8 @@ export type ClientMarketProvider = {
   anomalousHostRate: number;
   minDailyRateMinor?: number;
   maxDailyRateMinor?: number;
+  minCyclePriceMinor?: number;
+  maxCyclePriceMinor?: number;
   successfulAllocations: number;
   paymentMethodKinds: string[];
   countries: ClientMarketProviderCountry[];
@@ -2812,6 +2873,9 @@ export type ClientMarketQuoteItem = {
   hostname?: string;
   ip?: string;
   dailyRateMinor?: number;
+  pricingModel: MarketPricingModel;
+  cyclePriceMinor?: number;
+  billingInterval?: MarketBillingInterval;
   currency?: string;
   freeDurationDays?: number;
   offerRevision: number;
@@ -2823,6 +2887,7 @@ export type ClientMarketAllocationQuote = {
   expiresAt: string;
   items: ClientMarketQuoteItem[];
   funding: MarketFundingSummary[];
+  recurringFunding: MarketRecurringFundingSummary[];
 };
 
 export type ClientMarketCommitQuoteResponse = {
@@ -2853,6 +2918,10 @@ export type ClientMarketRental = {
     | "released"
     | string;
   dailyRateMinor?: number;
+  pricingModel: MarketPricingModel;
+  cyclePriceMinor?: number;
+  billingInterval?: MarketBillingInterval;
+  recurring?: MarketRecurringContract;
   currency?: "USD";
   freeDurationDays?: number;
   offerRevision: number;
@@ -2879,6 +2948,8 @@ export type ClientMarketHostUsageHistoryEntry = {
   startedAt: string;
   endedAt?: string;
   dailyRateMinor?: number;
+  cyclePriceMinor?: number;
+  pricingModel: MarketPricingModel;
   currency?: string;
   chargesMinor: number;
   unbilledMinor: number;
@@ -2893,6 +2964,9 @@ export type ClientMarketHostTransferDocument = {
     port: number;
     note?: string;
     dailyRateMinor?: number;
+    cyclePriceMinor?: number;
+    pricingModel?: MarketPricingModel;
+    billingInterval?: MarketBillingInterval;
     currency?: "USD";
     freeDurationDays?: number;
     expectedFingerprint?: string;
@@ -2935,6 +3009,7 @@ export type ShareMarketSeatInput = {
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
+  cyclePriceMinor?: number;
   currency?: "USD";
   serviceDurationDays?: number;
   trialHours?: number;
@@ -2964,6 +3039,10 @@ export type ShareMarketSubscription = {
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
+  pricingModel: MarketPricingModel;
+  cyclePriceMinor?: number;
+  billingInterval?: MarketBillingInterval;
+  recurring?: MarketRecurringContract;
   currency?: "USD";
   serviceDurationDays?: number;
   trialHours?: number;
@@ -3062,6 +3141,8 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   id: string;
   position: number;
   status: string;
+  pricingModel: MarketPricingModel;
+  billingInterval?: MarketBillingInterval;
   offerRevision: number;
   isFree: boolean;
   canRent: boolean;
@@ -3210,6 +3291,7 @@ export type ShareMarketRentQuote = {
   expiresAt: string;
   trialSecondsRemaining: number;
   funding?: MarketFundingSummary;
+  recurringFunding?: MarketRecurringFundingSummary;
   offer: {
     seatId: string;
     listingId: string;
@@ -3221,6 +3303,9 @@ export type ShareMarketRentQuote = {
     tokenLimit?: number;
     tokenPeriod: ShareTokenPeriod;
     dailyRateMinor?: number;
+    pricingModel: MarketPricingModel;
+    cyclePriceMinor?: number;
+    billingInterval?: MarketBillingInterval;
     currency?: "USD";
     serviceDurationDays?: number;
     trialHours?: number;

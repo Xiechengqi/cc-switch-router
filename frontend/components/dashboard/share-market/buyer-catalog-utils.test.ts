@@ -7,6 +7,7 @@ import {
   filterMergedCatalogListings,
   initialCatalogSeat,
   listingMatchesOwner,
+  catalogOwnerOptions,
   listingFamilyTabs,
   MARKET_CATALOG_PAGE_SIZE,
   MARKET_RENTAL_HISTORY_PAGE_SIZE,
@@ -25,6 +26,7 @@ import {
   integrityReasonText,
   marketProviderStatusView,
   primaryMarketCapability,
+  subscriptionStatusKey,
 } from "./market-utils";
 import { mergeShareMarketSubscriptionPage } from "./subscription-utils";
 import type {
@@ -53,6 +55,13 @@ test("rent confirmation exposes exactly one valid primary action", () => {
   assert.equal(canOptionallyTopupRent(false, ready), true);
   assert.equal(canOptionallyTopupRent(false, payable), false);
   assert.equal(canOptionallyTopupRent(true, ready), false);
+});
+
+test("prepaid monthly subscriptions have a visible status label", () => {
+  assert.equal(
+    subscriptionStatusKey("active_prepaid"),
+    "shareMarket.subscription.activePrepaid",
+  );
 });
 
 test("a selected seat is preserved by id without falling back", () => {
@@ -108,7 +117,7 @@ test("family and search filters match catalog listing fields", () => {
   assert.deepEqual(listingFamilyTabs(listings).map((item) => item.value), ["anthropic", "openai"]);
   assert.deepEqual(filterMarketListings(listings, "openai", "").map((item) => item.id), ["openai"]);
   assert.deepEqual(filterMarketListings(listings, "all", "opus").map((item) => item.id), ["anthropic"]);
-  assert.deepEqual(filterMarketListings(listings, "all", "", "other@").map((item) => item.id), ["anthropic"]);
+  assert.deepEqual(filterMarketListings(listings, "all", "", ["other@example.com"]).map((item) => item.id), ["anthropic"]);
 });
 
 const capability = (
@@ -423,6 +432,7 @@ const rental = (
   createdAt: extra.createdAt || extra.updatedAt || "2026-01-01T00:00:00Z",
   updatedAt: extra.updatedAt || "2026-01-01T00:00:00Z",
   ...extra,
+  pricingModel: extra.pricingModel || "free",
 });
 
 test("closed rented listings are merged over the public catalog copy", () => {
@@ -460,14 +470,19 @@ test("owner filter matches email independently of the Share search box", () => {
   });
   const rentedShareIds = new Set(["share-openai"]);
   const listings = [openaiRented, anthropicRented, openaiPublic];
-  assert.equal(listingMatchesOwner(openaiRented, "ALICE"), true);
-  assert.equal(listingMatchesOwner(anthropicRented, "alice"), false);
+  assert.equal(listingMatchesOwner(openaiRented, ["alice@example.com"]), true);
+  assert.equal(listingMatchesOwner(anthropicRented, ["alice@example.com"]), false);
+  assert.deepEqual(
+    catalogOwnerOptions(listings, rentedShareIds).map((item) => item.value),
+    ["alice@example.com", "bob@example.com"],
+  );
+  assert.equal(catalogOwnerOptions(listings, rentedShareIds)[0].rented, true);
   assert.deepEqual(
     filterMergedCatalogListings(listings, {
       mine: false,
       family: "all",
       query: "",
-      owner: "alice@",
+      owner: ["alice@example.com"],
       rentedShareIds,
     }).map((item) => item.id),
     ["openai-rented", "openai-public"],
@@ -477,7 +492,7 @@ test("owner filter matches email independently of the Share search box", () => {
       mine: true,
       family: "all",
       query: "",
-      owner: "alice@",
+      owner: ["alice@example.com", "bob@example.com"],
       rentedShareIds,
     }).map((item) => item.id),
     ["openai-rented"],

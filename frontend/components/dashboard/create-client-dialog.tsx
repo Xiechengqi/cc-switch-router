@@ -11,6 +11,7 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { marketEligibilityFromError } from "@/components/common/seller-approval-dialog";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
 import {
+  MarketRecurringFundingSummaryCard,
   MarketFundingSummaryCard,
   MarketFundingTopupDialog,
 } from "@/components/dashboard/market-funding-topup-dialog";
@@ -26,8 +27,12 @@ import {
 } from "@/lib/api";
 import {
   applyMarketFundingConflict,
+  applyRecurringFundingConflict,
+  marketFundingAfterRecurringHolds,
   marketFundingConflictFromError,
   marketFundingTopupUnavailableKey,
+  recurringFundingForRenewal,
+  type MarketTopupFunding,
 } from "@/lib/market-funding";
 import type {
   ClientMarketAllocationQuote,
@@ -35,7 +40,6 @@ import type {
   ClientMarketProvider,
   CreateClientRegionsPersist,
   CreateClientSelectionPersist,
-  MarketFundingSummary,
   ProvisioningJob,
 } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
@@ -46,7 +50,7 @@ const REGIONS_KEY = "cc_switch_router_create_client_regions_v2";
 
 type Phase = "form" | "quote" | "running" | "complete";
 type CreateMode = "manual" | "online";
-type Draft = { subdomain: string; password: string };
+type Draft = { subdomain: string; password: string; autoRenew: boolean };
 type SubdomainCheck = {
   value: string;
   status: "checking" | "available" | "unavailable" | "error";
@@ -102,7 +106,12 @@ function formatOffer(
   locale: string,
   _currency = "USD",
   freeDurationDays?: number,
+  cyclePriceMinor?: number,
 ) {
+  if (cyclePriceMinor != null) {
+    const amount = formatUsdMoney(cyclePriceMinor, locale);
+    return locale.startsWith("zh") ? `${amount} / 月` : `${amount} / month`;
+  }
   if (dailyRateMinor == null) {
     if (freeDurationDays != null) {
       return locale.startsWith("zh")
@@ -152,7 +161,7 @@ export function CreateClientDialog({
   );
   const [quantity, setQuantity] = React.useState(1);
   const [quote, setQuote] = React.useState<ClientMarketAllocationQuote | null>(null);
-  const [topupFunding, setTopupFunding] = React.useState<MarketFundingSummary>();
+  const [topupFunding, setTopupFunding] = React.useState<MarketTopupFunding>();
   const [drafts, setDrafts] = React.useState<Record<string, Draft>>({});
   /** Drafts rescued from an expired quote, keyed by hostId so they survive the new
    *  quote's fresh item ids. Losing a filled-in subdomain and password on a 120s
@@ -466,7 +475,11 @@ export function CreateClientDialog({
         Object.fromEntries(
           next.items.map((item) => [
             item.id,
-            preservedDrafts.current[item.hostId] ?? { subdomain: randomSubdomain(), password: "" },
+            preservedDrafts.current[item.hostId] ?? {
+              subdomain: randomSubdomain(),
+              password: "",
+              autoRenew: false,
+            },
           ]),
         ),
       );
@@ -501,7 +514,10 @@ export function CreateClientDialog({
 
   const commit = async () => {
     if (!quote) return;
-    if (quote.funding.some((funding) => funding.requiredTopupMinor > 0)) {
+    if (
+      effectiveFunding.some((funding) => funding.requiredTopupMinor > 0)
+      || effectiveRecurringFunding.some((funding) => funding.requiredTopupMinor > 0)
+    ) {
       setError(t("marketFunding.blocked"));
       return;
     }
@@ -510,6 +526,8 @@ export function CreateClientDialog({
       offerRevision: item.offerRevision,
       subdomain: normalizeDraftSubdomain(drafts[item.id]?.subdomain || ""),
       password: drafts[item.id]?.password || "",
+      autoRenew: item.pricingModel === "prepaid_calendar_month"
+        && drafts[item.id]?.autoRenew === true,
     }));
     if (items.some((item) => !item.subdomain.trim())) {
       setError(t("createClient.subdomainRequired"));
@@ -580,7 +598,13 @@ export function CreateClientDialog({
           setQuote((current) => current ? {
             ...current,
             funding: current.funding.map((funding) =>
-              applyMarketFundingConflict(funding, fundingConflict)),
+              applyMarketFundingConflict(
+                funding,
+                fundingConflict,
+                recurringHoldBySupplier.get(`${funding.supplierUserId}:${funding.currency}`) || 0,
+              )),
+            recurringFunding: current.recurringFunding.map((funding) =>
+              applyRecurringFundingConflict(funding, fundingConflict)),
           } : current);
           setError(t("marketFunding.blocked"));
         } else {
@@ -620,14 +644,60 @@ export function CreateClientDialog({
     [ownerEmail, t],
   );
   const quoteSeconds = secondsRemaining(quote?.expiresAt);
-  const paidQuoteCount = quote?.items.filter((item) => item.dailyRateMinor != null).length || 0;
+  const paidQuoteCount = quote?.items.filter((item) =>
+    item.dailyRateMinor != null || item.cyclePriceMinor != null).length || 0;
+  const recurringQuoteCount = quote?.items.filter((item) =>
+    item.pricingModel === "prepaid_calendar_month").length || 0;
+  const legacyPaidQuoteCount = paidQuoteCount - recurringQuoteCount;
   const freeQuoteCount = (quote?.items.length || 0) - paidQuoteCount;
-  const quoteSupplierCount = new Set(
+  const recurringSupplierCount = new Set(
+    quote?.items
+      .filter((item) => item.pricingModel === "prepaid_calendar_month")
+      .map((item) => item.providerId) || [],
+  ).size;
+  const legacySupplierCount = new Set(
     quote?.items
       .filter((item) => item.dailyRateMinor != null)
       .map((item) => item.providerId) || [],
   ).size;
-  const hasFundingShortfall = quote?.funding.some((funding) => funding.requiredTopupMinor > 0) || false;
+  const recurringRenewalBySupplier = React.useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const item of quote?.items || []) {
+      if (
+        item.pricingModel !== "prepaid_calendar_month"
+        || item.cyclePriceMinor == null
+        || drafts[item.id]?.autoRenew !== true
+      ) continue;
+      totals.set(item.providerId, (totals.get(item.providerId) || 0) + item.cyclePriceMinor);
+    }
+    return totals;
+  }, [drafts, quote?.items]);
+  const effectiveRecurringFunding = React.useMemo(
+    () => (quote?.recurringFunding || []).map((funding) => {
+      const renewal = recurringRenewalBySupplier.get(funding.supplierUserId) || 0;
+      return recurringFundingForRenewal(funding, renewal > 0, renewal);
+    }),
+    [quote?.recurringFunding, recurringRenewalBySupplier],
+  );
+  const recurringHoldBySupplier = React.useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const funding of effectiveRecurringFunding) {
+      const key = `${funding.supplierUserId}:${funding.currency}`;
+      totals.set(key, (totals.get(key) || 0) + funding.totalRequiredHoldMinor);
+    }
+    return totals;
+  }, [effectiveRecurringFunding]);
+  const effectiveFunding = React.useMemo(
+    () => (quote?.funding || []).map((funding) => marketFundingAfterRecurringHolds(
+      funding,
+      recurringHoldBySupplier.get(`${funding.supplierUserId}:${funding.currency}`) || 0,
+    )),
+    [quote?.funding, recurringHoldBySupplier],
+  );
+  const hasFundingShortfall = !!quote && (
+    effectiveFunding.some((funding) => funding.requiredTopupMinor > 0)
+    || effectiveRecurringFunding.some((funding) => funding.requiredTopupMinor > 0)
+  );
   const subdomainsCanCommit = !!quote && quote.items.every((item) => {
     const value = normalizeDraftSubdomain(drafts[item.id]?.subdomain || "");
     const check = subdomainChecks[item.id];
@@ -679,7 +749,7 @@ export function CreateClientDialog({
                 {fixedHost ? (
                   <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-md border p-3">
                     <div className="flex flex-wrap items-center gap-2"><Server className="h-4 w-4" /><strong className="text-sm">{fixedHost.hostname || fixedHost.ip}</strong><Chip size="sm" variant="soft">{fixedHost.countryCode || "-"}</Chip></div>
-                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-xs text-muted-foreground"><span className="min-w-0 truncate" title={fixedHost.hostOwnerEmail}>{fixedHost.hostOwnerEmail}</span><span className="font-medium text-foreground">{formatOffer(fixedHost.dailyRateMinor, locale, fixedHost.currency, fixedHost.freeDurationDays)}</span><PaymentMethodIcons kinds={fixedHost.paymentMethodKinds || []} className="col-span-2" /></div>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-xs text-muted-foreground"><span className="min-w-0 truncate" title={fixedHost.hostOwnerEmail}>{fixedHost.hostOwnerEmail}</span><span className="font-medium text-foreground">{formatOffer(fixedHost.dailyRateMinor, locale, fixedHost.currency, fixedHost.freeDurationDays, fixedHost.cyclePriceMinor)}</span><PaymentMethodIcons kinds={fixedHost.paymentMethodKinds || []} className="col-span-2" /></div>
                   </section>
                 ) : (
                   <>
@@ -757,22 +827,46 @@ export function CreateClientDialog({
                 >
                   {t("createClient.quoteCountdown", { seconds: quoteSeconds })}
                 </Chip></div>
-                {paidQuoteCount ? (
+                {recurringQuoteCount ? (
+                  <div className="flex gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-950">
+                    <ShieldCheck className="mt-1 h-4 w-4 shrink-0" />
+                    <div>
+                      <strong>{t("createClient.quoteTerms.prepaidMonthlyTitle")}</strong>
+                      <p>{t("createClient.quoteTerms.prepaidMonthly", {
+                        count: recurringQuoteCount,
+                        suppliers: recurringSupplierCount,
+                      })}</p>
+                    </div>
+                  </div>
+                ) : null}
+                {legacyPaidQuoteCount ? (
                   <div className="flex gap-3 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm leading-6 text-sky-950">
                     <Clock3 className="mt-1 h-4 w-4 shrink-0" />
                     <div>
                       <strong>{t("createClient.quoteTerms.postpaidTitle")}</strong>
                       <p>{t("createClient.quoteTerms.postpaid", {
-                        count: paidQuoteCount,
-                        suppliers: quoteSupplierCount,
+                        count: legacyPaidQuoteCount,
+                        suppliers: legacySupplierCount,
                         hours: 12,
                       })}</p>
                     </div>
                   </div>
                 ) : null}
-                {quote.funding.map((funding) => (
+                {effectiveFunding.map((funding) => (
                   <div key={`${funding.supplierUserId}:${funding.currency}`} className="grid gap-2">
                     <MarketFundingSummaryCard funding={funding} />
+                    {funding.topupAvailable ? (
+                      <Button size="sm" variant="outline" className="justify-self-start" onClick={() => setTopupFunding(funding)}>
+                        {t(funding.requiredTopupMinor > 0 ? "marketFunding.topup.requiredAction" : "marketFunding.topup.optionalAction")}
+                      </Button>
+                    ) : funding.requiredTopupMinor > 0 ? (
+                      <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding.topupUnavailableReason))}</p>
+                    ) : null}
+                  </div>
+                ))}
+                {effectiveRecurringFunding.map((funding) => (
+                  <div key={`recurring:${funding.supplierUserId}:${funding.currency}`} className="grid gap-2">
+                    <MarketRecurringFundingSummaryCard funding={funding} />
                     {funding.topupAvailable ? (
                       <Button size="sm" variant="outline" className="justify-self-start" onClick={() => setTopupFunding(funding)}>
                         {t(funding.requiredTopupMinor > 0 ? "marketFunding.topup.requiredAction" : "marketFunding.topup.optionalAction")}
@@ -789,10 +883,10 @@ export function CreateClientDialog({
                   </div>
                 ) : null}
                 {quote.items.map((item, index) => {
-                  const draft = drafts[item.id] || { subdomain: "", password: "" };
+                  const draft = drafts[item.id] || { subdomain: "", password: "", autoRenew: false };
                   const subdomainValue = normalizeDraftSubdomain(draft.subdomain);
                   const subdomainCheck = subdomainChecks[item.id]?.value === subdomainValue ? subdomainChecks[item.id] : undefined;
-                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="font-mono text-sm">{item.ip || "—"}</strong>{item.countryCode ? <CountryFlag className="text-sm" code={item.countryCode} /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.dailyRateMinor, locale, item.currency, item.freeDurationDays)}</span></div><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
+                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="font-mono text-sm">{item.ip || "—"}</strong>{item.countryCode ? <CountryFlag className="text-sm" code={item.countryCode} /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.dailyRateMinor, locale, item.currency, item.freeDurationDays, item.cyclePriceMinor)}</span></div>{item.pricingModel === "prepaid_calendar_month" ? <label className="flex cursor-pointer items-start gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm"><input type="checkbox" className="mt-1 h-4 w-4 accent-emerald-600" checked={draft.autoRenew} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, autoRenew: event.target.checked } }))} /><span><strong className="block">{t("marketRecurring.autoRenew")}</strong><span className="block text-xs leading-5 text-muted-foreground">{t("marketRecurring.autoRenewAtCheckout", { amount: formatOffer(undefined, locale, item.currency, undefined, item.cyclePriceMinor) })}</span></span></label> : null}<label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
                 })}
               </div>
             ) : null}
