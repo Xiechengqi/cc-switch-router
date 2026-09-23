@@ -32,6 +32,17 @@ const CATEGORY_STEMS = {
   cacheWrite5m: "cache_creation_input_token_cost",
 };
 
+// LiteLLM occasionally retires a direct Anthropic key while retaining the
+// same dated model on an official provider rail. Router request logs keep the
+// Server wire name, so preserve only explicitly reviewed, version-exact
+// identities here; never fall back to a fuzzy model-family match.
+const SERVED_MODEL_EQUIVALENTS = Object.freeze([
+  {
+    pattern: "claude-4-sonnet-20250514",
+    priceKeyCandidates: ["anthropic.claude-sonnet-4-20250514-v1:0"],
+  },
+]);
+
 // micro-USD per 1M tokens = usd_per_token * 1e6 (per 1M) * 1e6 (micro) = * 1e12
 const SCALE_EXPONENT = 12;
 
@@ -251,6 +262,17 @@ function main() {
 
   // An alias must not shadow a real model key, and must be unique.
   const modelKeys = new Set(models.map((model) => model.priceKey));
+  for (const equivalent of SERVED_MODEL_EQUIVALENTS) {
+    if (modelKeys.has(equivalent.pattern)) continue;
+    const priceKey = equivalent.priceKeyCandidates.find((candidate) => modelKeys.has(candidate));
+    if (!priceKey) continue;
+    aliases.push({
+      pattern: equivalent.pattern,
+      matchKind: "exact",
+      priceKey,
+      priority: 100,
+    });
+  }
   const seenAlias = new Set();
   const cleanAliases = aliases
     .filter((alias) => !modelKeys.has(alias.pattern))

@@ -332,12 +332,25 @@ const requiredServed = [
   "claude-sonnet-4-5",
   "gpt-4o",
 ];
+const approvedServedEquivalents = new Map([
+  [
+    "claude-4-sonnet-20250514",
+    new Set(["anthropic.claude-sonnet-4-20250514-v1:0"]),
+  ],
+]);
 for (const key of requiredServed) {
-  const aliased = (catalog.aliases || []).some(
-    (alias) => alias.pattern === key || alias.priceKey === key,
-  );
-  if (!catalogKeys.has(key) && !aliased) {
+  if (catalogKeys.has(key)) continue;
+  const alias = (catalog.aliases || []).find((candidate) => candidate.pattern === key);
+  if (!alias) {
     fail(`derived catalog is missing served model ${key}`);
+    continue;
+  }
+  if (alias.matchKind !== "exact") {
+    fail(`served model ${key} must use an exact equivalent alias`);
+  }
+  const approved = approvedServedEquivalents.get(key);
+  if (approved && !approved.has(alias.priceKey)) {
+    fail(`served model ${key} uses unreviewed equivalent ${alias.priceKey}`);
   }
 }
 
