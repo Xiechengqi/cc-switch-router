@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "revision": "f876938fcfc7",
+  "revision": "34f2bd0e10ac",
   "derivedAt": "2026-09-23",
   "source": {
     "name": "LiteLLM model_prices_and_context_window.json",
@@ -14537,6 +14537,53 @@
           "output": "500000",
           "cacheRead": "0",
           "cacheWrite5m": "0",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-3-7-sonnet-20250219",
+      "displayName": "Claude 3 7 Sonnet 20250219",
+      "longContextThreshold": null,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `anthropic.claude-3-7-sonnet-20250219-v1:0` (sha256 eedf5a751f3b) on 2026-09-23; emitted as version-exact served identity `claude-3-7-sonnet-20250219`",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": null
+        }
+      ]
+    },
+    {
+      "priceKey": "claude-4-sonnet-20250514",
+      "displayName": "Claude 4 Sonnet 20250514",
+      "longContextThreshold": 200000,
+      "longContextInclusive": false,
+      "supportsCacheBreakdown": false,
+      "sourceNote": "derived from LiteLLM model_prices_and_context_window.json entry `anthropic.claude-sonnet-4-20250514-v1:0` (sha256 eedf5a751f3b) on 2026-09-23; emitted as version-exact served identity `claude-4-sonnet-20250514`",
+      "rates": [
+        {
+          "serviceTier": "standard",
+          "contextTier": "base",
+          "input": "3000000",
+          "output": "15000000",
+          "cacheRead": "300000",
+          "cacheWrite5m": "3750000",
+          "cacheWrite1h": null
+        },
+        {
+          "serviceTier": "standard",
+          "contextTier": "long",
+          "input": "6000000",
+          "output": "22500000",
+          "cacheRead": "600000",
+          "cacheWrite5m": "7500000",
           "cacheWrite1h": null
         }
       ]
@@ -65528,12 +65575,6 @@
       "matchKind": "exact",
       "priceKey": "deepinfra/anthropic/claude-4-sonnet",
       "priority": 50
-    },
-    {
-      "pattern": "claude-4-sonnet-20250514",
-      "matchKind": "exact",
-      "priceKey": "anthropic.claude-sonnet-4-20250514-v1:0",
-      "priority": 100
     },
     {
       "pattern": "claude-4.5-haiku",

@@ -33,10 +33,15 @@ const CATEGORY_STEMS = {
 };
 
 // LiteLLM occasionally retires a direct Anthropic key while retaining the
-// same dated model on an official provider rail. Router request logs keep the
-// Server wire name, so preserve only explicitly reviewed, version-exact
-// identities here; never fall back to a fuzzy model-family match.
+// same dated model on an official provider rail. Router request logs and admin
+// aliases keep the Server wire name as a stable priceKey, so preserve only
+// explicitly reviewed, version-exact identities here; never fall back to a
+// fuzzy model-family match.
 const SERVED_MODEL_EQUIVALENTS = Object.freeze([
+  {
+    pattern: "claude-3-7-sonnet-20250219",
+    priceKeyCandidates: ["anthropic.claude-3-7-sonnet-20250219-v1:0"],
+  },
   {
     pattern: "claude-4-sonnet-20250514",
     priceKeyCandidates: ["anthropic.claude-sonnet-4-20250514-v1:0"],
@@ -260,19 +265,29 @@ function main() {
 
   models.sort((a, b) => (a.priceKey < b.priceKey ? -1 : a.priceKey > b.priceKey ? 1 : 0));
 
-  // An alias must not shadow a real model key, and must be unique.
+  // Preserve stable served priceKeys when LiteLLM retains the exact dated model
+  // only on an official provider rail. Copying the reviewed equivalent rate
+  // keeps persisted/admin aliases valid; using an alias here would change the
+  // resolved priceKey and break historical identity.
   const modelKeys = new Set(models.map((model) => model.priceKey));
   for (const equivalent of SERVED_MODEL_EQUIVALENTS) {
     if (modelKeys.has(equivalent.pattern)) continue;
-    const priceKey = equivalent.priceKeyCandidates.find((candidate) => modelKeys.has(candidate));
-    if (!priceKey) continue;
-    aliases.push({
-      pattern: equivalent.pattern,
-      matchKind: "exact",
-      priceKey,
-      priority: 100,
+    const sourceModel = equivalent.priceKeyCandidates
+      .map((candidate) => models.find((model) => model.priceKey === candidate))
+      .find(Boolean);
+    if (!sourceModel) continue;
+    models.push({
+      ...sourceModel,
+      priceKey: equivalent.pattern,
+      displayName: prettifyName(equivalent.pattern),
+      sourceNote: `${sourceModel.sourceNote}; emitted as version-exact served identity \`${equivalent.pattern}\``,
+      rates: sourceModel.rates.map((rate) => ({ ...rate })),
     });
+    modelKeys.add(equivalent.pattern);
   }
+  models.sort((a, b) => (a.priceKey < b.priceKey ? -1 : a.priceKey > b.priceKey ? 1 : 0));
+
+  // An alias must not shadow a real model key, and must be unique.
   const seenAlias = new Set();
   const cleanAliases = aliases
     .filter((alias) => !modelKeys.has(alias.pattern))
