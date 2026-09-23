@@ -23079,6 +23079,7 @@ mod quota_runtime_filter_tests {
                 blocked_reason: Some("five hour quota exhausted".to_string()),
                 blocked_scope: Some("five_hour".to_string()),
                 tiers: Vec::new(),
+                unobserved_tiers: Vec::new(),
             }),
             models: Vec::new(),
             ..Default::default()
@@ -23112,6 +23113,7 @@ mod quota_runtime_filter_tests {
                     unit: None,
                     ..Default::default()
                 }],
+                unobserved_tiers: Vec::new(),
             }),
             models: Vec::new(),
             ..Default::default()
@@ -23148,6 +23150,7 @@ mod quota_runtime_filter_tests {
                         ..Default::default()
                     })
                     .collect(),
+                unobserved_tiers: Vec::new(),
             }),
             models: Vec::new(),
             ..Default::default()
@@ -37291,6 +37294,7 @@ mod tests {
                 blocked_reason: None,
                 blocked_scope: None,
                 tiers: vec![],
+                unobserved_tiers: Vec::new(),
             }),
             api_url: Some("https://example.com".into()),
             models: vec![ShareUpstreamModel {
@@ -37342,6 +37346,51 @@ mod tests {
         assert!(
             policy < probe,
             "expected modelPolicy before modelProbe, got {json}"
+        );
+    }
+
+    #[test]
+    fn share_contract_v7_keeps_v6_compatible_and_rejects_future_versions() {
+        let mut legacy = test_share_descriptor("share-v6", "share-v6-sub");
+        legacy.contract_version = 6;
+        normalize_share_descriptor_fields(&mut legacy).expect("v6 descriptor remains readable");
+
+        let mut future = test_share_descriptor("share-v8", "share-v8-sub");
+        future.contract_version = SHARE_CONTRACT_VERSION + 1;
+        let error = normalize_share_descriptor_fields(&mut future)
+            .expect_err("future Share contract must fail closed");
+        assert!(error.to_string().contains("expected 2..=7"));
+    }
+
+    #[test]
+    fn share_contract_v7_decodes_unobserved_quota_hints_without_numeric_usage() {
+        let legacy: crate::models::ShareUpstreamQuota = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "tiers": []
+        }))
+        .expect("v6 quota without hints");
+        assert!(legacy.unobserved_tiers.is_empty());
+
+        let quota: crate::models::ShareUpstreamQuota = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "tiers": [],
+            "unobservedTiers": [{
+                "name": "seven_day_fable",
+                "label": "Fable 7d",
+                "scope": "model_family",
+                "capacityPool": "claude_fable_7d_oi",
+                "modelFamily": "claude-fable-5",
+                "relativeWeeklyCapacity": 0.5,
+                "source": "claude_subscription_plan",
+                "reason": "awaiting_upstream_observation"
+            }]
+        }))
+        .expect("v7 unobserved quota hint");
+        assert!(quota.tiers.is_empty());
+        assert_eq!(quota.unobserved_tiers.len(), 1);
+        assert_eq!(
+            quota.unobserved_tiers[0].capacity_pool,
+            "claude_fable_7d_oi"
         );
     }
 

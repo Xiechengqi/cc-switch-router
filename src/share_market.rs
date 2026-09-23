@@ -23,7 +23,7 @@ use crate::error::AppError;
 use crate::models::{
     AuthSession, MIN_SHARE_MARKET_CONTRACT_VERSION, ShareEditAvailableEvent, ShareGrantManager,
     ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareSupport,
-    ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
+    ShareTokenPeriod, ShareUpstreamQuotaTierHint, ShareUserGrant, ShareUserPolicy,
 };
 use crate::store::AppStore;
 
@@ -198,6 +198,8 @@ pub struct ShareMarketProviderQuota {
     pub subscription_period_end: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiers: Vec<ShareMarketProviderQuotaTier>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2633,7 +2635,15 @@ fn public_provider_quota(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if status.is_none() && plan.is_none() && subscription_period_end.is_none() && tiers.is_empty() {
+    let unobserved_tiers = quota
+        .map(|value| value.unobserved_tiers.clone())
+        .unwrap_or_default();
+    if status.is_none()
+        && plan.is_none()
+        && subscription_period_end.is_none()
+        && tiers.is_empty()
+        && unobserved_tiers.is_empty()
+    {
         return None;
     }
     Some(ShareMarketProviderQuota {
@@ -2641,6 +2651,7 @@ fn public_provider_quota(
         plan,
         subscription_period_end,
         tiers,
+        unobserved_tiers,
     })
 }
 
@@ -14395,6 +14406,16 @@ mod tests {
                         "used": 55.0,
                         "limit": 100.0,
                         "unit": "requests"
+                    }],
+                    "unobservedTiers": [{
+                        "name": "seven_day_fable",
+                        "label": "Fable 7d",
+                        "scope": "model_family",
+                        "capacityPool": "claude_fable_7d_oi",
+                        "modelFamily": "claude-fable-5",
+                        "relativeWeeklyCapacity": 0.5,
+                        "source": "claude_subscription_plan",
+                        "reason": "awaiting_upstream_observation"
                     }]
                 }
             }
@@ -14413,6 +14434,11 @@ mod tests {
         assert_eq!(quota.plan.as_deref(), Some("Plus"));
         assert_eq!(quota.tiers[0].label, "weekly");
         assert_eq!(quota.tiers[0].utilization, 0.55);
+        assert_eq!(quota.unobserved_tiers.len(), 1);
+        assert_eq!(
+            quota.unobserved_tiers[0].capacity_pool,
+            "claude_fable_7d_oi"
+        );
 
         let public_json = serde_json::to_string(capability).expect("encode public capability");
         assert!(public_json.contains("private@example.com"));

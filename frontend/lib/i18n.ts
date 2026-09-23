@@ -49,6 +49,7 @@ export const messages = {
     "common.required": "required",
     "common.restartRequired": "restart",
     "common.unset": "unset",
+    "quota.awaitingObservation": "awaiting observation",
     "nav.clientsTitle": "Total number of clients registered on this router.",
     "nav.countriesTitle":
       "Distinct countries currently routing traffic through this router.",
@@ -3787,6 +3788,7 @@ export const messages = {
     "common.required": "必填",
     "common.restartRequired": "需重启",
     "common.unset": "未设置",
+    "quota.awaitingObservation": "待观测",
     "nav.clientsTitle": "此 router 注册的 client 总数。",
     "nav.countriesTitle": "当前通过此 router 路由流量的不同国家数量。",
     "nav.activeSharesTitle": "当前 share 状态为 active 的 client 数量。",

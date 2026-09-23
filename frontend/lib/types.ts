@@ -1159,6 +1159,17 @@ export type ProviderModelProbe = {
   healthFingerprint?: string;
 };
 
+export type ShareUpstreamQuotaTierHint = {
+  name: string;
+  label: string;
+  scope: "account" | "model_family" | string;
+  capacityPool: string;
+  modelFamily?: string;
+  relativeWeeklyCapacity?: number;
+  source: string;
+  reason: string;
+};
+
 export type ShareUpstreamProvider = {
   providerName?: string;
   kind?: string;
@@ -1193,6 +1204,7 @@ export type ShareUpstreamProvider = {
       relativeWeeklyCapacity?: number;
       source?: string;
     }>;
+    unobservedTiers?: ShareUpstreamQuotaTierHint[];
   };
   models?: Array<{
     slot?: string;
@@ -3193,6 +3205,7 @@ export type ShareMarketProviderQuota = {
     relativeWeeklyCapacity?: number;
     source?: string;
   }>;
+  unobservedTiers?: ShareUpstreamQuotaTierHint[];
 };
 
 export type ShareMarketAppCapability = {

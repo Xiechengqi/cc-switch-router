@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { AppLocale, MessageKey } from "@/lib/i18n";
+import { messages, type AppLocale, type MessageKey } from "@/lib/i18n";
 import type {
   DashboardClient,
   HealthCheckEntry,
@@ -11,6 +11,7 @@ import type {
   ShareAppRuntimes,
   ShareRequestLog,
   ShareUpstreamProvider,
+  ShareUpstreamQuotaTierHint,
   ShareView,
 } from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
@@ -866,6 +867,7 @@ export function normalizeCompactTierLabel(
   if (normalized === "seven_day_opus" || normalized === "seven_day_omelette")
     return "7d Opus";
   if (normalized === "seven_day_sonnet") return "7d Sonnet";
+  if (normalized === "seven_day_fable") return "Fable 7d";
   const mapped = quotaTierLabel(label, locale);
   return mapped || String(label || "").trim();
 }
@@ -894,6 +896,48 @@ export function formatCompactQuotaTier(
   const countdown = countdownStr(tier.resetsAt);
   const amount = formatQuotaUsageAmount(tier, locale);
   return [label, amount, utilization, countdown].filter(Boolean).join(" ");
+}
+
+export function formatUnobservedQuotaTier(
+  tier: Pick<ShareUpstreamQuotaTierHint, "name" | "label">,
+  locale: AppLocale = "en",
+) {
+  const label = normalizeCompactTierLabel(tier.label || tier.name, locale);
+  const status = messages[locale]["quota.awaitingObservation"];
+  return [label, status].filter(Boolean).join(" ");
+}
+
+function normalizedQuotaTierIdentity(value?: string) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+  if (["sevendayfable", "fable7d", "fable7day"].includes(normalized))
+    return "seven_day_fable";
+  return normalized;
+}
+
+function quotaTierIdentityKeys(tier: {
+  name?: string;
+  label?: string;
+  capacityPool?: string;
+}) {
+  const keys = new Set<string>();
+  const pool = String(tier.capacityPool || "").trim().toLowerCase();
+  if (pool) keys.add(`pool:${pool}`);
+  for (const value of [tier.name, tier.label]) {
+    const identity = normalizedQuotaTierIdentity(value);
+    if (identity) keys.add(`tier:${identity}`);
+  }
+  return [...keys];
+}
+
+function quotaTierMatchesHint(
+  tier: NonNullable<NonNullable<ShareUpstreamProvider["quota"]>["tiers"]>[number],
+  hint: ShareUpstreamQuotaTierHint,
+) {
+  const tierKeys = new Set(quotaTierIdentityKeys(tier));
+  return quotaTierIdentityKeys(hint).some((key) => tierKeys.has(key));
 }
 
 export function quotaPlanLabel(_runtime: ShareUpstreamProvider, plan?: string) {
@@ -1066,9 +1110,10 @@ export function quotaSummary(
   const status = String(quota?.status || "").toLowerCase();
   if (!quota || (status && !["ok", "success", "valid"].includes(status)))
     return "";
-  let tiers = (quota.tiers || [])
+  const observedTiers = (quota.tiers || [])
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
     .filter((tier) => tier.label);
+  let tiers = observedTiers;
   if (runtime.app === "claude") {
     const preferredLabels = new Set(["5h", "1w", "7d", "fable 7d"]);
     const preferredTiers = tiers.filter((tier) =>
@@ -1087,8 +1132,19 @@ export function quotaSummary(
         1,
       );
     })
-    .filter(Boolean)
-    .join(" · ");
+    .filter(Boolean);
+  const emittedHintKeys = new Set<string>();
+  const unobservedTierText = (quota.unobservedTiers || [])
+    .filter((hint) => {
+      if (observedTiers.some((tier) => quotaTierMatchesHint(tier, hint)))
+        return false;
+      const keys = quotaTierIdentityKeys(hint);
+      if (keys.some((key) => emittedHintKeys.has(key))) return false;
+      keys.forEach((key) => emittedHintKeys.add(key));
+      return true;
+    })
+    .map((hint) => formatUnobservedQuotaTier(hint, locale))
+    .filter(Boolean);
   const expireText = providerSubscriptionExpiry(runtime, locale);
   const activityText = isOllamaCloudRuntime(runtime)
     ? ollamaActivityCost(quota.activityCost, locale)
@@ -1096,7 +1152,7 @@ export function quotaSummary(
   return [
     quotaPlanLabel(runtime, quota.plan || quota.credentialMessage),
     expireText,
-    tierText,
+    [...tierText, ...unobservedTierText].join(" · "),
     activityText,
   ]
     .filter(Boolean)

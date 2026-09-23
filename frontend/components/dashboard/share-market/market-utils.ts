@@ -289,6 +289,7 @@ export function marketCapabilityRuntime(
           plan: capability.quota.plan,
           subscriptionPeriodEnd: capability.quota.subscriptionPeriodEnd,
           tiers: capability.quota.tiers,
+          unobservedTiers: capability.quota.unobservedTiers,
         }
       : capability.subscriptionLevel
         ? {

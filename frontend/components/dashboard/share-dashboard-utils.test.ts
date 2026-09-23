@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   formatCompactQuotaTier,
+  formatUnobservedQuotaTier,
   providerAccountIdentity,
   providerAccountLevel,
   providerAccountTierLabel,
@@ -195,4 +196,63 @@ test("Claude quota summary keeps the scoped Fable weekly pool", () => {
   assert.match(line, /Claude Max 20x/);
   assert.match(line, /7d 72%/);
   assert.match(line, /Fable 7d 100%/);
+});
+
+test("Claude quota summary labels an entitled but unobserved Fable pool", () => {
+  const unobservedFable = {
+    name: "seven_day_fable",
+    label: "Fable 7d",
+    scope: "model_family",
+    capacityPool: "claude_fable_7d_oi",
+    modelFamily: "claude-fable-5",
+    relativeWeeklyCapacity: 0.5,
+    source: "claude_subscription_plan",
+    reason: "awaiting_upstream_observation",
+  };
+  const runtime: ShareUpstreamProvider = {
+    kind: "official_oauth",
+    app: "claude",
+    providerName: "Claude Official",
+    providerType: "claude_oauth",
+    quota: {
+      status: "ok",
+      plan: "Claude Max 20x",
+      tiers: [{ label: "1w", utilization: 72 }],
+      unobservedTiers: [unobservedFable],
+    },
+  };
+
+  assert.equal(formatUnobservedQuotaTier(unobservedFable, "en"), "Fable 7d awaiting observation");
+  assert.equal(formatUnobservedQuotaTier(unobservedFable, "zh-CN"), "Fable 7d 待观测");
+  assert.match(quotaSummary(runtime, "en"), /Fable 7d awaiting observation/);
+  assert.doesNotMatch(quotaSummary(runtime, "en"), /Fable 7d 0%/);
+});
+
+test("observed Fable quota wins over a duplicate unobserved hint", () => {
+  const line = quotaSummary({
+    kind: "official_oauth",
+    app: "claude",
+    providerType: "claude_oauth",
+    quota: {
+      status: "ok",
+      tiers: [{
+        name: "upstream_fable_window",
+        label: "Fable 7d",
+        utilization: 41,
+      }],
+      unobservedTiers: [{
+        name: "seven_day_fable",
+        label: "Fable 7-Day",
+        scope: "model_family",
+        capacityPool: "claude_fable_7d_oi",
+        modelFamily: "claude-fable-5",
+        relativeWeeklyCapacity: 0.5,
+        source: "claude_subscription_plan",
+        reason: "awaiting_upstream_observation",
+      }],
+    },
+  });
+
+  assert.match(line, /Fable 7d 41%/);
+  assert.doesNotMatch(line, /awaiting observation/);
 });

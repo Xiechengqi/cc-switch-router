@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 use crate::namespace::PROTOCOL_EPOCH;
 
 pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
-/// Contract v5 introduced the market App-scope guarantees. Contract v6 only
-/// adds scoped quota metadata, so v5 market records remain valid during a
-/// rolling Server/Router deployment.
+/// Contract v5 introduced the market App-scope guarantees. Contracts v6 and
+/// v7 only add quota presentation metadata, so v5 market records remain valid
+/// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 6;
+pub const SHARE_CONTRACT_VERSION: u16 = 7;
 
 #[derive(Debug)]
 struct ParsedRawJson<T> {
@@ -2630,6 +2630,25 @@ pub struct ShareUpstreamQuotaTier {
     pub source: Option<String>,
 }
 
+/// A quota pool which the Server can prove exists, but for which the upstream
+/// has not exposed a numeric utilization/reset observation yet. Keeping these
+/// hints separate from `tiers` prevents presentation-only entitlement evidence
+/// from affecting scheduling or quota blocking.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUpstreamQuotaTierHint {
+    pub name: String,
+    pub label: String,
+    pub scope: String,
+    pub capacity_pool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_weekly_capacity: Option<f64>,
+    pub source: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUpstreamQuota {
@@ -2656,6 +2675,8 @@ pub struct ShareUpstreamQuota {
     pub blocked_scope: Option<String>,
     #[serde(default)]
     pub tiers: Vec<ShareUpstreamQuotaTier>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

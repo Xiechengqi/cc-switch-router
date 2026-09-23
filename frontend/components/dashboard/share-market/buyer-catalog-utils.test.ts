@@ -188,6 +188,42 @@ test("provider panel reproduces quota, provider identity and enabled app model r
   assert.match(view.toneClassName, /emerald/);
 });
 
+test("provider panel preserves unobserved Fable quota hints", () => {
+  const view = marketProviderStatusView(
+    {
+      supportedApps: ["claude"],
+      appCapabilities: [
+        capability({
+          app: "claude",
+          providerFamily: "anthropic",
+          providerName: "Claude Official",
+          providerType: "claude_oauth",
+          quota: {
+            status: "ok",
+            plan: "Claude Max 20x",
+            tiers: [{ label: "1w", utilization: 24 }],
+            unobservedTiers: [{
+              name: "seven_day_fable",
+              label: "Fable 7d",
+              scope: "model_family",
+              capacityPool: "claude_fable_7d_oi",
+              modelFamily: "claude-fable-5",
+              relativeWeeklyCapacity: 0.5,
+              source: "claude_subscription_plan",
+              reason: "awaiting_upstream_observation",
+            }],
+          },
+        }),
+      ],
+    },
+    "en",
+    { unknown: "Unknown", passthrough: "Passthrough" },
+  );
+
+  assert.match(view.primaryLine, /Fable 7d awaiting observation/);
+  assert.doesNotMatch(view.primaryLine, /Fable 7d 0%/);
+});
+
 test("provider panel keeps degraded and API providers safe", () => {
   const view = marketProviderStatusView(
     {

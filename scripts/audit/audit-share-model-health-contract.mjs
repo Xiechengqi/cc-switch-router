@@ -26,7 +26,7 @@ function requireMarkers(relativePath, markers) {
 
 const models = requireMarkers("src/models.rs", [
   "MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5",
-  "SHARE_CONTRACT_VERSION: u16 = 6",
+  "SHARE_CONTRACT_VERSION: u16 = 7",
   "pub struct ProviderModelProbe",
   "pub requested_model: String",
   "pub wire_model: String",
@@ -160,7 +160,7 @@ if (/\bAPP_PROBE\b/.test(models + store + scheduler + main)) {
 }
 
 requireMarkers("PROTOCOL.md", [
-  "Share Contract v6",
+  "Share Contract v7",
   "MIN_SHARE_MARKET_CONTRACT_VERSION",
   "modelProbe",
   "每个完整监测日固定 48 槽",
@@ -190,4 +190,4 @@ if (errors.length) {
   process.exit(1);
 }
 
-console.log("Share model health contract audit ok: Contract v6, market floor v5, evidence v2, probe epochs, UTC slots, and heatmap aligned");
+console.log("Share model health contract audit ok: Contract v7, market floor v5, evidence v2, probe epochs, UTC slots, and heatmap aligned");

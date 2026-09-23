@@ -352,6 +352,7 @@ mod tests {
                 unit: None,
                 ..Default::default()
             }],
+            unobserved_tiers: Vec::new(),
         };
         // Only short window → fall back to neutral.
         assert_eq!(compute_quota_health(Some(&quota), Utc::now()), 0.5);
@@ -389,6 +390,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            unobserved_tiers: Vec::new(),
         };
         let v = compute_quota_health(Some(&quota), Utc::now());
         // The 95%-utilized daily tier dominates softmin, so result is near 0.05..0.1.
@@ -428,6 +430,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            unobserved_tiers: Vec::new(),
         };
 
         let generic = compute_quota_health(Some(&quota), now);
@@ -441,6 +444,52 @@ mod tests {
         assert!(
             fable < 0.05,
             "exhausted Fable pool should dominate: {fable}"
+        );
+    }
+
+    #[test]
+    fn unobserved_quota_hints_never_affect_scheduling_health() {
+        let now = Utc::now();
+        let mut quota = ShareUpstreamQuota {
+            status: "ok".into(),
+            plan: Some("Claude Max 20x".into()),
+            activity_cost: None,
+            queried_at: None,
+            subscription_period_end: None,
+            availability: None,
+            blocked_until: None,
+            blocked_reason: None,
+            blocked_scope: None,
+            tiers: vec![crate::models::ShareUpstreamQuotaTier {
+                label: "1w".into(),
+                utilization: 72.0,
+                resets_at: Some(ts(7 * 86400)),
+                scope: Some("account".into()),
+                ..Default::default()
+            }],
+            unobserved_tiers: Vec::new(),
+        };
+        let generic_before = compute_quota_health(Some(&quota), now);
+        let fable_before =
+            compute_quota_health_for_model(Some(&quota), Some("claude-fable-5-1"), now);
+
+        quota
+            .unobserved_tiers
+            .push(crate::models::ShareUpstreamQuotaTierHint {
+                name: "seven_day_fable".into(),
+                label: "Fable 7d".into(),
+                scope: "model_family".into(),
+                capacity_pool: "claude_fable_7d_oi".into(),
+                model_family: Some("claude-fable-5".into()),
+                relative_weekly_capacity: Some(0.5),
+                source: "claude_subscription_plan".into(),
+                reason: "awaiting_upstream_observation".into(),
+            });
+
+        assert_eq!(compute_quota_health(Some(&quota), now), generic_before);
+        assert_eq!(
+            compute_quota_health_for_model(Some(&quota), Some("claude-fable-5-1"), now),
+            fable_before
         );
     }
 
