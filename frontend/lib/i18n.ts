@@ -309,19 +309,24 @@ export const messages = {
     "shareMarket.rentConfirm.noTrialCompact":
       "No trial remains · billing starts when healthy service begins.",
     "shareMarket.rentConfirm.remainingTrialCompact":
-      "{hours} hours of healthy-service trial remain{tokens}. Billing starts after the trial.",
-    "shareMarket.rentConfirm.trialTokenCompact": " · up to {tokens}",
+      "{hours}h trial{tokens}",
+    "shareMarket.rentConfirm.trialTokenCompact": " · {tokens}",
     "shareMarket.rentConfirm.usageQuota": "Usage allowance",
     "shareMarket.rentConfirm.quotaSummary": "Concurrency {parallel} · Token {tokens}",
     "shareMarket.rentConfirm.termFixedCompact":
-      "{days} days · starts on first access dispatch and is reclaimed at expiry",
+      "{days} days",
     "shareMarket.rentConfirm.termPermanentCompact":
-      "Ongoing · either party can return or reclaim the seat",
+      "Ongoing",
     "shareMarket.rentConfirm.termMonthlyCompact":
-      "One calendar month at a time · the activation day becomes the monthly renewal day",
-    "shareMarket.rentConfirm.details": "View all details",
-    "shareMarket.rentConfirm.billingDetails": "Billing and service terms",
+      "Calendar month",
+    "shareMarket.rentConfirm.details": "Terms and technical info",
+    "shareMarket.rentConfirm.billingDetails": "Billing terms",
     "shareMarket.rentConfirm.technicalDetails": "Technical details",
+    "shareMarket.rentConfirm.fundingLabel": "Funding",
+    "shareMarket.rentConfirm.fundingReady": "{amount} required · Balance ready",
+    "shareMarket.rentConfirm.fundingTopup": "Top up {amount}",
+    "shareMarket.rentConfirm.fundingCredit": "Uses {amount} credit",
+    "shareMarket.rentConfirm.topupAmount": "Top up {amount}",
     "shareMarket.rentConfirm.fundingChanged":
       "Funding changed. This is the latest quote; review it before confirming again.",
     "shareMarket.rentConfirm.postpaid":
@@ -375,6 +380,14 @@ export const messages = {
     "shareMarket.blockReason.login_required": "Sign in to rent this seat.",
     "shareMarket.blockReason.share_unavailable": "This Share is not currently listed for rental.",
     "shareMarket.blockReason.share_offline": "This Share is offline.",
+    "shareMarket.blockReason.runtime_syncing": "Status syncing. Please try again shortly.",
+    "shareMarket.blockReason.share_expired": "This Share has expired.",
+    "shareMarket.blockReason.share_upgrade_required": "This Share needs an upgrade.",
+    "shareMarket.blockReason.share_tokens_exhausted": "This Share has no quota remaining.",
+    "shareMarket.blockReason.model_unavailable": "The selected model is temporarily unavailable.",
+    "shareMarket.blockReason.app_unavailable": "The required app is unavailable.",
+    "shareMarket.blockReason.provider_unavailable": "The provider is temporarily unavailable.",
+    "shareMarket.blockReason.service_unavailable": "Service is temporarily unavailable.",
     "shareMarket.blockReason.seat_unavailable": "This seat is no longer available.",
     "shareMarket.blockReason.approval_required": "Seller approval is required.",
     "shareMarket.blockReason.access_required": "Seller approval is required.",
@@ -4042,19 +4055,24 @@ export const messages = {
     "shareMarket.rentConfirm.noTrialCompact":
       "无剩余试用 · 健康服务开始后计费。",
     "shareMarket.rentConfirm.remainingTrialCompact":
-      "剩余 {hours} 小时健康服务试用{tokens}，用完后开始计费。",
-    "shareMarket.rentConfirm.trialTokenCompact": " · 最多 {tokens}",
+      "试用 {hours}h{tokens}",
+    "shareMarket.rentConfirm.trialTokenCompact": " · {tokens}",
     "shareMarket.rentConfirm.usageQuota": "使用额度",
     "shareMarket.rentConfirm.quotaSummary": "并发 {parallel} · Token {tokens}",
     "shareMarket.rentConfirm.termFixedCompact":
-      "{days} 天 · 首次下发访问权限时起算，到期自动回收",
+      "{days} 天",
     "shareMarket.rentConfirm.termPermanentCompact":
-      "长期有效 · 任一方可归还或回收拼车位",
+      "长期有效",
     "shareMarket.rentConfirm.termMonthlyCompact":
-      "按日历月续期 · 激活日作为每月续费日",
-    "shareMarket.rentConfirm.details": "查看完整明细",
-    "shareMarket.rentConfirm.billingDetails": "计费与服务条款",
+      "日历月",
+    "shareMarket.rentConfirm.details": "条款与技术信息",
+    "shareMarket.rentConfirm.billingDetails": "计费条款",
     "shareMarket.rentConfirm.technicalDetails": "技术明细",
+    "shareMarket.rentConfirm.fundingLabel": "资金",
+    "shareMarket.rentConfirm.fundingReady": "需预留 {amount} · 余额充足",
+    "shareMarket.rentConfirm.fundingTopup": "需充值 {amount}",
+    "shareMarket.rentConfirm.fundingCredit": "使用授信 {amount}",
+    "shareMarket.rentConfirm.topupAmount": "充值 {amount}",
     "shareMarket.rentConfirm.fundingChanged":
       "资金状态已变化，以下是最新报价，请重新核对后确认。",
     "shareMarket.rentConfirm.postpaid":
@@ -4107,6 +4125,14 @@ export const messages = {
     "shareMarket.blockReason.login_required": "登录后才能租用。",
     "shareMarket.blockReason.share_unavailable": "该 Share 当前未开放租用。",
     "shareMarket.blockReason.share_offline": "该 Share 当前离线。",
+    "shareMarket.blockReason.runtime_syncing": "状态同步中，请稍后重试。",
+    "shareMarket.blockReason.share_expired": "该 Share 已到期。",
+    "shareMarket.blockReason.share_upgrade_required": "该 Share 需要升级。",
+    "shareMarket.blockReason.share_tokens_exhausted": "该 Share 额度已用尽。",
+    "shareMarket.blockReason.model_unavailable": "模型暂时不可用。",
+    "shareMarket.blockReason.app_unavailable": "所需应用暂时不可用。",
+    "shareMarket.blockReason.provider_unavailable": "供应商暂时不可用。",
+    "shareMarket.blockReason.service_unavailable": "服务暂时不可用。",
     "shareMarket.blockReason.seat_unavailable": "该拼车位已不可用。",
     "shareMarket.blockReason.approval_required": "需要卖家批准后才能租用。",
     "shareMarket.blockReason.access_required": "需要卖家批准后才能租用。",

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  catalogNeedsRuntimeSync,
   catalogSeatPreview,
   canOptionallyTopupRent,
   filterMarketListings,
@@ -20,6 +21,7 @@ import {
   preserveCatalogSeat,
   rentConfirmPrimaryAction,
   rentedShareIdsFromSubscriptions,
+  showRentQuoteCountdown,
   sortMergedCatalogListings,
 } from "./buyer-catalog-utils";
 import {
@@ -55,6 +57,19 @@ test("rent confirmation exposes exactly one valid primary action", () => {
   assert.equal(canOptionallyTopupRent(false, ready), true);
   assert.equal(canOptionallyTopupRent(false, payable), false);
   assert.equal(canOptionallyTopupRent(true, ready), false);
+});
+
+test("catalog runtime sync polling only activates for stale runtime evidence", () => {
+  assert.equal(catalogNeedsRuntimeSync([]), false);
+  assert.equal(catalogNeedsRuntimeSync([{ serviceBlockReason: "share_offline" }]), false);
+  assert.equal(catalogNeedsRuntimeSync([{ serviceBlockReason: "runtime_stale" }]), true);
+});
+
+test("rent quote countdown stays quiet until action is useful", () => {
+  assert.equal(showRentQuoteCountdown(false, 90), false);
+  assert.equal(showRentQuoteCountdown(false, 31), false);
+  assert.equal(showRentQuoteCountdown(false, 30), true);
+  assert.equal(showRentQuoteCountdown(true, 90), true);
 });
 
 test("prepaid monthly subscriptions have a visible status label", () => {
@@ -440,6 +455,7 @@ const listing = (
   createdAt: extra.createdAt || "2026-01-01T00:00:00Z",
   updatedAt: extra.updatedAt || extra.createdAt || "2026-01-01T00:00:00Z",
   ...extra,
+  serviceState: extra.serviceState ?? "available",
 });
 
 const rental = (

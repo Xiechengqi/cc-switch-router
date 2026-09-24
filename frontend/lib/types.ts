@@ -3256,6 +3256,9 @@ export type ShareMarketListing = {
   shareStatus: string;
   subdomain?: string;
   shareOnline: boolean;
+  serviceState: "available" | "degraded" | "unavailable";
+  serviceBlockReason?: string;
+  serviceReasons?: string[];
   isOwner: boolean;
   canDelete: boolean;
   deleteBlockedReason?: string;

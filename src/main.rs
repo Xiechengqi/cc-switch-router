@@ -547,7 +547,10 @@ async fn main() -> Result<()> {
                 .timeout(Duration::from_secs(5))
                 .build()?;
 
-            let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
+            // Keep three refresh opportunities inside the 15-minute Share Market
+            // freshness fence, so a single missed cycle or route rotation cannot
+            // make an otherwise healthy listing temporarily unrentable.
+            let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;

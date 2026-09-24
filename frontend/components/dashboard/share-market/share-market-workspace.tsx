@@ -7,6 +7,7 @@ import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareMarketBuyerCatalog } from "@/components/dashboard/share-market/buyer-catalog";
+import { catalogNeedsRuntimeSync } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { shareMarketMutationError } from "@/components/dashboard/share-market/market-utils";
 import { mergeShareMarketSubscriptionPage, subscriptionsNeedGrantPolling } from "@/components/dashboard/share-market/subscription-utils";
 import { ShareMarketOwnerWorkspace } from "@/components/dashboard/share-market/owner-workspace";
@@ -28,6 +29,7 @@ type Workspace = "catalog" | "selling";
 type LoadScope = Workspace | "all";
 const SHARE_MARKET_POLL_MS = 15_000;
 const SHARE_MARKET_GRANT_POLL_MS = 2_000;
+const SHARE_MARKET_RUNTIME_SYNC_POLL_MS = 3_000;
 
 function workspaceFromQuery(value: string | null): Workspace {
   if (value === "selling" || value === "mine") return "selling";
@@ -240,14 +242,21 @@ export function ShareMarketWorkspace() {
   }, [actorKey, authed, authLoading, load]);
 
   const grantPolling = subscriptionsNeedGrantPolling(subscriptions);
+  const runtimeSyncPolling = workspace === "catalog"
+    && catalogNeedsRuntimeSync(catalog?.listings ?? []);
   React.useEffect(() => {
     if (authLoading) return;
     const tick = () => {
       if (document.visibilityState !== "visible" || pausePolling) return;
       void load({ scope: workspace, silent: true, skipIfBusy: true });
     };
-    if (grantPolling) tick();
-    const timer = window.setInterval(tick, grantPolling ? SHARE_MARKET_GRANT_POLL_MS : SHARE_MARKET_POLL_MS);
+    if (grantPolling || runtimeSyncPolling) tick();
+    const pollMs = grantPolling
+      ? SHARE_MARKET_GRANT_POLL_MS
+      : runtimeSyncPolling
+        ? SHARE_MARKET_RUNTIME_SYNC_POLL_MS
+        : SHARE_MARKET_POLL_MS;
+    const timer = window.setInterval(tick, pollMs);
     const onVisibility = () => {
       if (document.visibilityState === "visible") tick();
     };
@@ -256,7 +265,7 @@ export function ShareMarketWorkspace() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [authLoading, grantPolling, load, pausePolling, workspace]);
+  }, [authLoading, grantPolling, load, pausePolling, runtimeSyncPolling, workspace]);
 
   const setWorkspace = (next: Workspace) => {
     if (!authed && next !== "catalog") return;

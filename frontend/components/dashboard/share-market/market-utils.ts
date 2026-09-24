@@ -68,6 +68,7 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
     share_market_share_offline: "shareMarket.error.shareOffline",
     share_market_share_expired: "shareMarket.error.shareExpired",
     share_market_runtime_stale: "shareMarket.error.runtimeStale",
+    share_market_runtime_sync_required: "shareMarket.error.runtimeStale",
     share_market_model_unavailable: "shareMarket.error.modelUnavailable",
     share_market_contract_incompatible: "shareMarket.error.contractIncompatible",
     share_market_required_app_unavailable: "shareMarket.error.requiredAppUnavailable",

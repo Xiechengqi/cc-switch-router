@@ -25,7 +25,7 @@ use crate::models::{
     ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareSupport,
     ShareTokenPeriod, ShareUpstreamQuotaTierHint, ShareUserGrant, ShareUserPolicy,
 };
-use crate::store::AppStore;
+use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
 const DEFAULT_TRIAL_HOURS: i64 = crate::market_billing::DEFAULT_TRIAL_HOURS;
 const DEFAULT_TRIAL_TOKEN_LIMIT: u64 = 1_000_000;
@@ -53,6 +53,7 @@ const MARKET_PERFORMANCE_WINDOW_HOURS: i64 = 24;
 const MARKET_RELIABILITY_MIN_OBSERVED_MINUTES: u32 = 72;
 const MANAGED_GRANT_MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
 const SHARE_RUNTIME_FRESHNESS_SECS: i64 = 15 * 60;
+const SHARE_MARKET_PUBLISH_RUNTIME_MAX_AGE_SECS: i64 = 5 * 60;
 const SHARE_MODEL_HEALTH_FRESHNESS_SECS: i64 = 20 * 60;
 const SHARE_ROUTE_HEALTH_FRESHNESS_SECS: i64 = 90;
 const SHARE_NEAR_EXPIRY_DAYS: i64 = 7;
@@ -286,6 +287,8 @@ pub struct ListingView {
     pub subdomain: String,
     pub share_online: bool,
     pub service_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_block_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_reasons: Vec<String>,
     pub is_owner: bool,
@@ -625,6 +628,52 @@ pub(crate) struct ShareMarketServiceAvailability {
 impl ShareMarketServiceAvailability {
     fn available(&self) -> bool {
         self.blocking_reason.is_none()
+    }
+}
+
+fn service_block_reason(availability: &[ShareMarketServiceAvailability]) -> Option<String> {
+    const PRIORITY: [&str; 9] = [
+        "share_offline",
+        "share_inactive",
+        "share_expired",
+        "share_expiry_invalid",
+        "runtime_stale",
+        "share_contract_upgrade_required",
+        "contract_incompatible",
+        "share_tokens_exhausted",
+        "model_unavailable",
+    ];
+    for reason in PRIORITY {
+        if availability
+            .iter()
+            .any(|item| item.blocking_reason.as_deref() == Some(reason))
+        {
+            return Some(reason.to_string());
+        }
+    }
+    availability
+        .iter()
+        .find_map(|item| item.blocking_reason.clone())
+}
+
+fn rent_block_reason_for_service(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("runtime_stale") => "runtime_syncing",
+        Some("share_expired" | "share_expiry_invalid") => "share_expired",
+        Some("share_contract_upgrade_required" | "contract_incompatible") => {
+            "share_upgrade_required"
+        }
+        Some("share_tokens_exhausted") => "share_tokens_exhausted",
+        Some("model_unavailable") => "model_unavailable",
+        Some("required_app_disabled") => "app_unavailable",
+        Some(
+            "binding_unresolved"
+            | "binding_missing"
+            | "provider_disabled"
+            | "quota_blocked"
+            | "authentication_failed",
+        ) => "provider_unavailable",
+        _ => "service_unavailable",
     }
 }
 
@@ -5786,6 +5835,7 @@ impl AppStore {
                 && app_availability
                     .iter()
                     .all(ShareMarketServiceAvailability::available);
+            let service_block_reason = service_block_reason(&app_availability);
             let service_state = if service_available {
                 if app_availability
                     .iter()
@@ -5903,10 +5953,12 @@ impl AppStore {
                     Some("direct_access".to_string())
                 } else if viewer.is_none() {
                     Some("login_required".to_string())
-                } else if status != "active" || share_status != "active" || !service_available {
+                } else if status != "active" || share_status != "active" {
                     Some("share_unavailable".to_string())
                 } else if !share_online {
                     Some("share_offline".to_string())
+                } else if !service_available {
+                    Some(rent_block_reason_for_service(service_block_reason.as_deref()).to_string())
                 } else if seat.status != SEAT_AVAILABLE || seat.retired_at.is_some() {
                     Some("seat_unavailable".to_string())
                 } else if seller_approval_required {
@@ -6000,6 +6052,7 @@ impl AppStore {
                 subdomain: subdomain.clone(),
                 share_online,
                 service_state: service_state.into(),
+                service_block_reason,
                 service_reasons,
                 is_owner,
                 can_delete: delete_capability.can_delete,
@@ -6574,6 +6627,92 @@ fn expire_listing_rent_quotes_tx(
 }
 
 impl AppStore {
+    async fn share_market_publish_runtime_target(
+        &self,
+        session: &AuthSession,
+        share_id: &str,
+    ) -> Result<Option<ShareRouteTarget>, AppError> {
+        let runtime_refreshed_at = {
+            let conn = self.conn.lock().await;
+            let share = conn
+                .query_row(
+                    "SELECT owner_email, share_status, runtime_refreshed_at
+                       FROM shares WHERE share_id = ?1",
+                    params![share_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db("read Share Market publish runtime"))?;
+            let Some((owner_email, share_status, runtime_refreshed_at)) = share else {
+                return Err(AppError::NotFound("Share not found".into()));
+            };
+            if !owner_email.eq_ignore_ascii_case(&session.email) {
+                return Err(AppError::Forbidden(
+                    "only the Share owner can publish it".into(),
+                ));
+            }
+            if share_status != "active" {
+                return Err(AppError::Conflict(
+                    "Share must be active before it can be published".into(),
+                ));
+            }
+            runtime_refreshed_at
+        };
+        let now = Utc::now();
+        let fresh = parse_optional_runtime_time(runtime_refreshed_at.as_deref()).is_some_and(
+            |refreshed_at| {
+                refreshed_at <= now + Duration::minutes(5)
+                    && now - refreshed_at
+                        <= Duration::seconds(SHARE_MARKET_PUBLISH_RUNTIME_MAX_AGE_SECS)
+            },
+        );
+        if fresh {
+            return Ok(None);
+        }
+        self.list_share_route_targets()
+            .await?
+            .into_iter()
+            .find(|target| target.share_id == share_id)
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::coded_conflict(
+                    "share_market_runtime_sync_required",
+                    "Share runtime must be synchronized before publishing",
+                    serde_json::json!({ "reason": "runtime_stale" }),
+                )
+            })
+    }
+
+    async fn share_market_listing_share_id_for_owner(
+        &self,
+        session: &AuthSession,
+        listing_id: &str,
+    ) -> Result<String, AppError> {
+        let conn = self.conn.lock().await;
+        let listing = conn
+            .query_row(
+                "SELECT share_id, owner_user_id FROM share_market_listings
+                  WHERE id = ?1 AND deleted_at IS NULL",
+                params![listing_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_db("read Share Market listing publish target"))?
+            .ok_or_else(|| AppError::NotFound("Share listing not found".into()))?;
+        if listing.1 != session.user_id {
+            return Err(AppError::Forbidden(
+                "only listing owner can publish seats".into(),
+            ));
+        }
+        Ok(listing.0)
+    }
+
     pub async fn share_market_create_listing(
         &self,
         session: &AuthSession,
@@ -7835,12 +7974,108 @@ impl AppStore {
     }
 }
 
+fn market_publish_runtime_snapshot_issue(
+    expected_share_id: &str,
+    actual_share_id: &str,
+    queried_at: i64,
+    now: DateTime<Utc>,
+) -> Option<&'static str> {
+    if actual_share_id != expected_share_id {
+        return Some("share_mismatch");
+    }
+    let Some(queried_at) = DateTime::<Utc>::from_timestamp(queried_at, 0) else {
+        return Some("runtime_stale");
+    };
+    (queried_at > now + Duration::minutes(5)
+        || now - queried_at > Duration::seconds(SHARE_MARKET_PUBLISH_RUNTIME_MAX_AGE_SECS))
+    .then_some("runtime_stale")
+}
+
+async fn refresh_share_runtime_before_market_publish(
+    state: &ServerState,
+    session: &AuthSession,
+    share_id: &str,
+) -> Result<(), AppError> {
+    let Some(target) = state
+        .store
+        .share_market_publish_runtime_target(session, share_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    if !state
+        .proxy
+        .active_subdomains()
+        .await
+        .contains(&target.subdomain)
+    {
+        return Err(AppError::coded_conflict(
+            "share_market_runtime_sync_required",
+            "Share must be online before publishing",
+            serde_json::json!({ "reason": "share_offline" }),
+        ));
+    }
+    let snapshot = tokio::time::timeout(
+        StdDuration::from_secs(5),
+        fetch_share_runtime_snapshot_from_route(
+            &state.store,
+            &state.config,
+            &state.proxy_http,
+            &target.subdomain,
+            &target.share_id,
+            &target.installation_id,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        tracing::warn!(share_id = %target.share_id, "pre-publish Share runtime refresh timed out");
+        AppError::coded_conflict(
+            "share_market_runtime_sync_required",
+            "Share runtime synchronization timed out before publishing",
+            serde_json::json!({ "reason": "runtime_stale" }),
+        )
+    })?
+    .map_err(|error| {
+        tracing::warn!(share_id = %target.share_id, "pre-publish Share runtime refresh failed: {error}");
+        AppError::coded_conflict(
+            "share_market_runtime_sync_required",
+            "Share runtime could not be synchronized before publishing",
+            serde_json::json!({ "reason": "runtime_stale" }),
+        )
+    })?;
+    let now = Utc::now();
+    if let Some(issue) = market_publish_runtime_snapshot_issue(
+        &target.share_id,
+        &snapshot.share_id,
+        snapshot.queried_at,
+        now,
+    ) {
+        tracing::warn!(
+            expected_share_id = %target.share_id,
+            actual_share_id = %snapshot.share_id,
+            issue,
+            "pre-publish Share runtime refresh returned invalid evidence"
+        );
+        return Err(AppError::coded_conflict(
+            "share_market_runtime_sync_required",
+            "Share returned invalid runtime evidence before publishing",
+            serde_json::json!({ "reason": "runtime_stale" }),
+        ));
+    }
+    state.store.record_share_runtime_snapshot(snapshot).await
+}
+
 async fn create_listing(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<CreateListingRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session(&state, &headers).await?;
+    let share_id = input.share_id.trim();
+    if share_id.is_empty() {
+        return Err(AppError::BadRequest("shareId is required".into()));
+    }
+    refresh_share_runtime_before_market_publish(&state, &session, share_id).await?;
     let id = state
         .store
         .share_market_create_listing(&session, input)
@@ -7855,6 +8090,11 @@ async fn add_seat(
     Json(input): Json<SeatInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session(&state, &headers).await?;
+    let share_id = state
+        .store
+        .share_market_listing_share_id_for_owner(&session, &listing_id)
+        .await?;
+    refresh_share_runtime_before_market_publish(&state, &session, &share_id).await?;
     let id = state
         .store
         .share_market_add_seat(&session, &listing_id, input)
@@ -7869,6 +8109,11 @@ async fn reopen_listing(
     Json(input): Json<ReopenListingRequest>,
 ) -> Result<Json<ReopenListingResponse>, AppError> {
     let session = require_session(&state, &headers).await?;
+    let share_id = state
+        .store
+        .share_market_listing_share_id_for_owner(&session, &listing_id)
+        .await?;
+    refresh_share_runtime_before_market_publish(&state, &session, &share_id).await?;
     Ok(Json(
         state
             .store
@@ -21212,13 +21457,139 @@ mod tests {
         assert!(!listing.seats[0].can_rent);
         assert_eq!(
             listing.seats[0].rent_block_reason.as_deref(),
-            Some("share_unavailable")
+            Some("service_unavailable")
         );
         assert!(
             store
                 .share_market_create_rent_quote(&renter, &seat_id, None)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_exposes_runtime_sync_and_offline_as_distinct_rent_blocks() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-runtime-state", "owner-runtime-state@example.com");
+        let renter = session("renter-runtime-state", "renter-runtime-state@example.com");
+        let share_id = "share-runtime-state";
+        let route = "share-runtime-state-route";
+        insert_share(&store, share_id, &owner.email, &[ShareTokenPeriod::Day]).await;
+        create_listing(&store, &owner, share_id, free_seat()).await;
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET runtime_refreshed_at = ?2 WHERE share_id = ?1",
+                params![share_id, (Utc::now() - Duration::minutes(16)).to_rfc3339()],
+            )
+            .expect("make Share runtime stale");
+
+        let stale = store
+            .share_market_catalog(Some(&renter), &[route.into()])
+            .await
+            .expect("stale runtime catalog");
+        assert_eq!(stale.listings[0].service_state, "unavailable");
+        assert_eq!(
+            stale.listings[0].service_block_reason.as_deref(),
+            Some("runtime_stale")
+        );
+        assert_eq!(
+            stale.listings[0].seats[0].rent_block_reason.as_deref(),
+            Some("runtime_syncing")
+        );
+
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET runtime_refreshed_at = ?2 WHERE share_id = ?1",
+                params![share_id, Utc::now().to_rfc3339()],
+            )
+            .expect("refresh Share runtime");
+        let offline = store
+            .share_market_catalog(Some(&renter), &[])
+            .await
+            .expect("offline catalog");
+        assert_eq!(
+            offline.listings[0].service_block_reason.as_deref(),
+            Some("share_offline")
+        );
+        assert_eq!(
+            offline.listings[0].seats[0].rent_block_reason.as_deref(),
+            Some("share_offline")
+        );
+    }
+
+    #[tokio::test]
+    async fn market_publish_refreshes_only_old_owner_runtime_snapshots() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-publish-runtime", "owner-publish-runtime@example.com");
+        let outsider = session("outsider-publish-runtime", "outsider@example.com");
+        let share_id = "share-publish-runtime";
+        insert_share(&store, share_id, &owner.email, &[ShareTokenPeriod::Day]).await;
+        let (listing_id, _) = create_listing(&store, &owner, share_id, free_seat()).await;
+
+        assert!(matches!(
+            store
+                .share_market_listing_share_id_for_owner(&outsider, &listing_id)
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        assert!(
+            store
+                .share_market_publish_runtime_target(&owner, share_id)
+                .await
+                .expect("fresh owner runtime")
+                .is_none()
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET runtime_refreshed_at = ?2 WHERE share_id = ?1",
+                params![share_id, (Utc::now() - Duration::minutes(6)).to_rfc3339()],
+            )
+            .expect("age Share runtime");
+        let target = store
+            .share_market_publish_runtime_target(&owner, share_id)
+            .await
+            .expect("old owner runtime")
+            .expect("refresh target");
+        assert_eq!(target.share_id, share_id);
+        assert_eq!(target.subdomain, "share-publish-runtime-route");
+        assert!(
+            store
+                .share_market_publish_runtime_target(&outsider, share_id)
+                .await
+                .is_err()
+        );
+
+        let now = Utc::now();
+        assert_eq!(
+            market_publish_runtime_snapshot_issue(share_id, "share-other", now.timestamp(), now,),
+            Some("share_mismatch")
+        );
+        assert_eq!(
+            market_publish_runtime_snapshot_issue(
+                share_id,
+                share_id,
+                (now - Duration::minutes(6)).timestamp(),
+                now,
+            ),
+            Some("runtime_stale")
+        );
+        assert_eq!(
+            market_publish_runtime_snapshot_issue(share_id, share_id, i64::MAX, now),
+            Some("runtime_stale")
+        );
+        assert_eq!(
+            market_publish_runtime_snapshot_issue(share_id, share_id, now.timestamp(), now),
+            None
         );
     }
 

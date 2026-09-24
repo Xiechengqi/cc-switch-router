@@ -19,6 +19,12 @@ type SelectableSeat = Pick<ShareMarketSeat, "id" | "status" | "readOnly">;
 
 export type RentConfirmPrimaryAction = "confirm" | "topup" | "refresh" | "blocked";
 
+export function catalogNeedsRuntimeSync(
+  listings: Array<Pick<ShareMarketListing, "serviceBlockReason">>,
+) {
+  return listings.some((listing) => listing.serviceBlockReason === "runtime_stale");
+}
+
 type RentConfirmFunding = Pick<
   MarketFundingSummary,
   "requiredTopupMinor" | "topupAvailable"
@@ -31,6 +37,10 @@ export function rentConfirmPrimaryAction(
   if (quoteRequiresRefresh) return "refresh";
   if (!funding || funding.requiredTopupMinor <= 0) return "confirm";
   return funding.topupAvailable ? "topup" : "blocked";
+}
+
+export function showRentQuoteCountdown(quoteRequiresRefresh: boolean, remainingSeconds: number) {
+  return quoteRequiresRefresh || remainingSeconds <= 30;
 }
 
 export function canOptionallyTopupRent(
