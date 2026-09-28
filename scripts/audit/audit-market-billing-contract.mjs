@@ -478,6 +478,9 @@ function main() {
       "frontend/components/dashboard/market-funding-topup-dialog.tsx",
       [
         "ConfirmAlertDialog",
+        "setRefreshConfirmOpen(true)",
+        'description={t("marketBilling.binance.refreshConfirm")}',
+        "onConfirm={() => void refreshIntent()}",
         "setCancelConfirmOpen(true)",
         'description={t("marketBilling.binance.cancelConfirm")}',
         "onConfirm={() => void cancelIntent()}",
@@ -564,6 +567,34 @@ function main() {
     }
   }
 
+  const buyerCatalogSource = fs.readFileSync(
+    path.join(root, "frontend/components/dashboard/share-market/buyer-catalog.tsx"),
+    "utf8",
+  );
+  const rentConfirmDialogStart = buyerCatalogSource.indexOf(
+    '<Modal.Backdrop isOpen={!!rentTarget}',
+  );
+  const rentConfirmDialogEnd = buyerCatalogSource.indexOf(
+    "<MarketAccessDialog",
+    rentConfirmDialogStart,
+  );
+  if (rentConfirmDialogStart < 0 || rentConfirmDialogEnd <= rentConfirmDialogStart) {
+    errors.push("Share rental confirmation dialog source boundary is missing");
+  } else {
+    const rentConfirmDialog = buyerCatalogSource.slice(
+      rentConfirmDialogStart,
+      rentConfirmDialogEnd,
+    );
+    const dividerClass = rentConfirmDialog.match(
+      /\b(?:border-[xytrbl](?:-\d+)?|divide-[xy])\b/,
+    );
+    if (dividerClass) {
+      errors.push(
+        `Share rental confirmation dialog must stay free of directional divider classes: ${dividerClass[0]}`,
+      );
+    }
+  }
+
   const fundingTopupSource = fs.readFileSync(
     path.join(root, "frontend/components/dashboard/market-funding-topup-dialog.tsx"),
     "utf8",
@@ -582,8 +613,8 @@ function main() {
       fundingTopupFlowStart,
       fundingTopupFlowEnd,
     );
-    if (fundingTopupFlow.includes('window.confirm(t("marketBilling.binance.cancelConfirm"))')) {
-      errors.push("MarketFundingTopupFlow cancellation must use the application confirmation dialog");
+    if (fundingTopupFlow.includes("window.confirm(")) {
+      errors.push("MarketFundingTopupFlow confirmations must use the application confirmation dialog");
     }
     const dividerClass = fundingTopupFlow.match(
       /\b(?:border-[xytrbl](?:-\d+)?|divide-[xy])\b/,

@@ -280,6 +280,7 @@ export function MarketFundingTopupFlow({
   const [intent, setIntent] = React.useState<BinanceFundingIntent | null>(null);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState("");
+  const [refreshConfirmOpen, setRefreshConfirmOpen] = React.useState(false);
   const [cancelConfirmOpen, setCancelConfirmOpen] = React.useState(false);
   const [clockMs, setClockMs] = React.useState(() => Date.now());
   const idempotencyRef = React.useRef<{ amountMinor: number; key: string } | null>(null);
@@ -288,6 +289,7 @@ export function MarketFundingTopupFlow({
   const intentMutationRef = React.useRef(false);
   const intentPollInFlightRef = React.useRef(false);
   const dismissalBlocked = !!busy
+    || refreshConfirmOpen
     || cancelConfirmOpen
     || (variant === "checkout" && intent?.status === "pending");
   const fundingErrorText = React.useCallback((reason: unknown) => {
@@ -314,6 +316,7 @@ export function MarketFundingTopupFlow({
     setIntent(null);
     setError("");
     setBusy("");
+    setRefreshConfirmOpen(false);
     setCancelConfirmOpen(false);
     setClockMs(Date.now());
     idempotencyRef.current = null;
@@ -369,6 +372,12 @@ export function MarketFundingTopupFlow({
 
   React.useEffect(() => {
     if (intent?.status !== "pending") setCancelConfirmOpen(false);
+  }, [intent?.status]);
+
+  React.useEffect(() => {
+    if (!["pending", "expired", "cancelled"].includes(intent?.status ?? "")) {
+      setRefreshConfirmOpen(false);
+    }
   }, [intent?.status]);
 
   const amountMinor = React.useMemo(() => {
@@ -442,7 +451,8 @@ export function MarketFundingTopupFlow({
   };
 
   const refreshIntent = async () => {
-    if (!intent || busy || !window.confirm(t("marketBilling.binance.refreshConfirm"))) return;
+    if (!intent || busy) return;
+    setRefreshConfirmOpen(false);
     const mutationEpoch = ++intentEpochRef.current;
     intentMutationRef.current = true;
     intentPollInFlightRef.current = false;
@@ -615,7 +625,7 @@ export function MarketFundingTopupFlow({
             </div>
             {canTransfer ? <p className="rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">{t("marketBilling.binance.path")}</p> : null}
             <div className="flex flex-wrap justify-center gap-2">
-              {["pending", "expired", "cancelled"].includes(intent.status) ? <Button size="sm" variant="outline" className="min-h-11" isDisabled={!!busy || intent.accountStatus !== "verified"} onClick={() => void refreshIntent()}>{busy === "refresh" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("marketBilling.binance.refresh")}</Button> : null}
+              {["pending", "expired", "cancelled"].includes(intent.status) ? <Button size="sm" variant="outline" className="min-h-11" isDisabled={!!busy || intent.accountStatus !== "verified"} onClick={() => setRefreshConfirmOpen(true)}>{busy === "refresh" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("marketBilling.binance.refresh")}</Button> : null}
               {intent.status === "pending" ? <Button size="sm" variant="outline" className="min-h-11" isDisabled={!!busy} onClick={() => setCancelConfirmOpen(true)}>{busy === "cancel" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}{t("marketBilling.binance.cancel")}</Button> : null}
             </div>
           </>
@@ -627,6 +637,17 @@ export function MarketFundingTopupFlow({
         </Button>
         {!intent ? <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busy || amountMinor == null || !funding?.topupAvailable} onClick={() => void createIntent()}>{busy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("marketBilling.prepaid.topup.create")}</Button> : null}
       </Modal.Footer>
+      <ConfirmAlertDialog
+        open={refreshConfirmOpen}
+        title={t("marketBilling.binance.refresh")}
+        description={t("marketBilling.binance.refreshConfirm")}
+        confirmLabel={t("marketBilling.binance.refresh")}
+        cancelLabel={t("common.cancel")}
+        tone="warning"
+        busy={busy === "refresh"}
+        onConfirm={() => void refreshIntent()}
+        onOpenChange={(open) => !busy && setRefreshConfirmOpen(open)}
+      />
       <ConfirmAlertDialog
         open={cancelConfirmOpen}
         title={t("marketBilling.binance.cancel")}

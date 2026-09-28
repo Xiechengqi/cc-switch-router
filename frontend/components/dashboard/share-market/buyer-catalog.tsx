@@ -1,6 +1,9 @@
 "use client";
 
-/* Hallmark · pre-emit critique: P5 H5 E4 S5 R5 V4 */
+/* Hallmark · component: Share rental confirmation · genre: modern-minimal · theme: existing router system
+ * states: default · hover · focus · active · disabled · loading · error · success
+ * contrast: pass (40–41) · pre-emit critique: P5 H5 E5 S5 R5 V4
+ */
 
 import * as React from "react";
 import { Button, Drawer, Modal } from "@heroui/react";
@@ -854,7 +857,7 @@ export function ShareMarketBuyerCatalog({
                 <Modal.Body className="grid max-h-[min(72dvh,640px)] gap-4 overflow-y-auto">
                   {rentTarget ? (
                     <>
-                      <section className="grid gap-3 border-y border-slate-200 py-4">
+                      <section className="grid gap-3 py-2">
                         <div className="flex min-w-0 flex-wrap items-end justify-between gap-3">
                           <div className="min-w-0">
                             <span className="block text-xs text-slate-500">{t("shareMarket.rentConfirm.priceLabel")}</span>
@@ -869,7 +872,7 @@ export function ShareMarketBuyerCatalog({
                       </section>
 
                       {effectiveRentFunding ? (
-                        <section className="grid gap-3 border-b border-slate-200 pb-4" aria-live="polite">
+                        <section className="grid gap-3 rounded-lg bg-slate-50 px-3 py-3" aria-live="polite">
                           <div className="flex items-center justify-between gap-3">
                             <h3 className="text-sm font-semibold text-slate-900">{t("shareMarket.rentConfirm.fundingLabel")}</h3>
                             <span className={cn(
@@ -887,16 +890,16 @@ export function ShareMarketBuyerCatalog({
                                   : t("shareMarket.rentConfirm.fundingReadyShort")}
                             </span>
                           </div>
-                          <dl className="grid grid-cols-3 text-sm">
-                            <div className="min-w-0 border-r border-slate-200 pr-2">
+                          <dl className="grid grid-cols-3 gap-3 text-sm">
+                            <div className="min-w-0">
                               <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.prepaidAvailable")}</dt>
                               <dd className="mt-1 truncate font-semibold tabular-nums">{formatUsdMoney(effectiveRentFunding.prepaidAvailableMinor, locale)}</dd>
                             </div>
-                            <div className="min-w-0 border-r border-slate-200 px-2">
+                            <div className="min-w-0">
                               <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.topup.requiredNow")}</dt>
                               <dd className="mt-1 truncate font-semibold tabular-nums">{formatUsdMoney(rentRequiredNowMinor, locale)}</dd>
                             </div>
-                            <div className="min-w-0 pl-2">
+                            <div className="min-w-0">
                               <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.shortfall")}</dt>
                               <dd className={cn(
                                 "mt-1 truncate font-semibold tabular-nums",
@@ -909,7 +912,7 @@ export function ShareMarketBuyerCatalog({
 
                       {rentRecurringFunding ? (
                         <label className={cn(
-                          "flex min-h-11 items-center justify-between gap-3 border-b border-slate-200 pb-4 text-sm",
+                          "flex min-h-11 items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-3 text-sm",
                           busySeatId || quoteRequiresRefresh
                             ? "cursor-not-allowed opacity-60"
                             : "cursor-pointer",
@@ -931,11 +934,11 @@ export function ShareMarketBuyerCatalog({
                         </label>
                       ) : null}
 
-                      {rentNotice ? <p role="status" className="border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm leading-5 text-amber-900">{rentNotice}</p> : null}
-                      {rentFundingBlocked ? <p role="alert" className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm leading-5 text-rose-800">{rentFundingBlocked}</p> : null}
-                      {error ? <p role="alert" className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm leading-5 text-rose-800">{error}</p> : null}
+                      {rentNotice ? <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm leading-5 text-amber-900">{rentNotice}</p> : null}
+                      {rentFundingBlocked ? <p role="alert" className="rounded-md bg-rose-50 px-3 py-2 text-sm leading-5 text-rose-800">{rentFundingBlocked}</p> : null}
+                      {error ? <p role="alert" className="rounded-md bg-rose-50 px-3 py-2 text-sm leading-5 text-rose-800">{error}</p> : null}
 
-                      <details className="group border-t border-slate-200">
+                      <details className="group rounded-lg bg-slate-50 px-3">
                         <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 rounded-sm py-2 text-sm font-medium text-slate-700 hover:text-slate-950 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary active:text-slate-950 [&::-webkit-details-marker]:hidden">
                           <span className="flex min-w-0 items-center gap-2">
                             <Info className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
@@ -943,7 +946,7 @@ export function ShareMarketBuyerCatalog({
                           </span>
                           <ChevronDown className="h-4 w-4 shrink-0 text-slate-400 group-open:rotate-180" aria-hidden="true" />
                         </summary>
-                        <div className="grid gap-5 pb-1 pt-3">
+                        <div className="grid gap-5 pb-3 pt-2">
                           <section className="grid gap-2">
                             <h3 className="text-sm font-semibold text-slate-900">{t("shareMarket.rentConfirm.billingDetails")}</h3>
                             <div className="grid gap-2 text-xs leading-5 text-slate-600">
@@ -978,7 +981,7 @@ export function ShareMarketBuyerCatalog({
                     </>
                   ) : null}
                 </Modal.Body>
-                <Modal.Footer className="flex-wrap justify-between border-t border-slate-200">
+                <Modal.Footer className="flex-wrap justify-between">
                   {rentPrimaryAction !== "close" ? <Button className="min-h-11 whitespace-nowrap" variant="ghost" isDisabled={!!busySeatId} onClick={closeRentDialog}>{t("common.cancel")}</Button> : <span />}
                   {rentPrimaryAction === "refresh" || rentPrimaryAction === "retry" ? (
                     <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={() => void refreshQuote()}>
