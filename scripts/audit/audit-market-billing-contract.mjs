@@ -475,6 +475,15 @@ function main() {
       ],
     ],
     [
+      "frontend/components/dashboard/market-funding-topup-dialog.tsx",
+      [
+        "ConfirmAlertDialog",
+        "setCancelConfirmOpen(true)",
+        'description={t("marketBilling.binance.cancelConfirm")}',
+        "onConfirm={() => void cancelIntent()}",
+      ],
+    ],
+    [
       "frontend/components/dashboard/create-client-dialog.tsx",
       ["createClient.quoteTerms.postpaid", "createClient.quoteTerms.free", "offerRevision: item.offerRevision"],
     ],
@@ -552,6 +561,37 @@ function main() {
     const source = fs.readFileSync(path.join(root, relativePath), "utf8");
     for (const marker of requiredMarkers) {
       if (!source.includes(marker)) errors.push(`${relativePath} is missing ${marker}`);
+    }
+  }
+
+  const fundingTopupSource = fs.readFileSync(
+    path.join(root, "frontend/components/dashboard/market-funding-topup-dialog.tsx"),
+    "utf8",
+  );
+  const fundingTopupFlowStart = fundingTopupSource.indexOf(
+    "export function MarketFundingTopupFlow(",
+  );
+  const fundingTopupFlowEnd = fundingTopupSource.indexOf(
+    "export function MarketFundingTopupDialog(",
+    fundingTopupFlowStart,
+  );
+  if (fundingTopupFlowStart < 0 || fundingTopupFlowEnd <= fundingTopupFlowStart) {
+    errors.push("MarketFundingTopupFlow source boundary is missing");
+  } else {
+    const fundingTopupFlow = fundingTopupSource.slice(
+      fundingTopupFlowStart,
+      fundingTopupFlowEnd,
+    );
+    if (fundingTopupFlow.includes('window.confirm(t("marketBilling.binance.cancelConfirm"))')) {
+      errors.push("MarketFundingTopupFlow cancellation must use the application confirmation dialog");
+    }
+    const dividerClass = fundingTopupFlow.match(
+      /\b(?:border-[xytrbl](?:-\d+)?|divide-[xy])\b/,
+    );
+    if (dividerClass) {
+      errors.push(
+        `MarketFundingTopupFlow must stay free of directional divider classes: ${dividerClass[0]}`,
+      );
     }
   }
 
