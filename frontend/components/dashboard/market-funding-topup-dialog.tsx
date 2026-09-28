@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
-import { AlertTriangle, Ban, CircleCheckBig, Copy, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle, Ban, ChevronDown, CircleCheckBig, Copy, Loader2, RefreshCw } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   cancelBinanceFundingIntent,
@@ -252,16 +252,22 @@ export function MarketRecurringFundingSummaryCard({
   );
 }
 
-export function MarketFundingTopupDialog({
-  open,
+export function MarketFundingTopupFlow({
+  active,
   funding,
   onClose,
+  onBack,
+  onDismissBlockedChange,
   onCredited,
+  variant = "standalone",
 }: {
-  open: boolean;
+  active: boolean;
   funding?: MarketTopupFunding;
   onClose: () => void;
+  onBack?: () => void;
+  onDismissBlockedChange?: (blocked: boolean) => void;
   onCredited: (intent: BinanceFundingIntent) => void | Promise<void>;
+  variant?: "standalone" | "checkout";
 }) {
   const { locale, t } = useLocaleText();
   const [amount, setAmount] = React.useState("");
@@ -274,34 +280,45 @@ export function MarketFundingTopupDialog({
   const intentEpochRef = React.useRef(0);
   const intentMutationRef = React.useRef(false);
   const intentPollInFlightRef = React.useRef(false);
+  const dismissalBlocked = !!busy || (variant === "checkout" && intent?.status === "pending");
   const fundingErrorText = React.useCallback((reason: unknown) => {
     const messageKey = marketFundingTopupErrorKey(reason);
     return messageKey ? t(messageKey) : reason instanceof Error ? reason.message : String(reason);
   }, [t]);
 
   React.useEffect(() => {
-    if (!open) return;
+    onDismissBlockedChange?.(dismissalBlocked);
+    return () => onDismissBlockedChange?.(false);
+  }, [dismissalBlocked, onDismissBlockedChange]);
+
+  React.useEffect(() => {
+    if (!active) return;
     intentEpochRef.current += 1;
     intentMutationRef.current = false;
     intentPollInFlightRef.current = false;
-    setAmount(funding ? (defaultMarketFundingTopupMinor(funding) / 100).toFixed(2) : "");
+    const initialMinor = funding
+      ? variant === "checkout" && funding.requiredTopupMinor > 0
+        ? Math.min(funding.requiredTopupMinor, MAX_MARKET_FUNDING_TOPUP_MINOR)
+        : defaultMarketFundingTopupMinor(funding)
+      : 0;
+    setAmount(initialMinor > 0 ? (initialMinor / 100).toFixed(2) : "");
     setIntent(null);
     setError("");
     setBusy("");
     setClockMs(Date.now());
     idempotencyRef.current = null;
     creditedRef.current = "";
-  }, [funding, open]);
+  }, [active, funding, variant]);
 
   React.useEffect(() => {
-    if (!open || !intent?.id || intent.status !== "pending") return;
+    if (!active || !intent?.id || intent.status !== "pending") return;
     const controller = new AbortController();
-    let active = true;
+    let pollActive = true;
     const intentId = intent.id;
     const epoch = ++intentEpochRef.current;
     intentPollInFlightRef.current = false;
     const accept = (next: BinanceFundingIntent) => {
-      if (!active || intentEpochRef.current !== epoch) return;
+      if (!pollActive || intentEpochRef.current !== epoch) return;
       setIntent(next);
       setError("");
     };
@@ -311,34 +328,34 @@ export function MarketFundingTopupDialog({
       void getBinanceFundingIntent(intentId, controller.signal)
         .then(accept)
         .catch((reason) => {
-          if (!active || controller.signal.aborted || intentEpochRef.current !== epoch) return;
+          if (!pollActive || controller.signal.aborted || intentEpochRef.current !== epoch) return;
           setIntent((current) => current?.id === intentId
             ? { ...current, accountStatus: "unavailable" }
             : current);
           setError(fundingErrorText(reason));
         })
         .finally(() => {
-          if (active && intentEpochRef.current === epoch) {
+          if (pollActive && intentEpochRef.current === epoch) {
             intentPollInFlightRef.current = false;
           }
         });
     }, 3_000);
     const clock = window.setInterval(() => setClockMs(Date.now()), 1_000);
     return () => {
-      active = false;
+      pollActive = false;
       controller.abort();
       window.clearInterval(poll);
       window.clearInterval(clock);
       intentPollInFlightRef.current = false;
     };
-  }, [fundingErrorText, intent?.id, intent?.status, open]);
+  }, [active, fundingErrorText, intent?.id, intent?.status]);
 
   React.useEffect(() => {
-    if (!open || intent?.status !== "credited" || creditedRef.current === intent.id) return;
+    if (!active || intent?.status !== "credited" || creditedRef.current === intent.id) return;
     creditedRef.current = intent.id;
-    toast.success(t("marketBilling.prepaid.topup.credited"));
+    if (variant === "standalone") toast.success(t("marketBilling.prepaid.topup.credited"));
     void onCredited(intent);
-  }, [intent?.id, intent?.status, onCredited, open, t]);
+  }, [active, intent?.id, intent?.status, onCredited, t, variant]);
 
   const amountMinor = React.useMemo(() => {
     const normalized = amount.trim();
@@ -351,12 +368,16 @@ export function MarketFundingTopupDialog({
       ? minor
       : null;
   }, [amount]);
+  const amountInvalid = amount.trim().length > 0 && amountMinor == null;
   const minimumPresetMinor = Math.min(
     funding?.requiredTopupMinor ?? 0,
     MAX_MARKET_FUNDING_TOPUP_MINOR,
   );
   const recurringFunding = funding && isRecurringFunding(funding) ? funding : undefined;
   const meteredFunding = funding && !isRecurringFunding(funding) ? funding : undefined;
+  const requiredNowMinor = recurringFunding?.totalRequiredHoldMinor
+    ?? meteredFunding?.requiredCoverageMinor
+    ?? 0;
   const recommendedTopupMinor = Math.max(
     meteredFunding?.recommendedTopupMinor ?? recurringFunding?.requiredTopupMinor ?? 0,
     funding?.requiredTopupMinor ?? 0,
@@ -462,65 +483,162 @@ export function MarketFundingTopupDialog({
   };
 
   return (
-    <Modal.Backdrop isOpen={open} onOpenChange={(next) => !next && !busy && onClose()}>
-      <Modal.Container placement="center">
-        <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-          <Modal.Header><Modal.Heading>{t("marketBilling.dialog.topup")}</Modal.Heading></Modal.Header>
-          <Modal.Body className="grid max-h-[70vh] gap-4 overflow-y-auto">
-            {funding ? (
-              <div className="grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm sm:grid-cols-4">
-                <div><span className="block text-xs text-slate-500">{t("marketBilling.supplier")}</span><strong className="break-all">{funding.supplierEmail}</strong></div>
-                <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</span><strong>{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</strong></div>
-                <div><span className="block text-xs text-slate-500">{t("marketFunding.shortfall")}</span><strong>{formatUsdMoney(funding.requiredTopupMinor, locale)}</strong></div>
-                <div><span className="block text-xs text-slate-500">{recurringFunding ? t("marketRecurringFunding.topupTarget") : t("marketFunding.topup.recommended", { days: meteredFunding?.recommendedCoverageDays ?? 0 })}</span><strong>{formatUsdMoney(recommendedTopupMinor, locale)}</strong></div>
-              </div>
-            ) : null}
-            {!intent ? (
-              <div className="grid gap-3">
-                <div className="flex flex-wrap gap-2">
-                  {funding && minimumPresetMinor > 0 ? <Button size="sm" variant="outline" onClick={() => { setAmount((minimumPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(funding.requiredTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.minimumPreset", { amount: formatUsdMoney(minimumPresetMinor, locale) })}</Button> : null}
-                  {meteredFunding && recommendedPresetMinor > 0 && recommendedPresetMinor !== minimumPresetMinor ? <Button size="sm" variant="outline" onClick={() => { setAmount((recommendedPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(recommendedTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.recommendedPreset", { days: meteredFunding.recommendedCoverageDays, amount: formatUsdMoney(recommendedPresetMinor, locale) })}</Button> : null}
-                </div>
+    <>
+      <Modal.Header>
+        <div className="min-w-0 pr-8">
+          <Modal.Heading>
+            {t(variant === "checkout" ? "marketFunding.topup.checkoutTitle" : "marketBilling.dialog.topup")}
+          </Modal.Heading>
+          {variant === "checkout" && funding ? (
+            <p className="mt-1 truncate text-xs text-slate-500" title={funding.supplierEmail}>
+              {funding.supplierEmail}
+            </p>
+          ) : null}
+        </div>
+      </Modal.Header>
+      <Modal.Body className="grid max-h-[min(72dvh,640px)] gap-4 overflow-y-auto">
+        {funding ? variant === "checkout" ? (
+          <dl className="grid grid-cols-3 border-y border-slate-200 py-3 text-sm">
+            <div className="min-w-0 border-r border-slate-200 pr-2">
+              <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.prepaidAvailable")}</dt>
+              <dd className="mt-1 truncate font-semibold tabular-nums text-slate-950">{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</dd>
+            </div>
+            <div className="min-w-0 border-r border-slate-200 px-2">
+              <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.topup.requiredNow")}</dt>
+              <dd className="mt-1 truncate font-semibold tabular-nums text-slate-950">{formatUsdMoney(requiredNowMinor, locale)}</dd>
+            </div>
+            <div className="min-w-0 pl-2">
+              <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.shortfall")}</dt>
+              <dd className="mt-1 truncate font-semibold tabular-nums text-rose-700">{formatUsdMoney(funding.requiredTopupMinor, locale)}</dd>
+            </div>
+          </dl>
+        ) : (
+          <div className="grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm sm:grid-cols-4">
+            <div><span className="block text-xs text-slate-500">{t("marketBilling.supplier")}</span><strong className="break-all">{funding.supplierEmail}</strong></div>
+            <div><span className="block text-xs text-slate-500">{t("marketFunding.prepaidAvailable")}</span><strong>{formatUsdMoney(funding.prepaidAvailableMinor, locale)}</strong></div>
+            <div><span className="block text-xs text-slate-500">{t("marketFunding.shortfall")}</span><strong>{formatUsdMoney(funding.requiredTopupMinor, locale)}</strong></div>
+            <div><span className="block text-xs text-slate-500">{recurringFunding ? t("marketRecurringFunding.topupTarget") : t("marketFunding.topup.recommended", { days: meteredFunding?.recommendedCoverageDays ?? 0 })}</span><strong>{formatUsdMoney(recommendedTopupMinor, locale)}</strong></div>
+          </div>
+        ) : null}
+
+        {!intent ? variant === "checkout" ? (
+          <div className="grid gap-4">
+            <div className="py-2 text-center">
+              <span className="block text-xs font-medium text-slate-500">{t("marketFunding.topup.transferAmount")}</span>
+              <strong className="mt-1 block text-3xl font-semibold tracking-tight tabular-nums text-slate-950">
+                {amountMinor == null ? "—" : formatUsdMoney(amountMinor, locale)}
+              </strong>
+              <span className="mt-1 block text-xs text-slate-500">
+                {t(amountMinor === funding?.requiredTopupMinor
+                  ? "marketFunding.topup.exactShortfall"
+                  : "marketFunding.topup.customSelected")}
+              </span>
+            </div>
+            <details className="group border-t border-slate-200">
+              <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between py-2 text-sm font-medium text-slate-700 hover:text-slate-950 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary active:text-slate-950 [&::-webkit-details-marker]:hidden">
+                {t("marketFunding.topup.adjustAmount")}
+                <span className="flex items-center gap-2 text-xs font-normal text-slate-500">
+                  <span className="group-open:hidden">{t("marketFunding.topup.optional")}</span>
+                  <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" aria-hidden="true" />
+                </span>
+              </summary>
+              <div className="grid gap-2 pb-2">
                 <label className="grid gap-1 text-sm">
                   <span className="text-slate-500">{t("marketFunding.topup.custom")}</span>
-                  <input value={amount} onChange={(event) => { setAmount(event.target.value); idempotencyRef.current = null; }} inputMode="decimal" max={MAX_MARKET_FUNDING_TOPUP_MINOR / 100} className="h-10 rounded-md border border-slate-200 px-3 tabular-nums" autoFocus />
-                  <span className="text-xs text-slate-500">{t("marketFunding.topup.transferLimit", { amount: formatUsdMoney(MAX_MARKET_FUNDING_TOPUP_MINOR, locale) })}</span>
+                  <input value={amount} onChange={(event) => { setAmount(event.target.value); idempotencyRef.current = null; }} inputMode="decimal" max={MAX_MARKET_FUNDING_TOPUP_MINOR / 100} aria-invalid={amountInvalid} className="min-h-11 rounded-md border border-slate-300 px-3 tabular-nums focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary aria-invalid:border-rose-400" />
+                  <span className={`min-h-5 text-xs ${amountInvalid ? "text-rose-700" : "text-slate-500"}`}>
+                    {amountInvalid
+                      ? t("marketBilling.prepaid.amountInvalid")
+                      : t("marketFunding.topup.transferLimit", { amount: formatUsdMoney(MAX_MARKET_FUNDING_TOPUP_MINOR, locale) })}
+                  </span>
                 </label>
-                {partialRemainingMinor > 0 ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">{t("marketFunding.topup.partialNotice", { remaining: formatUsdMoney(partialRemainingMinor, locale) })}</p> : null}
-                <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">{t("marketFunding.topup.providerScope")}</p>
+                <p className="text-xs leading-5 text-slate-500">{t("marketFunding.topup.providerScope")}</p>
                 <p className="text-xs leading-5 text-slate-500">{t("marketFunding.topup.refundDisclosure")}</p>
-                {!funding?.topupAvailable ? <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding?.topupUnavailableReason))}</p> : null}
               </div>
-            ) : null}
-            {error ? <div className="flex gap-2 rounded-md border border-rose-200 bg-rose-50 p-3 text-xs leading-5 text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div> : null}
-            {intent ? (
-              <>
-                <div className={`rounded-xl border p-4 text-center ${intent.status === "credited" ? "border-emerald-200 bg-emerald-50" : "border-amber-200 bg-amber-50/70"}`}>
-                  {intent.status === "credited" ? <CircleCheckBig className="mx-auto h-8 w-8 text-emerald-600" /> : null}
-                  <p className="text-xs font-medium text-slate-500">{canTransfer ? t("marketBilling.binance.exactAmount") : statusLabel(intent.status, t)}</p>
-                  <strong className="mt-1 block text-3xl tabular-nums">{intent.payAmount}<span className="ml-2 text-base">{intent.asset}</span></strong>
-                  {canTransfer ? <Button size="sm" variant="outline" className="mt-3" onClick={() => void copy(intent.payAmount)}><Copy className="h-4 w-4" />{t("marketBilling.binance.copyAmount")}</Button> : null}
-                </div>
-                <div className="divide-y divide-dashed divide-slate-200 rounded-lg border border-slate-200 px-3 text-sm">
-                  {canTransfer ? <>
-                    <div className="flex items-center justify-between gap-3 py-3"><span className="text-slate-500">{t("marketBilling.binance.receiverUid")}</span><span className="flex items-center gap-2"><strong className="break-all text-right">{intent.receiverUid}</strong><Button isIconOnly size="sm" variant="ghost" aria-label={t("marketBilling.binance.copyUid")} onClick={() => void copy(intent.receiverUid)}><Copy className="h-4 w-4" /></Button></span></div>
-                    <div className="flex items-center justify-between gap-3 py-3"><span className="text-slate-500">{t("marketBilling.binance.noteCode")}</span><span className="flex items-center gap-2"><strong>{intent.noteCode}</strong><Button isIconOnly size="sm" variant="ghost" aria-label={t("marketBilling.binance.copyNote")} onClick={() => void copy(intent.noteCode)}><Copy className="h-4 w-4" /></Button></span></div>
-                  </> : null}
-                  <div className="flex items-center justify-between gap-3 py-3"><span className="text-slate-500">{t("marketBilling.binance.remaining")}</span><strong className="tabular-nums">{countdown}</strong></div>
-                  <div className="flex items-center justify-between gap-3 py-3"><span className="text-slate-500">{t("marketBilling.binance.statusLabel")}</span><strong>{statusLabel(intent.status, t)}</strong></div>
-                </div>
-                {canTransfer ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">{t("marketBilling.binance.path")}</p> : null}
-                <div className="flex justify-center gap-2">
-                  {["pending", "expired", "cancelled"].includes(intent.status) ? <Button size="sm" variant="outline" isDisabled={!!busy || intent.accountStatus !== "verified"} onClick={() => void refreshIntent()}>{busy === "refresh" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("marketBilling.binance.refresh")}</Button> : null}
-                  {intent.status === "pending" ? <Button size="sm" variant="outline" isDisabled={!!busy} onClick={() => void cancelIntent()}>{busy === "cancel" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}{t("marketBilling.binance.cancel")}</Button> : null}
-                </div>
-              </>
-            ) : null}
-          </Modal.Body>
-          <Modal.Footer>
-            <Button variant="ghost" isDisabled={!!busy} onClick={onClose}>{intent ? t("common.close") : t("common.cancel")}</Button>
-            {!intent ? <Button variant="primary" isDisabled={!!busy || amountMinor == null || !funding?.topupAvailable} onClick={() => void createIntent()}>{busy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("marketBilling.prepaid.topup.create")}</Button> : null}
-          </Modal.Footer>
+            </details>
+            {partialRemainingMinor > 0 ? <p className="border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">{t("marketFunding.topup.partialNotice", { remaining: formatUsdMoney(partialRemainingMinor, locale) })}</p> : null}
+            {!funding?.topupAvailable ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding?.topupUnavailableReason))}</p> : null}
+          </div>
+        ) : (
+          <div className="grid gap-3">
+            <div className="flex flex-wrap gap-2">
+              {funding && minimumPresetMinor > 0 ? <Button size="sm" variant="outline" onClick={() => { setAmount((minimumPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(funding.requiredTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.minimumPreset", { amount: formatUsdMoney(minimumPresetMinor, locale) })}</Button> : null}
+              {meteredFunding && recommendedPresetMinor > 0 && recommendedPresetMinor !== minimumPresetMinor ? <Button size="sm" variant="outline" onClick={() => { setAmount((recommendedPresetMinor / 100).toFixed(2)); idempotencyRef.current = null; }}>{t(recommendedTopupMinor > MAX_MARKET_FUNDING_TOPUP_MINOR ? "marketFunding.topup.maximumPreset" : "marketFunding.topup.recommendedPreset", { days: meteredFunding.recommendedCoverageDays, amount: formatUsdMoney(recommendedPresetMinor, locale) })}</Button> : null}
+            </div>
+            <label className="grid gap-1 text-sm">
+              <span className="text-slate-500">{t("marketFunding.topup.custom")}</span>
+              <input value={amount} onChange={(event) => { setAmount(event.target.value); idempotencyRef.current = null; }} inputMode="decimal" max={MAX_MARKET_FUNDING_TOPUP_MINOR / 100} aria-invalid={amountInvalid} className="min-h-11 rounded-md border border-slate-200 px-3 tabular-nums aria-invalid:border-rose-400" autoFocus />
+              <span className={`min-h-5 text-xs ${amountInvalid ? "text-rose-700" : "text-slate-500"}`}>
+                {amountInvalid
+                  ? t("marketBilling.prepaid.amountInvalid")
+                  : t("marketFunding.topup.transferLimit", { amount: formatUsdMoney(MAX_MARKET_FUNDING_TOPUP_MINOR, locale) })}
+              </span>
+            </label>
+            {partialRemainingMinor > 0 ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">{t("marketFunding.topup.partialNotice", { remaining: formatUsdMoney(partialRemainingMinor, locale) })}</p> : null}
+            <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">{t("marketFunding.topup.providerScope")}</p>
+            <p className="text-xs leading-5 text-slate-500">{t("marketFunding.topup.refundDisclosure")}</p>
+            {!funding?.topupAvailable ? <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding?.topupUnavailableReason))}</p> : null}
+          </div>
+        ) : null}
+
+        {error ? <div className="flex gap-2 border-l-2 border-rose-400 bg-rose-50 p-3 text-xs leading-5 text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div> : null}
+        {intent ? (
+          <>
+            <div className={`border-y py-4 text-center ${intent.status === "credited" ? "border-emerald-200 bg-emerald-50" : "border-amber-200 bg-amber-50/70"}`}>
+              {intent.status === "credited" ? <CircleCheckBig className="mx-auto h-8 w-8 text-emerald-600" /> : null}
+              <p className="text-xs font-medium text-slate-500">{canTransfer ? t("marketBilling.binance.exactAmount") : statusLabel(intent.status, t)}</p>
+              <strong className="mt-1 block text-3xl tabular-nums">{intent.payAmount}<span className="ml-2 text-base">{intent.asset}</span></strong>
+              {canTransfer ? <Button size="sm" variant="outline" className="mt-3 min-h-11" onClick={() => void copy(intent.payAmount)}><Copy className="h-4 w-4" />{t("marketBilling.binance.copyAmount")}</Button> : null}
+            </div>
+            <div className="divide-y divide-dashed divide-slate-200 border-y border-slate-200 px-1 text-sm">
+              {canTransfer ? <>
+                <div className="flex min-h-12 items-center justify-between gap-3 py-2"><span className="text-slate-500">{t("marketBilling.binance.receiverUid")}</span><span className="flex min-w-0 items-center gap-1"><strong className="truncate text-right">{intent.receiverUid}</strong><Button isIconOnly size="sm" variant="ghost" className="min-h-11 min-w-11" aria-label={t("marketBilling.binance.copyUid")} onClick={() => void copy(intent.receiverUid)}><Copy className="h-4 w-4" /></Button></span></div>
+                <div className="flex min-h-12 items-center justify-between gap-3 py-2"><span className="text-slate-500">{t("marketBilling.binance.noteCode")}</span><span className="flex items-center gap-1"><strong>{intent.noteCode}</strong><Button isIconOnly size="sm" variant="ghost" className="min-h-11 min-w-11" aria-label={t("marketBilling.binance.copyNote")} onClick={() => void copy(intent.noteCode)}><Copy className="h-4 w-4" /></Button></span></div>
+              </> : null}
+              <div className="flex min-h-12 items-center justify-between gap-3 py-2"><span className="text-slate-500">{t("marketBilling.binance.remaining")}</span><strong className="tabular-nums">{countdown}</strong></div>
+              <div className="flex min-h-12 items-center justify-between gap-3 py-2"><span className="text-slate-500">{t("marketBilling.binance.statusLabel")}</span><strong>{statusLabel(intent.status, t)}</strong></div>
+            </div>
+            {canTransfer ? <p className="border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">{t("marketBilling.binance.path")}</p> : null}
+            <div className="flex flex-wrap justify-center gap-2">
+              {["pending", "expired", "cancelled"].includes(intent.status) ? <Button size="sm" variant="outline" className="min-h-11" isDisabled={!!busy || intent.accountStatus !== "verified"} onClick={() => void refreshIntent()}>{busy === "refresh" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("marketBilling.binance.refresh")}</Button> : null}
+              {intent.status === "pending" ? <Button size="sm" variant="outline" className="min-h-11" isDisabled={!!busy} onClick={() => void cancelIntent()}>{busy === "cancel" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}{t("marketBilling.binance.cancel")}</Button> : null}
+            </div>
+          </>
+        ) : null}
+      </Modal.Body>
+      <Modal.Footer className="flex-wrap justify-between border-t border-slate-200">
+        <Button className="min-h-11 whitespace-nowrap" variant="ghost" isDisabled={dismissalBlocked} onClick={onBack ?? onClose}>
+          {onBack ? t("marketFunding.topup.backToRental") : intent ? t("common.close") : t("common.cancel")}
+        </Button>
+        {!intent ? <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busy || amountMinor == null || !funding?.topupAvailable} onClick={() => void createIntent()}>{busy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("marketBilling.prepaid.topup.create")}</Button> : null}
+      </Modal.Footer>
+    </>
+  );
+}
+
+export function MarketFundingTopupDialog({
+  open,
+  funding,
+  onClose,
+  onCredited,
+}: {
+  open: boolean;
+  funding?: MarketTopupFunding;
+  onClose: () => void;
+  onCredited: (intent: BinanceFundingIntent) => void | Promise<void>;
+}) {
+  const [dismissBlocked, setDismissBlocked] = React.useState(false);
+  return (
+    <Modal.Backdrop isOpen={open} onOpenChange={(next) => !next && !dismissBlocked && onClose()}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light max-h-[calc(100dvh-1rem)] w-[min(560px,calc(100vw-1rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
+          <MarketFundingTopupFlow
+            active={open}
+            funding={funding}
+            onClose={onClose}
+            onDismissBlockedChange={setDismissBlocked}
+            onCredited={onCredited}
+          />
         </Modal.Dialog>
       </Modal.Container>
     </Modal.Backdrop>

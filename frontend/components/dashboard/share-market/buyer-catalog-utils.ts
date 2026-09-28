@@ -17,7 +17,14 @@ import {
 
 type SelectableSeat = Pick<ShareMarketSeat, "id" | "status" | "readOnly">;
 
-export type RentConfirmPrimaryAction = "confirm" | "topup" | "refresh" | "blocked";
+export type RentConfirmPrimaryAction =
+  | "confirm"
+  | "topup"
+  | "refresh"
+  | "retry"
+  | "contact"
+  | "billing"
+  | "close";
 
 export function catalogNeedsRuntimeSync(
   listings: Array<Pick<ShareMarketListing, "serviceBlockReason">>,
@@ -27,7 +34,7 @@ export function catalogNeedsRuntimeSync(
 
 type RentConfirmFunding = Pick<
   MarketFundingSummary,
-  "requiredTopupMinor" | "topupAvailable"
+  "requiredTopupMinor" | "topupAvailable" | "topupUnavailableReason"
 >;
 
 export function rentConfirmPrimaryAction(
@@ -36,7 +43,22 @@ export function rentConfirmPrimaryAction(
 ): RentConfirmPrimaryAction {
   if (quoteRequiresRefresh) return "refresh";
   if (!funding || funding.requiredTopupMinor <= 0) return "confirm";
-  return funding.topupAvailable ? "topup" : "blocked";
+  if (funding.topupAvailable) return "topup";
+  switch (funding.topupUnavailableReason) {
+    case "temporarily_unavailable":
+      return "retry";
+    case "settlement_required":
+    case "relationship_closed":
+      return "billing";
+    case "router_disabled":
+    case "router_shadow":
+    case "region_restricted":
+    case "credential_storage_unavailable":
+      return "close";
+    case "supplier_unavailable":
+    default:
+      return "contact";
+  }
 }
 
 export function showRentQuoteCountdown(quoteRequiresRefresh: boolean, remainingSeconds: number) {

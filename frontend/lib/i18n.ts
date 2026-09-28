@@ -305,6 +305,10 @@ export const messages = {
       "This quote must be refreshed before you continue.",
     "shareMarket.rentConfirm.refreshRequiredShort": "Refresh required",
     "shareMarket.rentConfirm.requote": "Refresh quote",
+    "shareMarket.rentConfirm.retry": "Try again",
+    "shareMarket.rentConfirm.contactSeller": "Contact seller",
+    "shareMarket.rentConfirm.openBilling": "Open billing",
+    "shareMarket.rentConfirm.returnToMarket": "Back to market",
     "shareMarket.rentConfirm.priceLabel": "Price",
     "shareMarket.rentConfirm.noTrialCompact":
       "No trial remains · billing starts when healthy service begins.",
@@ -324,11 +328,15 @@ export const messages = {
     "shareMarket.rentConfirm.technicalDetails": "Technical details",
     "shareMarket.rentConfirm.fundingLabel": "Funding",
     "shareMarket.rentConfirm.fundingReady": "{amount} required · Balance ready",
+    "shareMarket.rentConfirm.fundingReadyShort": "Balance ready",
     "shareMarket.rentConfirm.fundingTopup": "Top up {amount}",
     "shareMarket.rentConfirm.fundingCredit": "Uses {amount} credit",
     "shareMarket.rentConfirm.topupAmount": "Top up {amount}",
     "shareMarket.rentConfirm.fundingChanged":
       "Funding changed. This is the latest quote; review it before confirming again.",
+    "shareMarket.rentConfirm.topupCredited":
+      "Top-up received. Review the refreshed quote, then confirm the rental.",
+    "shareMarket.rentConfirm.autoRenewHold": "Reserve +{amount} now for the next month",
     "shareMarket.rentConfirm.postpaid":
       "The first {hours} hours of healthy service are free and do not create charges{tokens}. After that, usage is charged at the daily rate, using prepaid funds first and this Owner's explicit credit only for any remainder.",
     "shareMarket.rentConfirm.prepaidMonthly":
@@ -1864,6 +1872,14 @@ export const messages = {
     "marketFunding.topup.action": "Top up with Binance",
     "marketFunding.topup.requiredAction": "Top up and continue",
     "marketFunding.topup.optionalAction": "Add prepaid funds",
+    "marketFunding.topup.checkoutTitle": "Top up to rent",
+    "marketFunding.topup.requiredNow": "Needed now",
+    "marketFunding.topup.transferAmount": "Transfer amount",
+    "marketFunding.topup.exactShortfall": "Set to the exact shortfall",
+    "marketFunding.topup.customSelected": "Custom amount selected",
+    "marketFunding.topup.adjustAmount": "Change amount",
+    "marketFunding.topup.optional": "Optional",
+    "marketFunding.topup.backToRental": "Back to rental",
     "marketFunding.topup.recommended": "Recommended ({days} days)",
     "marketFunding.topup.minimumPreset": "Minimum · {amount}",
     "marketFunding.topup.recommendedPreset": "Recommended {days} days · {amount}",
@@ -4051,6 +4067,10 @@ export const messages = {
     "shareMarket.rentConfirm.refreshRequired": "继续操作前必须刷新当前报价。",
     "shareMarket.rentConfirm.refreshRequiredShort": "需刷新报价",
     "shareMarket.rentConfirm.requote": "刷新报价",
+    "shareMarket.rentConfirm.retry": "重试",
+    "shareMarket.rentConfirm.contactSeller": "联系卖家",
+    "shareMarket.rentConfirm.openBilling": "前往账务",
+    "shareMarket.rentConfirm.returnToMarket": "返回市场",
     "shareMarket.rentConfirm.priceLabel": "价格",
     "shareMarket.rentConfirm.noTrialCompact":
       "无剩余试用 · 健康服务开始后计费。",
@@ -4070,11 +4090,15 @@ export const messages = {
     "shareMarket.rentConfirm.technicalDetails": "技术明细",
     "shareMarket.rentConfirm.fundingLabel": "资金",
     "shareMarket.rentConfirm.fundingReady": "需预留 {amount} · 余额充足",
+    "shareMarket.rentConfirm.fundingReadyShort": "余额充足",
     "shareMarket.rentConfirm.fundingTopup": "需充值 {amount}",
     "shareMarket.rentConfirm.fundingCredit": "使用授信 {amount}",
     "shareMarket.rentConfirm.topupAmount": "充值 {amount}",
     "shareMarket.rentConfirm.fundingChanged":
       "资金状态已变化，以下是最新报价，请重新核对后确认。",
+    "shareMarket.rentConfirm.topupCredited":
+      "充值已到账，请核对刷新后的报价再确认租用。",
+    "shareMarket.rentConfirm.autoRenewHold": "现在多冻结 {amount} 作为下一期费用",
     "shareMarket.rentConfirm.postpaid":
       "前 {hours} 小时健康服务时间免费且不产生费用{tokens}；之后按日费计费，优先扣除预存，仅不足部分使用该 Owner 明确授予的信用额度。",
     "shareMarket.rentConfirm.prepaidMonthly":
@@ -5558,6 +5582,14 @@ export const messages = {
     "marketFunding.topup.action": "通过币安充值",
     "marketFunding.topup.requiredAction": "充值并继续",
     "marketFunding.topup.optionalAction": "充值预存",
+    "marketFunding.topup.checkoutTitle": "充值后租用",
+    "marketFunding.topup.requiredNow": "当前所需",
+    "marketFunding.topup.transferAmount": "转账金额",
+    "marketFunding.topup.exactShortfall": "已按差额填写",
+    "marketFunding.topup.customSelected": "已修改充值金额",
+    "marketFunding.topup.adjustAmount": "修改金额",
+    "marketFunding.topup.optional": "可选",
+    "marketFunding.topup.backToRental": "返回租用",
     "marketFunding.topup.recommended": "建议充值（{days} 天）",
     "marketFunding.topup.minimumPreset": "最低所需 · {amount}",
     "marketFunding.topup.recommendedPreset": "建议 {days} 天 · {amount}",
