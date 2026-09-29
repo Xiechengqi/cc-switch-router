@@ -8,8 +8,10 @@ import type {
 } from "@/lib/types";
 import {
   actorBoundValue,
-  basisPointsPercent,
+  basisPointsScore,
   filterMarketProviders,
+  formatBasisPointScore,
+  isFormallyRanked,
   preferredProviderTopupFunding,
   providerCreditSummary,
 } from "./providers-page-utils";
@@ -90,7 +92,7 @@ function funding(projectedDailyRateMinor: number, requiredTopupMinor = 0): Marke
   };
 }
 
-test("Provider filters stay orthogonal and preserve server order", () => {
+test("Provider name and market filters stay orthogonal and preserve server order", () => {
   const rankedShare = provider("Ranked Share", {
     rankState: "ranked",
     rankPosition: 1,
@@ -114,17 +116,42 @@ test("Provider filters stay orthogonal and preserve server order", () => {
     ["Ranked Share"],
   );
   assert.deepEqual(
-    filterMarketProviders(providers, { rank: "collecting", query: "client" }).map((item) => item.id),
+    filterMarketProviders(providers, { market: "client", query: "client" }).map((item) => item.id),
     ["Collecting Client"],
   );
   assert.deepEqual(filterMarketProviders(providers, {}), providers);
 });
 
-test("basis point display clamps malformed values", () => {
-  assert.equal(basisPointsPercent(9_876), 98.76);
-  assert.equal(basisPointsPercent(11_000), 100);
-  assert.equal(basisPointsPercent(-1), 0);
-  assert.equal(basisPointsPercent(undefined), undefined);
+test("basis point scores are clamped and formatted as scores, not percentages", () => {
+  assert.equal(basisPointsScore(9_876), 98.76);
+  assert.equal(basisPointsScore(11_000), 100);
+  assert.equal(basisPointsScore(-1), 0);
+  assert.equal(basisPointsScore(undefined), undefined);
+  assert.equal(formatBasisPointScore(8_640, "en"), "86.4 / 100");
+  assert.equal(formatBasisPointScore(undefined, "en"), "—");
+  assert.equal(formatBasisPointScore(8_640, "en").includes("%"), false);
+});
+
+test("formal rank presentation fails closed when rank fields disagree", () => {
+  assert.equal(isFormallyRanked(provider("ranked", {
+    rankState: "ranked",
+    rankPosition: 1,
+    scoreBps: 8_640,
+  })), true);
+  assert.equal(isFormallyRanked(provider("collecting", {
+    rankState: "collecting",
+    rankPosition: 1,
+    scoreBps: 8_640,
+  })), false);
+  assert.equal(isFormallyRanked(provider("missing score", {
+    rankState: "ranked",
+    rankPosition: 1,
+  })), false);
+  assert.equal(isFormallyRanked(provider("invalid score", {
+    rankState: "ranked",
+    rankPosition: 1,
+    scoreBps: 10_001,
+  })), false);
 });
 
 test("top-up defaults to the higher-demand Provider relationship", () => {
